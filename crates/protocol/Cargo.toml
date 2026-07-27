@@ -1,0 +1,15 @@
+[package]
+name = "cursio-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+# Clipboard sharing reuses the format-plural `ClipboardContent`/`ClipboardFormat`
+# vocabulary rather than inventing a wire-only copy: the same set of
+# representations the platform backends and the history store speak travels the
+# wire unchanged. `ClipboardFormat` already derives Serialize/Deserialize.
+clipboard-core.workspace = true

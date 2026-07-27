@@ -1,0 +1,911 @@
+//! Linux window capture: `ScreenCast` portal → PipeWire → [`WindowFrame`].
+//!
+//! The **host** side of window transfer on Wayland. A Wayland app cannot read
+//! another window's pixels directly — the compositor forbids it, the same wall
+//! the input path hits — so the sanctioned route is `xdg-desktop-portal`'s
+//! **ScreenCast** interface: the portal lets the user pick the source, hands
+//! back a PipeWire node id plus a remote fd, and we attach a PipeWire stream to
+//! that node to receive frames.
+//!
+//! ## Only prompting once, ever
+//!
+//! The portal's picker is the one piece of friction in this feature: by default
+//! it asks "which window do you want to share?" on *every* `Start`. That is
+//! badly matched to our trigger — the user already expressed intent by dragging
+//! a specific window past the edge, and being re-asked each time would make the
+//! feature unusable.
+//!
+//! So we request [`PersistMode::ExplicitlyRevoked`], which makes the portal
+//! return a **restore token**. We persist that token ([`restore_token_path`])
+//! and pass it back on the next `Start`, and the portal restores the same source
+//! **without showing the dialog**. Net effect: one prompt the first time on a
+//! machine, silence forever after (until the user revokes it in system
+//! settings). GNOME 43+/KDE support this; where it isn't supported the token is
+//! simply ignored and the picker returns — degraded, not broken.
+//!
+//! **Where persistence is requested matters.** Because our session is also a
+//! remote-desktop one (below), the portal *rejects* `persist_mode` and
+//! `restore_token` on `SelectSources` outright — "Remote desktop sessions
+//! cannot persist", an unconditional check in the portal's `screen-cast.c`.
+//! The reason is sound: a silently-restored session that can drive the keyboard
+//! would be a standing input grant nobody re-confirmed. `SelectDevices` *does*
+//! accept persistence, so that is the single place we ask for it, and it covers
+//! the whole session. Asking on both is what fails.
+//!
+//! ## Threading
+//!
+//! Two event loops that both refuse to be moved between threads: `ashpd`'s
+//! portal session (`!Send`) and PipeWire's `MainLoop` (blocking `run()`). They
+//! live together on **one dedicated thread**, exactly like
+//! `cursio-input`'s `wl_capture`: the thread first `block_on`s the async portal
+//! setup on a current-thread runtime, then hands control to the blocking
+//! PipeWire loop while keeping the portal `Session` alive in scope (dropping it
+//! would tear the cast down). Only `Send` channels cross back out, so a slow
+//! link can never stall capture.
+
+use std::os::fd::OwnedFd;
+use std::path::PathBuf;
+
+use ashpd::desktop::{
+    PersistMode,
+    remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions},
+    screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+};
+use cursio_protocol::{
+    TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
+};
+use tokio::sync::mpsc;
+
+use crate::frame_pipeline::{FrameDiffer, pick_codec, should_use_video};
+use crate::{CaptureSession, WindowCapture, WindowError};
+
+/// Where the ScreenCast restore token is persisted, next to `identity.json` in
+/// the same config dir the rest of Cursio uses. Absent file = first run (expect
+/// one picker dialog); present = the portal should restore silently.
+fn restore_token_path() -> Result<PathBuf, WindowError> {
+    let dirs = directories::ProjectDirs::from("dev", "cursio", "cursio")
+        .ok_or_else(|| WindowError::Backend("no config dir for restore token".into()))?;
+    Ok(dirs.config_dir().join("window_restore.json"))
+}
+
+/// The persisted restore token, in its own tiny file rather than mixed into
+/// identity/pairing state: it is portal-scoped, disposable, and safe to delete
+/// (worst case the user sees the picker once more).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RestoreState {
+    /// Opaque token from the portal; meaningful only to it.
+    token: String,
+}
+
+fn load_restore_token() -> Option<String> {
+    let path = restore_token_path().ok()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let state: RestoreState = serde_json::from_slice(&bytes).ok()?;
+    tracing::debug!(path = %path.display(), "loaded ScreenCast restore token");
+    Some(state.token)
+}
+
+/// Persist a fresh token, best-effort: failing to save only costs an extra
+/// dialog next run, so it must never break an otherwise working capture.
+fn save_restore_token(token: &str) {
+    let Ok(path) = restore_token_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let state = RestoreState {
+        token: token.to_owned(),
+    };
+    match serde_json::to_vec_pretty(&state).map(|b| std::fs::write(&path, b)) {
+        Ok(Ok(())) => tracing::info!(path = %path.display(), "saved ScreenCast restore token (portal won't prompt again)"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "could not write restore token; portal will prompt next time"),
+        Err(e) => tracing::warn!(error = %e, "could not encode restore token"),
+    }
+}
+
+/// What the portal handed us: the node to attach to and the fd to attach
+/// *through*.
+///
+/// The portal also reports a source size, but we deliberately don't carry it:
+/// the authoritative geometry is whatever PipeWire *negotiates*, which arrives
+/// in `param_changed` and is what the buffers actually contain. Trusting the
+/// portal's number instead would risk a meta that disagrees with the pixels.
+///
+/// `_session` is held, never used: the cast lives exactly as long as the portal
+/// session object does, so dropping it would kill the stream mid-flight. It
+/// stays on the capture thread with everything else that isn't `Send`.
+struct PortalCast {
+    node_id: u32,
+    fd: OwnedFd,
+    /// The RemoteDesktop proxy + session, kept for two reasons: the cast lives
+    /// exactly as long as the session object (dropping it kills the stream
+    /// mid-flight), and replaying the viewer's input goes back through this
+    /// same pair. Both stay on the capture thread — neither is `Send`.
+    remote: RemoteDesktop,
+    session: ashpd::desktop::Session<RemoteDesktop>,
+    /// Whether the portal actually granted input devices. When it didn't, the
+    /// surrogate is view-only and we say so once rather than failing every
+    /// event.
+    input_granted: bool,
+}
+
+/// Open the portal and start streaming one window — *and* claim the right to
+/// drive it.
+///
+/// The session is created on **RemoteDesktop**, not ScreenCast, then
+/// `select_sources` is called on that same session (ashpd's `RemoteDesktop`
+/// implements `IsScreencastSession`, and the portal spec explicitly supports
+/// pairing the two). That pairing is the whole point: one session means the
+/// user is asked **once**, and the grant covers both directions — pixels out
+/// through PipeWire, input back through `notify_*`. Two separate sessions would
+/// mean two dialogs and a cast the input side can't address.
+///
+/// Asks for `SourceType::Window` so the picker offers windows rather than whole
+/// monitors, and for `CursorMode::Embedded` so the pointer is baked into the
+/// pixels — the viewer sees the cursor where the app draws it without us having
+/// to composite a second cursor over the surrogate.
+async fn setup_portal() -> Result<PortalCast, String> {
+    let remote = RemoteDesktop::new()
+        .await
+        .map_err(|e| format!("open RemoteDesktop portal: {e}"))?;
+    let screencast = Screencast::new()
+        .await
+        .map_err(|e| format!("open ScreenCast portal: {e}"))?;
+
+    let session = remote
+        .create_session(Default::default())
+        .await
+        .map_err(|e| format!("create portal session: {e}"))?;
+
+    // Warn *before* `Start` blocks on the picker. A daemon has no toplevel to
+    // pass as `WindowIdentifier`, so the portal logs "Failed to associate
+    // portal window with parent window" and shows the dialog **unfocused** —
+    // it can end up behind a fullscreen window and look like nothing happened,
+    // while we sit here waiting indefinitely. There is no API fix (every
+    // `WindowIdentifier` constructor needs a real window we don't have), so
+    // being loud about it is the fix.
+    tracing::info!(
+        "waiting for the screen-share dialog — it may open BEHIND other windows; \
+         pick the window to share (check Alt+Tab if you don't see it)"
+    );
+
+    let token = load_restore_token();
+
+    // Input devices first, then the pixel source, both on this one session.
+    remote
+        .select_devices(
+            &session,
+            SelectDevicesOptions::default()
+                .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+                .set_restore_token(token.as_deref())
+                .set_persist_mode(PersistMode::ExplicitlyRevoked),
+        )
+        .await
+        .map_err(|e| format!("select devices: {e}"))?;
+
+    // NOTE: no `persist_mode`/`restore_token` here, deliberately. The portal
+    // rejects both outright on a session that is also a remote-desktop one
+    // ("Remote desktop sessions cannot persist" — see `screen-cast.c`, the
+    // check is unconditional on `IS_REMOTE_DESKTOP_SESSION`). Persistence for
+    // the combined session is carried by `select_devices` above instead, which
+    // does accept it; passing it twice is what fails.
+    screencast
+        .select_sources(
+            &session,
+            SelectSourcesOptions::default()
+                .set_cursor_mode(CursorMode::Embedded)
+                .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Window))
+                .set_multiple(false),
+        )
+        .await
+        .map_err(|e| format!("select sources: {e}"))?;
+
+    // One `Start` for both capabilities — and one dialog for the user.
+    let response = remote
+        .start(&session, None, Default::default())
+        .await
+        .map_err(|e| format!("start session: {e}"))?
+        .response()
+        .map_err(|e| format!("start session response: {e}"))?;
+
+    // A new token is issued whenever the portal decides to; store it so the
+    // next run restores silently.
+    if let Some(t) = response.restore_token() {
+        save_restore_token(t);
+    }
+
+    let devices = response.devices();
+    let input_granted = devices.contains(DeviceType::Pointer);
+    if !input_granted {
+        // Not fatal: watching a window is still useful, and this is exactly
+        // what a compositor without RemoteDesktop support will do.
+        tracing::warn!(
+            ?devices,
+            "portal granted no pointer device — the surrogate will be view-only"
+        );
+    }
+
+    let stream = response
+        .streams()
+        .first()
+        .ok_or_else(|| "portal returned no stream (nothing selected?)".to_string())?;
+    let node_id = stream.pipe_wire_node_id();
+    let size = stream.size(); // logged only; see `PortalCast` on why we don't keep it
+
+    let fd = screencast
+        .open_pipe_wire_remote(&session, Default::default())
+        .await
+        .map_err(|e| format!("open_pipe_wire_remote: {e}"))?;
+
+    tracing::info!(
+        node_id,
+        ?size,
+        input_granted,
+        "portal session started (cast + input)"
+    );
+
+    Ok(PortalCast {
+        node_id,
+        fd,
+        remote,
+        session,
+        input_granted,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buttons_replay_as_evdev_codes() {
+        use cursio_protocol::MouseButton;
+        // These must match `input-event-codes.h`: the surrogate's click is
+        // replayed by number, so a wrong code silently presses another button.
+        assert_eq!(evdev_button(MouseButton::Left), 0x110);
+        assert_eq!(evdev_button(MouseButton::Right), 0x111);
+        assert_eq!(evdev_button(MouseButton::Middle), 0x112);
+        assert_eq!(evdev_button(MouseButton::Back), 0x113);
+        assert_eq!(evdev_button(MouseButton::Forward), 0x114);
+    }
+}
+
+/// What the capture thread is told to do from the outside.
+enum CaptureCommand {
+    /// Replay one viewer input event onto the real window.
+    ///
+    /// Input can't be applied where [`CaptureSession::apply_input`] is called:
+    /// the portal's `notify_*` calls are async D-Bus, and the only runtime that
+    /// may drive them is the capture thread's (the portal session is `!Send`).
+    /// So the event is queued here and replayed there.
+    Input(WindowInput),
+    /// Stop the PipeWire loop and end the thread.
+    Stop,
+}
+
+/// A live capture of one window via the ScreenCast portal.
+///
+/// Owns the channels to the capture thread; the thread itself owns everything
+/// that isn't `Send` (portal session, PipeWire loop).
+pub struct PortalCaptureSession {
+    meta: WindowMeta,
+    frames: mpsc::UnboundedReceiver<WindowFrame>,
+    commands: mpsc::UnboundedSender<CaptureCommand>,
+}
+
+impl CaptureSession for PortalCaptureSession {
+    fn meta(&self) -> &WindowMeta {
+        &self.meta
+    }
+
+    fn frames(&mut self) -> &mut mpsc::UnboundedReceiver<WindowFrame> {
+        &mut self.frames
+    }
+
+    fn apply_input(&mut self, input: WindowInput) -> Result<(), WindowError> {
+        // Hand off to the capture thread, which owns the portal session and the
+        // runtime its async `notify_*` calls need. Queuing rather than blocking
+        // keeps the session loop free — replay is fire-and-forget by nature.
+        self.commands
+            .send(CaptureCommand::Input(input))
+            .map_err(|_| WindowError::Backend("capture thread is gone".into()))
+    }
+
+    fn on_ack(&mut self, _ack: WindowFrameAck) {
+        // Milestone 2 runs at a fixed rate with no adaptive controller, so acks
+        // are accepted and ignored. Milestone 3 turns this into the rate-control
+        // loop (sent-vs-acked + RTT → fps/quality).
+    }
+
+    fn close(&mut self, reason: WindowCloseReason) {
+        tracing::info!(?reason, id = self.meta.id, "closing window capture");
+        let _ = self.commands.send(CaptureCommand::Stop);
+    }
+}
+
+impl Drop for PortalCaptureSession {
+    fn drop(&mut self) {
+        let _ = self.commands.send(CaptureCommand::Stop);
+    }
+}
+
+/// The Linux [`WindowCapture`] backend: ScreenCast portal + PipeWire.
+pub struct PortalWindowCapture;
+
+impl WindowCapture for PortalWindowCapture {
+    type Session = PortalCaptureSession;
+
+    fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError> {
+        spawn_capture(id)
+    }
+}
+
+/// Start the capture thread and block until the portal + PipeWire stream are up.
+///
+/// Blocking here is deliberate: a declined portal dialog or a missing PipeWire
+/// must surface as an error from `begin()`, not as a stream that silently never
+/// produces frames. Mirrors `spawn_wayland_capture` in `cursio-input`.
+fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
+    let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    // Readiness carries the negotiated window geometry back, so the meta we
+    // offer the peer matches what the stream will actually deliver.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WindowMeta, String>>();
+
+    std::thread::Builder::new()
+        .name("cursio-window-capture".into())
+        .spawn(move || capture_thread(id, frames_tx, cmd_rx, ready_tx))
+        .map_err(|e| WindowError::Backend(format!("spawn capture thread: {e}")))?;
+
+    match ready_rx.recv() {
+        Ok(Ok(meta)) => Ok(PortalCaptureSession {
+            meta,
+            frames: frames_rx,
+            commands: cmd_tx,
+        }),
+        Ok(Err(e)) => Err(WindowError::Backend(e)),
+        Err(_) => Err(WindowError::Backend(
+            "capture thread ended before signalling readiness".into(),
+        )),
+    }
+}
+
+/// The capture thread: portal setup (async), then the PipeWire loop (blocking).
+///
+/// Both halves are pinned here because neither is `Send`. The portal `Session`
+/// inside [`PortalCast`] must outlive the stream, so it stays in scope for the
+/// whole function.
+fn capture_thread(
+    id: WindowId,
+    frames_tx: mpsc::UnboundedSender<WindowFrame>,
+    cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
+    ready_tx: std::sync::mpsc::Sender<Result<WindowMeta, String>>,
+) {
+    // Phase 1: the portal handshake is async (D-Bus), so it needs a runtime —
+    // current-thread, because none of it may migrate.
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = ready_tx.send(Err(format!("build runtime: {e}")));
+            return;
+        }
+    };
+    let cast = match rt.block_on(setup_portal()) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+
+    // Phase 2: hand the thread to PipeWire. `cast` (and its portal session)
+    // stays alive here for the duration.
+    if let Err(e) = run_pipewire_loop(id, cast, frames_tx, cmd_rx, &ready_tx, &rt) {
+        // If we never signalled readiness, this is the error the caller sees;
+        // if we already did, the send is a no-op and the log is the record.
+        tracing::error!(error = %e, "window capture loop ended with an error");
+        let _ = ready_tx.send(Err(e));
+    }
+}
+
+/// State the PipeWire callbacks share.
+///
+/// `param_changed` learns the negotiated geometry, `process` needs it to
+/// interpret the buffer, and both run on the PipeWire loop thread — hence
+/// `Rc<RefCell<_>>` rather than any locking. Same shape as the audio backend's
+/// per-stream `Cell`s, just with more to carry.
+struct StreamState {
+    /// Negotiated video format; `None` until the first `param_changed`.
+    format: Option<pipewire::spa::param::video::VideoInfoRaw>,
+    /// Monotonic per-window frame counter for [`WindowFrame::seq`].
+    seq: u32,
+    differ: FrameDiffer,
+    /// Set once we've reported readiness, so it only happens on the first
+    /// format.
+    announced: bool,
+    /// H.264 encoder for large updates, opened lazily.
+    ///
+    /// Lazy because a window that only ever changes a little never needs one,
+    /// and opening it costs a GPU session. Cleared on resize: H.264 cannot
+    /// change frame size mid-stream, so a new geometry means a new encoder (and
+    /// a fresh keyframe).
+    video: Option<crate::video_encoder::VideoEncoder>,
+}
+
+/// Build the format Pod we offer PipeWire.
+///
+/// We ask for **BGRA only** — deliberately narrow. It is exactly the wire
+/// format [`TileCodec::RawBgra8888`] specifies, so accepting anything else
+/// would mean a per-frame colour conversion on the hot path. The compositor can
+/// produce BGRA, so constraining here costs nothing and saves the conversion.
+/// Size and framerate stay ranges: the portal decides the window's real size,
+/// and the compositor caps the rate.
+fn format_param_pod() -> Vec<u8> {
+    use pipewire::spa::{
+        param::{
+            ParamType,
+            format::{FormatProperties, MediaSubtype, MediaType},
+            video::VideoFormat,
+        },
+        pod::{Value, object, property, serialize::PodSerializer},
+        utils::{Fraction, Rectangle, SpaTypes},
+    };
+
+    let obj = object!(
+        SpaTypes::ObjectParamFormat,
+        ParamType::EnumFormat,
+        property!(FormatProperties::MediaType, Id, MediaType::Video),
+        property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        property!(
+            FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            VideoFormat::BGRA,
+            VideoFormat::BGRA,
+        ),
+        property!(
+            FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            Rectangle {
+                width: 640,
+                height: 480
+            },
+            Rectangle {
+                width: 1,
+                height: 1
+            },
+            Rectangle {
+                width: 8192,
+                height: 8192
+            }
+        ),
+        property!(
+            FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            Fraction { num: 60, denom: 1 },
+            Fraction { num: 0, denom: 1 },
+            Fraction {
+                num: 144,
+                denom: 1
+            }
+        ),
+    );
+
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+        .expect("serializing a static format pod cannot fail")
+        .0
+        .into_inner()
+}
+
+/// Attach a PipeWire stream to the portal's node and pump frames until stopped.
+fn run_pipewire_loop(
+    id: WindowId,
+    cast: PortalCast,
+    frames_tx: mpsc::UnboundedSender<WindowFrame>,
+    mut cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
+    ready_tx: &std::sync::mpsc::Sender<Result<WindowMeta, String>>,
+    rt: &tokio::runtime::Runtime,
+) -> Result<(), String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use pipewire::{
+        context::ContextRc,
+        main_loop::MainLoopRc,
+        properties::properties,
+        spa::{pod::Pod, utils::Direction},
+        stream::{StreamFlags, StreamRc},
+    };
+
+    pipewire::init();
+
+    // Split the cast up front: the fd is consumed by `connect_fd_rc`, while the
+    // portal proxy/session must stay alive for the whole loop (they are both
+    // what keeps the cast open and how input is replayed).
+    let PortalCast {
+        node_id,
+        fd,
+        remote,
+        session,
+        input_granted,
+    } = cast;
+
+    let main_loop = MainLoopRc::new(None).map_err(|e| format!("main loop: {e}"))?;
+    let context = ContextRc::new(&main_loop, None).map_err(|e| format!("context: {e}"))?;
+    // Connect through the portal's fd, not the session bus: this is the
+    // permission-scoped PipeWire the portal opened for us.
+    let core = context
+        .connect_fd_rc(fd, None)
+        .map_err(|e| format!("connect to portal pipewire: {e}"))?;
+
+    let stream = StreamRc::new(
+        core.clone(),
+        "cursio-window-capture",
+        properties! {
+            *pipewire::keys::MEDIA_TYPE => "Video",
+            *pipewire::keys::MEDIA_CATEGORY => "Capture",
+            *pipewire::keys::MEDIA_ROLE => "Screen",
+        },
+    )
+    .map_err(|e| format!("stream: {e}"))?;
+
+    let state = Rc::new(RefCell::new(StreamState {
+        format: None,
+        seq: 0,
+        differ: FrameDiffer::new(),
+        announced: false,
+        video: None,
+    }));
+
+    let ready = ready_tx.clone();
+    let state_fmt = state.clone();
+    let state_proc = state.clone();
+
+    let _listener = stream
+        .add_local_listener_with_user_data(())
+        .param_changed(move |_, (), param_id, param| {
+            let Some(param) = param else { return };
+            if param_id != pipewire::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let Ok((media_type, media_subtype)) =
+                pipewire::spa::param::format_utils::parse_format(param)
+            else {
+                return;
+            };
+            if media_type != pipewire::spa::param::format::MediaType::Video
+                || media_subtype != pipewire::spa::param::format::MediaSubtype::Raw
+            {
+                return;
+            }
+
+            let mut info = pipewire::spa::param::video::VideoInfoRaw::default();
+            if info.parse(param).is_err() {
+                tracing::warn!("could not parse negotiated video format");
+                return;
+            }
+            let size = info.size();
+            tracing::info!(
+                width = size.width,
+                height = size.height,
+                format = ?info.format(),
+                "window capture format negotiated"
+            );
+
+            let mut st = state_fmt.borrow_mut();
+            st.format = Some(info);
+            // The first negotiated format is what makes the offer meaningful —
+            // only now do we know the real geometry to tell the peer about.
+            if !st.announced {
+                st.announced = true;
+                let _ = ready.send(Ok(WindowMeta {
+                    id,
+                    // The portal deliberately doesn't expose the source window's
+                    // title (it would leak what the user picked); a neutral label
+                    // is honest until we can learn it another way.
+                    title: "Shared window".to_string(),
+                    width: size.width,
+                    height: size.height,
+                }));
+            }
+        })
+        .process(move |stream, ()| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            let Some(data) = datas.first_mut() else { return };
+
+            let chunk = data.chunk();
+            let (offset, size, stride) = (
+                chunk.offset() as usize,
+                chunk.size() as usize,
+                chunk.stride() as usize,
+            );
+            if size == 0 || stride == 0 {
+                return;
+            }
+            let Some(bytes) = data.data() else { return };
+
+            let mut st = state_proc.borrow_mut();
+            let Some(info) = st.format else { return };
+            let (width, height) = (info.size().width, info.size().height);
+            let row_bytes = (width as usize) * 4;
+
+            // PipeWire rows are `stride` bytes apart, which may exceed the
+            // visible `width * 4` (alignment padding). Repack tightly so every
+            // later stage — differ, tile extraction, the wire format — can
+            // assume no padding.
+            let mut frame = Vec::with_capacity(row_bytes * height as usize);
+            for y in 0..height as usize {
+                let start = offset + y * stride;
+                let end = start + row_bytes;
+                if end > bytes.len() {
+                    // Short buffer: the format and the data disagree, so this
+                    // frame isn't safe to interpret. Skip rather than send
+                    // garbage or panic on the RT thread.
+                    return;
+                }
+                frame.extend_from_slice(&bytes[start..end]);
+            }
+
+            let Some(dirty) = st.differ.diff(&frame, width, height) else {
+                return; // nothing changed — the static-window case costs nothing
+            };
+
+            // Which path? A small change rides a lossless tile; a large one
+            // goes through the video encoder, which codes the difference from
+            // the previous frame rather than the pixels themselves.
+            if should_use_video(dirty, width, height) {
+                // Geometry changes invalidate the encoder: H.264 is fixed-size.
+                if st
+                    .video
+                    .as_ref()
+                    .is_some_and(|e| e.size() != (width, height))
+                {
+                    tracing::info!(width, height, "window resized; reopening video encoder");
+                    st.video = None;
+                }
+                if st.video.is_none() {
+                    match crate::video_encoder::VideoEncoder::open(width, height) {
+                        Ok(enc) => st.video = Some(enc),
+                        Err(e) => {
+                            // Not fatal: fall through to the lossless path,
+                            // which always works — just more expensively.
+                            tracing::warn!(error = %e, "no video encoder; using lossless tiles");
+                        }
+                    }
+                }
+
+                if let Some(enc) = st.video.as_mut() {
+                    match enc.encode(&frame) {
+                        Ok(packets) => {
+                            // One visual update can yield several packets, and
+                            // sometimes none — the encoder decides.
+                            let full = enc.full_rect();
+                            for data in packets {
+                                st.seq = st.seq.wrapping_add(1);
+                                let seq = st.seq;
+                                let _ = frames_tx.send(WindowFrame {
+                                    id,
+                                    seq,
+                                    dirty: full,
+                                    codec: TileCodec::LossyVideo,
+                                    data,
+                                });
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            // Drop the encoder so the next frame retries
+                            // cleanly rather than repeating a broken session.
+                            tracing::warn!(error = %e, "video encode failed; falling back to tiles");
+                            st.video = None;
+                        }
+                    }
+                }
+            }
+
+            let tile = FrameDiffer::extract(&frame, width, dirty);
+            let codec = pick_codec(tile.len());
+            let encoded = match crate::codec::encode_tile(codec, &tile) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tile encode failed; dropping frame");
+                    return;
+                }
+            };
+
+            st.seq = st.seq.wrapping_add(1);
+            let seq = st.seq;
+            // Send is non-blocking: the channel absorbs bursts so a slow link
+            // never stalls this RT callback.
+            let _ = frames_tx.send(WindowFrame {
+                id,
+                seq,
+                dirty,
+                codec,
+                data: encoded,
+            });
+        })
+        .register()
+        .map_err(|e| format!("register stream listener: {e}"))?;
+
+    let pod_bytes = format_param_pod();
+    let mut params = [Pod::from_bytes(&pod_bytes).expect("valid format pod")];
+    stream
+        .connect(
+            Direction::Input,
+            Some(node_id),
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+            &mut params,
+        )
+        .map_err(|e| format!("stream connect: {e}"))?;
+
+    tracing::info!(node_id, "window capture stream connected");
+
+    // Drive the loop, servicing commands between iterations — PipeWire's loop
+    // has no cross-thread "run until signalled" (same approach as the audio
+    // capture loop).
+    let mut warned_no_input = false;
+    'outer: loop {
+        // Drain queued input before iterating: replay should track the user's
+        // hand, and a batch that sat through a 50 ms PipeWire tick would feel
+        // like lag. Bounded so a flood of motion can't stall capture entirely.
+        for _ in 0..64 {
+            match cmd_rx.try_recv() {
+                Ok(CaptureCommand::Input(input)) => {
+                    if !input_granted {
+                        if !warned_no_input {
+                            warned_no_input = true;
+                            tracing::warn!(
+                                "ignoring viewer input: the portal granted no input devices"
+                            );
+                        }
+                        continue;
+                    }
+                    // `block_on` is safe here: this thread's runtime is
+                    // current-thread and nothing else is driving it while the
+                    // PipeWire loop is between iterations.
+                    if let Err(e) = rt.block_on(replay_input(&remote, &session, node_id, input)) {
+                        tracing::debug!(error = %e, "could not replay input onto the window");
+                    }
+                }
+                Ok(CaptureCommand::Stop) => break 'outer,
+                Err(mpsc::error::TryRecvError::Disconnected) => break 'outer,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+        main_loop
+            .loop_()
+            .iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(16)));
+    }
+
+    tracing::info!("window capture stream stopped");
+    Ok(())
+}
+
+/// The protocol's neutral button → its evdev `BTN_*` code.
+///
+/// Same namespace `cursio-input` injects with, and the same one libei reports —
+/// keeping one vocabulary end to end is what lets a click cross machines (and
+/// operating systems) without a translation table in the middle.
+fn evdev_button(button: cursio_protocol::MouseButton) -> i32 {
+    use cursio_protocol::MouseButton;
+    match button {
+        MouseButton::Left => 0x110,
+        MouseButton::Right => 0x111,
+        MouseButton::Middle => 0x112,
+        MouseButton::Back => 0x113,
+        MouseButton::Forward => 0x114,
+    }
+}
+
+/// Replay one [`WindowInput`] onto the real window through the portal.
+///
+/// Coordinates arrive in the window's own pixel space, which is exactly the
+/// space `notify_pointer_motion_absolute` expects when given the cast's stream
+/// node — so no translation is needed, and that is precisely why the capture and
+/// input halves had to share one session.
+///
+/// Buttons and keys use evdev codes on both sides of the wire, so they pass
+/// through unchanged: the protocol picked that namespace to avoid a keymap
+/// round-trip here (see `input-design.md`).
+async fn replay_input(
+    remote: &RemoteDesktop,
+    session: &ashpd::desktop::Session<RemoteDesktop>,
+    node_id: u32,
+    input: WindowInput,
+) -> Result<(), ashpd::Error> {
+    match input {
+        WindowInput::PointerMove { x, y, .. } => {
+            remote
+                .notify_pointer_motion_absolute(
+                    session,
+                    node_id,
+                    x as f64,
+                    y as f64,
+                    Default::default(),
+                )
+                .await
+        }
+        WindowInput::PointerButton {
+            x,
+            y,
+            button,
+            pressed,
+            ..
+        } => {
+            // Move first: the portal has no "click at (x, y)", so the press must
+            // land where the viewer's pointer actually is.
+            remote
+                .notify_pointer_motion_absolute(
+                    session,
+                    node_id,
+                    x as f64,
+                    y as f64,
+                    Default::default(),
+                )
+                .await?;
+            remote
+                .notify_pointer_button(
+                    session,
+                    evdev_button(button),
+                    if pressed {
+                        ashpd::desktop::remote_desktop::KeyState::Pressed
+                    } else {
+                        ashpd::desktop::remote_desktop::KeyState::Released
+                    },
+                    Default::default(),
+                )
+                .await
+        }
+        WindowInput::PointerScroll { dx, dy, .. } => {
+            // The protocol counts notches with +y = up; the portal's discrete
+            // axis counts steps with +y = down, hence the negation.
+            if dx != 0 {
+                remote
+                    .notify_pointer_axis_discrete(
+                        session,
+                        ashpd::desktop::remote_desktop::Axis::Horizontal,
+                        dx,
+                        Default::default(),
+                    )
+                    .await?;
+            }
+            if dy != 0 {
+                remote
+                    .notify_pointer_axis_discrete(
+                        session,
+                        ashpd::desktop::remote_desktop::Axis::Vertical,
+                        -dy,
+                        Default::default(),
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+        WindowInput::Key { key, pressed, .. } => {
+            remote
+                .notify_keyboard_keycode(
+                    session,
+                    key as i32,
+                    if pressed {
+                        ashpd::desktop::remote_desktop::KeyState::Pressed
+                    } else {
+                        ashpd::desktop::remote_desktop::KeyState::Released
+                    },
+                    Default::default(),
+                )
+                .await
+        }
+    }
+}

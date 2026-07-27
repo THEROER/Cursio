@@ -1,0 +1,62 @@
+[package]
+name = "cursio-core"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cursio"
+path = "src/bin/cursio.rs"
+
+[dependencies]
+cursio-protocol.workspace = true
+cursio-transport.workspace = true
+cursio-input.workspace = true
+cursio-audio.workspace = true
+cursio-window.workspace = true
+cursio-files.workspace = true
+# Compresses file chunks when it pays; see files_session::pack.
+zstd = "0.13"
+# Clipboard sharing: the platform layer (read/write/watch) the session module
+# drives on a worker thread. Same crate `clipd` uses, so the two compose for
+# free — content received from a peer lands on the local clipboard.
+clipboard-core.workspace = true
+
+async-trait.workspace = true
+tokio.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Console + rotating-file logging, shared across binaries. Re-exported as
+# `cursio_core::logging` for the historical path.
+cursio-log.workspace = true
+uuid.workspace = true
+clap.workspace = true
+hostname.workspace = true
+directories.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Self-elevation at startup: without admin rights, Windows' UIPI silently drops
+# injected input aimed at higher-integrity windows (an elevated console, Task
+# Manager), so the peer's mouse appears dead over exactly those windows.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    # OpenProcessToken/GetTokenInformation — are we already elevated?
+    "Win32_Security",
+    "Win32_System_Threading",
+    # ShellExecuteExW with the "runas" verb — the actual UAC prompt.
+    # SHELLEXECUTEINFOW carries an HKEY field, so the binding is gated on
+    # Win32_System_Registry even though we never touch the registry.
+    "Win32_UI_Shell",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# `start_paused` for time-dependent tests (liveness timeouts) — lets a 15s
+# timeout elapse in virtual time instead of really waiting.
+tokio = { version = "1", features = ["full", "test-util"] }

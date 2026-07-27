@@ -1,0 +1,5 @@
+# `cargo xtask <cmd>` — project automation (build / install / cross-compile).
+# See crates/xtask for the commands. Kept as an alias so contributors don't need
+# to remember the package name or the env vars each target needs.
+[alias]
+xtask = "run --quiet --package xtask --"

@@ -1,0 +1,61 @@
+[package]
+name = "cursio-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cursio-protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Stream/chunk channels between platform backends and the session are tokio mpsc
+# on every platform, same as cursio-input's CaptureHandle and cursio-window.
+tokio = { workspace = true }
+# Opus, for compressing the audio wire format. Raw f32 is ~3 Mbit/s per stream,
+# which saturates the link that input also shares — Opus carries it at ~100
+# kbit/s. Used in restricted-low-delay mode (see `codec.rs`): latency first.
+shiguredo_opus = "2026.1.0"
+
+# Linux audio via PipeWire: per-node capture (incl. per-app streams), null-sink
+# virtual output, and playback nodes. `pipewire` is the official Rust binding;
+# it links against the system libpipewire-0.3 (present on the dev box).
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.10"
+
+# Windows audio via WASAPI: render/loopback + process loopback for per-app
+# capture (Win10 2004+). The `windows` crate gives COM wrappers for the WASAPI
+# interfaces (IMMDeviceEnumerator, IAudioClient, capture/render clients),
+# cutting the unsafe surface versus raw windows-sys.
+[target.'cfg(target_os = "windows")'.dependencies]
+# Build libopus from source on Windows. The crate's prebuilt path is broken for
+# MSVC: it downloads an archive containing `opus.lib` (the correct MSVC name)
+# but then copies a hardcoded `libopus.a`, so the build panics with a missing
+# file. `source-build` compiles libopus with the crate's own bundled cmake and
+# avoids that path entirely. Linux keeps using the prebuilt library, which works.
+shiguredo_opus = { version = "2026.1.0", features = ["source-build"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    # IAudioEndpointVolume (per-device volume/mute for the DeviceMonitor).
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    # IMMDevice::Activate is gated behind these two (its params use PROPVARIANT).
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_Devices_FunctionDiscovery",
+    # IMMDevice::OpenPropertyStore + IPropertyStore (device friendly names).
+    "Win32_UI_Shell_PropertiesSystem",
+    # Talking to the Cursio virtual-audio driver: CreateFileW on \\.\CursioAudio
+    # plus DeviceIoControl for the PCM bridge (see vad_client.rs).
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    # CreateFileW's SECURITY_ATTRIBUTES parameter gates it behind this.
+    "Win32_Security",
+] }
+# `#[implement]` (for the process-loopback activation completion handler)
+# expands to code referring to `windows_core`, so it must be a direct dep.
+windows-core = "0.61"
+
+[dev-dependencies]
+tokio.workspace = true

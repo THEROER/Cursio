@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Project automation binary, run via `cargo xtask <cmd>` (see .cargo/config.toml).
+# Deliberately dependency-light: it shells out to cargo/install steps rather than
+# pulling a build framework, so it compiles in a second and stays easy to read.
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true

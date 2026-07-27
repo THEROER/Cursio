@@ -1,0 +1,27 @@
+[package]
+name = "cursio-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cursio-protocol.workspace = true
+
+tokio.workspace = true
+futures.workspace = true
+async-trait = "0.1"
+
+mdns-sd.workspace = true
+if-addrs = "0.13"
+
+snow.workspace = true
+spake2.workspace = true
+rand.workspace = true
+sha2.workspace = true
+
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true

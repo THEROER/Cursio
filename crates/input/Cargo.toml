@@ -1,0 +1,45 @@
+[package]
+name = "cursio-input"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cursio-protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Capture channels (CaptureHandle) are tokio mpsc on every platform.
+tokio = { workspace = true }
+
+# Linux input injection/capture.
+# - evdev/uinput: the X11-and-legacy path (grab + inject on non-Wayland).
+# - ashpd + reis: the Wayland path via xdg-desktop-portal InputCapture (edge
+#   detection + capture) and RemoteDesktop (injection) over libei/eis.
+# `tokio` feature gives async event streams for evdev capture.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = { version = "0.13", features = ["tokio"] }
+# input_capture: the pointer-barrier/edge-detection portal interface.
+ashpd = { version = "0.13", features = ["input_capture"] }
+# tokio: async handshake + event stream (handshake_tokio).
+reis = { version = "0.7", features = ["tokio"] }
+futures-util = "0.3"
+
+# Windows input injection/capture via SendInput + RawInput.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    # WNDCLASSW / RegisterClassW are gated behind Gdi (WNDCLASSW has an HBRUSH).
+    "Win32_Graphics_Gdi",
+    # Reading HKCU\Control Panel\Cursors to restore the user's real cursors,
+    # and expanding %SystemRoot% in the paths it stores.
+    "Win32_System_Registry",
+    "Win32_System_Environment",
+] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+tokio.workspace = true
+futures-util = "0.3"

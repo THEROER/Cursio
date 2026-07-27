@@ -1,0 +1,52 @@
+[package]
+name = "cursio-files"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cursio-protocol.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+# Only for the channel the mount uses to reach the async session; no filesystem
+# work runs on the runtime (see mount::bridge).
+tokio = { workspace = true }
+# Compresses file chunks when that actually shrinks them; see protocol::Chunk.
+zstd = "0.13"
+
+# The mount side runs a FUSE filesystem. `fuser` talks the kernel's FUSE ABI
+# directly over /dev/fuse, so it needs no libfuse-dev at build time — only
+# fusermount3 at runtime, which is part of a normal desktop install.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+libc = "0.2"
+
+# Windows mounting goes through WinFsp. Gated on the MSVC environment, not just
+# on Windows: `winfsp-sys` refuses any other triple outright (its build script
+# panics with "unsupported triple" on MinGW), so the MinGW cross-build that
+# `cargo xtask windows` performs must not see this dependency at all. Build the
+# mounting half with `cargo xwin --target x86_64-pc-windows-msvc`.
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
+# NOT the `debug` feature: it routes WinFsp's diagnostics to stderr via
+# `GetStdHandle(...).unwrap()`, which panics or yields a useless handle when the
+# process has no console — and the filesystem then stops answering entirely,
+# losing even the UNC path that worked without it.
+winfsp = "0.13"
+widestring = "1"
+windows = { version = "0.61", features = ["Win32_Foundation"] }
+
+# Just `GetDiskFreeSpaceExW`, for the capacity a volume reports. `windows-sys`
+# rather than `windows`: this is one raw call with no COM or lifetime handling
+# to gain from the safe wrappers.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    # Locating and loading WinFsp's side-by-side DLL; see winmount::fs.
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    # Mapping the drive letter onto the UNC share, as `net use` does.
+    "Win32_NetworkManagement_WNet",
+] }
+
+[dev-dependencies]
+tempfile = "3"

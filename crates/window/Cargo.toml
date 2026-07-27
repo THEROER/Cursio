@@ -1,0 +1,106 @@
+[package]
+name = "cursio-window"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cursio-protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Frame/input channels between platform backends and the session are tokio mpsc
+# on every platform, same as cursio-input's CaptureHandle.
+tokio = { workspace = true }
+# Lossless BGRA tile compression (the `LosslessBgra8888` codec) and decoding on
+# the viewer side. Cheap CPU, pixel-exact — the default for text/UI updates.
+zstd = "0.13"
+
+# Linux window capture (portal ScreenCast / PipeWire) and surrogate rendering
+# (Wayland client) land here as they're implemented.
+[target.'cfg(target_os = "linux")'.dependencies]
+# ScreenCast portal (pick the window, get a PipeWire node) + the PipeWire remote
+# fd. Same portal stack the input path uses (`ashpd`), just the screencast side.
+# NOTE: deliberately WITHOUT ashpd's "pipewire" feature. That feature pulls in
+# `pipewire 0.9`, which declares the same `links = "pipewire-0.3"` as the
+# `pipewire 0.10` we (and cursio-audio) use directly — cargo refuses two crates
+# claiming the same native library, breaking the whole workspace build. We only
+# need the portal's `open_pipe_wire_remote()` (part of "screencast"), which hands
+# back a raw fd we attach our own 0.10 stream to.
+# `remote_desktop` rides the *same* portal session as `screencast` (ashpd's
+# `RemoteDesktop` implements `IsScreencastSession`), so pixels out and input back
+# cost the user exactly one dialog, not two.
+ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
+# The PipeWire video stream carrying the captured window's BGRA frames. Same
+# crate/version the audio backend already drives (0.10).
+pipewire = "0.10"
+futures-util = "0.3"
+# Listening for the GNOME Shell extension's window-drag signals. Not a new
+# dependency in practice: `ashpd` above already builds on this exact zbus, so
+# naming it here adds no crate to the tree — it only makes the direct use
+# honest. The extension is optional, so this code path must tolerate the bus
+# name never appearing.
+zbus = "5"
+# Persisting the ScreenCast restore token so the portal only prompts once, ever
+# — written next to identity.json in the config dir.
+directories = "5"
+serde = { workspace = true }
+serde_json.workspace = true
+# The viewer's surrogate window. Same GTK4 the clipd popup uses, so no new
+# toolkit enters the tree. `gdk::MemoryTexture` consumes B8g8r8a8 — the wire
+# format verbatim — so frames reach the screen without a colour conversion.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+# H.264 encoding for the `LossyVideo` tile codec. Measured on 2026-07-20: the
+# lossless path costs 742 Mbit/s on a moving 1080p window, NVENC 11.3 Mbit/s —
+# a 66x gap no rate controller can close. `ffmpeg-next` is one API over NVENC,
+# VAAPI, and libx264, which matters because the peer's GPU is not ours. Links
+# against the system libav* (7.1 here); no vendored FFmpeg build.
+ffmpeg-next = "8.1"
+
+# Windows window capture (Graphics Capture / Desktop Duplication by HWND) and
+# surrogate rendering land here as they're implemented. The behaviour of a
+# *hidden* window under Windows.Graphics.Capture is being settled first, by the
+# standalone `tools/wgc-probe` (kept out of this crate so it doesn't drag GTK
+# and ffmpeg through a Windows cross-build).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    # Windows.Graphics.Capture: one window by HWND, proven to keep delivering
+    # frames while the window is invisible (see tools/wgc-probe).
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Foundation",
+    # Capture yields D3D11 textures, so a device and a staging copy are needed.
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    # Interop: a capture item for an HWND, and the WinRT/D3D bridge.
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    # Finding the window, hiding it (layered alpha), and PostMessage replay.
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    # H.264 decoding for the surrogate. Media Foundation is the answer to
+    # `ffmpeg-next` needing system libav*, which Windows does not have: the
+    # transform ships with the OS, so the .exe stays self-contained and no
+    # FFmpeg build enters the cross-compile. Enumerated via `MFTEnumEx` so a
+    # hardware decoder is used when the machine has one.
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    # `ICodecAPI` passes its encoder settings as VARIANTs.
+    "Win32_System_Variant",
+] }
+
+[dev-dependencies]
+tokio.workspace = true
+# The capture_probe example logs through the same stack as the daemon.
+tracing-subscriber.workspace = true
+
+# Linux-only dev deps. `ffmpeg-next` must be scoped to the target: as a plain
+# dev-dependency its `ffmpeg-sys` build script runs even when cross-compiling to
+# Windows, where it looks for system libav* and fails — which would block
+# building the Windows examples from this machine.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# encode_bench calls ffmpeg_next::init() directly before benchmarking.
+ffmpeg-next = "8.1"

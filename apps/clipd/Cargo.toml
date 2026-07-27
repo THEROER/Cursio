@@ -1,0 +1,51 @@
+[package]
+name = "clipd"
+version.workspace = true
+edition.workspace = true
+description = "Clipboard history for Linux — a Win+V that works on Wayland/GNOME"
+
+[lib]
+name = "clipd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clipd"
+path = "src/main.rs"
+
+[dependencies]
+clipboard-core.workspace = true
+# Console + rotating-file logging, shared with the rest of Cursio.
+cursio-log.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+directories.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+
+# History lives in SQLite: the store is queried by recency and by substring
+# search, both of which want an index rather than a re-parsed flat file. The
+# `bundled` feature compiles SQLite in, so clipd doesn't depend on the system
+# library version.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# Content-addressed blob names for deduplicating repeated copies.
+sha2.workspace = true
+# Thumbnails for the picker: generated once on insert, so listing the history
+# never decodes full-size images.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# The popup. libadwaita (not a hand-styled toolkit, not a web view) so the
+# window follows the system theme, accent colour, font and animations — it
+# appears beside real GNOME surfaces, where anything off reads as foreign.
+# v4_12 gates ContentFit, ListView::scroll_to and CssProvider::load_from_string.
+# The system has GTK 4.20, so this is a conservative floor rather than a
+# requirement to upgrade.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+# getuid(), for the fallback socket path when XDG_RUNTIME_DIR is unset.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,49 @@
+[package]
+name = "clipboard-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+# Change notifications go out on a channel so a slow consumer never stalls the
+# platform's clipboard thread — same pattern as cursio-input's CaptureHandle.
+tokio = { workspace = true }
+
+# Linux clipboard via the wlr/ext `data-control` protocol, which is what grants
+# a windowless background process focus-independent clipboard access (an
+# ordinary Wayland client only sees the clipboard while focused). X11 support
+# is a separate backend; see linux.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+# GNOME does not implement the Wayland `data-control` protocol a background
+# clipboard manager would need, so the Linux path goes through X11/XWayland,
+# which GNOME bridges to the Wayland clipboard both ways. `arboard` is used
+# rather than raw X11 because x11-clipboard/xclip hold only one target per
+# selection and so cannot carry a copy's multiple representations. See linux.rs.
+arboard = "3.6"
+# arboard hands images back as raw RGBA; they are (re-)encoded as PNG here, both
+# to be portable and because raw pixels would cost ~16x more to store.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Windows clipboard via the Win32 API: OpenClipboard/GetClipboardData/
+# SetClipboardData for read/write, and AddClipboardFormatListener on a
+# message-only window for change notifications (the same message-window pattern
+# cursio-input's Windows capture uses). `windows` gives safe COM/Win32 wrappers.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
+# Encode/decode PNG <-> the DIB bitmap Windows apps expect on the clipboard, so
+# an image copied in a Windows app arrives as PNG on the peer and vice versa.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber.workspace = true
