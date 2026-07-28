@@ -53,6 +53,16 @@ struct State {
 /// contents change, and this list is consulted on every path resolution.
 const VOLUMES_TTL: Duration = Duration::from_secs(30);
 
+/// How many FUSE event-loop threads serve the mount.
+///
+/// This is the number of operations that can be in flight at once, because
+/// every callback blocks its thread on a round trip to the peer — so it is the
+/// mount's whole concurrency, not a tuning knob for CPU. It tracks the session's
+/// per-pass reply budget: below that, threads sit parked while the kernel holds
+/// requests waiting; far above it they only queue deeper for no gain, and each
+/// one costs a request buffer sized for the largest write the kernel may send.
+const FUSE_THREADS: usize = 32;
+
 impl RemoteFs {
     pub fn new(peer: PeerLink) -> Self {
         Self {
@@ -705,6 +715,45 @@ fn is_mounted(mountpoint: &std::path::Path) -> bool {
         .any(|p| p == needle)
 }
 
+/// The session configuration the mount runs under.
+///
+/// Split out from [`mount`] so the settings can be asserted on without mounting
+/// anything: everything here is a decision, and the concurrency ones are silent
+/// when wrong — the filesystem still works, only far slower.
+fn mount_config(peer_name: &str) -> fuser::Config {
+    let mut config = fuser::Config::default();
+
+    // Every callback in this filesystem blocks on a round trip: `PeerLink::call`
+    // parks the calling thread until the peer answers. On the default single
+    // event loop that serialises the entire mount — one request in flight at a
+    // time, each paying the full latency — so copying many small files runs at
+    // one file per round trip however much bandwidth is free. The engine at the
+    // far end already pipelines (`pump_requests` drains several per pass) and
+    // `RemoteFs` takes `&self` behind a mutex, so filling that pipe only ever
+    // needed threads to wait in parallel.
+    config.n_threads = Some(FUSE_THREADS);
+    // Give each worker its own `/dev/fuse` fd, so they take requests from the
+    // kernel independently instead of contending on a single descriptor.
+    config.clone_fd = true;
+
+    config.mount_options = vec![
+        MountOption::FSName(format!("cursio-{peer_name}")),
+        MountOption::Subtype("cursio".to_string()),
+        // The peer's disks are the user's own; nothing here should honour
+        // set-user-id bits or device nodes that arrived over a network.
+        MountOption::NoSuid,
+        MountOption::NoDev,
+        // Deliberately NOT AutoUnmount: fuser refuses it unless the session ACL
+        // is widened to `allow_other` or `allow_root`, and either would expose
+        // the peer's files — and through them the peer's whole disk — to every
+        // account on this machine. That is a real loss of privacy to buy
+        // cleanup after a crash, which `MountHandle`'s Drop already handles on
+        // every ordinary exit. A crash leaves a stale mount point, cleared with
+        // `fusermount -u`; that is the better trade.
+    ];
+    config
+}
+
 /// Mount the peer's volumes at `mountpoint`, returning once they are visible.
 pub fn mount(
     peer: PeerLink,
@@ -721,23 +770,7 @@ pub fn mount(
     release_stale_mount(&mountpoint);
     std::fs::create_dir_all(&mountpoint)?;
 
-    let mut config = fuser::Config::default();
-    config.mount_options = vec![
-        MountOption::FSName(format!("cursio-{peer_name}")),
-        MountOption::Subtype("cursio".to_string()),
-        // The peer's disks are the user's own; nothing here should honour
-        // set-user-id bits or device nodes that arrived over a network.
-        MountOption::NoSuid,
-        MountOption::NoDev,
-        // Deliberately NOT AutoUnmount: fuser refuses it unless the session ACL
-        // is widened to `allow_other` or `allow_root`, and either would expose
-        // the peer's files — and through them the peer's whole disk — to every
-        // account on this machine. That is a real loss of privacy to buy
-        // cleanup after a crash, which `MountHandle`'s Drop already handles on
-        // every ordinary exit. A crash leaves a stale mount point, cleared with
-        // `fusermount -u`; that is the better trade.
-    ];
-
+    let config = mount_config(peer_name);
     let session = fuser::Session::new(RemoteFs::new(peer), &mountpoint, &config)?.spawn()?;
     tracing::info!(mount = %mountpoint.display(), peer = peer_name, "peer volumes mounted");
     Ok(MountHandle {
@@ -770,6 +803,42 @@ mod tests {
         // The root always is one, so a true answer is reachable too.
         assert!(is_mounted(std::path::Path::new("/")));
         let _ = std::fs::remove_dir(&tmp);
+    }
+
+    /// The mount must serve requests concurrently.
+    ///
+    /// Every callback here blocks on a round trip, so the thread count is the
+    /// number of operations that can be in flight. Left at the default of one,
+    /// the filesystem still passes every other test and still works — it just
+    /// serialises on network latency, which showed up as a copy of many small
+    /// files crawling while the link sat idle. Nothing else fails when this
+    /// regresses, so it is asserted directly.
+    #[test]
+    fn the_mount_serves_requests_concurrently() {
+        let config = mount_config("peer");
+        assert!(
+            config.n_threads.is_some_and(|n| n > 1),
+            "a single event loop would serialise every blocking round trip"
+        );
+        assert!(
+            config.clone_fd,
+            "workers sharing one fd contend for kernel requests"
+        );
+    }
+
+    /// The security-relevant mount options must stay on: they are what keeps a
+    /// peer's disk from carrying set-user-id bits or device nodes onto this
+    /// machine, and nothing observable breaks if they silently go missing.
+    #[test]
+    fn the_mount_refuses_setuid_and_device_nodes() {
+        let config = mount_config("peer");
+        assert!(config.mount_options.contains(&MountOption::NoSuid));
+        assert!(config.mount_options.contains(&MountOption::NoDev));
+        assert_eq!(
+            config.acl,
+            fuser::SessionACL::Owner,
+            "widening the ACL would expose the peer's disk to every local account"
+        );
     }
 
     /// Open flags must survive the crossing, or a file opened for writing

@@ -29,7 +29,14 @@ use crate::module::SessionModule;
 /// the loop always gets back to its `select!`. Anything left waits for the next
 /// pump rather than being dropped — file data, unlike audio, is worthless if it
 /// arrives incomplete.
-const MAX_REPLIES_PER_PUMP: usize = 8;
+///
+/// Sized to stay ahead of the mount's threads rather than to match them: each
+/// pass is a bounded drain of an already-filled queue, so the cost of a larger
+/// budget is a few more non-blocking `try_recv` calls, while a budget below the
+/// number of waiting requests leaves the peer's threads parked between passes.
+/// A copy of many small files fills this queue faster than any single pass can
+/// drain it, and at eight the kernel was seen holding three times that waiting.
+const MAX_REPLIES_PER_PUMP: usize = 32;
 
 /// Compression level for file chunks.
 ///
