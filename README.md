@@ -159,7 +159,7 @@ Project automation lives in `cargo xtask`, which wraps the env vars and target
 triples each build needs:
 
 ```sh
-cargo xtask build              # release build of all binaries for this host
+cargo xtask build              # release build of supported binaries for this host
 cargo xtask install            # build + copy cursio, clipd, cursio-app to ~/.local/bin
                                # (+ .desktop launchers for the GUI apps on Linux)
 cargo xtask windows            # cross-compile the .exe(s) from Linux (mingw)
@@ -167,8 +167,8 @@ cargo xtask logs --follow      # print the log dir and tail the current log
 ```
 
 `install` also installs `.desktop` files under `~/.local/share/applications`.
-Add `~/.local/bin` to your `PATH` if it isn't already. `macos` and `android`
-are placeholders for now.
+Add `~/.local/bin` to your `PATH` if it isn't already. `clipd` is Linux-only,
+so macOS builds `cursio` and `cursio-app`. Android remains a placeholder.
 
 > On this Ubuntu box `cargo xtask` sets `OPUS_TARGET=ubuntu-24.04_x86_64`
 > automatically for native builds (a plain `cargo build` still needs it set by

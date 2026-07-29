@@ -8,8 +8,8 @@
 //! - `windows` — cross-compile the `.exe`s from Linux (mingw), no Windows box.
 //! - `logs`    — print the log directory (and `tail -f` it with `--follow`).
 //!
-//! macOS and Android are declared but not wired up yet; they print what's
-//! missing instead of pretending to work.
+//! Android is declared but not wired up yet; it prints what's missing instead
+//! of pretending to work.
 //!
 //! Run `cargo xtask <cmd> --help` for flags.
 
@@ -140,7 +140,7 @@ enum Command_ {
         #[arg(long)]
         debug: bool,
     },
-    /// macOS build (not wired up yet — prints what's needed).
+    /// Build the supported macOS binaries.
     Macos,
     /// Android build (future — prints what's needed).
     Android,
@@ -185,7 +185,7 @@ fn main() -> Result<()> {
 /// Build the selected binaries. `release` picks the profile; `only` narrows to
 /// one binary; `target` cross-compiles when set (else host).
 fn build(release: bool, only: Option<BinArg>, target: Option<&str>) -> Result<()> {
-    let selected = select(only);
+    let selected = select_for_host(only)?;
     let profile = if release { "release" } else { "debug" };
     let where_ = target.unwrap_or("host");
     println!("→ building {} ({profile}, {where_})", names(&selected));
@@ -224,7 +224,7 @@ fn install(only: Option<BinArg>, no_build: bool) -> Result<()> {
     std::fs::create_dir_all(&bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
 
     let src_dir = out_dir(true, None);
-    let selected = select(only);
+    let selected = select_for_host(only)?;
     for b in &selected {
         let src = src_dir.join(exe_name(b.bin, None));
         if !src.exists() {
@@ -312,13 +312,10 @@ fn windows(release: bool) -> Result<()> {
 }
 
 fn macos() -> Result<()> {
-    println!(
-        "macOS build isn't wired up yet.\n\
-         When it is, it'll build the aarch64-apple-darwin / x86_64-apple-darwin \n\
-         binaries here. For now, build on a Mac with:\n  \
-         cargo build --release -p cursio-core -p cursio-app"
-    );
-    Ok(())
+    if !cfg!(target_os = "macos") {
+        bail!("`cargo xtask macos` must run on macOS");
+    }
+    build(true, None, None)
 }
 
 fn android() -> Result<()> {
@@ -347,10 +344,24 @@ fn logs(follow: bool) -> Result<()> {
 
 // --- helpers ---------------------------------------------------------------
 
-fn select(only: Option<BinArg>) -> Vec<&'static Binary> {
+fn select_for_host(only: Option<BinArg>) -> Result<Vec<&'static Binary>> {
+    let supported = |binary: &&Binary| binary.bin != "clipd" || cfg!(target_os = "linux");
     match only {
-        Some(b) => BINARIES.iter().filter(|x| x.bin == b.as_str()).collect(),
-        None => BINARIES.iter().collect(),
+        Some(b) => {
+            let selected: Vec<_> = BINARIES
+                .iter()
+                .filter(|binary| binary.bin == b.as_str())
+                .filter(supported)
+                .collect();
+            if selected.is_empty() {
+                bail!(
+                    "{} is Linux-only and cannot be built on this host",
+                    b.as_str()
+                );
+            }
+            Ok(selected)
+        }
+        None => Ok(BINARIES.iter().filter(supported).collect()),
     }
 }
 
