@@ -80,7 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let discovery = args
         .interface
         .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
-    let receiver = Receiver::bind_with_crypto(config, discovery, crypto).await?;
+    let receiver = Receiver::bind_with_crypto(config, discovery, crypto)
+        .await?
+        .with_screen_enabled(true);
     let address = receiver.local_addr()?;
 
     println!("AirPlay receiver is listening on {address}");

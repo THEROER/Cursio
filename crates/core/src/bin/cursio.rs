@@ -124,11 +124,14 @@ enum Command {
         /// separates "capture is broken" from "hiding broke the capture".
         #[arg(long, default_value_t = false)]
         keep_window_visible: bool,
-        /// Advertise an AirPlay receiver and accept iPhone screen mirroring.
-        #[arg(long, default_value_t = false, overrides_with = "no_airplay")]
-        airplay: bool,
-        /// Disable the AirPlay receiver.
-        #[arg(long, default_value_t = false, overrides_with = "airplay")]
+        /// Decode iPhone mirroring video and show it in a native window.
+        ///
+        /// Without this flag the AirPlay RTSP control receiver still runs, but
+        /// it does not create a video decoder or screen window.
+        #[arg(long, visible_alias = "airplay", default_value_t = false)]
+        airplay_screen: bool,
+        /// Disable the AirPlay RTSP receiver completely.
+        #[arg(long, default_value_t = false, conflicts_with = "airplay_screen")]
         no_airplay: bool,
         /// Override the name shown in the iPhone Screen Mirroring picker.
         #[arg(long)]
@@ -244,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
             share_window,
             share_window_title,
             keep_window_visible,
-            airplay,
+            airplay_screen,
             no_airplay,
             airplay_name,
             airplay_port,
@@ -272,8 +275,7 @@ async fn main() -> anyhow::Result<()> {
                 peer_edge.map(Into::into),
                 modules,
             );
-            let airplay = airplay && !no_airplay;
-            if !airplay {
+            if no_airplay {
                 mesh.await
             } else {
                 match bind_airplay(
@@ -284,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
                         interface: airplay_interface,
                         resolution: res,
                         fps,
+                        screen_enabled: airplay_screen,
                     },
                 )
                 .await
@@ -313,25 +316,28 @@ struct AirPlayOpts {
     interface: Option<IpAddr>,
     resolution: AirPlayResolutionArg,
     fps: u16,
+    screen_enabled: bool,
 }
 
 async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::Result<Receiver> {
     let profile = VideoProfile::new(options.resolution.into(), options.fps)?;
-    let hardware = cursio_airplay::hardware::HardwareInfo::detect();
-    for gpu in &hardware.gpus {
-        let vram = gpu
-            .dedicated_vram_bytes
-            .map(|bytes| format!("{:.1} GiB", bytes as f64 / 1024_f64.powi(3)))
-            .unwrap_or_else(|| "shared/unknown VRAM".to_string());
-        tracing::info!(gpu = %gpu.name, %vram, "AirPlay GPU");
-    }
-    for warning in hardware.profile_warnings(profile) {
-        tracing::warn!("{warning}");
-    }
-    for warning in
-        cursio_airplay::video::dependency_warnings(cursio_airplay::video::VideoCodec::H264)
-    {
-        tracing::warn!("{warning}");
+    if options.screen_enabled {
+        let hardware = cursio_airplay::hardware::HardwareInfo::detect();
+        for gpu in &hardware.gpus {
+            let vram = gpu
+                .dedicated_vram_bytes
+                .map(|bytes| format!("{:.1} GiB", bytes as f64 / 1024_f64.powi(3)))
+                .unwrap_or_else(|| "shared/unknown VRAM".to_string());
+            tracing::info!(gpu = %gpu.name, %vram, "AirPlay GPU");
+        }
+        for warning in hardware.profile_warnings(profile) {
+            tracing::warn!("{warning}");
+        }
+        for warning in
+            cursio_airplay::video::dependency_warnings(cursio_airplay::video::VideoCodec::H264)
+        {
+            tracing::warn!("{warning}");
+        }
     }
     let crypto = Arc::new(AppleCryptoProvider::new());
     let config = ReceiverConfig::new(
@@ -346,10 +352,13 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     let discovery = options
         .interface
         .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
-    let receiver = Receiver::bind_with_crypto(config, discovery, crypto).await?;
+    let receiver = Receiver::bind_with_crypto(config, discovery, crypto)
+        .await?
+        .with_screen_enabled(options.screen_enabled);
     tracing::info!(
         address = %receiver.local_addr()?,
-        "mesh AirPlay receiver is visible in iPhone Screen Mirroring"
+        screen = options.screen_enabled,
+        "mesh AirPlay RTSP receiver is available"
     );
     Ok(receiver)
 }
@@ -1410,21 +1419,31 @@ mod tests {
     }
 
     #[test]
-    fn airplay_is_enabled_only_by_its_flag() {
-        let Command::Mesh { airplay, .. } =
+    fn airplay_screen_is_enabled_only_by_its_flag() {
+        let Command::Mesh { airplay_screen, .. } =
             Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
         else {
             unreachable!();
         };
-        assert!(!airplay);
+        assert!(!airplay_screen);
 
-        let Command::Mesh { airplay, .. } = Cli::try_parse_from(["cursio", "mesh", "--airplay"])
-            .unwrap()
-            .command
+        let Command::Mesh { airplay_screen, .. } =
+            Cli::try_parse_from(["cursio", "mesh", "--airplay-screen"])
+                .unwrap()
+                .command
         else {
             unreachable!();
         };
-        assert!(airplay);
+        assert!(airplay_screen);
+
+        let Command::Mesh { airplay_screen, .. } =
+            Cli::try_parse_from(["cursio", "mesh", "--airplay"])
+                .unwrap()
+                .command
+        else {
+            unreachable!();
+        };
+        assert!(airplay_screen);
     }
 
     #[test]

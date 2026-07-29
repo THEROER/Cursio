@@ -16,6 +16,7 @@ pub struct Receiver {
     config: Arc<ReceiverConfig>,
     _announcement: AirPlayAnnouncement,
     crypto: Option<Arc<dyn CryptoProvider>>,
+    screen_enabled: bool,
 }
 
 impl Receiver {
@@ -51,7 +52,17 @@ impl Receiver {
             config: Arc::new(config),
             _announcement: announcement,
             crypto,
+            screen_enabled: false,
         })
+    }
+
+    /// Enable the mirroring video sink and its native presentation window.
+    ///
+    /// The control listener remains usable when this is false, but mirror
+    /// `SETUP` requests are rejected before a decoder or window is created.
+    pub fn with_screen_enabled(mut self, enabled: bool) -> Self {
+        self.screen_enabled = enabled;
+        self
     }
 
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
@@ -64,6 +75,7 @@ impl Receiver {
             address = %self.listener.local_addr()?,
             name = %self.config.name,
             crypto = if self.crypto.is_some() { "configured" } else { "unavailable" },
+            screen = if self.screen_enabled { "enabled" } else { "disabled" },
             "cursio_airplay receiver started"
         );
         if self.crypto.is_none() {
@@ -81,12 +93,15 @@ impl Receiver {
                 .crypto
                 .as_ref()
                 .map(|provider| provider.start_session());
+            let screen_enabled = self.screen_enabled;
             tokio::spawn(async move {
                 let context = ConnectionContext {
                     local_addr,
                     peer_addr: peer,
                 };
-                if let Err(error) = serve_connection(stream, config, crypto, Some(context)).await {
+                if let Err(error) =
+                    serve_connection(stream, config, crypto, Some(context), screen_enabled).await
+                {
                     tracing::warn!(%peer, %error, "AirPlay control connection ended");
                 }
             });
@@ -99,12 +114,13 @@ async fn serve_connection<T>(
     config: Arc<ReceiverConfig>,
     mut crypto: Option<Box<dyn CryptoSession>>,
     context: Option<ConnectionContext>,
+    screen_enabled: bool,
 ) -> Result<(), AirPlayError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut decoder = RequestDecoder::new();
-    let mut media = MediaSession::default();
+    let mut media = MediaSession::new(screen_enabled);
     let mut read_buffer = [0_u8; 8192];
     loop {
         let count = stream.read(&mut read_buffer).await?;
@@ -128,7 +144,8 @@ where
                 "AirPlay request decoded"
             );
             let target = request.target.split('?').next().unwrap_or(&request.target);
-            if context.is_some()
+            if screen_enabled
+                && context.is_some()
                 && request.method.eq_ignore_ascii_case("GET")
                 && matches!(target, "/info" | "/server-info")
             {
@@ -210,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn serves_fragmented_and_pipelined_requests() {
         let (mut client, server) = tokio::io::duplex(32 * 1024);
-        let task = tokio::spawn(serve_connection(server, config(), None, None));
+        let task = tokio::spawn(serve_connection(server, config(), None, None, false));
 
         client
             .write_all(b"GET /info RTSP/1.0\r\nCSeq: 1\r\nContent-L")
@@ -236,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn truncated_request_is_rejected() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(serve_connection(server, config(), None, None));
+        let task = tokio::spawn(serve_connection(server, config(), None, None, false));
         client
             .write_all(b"GET /info RTSP/1.0\r\nContent-Length: 4\r\n\r\nab")
             .await
@@ -253,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn upgrades_reverse_event_channel() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(serve_connection(server, config(), None, None));
+        let task = tokio::spawn(serve_connection(server, config(), None, None, false));
         client
             .write_all(b"POST /reverse HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
             .await

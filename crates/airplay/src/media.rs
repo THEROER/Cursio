@@ -24,14 +24,23 @@ pub(crate) struct ConnectionContext {
     pub peer_addr: SocketAddr,
 }
 
-#[derive(Default)]
 pub(crate) struct MediaSession {
     encrypted_key: Option<Vec<u8>>,
     timing_task: Option<JoinHandle<()>>,
     mirror_task: Option<JoinHandle<()>>,
+    screen_enabled: bool,
 }
 
 impl MediaSession {
+    pub(crate) fn new(screen_enabled: bool) -> Self {
+        Self {
+            encrypted_key: None,
+            timing_task: None,
+            mirror_task: None,
+            screen_enabled,
+        }
+    }
+
     pub(crate) async fn handle_request(
         &mut self,
         request: &Request,
@@ -133,6 +142,14 @@ impl MediaSession {
         }
 
         if let Some(stream_connection_id) = setup.mirror_stream_id {
+            if !self.screen_enabled {
+                tracing::info!(
+                    stream_connection_id,
+                    "AirPlay screen mirroring rejected because it is disabled"
+                );
+                return Ok(Response::new(501, "Not Implemented")
+                    .with_header("X-Cursio-Stage", "airplay-screen-disabled"));
+            }
             let Some(encrypted_key) = self.encrypted_key.as_deref() else {
                 return Ok(Response::new(455, "Method Not Valid in This State"));
             };
@@ -521,7 +538,7 @@ mod tests {
             local_addr: "127.0.0.1:7000".parse().unwrap(),
             peer_addr: "127.0.0.1:50000".parse().unwrap(),
         };
-        let mut media = MediaSession::default();
+        let mut media = MediaSession::new(false);
         let response = media
             .handle_request(&request, Some(context), Some(&mut TestCrypto))
             .await
@@ -543,6 +560,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mirror_setup_is_rejected_when_screen_is_disabled() {
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), MIRROR_STREAM_TYPE.into());
+        stream.insert("streamConnectionID".into(), 42_u64.into());
+        let mut root = Dictionary::new();
+        root.insert(
+            "streams".into(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        let request = Request {
+            method: "SETUP".into(),
+            target: "rtsp://127.0.0.1/1".into(),
+            version: crate::rtsp::Version::Rtsp10,
+            headers: Vec::new(),
+            body: binary_plist(Value::Dictionary(root)),
+        };
+        let context = ConnectionContext {
+            local_addr: "127.0.0.1:7000".parse().unwrap(),
+            peer_addr: "127.0.0.1:50000".parse().unwrap(),
+        };
+        let mut media = MediaSession::new(false);
+        let response = media
+            .handle_request(&request, Some(context), Some(&mut TestCrypto))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response.status, 501);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name == "X-Cursio-Stage" && value == "airplay-screen-disabled"
+        }));
+    }
+
+    #[tokio::test]
     async fn get_parameter_returns_requested_volume() {
         let request = Request {
             method: "GET_PARAMETER".into(),
@@ -551,7 +602,7 @@ mod tests {
             headers: vec![("Content-Type".into(), "text/parameters".into())],
             body: b"volume\r\n".to_vec(),
         };
-        let mut media = MediaSession::default();
+        let mut media = MediaSession::new(false);
         media.encrypted_key = Some(vec![7; 72]);
         let response = media
             .handle_request(&request, None, None)

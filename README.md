@@ -124,15 +124,15 @@ cargo test -p cursio-protocol -p cursio-transport -p cursio-core
 
 ### AirPlay receiver
 
-Start the receiver with `cursio mesh --airplay`. On an iPhone, open Control
-Center → Screen Mirroring and select `Cursio - <computer name>`. Without the
-`--airplay` flag Cursio does not bind or advertise an AirPlay listener.
-Use `--airplay-name <name>` and `--airplay-port <port>` to change the
-announcement.
+`cursio mesh` starts the AirPlay RTSP control receiver without creating a
+decoder or screen window. Add `--airplay-screen` (or its compatibility alias
+`--airplay`) to accept iPhone screen video: open Control Center → Screen
+Mirroring and select `Cursio - <computer name>`. Use `--no-airplay` to disable
+the RTSP listener completely. `--airplay-name <name>` and `--airplay-port
+<port>` change the announcement.
 
 The `Cursio - AirPlay Screen` window opens only after an iPhone connects and
-requests receiver information; starting `mesh --airplay` alone does not open
-an empty window.
+requests receiver information, and only when `--airplay-screen` is set.
 
 Current AirPlay scope:
 
