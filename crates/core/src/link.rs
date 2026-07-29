@@ -139,6 +139,12 @@ where
             trusted.shared_key()?
         }
         None => {
+            if plan.password.is_empty() {
+                anyhow::bail!(
+                    "peer {} is not trusted; pair it explicitly with `cursio join`",
+                    peer.peer_id
+                );
+            }
             tracing::info!("new peer; running pairing");
             let paired = pairing::run_pairing(
                 &mut transport,

@@ -649,7 +649,6 @@ async fn run_pairing_and_session(
     let mut secure = link.transport;
     let modules = link.modules;
 
-
     // Test mode: stream a synthetic mouse pattern to the peer, then finish.
     // Lets us verify remote injection before the capture side exists.
     if test_input {
