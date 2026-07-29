@@ -125,12 +125,20 @@ fn service_infos(
     let device_id = receiver.device_id.to_string();
     let identity = receiver.identity.to_string();
     let airplay_properties = [
+        ("acl", "0".to_string()),
+        ("btaddr", "00:00:00:00:00:00".to_string()),
         ("deviceid", device_id),
         ("features", AIRPLAY_FEATURES_TXT.to_string()),
+        ("fv", "77.40.00".to_string()),
         ("flags", "0x4".to_string()),
+        ("gcgl", "0".to_string()),
+        ("gid", identity.clone()),
+        ("igl", "0".to_string()),
         ("model", receiver.model.clone()),
+        ("osvers", "15.6".to_string()),
         ("pk", LEGACY_RECEIVER_PUBLIC_KEY_HEX.to_string()),
         ("pi", identity),
+        ("protovers", "1.1".to_string()),
         ("srcvers", receiver.source_version.clone()),
         ("vv", "2".to_string()),
     ];
