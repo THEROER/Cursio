@@ -10,6 +10,7 @@ mod config;
 pub mod discovery;
 mod receiver;
 pub mod rtsp;
+pub mod video;
 
 pub use config::{ConfigError, DeviceId, ReceiverConfig, Resolution, VideoProfile};
 pub use receiver::Receiver;
@@ -29,4 +30,6 @@ pub enum AirPlayError {
     Plist(#[from] plist::Error),
     #[error("invalid receiver configuration: {0}")]
     Config(#[from] ConfigError),
+    #[error("video pipeline error: {0}")]
+    Video(String),
 }
