@@ -1,2 +1,9 @@
 /target
 .write_test
+
+# Frontend build artefacts (app/ui is a Nuxt SPA built with bun).
+node_modules/
+.nuxt/
+.output/
+# `nuxt generate` mirrors .output/public here.
+app/ui/dist/

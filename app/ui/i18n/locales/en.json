@@ -1,0 +1,28 @@
+{
+  "app": {
+    "title": "Cursio",
+    "subtitle": "Use this device as a touchpad for your computer"
+  },
+  "connection": {
+    "password": "Pairing password",
+    "passwordHint": "Only needed the first time these two devices meet",
+    "connect": "Connect",
+    "connecting": "Connecting",
+    "disconnected": "Not connected",
+    "searching": "Looking for a computer on this network",
+    "connectingTo": "Connecting to {peer}",
+    "connectedTo": "Connected to {peer}",
+    "failed": "Connection failed"
+  },
+  "pad": {
+    "idle": "Connect to start controlling your computer",
+    "ready": "Slide a finger to move the pointer",
+    "hints": "Tap to click · Two fingers to scroll",
+    "lost": "The link is gone — connect again"
+  },
+  "buttons": {
+    "left": "Left",
+    "middle": "Middle",
+    "right": "Right"
+  }
+}

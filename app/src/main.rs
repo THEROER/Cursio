@@ -3,6 +3,9 @@
     windows_subsystem = "windows"
 )]
 
+/// Driving a peer's cursor from a touch surface — the phone-as-touchpad half.
+mod touchpad;
+
 fn main() {
     // Console (info) + rotating file (debug) logging, shared with the CLI.
     // `_log` must outlive the UI — dropping it flushes the log file.
@@ -22,6 +25,14 @@ fn main() {
     }
 
     tauri::Builder::default()
+        .manage(touchpad::Touchpad::default())
+        .invoke_handler(tauri::generate_handler![
+            touchpad::commands::touchpad_status,
+            touchpad::commands::touchpad_connect,
+            touchpad::commands::touchpad_motion,
+            touchpad::commands::touchpad_button,
+            touchpad::commands::touchpad_scroll,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -12,7 +12,11 @@ tauri-build = { version = "2.0.0-beta.18" }
 
 [dependencies]
 cursio-core.workspace = true
+cursio-protocol.workspace = true
+cursio-transport.workspace = true
 tauri = { version = "2.0.0-beta.20", features = [] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+anyhow.workspace = true
+tokio.workspace = true

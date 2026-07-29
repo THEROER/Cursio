@@ -3,9 +3,10 @@
   "version": "0.1.0",
   "identifier": "com.cursio.dev",
   "build": {
-    "beforeDevCommand": "",
-    "beforeBuildCommand": "",
-    "frontendDist": "dist"
+    "beforeDevCommand": "bun run --cwd ui dev",
+    "beforeBuildCommand": "bun run --cwd ui generate",
+    "devUrl": "http://127.0.0.1:3000",
+    "frontendDist": "ui/.output/public"
   },
   "app": {
     "windows": [
@@ -16,7 +17,8 @@
         "width": 800,
         "height": 600
       }
-    ]
+    ],
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,

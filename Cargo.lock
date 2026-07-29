@@ -1025,11 +1025,15 @@ dependencies = [
 name = "cursio-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cursio-core",
+ "cursio-protocol",
+ "cursio-transport",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tokio",
  "tracing",
 ]
 

@@ -1,0 +1,17 @@
+@import "tailwindcss";
+/* The kit contributes its @theme tokens and a @source over its own components;
+   this app owns the Tailwind build, per the kit's README. */
+@import "@leavepulse/ui/css";
+/* Skin the browser's own scrollbars to match. Must come after the tokens — it
+   reads --color-brand from them. */
+@import "@leavepulse/ui/scrollbar.css";
+
+/* The touch surface owns every gesture that lands on it. Without this the
+   browser claims drags for panning and pinches for zoom, and the pointer on
+   the other machine stutters or stops entirely mid-stroke. */
+.cursio-pad {
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
