@@ -308,7 +308,7 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     let config = ReceiverConfig::new(
         options
             .name
-            .unwrap_or_else(|| format!("Cursio - {}", identity.display_name)),
+            .unwrap_or_else(|| airplay_receiver_name(&identity.display_name)),
         identity.peer_id,
         SocketAddr::from(([0, 0, 0, 0], options.port)),
         profile,
@@ -322,6 +322,14 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
         "mesh AirPlay receiver is visible in iPhone Screen Mirroring"
     );
     Ok(receiver)
+}
+
+fn airplay_receiver_name(display_name: &str) -> String {
+    let hostname = display_name
+        .trim()
+        .trim_end_matches('.')
+        .trim_end_matches(".local");
+    format!("Cursio - {}", sanitize_instance(hostname))
 }
 
 fn read_pairing_password() -> anyhow::Result<Zeroizing<String>> {
@@ -1355,5 +1363,22 @@ fn sanitize_instance(name: &str) -> String {
         "cursio-node".into()
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn airplay_name_removes_mdns_suffix_and_dots() {
+        assert_eq!(
+            airplay_receiver_name("gaming-pc.local"),
+            "Cursio - gaming-pc"
+        );
+        assert_eq!(
+            airplay_receiver_name("office.pc.local."),
+            "Cursio - office-pc"
+        );
     }
 }
