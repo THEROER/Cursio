@@ -125,8 +125,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         keep_window_visible: bool,
         /// Advertise an AirPlay receiver and accept iPhone screen mirroring.
-        /// Enabled by default; use `--no-airplay` to turn it off.
-        #[arg(long, default_value_t = true, overrides_with = "no_airplay")]
+        #[arg(long, default_value_t = false, overrides_with = "no_airplay")]
         airplay: bool,
         /// Disable the AirPlay receiver.
         #[arg(long, default_value_t = false, overrides_with = "airplay")]
@@ -334,8 +333,6 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     {
         tracing::warn!("{warning}");
     }
-    cursio_airplay::video::prepare_window()?;
-
     let crypto = Arc::new(AppleCryptoProvider::new());
     let config = ReceiverConfig::new(
         options
@@ -1410,6 +1407,24 @@ mod tests {
 
         let after = Cli::try_parse_from(["cursio", "mesh", "-vv"]).unwrap();
         assert_eq!(after.verbose, 2);
+    }
+
+    #[test]
+    fn airplay_is_enabled_only_by_its_flag() {
+        let Command::Mesh { airplay, .. } =
+            Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
+        else {
+            unreachable!();
+        };
+        assert!(!airplay);
+
+        let Command::Mesh { airplay, .. } = Cli::try_parse_from(["cursio", "mesh", "--airplay"])
+            .unwrap()
+            .command
+        else {
+            unreachable!();
+        };
+        assert!(airplay);
     }
 
     #[test]

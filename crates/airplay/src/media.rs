@@ -95,6 +95,11 @@ impl MediaSession {
         let setup = match SetupRequest::parse(body) {
             Ok(setup) => setup,
             Err(message) => {
+                tracing::warn!(
+                    error = message,
+                    body_bytes = body.len(),
+                    "rejected AirPlay SETUP"
+                );
                 return Ok(Response::new(400, "Bad Request").with_header("X-Cursio-Error", message));
             }
         };
@@ -265,7 +270,7 @@ impl SetupRequest {
                     mirror_stream_id = Some(
                         stream
                             .get("streamConnectionID")
-                            .and_then(Value::as_unsigned_integer)
+                            .and_then(plist_u64_bits)
                             .ok_or("mirror stream has no streamConnectionID")?,
                     );
                 }
@@ -277,6 +282,16 @@ impl SetupRequest {
             mirror_stream_id,
         })
     }
+}
+
+/// Binary plists do not tag integers as signed or unsigned. Values with their
+/// high bit set are decoded by some plist producers/readers as negative i64,
+/// while AirPlay defines streamConnectionID as an opaque u64. Preserve the
+/// original two's-complement bits in either representation.
+fn plist_u64_bits(value: &Value) -> Option<u64> {
+    value
+        .as_unsigned_integer()
+        .or_else(|| value.as_signed_integer().map(|value| value as u64))
 }
 
 async fn run_timing(socket: UdpSocket) {
@@ -447,6 +462,17 @@ mod tests {
         );
         let stream = SetupRequest::parse(&binary_plist(Value::Dictionary(root))).unwrap();
         assert_eq!(stream.mirror_stream_id, Some(42));
+
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), MIRROR_STREAM_TYPE.into());
+        stream.insert("streamConnectionID".into(), (-1_i64).into());
+        let mut root = Dictionary::new();
+        root.insert(
+            "streams".into(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        let stream = SetupRequest::parse(&binary_plist(Value::Dictionary(root))).unwrap();
+        assert_eq!(stream.mirror_stream_id, Some(u64::MAX));
     }
 
     #[test]

@@ -68,7 +68,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         eprintln!("warning: {warning}");
     }
-    cursio_airplay::video::prepare_window()?;
     let receiver_name = args.name;
     let crypto = Arc::new(AppleCryptoProvider::new());
     let config = ReceiverConfig::new(

@@ -128,6 +128,12 @@ where
                 "AirPlay request decoded"
             );
             let target = request.target.split('?').next().unwrap_or(&request.target);
+            if context.is_some()
+                && request.method.eq_ignore_ascii_case("GET")
+                && matches!(target, "/info" | "/server-info")
+            {
+                crate::video::prepare_window()?;
+            }
             if request.method.eq_ignore_ascii_case("POST") && target == "/reverse" {
                 stream
                     .write_all(

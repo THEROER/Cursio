@@ -124,10 +124,15 @@ cargo test -p cursio-protocol -p cursio-transport -p cursio-core
 
 ### AirPlay receiver
 
-`cursio mesh` advertises an AirPlay receiver by default. On an iPhone, open
-Control Center → Screen Mirroring and select `Cursio - <computer name>`.
-Use `--no-airplay` to disable it, or `--airplay-name <name>` and
-`--airplay-port <port>` to change the announcement.
+Start the receiver with `cursio mesh --airplay`. On an iPhone, open Control
+Center → Screen Mirroring and select `Cursio - <computer name>`. Without the
+`--airplay` flag Cursio does not bind or advertise an AirPlay listener.
+Use `--airplay-name <name>` and `--airplay-port <port>` to change the
+announcement.
+
+The `Cursio - AirPlay Screen` window opens only after an iPhone connects and
+requests receiver information; starting `mesh --airplay` alone does not open
+an empty window.
 
 Current AirPlay scope:
 
