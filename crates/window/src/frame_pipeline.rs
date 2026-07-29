@@ -10,7 +10,8 @@
 //! bounding box, then decide whether that change rides a lossless tile or the
 //! video stream.
 
-use cursio_protocol::{Rect, TileCodec};
+use cursio_protocol::{Rect, TileCodec, WindowFrame};
+use tokio::sync::mpsc;
 
 /// Tracks the last full frame so each new capture can be reduced to what
 /// actually changed.
@@ -42,6 +43,16 @@ impl FrameDiffer {
             width: 0,
             height: 0,
         }
+    }
+
+    /// Forget the reference frame so the next update covers the full surface.
+    ///
+    /// Required after backpressure drops an update: the viewer did not receive
+    /// the state represented by `prev`, so later deltas must not depend on it.
+    pub fn reset(&mut self) {
+        self.prev.clear();
+        self.width = 0;
+        self.height = 0;
     }
 
     /// Compare `frame` (tightly packed BGRA of `width * height`) against the
@@ -172,6 +183,34 @@ pub fn pick_codec(tile_len: usize) -> TileCodec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameQueueError {
+    Full,
+    Closed,
+}
+
+/// Enqueue every packet belonging to one encoded update, or none of them.
+///
+/// H.264 encoders may return several packets for a single input frame. Sending
+/// only the first packet before discovering that the bounded queue is full
+/// would corrupt the decoder state, so capacity is reserved atomically.
+pub fn try_queue_frames(
+    tx: &mpsc::Sender<WindowFrame>,
+    frames: Vec<WindowFrame>,
+) -> Result<(), FrameQueueError> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    let permits = tx.try_reserve_many(frames.len()).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(()) => FrameQueueError::Full,
+        mpsc::error::TrySendError::Closed(()) => FrameQueueError::Closed,
+    })?;
+    for (permit, frame) in permits.zip(frames) {
+        permit.send(frame);
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod differ_tests {
@@ -268,6 +307,24 @@ mod differ_tests {
     }
 
     #[test]
+    fn reset_forces_the_next_frame_to_be_full() {
+        let mut d = FrameDiffer::new();
+        let frame = solid(8, 4, 0x10);
+        d.diff(&frame, 8, 4);
+        assert_eq!(d.diff(&frame, 8, 4), None);
+        d.reset();
+        assert_eq!(
+            d.diff(&frame, 8, 4),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 4,
+            })
+        );
+    }
+
+    #[test]
     fn extract_pulls_exactly_the_dirty_rect() {
         // 4x2 frame; mark the pixel at (2,1) and extract just that 1x1.
         let mut f = solid(4, 2, 0x10);
@@ -332,6 +389,37 @@ mod differ_tests {
     }
 
     #[test]
+    fn packet_batch_is_enqueued_atomically() {
+        fn packet(seq: u32) -> WindowFrame {
+            WindowFrame {
+                id: 1,
+                seq,
+                dirty: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                codec: TileCodec::LossyVideo,
+                data: vec![seq as u8],
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel(2);
+        assert_eq!(
+            try_queue_frames(&tx, vec![packet(1), packet(2)]),
+            Ok(())
+        );
+        assert_eq!(
+            try_queue_frames(&tx, vec![packet(3)]),
+            Err(FrameQueueError::Full)
+        );
+        assert_eq!(rx.try_recv().unwrap().seq, 1);
+        assert_eq!(rx.try_recv().unwrap().seq, 2);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn zero_sized_window_never_picks_video() {
         // Guards the division: a zero-area window would otherwise produce NaN.
         let any = Rect {
@@ -351,4 +439,3 @@ mod differ_tests {
         assert_eq!(pick_codec(64 * 1024), TileCodec::LosslessBgra8888);
     }
 }
-

@@ -122,7 +122,7 @@ pub trait CaptureSession {
 
     /// The channel of pixel updates for this window. The first frame is a full
     /// window; subsequent frames carry only changed regions.
-    fn frames(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<WindowFrame>;
+    fn frames(&mut self) -> &mut tokio::sync::mpsc::Receiver<WindowFrame>;
 
     /// Apply one viewer input event (in the window's own coordinates) to the
     /// real window on this host.
@@ -140,6 +140,13 @@ pub trait CaptureSession {
     /// callers should send a [`Message::WindowClose`](cursio_protocol::Message::WindowClose).
     fn close(&mut self, reason: WindowCloseReason);
 }
+
+/// Maximum encoded packets waiting between a capture backend and the session.
+///
+/// The capture side never waits on this queue. When it fills, the backend drops
+/// the update and resets its differ/encoder so the next accepted update is
+/// independently decodable instead of extending latency with stale frames.
+pub const CAPTURE_FRAME_QUEUE_CAPACITY: usize = 8;
 
 /// Selects and starts capturing a local window (the **host** side).
 ///

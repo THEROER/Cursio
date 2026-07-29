@@ -57,7 +57,7 @@ enum CaptureCommand {
 /// A live capture of one window via Windows.Graphics.Capture.
 pub struct WgcCaptureSession {
     meta: WindowMeta,
-    frames: mpsc::UnboundedReceiver<WindowFrame>,
+    frames: mpsc::Receiver<WindowFrame>,
     commands: mpsc::UnboundedSender<CaptureCommand>,
     /// Set when the capture thread stops on its own (window closed), so
     /// `close()` doesn't wait on a thread that is already gone.
@@ -69,7 +69,7 @@ impl CaptureSession for WgcCaptureSession {
         &self.meta
     }
 
-    fn frames(&mut self) -> &mut mpsc::UnboundedReceiver<WindowFrame> {
+    fn frames(&mut self) -> &mut mpsc::Receiver<WindowFrame> {
         &mut self.frames
     }
 
@@ -140,7 +140,7 @@ fn spawn_capture(
     title: String,
     hide_source: bool,
 ) -> Result<WgcCaptureSession, WindowError> {
-    let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+    let (frames_tx, frames_rx) = mpsc::channel(crate::CAPTURE_FRAME_QUEUE_CAPACITY);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WindowMeta, String>>();
     let ended = Arc::new(AtomicBool::new(false));
@@ -268,7 +268,7 @@ fn emit_frame(
     // Geometry whose encoder already failed to open, so we don't retry it once
     // per frame.
     video_failed_for: &mut Option<(u32, u32)>,
-    frames_tx: &mpsc::UnboundedSender<WindowFrame>,
+    frames_tx: &mpsc::Sender<WindowFrame>,
 ) {
     let Some(dirty) = differ.diff(frame, width, height) else {
         return; // unchanged — a static window costs nothing
@@ -345,15 +345,22 @@ fn emit_frame(
                     // One visual update can yield several packets, and
                     // sometimes none — the encoder decides.
                     let full = enc.full_rect();
-                    for data in packets {
-                        *seq = seq.wrapping_add(1);
-                        let _ = frames_tx.send(WindowFrame {
-                            id,
-                            seq: *seq,
-                            dirty: full,
-                            codec: TileCodec::LossyVideo,
-                            data,
-                        });
+                    let frames = packets
+                        .into_iter()
+                        .map(|data| {
+                            *seq = seq.wrapping_add(1);
+                            WindowFrame {
+                                id,
+                                seq: *seq,
+                                dirty: full,
+                                codec: TileCodec::LossyVideo,
+                                data,
+                            }
+                        })
+                        .collect();
+                    if crate::frame_pipeline::try_queue_frames(frames_tx, frames).is_err() {
+                        differ.reset();
+                        *video = None;
                     }
                     return;
                 }
@@ -372,13 +379,19 @@ fn emit_frame(
     match crate::codec::encode_tile(codec, &tile) {
         Ok(data) => {
             *seq = seq.wrapping_add(1);
-            let _ = frames_tx.send(WindowFrame {
-                id,
-                seq: *seq,
-                dirty,
-                codec,
-                data,
-            });
+            if frames_tx
+                .try_send(WindowFrame {
+                    id,
+                    seq: *seq,
+                    dirty,
+                    codec,
+                    data,
+                })
+                .is_err()
+            {
+                differ.reset();
+                *video = None;
+            }
         }
         Err(e) => tracing::warn!(error = %e, "tile encode failed; dropping frame"),
     }
@@ -392,7 +405,7 @@ fn capture_thread(
     hwnd: HWND,
     title: String,
     hide_source: bool,
-    frames_tx: mpsc::UnboundedSender<WindowFrame>,
+    frames_tx: mpsc::Sender<WindowFrame>,
     mut cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: &std::sync::mpsc::Sender<Result<WindowMeta, String>>,
 ) -> Result<(), String> {

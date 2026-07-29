@@ -288,7 +288,7 @@ enum CaptureCommand {
 /// that isn't `Send` (portal session, PipeWire loop).
 pub struct PortalCaptureSession {
     meta: WindowMeta,
-    frames: mpsc::UnboundedReceiver<WindowFrame>,
+    frames: mpsc::Receiver<WindowFrame>,
     commands: mpsc::UnboundedSender<CaptureCommand>,
 }
 
@@ -297,7 +297,7 @@ impl CaptureSession for PortalCaptureSession {
         &self.meta
     }
 
-    fn frames(&mut self) -> &mut mpsc::UnboundedReceiver<WindowFrame> {
+    fn frames(&mut self) -> &mut mpsc::Receiver<WindowFrame> {
         &mut self.frames
     }
 
@@ -345,7 +345,7 @@ impl WindowCapture for PortalWindowCapture {
 /// must surface as an error from `begin()`, not as a stream that silently never
 /// produces frames. Mirrors `spawn_wayland_capture` in `cursio-input`.
 fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
-    let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+    let (frames_tx, frames_rx) = mpsc::channel(crate::CAPTURE_FRAME_QUEUE_CAPACITY);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     // Readiness carries the negotiated window geometry back, so the meta we
     // offer the peer matches what the stream will actually deliver.
@@ -376,7 +376,7 @@ fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
 /// whole function.
 fn capture_thread(
     id: WindowId,
-    frames_tx: mpsc::UnboundedSender<WindowFrame>,
+    frames_tx: mpsc::Sender<WindowFrame>,
     cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: std::sync::mpsc::Sender<Result<WindowMeta, String>>,
 ) {
@@ -508,7 +508,7 @@ fn format_param_pod() -> Vec<u8> {
 fn run_pipewire_loop(
     id: WindowId,
     cast: PortalCast,
-    frames_tx: mpsc::UnboundedSender<WindowFrame>,
+    frames_tx: mpsc::Sender<WindowFrame>,
     mut cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: &std::sync::mpsc::Sender<Result<WindowMeta, String>>,
     rt: &tokio::runtime::Runtime,
@@ -691,16 +691,25 @@ fn run_pipewire_loop(
                             // One visual update can yield several packets, and
                             // sometimes none — the encoder decides.
                             let full = enc.full_rect();
-                            for data in packets {
-                                st.seq = st.seq.wrapping_add(1);
-                                let seq = st.seq;
-                                let _ = frames_tx.send(WindowFrame {
-                                    id,
-                                    seq,
-                                    dirty: full,
-                                    codec: TileCodec::LossyVideo,
-                                    data,
-                                });
+                            let frames = packets
+                                .into_iter()
+                                .map(|data| {
+                                    st.seq = st.seq.wrapping_add(1);
+                                    WindowFrame {
+                                        id,
+                                        seq: st.seq,
+                                        dirty: full,
+                                        codec: TileCodec::LossyVideo,
+                                        data,
+                                    }
+                                })
+                                .collect();
+                            if crate::frame_pipeline::try_queue_frames(&frames_tx, frames).is_err() {
+                                // The viewer never saw this encoder/differ
+                                // state. Restart both so the next accepted
+                                // update is a full frame and fresh keyframe.
+                                st.differ.reset();
+                                st.video = None;
                             }
                             return;
                         }
@@ -726,15 +735,21 @@ fn run_pipewire_loop(
 
             st.seq = st.seq.wrapping_add(1);
             let seq = st.seq;
-            // Send is non-blocking: the channel absorbs bursts so a slow link
-            // never stalls this RT callback.
-            let _ = frames_tx.send(WindowFrame {
+            // Never block the PipeWire callback. If the bounded queue is full,
+            // discard this delta and force the next accepted frame to be full.
+            if frames_tx
+                .try_send(WindowFrame {
                 id,
                 seq,
                 dirty,
                 codec,
                 data: encoded,
-            });
+                })
+                .is_err()
+            {
+                st.differ.reset();
+                st.video = None;
+            }
         })
         .register()
         .map_err(|e| format!("register stream listener: {e}"))?;

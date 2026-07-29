@@ -22,7 +22,7 @@
 //! one automatically is milestone 5.
 
 use async_trait::async_trait;
-use cursio_protocol::{Message, ModuleId, WindowCloseReason, WindowId, WindowMsg};
+use cursio_protocol::{Message, ModuleId, Priority, WindowCloseReason, WindowId, WindowMsg};
 use cursio_transport::{TransportError, TransportTx};
 use cursio_window::{CaptureSession, Surrogate, WindowCapture, WindowRenderer};
 
@@ -46,6 +46,13 @@ async fn send_control(tx: &mut dyn TransportTx, msg: WindowMsg) -> Result<(), Tr
 /// 16 ms while `pump` runs far more often than that, so a small bound keeps
 /// latency low and still never monopolises the loop.
 const MAX_FRAMES_PER_PUMP: usize = 4;
+
+/// Stop pulling capture packets once this much video is waiting for the socket.
+///
+/// `PriorityTransport::send` only enqueues, so without this gate the session
+/// drains one queue into another and can still accumulate seconds of stale
+/// video. Backpressure now reaches the bounded capture channel instead.
+const VIDEO_QUEUE_HIGH_WATER_BYTES: usize = 2 * 1024 * 1024;
 
 /// Most input events to forward per pump, viewer→host.
 ///
@@ -268,6 +275,9 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             return Ok(());
         };
         for _ in 0..MAX_FRAMES_PER_PUMP {
+            if tx.queue_depth(Priority::Video).queued_bytes >= VIDEO_QUEUE_HIGH_WATER_BYTES {
+                break;
+            }
             // `try_recv`, never `recv`: the capture channel going quiet is the
             // normal case (a static window emits nothing), and awaiting it here
             // would block the whole session loop on an idle window.
@@ -581,13 +591,23 @@ fn spawn_drag_trigger(
 mod tests {
     use super::*;
     use cursio_protocol::{Rect, TileCodec, WindowFrame, WindowInput, WindowMeta};
+    use cursio_transport::QueueDepth;
     use cursio_window::{WindowError, window_test_support::*};
     use tokio::sync::mpsc;
 
     /// Collects what the module sends, standing in for the transport.
-    #[derive(Default)]
     struct RecordingTx {
         sent: Vec<Message>,
+        video_depth: QueueDepth,
+    }
+
+    impl Default for RecordingTx {
+        fn default() -> Self {
+            Self {
+                sent: Vec::new(),
+                video_depth: QueueDepth::default(),
+            }
+        }
     }
 
     #[async_trait]
@@ -595,6 +615,14 @@ mod tests {
         async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
             self.sent.push(msg.clone());
             Ok(())
+        }
+
+        fn queue_depth(&self, priority: Priority) -> QueueDepth {
+            if priority == Priority::Video {
+                self.video_depth
+            } else {
+                QueueDepth::default()
+            }
         }
     }
 
@@ -637,9 +665,16 @@ mod tests {
         }
     }
 
+    fn frame_channel() -> (
+        mpsc::Sender<WindowFrame>,
+        mpsc::Receiver<WindowFrame>,
+    ) {
+        mpsc::channel(64)
+    }
+
     #[tokio::test]
     async fn a_drag_request_starts_the_transfer_on_the_next_pump() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
@@ -662,7 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn dragging_back_closes_the_transfer_as_returned() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
@@ -694,7 +729,7 @@ mod tests {
     async fn a_second_send_while_hosting_is_ignored() {
         // The trigger latches per drag, but a repeat must not restart capture
         // or allocate a second id for the window already on the peer.
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
@@ -726,7 +761,7 @@ mod tests {
     async fn requests_are_ignored_without_a_trigger_attached() {
         // The plain `--share-window` path has no request channel; the engine
         // must pump normally rather than assume one exists.
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -739,13 +774,13 @@ mod tests {
 
     #[tokio::test]
     async fn offer_precedes_the_first_frame() {
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
         );
         let id = eng.share_window().unwrap();
-        frames_tx.send(frame(id, 1)).unwrap();
+        frames_tx.try_send(frame(id, 1)).unwrap();
 
         let mut tx = RecordingTx::default();
         eng.pump(&mut tx).await.unwrap();
@@ -764,7 +799,7 @@ mod tests {
 
     #[tokio::test]
     async fn offer_is_sent_only_once() {
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -772,9 +807,9 @@ mod tests {
         let id = eng.share_window().unwrap();
 
         let mut tx = RecordingTx::default();
-        frames_tx.send(frame(id, 1)).unwrap();
+        frames_tx.try_send(frame(id, 1)).unwrap();
         eng.pump(&mut tx).await.unwrap();
-        frames_tx.send(frame(id, 2)).unwrap();
+        frames_tx.try_send(frame(id, 2)).unwrap();
         eng.pump(&mut tx).await.unwrap();
 
         let offers = tx
@@ -788,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn frames_are_bounded_per_pump() {
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -797,7 +832,7 @@ mod tests {
         // Far more than one pump may take: draining them all would starve the
         // session's inbound branch.
         for seq in 0..50 {
-            frames_tx.send(frame(id, seq)).unwrap();
+            frames_tx.try_send(frame(id, seq)).unwrap();
         }
 
         let mut tx = RecordingTx::default();
@@ -811,9 +846,42 @@ mod tests {
         assert_eq!(frames, MAX_FRAMES_PER_PUMP);
     }
 
+    #[tokio::test]
+    async fn backed_up_transport_leaves_capture_frame_queued() {
+        let (frames_tx, frames_rx) = frame_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        );
+        let id = eng.share_window().unwrap();
+        frames_tx.try_send(frame(id, 1)).unwrap();
+
+        let mut tx = RecordingTx {
+            sent: Vec::new(),
+            video_depth: QueueDepth {
+                queued_bytes: VIDEO_QUEUE_HIGH_WATER_BYTES,
+                sent_bytes: 0,
+            },
+        };
+        eng.pump(&mut tx).await.unwrap();
+        assert!(
+            tx.sent
+                .iter()
+                .all(|message| !matches!(message, Message::WindowFrame(_)))
+        );
+
+        tx.video_depth = QueueDepth::default();
+        eng.pump(&mut tx).await.unwrap();
+        assert!(
+            tx.sent
+                .iter()
+                .any(|message| matches!(message, Message::WindowFrame(_)))
+        );
+    }
+
     #[test]
     fn an_offer_opens_a_surrogate() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -830,7 +898,7 @@ mod tests {
 
     #[test]
     fn a_failed_surrogate_tells_the_host_to_stop() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::failing(),
@@ -853,7 +921,7 @@ mod tests {
 
     #[test]
     fn window_messages_are_claimed_and_others_are_not() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -873,7 +941,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dead_capture_closes_the_transfer() {
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -895,7 +963,7 @@ mod tests {
 
     #[test]
     fn peer_close_tears_down_our_surrogate() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -916,7 +984,7 @@ mod tests {
 
     #[test]
     fn sharing_twice_is_refused() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
