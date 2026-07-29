@@ -68,7 +68,11 @@ impl MirrorPacketDecoder {
             return Ok(None);
         }
 
-        let payload_type = u16::from_le_bytes([self.buffered[4], self.buffered[5]]).into();
+        // Byte 4 selects the payload kind. Byte 5 is a video subtype flag
+        // (notably 0x10 for an IDR frame), not the high byte of a u16 type.
+        // Treating 00 10 as type 0x1000 skips the first encrypted IDR payload
+        // and permanently desynchronizes the continuous AES-CTR stream.
+        let payload_type = u16::from(self.buffered[4]).into();
         let flags = u16::from_le_bytes([self.buffered[6], self.buffered[7]]);
         let timestamp = u64::from_le_bytes(
             self.buffered[8..16]
@@ -225,6 +229,18 @@ mod tests {
             PayloadType::Video
         );
         assert!(decoder.next_packet().unwrap().is_none());
+    }
+
+    #[test]
+    fn idr_subtype_is_still_encrypted_video() {
+        let mut bytes = packet(0, 7, b"idr");
+        bytes[5] = 0x10;
+        let mut decoder = MirrorPacketDecoder::new();
+        decoder.push(&bytes).unwrap();
+        assert_eq!(
+            decoder.next_packet().unwrap().unwrap().payload_type,
+            PayloadType::Video
+        );
     }
 
     #[test]
