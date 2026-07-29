@@ -405,12 +405,26 @@ impl Capture {
     pub fn advertisements(
         &mut self,
     ) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta> {
-        self.inner.advertisements()
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.advertisements()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            unreachable!("unsupported platforms cannot construct Capture")
+        }
     }
 
     /// Captured audio chunks.
     pub fn chunks(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioChunk> {
-        self.inner.chunks()
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.chunks()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            unreachable!("unsupported platforms cannot construct Capture")
+        }
     }
 }
 
@@ -494,7 +508,15 @@ impl Playback {
 
     /// Enqueue one inbound chunk for playback.
     pub fn play(&self, chunk: &AudioChunk) -> Result<(), AudioError> {
-        self.inner.play(chunk)
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.play(chunk)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = chunk;
+            Err(AudioError::Unsupported)
+        }
     }
 
     /// Whether anything on this machine is actually consuming this node.

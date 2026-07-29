@@ -78,7 +78,6 @@ pub fn spawn_capture(peer_edge: Option<cursio_protocol::Edge>) -> Result<Capture
 /// turns this into an edge-crossing ownership handoff (if that edge borders the
 /// peer). Only the Wayland backend emits these today (via portal barriers);
 /// evdev/Windows will grow their own edge detection later.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeCrossing {
     /// Which of this machine's edges the cursor left across.
@@ -91,7 +90,6 @@ pub struct EdgeCrossing {
 /// Handle to a running input capture: a channel of neutral events, the names of
 /// the devices being read, and a [`GrabControl`] to freeze/unfreeze local input.
 /// Both platform capture backends return this.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub struct CaptureHandle {
     /// Receives neutral input events from all captured devices.
     pub events: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
