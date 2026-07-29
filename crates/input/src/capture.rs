@@ -137,6 +137,9 @@ fn start_reader(
                         }
                     };
                     if let Some(neutral) = translate(event) {
+                        if !grab_rx.borrow().forwards_events() {
+                            continue;
+                        }
                         // Receiver gone => nothing left to capture for; stop.
                         if tx.send(neutral).is_err() {
                             tracing::debug!("capture receiver gone; stopping reader");

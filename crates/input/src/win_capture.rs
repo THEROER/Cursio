@@ -459,6 +459,9 @@ unsafe fn emit_keyboard(raw: &RAWINPUT) {
 
 /// Push one neutral event onto the capture channel for this thread.
 fn push(event: InputEvent) {
+    if HOOK_MODE.load(Ordering::SeqCst) == MODE_IDLE {
+        return;
+    }
     SENDER.with(|s| {
         if let Some(tx) = s.borrow().as_ref() {
             let _ = tx.send(event);

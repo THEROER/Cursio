@@ -486,7 +486,11 @@ fn spawn_peer_session(
         // one runs without local input rather than panicking — there is only one
         // keyboard and mouse, so only one peer can be driven at a time.
         let mut borrowed = capture.try_borrow_mut().ok();
-        let capture_for_session = borrowed.as_mut().and_then(|slot| slot.as_mut());
+        let mut capture_for_session = borrowed.as_mut().and_then(|slot| slot.as_mut());
+        if let Some(capture) = capture_for_session.as_mut() {
+            while capture.events.try_recv().is_ok() {}
+            while capture.commands.try_recv().is_ok() {}
+        }
 
         // Mesh sessions only ever run between already-paired peers, so no
         // password is needed: the trust store holds the key and pairing is
@@ -832,6 +836,12 @@ fn spawn_hotkey_filter(
         // broken. That was the "нажал и всё зависло" report.
         let mut swallow_until_release = false;
         while let Some(event) = upstream.recv().await {
+            if !grab.mode().forwards_events() {
+                ctrl = false;
+                alt = false;
+                swallow_until_release = false;
+                continue;
+            }
             if let InputEvent::Key { key, pressed } = event {
                 match key {
                     KEY_LEFTCTRL | KEY_RIGHTCTRL => {

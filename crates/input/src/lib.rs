@@ -111,9 +111,8 @@ pub struct CaptureHandle {
 /// InputCapture portal has to be *armed* while we're active so a cursor shoved
 /// off the peer-facing edge is detected (see [`wl_capture`]) — arming does **not**
 /// grab input, only watches the edges. On evdev/Windows there are no edge
-/// barriers, so `Active` and `Idle` collapse to the same "don't grab" behaviour
-/// and only `Dormant` grabs.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// barriers, so `Active` and `Idle` are both ungrabbed; unlike `Active`, `Idle`
+/// discards physical events instead of retaining them for a future session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     /// This machine holds the shared cursor. Local input acts normally (not
@@ -139,13 +138,19 @@ pub enum InputMode {
     Shutdown,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl InputMode {
     /// Whether local input should be grabbed (frozen locally) in this mode.
     /// Only `Dormant` grabs; this is what evdev/Windows key off, ignoring the
     /// Wayland-only arm-while-`Active` distinction.
     pub fn grabbed(self) -> bool {
         matches!(self, InputMode::Dormant)
+    }
+
+    /// Whether physical events belong to an active session and should enter
+    /// its queue. Idle capture stays installed for fast reconnects, but it must
+    /// not retain hours of local input for the next peer.
+    pub fn forwards_events(self) -> bool {
+        matches!(self, InputMode::Active | InputMode::Dormant)
     }
 }
 
@@ -155,18 +160,18 @@ impl InputMode {
 /// While this machine drives the peer (`Dormant`) its own cursor/keyboard are
 /// grabbed so they don't double-act; while it holds the cursor (`Active`) input
 /// stays local but, on Wayland, edge barriers are armed to catch an off-edge
-/// crossing. Capture keeps running in every mode; the mode only changes routing.
+/// crossing. The backend may stay installed in every mode, but `Idle` events are
+/// discarded so reconnecting cannot replay stale input.
 /// Backed by a [`tokio::sync::watch`] the capture tasks observe (Linux evdev:
 /// `EVIOCGRAB`; Wayland: portal enable/disable; Windows: low-level hooks).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Clone)]
 pub struct GrabControl {
     tx: tokio::sync::watch::Sender<InputMode>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl GrabControl {
     /// Create a control paired with the receiver the capture tasks watch.
+    #[cfg(any(target_os = "linux", target_os = "windows", test))]
     pub(crate) fn new() -> (Self, tokio::sync::watch::Receiver<InputMode>) {
         let (tx, rx) = tokio::sync::watch::channel(InputMode::Idle);
         (Self { tx }, rx)
@@ -179,6 +184,11 @@ impl GrabControl {
         let _ = self.tx.send(mode);
     }
 
+    /// Current capture mode.
+    pub fn mode(&self) -> InputMode {
+        *self.tx.borrow()
+    }
+
     /// Convenience for the two-state callers that only care about grab: `true`
     /// = [`Dormant`](InputMode::Dormant), `false` = [`Active`](InputMode::Active).
     pub fn set_grabbed(&self, grabbed: bool) {
@@ -187,6 +197,29 @@ impl GrabControl {
         } else {
             InputMode::Active
         });
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    #[test]
+    fn idle_and_shutdown_do_not_forward_events() {
+        assert!(!InputMode::Idle.forwards_events());
+        assert!(!InputMode::Shutdown.forwards_events());
+        assert!(InputMode::Active.forwards_events());
+        assert!(InputMode::Dormant.forwards_events());
+    }
+
+    #[test]
+    fn grab_control_reports_each_transition() {
+        let (control, _receiver) = GrabControl::new();
+        assert_eq!(control.mode(), InputMode::Idle);
+        control.set_mode(InputMode::Active);
+        assert_eq!(control.mode(), InputMode::Active);
+        control.set_mode(InputMode::Dormant);
+        assert_eq!(control.mode(), InputMode::Dormant);
     }
 }
 
