@@ -144,6 +144,8 @@ mod tests {
             id: id.to_string(),
             label: id.to_string(),
             writable: true,
+            total_bytes: 0,
+            free_bytes: 0,
         }
     }
 
