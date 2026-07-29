@@ -1087,8 +1087,21 @@ pub fn mount(peer: PeerLink, peer_name: &str) -> anyhow::Result<MountHandle> {
         Ok(()) => tracing::debug!(drive = %mountpoint, "mounted"),
         Err(e) => return Err(anyhow::anyhow!("cannot mount on {mountpoint}: {e:?}")),
     }
-    match host.start() {
-        Ok(()) => tracing::debug!("dispatcher started"),
+    // Start the dispatcher with enough threads to keep requests in flight.
+    //
+    // `start()` asks WinFsp for its default, which is sized for a filesystem
+    // whose work is local: a couple of threads per core, on the assumption that
+    // a callback returns as soon as the disk does. Every callback here instead
+    // blocks for a network round trip, so that default caps the mount at a
+    // handful of concurrent operations and a copy of many small files spends
+    // its time waiting rather than transferring — the same serialisation the
+    // FUSE side had on its single event loop.
+    //
+    // WinFsp clamps whatever it is given to its own supported range, so an
+    // unreasonable figure here degrades rather than failing to mount.
+    let threads = crate::bridge::mount_threads();
+    match host.start_with_threads(threads as u32) {
+        Ok(()) => tracing::debug!(threads, "dispatcher started"),
         Err(e) => return Err(anyhow::anyhow!("cannot start the filesystem: {e:?}")),
     }
 

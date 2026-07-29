@@ -48,6 +48,30 @@ use cursio_protocol::{FileError, FileHandle, FileMeta, OpenMode, Volume};
 /// `EIO`, which every application already knows how to report.
 pub const OP_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How many threads the OS should use to call into a mount.
+///
+/// This is the mount's concurrency and nothing else. Every callback blocks its
+/// thread for a full round trip ([`PeerLink::call`]), so the thread count *is*
+/// the number of operations that can be outstanding — on a single-threaded
+/// dispatcher a copy of many small files runs at one file per round trip no
+/// matter how much bandwidth is free. Threads waiting on the network cost a
+/// request buffer each and no CPU, which is why the safe error is to have too
+/// many rather than too few.
+///
+/// Shared by both mount implementations because the reasoning is the same on
+/// each: FUSE and WinFsp differ in how the OS asks, not in what it costs us to
+/// wait. Scaled with the machine, with a floor that keeps a small laptop from
+/// serialising a directory walk and a ceiling that keeps a large server from
+/// reserving buffers nothing will use — above it the limit is the session's
+/// in-flight window, which is sized from the link itself
+/// (`cursio_core::files_session::Pacer`) rather than guessed at here.
+pub fn mount_threads() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores * 4).clamp(16, 64)
+}
+
 /// One thing the mount wants the peer to do.
 ///
 /// Each carries the channel its answer comes back on, so replies cannot be
@@ -381,6 +405,29 @@ mod tests {
         assert!(
             OP_TIMEOUT >= Duration::from_secs(1),
             "must not trip on an ordinary slow read"
+        );
+    }
+
+    /// The mount must be able to hold enough operations open to keep the link
+    /// busy, on any machine.
+    ///
+    /// This is the setting that decides whether a copy of many small files runs
+    /// at the link's speed or at one file per round trip, and nothing fails
+    /// when it is wrong — the filesystem behaves correctly either way, just far
+    /// slower. So the sizing is asserted rather than left to be noticed.
+    #[test]
+    fn a_mount_can_keep_enough_operations_open_to_fill_the_link() {
+        let threads = mount_threads();
+        assert!(
+            threads >= 16,
+            "a 6 ms round trip and {threads} threads caps the mount at \
+             {} operations a second",
+            threads * 166,
+        );
+        assert!(
+            threads <= 64,
+            "each thread holds a request buffer; {threads} is memory for \
+             concurrency the session's window will never use"
         );
     }
 

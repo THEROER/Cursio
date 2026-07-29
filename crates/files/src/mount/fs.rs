@@ -17,7 +17,7 @@ use fuser::{
 
 use super::attr::{attr_from, dir_attr, root_attr, to_errno, CACHE_TTL};
 use crate::server::{FALLBACK_FREE, FALLBACK_TOTAL};
-use crate::bridge::PeerLink;
+use crate::bridge::{mount_threads, PeerLink};
 use super::inode::{join, Entry, InodeTable, ROOT_INO};
 
 /// Generation number for every inode we hand out.
@@ -52,16 +52,6 @@ struct State {
 /// Far longer than [`CACHE_TTL`]: drives do not come and go the way file
 /// contents change, and this list is consulted on every path resolution.
 const VOLUMES_TTL: Duration = Duration::from_secs(30);
-
-/// How many FUSE event-loop threads serve the mount.
-///
-/// This is the number of operations that can be in flight at once, because
-/// every callback blocks its thread on a round trip to the peer — so it is the
-/// mount's whole concurrency, not a tuning knob for CPU. It tracks the session's
-/// per-pass reply budget: below that, threads sit parked while the kernel holds
-/// requests waiting; far above it they only queue deeper for no gain, and each
-/// one costs a request buffer sized for the largest write the kernel may send.
-const FUSE_THREADS: usize = 32;
 
 impl RemoteFs {
     pub fn new(peer: PeerLink) -> Self {
@@ -731,7 +721,7 @@ fn mount_config(peer_name: &str) -> fuser::Config {
     // far end already pipelines (`pump_requests` drains several per pass) and
     // `RemoteFs` takes `&self` behind a mutex, so filling that pipe only ever
     // needed threads to wait in parallel.
-    config.n_threads = Some(FUSE_THREADS);
+    config.n_threads = Some(mount_threads());
     // Give each worker its own `/dev/fuse` fd, so they take requests from the
     // kernel independently instead of contending on a single descriptor.
     config.clone_fd = true;
@@ -816,8 +806,9 @@ mod tests {
     #[test]
     fn the_mount_serves_requests_concurrently() {
         let config = mount_config("peer");
-        assert!(
-            config.n_threads.is_some_and(|n| n > 1),
+        assert_eq!(
+            config.n_threads,
+            Some(mount_threads()),
             "a single event loop would serialise every blocking round trip"
         );
         assert!(
