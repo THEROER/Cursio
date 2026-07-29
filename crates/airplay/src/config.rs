@@ -6,7 +6,7 @@ use uuid::Uuid;
 /// Default port used by Apple TV receivers for the AirPlay control connection.
 pub const DEFAULT_CONTROL_PORT: u16 = 7000;
 /// Compatibility model advertised during the initial AirPlay probe.
-pub const DEFAULT_MODEL: &str = "AppleTV5,3";
+pub const DEFAULT_MODEL: &str = "AppleTV2,1";
 /// AirTunes source version advertised to clients.
 pub const DEFAULT_SOURCE_VERSION: &str = "220.68";
 

@@ -5,7 +5,7 @@ use std::fmt;
 use plist::{Dictionary, Value};
 
 use crate::crypto::{CryptoEndpoint, CryptoSession};
-use crate::discovery::AIRPLAY_FEATURES;
+use crate::discovery::{AIRPLAY_FEATURES, LEGACY_RECEIVER_PUBLIC_KEY};
 use crate::{AirPlayError, ReceiverConfig};
 
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -316,6 +316,10 @@ fn info_plist(receiver: &ReceiverConfig) -> Result<Vec<u8>, plist::Error> {
         "deviceID".to_string(),
         receiver.device_id.to_string().into(),
     );
+    info.insert(
+        "macAddress".to_string(),
+        receiver.device_id.to_string().into(),
+    );
     info.insert("model".to_string(), receiver.model.clone().into());
     info.insert(
         "sourceVersion".to_string(),
@@ -325,15 +329,26 @@ fn info_plist(receiver: &ReceiverConfig) -> Result<Vec<u8>, plist::Error> {
     info.insert("features".to_string(), AIRPLAY_FEATURES.into());
     info.insert("statusFlags".to_string(), 4_u64.into());
     info.insert("vv".to_string(), 2_u64.into());
+    info.insert(
+        "pk".to_string(),
+        Value::Data(LEGACY_RECEIVER_PUBLIC_KEY.to_vec()),
+    );
+    info.insert("keepAliveLowPower".to_string(), true.into());
+    info.insert("keepAliveSendStatsAsBody".to_string(), true.into());
 
     let (width, height) = receiver.profile.resolution.dimensions();
     let mut display = Dictionary::new();
     display.insert("width".to_string(), u64::from(width).into());
     display.insert("height".to_string(), u64::from(height).into());
+    display.insert("widthPixels".to_string(), u64::from(width).into());
+    display.insert("heightPixels".to_string(), u64::from(height).into());
+    display.insert("features".to_string(), 2_u64.into());
+    display.insert("uuid".to_string(), "cursio_display".into());
     display.insert(
         "refreshRate".to_string(),
-        u64::from(receiver.profile.fps).into(),
+        Value::Real(1.0 / f64::from(receiver.profile.fps)),
     );
+    display.insert("maxFPS".to_string(), u64::from(receiver.profile.fps).into());
     info.insert(
         "displays".to_string(),
         Value::Array(vec![Value::Dictionary(display)]),

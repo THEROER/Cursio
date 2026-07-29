@@ -14,8 +14,14 @@ pub const RAOP_SERVICE_TYPE: &str = "_raop._tcp.local.";
 ///
 /// Keep this isolated: every bit is a protocol promise. Pairing and media
 /// handlers must eventually narrow this value to what they actually implement.
-pub const AIRPLAY_FEATURES: u64 = (0x1e_u64 << 32) | 0x5a7f_fff7;
-const AIRPLAY_FEATURES_TXT: &str = "0x5A7FFFF7,0x1E";
+pub const AIRPLAY_FEATURES: u64 = 0x527f_fee6;
+const AIRPLAY_FEATURES_TXT: &str = "0x527FFEE6,0x0";
+const LEGACY_RECEIVER_PUBLIC_KEY_HEX: &str =
+    "b07727d6f6cd6e08b58ede525ec3cdeaa252ad9f683feb212ef8a205246554e7";
+pub(crate) const LEGACY_RECEIVER_PUBLIC_KEY: [u8; 32] = [
+    0xb0, 0x77, 0x27, 0xd6, 0xf6, 0xcd, 0x6e, 0x08, 0xb5, 0x8e, 0xde, 0x52, 0x5e, 0xc3, 0xcd, 0xea,
+    0xa2, 0x52, 0xad, 0x9f, 0x68, 0x3f, 0xeb, 0x21, 0x2e, 0xf8, 0xa2, 0x05, 0x24, 0x65, 0x54, 0xe7,
+];
 
 /// Active registration for both service records.
 pub struct AirPlayAnnouncement {
@@ -67,6 +73,7 @@ fn service_infos(
         ("features", AIRPLAY_FEATURES_TXT.to_string()),
         ("flags", "0x4".to_string()),
         ("model", receiver.model.clone()),
+        ("pk", LEGACY_RECEIVER_PUBLIC_KEY_HEX.to_string()),
         ("pi", identity),
         ("srcvers", receiver.source_version.clone()),
         ("vv", "2".to_string()),
@@ -74,16 +81,23 @@ fn service_infos(
     let raop_properties = [
         ("ch", "2".to_string()),
         ("cn", "0,1,2,3".to_string()),
+        ("da", "true".to_string()),
         ("et", "0,3,5".to_string()),
+        ("ft", AIRPLAY_FEATURES_TXT.to_string()),
+        ("am", receiver.model.clone()),
         ("md", "0,1,2".to_string()),
+        ("pk", LEGACY_RECEIVER_PUBLIC_KEY_HEX.to_string()),
         ("pw", "false".to_string()),
+        ("rhd", "5.6.0.0".to_string()),
         ("sr", "44100".to_string()),
+        ("sf", "0x4".to_string()),
         ("ss", "16".to_string()),
         ("sv", "false".to_string()),
         ("tp", "UDP".to_string()),
         ("txtvers", "1".to_string()),
         ("vn", "65537".to_string()),
         ("vs", receiver.source_version.clone()),
+        ("vv", "2".to_string()),
     ];
     let raop_instance = format!("{}@{instance}", receiver.device_id.raop_prefix());
 
