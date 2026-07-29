@@ -778,10 +778,20 @@ async fn run_pairing_and_session(
     // cursor would land on a different machine each time. Comparing ids is
     // deterministic, needs no negotiation, and each side independently computes
     // the opposite answer, which is exactly the "exactly one active" invariant.
-    let start_active = identity.peer_id < peer.peer_id;
+    //
+    // What the ids cannot say is whether the peer is a machine that can hold a
+    // cursor at all, so the device kinds decide first — see `CursorSetup`.
+    let cursor_setup = session::CursorSetup::negotiate(
+        session::local_device_kind(),
+        identity.peer_id,
+        peer.device_kind,
+        peer.peer_id,
+    );
 
     tracing::info!(
-        start_active,
+        start_active = cursor_setup.start_active,
+        peer_kind = ?peer.device_kind,
+        peer_takes_cursor = cursor_setup.peer_takes_cursor,
         "session up — sharing input; press Ctrl+Alt+G to toggle control (Ctrl-C to stop)"
     );
     let boxed: Box<dyn Transport> = Box::new(secure);
@@ -791,7 +801,7 @@ async fn run_pairing_and_session(
     let cursor_ref = cursor.clone();
     let result = session::run_session(
         boxed,
-        start_active,
+        cursor_setup,
         captured,
         move |event| inject(inject_ref.borrow_mut().as_mut(), event),
         commands,

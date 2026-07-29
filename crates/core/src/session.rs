@@ -122,8 +122,19 @@ pub async fn handshake<T: Transport + ?Sized>(
 ///
 /// Desktop/laptop is not distinguishable without poking at hardware, and nothing
 /// depends on the difference today — [`DeviceKind::takes_cursor`] treats them
-/// alike. Phone and tablet builds will set this explicitly rather than inferring
-/// it here.
+/// alike.
+///
+/// A mobile build says so, and that one word decides how the whole session is
+/// arranged: the peer keeps the cursor permanently, this side stays dormant,
+/// and staying dormant is exactly what makes its input stream to the peer
+/// rather than act locally. A phone that claimed to be a desktop would take the
+/// cursor half the time and freeze the machine it was supposed to be driving.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn local_device_kind() -> DeviceKind {
+    DeviceKind::Phone
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn local_device_kind() -> DeviceKind {
     DeviceKind::Desktop
 }
@@ -158,6 +169,62 @@ pub enum OwnershipCmd {
     /// the capture path (not only here); this variant handles the session-side
     /// cleanup and best-effort notifies the peer.
     Panic,
+}
+
+/// How a session treats the shared cursor, decided before the loop starts.
+///
+/// Two machines with screens pass the cursor back and forth, and which one
+/// starts with it is settled by comparing peer ids — deterministic, and each
+/// side computes the opposite answer. But not every peer is such a machine: a
+/// phone acting as a touchpad has no screen for the cursor to enter and no
+/// injector to drive it ([`DeviceKind::takes_cursor`]), so there is nothing to
+/// pass back and forth. It only ever *produces* input.
+///
+/// Handing the cursor to a peer that cannot hold it is not a cosmetic mistake.
+/// The machine that gives it up grabs its own input and streams it away, so it
+/// stops responding to its own keyboard and mouse — and the only thing that
+/// could hand control back is the peer that was never able to take it. The
+/// session would have to be killed to recover. That is why this is settled up
+/// front and enforced in the loop, rather than left to the id comparison that
+/// knows nothing about what a peer is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorSetup {
+    /// Whether this machine begins holding the shared cursor.
+    pub start_active: bool,
+    /// Whether the peer can ever hold it at all.
+    pub peer_takes_cursor: bool,
+}
+
+impl CursorSetup {
+    /// Work out the arrangement for a link between these two machines.
+    ///
+    /// Both sides run this and reach complementary answers, which is what keeps
+    /// "exactly one machine is active" true without negotiating it over the
+    /// wire.
+    pub fn negotiate(
+        local_kind: DeviceKind,
+        local_id: PeerId,
+        peer_kind: DeviceKind,
+        peer_id: PeerId,
+    ) -> Self {
+        let peer_takes_cursor = peer_kind.takes_cursor();
+        let start_active = match (local_kind.takes_cursor(), peer_takes_cursor) {
+            // The ordinary case: two machines with screens. Compare ids, not
+            // who dialled whom — the latter flips when the same two machines
+            // reconnect the other way round, landing the cursor somewhere
+            // different each time.
+            (true, true) => local_id < peer_id,
+            // Only we can hold it, so we hold it, always.
+            (true, false) => true,
+            // We cannot hold it: this machine is the input source. Staying
+            // dormant is exactly what makes its input stream to the peer.
+            (false, _) => false,
+        };
+        CursorSetup {
+            start_active,
+            peer_takes_cursor,
+        }
+    }
 }
 
 /// Reports this machine's new **active** state after a change, so the caller can
@@ -196,8 +263,10 @@ pub struct Ownership {
 /// both-own deadlock (which caused an input feedback loop) impossible.
 ///
 /// The parameters wire this crate to platform code without depending on it:
-/// - `start_active` — whether this machine begins holding the cursor. The two
-///   peers must pass opposite values (the binary keys this off its role).
+/// - `cursor` — how the shared cursor is arranged on this link: who starts with
+///   it, and whether the peer is the sort of machine that can hold it at all.
+///   Build it with [`CursorSetup::negotiate`], which both sides run to reach
+///   complementary answers.
 /// - `captured` — local input events; forwarded only while dormant.
 /// - `on_input` — inject an inbound event; called only while active.
 /// - `commands` — hotkey toggle requests; `None` for a session that never
@@ -220,7 +289,7 @@ pub struct Ownership {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_session<F, G>(
     transport: Box<dyn Transport>,
-    start_active: bool,
+    cursor: CursorSetup,
     // Borrowed, not owned: the capture that feeds these outlives any single
     // session (it holds a portal permission that must not be re-acquired per
     // connection), so a session reads from them and hands them back.
@@ -286,7 +355,7 @@ where
 
     // Ownership: is THIS machine the active one (holds the shared cursor)?
     // Peers start in opposite states so exactly one is active from the outset.
-    let mut am_active = start_active;
+    let mut am_active = cursor.start_active;
     on_ownership(Ownership { active: am_active, panic: false });
     tracing::info!(am_active, "initial ownership");
 
@@ -371,6 +440,17 @@ where
                     // active" invariant holds. (The dormant side can still run
                     // the hotkey because capture keeps reading even while its
                     // input is grabbed.)
+                    // A peer that cannot hold the cursor cannot be handed it.
+                    // Obeying the hotkey here would grab this machine's input
+                    // and stream it to a phone that has nothing to inject it
+                    // into — the machine stops responding to its own keyboard,
+                    // and the only thing that could give control back is the
+                    // peer that was never able to take it.
+                    Some(OwnershipCmd::Toggle) if !cursor.peer_takes_cursor => {
+                        tracing::info!(
+                            "ignoring the ownership hotkey: this peer cannot hold the cursor"
+                        );
+                    }
                     Some(OwnershipCmd::Toggle) => {
                         am_active = !am_active;
                         tracing::info!(am_active, "hotkey toggled ownership");
@@ -383,6 +463,11 @@ where
                     // Edge-crossing handoff: only the active side hands off (the
                     // cursor left *us*). If we're already dormant, ignore it —
                     // the crossing belongs to the peer's screen, not ours.
+                    // Same reasoning as the hotkey: the cursor cannot cross an
+                    // edge into a machine that has no screen behind it.
+                    Some(OwnershipCmd::HandoffToPeer { edge, .. }) if !cursor.peer_takes_cursor => {
+                        tracing::trace!(?edge, "edge crossing ignored: peer cannot hold the cursor");
+                    }
                     Some(OwnershipCmd::HandoffToPeer { edge, pos_norm }) => {
                         if am_active {
                             am_active = false;
@@ -443,6 +528,18 @@ where
                             tracing::trace!(?event, "peer input");
                             on_input(event);
                         }
+                    }
+                    // A peer that cannot hold the cursor claiming it anyway.
+                    //
+                    // Nothing we ship sends this, so it means a peer that has
+                    // misdescribed itself or a build we don't know. Obeying it
+                    // would freeze this machine's own input with no way back,
+                    // so it is refused — and said out loud, because a phone
+                    // whose taps do nothing is otherwise a silent mystery.
+                    Some(Message::Grab { active: false }) if !cursor.peer_takes_cursor => {
+                        tracing::warn!(
+                            "peer claimed the cursor but is not a machine that can hold one; ignoring"
+                        );
                     }
                     Some(Message::Grab { active }) => {
                         // The peer is handing the cursor to us (active=true) or
@@ -627,6 +724,79 @@ async fn recv_maybe<T>(
 /// Thin wrapper over [`run_session`] for callers that only need liveness (no
 /// input capture or injection), e.g. tests or a liveness-only role.
 pub async fn run_heartbeat(transport: Box<dyn Transport>) -> Result<(), SessionError> {
-    // start_active is irrelevant with no capture/injection; pass false.
-    run_session(transport, false, None, |_| {}, None, |_| {}, Vec::new()).await
+    // Ownership is irrelevant with no capture or injection: stay dormant and
+    // let the peer keep the cursor it already has.
+    let cursor = CursorSetup {
+        start_active: false,
+        peer_takes_cursor: true,
+    };
+    run_session(transport, cursor, None, |_| {}, None, |_| {}, Vec::new()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(byte: u8) -> PeerId {
+        PeerId::from_bytes([byte; 16])
+    }
+
+    /// Two machines with screens: the lower id starts with the cursor, and each
+    /// side reaches the opposite answer without asking the other.
+    ///
+    /// This is the invariant the whole ownership model rests on — two actives
+    /// means both machines inject each other's input, which is the feedback
+    /// loop the design exists to make impossible.
+    #[test]
+    fn two_desktops_agree_on_exactly_one_holder() {
+        let low = id(1);
+        let high = id(2);
+        let a = CursorSetup::negotiate(DeviceKind::Desktop, low, DeviceKind::Laptop, high);
+        let b = CursorSetup::negotiate(DeviceKind::Laptop, high, DeviceKind::Desktop, low);
+        assert!(a.start_active);
+        assert!(!b.start_active);
+        assert!(a.peer_takes_cursor && b.peer_takes_cursor);
+    }
+
+    /// A phone peer never gets the cursor, whichever way the ids fall.
+    ///
+    /// The ids alone decided this before, so half of all phone pairings put the
+    /// desktop into the dormant state: it grabs its own keyboard and mouse,
+    /// streams them to a device with nothing to inject them into, and the only
+    /// thing that could hand control back is that same device. The user's
+    /// machine stops responding and the session has to be killed. Whichever id
+    /// the phone happens to have must not be able to cause that.
+    #[test]
+    fn a_phone_peer_never_takes_the_cursor() {
+        for phone_id in [id(0), id(255)] {
+            let setup =
+                CursorSetup::negotiate(DeviceKind::Desktop, id(128), DeviceKind::Phone, phone_id);
+            assert!(
+                setup.start_active,
+                "the desktop must hold the cursor against a phone with id {phone_id:?}"
+            );
+            assert!(!setup.peer_takes_cursor);
+        }
+    }
+
+    /// The phone's own view: dormant, which is precisely what makes its input
+    /// stream to the peer rather than act locally.
+    #[test]
+    fn a_phone_stays_dormant_so_its_input_is_forwarded() {
+        let setup = CursorSetup::negotiate(DeviceKind::Phone, id(1), DeviceKind::Desktop, id(2));
+        assert!(!setup.start_active);
+        assert!(setup.peer_takes_cursor, "the desktop can hold the cursor");
+
+        // And the two sides still agree: the desktop holds it.
+        let desktop = CursorSetup::negotiate(DeviceKind::Desktop, id(2), DeviceKind::Phone, id(1));
+        assert!(desktop.start_active);
+    }
+
+    /// A headless box has no screen either, so it is treated like the phone.
+    #[test]
+    fn a_headless_peer_is_not_a_cursor_destination() {
+        let setup = CursorSetup::negotiate(DeviceKind::Desktop, id(9), DeviceKind::Headless, id(1));
+        assert!(setup.start_active);
+        assert!(!setup.peer_takes_cursor);
+    }
 }

@@ -55,7 +55,7 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
         // client. No handoff needed.
         let res = session::run_session(
             server,
-            true, // start_active
+            session::CursorSetup { start_active: true, peer_takes_cursor: true },
             None,
             |ev| received_in_task.lock().unwrap().push(ev),
             None,
@@ -95,7 +95,7 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
             Duration::from_secs(3),
             session::run_session(
                 client,
-                false,
+                session::CursorSetup { start_active: false, peer_takes_cursor: true },
                 Some(&mut rx),
                 |_| {},
                 None,

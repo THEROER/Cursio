@@ -40,7 +40,10 @@ async fn silent_peer_times_out_instead_of_hanging() {
     let _silent_peer = server;
 
     let boxed: Box<dyn Transport> = Box::new(client);
-    let res = session::run_session(boxed, false, None, |_| {}, None, |_| {}, Vec::new()).await;
+    let res = session::run_session(
+        boxed,
+        session::CursorSetup { start_active: false, peer_takes_cursor: true },
+        None, |_| {}, None, |_| {}, Vec::new()).await;
 
     // `start_paused` auto-advances time when the runtime idles, so the 15s
     // timeout elapses in virtual time — the test itself is instant.
