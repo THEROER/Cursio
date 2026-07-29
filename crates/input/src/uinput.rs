@@ -193,7 +193,10 @@ impl InputInjector for UinputInjector {
         // keys on the keyboard), ignoring `active` — we must clean up even if
         // we ended in the inactive state.
         let held: Vec<u16> = self.held.drain().collect();
-        tracing::info!(count = held.len(), "releasing held keys/buttons on session end");
+        tracing::info!(
+            count = held.len(),
+            "releasing held keys/buttons on session end"
+        );
         for code in held {
             let ev = KeyEvent::new(KeyCode::new(code), 0).into();
             let res = if code >= BTN_0 {

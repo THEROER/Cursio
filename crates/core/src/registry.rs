@@ -89,7 +89,10 @@ impl PeerRegistry {
                 )
             })
             .collect();
-        Self { peers, local: Some(local) }
+        Self {
+            peers,
+            local: Some(local),
+        }
     }
 
     /// Is this id us? Used to keep the node out of its own peer set.
@@ -147,7 +150,12 @@ impl PeerRegistry {
 
     /// Mark a peer offline as of now.
     pub fn mark_offline(&mut self, peer_id: PeerId) {
-        self.set_state(peer_id, PeerState::Offline { since: Some(Instant::now()) });
+        self.set_state(
+            peer_id,
+            PeerState::Offline {
+                since: Some(Instant::now()),
+            },
+        );
     }
 
     pub fn get(&self, peer_id: &PeerId) -> Option<&KnownPeer> {
@@ -161,7 +169,11 @@ impl PeerRegistry {
     /// Peers we should try to reach: known, currently offline, and with a
     /// known address.
     pub fn dial_candidates(&self) -> Vec<KnownPeer> {
-        self.peers.values().filter(|p| p.dialable()).cloned().collect()
+        self.peers
+            .values()
+            .filter(|p| p.dialable())
+            .cloned()
+            .collect()
     }
 
     pub fn all(&self) -> impl Iterator<Item = &KnownPeer> {
@@ -221,7 +233,10 @@ mod tests {
 
         assert!(reg.is_known(&id), "peer was forgotten when it went offline");
         assert_eq!(reg.online_count(), 0);
-        assert!(reg.get(&id).unwrap().addr.is_some(), "address was discarded");
+        assert!(
+            reg.get(&id).unwrap().addr.is_some(),
+            "address was discarded"
+        );
     }
 
     /// A rebooted peer often returns on a different address; the registry must
@@ -244,13 +259,19 @@ mod tests {
     #[test]
     fn a_node_is_never_its_own_peer() {
         let me = peer(42);
-        let mut reg = PeerRegistry { peers: Default::default(), local: Some(me) };
+        let mut reg = PeerRegistry {
+            peers: Default::default(),
+            local: Some(me),
+        };
 
         reg.admit(me, "myself".into(), Some("127.0.0.1:9000".parse().unwrap()));
         assert!(!reg.is_known(&me), "the node admitted itself as a peer");
 
         assert!(!reg.note_seen(me, "myself", "127.0.0.1:9000".parse().unwrap()));
-        assert!(reg.dial_candidates().is_empty(), "the node would dial itself");
+        assert!(
+            reg.dial_candidates().is_empty(),
+            "the node would dial itself"
+        );
     }
 
     /// Untrusted machines announcing themselves must not join the mesh.
@@ -277,7 +298,11 @@ mod tests {
         reg.admit(no_addr, "c".into(), None);
         reg.admit(ready, "d".into(), Some(addr));
 
-        let ids: Vec<_> = reg.dial_candidates().into_iter().map(|p| p.peer_id).collect();
+        let ids: Vec<_> = reg
+            .dial_candidates()
+            .into_iter()
+            .map(|p| p.peer_id)
+            .collect();
         assert_eq!(ids, vec![ready]);
     }
 }

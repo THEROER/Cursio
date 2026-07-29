@@ -72,7 +72,12 @@ mod tests {
         let mut fb = Framebuffer::new(4, 2);
         let tile = [0xFF, 0xFF, 0xFF, 0xFF];
         fb.blit(
-            Rect { x: 2, y: 1, width: 1, height: 1 },
+            Rect {
+                x: 2,
+                y: 1,
+                width: 1,
+                height: 1,
+            },
             &tile,
         )
         .unwrap();
@@ -85,7 +90,12 @@ mod tests {
     fn out_of_bounds_tile_is_rejected_not_clipped() {
         let mut fb = Framebuffer::new(4, 2);
         let err = fb.blit(
-            Rect { x: 3, y: 0, width: 2, height: 1 },
+            Rect {
+                x: 3,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
             &[0; 8],
         );
         assert!(matches!(err, Err(WindowError::Backend(_))));

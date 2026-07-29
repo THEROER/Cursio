@@ -47,16 +47,16 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use ashpd::desktop::{
-    PersistMode,
     remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions},
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+    PersistMode,
 };
 use cursio_protocol::{
     TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
 };
 use tokio::sync::mpsc;
 
-use crate::frame_pipeline::{FrameDiffer, pick_codec, should_use_video};
+use crate::frame_pipeline::{pick_codec, should_use_video, FrameDiffer};
 use crate::{CaptureSession, WindowCapture, WindowError};
 
 /// Where the ScreenCast restore token is persisted, next to `identity.json` in
@@ -88,7 +88,9 @@ fn load_restore_token() -> Option<String> {
 /// Persist a fresh token, best-effort: failing to save only costs an extra
 /// dialog next run, so it must never break an otherwise working capture.
 fn save_restore_token(token: &str) {
-    let Ok(path) = restore_token_path() else { return };
+    let Ok(path) = restore_token_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -96,8 +98,12 @@ fn save_restore_token(token: &str) {
         token: token.to_owned(),
     };
     match serde_json::to_vec_pretty(&state).map(|b| std::fs::write(&path, b)) {
-        Ok(Ok(())) => tracing::info!(path = %path.display(), "saved ScreenCast restore token (portal won't prompt again)"),
-        Ok(Err(e)) => tracing::warn!(error = %e, "could not write restore token; portal will prompt next time"),
+        Ok(Ok(())) => {
+            tracing::info!(path = %path.display(), "saved ScreenCast restore token (portal won't prompt again)")
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "could not write restore token; portal will prompt next time")
+        }
         Err(e) => tracing::warn!(error = %e, "could not encode restore token"),
     }
 }
@@ -445,11 +451,11 @@ struct StreamState {
 fn format_param_pod() -> Vec<u8> {
     use pipewire::spa::{
         param::{
-            ParamType,
             format::{FormatProperties, MediaSubtype, MediaType},
             video::VideoFormat,
+            ParamType,
         },
-        pod::{Value, object, property, serialize::PodSerializer},
+        pod::{object, property, serialize::PodSerializer, Value},
         utils::{Fraction, Rectangle, SpaTypes},
     };
 
@@ -491,10 +497,7 @@ fn format_param_pod() -> Vec<u8> {
             Fraction,
             Fraction { num: 60, denom: 1 },
             Fraction { num: 0, denom: 1 },
-            Fraction {
-                num: 144,
-                denom: 1
-            }
+            Fraction { num: 144, denom: 1 }
         ),
     );
 

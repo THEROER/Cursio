@@ -14,11 +14,9 @@ use cursio_protocol::InputEvent;
 #[cfg(target_os = "linux")]
 pub mod capture;
 #[cfg(target_os = "linux")]
-pub mod uinput;
-#[cfg(target_os = "linux")]
 pub mod lin_cursor;
 #[cfg(target_os = "linux")]
-pub mod wl_capture;
+pub mod uinput;
 #[cfg(target_os = "windows")]
 pub mod win;
 #[cfg(target_os = "windows")]
@@ -27,6 +25,8 @@ pub mod win_capture;
 pub mod win_cursor;
 #[cfg(target_os = "windows")]
 mod win_keymap;
+#[cfg(target_os = "linux")]
+pub mod wl_capture;
 
 #[cfg(target_os = "linux")]
 pub use lin_cursor::LinuxCursor;
@@ -43,7 +43,9 @@ pub use win_cursor::WinCursor;
 /// and the caller filters), the Windows jump-zone watch lives in the mouse hook,
 /// so the edge is pushed down into the backend here.
 #[cfg(target_os = "windows")]
-pub fn spawn_capture(peer_edge: Option<cursio_protocol::Edge>) -> Result<CaptureHandle, InputError> {
+pub fn spawn_capture(
+    peer_edge: Option<cursio_protocol::Edge>,
+) -> Result<CaptureHandle, InputError> {
     win_capture::spawn_capture_with_edge(peer_edge)
 }
 
@@ -61,7 +63,9 @@ pub fn spawn_capture(peer_edge: Option<cursio_protocol::Edge>) -> Result<Capture
 /// edge-crossing is off (only the hotkey hands off). The evdev backend has no
 /// edge detection, so it ignores this.
 #[cfg(target_os = "linux")]
-pub fn spawn_capture(peer_edge: Option<cursio_protocol::Edge>) -> Result<CaptureHandle, InputError> {
+pub fn spawn_capture(
+    peer_edge: Option<cursio_protocol::Edge>,
+) -> Result<CaptureHandle, InputError> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland");
     if wayland {

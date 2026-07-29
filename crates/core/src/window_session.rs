@@ -293,7 +293,10 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                     self.offer_sent = false;
                     send_control(
                         tx,
-                        WindowMsg::Close { id, reason: WindowCloseReason::HostClosed },
+                        WindowMsg::Close {
+                            id,
+                            reason: WindowCloseReason::HostClosed,
+                        },
                     )
                     .await?;
                     break;
@@ -320,7 +323,10 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                     if let Some(id) = id {
                         send_control(
                             tx,
-                            WindowMsg::Close { id, reason: WindowCloseReason::ViewerClosed },
+                            WindowMsg::Close {
+                                id,
+                                reason: WindowCloseReason::ViewerClosed,
+                            },
                         )
                         .await?;
                     }
@@ -337,7 +343,6 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
         }
         Ok(())
     }
-
 }
 
 #[async_trait]
@@ -430,7 +435,10 @@ where
             session.close(WindowCloseReason::HostClosed);
             let _ = send_control(
                 tx,
-                WindowMsg::Close { id, reason: WindowCloseReason::HostClosed },
+                WindowMsg::Close {
+                    id,
+                    reason: WindowCloseReason::HostClosed,
+                },
             )
             .await;
         }
@@ -474,10 +482,7 @@ impl crate::module::ModuleFactory for WindowFactory {
     }
 
     #[allow(unused_variables)]
-    fn build(
-        &self,
-        ctx: &crate::module::SessionCtx,
-    ) -> anyhow::Result<Box<dyn SessionModule>> {
+    fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         #[cfg(target_os = "linux")]
         {
             // On Linux the portal runs its own window picker, so there is no
@@ -566,8 +571,12 @@ fn spawn_drag_trigger(
                  window transfer still works with --share-window"
             );
         }
-        tracing::info!(?peer_edge, width = screen.width, height = screen.height,
-            "watching for windows dragged toward the peer");
+        tracing::info!(
+            ?peer_edge,
+            width = screen.width,
+            height = screen.height,
+            "watching for windows dragged toward the peer"
+        );
 
         let mut trigger = DragTrigger::new(peer_edge, screen);
         while let Some(event) = watcher.next().await {
@@ -592,7 +601,7 @@ mod tests {
     use super::*;
     use cursio_protocol::{Rect, TileCodec, WindowFrame, WindowInput, WindowMeta};
     use cursio_transport::QueueDepth;
-    use cursio_window::{WindowError, window_test_support::*};
+    use cursio_window::{window_test_support::*, WindowError};
     use tokio::sync::mpsc;
 
     /// Collects what the module sends, standing in for the transport.
@@ -665,10 +674,7 @@ mod tests {
         }
     }
 
-    fn frame_channel() -> (
-        mpsc::Sender<WindowFrame>,
-        mpsc::Receiver<WindowFrame>,
-    ) {
+    fn frame_channel() -> (mpsc::Sender<WindowFrame>, mpsc::Receiver<WindowFrame>) {
         mpsc::channel(64)
     }
 
@@ -721,7 +727,10 @@ mod tests {
         // home rather than died, so its surrogate disappears quietly.
         assert!(matches!(
             tx.control().first(),
-            Some(WindowMsg::Close { reason: WindowCloseReason::Returned, .. })
+            Some(WindowMsg::Close {
+                reason: WindowCloseReason::Returned,
+                ..
+            })
         ));
     }
 
@@ -791,7 +800,11 @@ mod tests {
         // is a first-class variant, and they must still be ordered relative to
         // each other on the wire.
         assert!(matches!(
-            tx.sent.first().unwrap().decode_module::<WindowMsg>(ModuleId::WINDOW).unwrap(),
+            tx.sent
+                .first()
+                .unwrap()
+                .decode_module::<WindowMsg>(ModuleId::WINDOW)
+                .unwrap(),
             Some(WindowMsg::Offer(_))
         ));
         assert!(matches!(tx.sent.get(1), Some(Message::WindowFrame(_))));
@@ -864,19 +877,17 @@ mod tests {
             },
         };
         eng.pump(&mut tx).await.unwrap();
-        assert!(
-            tx.sent
-                .iter()
-                .all(|message| !matches!(message, Message::WindowFrame(_)))
-        );
+        assert!(tx
+            .sent
+            .iter()
+            .all(|message| !matches!(message, Message::WindowFrame(_))));
 
         tx.video_depth = QueueDepth::default();
         eng.pump(&mut tx).await.unwrap();
-        assert!(
-            tx.sent
-                .iter()
-                .any(|message| matches!(message, Message::WindowFrame(_)))
-        );
+        assert!(tx
+            .sent
+            .iter()
+            .any(|message| matches!(message, Message::WindowFrame(_))));
     }
 
     #[test]
@@ -928,13 +939,18 @@ mod tests {
         );
         assert!(eng.handle_message(&Message::WindowFrame(frame(1, 1))));
         assert!(eng.handle_message(&control_frame(WindowMsg::FrameAck(
-            cursio_protocol::WindowFrameAck { id: 1, acked_seq: 1 }
+            cursio_protocol::WindowFrameAck {
+                id: 1,
+                acked_seq: 1
+            }
         ))));
-        assert!(eng.handle_message(&Message::WindowInput(WindowInput::PointerMove {
-            id: 1,
-            x: 0,
-            y: 0
-        })));
+        assert!(
+            eng.handle_message(&Message::WindowInput(WindowInput::PointerMove {
+                id: 1,
+                x: 0,
+                y: 0
+            }))
+        );
         // Another module's message must fall through to it.
         assert!(!eng.handle_message(&Message::Heartbeat { nonce: 1 }));
     }
@@ -956,7 +972,10 @@ mod tests {
 
         assert!(tx.control().iter().any(|m| matches!(
             m,
-            WindowMsg::Close { reason: WindowCloseReason::HostClosed, .. }
+            WindowMsg::Close {
+                reason: WindowCloseReason::HostClosed,
+                ..
+            }
         )));
         assert!(eng.hosted.is_none());
     }
@@ -990,9 +1009,6 @@ mod tests {
             FakeRenderer::default(),
         );
         eng.share_window().unwrap();
-        assert!(matches!(
-            eng.share_window(),
-            Err(WindowError::Backend(_))
-        ));
+        assert!(matches!(eng.share_window(), Err(WindowError::Backend(_))));
     }
 }

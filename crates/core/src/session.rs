@@ -356,7 +356,10 @@ where
     // Ownership: is THIS machine the active one (holds the shared cursor)?
     // Peers start in opposite states so exactly one is active from the outset.
     let mut am_active = cursor.start_active;
-    on_ownership(Ownership { active: am_active, panic: false });
+    on_ownership(Ownership {
+        active: am_active,
+        panic: false,
+    });
     tracing::info!(am_active, "initial ownership");
 
     // Bring each subsystem up on the shared channel before the loop starts.
@@ -648,8 +651,11 @@ async fn forward_captured(
         dy: &mut i32,
     ) -> Result<(), SessionError> {
         if *dx != 0 || *dy != 0 {
-            tx.send(&Message::Input(InputEvent::PointerMotion { dx: *dx, dy: *dy }))
-                .await?;
+            tx.send(&Message::Input(InputEvent::PointerMotion {
+                dx: *dx,
+                dy: *dy,
+            }))
+            .await?;
             *dx = 0;
             *dy = 0;
         }
@@ -681,7 +687,8 @@ async fn forward_captured(
                         "forwarding pointer button to peer");
                 }
                 flush(tx, dx, dy).await?;
-                tx.send(&Message::Input(other)).await
+                tx.send(&Message::Input(other))
+                    .await
                     .map_err(SessionError::from)
             }
         }

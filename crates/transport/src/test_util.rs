@@ -29,7 +29,9 @@ impl MemTransport {
 #[async_trait]
 impl Transport for MemTransport {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        self.tx.send(msg.clone()).map_err(|_| TransportError::Closed)
+        self.tx
+            .send(msg.clone())
+            .map_err(|_| TransportError::Closed)
     }
     async fn recv(&mut self) -> Result<Message, TransportError> {
         self.rx.recv().await.ok_or(TransportError::Closed)
@@ -51,7 +53,9 @@ pub(crate) struct MemTx {
 #[async_trait]
 impl TransportTx for MemTx {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        self.tx.send(msg.clone()).map_err(|_| TransportError::Closed)
+        self.tx
+            .send(msg.clone())
+            .map_err(|_| TransportError::Closed)
     }
 }
 

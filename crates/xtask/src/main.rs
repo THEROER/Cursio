@@ -221,8 +221,7 @@ fn install(only: Option<BinArg>, no_build: bool) -> Result<()> {
     }
 
     let bin_dir = local_bin_dir()?;
-    std::fs::create_dir_all(&bin_dir)
-        .with_context(|| format!("creating {}", bin_dir.display()))?;
+    std::fs::create_dir_all(&bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
 
     let src_dir = out_dir(true, None);
     let selected = select(only);
@@ -277,7 +276,10 @@ fn windows(release: bool) -> Result<()> {
     // clipd is GTK/Linux-only — never cross-build it for Windows.
     let selected: Vec<&Binary> = BINARIES.iter().filter(|b| b.bin != "clipd").collect();
     let profile = if release { "release" } else { "debug" };
-    println!("→ cross-building {} for Windows ({profile})", names(&selected));
+    println!(
+        "→ cross-building {} for Windows ({profile})",
+        names(&selected)
+    );
 
     let mut cmd = cargo();
     cmd.arg("xwin");
@@ -301,7 +303,10 @@ fn windows(release: bool) -> Result<()> {
 
     let dir = out_dir(release, Some(WINDOWS_TARGET));
     for b in &selected {
-        println!("✓ {}", dir.join(exe_name(b.bin, Some(WINDOWS_TARGET))).display());
+        println!(
+            "✓ {}",
+            dir.join(exe_name(b.bin, Some(WINDOWS_TARGET))).display()
+        );
     }
     Ok(())
 }
@@ -332,8 +337,8 @@ fn logs(follow: bool) -> Result<()> {
     if !follow {
         return Ok(());
     }
-    let newest = newest_file(&dir)?
-        .with_context(|| format!("no log files in {}", dir.display()))?;
+    let newest =
+        newest_file(&dir)?.with_context(|| format!("no log files in {}", dir.display()))?;
     println!("→ tailing {}", newest.display());
     let mut cmd = Command::new("tail");
     cmd.arg("-f").arg(&newest);

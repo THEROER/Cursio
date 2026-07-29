@@ -225,9 +225,18 @@ mod tests {
         ClipboardOffer {
             generation: 3,
             formats: vec![
-                ClipboardFormatOffer { format: ClipboardFormat::Text, size: 5 },
-                ClipboardFormatOffer { format: ClipboardFormat::Html, size: 20 },
-                ClipboardFormatOffer { format: ClipboardFormat::ImagePng, size: 4096 },
+                ClipboardFormatOffer {
+                    format: ClipboardFormat::Text,
+                    size: 5,
+                },
+                ClipboardFormatOffer {
+                    format: ClipboardFormat::Html,
+                    size: 20,
+                },
+                ClipboardFormatOffer {
+                    format: ClipboardFormat::ImagePng,
+                    size: 4096,
+                },
             ],
         }
     }
@@ -241,7 +250,10 @@ mod tests {
             Some(&ClipboardFormat::Html)
         );
         // One that only takes text still gets a usable answer.
-        assert_eq!(o.best_for(&[ClipboardFormat::Text]), Some(&ClipboardFormat::Text));
+        assert_eq!(
+            o.best_for(&[ClipboardFormat::Text]),
+            Some(&ClipboardFormat::Text)
+        );
         // The image wins over everything textual when accepted.
         assert_eq!(
             o.best_for(&[ClipboardFormat::Text, ClipboardFormat::ImagePng]),

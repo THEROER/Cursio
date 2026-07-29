@@ -269,7 +269,7 @@ impl CaptureStream {
                         Ok(newest)
                     } else {
                         Err("capture session closed".into())
-                    }
+                    };
                 }
             }
         }

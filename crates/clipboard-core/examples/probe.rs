@@ -15,8 +15,7 @@ use clipboard_core::{ClipboardContent, ClipboardEntry, ClipboardFormat, Selectio
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -44,13 +43,22 @@ fn read() -> Result<(), Box<dyn std::error::Error>> {
                 let preview = if entry.format.is_text() {
                     let text = String::from_utf8_lossy(&bytes);
                     let trimmed: String = text.chars().take(60).collect();
-                    format!("{:?}{}", trimmed, if text.chars().count() > 60 { "…" } else { "" })
+                    format!(
+                        "{:?}{}",
+                        trimmed,
+                        if text.chars().count() > 60 { "…" } else { "" }
+                    )
                 } else {
                     // Show the leading bytes so an image is identifiable by its
                     // magic number (PNG starts 89 50 4E 47).
                     format!("{:02x?}…", &bytes[..bytes.len().min(8)])
                 };
-                println!("  {:<28} {:>9} bytes  {}", entry.format.mime(), bytes.len(), preview);
+                println!(
+                    "  {:<28} {:>9} bytes  {}",
+                    entry.format.mime(),
+                    bytes.len(),
+                    preview
+                );
             }
             Err(e) => println!("  {:<28} FAILED: {e}", entry.format.mime()),
         }
@@ -69,10 +77,7 @@ fn write_and_read_back() -> Result<(), Box<dyn std::error::Error>> {
     let content = ClipboardContent {
         entries: vec![
             ClipboardEntry::loaded(ClipboardFormat::Text, b"plain from probe".to_vec()),
-            ClipboardEntry::loaded(
-                ClipboardFormat::Html,
-                b"<b>rich</b> from probe".to_vec(),
-            ),
+            ClipboardEntry::loaded(ClipboardFormat::Html, b"<b>rich</b> from probe".to_vec()),
         ],
     };
     clipboard.write(Selection::Clipboard, &content)?;

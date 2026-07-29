@@ -116,9 +116,7 @@ pub enum Op {
     },
     /// Fire-and-forget: nothing useful comes back, and waiting a round trip for
     /// an acknowledgement would stall every `close()`.
-    Close {
-        handle: FileHandle,
-    },
+    Close { handle: FileHandle },
     MkDir {
         volume: String,
         path: String,
@@ -190,7 +188,10 @@ impl PeerLink {
     /// `build` is handed the reply channel so each variant can carry its own
     /// result type. Both failure modes — the session gone, or the peer too slow
     /// — come back as [`FileError::Io`], which the caller turns into `EIO`.
-    fn call<T>(&self, build: impl FnOnce(std_mpsc::Sender<Result<T, FileError>>) -> Op) -> Result<T, FileError> {
+    fn call<T>(
+        &self,
+        build: impl FnOnce(std_mpsc::Sender<Result<T, FileError>>) -> Op,
+    ) -> Result<T, FileError> {
         // Still within a cool-off from an earlier timeout: fail now rather than
         // making this caller wait out another one.
         if self.in_cooloff() {
@@ -438,7 +439,12 @@ mod tests {
         let link = PeerLink::new(tx);
 
         let responder = std::thread::spawn(move || {
-            let Some(Op::Stat { volume, path, reply }) = rx.blocking_recv() else {
+            let Some(Op::Stat {
+                volume,
+                path,
+                reply,
+            }) = rx.blocking_recv()
+            else {
                 panic!("expected a Stat");
             };
             assert_eq!(volume, "C:");

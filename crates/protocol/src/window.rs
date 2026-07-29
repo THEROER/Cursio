@@ -188,7 +188,11 @@ pub enum WindowInput {
     /// A key changed state while the window is focused. `key` is the same
     /// platform-neutral evdev keycode namespace as
     /// [`InputEvent::Key`](crate::InputEvent).
-    Key { id: WindowId, key: u16, pressed: bool },
+    Key {
+        id: WindowId,
+        key: u16,
+        pressed: bool,
+    },
 }
 
 /// Why a window transfer ended.
@@ -224,7 +228,10 @@ pub enum WindowMsg {
     /// Viewer -> host: newest frame presented, for adaptive rate control.
     FrameAck(WindowFrameAck),
     /// Either side: end a transfer. No frames or input for `id` are valid after.
-    Close { id: WindowId, reason: WindowCloseReason },
+    Close {
+        id: WindowId,
+        reason: WindowCloseReason,
+    },
 }
 
 impl WindowMsg {

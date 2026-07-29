@@ -18,17 +18,16 @@ use cursio_protocol::{
     AudioChunk, AudioCodec, AudioFormat, AudioStreamId, AudioStreamMeta, SampleKind, StreamRole,
 };
 use windows::core::Interface;
-use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
-    IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
-    IAudioCaptureClient, IAudioClient, IAudioRenderClient,
-    IAudioSessionControl, IAudioSessionControl2,
-    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    WAVEFORMATEX,
-};
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::Media::Audio::{
+    eCapture, eConsole, eRender, ActivateAudioInterfaceAsync,
+    IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
+    IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
+    IAudioRenderClient, IAudioSessionControl, IAudioSessionControl2, IAudioSessionManager2,
+    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, StructuredStorage::PropVariantToStringAlloc,
     CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
@@ -105,8 +104,9 @@ fn list_endpoints(
     let _com = ComGuard::new()?;
     // SAFETY: COM is initialized on this thread for the duration of the guard.
     unsafe {
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| AudioError::Backend(format!("enumerator: {e}")))?;
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| AudioError::Backend(format!("enumerator: {e}")))?;
         let collection = enumerator
             .EnumAudioEndpoints(direction, DEVICE_STATE_ACTIVE)
             .map_err(|e| AudioError::Backend(format!("enum endpoints: {e}")))?;
@@ -116,7 +116,9 @@ fn list_endpoints(
 
         let mut out = Vec::new();
         for i in 0..count {
-            let Ok(dev) = collection.Item(i) else { continue };
+            let Ok(dev) = collection.Item(i) else {
+                continue;
+            };
             let Ok(name) = device_friendly_name(&dev) else {
                 continue;
             };
@@ -147,8 +149,9 @@ pub fn list_app_streams() -> Result<Vec<crate::AppStream>, AudioError> {
     let _com = ComGuard::new()?;
     // SAFETY: COM is initialized on this thread for the duration of the guard.
     unsafe {
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| AudioError::Backend(format!("enumerator: {e}")))?;
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| AudioError::Backend(format!("enumerator: {e}")))?;
         let device = enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
             .map_err(|e| AudioError::Backend(format!("default endpoint: {e}")))?;
@@ -210,7 +213,8 @@ pub fn list_app_streams() -> Result<Vec<crate::AppStream>, AudioError> {
 /// Resolve a process id to its executable name (without path/extension).
 fn process_name(pid: u32) -> Option<String> {
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
     // SAFETY: handle is closed below; buffer length is passed and updated.
     unsafe {
@@ -312,7 +316,8 @@ unsafe fn activate_process_loopback(pid: u32) -> Result<IAudioClient, String> {
     }
 
     let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler { done: done.clone() }.into();
+    let handler: IActivateAudioInterfaceCompletionHandler =
+        ActivationHandler { done: done.clone() }.into();
 
     let op = ActivateAudioInterfaceAsync(
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
@@ -483,7 +488,11 @@ fn to_wire_format(src: &[u8], src_channels: u16, src_rate: u32) -> Vec<u8> {
 
         // Take the first two channels; duplicate when the source is mono.
         let left = samples[base];
-        let right = if src_channels >= 2 { samples[base + 1] } else { left };
+        let right = if src_channels >= 2 {
+            samples[base + 1]
+        } else {
+            left
+        };
         out.extend_from_slice(&left.to_le_bytes());
         out.extend_from_slice(&right.to_le_bytes());
     }
@@ -651,9 +660,8 @@ unsafe fn init_loopback_client() -> Result<(IAudioClient, WAVEFORMATEX), String>
 /// Passing the loopback flag on a capture endpoint is not a no-op — it asks for
 /// a render device's monitor and fails here — which is why it is conditional.
 unsafe fn init_device_client(mic: Option<&str>) -> Result<(IAudioClient, WAVEFORMATEX), String> {
-    let enumerator: IMMDeviceEnumerator =
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| format!("enumerator: {e}"))?;
+    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        .map_err(|e| format!("enumerator: {e}"))?;
 
     let device = match mic {
         None => enumerator
@@ -669,7 +677,9 @@ unsafe fn init_device_client(mic: Option<&str>) -> Result<(IAudioClient, WAVEFOR
         .Activate::<IAudioClient>(CLSCTX_ALL, None)
         .map_err(|e| format!("activate: {e}"))?;
 
-    let mix_ptr = client.GetMixFormat().map_err(|e| format!("mix format: {e}"))?;
+    let mix_ptr = client
+        .GetMixFormat()
+        .map_err(|e| format!("mix format: {e}"))?;
     let mix = *mix_ptr;
 
     let flags = if mic.is_some() {
@@ -708,7 +718,9 @@ unsafe fn find_capture_device(
         .map_err(|e| format!("enum capture endpoints: {e}"))?;
     let count = collection.GetCount().map_err(|e| format!("count: {e}"))?;
     for i in 0..count {
-        let Ok(dev) = collection.Item(i) else { continue };
+        let Ok(dev) = collection.Item(i) else {
+            continue;
+        };
         if let Ok(name) = device_friendly_name(&dev) {
             if name.to_lowercase().contains(&needle_low) {
                 tracing::info!(%name, "matched capture device");
@@ -962,7 +974,14 @@ impl WasapiSink {
         let thread = std::thread::Builder::new()
             .name(format!("cursio-wasapi-render-{id}"))
             .spawn(move || {
-                run_render_loop(device_name, display_name, feed_rx, stop_rx, ready_tx, gain_thread)
+                run_render_loop(
+                    device_name,
+                    display_name,
+                    feed_rx,
+                    stop_rx,
+                    ready_tx,
+                    gain_thread,
+                )
             })
             .map_err(|e| AudioError::Backend(format!("spawn render thread: {e}")))?;
 
@@ -1084,7 +1103,9 @@ impl WasapiDeviceMonitor {
     }
 
     pub fn set_mute(&self, node_name: String, mute: bool) {
-        let _ = self.commands.send(DeviceCommand::SetMute { node_name, mute });
+        let _ = self
+            .commands
+            .send(DeviceCommand::SetMute { node_name, mute });
     }
 }
 
@@ -1117,7 +1138,9 @@ unsafe fn endpoint_volume_by_name(
     let count = collection.GetCount().ok()?;
     let name_low = name.to_lowercase();
     for i in 0..count {
-        let Ok(dev) = collection.Item(i) else { continue };
+        let Ok(dev) = collection.Item(i) else {
+            continue;
+        };
         let Ok(dev_name) = device_friendly_name(&dev) else {
             continue;
         };
@@ -1171,9 +1194,10 @@ fn run_device_monitor_loop(
                 match cmd {
                     DeviceCommand::SetVolume { node_name, volume } => {
                         if let Some(vol) = endpoint_volume_by_name(&enumerator, &node_name) {
-                            if let Err(e) =
-                                vol.SetMasterVolumeLevelScalar(volume.clamp(0.0, 1.0), std::ptr::null())
-                            {
+                            if let Err(e) = vol.SetMasterVolumeLevelScalar(
+                                volume.clamp(0.0, 1.0),
+                                std::ptr::null(),
+                            ) {
                                 tracing::debug!(device = %node_name, error = %e, "set volume failed");
                             }
                         }
@@ -1192,7 +1216,9 @@ fn run_device_monitor_loop(
             if let Ok(collection) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
                 if let Ok(count) = collection.GetCount() {
                     for i in 0..count {
-                        let Ok(dev) = collection.Item(i) else { continue };
+                        let Ok(dev) = collection.Item(i) else {
+                            continue;
+                        };
                         let Ok(name) = device_friendly_name(&dev) else {
                             continue;
                         };
@@ -1230,15 +1256,16 @@ fn run_device_monitor_loop(
 unsafe fn init_render_client(
     device_name: Option<&str>,
 ) -> Result<(IAudioClient, WAVEFORMATEX, u32), String> {
-    let enumerator: IMMDeviceEnumerator =
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| format!("enumerator: {e}"))?;
+    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        .map_err(|e| format!("enumerator: {e}"))?;
     let device = find_render_device(&enumerator, device_name)?;
     let client: IAudioClient = device
         .Activate::<IAudioClient>(CLSCTX_ALL, None)
         .map_err(|e| format!("activate: {e}"))?;
 
-    let mix_ptr = client.GetMixFormat().map_err(|e| format!("mix format: {e}"))?;
+    let mix_ptr = client
+        .GetMixFormat()
+        .map_err(|e| format!("mix format: {e}"))?;
     let mix = *mix_ptr;
 
     client
@@ -1324,10 +1351,9 @@ fn run_render_loop(
                     .encode_utf16()
                     .chain(std::iter::once(0))
                     .collect();
-                if let Err(e) = session.SetDisplayName(
-                    windows::core::PCWSTR(wide.as_ptr()),
-                    std::ptr::null(),
-                ) {
+                if let Err(e) =
+                    session.SetDisplayName(windows::core::PCWSTR(wide.as_ptr()), std::ptr::null())
+                {
                     tracing::warn!(error = %e, "could not set mixer display name");
                 }
             }
@@ -1410,7 +1436,11 @@ fn run_render_loop(
                         for b in dst.iter_mut().skip(take) {
                             *b = 0;
                         }
-                        let flags = if take == 0 { AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 } else { 0 };
+                        let flags = if take == 0 {
+                            AUDCLNT_BUFFERFLAGS_SILENT.0 as u32
+                        } else {
+                            0
+                        };
                         let _ = render.ReleaseBuffer(free_frames, flags);
                         if started && jitter.is_empty() {
                             started = false; // re-arm prefill after a drain
@@ -1446,7 +1476,11 @@ mod format_tests {
         let mut input = Vec::new();
         for f in 0..2 {
             for ch in 0..16 {
-                input.push(if ch < 2 { (f * 2 + ch) as f32 * 0.1 } else { 0.9 });
+                input.push(if ch < 2 {
+                    (f * 2 + ch) as f32 * 0.1
+                } else {
+                    0.9
+                });
             }
         }
         let out = to_wire_format(&f32s(&input), 16, SAMPLE_RATE);
@@ -1468,7 +1502,11 @@ mod format_tests {
         let frames = 441;
         let input: Vec<f32> = (0..frames * 2).map(|i| i as f32 * 0.001).collect();
         let out = to_wire_format(&f32s(&input), 2, 44_100);
-        assert_eq!(parse(&out).len() / 2, 480, "441 frames @44.1k should be 480 @48k");
+        assert_eq!(
+            parse(&out).len() / 2,
+            480,
+            "441 frames @44.1k should be 480 @48k"
+        );
     }
 
     /// Matching format must be a pass-through — no needless copying or drift.

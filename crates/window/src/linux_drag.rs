@@ -131,28 +131,31 @@ async fn listen(tx: mpsc::UnboundedSender<DragEvent>) {
         // extension. Skip it rather than dying: the rest of the session is
         // still fine, and the log says what to reconcile.
         let event = match member.as_str() {
-            "WindowDragStarted" => msg
-                .body()
-                .deserialize::<(String, i32, i32)>()
-                .ok()
-                .map(|(title, x, y)| DragEvent::Started {
-                    title,
-                    at: PointerPos { x, y },
-                }),
-            "WindowDragMoved" => msg
-                .body()
-                .deserialize::<(i32, i32)>()
-                .ok()
-                .map(|(x, y)| DragEvent::Moved {
-                    at: PointerPos { x, y },
-                }),
-            "WindowDragEnded" => msg
-                .body()
-                .deserialize::<(i32, i32)>()
-                .ok()
-                .map(|(x, y)| DragEvent::Ended {
-                    at: PointerPos { x, y },
-                }),
+            "WindowDragStarted" => {
+                msg.body()
+                    .deserialize::<(String, i32, i32)>()
+                    .ok()
+                    .map(|(title, x, y)| DragEvent::Started {
+                        title,
+                        at: PointerPos { x, y },
+                    })
+            }
+            "WindowDragMoved" => {
+                msg.body()
+                    .deserialize::<(i32, i32)>()
+                    .ok()
+                    .map(|(x, y)| DragEvent::Moved {
+                        at: PointerPos { x, y },
+                    })
+            }
+            "WindowDragEnded" => {
+                msg.body()
+                    .deserialize::<(i32, i32)>()
+                    .ok()
+                    .map(|(x, y)| DragEvent::Ended {
+                        at: PointerPos { x, y },
+                    })
+            }
             other => {
                 tracing::debug!(signal = other, "unknown drag signal; ignoring");
                 None

@@ -59,8 +59,8 @@ mod windows_probe {
     use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowLongW, GetWindowTextW, IsWindowVisible, SetLayeredWindowAttributes,
-        SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE, LWA_ALPHA, SWP_NOSIZE,
-        SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WS_EX_LAYERED,
+        SetWindowLongW, SetWindowPos, ShowWindow, GWL_EXSTYLE, LWA_ALPHA, SWP_NOSIZE, SWP_NOZORDER,
+        SW_MINIMIZE, SW_RESTORE, WS_EX_LAYERED,
     };
 
     /// Collected while enumerating windows, to find one by title.
@@ -92,10 +92,7 @@ mod windows_probe {
             found: None,
         };
         unsafe {
-            let _ = EnumWindows(
-                Some(enum_proc),
-                LPARAM(&mut search as *mut Search as isize),
-            );
+            let _ = EnumWindows(Some(enum_proc), LPARAM(&mut search as *mut Search as isize));
         }
         search.found
     }
@@ -169,13 +166,20 @@ mod windows_probe {
     unsafe fn set_alpha(hwnd: HWND, alpha: u8) {
         let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
         let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as i32);
-        let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), alpha, LWA_ALPHA);
+        let _ = SetLayeredWindowAttributes(
+            hwnd,
+            windows::Win32::Foundation::COLORREF(0),
+            alpha,
+            LWA_ALPHA,
+        );
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-        let needle = std::env::args().nth(1).unwrap_or_else(|| "minecraft".into());
-        let (hwnd, title) = find_window(&needle)
-            .ok_or_else(|| format!("no visible window matching {needle:?}"))?;
+        let needle = std::env::args()
+            .nth(1)
+            .unwrap_or_else(|| "minecraft".into());
+        let (hwnd, title) =
+            find_window(&needle).ok_or_else(|| format!("no visible window matching {needle:?}"))?;
         println!("target: {title:?} (hwnd {:?})\n", hwnd.0);
 
         let window = Duration::from_secs(3);
@@ -185,7 +189,12 @@ mod windows_probe {
         println!("{}", "-".repeat(56));
 
         let base = count_frames(hwnd, window)?;
-        println!("{:<34} {:>8}  {:>9.1}", "1. normal, visible", base, fps(base));
+        println!(
+            "{:<34} {:>8}  {:>9.1}",
+            "1. normal, visible",
+            base,
+            fps(base)
+        );
 
         unsafe { set_alpha(hwnd, 0) };
         std::thread::sleep(Duration::from_millis(500));

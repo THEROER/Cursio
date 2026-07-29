@@ -12,7 +12,9 @@
 async fn main() {
     use cursio_audio::wasapi_backend::WasapiSink;
 
-    let name = std::env::args().nth(1).unwrap_or_else(|| "CABLE".to_string());
+    let name = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "CABLE".to_string());
     println!("opening render on a device matching: {name:?}");
 
     match WasapiSink::open_device(1, name.clone(), "Cursio probe".to_string()) {

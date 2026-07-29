@@ -170,7 +170,10 @@ mod tests {
 
         // Everything but Z: taken — a downward search must land on it.
         let almost_full = u32::MAX & !(1 << (b'Z' - b'A'));
-        assert_eq!(('D'..='Z').rev().find(|c| !taken(almost_full, *c)), Some('Z'));
+        assert_eq!(
+            ('D'..='Z').rev().find(|c| !taken(almost_full, *c)),
+            Some('Z')
+        );
 
         // Nothing free is an error, not a silent collision.
         assert_eq!(('D'..='Z').rev().find(|c| !taken(u32::MAX, *c)), None);
@@ -195,7 +198,11 @@ mod tests {
     /// looks plausible.
     #[test]
     fn extreme_timestamps_clamp() {
-        assert_eq!(to_filetime(i64::MIN), 0, "far past clamps to the FILETIME epoch");
+        assert_eq!(
+            to_filetime(i64::MIN),
+            0,
+            "far past clamps to the FILETIME epoch"
+        );
         // Far future saturates instead of wrapping to a small number.
         assert!(to_filetime(i64::MAX) > 0);
     }

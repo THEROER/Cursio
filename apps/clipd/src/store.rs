@@ -134,7 +134,12 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
-        let store = Store { conn, blobs, max_items: DEFAULT_MAX_ITEMS, max_bytes: DEFAULT_MAX_BYTES };
+        let store = Store {
+            conn,
+            blobs,
+            max_items: DEFAULT_MAX_ITEMS,
+            max_bytes: DEFAULT_MAX_BYTES,
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -301,7 +306,11 @@ impl Store {
     fn find_by_digest(&self, digest: &str) -> Result<Option<i64>> {
         Ok(self
             .conn
-            .query_row("SELECT id FROM items WHERE digest = ?1", params![digest], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM items WHERE digest = ?1",
+                params![digest],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
@@ -312,9 +321,7 @@ impl Store {
              FROM items ORDER BY pinned DESC, seq DESC LIMIT ?1",
         )?;
         let blobs = self.blobs.clone();
-        let rows = stmt.query_map(params![limit as i64], move |row| {
-            row_to_item(row, &blobs)
-        })?;
+        let rows = stmt.query_map(params![limit as i64], move |row| row_to_item(row, &blobs))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -393,8 +400,10 @@ impl Store {
 
     /// Delete one item.
     pub fn remove(&mut self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM reps WHERE item_id = ?1", params![id])?;
-        self.conn.execute("DELETE FROM items WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM reps WHERE item_id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM items WHERE id = ?1", params![id])?;
         self.collect_orphan_blobs()
     }
 
@@ -404,7 +413,8 @@ impl Store {
             "DELETE FROM reps WHERE item_id IN (SELECT id FROM items WHERE pinned = 0)",
             [],
         )?;
-        self.conn.execute("DELETE FROM items WHERE pinned = 0", [])?;
+        self.conn
+            .execute("DELETE FROM items WHERE pinned = 0", [])?;
         self.collect_orphan_blobs()
     }
 
@@ -426,9 +436,9 @@ impl Store {
 
         // Byte limit: drop oldest unpinned until the total fits.
         loop {
-            let total: i64 = self
-                .conn
-                .query_row("SELECT COALESCE(SUM(size), 0) FROM items", [], |r| r.get(0))?;
+            let total: i64 =
+                self.conn
+                    .query_row("SELECT COALESCE(SUM(size), 0) FROM items", [], |r| r.get(0))?;
             if (total as u64) <= self.max_bytes {
                 break;
             }
@@ -442,7 +452,8 @@ impl Store {
                 .optional()?;
             match oldest {
                 Some(id) => {
-                    self.conn.execute("DELETE FROM items WHERE id = ?1", params![id])?;
+                    self.conn
+                        .execute("DELETE FROM items WHERE id = ?1", params![id])?;
                 }
                 // Only pinned items left: they are exempt, so stop rather than
                 // loop forever.
@@ -463,14 +474,18 @@ impl Store {
     /// Blobs are shared by digest, so a file may outlive the row that created
     /// it; only a file with no referrers at all is safe to remove.
     fn collect_orphan_blobs(&self) -> Result<()> {
-        let mut stmt = self.conn.prepare("SELECT DISTINCT blob FROM reps WHERE blob IS NOT NULL")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT blob FROM reps WHERE blob IS NOT NULL")?;
         let mut referenced: std::collections::HashSet<String> = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<_, _>>()?;
 
         // Thumbnails live in the same directory and are referenced from `items`,
         // not `reps` — missing them here would delete every preview.
-        let mut thumbs = self.conn.prepare("SELECT DISTINCT thumb FROM items WHERE thumb IS NOT NULL")?;
+        let mut thumbs = self
+            .conn
+            .prepare("SELECT DISTINCT thumb FROM items WHERE thumb IS NOT NULL")?;
         for name in thumbs.query_map([], |r| r.get::<_, String>(0))? {
             referenced.insert(name?);
         }
@@ -489,10 +504,12 @@ impl Store {
 
     /// Total number of items and bytes held.
     pub fn stats(&self) -> Result<(usize, u64)> {
-        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
-        let bytes: i64 = self
+        let count: i64 = self
             .conn
-            .query_row("SELECT COALESCE(SUM(size), 0) FROM items", [], |r| r.get(0))?;
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
+        let bytes: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM items", [], |r| r.get(0))?;
         Ok((count as usize, bytes as u64))
     }
 }
@@ -542,8 +559,7 @@ fn write_blob(dir: &Path, bytes: &[u8]) -> Result<String> {
     let name = hex_digest(bytes);
     let path = dir.join(&name);
     if !path.exists() {
-        std::fs::write(&path, bytes)
-            .with_context(|| format!("writing blob {}", path.display()))?;
+        std::fs::write(&path, bytes).with_context(|| format!("writing blob {}", path.display()))?;
     }
     Ok(name)
 }
@@ -675,7 +691,10 @@ mod tests {
         let buffer = image::RgbaImage::from_pixel(width, height, image::Rgba([10, 120, 220, 255]));
         let mut bytes = Vec::new();
         buffer
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
         ClipboardContent::single(ClipboardFormat::ImagePng, bytes)
     }
@@ -694,11 +713,18 @@ mod tests {
         let (mut s, dir) = store();
         s.insert(&png(50_000)).unwrap();
 
-        let blobs: Vec<_> = std::fs::read_dir(dir.path().join("blobs")).unwrap().collect();
+        let blobs: Vec<_> = std::fs::read_dir(dir.path().join("blobs"))
+            .unwrap()
+            .collect();
         assert_eq!(blobs.len(), 1, "image should be stored as one blob file");
 
-        let db_len = std::fs::metadata(dir.path().join("history.db")).unwrap().len();
-        assert!(db_len < 50_000, "database grew to {db_len}; image leaked into it");
+        let db_len = std::fs::metadata(dir.path().join("history.db"))
+            .unwrap()
+            .len();
+        assert!(
+            db_len < 50_000,
+            "database grew to {db_len}; image leaked into it"
+        );
     }
 
     #[test]
@@ -741,9 +767,11 @@ mod tests {
     #[test]
     fn count_limit_evicts_oldest() {
         let (mut s, _d) = store();
-        let mut s = std::mem::replace(&mut s, Store::open(_d.path()).unwrap()).with_limits(3, u64::MAX);
+        let mut s =
+            std::mem::replace(&mut s, Store::open(_d.path()).unwrap()).with_limits(3, u64::MAX);
         for i in 0..5 {
-            s.insert(&ClipboardContent::text(format!("item {i}"))).unwrap();
+            s.insert(&ClipboardContent::text(format!("item {i}")))
+                .unwrap();
         }
         let items = s.recent(10).unwrap();
         assert_eq!(items.len(), 3);
@@ -754,12 +782,15 @@ mod tests {
     fn byte_limit_evicts_and_frees_blobs() {
         // A byte limit is what stops a handful of screenshots filling a disk.
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Store::open(dir.path()).unwrap().with_limits(usize::MAX, 20_000);
+        let mut s = Store::open(dir.path())
+            .unwrap()
+            .with_limits(usize::MAX, 20_000);
         for i in 0..5 {
             // Distinct content so each gets its own blob.
             let mut bytes = vec![0u8; 10_000];
             bytes[0] = i;
-            s.insert(&ClipboardContent::single(ClipboardFormat::ImagePng, bytes)).unwrap();
+            s.insert(&ClipboardContent::single(ClipboardFormat::ImagePng, bytes))
+                .unwrap();
         }
         let (count, total) = s.stats().unwrap();
         assert!(total <= 20_000, "total {total} exceeds the limit");
@@ -777,7 +808,8 @@ mod tests {
         s.set_pinned(keep, true).unwrap();
 
         for i in 0..5 {
-            s.insert(&ClipboardContent::text(format!("noise {i}"))).unwrap();
+            s.insert(&ClipboardContent::text(format!("noise {i}")))
+                .unwrap();
         }
         assert!(s.load(keep).is_ok(), "pinned item was evicted");
     }
@@ -811,7 +843,8 @@ mod tests {
         // Unescaped, "%" would match every row.
         let (mut s, _d) = store();
         s.insert(&ClipboardContent::text("50% off")).unwrap();
-        s.insert(&ClipboardContent::text("nothing special")).unwrap();
+        s.insert(&ClipboardContent::text("nothing special"))
+            .unwrap();
 
         assert_eq!(s.search("%", 10).unwrap().len(), 1);
         assert_eq!(s.search("50%", 10).unwrap().len(), 1);
@@ -822,7 +855,9 @@ mod tests {
         // The picker renders one item per line, so a preview must not contain
         // newlines or the list breaks apart.
         let (mut s, _d) = store();
-        let id = s.insert(&ClipboardContent::text("first\nsecond\tthird")).unwrap();
+        let id = s
+            .insert(&ClipboardContent::text("first\nsecond\tthird"))
+            .unwrap();
         let item = s.recent(1).unwrap().into_iter().next().unwrap();
         assert_eq!(item.id, id);
         assert!(!item.preview.contains('\n') && !item.preview.contains('\t'));
@@ -837,7 +872,11 @@ mod tests {
 
         let item = s.recent(1).unwrap().into_iter().next().unwrap();
         assert!(item.preview.chars().count() <= PREVIEW_CHARS + 1);
-        assert_eq!(s.load(id).unwrap().as_text(), Some(long.as_str()), "full text must survive");
+        assert_eq!(
+            s.load(id).unwrap().as_text(),
+            Some(long.as_str()),
+            "full text must survive"
+        );
     }
 
     #[test]
@@ -856,7 +895,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Store::open(dir.path()).unwrap();
         let mut content = ClipboardContent::text("caption");
-        content.insert(ClipboardEntry::loaded(ClipboardFormat::ImagePng, vec![1, 2, 3]));
+        content.insert(ClipboardEntry::loaded(
+            ClipboardFormat::ImagePng,
+            vec![1, 2, 3],
+        ));
         let id = s.insert(&content).unwrap();
 
         for blob in std::fs::read_dir(dir.path().join("blobs")).unwrap() {
@@ -871,12 +913,18 @@ mod tests {
     fn multi_format_item_keeps_every_representation() {
         let (mut s, _d) = store();
         let mut content = ClipboardContent::text("plain");
-        content.insert(ClipboardEntry::loaded(ClipboardFormat::Html, b"<b>rich</b>".to_vec()));
+        content.insert(ClipboardEntry::loaded(
+            ClipboardFormat::Html,
+            b"<b>rich</b>".to_vec(),
+        ));
         let id = s.insert(&content).unwrap();
 
         let back = s.load(id).unwrap();
         assert_eq!(back.as_text(), Some("plain"));
-        assert_eq!(back.bytes(&ClipboardFormat::Html), Some(&b"<b>rich</b>"[..]));
+        assert_eq!(
+            back.bytes(&ClipboardFormat::Html),
+            Some(&b"<b>rich</b>"[..])
+        );
     }
 
     #[test]
@@ -884,10 +932,16 @@ mod tests {
         // Representations may be read in any order; the same item must not be
         // recorded twice because of it.
         let mut a = ClipboardContent::text("body");
-        a.insert(ClipboardEntry::loaded(ClipboardFormat::Html, b"<p>body</p>".to_vec()));
+        a.insert(ClipboardEntry::loaded(
+            ClipboardFormat::Html,
+            b"<p>body</p>".to_vec(),
+        ));
 
         let mut b = ClipboardContent::single(ClipboardFormat::Html, b"<p>body</p>".to_vec());
-        b.insert(ClipboardEntry::loaded(ClipboardFormat::Text, b"body".to_vec()));
+        b.insert(ClipboardEntry::loaded(
+            ClipboardFormat::Text,
+            b"body".to_vec(),
+        ));
 
         assert_eq!(content_digest(&a), content_digest(&b));
     }
@@ -900,7 +954,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Store::open(dir.path()).unwrap().with_limits(3, u64::MAX);
         for i in 0..6 {
-            s.insert(&ClipboardContent::text(format!("item {i}"))).unwrap();
+            s.insert(&ClipboardContent::text(format!("item {i}")))
+                .unwrap();
         }
 
         let items = s.recent(10).unwrap();
@@ -936,7 +991,11 @@ mod tests {
         // no extension for `image::open` to sniff.
         let decoded = image::load_from_memory(&std::fs::read(&thumb).unwrap()).unwrap();
         assert!(decoded.width() <= THUMB_MAX_EDGE && decoded.height() <= THUMB_MAX_EDGE);
-        assert_eq!(decoded.width() * 3, decoded.height() * 4, "aspect ratio should hold");
+        assert_eq!(
+            decoded.width() * 3,
+            decoded.height() * 4,
+            "aspect ratio should hold"
+        );
     }
 
     #[test]
@@ -950,7 +1009,10 @@ mod tests {
 
         let item = s.recent(1).unwrap().into_iter().next().unwrap();
         let thumb_len = std::fs::metadata(item.thumbnail.unwrap()).unwrap().len();
-        assert!(thumb_len < original_len, "thumb {thumb_len} vs original {original_len}");
+        assert!(
+            thumb_len < original_len,
+            "thumb {thumb_len} vs original {original_len}"
+        );
     }
 
     #[test]
@@ -983,8 +1045,14 @@ mod tests {
         s.prune().unwrap();
 
         for item in s.recent(10).unwrap() {
-            let thumb = item.thumbnail.expect("surviving image should keep its thumbnail");
-            assert!(thumb.exists(), "thumbnail {} was garbage-collected", thumb.display());
+            let thumb = item
+                .thumbnail
+                .expect("surviving image should keep its thumbnail");
+            assert!(
+                thumb.exists(),
+                "thumbnail {} was garbage-collected",
+                thumb.display()
+            );
         }
     }
 
@@ -1023,7 +1091,9 @@ mod tests {
         assert!(items[0].thumbnail.is_none());
 
         // And the migrated database must still accept new items.
-        store.insert(&ClipboardContent::text("after upgrade")).unwrap();
+        store
+            .insert(&ClipboardContent::text("after upgrade"))
+            .unwrap();
         assert_eq!(store.recent(10).unwrap()[0].preview, "after upgrade");
     }
 

@@ -199,7 +199,10 @@ async fn main() -> anyhow::Result<()> {
             // The CLI's only job for modules is to build the registry; from here
             // on nothing names a specific module.
             let modules = module_registry(
-                &AudioOpts { audio, audio_render_device },
+                &AudioOpts {
+                    audio,
+                    audio_render_device,
+                },
                 clipboard,
                 files,
                 share_window,
@@ -275,19 +278,13 @@ fn module_registry(
     // Windows. A MinGW build has neither — `winfsp-sys` refuses that target —
     // so there the flag is accepted and does nothing, rather than failing a
     // session over a capability this binary genuinely cannot honour.
-    #[cfg(any(
-        target_os = "linux",
-        all(target_os = "windows", target_env = "msvc")
-    ))]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
     {
         registry = registry.with(Box::new(cursio_core::files_session::FilesFactory {
             enabled: files,
         }));
     }
-    #[cfg(not(any(
-        target_os = "linux",
-        all(target_os = "windows", target_env = "msvc")
-    )))]
+    #[cfg(not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))))]
     let _ = files;
 
     registry
@@ -532,7 +529,6 @@ fn spawn_peer_session(
     });
 }
 
-
 /// Pair with a new machine, then exit.
 ///
 /// This is a **setup** step, not a way to run Cursio: joining is the one moment
@@ -554,7 +550,12 @@ async fn join(
         Some(a) => a,
         None => {
             tracing::info!("browsing the LAN for a peer to pair with");
-            match cursio_core::link::discover_one(identity.peer_id, Duration::from_secs(discover_timeout_secs)).await {
+            match cursio_core::link::discover_one(
+                identity.peer_id,
+                Duration::from_secs(discover_timeout_secs),
+            )
+            .await
+            {
                 Some(peer) => {
                     tracing::info!(peer = %peer.display_name, addr = %peer.addr, "discovered peer");
                     peer.addr
@@ -574,13 +575,8 @@ async fn join(
 
     // Hello first, so we know who we're pairing with before spending a password
     // on them. Pairing is a one-shot: it runs no modules, so it advertises none.
-    let peer = session::handshake(
-        &mut transport,
-        &identity,
-        session::local_device_kind(),
-        &[],
-    )
-    .await?;
+    let peer =
+        session::handshake(&mut transport, &identity, session::local_device_kind(), &[]).await?;
     tracing::info!(peer = %peer.display_name, id = %peer.peer_id, "handshake ok");
 
     let mut store = TrustStore::load()?;
@@ -1240,8 +1236,6 @@ async fn list_peers(identity: NodeIdentity, timeout_secs: u64) -> anyhow::Result
     tracing::info!("done; {found} peer(s) found");
     Ok(())
 }
-
-
 
 /// mDNS instance names must be simple; strip anything awkward from the hostname.
 fn sanitize_instance(name: &str) -> String {

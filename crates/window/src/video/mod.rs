@@ -46,7 +46,11 @@ pub(crate) fn contains_keyframe(packet: &[u8]) -> bool {
             && i + 4 < packet.len()
             && packet[i + 3] == 1;
         if is_start || is_long {
-            let nal = if is_long { packet[i + 4] } else { packet[i + 3] };
+            let nal = if is_long {
+                packet[i + 4]
+            } else {
+                packet[i + 3]
+            };
             match nal & 0x1F {
                 // 5 = IDR slice; 7 = SPS, which the encoder emits immediately
                 // before an IDR, so either marks a valid entry point.

@@ -190,7 +190,6 @@ pub enum Message {
     /// else the audio module says — advertisements, gain, device and route state
     /// — is enveloped as [`audio::AudioMsg`].
     AudioChunk(audio::AudioChunk),
-
     // Clipboard traffic is no longer here: it moved to `Message::Module` with
     // `ModuleId::CLIPBOARD`, carrying `clipboard::ClipboardMsg`. It was migrated
     // first because it is pure bulk — no per-frame hot path to pay an extra
@@ -334,7 +333,11 @@ impl Message {
         module: ModuleId,
     ) -> Result<Option<T>, ProtocolError> {
         match self {
-            Message::Module { module: id, payload, .. } if *id == module => {
+            Message::Module {
+                module: id,
+                payload,
+                ..
+            } if *id == module => {
                 let decoded = bincode::deserialize(payload)
                     .map_err(|e| ProtocolError::Decode(e.to_string()))?;
                 Ok(Some(decoded))
@@ -428,11 +431,17 @@ mod tests {
     /// `Ok(None)` (not an error) is what lets a module claim-or-decline.
     #[test]
     fn a_module_does_not_decode_another_modules_frame() {
-        let msg = Message::module(ModuleId::AUDIO, Priority::Audio, &FakeModuleMsg::Ping(1)).unwrap();
+        let msg =
+            Message::module(ModuleId::AUDIO, Priority::Audio, &FakeModuleMsg::Ping(1)).unwrap();
 
-        let other = msg.decode_module::<FakeModuleMsg>(ModuleId::CLIPBOARD).unwrap();
+        let other = msg
+            .decode_module::<FakeModuleMsg>(ModuleId::CLIPBOARD)
+            .unwrap();
 
-        assert_eq!(other, None, "a frame addressed to audio was decoded by clipboard");
+        assert_eq!(
+            other, None,
+            "a frame addressed to audio was decoded by clipboard"
+        );
     }
 
     /// The scheduler ranks an envelope without decoding it, so the declared

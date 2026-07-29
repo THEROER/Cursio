@@ -93,8 +93,12 @@ pub fn screen_size() -> Option<crate::drag_trigger::ScreenBounds> {
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     };
     // SAFETY: a pure query with no arguments to get wrong.
-    let (width, height) =
-        unsafe { (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) };
+    let (width, height) = unsafe {
+        (
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
     if width <= 0 || height <= 0 {
         return None;
     }

@@ -596,7 +596,11 @@ impl FileSystemContext for RemoteFs {
                         context.path.clone()
                     } else {
                         // The parent of the volume root is the mount root.
-                        context.path.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or_default()
+                        context
+                            .path
+                            .rsplit_once('/')
+                            .map(|(p, _)| p.to_string())
+                            .unwrap_or_default()
                     };
                     fill_info_at(
                         info.file_info_mut(),
@@ -707,7 +711,9 @@ impl FileSystemContext for RemoteFs {
             self.peer
                 .mkdir(&volume, &path)
                 .map_err(|e| to_ntstatus(&e))?;
-            let meta = self.stat_path(&volume, &path).map_err(|e| to_ntstatus(&e))?;
+            let meta = self
+                .stat_path(&volume, &path)
+                .map_err(|e| to_ntstatus(&e))?;
             fill_info(file_info.as_mut(), &meta);
             set_normalized_name(file_info, file_name);
             return Ok(FileCtx {
@@ -878,9 +884,7 @@ fn load_winfsp_dll() -> anyhow::Result<()> {
     // Safe: `wide` is a valid NUL-terminated path that outlives the call. The
     // returned handle is intentionally leaked — the library must stay loaded for
     // the life of the process, since every later WinFsp call binds through it.
-    let handle = unsafe {
-        windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr())
-    };
+    let handle = unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr()) };
     if handle.is_null() {
         anyhow::bail!("cannot load {}", dll.display());
     }
@@ -895,10 +899,7 @@ fn load_winfsp_dll() -> anyhow::Result<()> {
 /// 32-bit view of the registry, which is where the (32-bit) installer writes
 /// them regardless of the machine's architecture.
 fn winfsp_dll_dir() -> Option<std::path::PathBuf> {
-    for key in [
-        r"SOFTWARE\WOW6432Node\WinFsp",
-        r"SOFTWARE\WinFsp",
-    ] {
+    for key in [r"SOFTWARE\WOW6432Node\WinFsp", r"SOFTWARE\WinFsp"] {
         for value in ["SxsDir", "InstallDir"] {
             if let Some(dir) = read_registry_string(key, value) {
                 let path = std::path::PathBuf::from(dir);
@@ -914,9 +915,7 @@ fn winfsp_dll_dir() -> Option<std::path::PathBuf> {
 /// Read one `HKEY_LOCAL_MACHINE` string value.
 fn read_registry_string(subkey: &str, value: &str) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::System::Registry::{
-        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
-    };
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 
     let wide = |s: &str| -> Vec<u16> {
         std::ffi::OsStr::new(s)
@@ -1053,7 +1052,7 @@ pub fn mount(peer: PeerLink, peer_name: &str) -> anyhow::Result<MountHandle> {
 
     let mut host: FileSystemHost<RemoteFs> =
         FileSystemHost::new(params, RemoteFs::new(peer, peer_name))
-        .map_err(|e| anyhow::anyhow!("cannot create the filesystem host: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("cannot create the filesystem host: {e:?}"))?;
 
     // Name the drive letter explicitly.
     //

@@ -108,7 +108,13 @@ impl WinInjector {
 fn send_input(input: &INPUT) -> Result<(), InputError> {
     // SAFETY: `input` is a fully-initialised INPUT; we pass a valid pointer and
     // the matching struct size, as SendInput requires.
-    let sent = unsafe { SendInput(1, input as *const INPUT, std::mem::size_of::<INPUT>() as i32) };
+    let sent = unsafe {
+        SendInput(
+            1,
+            input as *const INPUT,
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
     if sent == 1 {
         Ok(())
     } else {

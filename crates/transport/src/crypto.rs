@@ -580,7 +580,9 @@ mod tests {
     #[async_trait]
     impl TransportTx for MemTx {
         async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-            self.tx.send(msg.clone()).map_err(|_| TransportError::Closed)
+            self.tx
+                .send(msg.clone())
+                .map_err(|_| TransportError::Closed)
         }
     }
 
@@ -715,9 +717,6 @@ mod tests {
         assert_eq!(resp.recv().await.unwrap(), big);
 
         init.send(&Message::Heartbeat { nonce: 42 }).await.unwrap();
-        assert_eq!(
-            resp.recv().await.unwrap(),
-            Message::Heartbeat { nonce: 42 }
-        );
+        assert_eq!(resp.recv().await.unwrap(), Message::Heartbeat { nonce: 42 });
     }
 }

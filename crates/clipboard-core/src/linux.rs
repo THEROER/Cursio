@@ -155,9 +155,10 @@ fn encode_png(image: &arboard::ImageData<'_>) -> Result<Vec<u8>, ClipboardError>
     let height = u32::try_from(image.height)
         .map_err(|_| ClipboardError::Backend("image height out of range".to_string()))?;
 
-    let buffer = image::RgbaImage::from_raw(width, height, image.bytes.to_vec()).ok_or_else(
-        || ClipboardError::Backend("clipboard image pixel buffer has the wrong length".to_string()),
-    )?;
+    let buffer =
+        image::RgbaImage::from_raw(width, height, image.bytes.to_vec()).ok_or_else(|| {
+            ClipboardError::Backend("clipboard image pixel buffer has the wrong length".to_string())
+        })?;
 
     let mut png = Vec::new();
     buffer
@@ -360,7 +361,10 @@ pub fn watch(selection: Selection) -> Result<WatchHandle, ClipboardError> {
         tracing::debug!("clipboard watch ended");
     });
 
-    Ok(WatchHandle { changes, _stop: Box::new(StopGuard(stop)) })
+    Ok(WatchHandle {
+        changes,
+        _stop: Box::new(StopGuard(stop)),
+    })
 }
 
 /// A cheap value that changes whenever the clipboard's contents change.
@@ -429,8 +433,10 @@ fn encoded_fingerprint(selection: Selection) -> Option<String> {
     Some(format!(
         "{}:{:x?}:{:x?}",
         bytes.len(),
-        head.iter().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64)),
-        tail.iter().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64)),
+        head.iter()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64)),
+        tail.iter()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64)),
     ))
 }
 

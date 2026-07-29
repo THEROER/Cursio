@@ -172,7 +172,12 @@ impl FileServer {
     }
 
     /// Read from an open handle. Returns fewer bytes than asked at end of file.
-    pub fn read(&mut self, handle: FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, FileError> {
+    pub fn read(
+        &mut self,
+        handle: FileHandle,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, FileError> {
         let open = self.open.get_mut(&handle).ok_or(FileError::BadHandle)?;
         open.file
             .seek(SeekFrom::Start(offset))
@@ -195,7 +200,12 @@ impl FileServer {
     }
 
     /// Write to an open handle.
-    pub fn write(&mut self, handle: FileHandle, offset: u64, bytes: &[u8]) -> Result<u64, FileError> {
+    pub fn write(
+        &mut self,
+        handle: FileHandle,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<u64, FileError> {
         let open = self.open.get_mut(&handle).ok_or(FileError::BadHandle)?;
         if !open.writable {
             return Err(FileError::ReadOnly);
@@ -459,7 +469,10 @@ mod tests {
         let (total, free) = capacity_of(Path::new("/nonexistent/path/for/this/test"));
         assert_eq!(total, FALLBACK_TOTAL);
         assert_eq!(free, FALLBACK_FREE);
-        assert!(total > 0 && free > 0, "the fallback itself must be non-zero");
+        assert!(
+            total > 0 && free > 0,
+            "the fallback itself must be non-zero"
+        );
     }
 
     /// Every detected volume carries a usable capacity, since that is what the
@@ -612,10 +625,15 @@ mod tests {
             Err(FileError::ReadOnly)
         ));
         assert!(matches!(srv.mkdir("R:", "new"), Err(FileError::ReadOnly)));
-        assert!(matches!(srv.remove("R:", "f.txt"), Err(FileError::ReadOnly)));
+        assert!(matches!(
+            srv.remove("R:", "f.txt"),
+            Err(FileError::ReadOnly)
+        ));
 
         // Reading still works — that is the point of a read-only share.
-        let (h, _) = srv.open("R:", "f.txt", OpenMode::read_only()).expect("opens");
+        let (h, _) = srv
+            .open("R:", "f.txt", OpenMode::read_only())
+            .expect("opens");
         assert_eq!(srv.read(h, 0, 4).expect("reads"), b"data");
     }
 
@@ -629,7 +647,10 @@ mod tests {
         let srv = server_on(tmp.path());
 
         let entries = srv.read_dir("T:", "").expect("lists");
-        let link = entries.iter().find(|e| e.name == "escape").expect("present");
+        let link = entries
+            .iter()
+            .find(|e| e.name == "escape")
+            .expect("present");
         assert_eq!(
             link.kind,
             FileKind::Symlink,

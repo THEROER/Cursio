@@ -32,7 +32,9 @@ use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
     IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
@@ -79,7 +81,9 @@ impl ClipboardGuard {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        Err(ClipboardError::Backend("could not open the clipboard".into()))
+        Err(ClipboardError::Backend(
+            "could not open the clipboard".into(),
+        ))
     }
 }
 
@@ -193,8 +197,7 @@ fn register_format(name: &str) -> u32 {
 /// The clipboard must already be open (held by a [`ClipboardGuard`]).
 fn read_bytes(format: u32) -> Result<Vec<u8>, ClipboardError> {
     unsafe {
-        let handle: HANDLE =
-            GetClipboardData(format).map_err(|_| ClipboardError::OwnerGone)?;
+        let handle: HANDLE = GetClipboardData(format).map_err(|_| ClipboardError::OwnerGone)?;
         if handle.0.is_null() {
             return Err(ClipboardError::OwnerGone);
         }
@@ -329,7 +332,9 @@ pub fn watch(_selection: Selection) -> Result<WatchHandle, ClipboardError> {
             _stop: Box::new(WatchStop { _handle: handle }),
         }),
         Ok(Err(e)) => Err(ClipboardError::Backend(e)),
-        Err(_) => Err(ClipboardError::Backend("watcher thread died at startup".into())),
+        Err(_) => Err(ClipboardError::Backend(
+            "watcher thread died at startup".into(),
+        )),
     }
 }
 
@@ -356,8 +361,8 @@ fn watch_thread(
 
     let class_name: Vec<u16> = "CursioClipboardWatch\0".encode_utf16().collect();
     unsafe {
-        let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-            .unwrap_or_default();
+        let hinstance =
+            windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
         let wc = WNDCLASSW {
             lpfnWndProc: Some(watch_wndproc),
             hInstance: hinstance.into(),

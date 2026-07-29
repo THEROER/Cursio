@@ -207,20 +207,22 @@ fn run_worker(
         match job {
             Job::List(reply) => {
                 let result = match open(&mut clipboard) {
-                    Ok(()) => clipboard
-                        .as_mut()
-                        .unwrap()
-                        .read(Selection::Clipboard)
-                        .map(|content| {
-                            content
-                                .entries
-                                .iter()
-                                .map(|e| ClipboardFormatOffer {
-                                    format: e.format.clone(),
-                                    size: e.size,
-                                })
-                                .collect()
-                        }),
+                    Ok(()) => {
+                        clipboard
+                            .as_mut()
+                            .unwrap()
+                            .read(Selection::Clipboard)
+                            .map(|content| {
+                                content
+                                    .entries
+                                    .iter()
+                                    .map(|e| ClipboardFormatOffer {
+                                        format: e.format.clone(),
+                                        size: e.size,
+                                    })
+                                    .collect()
+                            })
+                    }
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(result);
@@ -232,10 +234,22 @@ fn run_worker(
                         .unwrap()
                         .load(Selection::Clipboard, &format)
                     {
-                        Ok(bytes) => ReadReply::Ok { generation, format, bytes },
-                        Err(error) => ReadReply::Failed { generation, format, error },
+                        Ok(bytes) => ReadReply::Ok {
+                            generation,
+                            format,
+                            bytes,
+                        },
+                        Err(error) => ReadReply::Failed {
+                            generation,
+                            format,
+                            error,
+                        },
                     },
-                    Err(error) => ReadReply::Failed { generation, format, error },
+                    Err(error) => ReadReply::Failed {
+                        generation,
+                        format,
+                        error,
+                    },
                 };
                 let _ = reads.send(reply);
             }

@@ -239,7 +239,9 @@ impl VadDevice {
 
     /// Tear the endpoint pair back down.
     fn remove_endpoint(&self, id: AudioStreamId) -> Result<(), AudioError> {
-        let arg = EndpointIdArg { id: endpoint_id(id) };
+        let arg = EndpointIdArg {
+            id: endpoint_id(id),
+        };
         self.ioctl(IOCTL_REMOVE_ENDPOINT, Some(as_bytes(&arg)), None)?;
         Ok(())
     }
@@ -283,9 +285,7 @@ fn as_bytes<T>(value: &T) -> &[u8] {
 }
 
 fn as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
-    unsafe {
-        std::slice::from_raw_parts_mut(value as *mut T as *mut u8, std::mem::size_of::<T>())
-    }
+    unsafe { std::slice::from_raw_parts_mut(value as *mut T as *mut u8, std::mem::size_of::<T>()) }
 }
 
 /// Is the Cursio virtual audio driver installed and speaking our protocol?
@@ -396,8 +396,11 @@ fn run_render_loop(
             break;
         }
 
-        let returned = match device.ioctl(IOCTL_PULL_RENDER, Some(as_bytes(&request)), Some(&mut reply))
-        {
+        let returned = match device.ioctl(
+            IOCTL_PULL_RENDER,
+            Some(as_bytes(&request)),
+            Some(&mut reply),
+        ) {
             Ok(n) => n as usize,
             Err(e) => {
                 tracing::warn!(stream = %id, error = %e, "vad: render pull failed, stopping");

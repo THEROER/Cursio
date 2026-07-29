@@ -372,16 +372,32 @@ fn build_factory() -> gtk::SignalListItemFactory {
         let list_item = list_item
             .downcast_ref::<gtk::ListItem>()
             .expect("factory items are ListItems");
-        let Some(object) = list_item.item() else { return };
-        let data = object.downcast_ref::<RowData>().expect("model holds RowData");
+        let Some(object) = list_item.item() else {
+            return;
+        };
+        let data = object
+            .downcast_ref::<RowData>()
+            .expect("model holds RowData");
         let item = data.item();
 
-        let Some(row) = list_item.child().and_downcast::<gtk::Box>() else { return };
-        let Some(media) = row.first_child().and_downcast::<gtk::Stack>() else { return };
-        let Some(text) = media.next_sibling().and_downcast::<gtk::Box>() else { return };
-        let Some(preview) = text.first_child().and_downcast::<gtk::Label>() else { return };
-        let Some(meta) = preview.next_sibling().and_downcast::<gtk::Label>() else { return };
-        let Some(pin) = text.next_sibling().and_downcast::<gtk::Image>() else { return };
+        let Some(row) = list_item.child().and_downcast::<gtk::Box>() else {
+            return;
+        };
+        let Some(media) = row.first_child().and_downcast::<gtk::Stack>() else {
+            return;
+        };
+        let Some(text) = media.next_sibling().and_downcast::<gtk::Box>() else {
+            return;
+        };
+        let Some(preview) = text.first_child().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        let Some(meta) = preview.next_sibling().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        let Some(pin) = text.next_sibling().and_downcast::<gtk::Image>() else {
+            return;
+        };
 
         preview.set_text(&item.preview);
         // Size is only worth the line for images; for a text snippet the byte
@@ -477,10 +493,14 @@ fn install_key_handling(
                 glib::Propagation::Stop
             }
             // Let the list handle movement keys itself.
-            gdk::Key::Up | gdk::Key::Down | gdk::Key::Page_Up | gdk::Key::Page_Down
-            | gdk::Key::Home | gdk::Key::End | gdk::Key::Return | gdk::Key::KP_Enter => {
-                glib::Propagation::Proceed
-            }
+            gdk::Key::Up
+            | gdk::Key::Down
+            | gdk::Key::Page_Up
+            | gdk::Key::Page_Down
+            | gdk::Key::Home
+            | gdk::Key::End
+            | gdk::Key::Return
+            | gdk::Key::KP_Enter => glib::Propagation::Proceed,
             _ => glib::Propagation::Proceed,
         }
     });
@@ -519,7 +539,9 @@ fn install_key_handling(
             let search = search.clone();
             let had_focus = had_focus.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-                let Some(window) = window_weak.upgrade() else { return };
+                let Some(window) = window_weak.upgrade() else {
+                    return;
+                };
                 if window.is_active() || !window.is_visible() {
                     return; // focus came back; it was a flicker
                 }
@@ -586,7 +608,9 @@ fn keep_above(window: &adw::ApplicationWindow) {
                     stderr = %String::from_utf8_lossy(&output.stderr).trim(),
                     "could not set the popup's window hints"
                 ),
-                Err(e) => tracing::debug!(error = %e, "xprop unavailable; popup will stack normally"),
+                Err(e) => {
+                    tracing::debug!(error = %e, "xprop unavailable; popup will stack normally")
+                }
             }
         });
     });

@@ -137,8 +137,6 @@ impl FrameDiffer {
     }
 }
 
-
-
 /// Above this fraction of the window's pixels, a change is sent through the
 /// video encoder instead of as a lossless tile.
 ///
@@ -201,16 +199,17 @@ pub fn try_queue_frames(
     if frames.is_empty() {
         return Ok(());
     }
-    let permits = tx.try_reserve_many(frames.len()).map_err(|error| match error {
-        mpsc::error::TrySendError::Full(()) => FrameQueueError::Full,
-        mpsc::error::TrySendError::Closed(()) => FrameQueueError::Closed,
-    })?;
+    let permits = tx
+        .try_reserve_many(frames.len())
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(()) => FrameQueueError::Full,
+            mpsc::error::TrySendError::Closed(()) => FrameQueueError::Closed,
+        })?;
     for (permit, frame) in permits.zip(frames) {
         permit.send(frame);
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod differ_tests {
@@ -406,10 +405,7 @@ mod differ_tests {
         }
 
         let (tx, mut rx) = mpsc::channel(2);
-        assert_eq!(
-            try_queue_frames(&tx, vec![packet(1), packet(2)]),
-            Ok(())
-        );
+        assert_eq!(try_queue_frames(&tx, vec![packet(1), packet(2)]), Ok(()));
         assert_eq!(
             try_queue_frames(&tx, vec![packet(3)]),
             Err(FrameQueueError::Full)

@@ -26,8 +26,8 @@
 //! and only channels cross the boundary, exactly like the GTK surrogate:
 //! frames in, input and acks out.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use cursio_protocol::{
     Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
@@ -36,7 +36,7 @@ use cursio_protocol::{
 use tokio::sync::mpsc;
 
 use crate::codec::decode_tile;
-use crate::{Surrogate, WindowError, WindowRenderer, presentation_ack::PresentationAcks};
+use crate::{presentation_ack::PresentationAcks, Surrogate, WindowError, WindowRenderer};
 
 mod win32;
 

@@ -467,6 +467,9 @@ mod tests {
             "the payload must be credited to its own class, got {depth:?}"
         );
         // Another class stays at zero: a bulk transfer is not audio's backlog.
-        assert_eq!(tx.queue_depth(Priority::Audio), crate::QueueDepth::default());
+        assert_eq!(
+            tx.queue_depth(Priority::Audio),
+            crate::QueueDepth::default()
+        );
     }
 }

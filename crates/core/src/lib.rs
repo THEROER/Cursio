@@ -16,10 +16,7 @@ pub mod elevate;
 /// File sharing. Present where a mount implementation exists: FUSE on Linux,
 /// WinFsp on Windows — and the latter builds only under MSVC, because
 /// `winfsp-sys` rejects every other target outright.
-#[cfg(any(
-    target_os = "linux",
-    all(target_os = "windows", target_env = "msvc")
-))]
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
 pub mod files_session;
 pub mod identity;
 /// Bringing a link up to the point a session can start: handshake, pairing,
@@ -29,8 +26,8 @@ pub mod link;
 pub mod logging;
 pub mod mesh;
 pub mod module;
-pub mod window_session;
 pub mod registry;
 pub mod session;
+pub mod window_session;
 
 pub use identity::NodeIdentity;

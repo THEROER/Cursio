@@ -35,8 +35,8 @@ use gtk::{gdk, glib};
 use tokio::sync::mpsc;
 
 use crate::{
-    Surrogate, WindowError, WindowRenderer, codec::decode_tile, framebuffer::Framebuffer,
-    presentation_ack::PresentationAcks, video_decoder::VideoDecoder,
+    codec::decode_tile, framebuffer::Framebuffer, presentation_ack::PresentationAcks,
+    video_decoder::VideoDecoder, Surrogate, WindowError, WindowRenderer,
 };
 /// Snapshot a framebuffer as a texture GTK can paint.
 ///

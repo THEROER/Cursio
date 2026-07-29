@@ -377,12 +377,7 @@ unsafe fn set_output_type(
         .and_then(|_| ty.SetUINT64(&MF_MT_FRAME_SIZE, pack_ratio(width, height)))
         .and_then(|_| ty.SetUINT64(&MF_MT_FRAME_RATE, pack_ratio(FRAME_RATE, 1)))
         .and_then(|_| ty.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1)))
-        .and_then(|_| {
-            ty.SetUINT32(
-                &MF_MT_INTERLACE_MODE,
-                MFVideoInterlace_Progressive.0 as u32,
-            )
-        })
+        .and_then(|_| ty.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32))
         // Every H.264 encoder MFT requires a bitrate on its output type, even
         // in a quality-driven rate-control mode where it is only a ceiling.
         // Sized generously: the design measured 138 Mbit/s worst case, and a
@@ -408,12 +403,7 @@ unsafe fn set_input_type(
         .and_then(|_| ty.SetUINT64(&MF_MT_FRAME_SIZE, pack_ratio(width, height)))
         .and_then(|_| ty.SetUINT64(&MF_MT_FRAME_RATE, pack_ratio(FRAME_RATE, 1)))
         .and_then(|_| ty.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1)))
-        .and_then(|_| {
-            ty.SetUINT32(
-                &MF_MT_INTERLACE_MODE,
-                MFVideoInterlace_Progressive.0 as u32,
-            )
-        })
+        .and_then(|_| ty.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32))
         .map_err(|e| WindowError::Backend(format!("describe NV12 input: {e}")))?;
 
     transform

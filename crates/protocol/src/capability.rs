@@ -231,14 +231,20 @@ pub fn negotiate(local: &[ModuleAdvert], peer: &[ModuleAdvert]) -> Negotiated {
         if mine.version != theirs.version {
             out.skipped.push((
                 mine.id,
-                SkipReason::VersionMismatch { local: mine.version, peer: theirs.version },
+                SkipReason::VersionMismatch {
+                    local: mine.version,
+                    peer: theirs.version,
+                },
             ));
             continue;
         }
         if !mine.role.compatible_with(theirs.role) {
             out.skipped.push((
                 mine.id,
-                SkipReason::RoleMismatch { local: mine.role, peer: theirs.role },
+                SkipReason::RoleMismatch {
+                    local: mine.role,
+                    peer: theirs.role,
+                },
             ));
             continue;
         }
@@ -281,15 +287,24 @@ mod tests {
     /// A stale module must not take the rest of the link down with it.
     #[test]
     fn a_version_mismatch_skips_only_that_module() {
-        let local = [ModuleAdvert::symmetric(ModuleId::AUDIO, 2), sym(ModuleId::CLIPBOARD)];
-        let peer = [ModuleAdvert::symmetric(ModuleId::AUDIO, 1), sym(ModuleId::CLIPBOARD)];
+        let local = [
+            ModuleAdvert::symmetric(ModuleId::AUDIO, 2),
+            sym(ModuleId::CLIPBOARD),
+        ];
+        let peer = [
+            ModuleAdvert::symmetric(ModuleId::AUDIO, 1),
+            sym(ModuleId::CLIPBOARD),
+        ];
 
         let n = negotiate(&local, &peer);
 
         assert_eq!(n.agreed, vec![ModuleId::CLIPBOARD]);
         assert_eq!(
             n.skipped,
-            vec![(ModuleId::AUDIO, SkipReason::VersionMismatch { local: 2, peer: 1 })]
+            vec![(
+                ModuleId::AUDIO,
+                SkipReason::VersionMismatch { local: 2, peer: 1 }
+            )]
         );
     }
 
@@ -303,7 +318,10 @@ mod tests {
         let n = negotiate(&local, &peer);
 
         assert_eq!(n.agreed, vec![ModuleId::CLIPBOARD]);
-        assert!(n.skipped.is_empty(), "an unknown peer module was reported as a problem");
+        assert!(
+            n.skipped.is_empty(),
+            "an unknown peer module was reported as a problem"
+        );
     }
 
     /// A phone touchpad (Source) pairs with a desktop injector (Sink); two
@@ -315,7 +333,10 @@ mod tests {
         assert_eq!(negotiate(&phone, &desktop).agreed, vec![ModuleId::INPUT]);
 
         let n = negotiate(&phone, &phone);
-        assert!(n.agreed.is_empty(), "two sources negotiated a module with no direction of flow");
+        assert!(
+            n.agreed.is_empty(),
+            "two sources negotiated a module with no direction of flow"
+        );
         assert!(matches!(n.skipped[0].1, SkipReason::RoleMismatch { .. }));
     }
 

@@ -126,7 +126,11 @@ mod tests {
         let local = PeerId::from_u128(1);
         let remote = PeerId::from_u128(9);
         let mut reg = PeerRegistry::default();
-        reg.admit(remote, "peer".into(), Some("127.0.0.1:9000".parse().unwrap()));
+        reg.admit(
+            remote,
+            "peer".into(),
+            Some("127.0.0.1:9000".parse().unwrap()),
+        );
         let reg = shared(reg);
 
         assert_eq!(next_dial_targets(local, &reg).len(), 1);
@@ -142,7 +146,11 @@ mod tests {
         let local = PeerId::from_u128(1);
         let remote = PeerId::from_u128(9);
         let mut reg = PeerRegistry::default();
-        reg.admit(remote, "peer".into(), Some("127.0.0.1:9000".parse().unwrap()));
+        reg.admit(
+            remote,
+            "peer".into(),
+            Some("127.0.0.1:9000".parse().unwrap()),
+        );
         let reg = shared(reg);
 
         assert_eq!(next_dial_targets(local, &reg).len(), 1);

@@ -32,12 +32,12 @@ pub mod codec;
 
 #[cfg(target_os = "linux")]
 pub mod pipewire_backend;
-#[cfg(target_os = "windows")]
-pub mod wasapi_backend;
 /// Drives the Cursio virtual audio driver, which is what gives Windows the
 /// same per-device parity Linux gets from PipeWire.
 #[cfg(target_os = "windows")]
 pub mod vad_client;
+#[cfg(target_os = "windows")]
+pub mod wasapi_backend;
 
 use cursio_protocol::{
     AudioChunk, AudioFrameAck, AudioStreamCloseReason, AudioStreamId, AudioStreamMeta,
@@ -402,9 +402,7 @@ impl Capture {
     }
 
     /// The stream advertisement to send before any chunk.
-    pub fn advertisements(
-        &mut self,
-    ) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta> {
+    pub fn advertisements(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta> {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             self.inner.advertisements()
@@ -463,9 +461,7 @@ impl Playback {
         #[cfg(target_os = "windows")]
         {
             let inner = match device {
-                Some(name) => {
-                    wasapi_backend::WasapiSink::open_device(id, name, node_name.clone())?
-                }
+                Some(name) => wasapi_backend::WasapiSink::open_device(id, name, node_name.clone())?,
                 None => wasapi_backend::WasapiSink::open(id, node_name.clone())?,
             };
             Ok(Playback { inner })

@@ -84,23 +84,13 @@ pub fn replay(hwnd: HWND, input: WindowInput) -> Result<(), String> {
                 // Linux portal path, which counts the other way).
                 if dy != 0 {
                     let delta = (dy * WHEEL_DELTA as i32) as i16 as usize;
-                    PostMessageW(
-                        Some(hwnd),
-                        WM_MOUSEWHEEL,
-                        WPARAM(delta << 16),
-                        LPARAM(0),
-                    )
-                    .map_err(|e| format!("WM_MOUSEWHEEL: {e}"))?;
+                    PostMessageW(Some(hwnd), WM_MOUSEWHEEL, WPARAM(delta << 16), LPARAM(0))
+                        .map_err(|e| format!("WM_MOUSEWHEEL: {e}"))?;
                 }
                 if dx != 0 {
                     let delta = (dx * WHEEL_DELTA as i32) as i16 as usize;
-                    PostMessageW(
-                        Some(hwnd),
-                        WM_MOUSEHWHEEL,
-                        WPARAM(delta << 16),
-                        LPARAM(0),
-                    )
-                    .map_err(|e| format!("WM_MOUSEHWHEEL: {e}"))?;
+                    PostMessageW(Some(hwnd), WM_MOUSEHWHEEL, WPARAM(delta << 16), LPARAM(0))
+                        .map_err(|e| format!("WM_MOUSEHWHEEL: {e}"))?;
                 }
                 Ok(())
             }
@@ -126,75 +116,75 @@ pub fn replay(hwnd: HWND, input: WindowInput) -> Result<(), String> {
 fn vk_from_evdev(code: u16) -> Option<u16> {
     // Values from `input-event-codes.h` on the left, `winuser.h` on the right.
     Some(match code {
-        1 => 0x1B,  // ESC
-        2..=10 => 0x30 + (code - 1) as u16, // 1..9 -> '1'..'9'
-        11 => 0x30, // 0
-        12 => 0xBD, // minus
-        13 => 0xBB, // equal
-        14 => 0x08, // backspace
-        15 => 0x09, // tab
-        16 => 0x51, // q
-        17 => 0x57, // w
-        18 => 0x45, // e
-        19 => 0x52, // r
-        20 => 0x54, // t
-        21 => 0x59, // y
-        22 => 0x55, // u
-        23 => 0x49, // i
-        24 => 0x4F, // o
-        25 => 0x50, // p
-        26 => 0xDB, // [
-        27 => 0xDD, // ]
-        28 => 0x0D, // enter
-        29 => 0x11, // left ctrl
-        30 => 0x41, // a
-        31 => 0x53, // s
-        32 => 0x44, // d
-        33 => 0x46, // f
-        34 => 0x47, // g
-        35 => 0x48, // h
-        36 => 0x4A, // j
-        37 => 0x4B, // k
-        38 => 0x4C, // l
-        39 => 0xBA, // ;
-        40 => 0xDE, // '
-        41 => 0xC0, // `
-        42 => 0x10, // left shift
-        43 => 0xDC, // backslash
-        44 => 0x5A, // z
-        45 => 0x58, // x
-        46 => 0x43, // c
-        47 => 0x56, // v
-        48 => 0x42, // b
-        49 => 0x4E, // n
-        50 => 0x4D, // m
-        51 => 0xBC, // ,
-        52 => 0xBE, // .
-        53 => 0xBF, // /
-        54 => 0x10, // right shift
-        55 => 0x6A, // numpad *
-        56 => 0x12, // left alt
-        57 => 0x20, // space
-        58 => 0x14, // caps lock
+        1 => 0x1B,                            // ESC
+        2..=10 => 0x30 + (code - 1) as u16,   // 1..9 -> '1'..'9'
+        11 => 0x30,                           // 0
+        12 => 0xBD,                           // minus
+        13 => 0xBB,                           // equal
+        14 => 0x08,                           // backspace
+        15 => 0x09,                           // tab
+        16 => 0x51,                           // q
+        17 => 0x57,                           // w
+        18 => 0x45,                           // e
+        19 => 0x52,                           // r
+        20 => 0x54,                           // t
+        21 => 0x59,                           // y
+        22 => 0x55,                           // u
+        23 => 0x49,                           // i
+        24 => 0x4F,                           // o
+        25 => 0x50,                           // p
+        26 => 0xDB,                           // [
+        27 => 0xDD,                           // ]
+        28 => 0x0D,                           // enter
+        29 => 0x11,                           // left ctrl
+        30 => 0x41,                           // a
+        31 => 0x53,                           // s
+        32 => 0x44,                           // d
+        33 => 0x46,                           // f
+        34 => 0x47,                           // g
+        35 => 0x48,                           // h
+        36 => 0x4A,                           // j
+        37 => 0x4B,                           // k
+        38 => 0x4C,                           // l
+        39 => 0xBA,                           // ;
+        40 => 0xDE,                           // '
+        41 => 0xC0,                           // `
+        42 => 0x10,                           // left shift
+        43 => 0xDC,                           // backslash
+        44 => 0x5A,                           // z
+        45 => 0x58,                           // x
+        46 => 0x43,                           // c
+        47 => 0x56,                           // v
+        48 => 0x42,                           // b
+        49 => 0x4E,                           // n
+        50 => 0x4D,                           // m
+        51 => 0xBC,                           // ,
+        52 => 0xBE,                           // .
+        53 => 0xBF,                           // /
+        54 => 0x10,                           // right shift
+        55 => 0x6A,                           // numpad *
+        56 => 0x12,                           // left alt
+        57 => 0x20,                           // space
+        58 => 0x14,                           // caps lock
         59..=68 => 0x70 + (code - 59) as u16, // F1..F10
-        87 => 0x7A, // F11
-        88 => 0x7B, // F12
-        96 => 0x0D, // numpad enter
-        97 => 0x11, // right ctrl
-        98 => 0x6F, // numpad /
-        100 => 0x12, // right alt
-        102 => 0x24, // home
-        103 => 0x26, // up
-        104 => 0x21, // page up
-        105 => 0x25, // left
-        106 => 0x27, // right
-        107 => 0x23, // end
-        108 => 0x28, // down
-        109 => 0x22, // page down
-        110 => 0x2D, // insert
-        111 => 0x2E, // delete
-        125 => 0x5B, // left meta / Windows key
-        126 => 0x5C, // right meta
+        87 => 0x7A,                           // F11
+        88 => 0x7B,                           // F12
+        96 => 0x0D,                           // numpad enter
+        97 => 0x11,                           // right ctrl
+        98 => 0x6F,                           // numpad /
+        100 => 0x12,                          // right alt
+        102 => 0x24,                          // home
+        103 => 0x26,                          // up
+        104 => 0x21,                          // page up
+        105 => 0x25,                          // left
+        106 => 0x27,                          // right
+        107 => 0x23,                          // end
+        108 => 0x28,                          // down
+        109 => 0x22,                          // page down
+        110 => 0x2D,                          // insert
+        111 => 0x2E,                          // delete
+        125 => 0x5B,                          // left meta / Windows key
+        126 => 0x5C,                          // right meta
         _ => return None,
     })
 }
@@ -218,7 +208,7 @@ mod tests {
     fn function_keys_are_contiguous() {
         assert_eq!(vk_from_evdev(59), Some(0x70)); // F1
         assert_eq!(vk_from_evdev(68), Some(0x79)); // F10
-        // F11/F12 sit elsewhere in the evdev table, so they're mapped apart.
+                                                   // F11/F12 sit elsewhere in the evdev table, so they're mapped apart.
         assert_eq!(vk_from_evdev(87), Some(0x7A));
         assert_eq!(vk_from_evdev(88), Some(0x7B));
     }

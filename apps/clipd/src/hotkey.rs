@@ -68,7 +68,8 @@ pub fn install(binding: &str, force: bool) -> Result<()> {
     let command = format!("{exe} pick");
 
     let slot_path = format!("{CUSTOM_PATH}{SLOT}/");
-    let schema = format!("org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{slot_path}");
+    let schema =
+        format!("org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{slot_path}");
 
     gsettings(&["set", &schema, "name", "Clipboard history"])?;
     gsettings(&["set", &schema, "command", &command])?;
@@ -115,7 +116,10 @@ fn conflicting_builtin(binding: &str) -> Result<Option<(&'static str, &'static s
             // A schema missing on this GNOME version is not a conflict.
             Err(_) => continue,
         };
-        if parse_list(&value).iter().any(|b| bindings_equal(b, binding)) {
+        if parse_list(&value)
+            .iter()
+            .any(|b| bindings_equal(b, binding))
+        {
             return Ok(Some((schema, key)));
         }
     }

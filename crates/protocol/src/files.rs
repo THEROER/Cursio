@@ -483,7 +483,10 @@ mod tests {
                 ..OpenMode::read_only()
             },
         ] {
-            assert!(m.is_mutating(), "{m:?} writes and must be refused read-only");
+            assert!(
+                m.is_mutating(),
+                "{m:?} writes and must be refused read-only"
+            );
         }
     }
 }

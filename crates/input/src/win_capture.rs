@@ -29,23 +29,23 @@ use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-};
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    PostThreadMessageW, RegisterClassW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, HWND_MESSAGE,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT,
-    RI_KEY_BREAK, RI_KEY_E0, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN,
-    RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
-    RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN,
-    RI_MOUSE_RIGHT_BUTTON_UP, RI_MOUSE_WHEEL, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN,
-    WM_MOUSEMOVE, WM_QUIT, WM_SYSKEYDOWN, WNDCLASSW,
+    PostThreadMessageW, RegisterClassW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
+    HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    MSLLHOOKSTRUCT, RI_KEY_BREAK, RI_KEY_E0, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP,
+    RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL, RI_MOUSE_LEFT_BUTTON_DOWN,
+    RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP,
+    RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, RI_MOUSE_WHEEL, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_MOUSEMOVE, WM_QUIT, WM_SYSKEYDOWN, WNDCLASSW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use crate::win_keymap::scancode_to_evdev;
@@ -453,7 +453,12 @@ unsafe fn emit_keyboard(raw: &RAWINPUT) {
             key: evdev,
             pressed,
         }),
-        None => tracing::trace!(make = kb.MakeCode, e0, vkey = kb.VKey, "unmapped key; dropping"),
+        None => tracing::trace!(
+            make = kb.MakeCode,
+            e0,
+            vkey = kb.VKey,
+            "unmapped key; dropping"
+        ),
     }
 }
 
@@ -587,7 +592,10 @@ fn install_hooks() {
         let keyboard =
             SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), std::ptr::null_mut(), 0);
         if mouse.is_null() || keyboard.is_null() {
-            tracing::warn!(err = last_error(), "failed to install input hooks; grab is partial");
+            tracing::warn!(
+                err = last_error(),
+                "failed to install input hooks; grab is partial"
+            );
             // Clean up whichever succeeded so we don't half-grab.
             if !mouse.is_null() {
                 UnhookWindowsHookEx(mouse);
@@ -634,7 +642,8 @@ fn remove_hooks() {
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let info = &*(lparam as *const MSLLHOOKSTRUCT);
-        let injected = info.flags & LLMHF_INJECTED != 0 || info.dwExtraInfo == INJECTED_TAG as usize;
+        let injected =
+            info.flags & LLMHF_INJECTED != 0 || info.dwExtraInfo == INJECTED_TAG as usize;
         match HOOK_MODE.load(Ordering::SeqCst) {
             // Dormant: swallow real input so it doesn't act locally; let injected
             // (our own / others') through.
@@ -780,7 +789,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     // whose typing worked. One value, one behaviour.
     if code >= 0 && HOOK_MODE.load(Ordering::SeqCst) == MODE_DORMANT {
         let info = &*(lparam as *const KBDLLHOOKSTRUCT);
-        let injected = info.flags & LLKHF_INJECTED != 0 || info.dwExtraInfo == INJECTED_TAG as usize;
+        let injected =
+            info.flags & LLKHF_INJECTED != 0 || info.dwExtraInfo == INJECTED_TAG as usize;
         if !injected {
             // wparam is the key message; *DOWN => pressed. The hook fires for
             // WM_KEYDOWN/WM_KEYUP and their SYS variants (Alt-combos).

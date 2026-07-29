@@ -85,9 +85,7 @@ const BTN_EXTRA: u32 = 0x114;
 /// `LocalSet`, and hand only the (Send) channels back out. Blocks until the
 /// portal session + libei handshake are up (so a grant failure or a declined
 /// dialog surfaces here) via a oneshot readiness signal.
-pub fn spawn_wayland_capture(
-    peer_edge: Option<Edge>,
-) -> Result<CaptureHandle, InputError> {
+pub fn spawn_wayland_capture(peer_edge: Option<Edge>) -> Result<CaptureHandle, InputError> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (edges_tx, edges_rx) = mpsc::unbounded_channel();
     let (grab, grab_rx) = crate::GrabControl::new();
@@ -564,7 +562,6 @@ fn crossing_from(a: &Activated, info: &HashMap<u32, BarrierInfo>) -> Option<crat
     })
 }
 
-
 /// Carries the sub-pixel remainder of pointer motion between libei events.
 ///
 /// libei reports motion as `f32`. Rounding each event's `dx`/`dy` on its own
@@ -637,11 +634,26 @@ fn handle_ei_event(
             // never injected there, the loss is in between.
             tracing::debug!(button = b.button, pressed, "captured pointer button");
             match b.button {
-                BTN_LEFT => InputEvent::PointerButton { button: MouseButton::Left, pressed },
-                BTN_RIGHT => InputEvent::PointerButton { button: MouseButton::Right, pressed },
-                BTN_MIDDLE => InputEvent::PointerButton { button: MouseButton::Middle, pressed },
-                BTN_SIDE => InputEvent::PointerButton { button: MouseButton::Back, pressed },
-                BTN_EXTRA => InputEvent::PointerButton { button: MouseButton::Forward, pressed },
+                BTN_LEFT => InputEvent::PointerButton {
+                    button: MouseButton::Left,
+                    pressed,
+                },
+                BTN_RIGHT => InputEvent::PointerButton {
+                    button: MouseButton::Right,
+                    pressed,
+                },
+                BTN_MIDDLE => InputEvent::PointerButton {
+                    button: MouseButton::Middle,
+                    pressed,
+                },
+                BTN_SIDE => InputEvent::PointerButton {
+                    button: MouseButton::Back,
+                    pressed,
+                },
+                BTN_EXTRA => InputEvent::PointerButton {
+                    button: MouseButton::Forward,
+                    pressed,
+                },
                 other => {
                     tracing::trace!(button = other, "dropping unmapped button");
                     return;

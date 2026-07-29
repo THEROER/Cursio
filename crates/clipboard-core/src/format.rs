@@ -181,12 +181,20 @@ pub struct ClipboardEntry {
 impl ClipboardEntry {
     /// An entry whose payload is already in hand.
     pub fn loaded(format: ClipboardFormat, bytes: Vec<u8>) -> Self {
-        ClipboardEntry { format, size: bytes.len() as u64, bytes: Some(bytes) }
+        ClipboardEntry {
+            format,
+            size: bytes.len() as u64,
+            bytes: Some(bytes),
+        }
     }
 
     /// An entry that is known to exist at `size` bytes but not yet fetched.
     pub fn lazy(format: ClipboardFormat, size: u64) -> Self {
-        ClipboardEntry { format, size, bytes: None }
+        ClipboardEntry {
+            format,
+            size,
+            bytes: None,
+        }
     }
 
     /// Whether the payload has been fetched.
@@ -212,7 +220,9 @@ pub struct ClipboardContent {
 impl ClipboardContent {
     /// Content consisting of a single representation.
     pub fn single(format: ClipboardFormat, bytes: Vec<u8>) -> Self {
-        ClipboardContent { entries: vec![ClipboardEntry::loaded(format, bytes)] }
+        ClipboardContent {
+            entries: vec![ClipboardEntry::loaded(format, bytes)],
+        }
     }
 
     /// Plain UTF-8 text — the common case, spelled directly.
@@ -312,7 +322,10 @@ mod tests {
 
     #[test]
     fn from_mime_tolerates_real_world_spellings() {
-        assert_eq!(ClipboardFormat::from_mime("text/plain"), ClipboardFormat::Text);
+        assert_eq!(
+            ClipboardFormat::from_mime("text/plain"),
+            ClipboardFormat::Text
+        );
         assert_eq!(
             ClipboardFormat::from_mime("TEXT/PLAIN;charset=utf-8"),
             ClipboardFormat::Text
@@ -366,7 +379,10 @@ mod tests {
         // The whole point of laziness: a 48 MiB image is describable without
         // being read, and "not fetched" is distinguishable from "empty".
         let content = ClipboardContent {
-            entries: vec![ClipboardEntry::lazy(ClipboardFormat::ImagePng, 48 * 1024 * 1024)],
+            entries: vec![ClipboardEntry::lazy(
+                ClipboardFormat::ImagePng,
+                48 * 1024 * 1024,
+            )],
         };
         let entry = content.entry(&ClipboardFormat::ImagePng).unwrap();
         assert_eq!(entry.size, 48 * 1024 * 1024);
@@ -398,7 +414,10 @@ mod tests {
     #[test]
     fn insert_replaces_existing_format() {
         let mut content = ClipboardContent::text("old");
-        content.insert(ClipboardEntry::loaded(ClipboardFormat::Text, b"new".to_vec()));
+        content.insert(ClipboardEntry::loaded(
+            ClipboardFormat::Text,
+            b"new".to_vec(),
+        ));
         assert_eq!(content.entries.len(), 1);
         assert_eq!(content.as_text(), Some("new"));
     }
