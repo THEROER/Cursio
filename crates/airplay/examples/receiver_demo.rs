@@ -50,6 +50,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let profile = VideoProfile::new(args.res.into(), args.fps)?;
+    let hardware = cursio_airplay::hardware::HardwareInfo::detect();
+    for gpu in &hardware.gpus {
+        let vram = gpu
+            .dedicated_vram_bytes
+            .map(|bytes| format!("{:.1} GiB", bytes as f64 / 1024_f64.powi(3)))
+            .unwrap_or_else(|| "shared/unknown VRAM".to_string());
+        println!("GPU: {} ({vram})", gpu.name);
+    }
+    for warning in hardware.profile_warnings(profile) {
+        eprintln!("warning: {warning}");
+    }
     let config = ReceiverConfig::new(
         args.name,
         args.identity,
