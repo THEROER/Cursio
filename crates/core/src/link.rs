@@ -68,12 +68,27 @@ pub struct Handshake<'a> {
     pub sends_input: bool,
 }
 
-/// Called the moment a session learns who the peer is.
+/// A link whose peer has said hello but which is not yet encrypted.
 ///
-/// For an *inbound* connection that is the first time it is known at all: a
-/// peer that dials us is an anonymous socket until it says hello. The mesh uses
-/// this to mark such a peer online.
-pub type IdentifiedCallback<'a> = dyn FnMut(PeerId, &str) + 'a;
+/// The pause exists because callers need to act here and nowhere else. For an
+/// *inbound* connection this is the first moment the peer is known at all — one
+/// that dials us is an anonymous socket until it says hello — and the mesh
+/// marks it online before the slower half of the setup runs.
+///
+/// Nothing confidential has crossed the wire yet, which is fine: the Hello
+/// carries only what the peer chose to publish about itself.
+pub struct Identified<T> {
+    pub transport: T,
+    pub peer: PeerHello,
+    negotiated: cursio_protocol::Negotiated,
+}
+
+impl<T> Identified<T> {
+    /// The modules both sides agreed on, and why the rest were skipped.
+    pub fn negotiated(&self) -> &cursio_protocol::Negotiated {
+        &self.negotiated
+    }
+}
 
 /// A link that is authenticated, encrypted, and ready for a session.
 pub struct Link {
@@ -85,21 +100,14 @@ pub struct Link {
     pub cursor: CursorSetup,
 }
 
-/// Run steps 1–5 on an open transport.
+/// Say hello and work out which modules can run.
 ///
-/// Takes the transport by value because pairing and the Noise handshake both
-/// consume it: what comes back is the encrypted channel, and the plaintext one
-/// no longer exists to be used by mistake.
-///
-/// `on_identified` fires as soon as the peer's identity is known; see
-/// [`IdentifiedCallback`].
-pub async fn establish<T>(
-    mut transport: T,
-    plan: Handshake<'_>,
-    on_identified: Option<&mut IdentifiedCallback<'_>>,
-) -> anyhow::Result<Link>
+/// Split from the rest so a caller can act on the peer's identity before the
+/// slower half — see [`Identified`]. [`establish`] runs both halves for callers
+/// with nothing to do in between.
+pub async fn identify<T>(mut transport: T, plan: &Handshake<'_>) -> anyhow::Result<Identified<T>>
 where
-    T: Transport + 'static,
+    T: Transport,
 {
     let advertised = advertise(plan.registry, plan.sends_input);
     let peer = session::handshake(
@@ -126,9 +134,27 @@ where
         tracing::warn!(module = %id, reason = %why, "module not running on this link");
     }
 
-    if let Some(cb) = on_identified {
-        cb(peer.peer_id, &peer.display_name);
-    }
+    Ok(Identified {
+        transport,
+        peer,
+        negotiated,
+    })
+}
+
+/// Pair if this is a first meeting, encrypt, and build the agreed modules.
+///
+/// Takes the identified link by value because pairing and the Noise handshake
+/// both consume the transport: what comes back is the encrypted channel, and
+/// the plaintext one no longer exists to be used by mistake.
+pub async fn secure<T>(link: Identified<T>, plan: &Handshake<'_>) -> anyhow::Result<Link>
+where
+    T: Transport + 'static,
+{
+    let Identified {
+        mut transport,
+        peer,
+        negotiated,
+    } = link;
 
     // Pairing runs over the plaintext transport, which is safe: SPAKE2 never
     // sends the password itself, only a value derived from it.
@@ -180,6 +206,15 @@ where
         modules,
         cursor,
     })
+}
+
+/// Bring a link all the way up, for callers with nothing to do in between.
+pub async fn establish<T>(transport: T, plan: Handshake<'_>) -> anyhow::Result<Link>
+where
+    T: Transport + 'static,
+{
+    let identified = identify(transport, &plan).await?;
+    secure(identified, &plan).await
 }
 
 impl Link {

@@ -596,7 +596,11 @@ async fn join(
     Ok(())
 }
 
-use cursio_core::link::IdentifiedCallback;
+/// Called once a session learns who the peer is (from the Hello handshake).
+/// The mesh uses it to mark an inbound peer online — until the handshake, a
+/// peer that dialled *us* is just an anonymous socket. Not `Send`: it reaches
+/// the mesh's own `Rc` state, which never leaves this thread.
+type IdentifiedCallback<'a> = dyn FnMut(cursio_protocol::PeerId, &str) + 'a;
 
 /// Shared tail of `serve`/`connect`: Hello handshake, pair on first meeting,
 /// bring up a Noise-encrypted channel, then run heartbeats over it.
@@ -632,19 +636,22 @@ async fn run_pairing_and_session(
     // Handshake, pairing, Noise and module negotiation are the same five steps
     // for every node, so they live in `link` — the app and a phone run this
     // exact sequence rather than a second copy of it.
-    let link = cursio_core::link::establish(
-        transport,
-        cursio_core::link::Handshake {
-            identity: &identity,
-            password,
-            role,
-            registry: modules,
-            peer_edge,
-            sends_input: capture.is_some(),
-        },
-        on_identified,
-    )
-    .await?;
+    let plan = cursio_core::link::Handshake {
+        identity: &identity,
+        password,
+        role,
+        registry: modules,
+        peer_edge,
+        sends_input: capture.is_some(),
+    };
+    let identified = cursio_core::link::identify(transport, &plan).await?;
+    // Report who this turned out to be before the slower half runs: for an
+    // inbound connection this is the first moment we know at all, and the mesh
+    // wants such a peer marked online without waiting out pairing.
+    if let Some(cb) = on_identified {
+        cb(identified.peer.peer_id, &identified.peer.display_name);
+    }
+    let link = cursio_core::link::secure(identified, &plan).await?;
     let peer = link.peer;
     let mut secure = link.transport;
     let modules = link.modules;

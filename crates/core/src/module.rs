@@ -89,7 +89,11 @@ impl SessionCtx<'_> {
 /// The three methods split cleanly by *when* they are answered: `id` always,
 /// `advert` once at startup (before any peer is known), and `build` per session
 /// (once the peer is known and negotiation has run).
-pub trait ModuleFactory {
+/// `Send + Sync` because a registry is consulted while a link is being brought
+/// up, and that happens across await points on whatever thread the runtime
+/// chooses. Factories hold configuration, not live state, so this costs
+/// nothing to satisfy.
+pub trait ModuleFactory: Send + Sync {
     /// Which module this builds. Must match `advert`'s id.
     fn id(&self) -> ModuleId;
 
