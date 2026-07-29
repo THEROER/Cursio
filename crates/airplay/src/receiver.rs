@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 
 use crate::crypto::{CryptoProvider, CryptoSession};
 use crate::discovery::AirPlayAnnouncement;
+use crate::media::{ConnectionContext, MediaSession};
 use crate::rtsp::{self, ProtocolError, RequestDecoder};
 use crate::{AirPlayError, ReceiverConfig};
 
@@ -62,13 +63,18 @@ impl Receiver {
         loop {
             let (stream, peer) = self.listener.accept().await?;
             stream.set_nodelay(true)?;
+            let local_addr = stream.local_addr()?;
             let config = self.config.clone();
             let crypto = self
                 .crypto
                 .as_ref()
                 .map(|provider| provider.start_session());
             tokio::spawn(async move {
-                if let Err(error) = serve_connection(stream, config, crypto).await {
+                let context = ConnectionContext {
+                    local_addr,
+                    peer_addr: peer,
+                };
+                if let Err(error) = serve_connection(stream, config, crypto, Some(context)).await {
                     tracing::warn!(%peer, %error, "AirPlay control connection ended");
                 }
             });
@@ -80,11 +86,13 @@ async fn serve_connection<T>(
     mut stream: T,
     config: Arc<ReceiverConfig>,
     mut crypto: Option<Box<dyn CryptoSession>>,
+    context: Option<ConnectionContext>,
 ) -> Result<(), AirPlayError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut decoder = RequestDecoder::new();
+    let mut media = MediaSession::default();
     let mut read_buffer = [0_u8; 8192];
     loop {
         let count = stream.read(&mut read_buffer).await?;
@@ -98,11 +106,24 @@ where
         decoder.push(&read_buffer[..count])?;
 
         while let Some(request) = decoder.next_request()? {
-            let response = match crypto.as_mut() {
-                Some(session) => {
-                    rtsp::route_with_crypto(&request, &config, Some(session.as_mut()))?
+            let response = if let Some(response) = media
+                .handle_request(
+                    &request,
+                    context,
+                    crypto
+                        .as_mut()
+                        .map(|session| session.as_mut() as &mut dyn CryptoSession),
+                )
+                .await?
+            {
+                response
+            } else {
+                match crypto.as_mut() {
+                    Some(session) => {
+                        rtsp::route_with_crypto(&request, &config, Some(session.as_mut()))?
+                    }
+                    None => rtsp::route(&request, &config)?,
                 }
-                None => rtsp::route(&request, &config)?,
             };
             let encoded = response.encode(request.version, request.header("CSeq"));
             stream.write_all(&encoded).await?;
@@ -134,7 +155,7 @@ mod tests {
     #[tokio::test]
     async fn serves_fragmented_and_pipelined_requests() {
         let (mut client, server) = tokio::io::duplex(32 * 1024);
-        let task = tokio::spawn(serve_connection(server, config(), None));
+        let task = tokio::spawn(serve_connection(server, config(), None, None));
 
         client
             .write_all(b"GET /info RTSP/1.0\r\nCSeq: 1\r\nContent-L")
@@ -160,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn truncated_request_is_rejected() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(serve_connection(server, config(), None));
+        let task = tokio::spawn(serve_connection(server, config(), None, None));
         client
             .write_all(b"GET /info RTSP/1.0\r\nContent-Length: 4\r\n\r\nab")
             .await

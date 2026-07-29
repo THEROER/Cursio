@@ -11,6 +11,18 @@ pub enum CryptoEndpoint {
     FairPlaySetup,
 }
 
+/// Stateful decryption for one AirPlay mirroring data connection.
+///
+/// The stream cipher state spans packet boundaries, so ciphertext must be fed
+/// in wire order through one instance for the lifetime of the connection.
+pub trait MirrorDecryptor: Send {
+    fn decrypt(
+        &mut self,
+        ciphertext: &[u8],
+        plaintext: &mut Vec<u8>,
+    ) -> Result<(), crate::AirPlayError>;
+}
+
 /// Cryptographic state for one AirPlay control connection.
 pub trait CryptoSession: Send {
     fn handle(
@@ -21,6 +33,19 @@ pub trait CryptoSession: Send {
 
     /// Unwrap the encrypted 16-byte media key delivered by the sender.
     fn unwrap_media_key(&mut self, encrypted_key: &[u8]) -> Result<[u8; 16], crate::AirPlayError>;
+
+    /// Build the stream cipher from the FairPlay-wrapped key, verified pairing
+    /// secret, and AirPlay stream id.
+    fn start_mirror_decryptor(
+        &mut self,
+        encrypted_key: &[u8],
+        stream_connection_id: u64,
+    ) -> Result<Box<dyn MirrorDecryptor>, crate::AirPlayError> {
+        let _ = (encrypted_key, stream_connection_id);
+        Err(crate::AirPlayError::Crypto(
+            "crypto provider does not implement mirror stream derivation".into(),
+        ))
+    }
 }
 
 /// Creates isolated cryptographic state for each control connection.

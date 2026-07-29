@@ -204,7 +204,7 @@ pub struct Response {
 }
 
 impl Response {
-    fn new(status: u16, reason: &'static str) -> Self {
+    pub(crate) fn new(status: u16, reason: &'static str) -> Self {
         Self {
             status,
             reason,
@@ -213,12 +213,12 @@ impl Response {
         }
     }
 
-    fn with_header(mut self, name: &str, value: &str) -> Self {
+    pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
         self
     }
 
-    fn with_body(mut self, content_type: &str, body: Vec<u8>) -> Self {
+    pub(crate) fn with_body(mut self, content_type: &str, body: Vec<u8>) -> Self {
         self.headers
             .push(("Content-Type".to_string(), content_type.to_string()));
         self.body = body;
