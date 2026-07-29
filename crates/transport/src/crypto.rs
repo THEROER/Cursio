@@ -21,6 +21,8 @@
 //! shared_key)` — fixed length, with domain separation so this key can't be
 //! confused with the pairing confirmation tags.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use cursio_protocol::{decode_frame, encode_frame, Message};
 use sha2::{Digest, Sha256};
@@ -66,11 +68,12 @@ const PART_HEADER_LEN: usize = 4 + 2 + 2;
 /// the part header. What's left is how much of the message each frame carries.
 const MAX_CHUNK_PAYLOAD: usize = MAX_NOISE_PLAINTEXT - 1 - PART_HEADER_LEN;
 
-/// A message split into this many pieces or more is refused rather than sent.
-/// `part_count` is a `u16`, and at ~64 KB per piece this still allows ~4 GB in
-/// one logical message — far past anything we send — while bounding how much a
-/// peer can make us buffer during reassembly.
-const MAX_PARTS: usize = u16::MAX as usize;
+/// Largest logical message accepted by the encrypted transport.
+const MAX_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PARTS: usize = MAX_LOGICAL_MESSAGE_BYTES.div_ceil(MAX_CHUNK_PAYLOAD);
+/// Priority scheduling can interleave several chunked messages, but a peer may
+/// not create unbounded half-finished allocations.
+const MAX_IN_FLIGHT_MESSAGES: usize = 8;
 
 /// Errors specific to the encrypted transport.
 #[derive(Debug, thiserror::Error)]
@@ -146,6 +149,9 @@ pub(crate) fn seal_frame(
 /// must not seal until the drainer has decided what goes next.
 pub(crate) fn chunk_plaintext(msg: &Message) -> Result<Vec<Vec<u8>>, TransportError> {
     let body = msg.to_bytes()?;
+    if body.len() > MAX_LOGICAL_MESSAGE_BYTES {
+        return Err(CryptoError::MessageTooLarge(body.len()).into());
+    }
 
     // Fast path: fits whole. Tag byte + body in one frame.
     if body.len() < MAX_NOISE_PLAINTEXT {
@@ -204,19 +210,17 @@ fn open_frame(noise: &SharedNoise, incoming: Message) -> Result<Vec<u8>, Transpo
 ///
 /// One per receiver (the un-split `recv` and each `EncryptedRx` own one). A
 /// `WHOLE` frame decodes immediately; `PART` frames accumulate by `msg_id`
-/// until every piece has arrived, then the full body is decoded. Kept
-/// deliberately simple: parts of one message arrive contiguously today (one
-/// sender, one ordered TCP stream), so we track a single in-progress message
-/// and reset if a different `msg_id` appears.
+/// until every piece has arrived, then the full body is decoded. Priority
+/// scheduling deliberately interleaves high-priority frames between large
+/// lower-priority messages, so partials are tracked independently by id.
 #[derive(Default)]
 struct Reassembler {
-    /// The message currently being reassembled, if any.
-    in_progress: Option<Partial>,
+    in_progress: HashMap<u32, Partial>,
+    buffered_bytes: usize,
 }
 
 /// Accumulated pieces of one chunked message.
 struct Partial {
-    msg_id: u32,
     part_count: u16,
     /// Received parts by index; `None` until that piece arrives.
     parts: Vec<Option<Vec<u8>>>,
@@ -253,29 +257,42 @@ impl Reassembler {
             return Err(CryptoError::Noise("bad chunk indices".into()).into());
         }
 
-        // Start a fresh Partial if this is a new message (or the first ever).
-        // A different msg_id mid-stream means the previous one was abandoned;
-        // drop it rather than leak the buffer.
-        let partial = match &mut self.in_progress {
-            Some(p) if p.msg_id == msg_id => p,
-            _ => {
-                self.in_progress = Some(Partial {
-                    msg_id,
+        if usize::from(part_count) > MAX_PARTS || chunk.len() > MAX_CHUNK_PAYLOAD {
+            return Err(
+                CryptoError::MessageTooLarge(usize::from(part_count) * MAX_CHUNK_PAYLOAD).into(),
+            );
+        }
+        if !self.in_progress.contains_key(&msg_id) {
+            if self.in_progress.len() >= MAX_IN_FLIGHT_MESSAGES {
+                return Err(
+                    CryptoError::Noise("too many chunked messages in flight".into()).into(),
+                );
+            }
+            self.in_progress.insert(
+                msg_id,
+                Partial {
                     part_count,
                     parts: (0..part_count).map(|_| None).collect(),
                     received: 0,
-                });
-                self.in_progress.as_mut().unwrap()
-            }
-        };
+                },
+            );
+        }
+        let partial = self
+            .in_progress
+            .get_mut(&msg_id)
+            .expect("partial was inserted above");
 
         if partial.part_count != part_count {
             return Err(CryptoError::Noise("inconsistent chunk count".into()).into());
         }
         // Ignore a duplicate piece (retransmit / reorder) rather than double-count.
         if partial.parts[part_idx as usize].is_none() {
+            if self.buffered_bytes.saturating_add(chunk.len()) > MAX_LOGICAL_MESSAGE_BYTES {
+                return Err(CryptoError::MessageTooLarge(self.buffered_bytes + chunk.len()).into());
+            }
             partial.parts[part_idx as usize] = Some(chunk.to_vec());
             partial.received += 1;
+            self.buffered_bytes += chunk.len();
         }
 
         if partial.received < partial.part_count {
@@ -283,8 +300,12 @@ impl Reassembler {
         }
 
         // Complete: concatenate in order and decode.
-        let partial = self.in_progress.take().unwrap();
+        let partial = self
+            .in_progress
+            .remove(&msg_id)
+            .expect("complete partial is still tracked");
         let total: usize = partial.parts.iter().flatten().map(|p| p.len()).sum();
+        self.buffered_bytes -= total;
         let mut body = Vec::with_capacity(total);
         for part in partial.parts {
             body.extend_from_slice(&part.expect("all parts present when received == count"));
@@ -704,10 +725,7 @@ mod tests {
         assert_eq!(resp.recv().await.unwrap(), msg);
     }
 
-    /// A small message sent right after a large one must still decode. Today
-    /// parts arrive contiguously, but the receiver must cleanly finish one
-    /// message and start the next — the property a priority multiplexer relies
-    /// on when it interleaves input frames between bulk chunks.
+    /// A small message sent right after a large one must still decode.
     #[tokio::test]
     async fn small_after_large_still_decodes() {
         let (mut init, mut resp) = establish_pair(b"seq-key").await;
@@ -718,5 +736,52 @@ mod tests {
 
         init.send(&Message::Heartbeat { nonce: 42 }).await.unwrap();
         assert_eq!(resp.recv().await.unwrap(), Message::Heartbeat { nonce: 42 });
+    }
+
+    #[test]
+    fn interleaved_chunked_messages_reassemble_independently() {
+        let first = Message::Opaque(vec![0x11; 220_000]);
+        let second = Message::Opaque(vec![0x22; 150_000]);
+        let first_frames = chunk_plaintext(&first).unwrap();
+        let second_frames = chunk_plaintext(&second).unwrap();
+        let whole = chunk_plaintext(&Message::Heartbeat { nonce: 9 }).unwrap();
+        let mut reassembler = Reassembler::default();
+        let mut completed = Vec::new();
+
+        assert!(reassembler.accept(&first_frames[0]).unwrap().is_none());
+        assert!(reassembler.accept(&second_frames[0]).unwrap().is_none());
+        completed.push(reassembler.accept(&whole[0]).unwrap().unwrap());
+
+        for index in 1..first_frames.len().max(second_frames.len()) {
+            if let Some(frame) = first_frames.get(index) {
+                if let Some(message) = reassembler.accept(frame).unwrap() {
+                    completed.push(message);
+                }
+            }
+            if let Some(frame) = second_frames.get(index) {
+                if let Some(message) = reassembler.accept(frame).unwrap() {
+                    completed.push(message);
+                }
+            }
+        }
+
+        assert!(completed.contains(&Message::Heartbeat { nonce: 9 }));
+        assert!(completed.contains(&first));
+        assert!(completed.contains(&second));
+        assert!(reassembler.in_progress.is_empty());
+        assert_eq!(reassembler.buffered_bytes, 0);
+    }
+
+    #[test]
+    fn oversized_chunk_count_is_rejected_before_allocation() {
+        let mut tagged = vec![frame_tag::PART];
+        tagged.extend_from_slice(&1_u32.to_be_bytes());
+        tagged.extend_from_slice(&0_u16.to_be_bytes());
+        tagged.extend_from_slice(&((MAX_PARTS + 1) as u16).to_be_bytes());
+
+        let mut reassembler = Reassembler::default();
+        assert!(reassembler.accept(&tagged).is_err());
+        assert!(reassembler.in_progress.is_empty());
+        assert_eq!(reassembler.buffered_bytes, 0);
     }
 }

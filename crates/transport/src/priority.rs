@@ -375,7 +375,7 @@ mod tests {
 
         // Both arrive intact. (Order isn't asserted: without socket backpressure
         // the mock can't reproduce the interleave — see the note above.)
-        let mut got = vec![rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+        let mut got = [rx.recv().await.unwrap(), rx.recv().await.unwrap()];
         got.sort_by_key(|m| format!("{m:?}").len());
         assert!(got.contains(&input), "input must round-trip");
         assert!(got.contains(&bulk), "bulk must round-trip");
