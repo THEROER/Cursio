@@ -17,7 +17,7 @@
 //! model doesn't have, and keeping all three meant the same session logic lived
 //! in three places — where a fix landed in one and not the others.)
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -115,32 +115,29 @@ enum Command {
         /// separates "capture is broken" from "hiding broke the capture".
         #[arg(long, default_value_t = false)]
         keep_window_visible: bool,
+        /// Advertise an AirPlay receiver and accept iPhone screen mirroring.
+        #[arg(long, default_value_t = false)]
+        airplay: bool,
+        /// Name shown in the iPhone Screen Mirroring picker.
+        #[arg(long, default_value = "Cursio AirPlay")]
+        airplay_name: String,
+        /// AirPlay control port.
+        #[arg(long, default_value_t = 7000)]
+        airplay_port: u16,
+        /// Pin AirPlay mDNS to the LAN interface with this address.
+        #[arg(long)]
+        airplay_interface: Option<IpAddr>,
+        /// Target AirPlay output resolution.
+        #[arg(long, value_enum, default_value_t = AirPlayResolutionArg::FullHd)]
+        res: AirPlayResolutionArg,
+        /// Target AirPlay output frame rate.
+        #[arg(long, default_value_t = 60)]
+        fps: u16,
     },
     /// List peers discovered on the LAN, then exit.
     Peers {
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
-    },
-    /// Receive an iPhone screen through AirPlay.
-    Airplay {
-        /// Name shown in the iPhone Screen Mirroring picker.
-        #[arg(long, default_value = "Cursio AirPlay")]
-        name: String,
-        /// AirPlay control port.
-        #[arg(long, default_value_t = 7000)]
-        port: u16,
-        /// Address on which the AirPlay control listener accepts connections.
-        #[arg(long, default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
-        bind: IpAddr,
-        /// Pin mDNS to the LAN interface with this address.
-        #[arg(long)]
-        interface: Option<IpAddr>,
-        /// Target output resolution.
-        #[arg(long, value_enum, default_value_t = AirPlayResolutionArg::FullHd)]
-        res: AirPlayResolutionArg,
-        /// Target output frame rate.
-        #[arg(long, default_value_t = 60)]
-        fps: u16,
     },
 }
 
@@ -235,6 +232,12 @@ async fn main() -> anyhow::Result<()> {
             share_window,
             share_window_title,
             keep_window_visible,
+            airplay,
+            airplay_name,
+            airplay_port,
+            airplay_interface,
+            res,
+            fps,
         } => {
             // The CLI's only job for modules is to build the registry; from here
             // on nothing names a specific module.
@@ -249,37 +252,47 @@ async fn main() -> anyhow::Result<()> {
                 share_window_title,
                 keep_window_visible,
             );
-            run_mesh(
-                identity,
+            let mesh = run_mesh(
+                identity.clone(),
                 port,
                 send_input,
                 peer_edge.map(Into::into),
                 modules,
-            )
-            .await
+            );
+            if !airplay {
+                mesh.await
+            } else {
+                let receiver = bind_airplay(
+                    &identity,
+                    AirPlayOpts {
+                        name: airplay_name,
+                        port: airplay_port,
+                        interface: airplay_interface,
+                        resolution: res,
+                        fps,
+                    },
+                )
+                .await?;
+                tokio::select! {
+                    result = mesh => result,
+                    result = receiver.serve() => result.map_err(Into::into),
+                }
+            }
         }
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
-        Command::Airplay {
-            name,
-            port,
-            bind,
-            interface,
-            res,
-            fps,
-        } => run_airplay(identity, name, port, bind, interface, res, fps).await,
     }
 }
 
-async fn run_airplay(
-    identity: NodeIdentity,
+struct AirPlayOpts {
     name: String,
     port: u16,
-    bind: IpAddr,
     interface: Option<IpAddr>,
     resolution: AirPlayResolutionArg,
     fps: u16,
-) -> anyhow::Result<()> {
-    let profile = VideoProfile::new(resolution.into(), fps)?;
+}
+
+async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::Result<Receiver> {
+    let profile = VideoProfile::new(options.resolution.into(), options.fps)?;
     let hardware = cursio_airplay::hardware::HardwareInfo::detect();
     for gpu in &hardware.gpus {
         let vram = gpu
@@ -292,15 +305,21 @@ async fn run_airplay(
         tracing::warn!("{warning}");
     }
 
-    let config = ReceiverConfig::new(name, identity.peer_id, SocketAddr::new(bind, port), profile)?;
-    let discovery = interface.map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
+    let config = ReceiverConfig::new(
+        options.name,
+        identity.peer_id,
+        SocketAddr::from(([0, 0, 0, 0], options.port)),
+        profile,
+    )?;
+    let discovery = options
+        .interface
+        .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
     let receiver = Receiver::bind(config, discovery).await?;
     tracing::info!(
         address = %receiver.local_addr()?,
-        "AirPlay receiver is visible in iPhone Screen Mirroring"
+        "mesh AirPlay receiver is visible in iPhone Screen Mirroring"
     );
-    receiver.serve().await?;
-    Ok(())
+    Ok(receiver)
 }
 
 fn read_pairing_password() -> anyhow::Result<Zeroizing<String>> {
