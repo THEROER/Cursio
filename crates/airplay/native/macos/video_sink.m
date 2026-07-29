@@ -98,7 +98,7 @@ static NSArray<NSData *> *annex_b_units(NSData *access_unit) {
                             NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable
                     backing:NSBackingStoreBuffered
                       defer:NO];
-    window.title = @"Cursio — iPhone Screen";
+    window.title = @"Cursio - AirPlay Screen";
     window.releasedWhenClosed = NO;
 
     NSView *content = window.contentView;

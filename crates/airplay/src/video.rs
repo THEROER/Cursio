@@ -11,7 +11,12 @@ mod macos;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub use gstreamer::HardwareVideoPipeline;
 #[cfg(target_os = "macos")]
-pub use macos::HardwareVideoPipeline;
+pub use macos::{prepare_window, HardwareVideoPipeline};
+
+#[cfg(not(target_os = "macos"))]
+pub fn prepare_window() -> Result<(), crate::AirPlayError> {
+    Ok(())
+}
 
 use crate::AirPlayError;
 

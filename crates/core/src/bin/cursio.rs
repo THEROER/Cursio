@@ -334,6 +334,7 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     {
         tracing::warn!("{warning}");
     }
+    cursio_airplay::video::prepare_window()?;
 
     let crypto = Arc::new(AppleCryptoProvider::new());
     let config = ReceiverConfig::new(
