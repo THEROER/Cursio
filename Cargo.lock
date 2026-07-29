@@ -1022,6 +1022,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cursio-airplay"
+version = "0.1.0"
+dependencies = [
+ "cursio-transport",
+ "mdns-sd",
+ "plist",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cursio-app"
 version = "0.1.0"
 dependencies = [

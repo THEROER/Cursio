@@ -50,7 +50,7 @@ impl DiscoveryConfig {
     ///   just the pinned one, so VPN/virtual interfaces can't be used.
     /// - Otherwise, best-effort excludes interfaces whose address falls in
     ///   known-virtual ranges (see [`is_virtual_addr`]).
-    fn build_daemon(&self) -> Result<ServiceDaemon, TransportError> {
+    pub fn new_daemon(&self) -> Result<ServiceDaemon, TransportError> {
         let daemon = ServiceDaemon::new().map_err(|e| TransportError::Other(e.to_string()))?;
 
         // IPv4-only on the LAN; drop all the IPv6 link-local multicast noise.
@@ -228,7 +228,7 @@ pub fn announce_with(
     port: u16,
     config: &DiscoveryConfig,
 ) -> Result<Announcement, TransportError> {
-    let daemon = config.build_daemon()?;
+    let daemon = config.new_daemon()?;
 
     let properties = [
         (TXT_PEER_ID, peer_id.to_string()),
@@ -293,7 +293,7 @@ pub fn browse_with<F>(
 where
     F: FnMut(DiscoveredPeer),
 {
-    let daemon = config.build_daemon()?;
+    let daemon = config.new_daemon()?;
     let receiver = daemon
         .browse(SERVICE_TYPE)
         .map_err(|e| TransportError::Other(e.to_string()))?;
