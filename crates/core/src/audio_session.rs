@@ -10,7 +10,7 @@
 //! lends it a `tx`. Input and audio now share one encrypted channel,
 //! multiplexed by message type.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use async_trait::async_trait;
 use cursio_protocol::{AudioMsg, Message, ModuleId, PeerId};
@@ -153,7 +153,7 @@ pub struct AudioEngine {
     unwanted_dropped: u64,
     /// Chunks skipped because they carried only silence.
     silent_dropped: u64,
-    /// Chunks dropped because a single pump ran out of send budget.
+    /// Chunks deferred because a single pump ran out of send budget.
     over_budget: u64,
     /// Chunks discarded as a stale backlog before they were ever encoded.
     ///
@@ -178,6 +178,12 @@ pub struct AudioEngine {
     /// Per-stream Opus encoders (outbound). One per stream: Opus is stateful,
     /// so frames from different sources must never share an encoder.
     encoders: HashMap<u32, cursio_audio::codec::OpusEncoder>,
+    /// Encoded packets waiting for the next send budget, keyed by stream.
+    ///
+    /// One capture chunk can produce several 5 ms Opus packets. Keeping the
+    /// unsent tail here prevents a budget boundary from creating an audible
+    /// hole after the source chunk has already been removed from its channel.
+    pending_packets: HashMap<u32, VecDeque<cursio_protocol::AudioChunk>>,
     /// Per-stream Opus decoders (inbound), for the same reason.
     decoders: HashMap<u32, cursio_audio::codec::OpusDecoder>,
     /// Highest chunk `seq` we have *sent* per outbound stream, so the sent-vs-
@@ -274,6 +280,7 @@ impl AudioEngine {
             stall_reported: false,
             next_app_slot: 0,
             encoders: HashMap::new(),
+            pending_packets: HashMap::new(),
             decoders: HashMap::new(),
             last_sent_seq: HashMap::new(),
             acked_seq: HashMap::new(),
@@ -339,7 +346,9 @@ impl SessionModule for AudioEngine {
         match cursio_audio::DeviceMonitor::start() {
             Ok(m) => {
                 self.device_monitor = Some(m);
-                tracing::info!("device-state monitor up — device volumes replicate across machines");
+                tracing::info!(
+                    "device-state monitor up — device volumes replicate across machines"
+                );
             }
             Err(e) => {
                 tracing::warn!(error = %e, "no device-state monitor; device volumes won't replicate");
@@ -456,6 +465,9 @@ impl SessionModule for AudioEngine {
             // nowhere. This is what stops a peer mirroring 13 endpoints from
             // streaming all 13 into nodes nothing has opened.
             if self.unwanted_streams.contains(id) {
+                if let Some(pending) = self.pending_packets.remove(id) {
+                    self.unwanted_dropped += pending.len() as u64;
+                }
                 let drained = drain_stale(cap.chunks(), 0);
                 if drained > 0 {
                     self.unwanted_dropped += drained as u64;
@@ -478,7 +490,25 @@ impl SessionModule for AudioEngine {
             if dropped > 0 {
                 self.stale_dropped += dropped as u64;
             }
-            while let Ok(chunk) = cap.chunks().try_recv() {
+            while budget > 0 {
+                if let Some(packet) = self
+                    .pending_packets
+                    .get_mut(id)
+                    .and_then(|packets| take_with_budget(packets, &mut budget))
+                {
+                    let seq = packet.seq;
+                    tx.send(&Message::AudioChunk(packet)).await?;
+                    self.last_sent_seq
+                        .entry(*id)
+                        .and_modify(|sent| *sent = (*sent).max(seq))
+                        .or_insert(seq);
+                    self.sent += 1;
+                    continue;
+                }
+
+                let Ok(chunk) = cap.chunks().try_recv() else {
+                    break;
+                };
                 // A virtual sink produces chunks continuously whether or not
                 // anything is playing into it, so most streams are pumping pure
                 // silence. Sending it wastes the link and — because input rides
@@ -489,19 +519,16 @@ impl SessionModule for AudioEngine {
                     self.silent_dropped += 1;
                     continue;
                 }
-                if budget == 0 {
-                    // Out of budget: leave what's left queued for the next
-                    // pump. The channel is unbounded, so nothing is lost —
-                    // it just waits a moment.
-                    self.over_budget += 1;
-                    break;
-                }
                 // Compress before sending. Raw f32 is ~3 Mbit/s per stream,
                 // which saturates the link that input also rides on; Opus
                 // carries the same audio at ~100 kbit/s. One encoder per
                 // stream — Opus is stateful and interleaving frames from
                 // different sources would corrupt both.
-                let bitrate = self.stream_bitrate.get(id).copied().unwrap_or(BITRATE_START);
+                let bitrate = self
+                    .stream_bitrate
+                    .get(id)
+                    .copied()
+                    .unwrap_or(BITRATE_START);
                 let encoder = match self.encoders.entry(*id) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
@@ -528,28 +555,25 @@ impl SessionModule for AudioEngine {
                 };
                 // A chunk smaller than one Opus frame yields nothing yet: the
                 // remainder is buffered in the encoder until it completes.
-                for packet in packets {
-                    if budget == 0 {
-                        self.over_budget += 1;
-                        break;
-                    }
-                    budget -= 1;
-                    tx.send(&Message::AudioChunk(cursio_protocol::AudioChunk {
-                        id: *id,
-                        seq: chunk.seq,
-                        timestamp: chunk.timestamp,
-                        data: packet,
-                    }))
-                    .await?;
-                    // Remember the newest seq sent, so the ack the peer returns
-                    // can be compared against it for rate control.
-                    self.last_sent_seq
-                        .entry(*id)
-                        .and_modify(|s| *s = (*s).max(chunk.seq))
-                        .or_insert(chunk.seq);
-                    self.sent += 1;
-                }
+                // Larger chunks may yield several packets; enqueue every one
+                // before the next loop iteration spends the remaining budget.
+                let pending = self.pending_packets.entry(*id).or_default();
+                pending.extend(packets.into_iter().map(|data| cursio_protocol::AudioChunk {
+                    id: *id,
+                    seq: chunk.seq,
+                    timestamp: chunk.timestamp,
+                    data,
+                }));
                 // (health logging happens once per pump, above — not per stream)
+            }
+            if budget == 0
+                && (self
+                    .pending_packets
+                    .get(id)
+                    .is_some_and(|packets| !packets.is_empty())
+                    || !cap.chunks().is_empty())
+            {
+                self.over_budget += 1;
             }
         }
 
@@ -570,8 +594,11 @@ impl SessionModule for AudioEngine {
             let routes: Vec<cursio_protocol::RouteEntry> =
                 self.routed_app_route.values().cloned().collect();
             tracing::info!(count = routes.len(), "broadcasting routing state");
-            send_control(tx, AudioMsg::RoutingState(cursio_protocol::RoutingState { routes }))
-                .await?;
+            send_control(
+                tx,
+                AudioMsg::RoutingState(cursio_protocol::RoutingState { routes }),
+            )
+            .await?;
         }
 
         // Route group ops: fan out changed group gain/mute to members and
@@ -994,7 +1021,11 @@ impl AudioEngine {
             // `app_routes` maps a name to ONE stream; only drop the entry if it
             // is this one, or the surviving node loses its route.
             if let Some(app) = &app {
-                if self.app_routes.get(app).is_some_and(|(id, _)| *id == stream_id) {
+                if self
+                    .app_routes
+                    .get(app)
+                    .is_some_and(|(id, _)| *id == stream_id)
+                {
                     self.app_routes.remove(app);
                 }
             }
@@ -1021,6 +1052,7 @@ impl AudioEngine {
         // later app starting on this id begins clean at the default bitrate
         // rather than inheriting a throttled encoder.
         self.encoders.remove(&stream_id);
+        self.pending_packets.remove(&stream_id);
         self.last_sent_seq.remove(&stream_id);
         self.acked_seq.remove(&stream_id);
         self.stream_bitrate.remove(&stream_id);
@@ -1123,7 +1155,10 @@ impl AudioEngine {
             // No device handle ⇒ nothing to represent. In the unified model every
             // crossable device carries one; a deviceless playback advert is legacy
             // (the removed global stream) and is simply ignored.
-            tracing::debug!(id = meta.id, "peer advertised a deviceless playback stream; ignoring");
+            tracing::debug!(
+                id = meta.id,
+                "peer advertised a deviceless playback stream; ignoring"
+            );
             return;
         };
         let node = format!("cursio_mirror_{}", sanitize_node(dev_id));
@@ -1140,8 +1175,7 @@ impl AudioEngine {
                 // attributed to the peer device it mirrors.
                 self.sink_node_for_peer_device
                     .insert(dev_id.clone(), node.clone());
-                self.peer_device_for_sink_node
-                    .insert(node, dev_id.clone());
+                self.peer_device_for_sink_node.insert(node, dev_id.clone());
             }
             Err(e) => tracing::error!(error = %e, %label, "failed to create Intent Sink"),
         }
@@ -1162,7 +1196,10 @@ impl AudioEngine {
     /// This is the reconnect path — one object carries the full map, so we don't
     /// depend on the graph re-emitting per-link events.
     fn on_routing_state(&mut self, state: &cursio_protocol::RoutingState) {
-        tracing::info!(count = state.routes.len(), "applying replicated routing state");
+        tracing::info!(
+            count = state.routes.len(),
+            "applying replicated routing state"
+        );
         // The set of stream ids the host still routes; anything we had targeted
         // that isn't here has gone back to the default.
         let live: std::collections::HashSet<u32> = state.routes.iter().map(|r| r.id).collect();
@@ -1189,10 +1226,13 @@ impl AudioEngine {
     /// funnelled into that device. Group gain/mute is a Route property, never the
     /// device's replicated volume (invariant #2).
     fn on_route_op(&mut self, target_device: (String, String), op: cursio_protocol::RouteOp) {
-        let group = self.route_groups.entry(target_device.clone()).or_insert(RouteGroup {
-            gain: 1.0,
-            mute: false,
-        });
+        let group = self
+            .route_groups
+            .entry(target_device.clone())
+            .or_insert(RouteGroup {
+                gain: 1.0,
+                mute: false,
+            });
         match op {
             cursio_protocol::RouteOp::SetGain(g) => {
                 group.gain = g.clamp(0.0, 4.0);
@@ -1241,10 +1281,14 @@ impl AudioEngine {
         }
         let dirty: Vec<(String, String)> = self.routes_dirty.drain().collect();
         for device in dirty {
-            let group = self.route_groups.get(&device).copied().unwrap_or(RouteGroup {
-                gain: 1.0,
-                mute: false,
-            });
+            let group = self
+                .route_groups
+                .get(&device)
+                .copied()
+                .unwrap_or(RouteGroup {
+                    gain: 1.0,
+                    mute: false,
+                });
             let effective = group.effective_gain();
             // Members: Remote Streams currently targeting this device.
             let members: Vec<u32> = self
@@ -1254,7 +1298,14 @@ impl AudioEngine {
                 .map(|r| r.id)
                 .collect();
             for &id in &members {
-                send_control(tx, AudioMsg::Gain { id, gain: effective }).await?;
+                send_control(
+                    tx,
+                    AudioMsg::Gain {
+                        id,
+                        gain: effective,
+                    },
+                )
+                .await?;
             }
             tracing::info!(device = %device.1, members = members.len(), gain = group.gain, mute = group.mute, "applied route group op to members");
             send_control(
@@ -1292,7 +1343,11 @@ impl AudioEngine {
         // If we're already rendering this stream, its target moved — reopen it on
         // the next chunk so it lands on the right device.
         if self.playbacks.remove(&id).is_some() {
-            tracing::info!(id, ?device, "stream re-routed; playback will reopen on the new device");
+            tracing::info!(
+                id,
+                ?device,
+                "stream re-routed; playback will reopen on the new device"
+            );
         }
     }
 
@@ -1330,7 +1385,14 @@ impl AudioEngine {
                 }
                 self.owned_device_state.insert(c.node_name.clone(), state);
                 tracing::info!(device = %c.node_name, volume = c.volume, mute = c.mute, "broadcasting owned device state");
-                send_control(tx, AudioMsg::DeviceState { device: c.node_name, state }).await?;
+                send_control(
+                    tx,
+                    AudioMsg::DeviceState {
+                        device: c.node_name,
+                        state,
+                    },
+                )
+                .await?;
             } else if let Some(peer_dev) = self.peer_device_for_sink_node.get(&c.node_name).cloned()
             {
                 // Non-owner side: a turn of the Intent Sink is a request — unless
@@ -1404,7 +1466,10 @@ impl AudioEngine {
         if !self.owned_device_nodes.contains(device) {
             // Not ours to mutate. Could be a device that has since disappeared, or
             // a misdirected request; ignore rather than guess.
-            tracing::debug!(device, "device-state set for a device we don't own; ignoring");
+            tracing::debug!(
+                device,
+                "device-state set for a device we don't own; ignoring"
+            );
             return;
         }
         let Some(monitor) = &self.device_monitor else {
@@ -1412,11 +1477,19 @@ impl AudioEngine {
         };
         match field {
             cursio_protocol::DeviceStateField::Volume(v) => {
-                tracing::info!(device, volume = v, "applying peer's volume request to owned device");
+                tracing::info!(
+                    device,
+                    volume = v,
+                    "applying peer's volume request to owned device"
+                );
                 monitor.set_volume(device.to_string(), v);
             }
             cursio_protocol::DeviceStateField::Mute(m) => {
-                tracing::info!(device, mute = m, "applying peer's mute request to owned device");
+                tracing::info!(
+                    device,
+                    mute = m,
+                    "applying peer's mute request to owned device"
+                );
                 monitor.set_mute(device.to_string(), m);
             }
         }
@@ -1430,7 +1503,10 @@ impl AudioEngine {
     fn on_device_state_replica(&mut self, device: &str, state: cursio_protocol::DeviceState) {
         let Some(node) = self.sink_node_for_peer_device.get(device).cloned() else {
             // We don't mirror this device (no Intent Sink for it). Nothing to do.
-            tracing::debug!(device, "device-state replica for a device we don't mirror; ignoring");
+            tracing::debug!(
+                device,
+                "device-state replica for a device we don't mirror; ignoring"
+            );
             return;
         };
         let Some(monitor) = &self.device_monitor else {
@@ -1504,11 +1580,21 @@ impl AudioEngine {
             };
             let gap = sent.saturating_sub(acked);
 
-            let current = self.stream_bitrate.get(&id).copied().unwrap_or(BITRATE_START);
+            let current = self
+                .stream_bitrate
+                .get(&id)
+                .copied()
+                .unwrap_or(BITRATE_START);
             let target = next_bitrate(current, gap);
 
             if target != current {
-                tracing::info!(id, gap, from = current, to = target, "adapting audio bitrate");
+                tracing::info!(
+                    id,
+                    gap,
+                    from = current,
+                    to = target,
+                    "adapting audio bitrate"
+                );
                 self.stream_bitrate.insert(id, target);
                 // Drop the encoder so `pump` rebuilds it at `target`.
                 self.encoders.remove(&id);
@@ -1668,6 +1754,20 @@ const MAX_CHUNKS_PER_PUMP: usize = 32;
 /// audio, the same order as the playback jitter ceiling.
 const MAX_CHUNK_BACKLOG: usize = 48;
 
+/// Pop one queued packet only when the current pump can send it.
+///
+/// Checking the budget before `pop_front` is important: the capture channel
+/// cannot put an item back, so taking first and discovering a zero budget later
+/// silently lost audio at every boundary.
+fn take_with_budget<T>(queue: &mut VecDeque<T>, budget: &mut usize) -> Option<T> {
+    if *budget == 0 {
+        return None;
+    }
+    let item = queue.pop_front()?;
+    *budget -= 1;
+    Some(item)
+}
+
 /// Drop all but the newest `keep` chunks waiting in `rx`, returning how many
 /// were discarded.
 ///
@@ -1804,10 +1904,7 @@ impl crate::module::ModuleFactory for AudioFactory {
             .then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::AUDIO, VERSION))
     }
 
-    fn build(
-        &self,
-        ctx: &crate::module::SessionCtx,
-    ) -> anyhow::Result<Box<dyn SessionModule>> {
+    fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         Ok(Box::new(AudioEngine::new(
             ctx.local.peer_id,
             self.render_device.clone(),
@@ -1885,7 +1982,11 @@ mod tests {
     fn backlog_within_budget_is_left_alone() {
         let mut rx = queued(MAX_CHUNK_BACKLOG as u32);
         assert_eq!(drain_stale(&mut rx, MAX_CHUNK_BACKLOG), 0);
-        assert_eq!(rx.len(), MAX_CHUNK_BACKLOG, "nothing should have been dropped");
+        assert_eq!(
+            rx.len(),
+            MAX_CHUNK_BACKLOG,
+            "nothing should have been dropped"
+        );
     }
 
     /// A stream that fell behind keeps only the NEWEST chunks: the stale head is
@@ -1904,6 +2005,21 @@ mod tests {
         // gone, and the newest is still queued.
         let front = rx.try_recv().expect("a chunk should remain");
         assert_eq!(front.seq, 20, "kept the wrong end of the queue");
+    }
+
+    #[test]
+    fn exhausted_send_budget_keeps_encoded_audio_queued() {
+        let mut packets = VecDeque::from([1, 2, 3]);
+        let mut budget = 0;
+
+        assert_eq!(take_with_budget(&mut packets, &mut budget), None);
+        assert_eq!(packets, VecDeque::from([1, 2, 3]));
+
+        budget = 2;
+        assert_eq!(take_with_budget(&mut packets, &mut budget), Some(1));
+        assert_eq!(take_with_budget(&mut packets, &mut budget), Some(2));
+        assert_eq!(take_with_budget(&mut packets, &mut budget), None);
+        assert_eq!(packets, VecDeque::from([3]));
     }
 
     /// The same machine must keep its range across reconnects, otherwise a
@@ -1963,7 +2079,10 @@ mod tests {
         // Real audio anywhere in the buffer means the whole chunk is audible.
         let mut active = idle.clone();
         active[..4].copy_from_slice(&0.5f32.to_le_bytes());
-        assert!(!is_silent(&active), "a loud sample must mark the chunk as audio");
+        assert!(
+            !is_silent(&active),
+            "a loud sample must mark the chunk as audio"
+        );
     }
 
     /// A sustained backlog must lower the bitrate; a caught-up link must raise it;
@@ -1984,7 +2103,10 @@ mod tests {
 
         // In the hysteresis band: hold, so it doesn't chatter on jitter.
         let held = next_bitrate(def, (BACKLOG_LOW + BACKLOG_HIGH) / 2);
-        assert_eq!(held, def, "a mid-range gap must leave the bitrate unchanged");
+        assert_eq!(
+            held, def,
+            "a mid-range gap must leave the bitrate unchanged"
+        );
     }
 
     /// The floor and ceiling must be hard stops even after repeated steps.
@@ -1995,11 +2117,17 @@ mod tests {
         for _ in 0..20 {
             b = next_bitrate(b, BACKLOG_HIGH + 1);
         }
-        assert_eq!(b, BITRATE_MIN, "repeated congestion must settle exactly at the floor");
+        assert_eq!(
+            b, BITRATE_MIN,
+            "repeated congestion must settle exactly at the floor"
+        );
         for _ in 0..20 {
             b = next_bitrate(b, 0);
         }
-        assert_eq!(b, def, "repeated recovery must settle exactly at the default");
+        assert_eq!(
+            b, def,
+            "repeated recovery must settle exactly at the default"
+        );
     }
 
     fn engine() -> AudioEngine {
@@ -2020,10 +2148,16 @@ mod tests {
     fn stream_route_sets_and_clears_target() {
         let mut e = engine();
         e.on_stream_route(&route(7, Some("Speakers")));
-        assert_eq!(e.inbound_app_device.get(&7).map(String::as_str), Some("Speakers"));
+        assert_eq!(
+            e.inbound_app_device.get(&7).map(String::as_str),
+            Some("Speakers")
+        );
 
         e.on_stream_route(&route(7, None));
-        assert!(!e.inbound_app_device.contains_key(&7), "None clears the target");
+        assert!(
+            !e.inbound_app_device.contains_key(&7),
+            "None clears the target"
+        );
     }
 
     /// A RoutingState snapshot is applied as a WHOLE object: listed streams get
@@ -2042,7 +2176,10 @@ mod tests {
         });
 
         assert_eq!(e.inbound_app_device.get(&1).map(String::as_str), Some("A2"));
-        assert!(!e.inbound_app_device.contains_key(&2), "stream missing from the snapshot is reset");
+        assert!(
+            !e.inbound_app_device.contains_key(&2),
+            "stream missing from the snapshot is reset"
+        );
         assert_eq!(e.inbound_app_device.get(&3).map(String::as_str), Some("C"));
     }
 
@@ -2051,7 +2188,10 @@ mod tests {
     /// again when unmuted.
     #[test]
     fn route_group_effective_gain_mute_wins() {
-        let mut g = RouteGroup { gain: 0.6, mute: false };
+        let mut g = RouteGroup {
+            gain: 0.6,
+            mute: false,
+        };
         assert_eq!(g.effective_gain(), 0.6);
         g.mute = true;
         assert_eq!(g.effective_gain(), 0.0, "muted group applies zero gain");
@@ -2068,11 +2208,17 @@ mod tests {
 
         e.on_route_op(dev.clone(), cursio_protocol::RouteOp::SetGain(0.5));
         assert_eq!(e.route_groups.get(&dev).unwrap().gain, 0.5);
-        assert!(e.routes_dirty.contains(&dev), "a group op marks the route dirty");
+        assert!(
+            e.routes_dirty.contains(&dev),
+            "a group op marks the route dirty"
+        );
 
         e.on_route_op(dev.clone(), cursio_protocol::RouteOp::SetMute(true));
         let g = e.route_groups.get(&dev).unwrap();
-        assert!(g.mute && g.gain == 0.5, "mute is independent of the stored gain");
+        assert!(
+            g.mute && g.gain == 0.5,
+            "mute is independent of the stored gain"
+        );
 
         // Out-of-range gain is clamped, never inverted or blown past headroom.
         e.on_route_op(dev.clone(), cursio_protocol::RouteOp::SetGain(-1.0));
@@ -2090,10 +2236,15 @@ mod tests {
             routes: vec![route(1, Some("A")), route(2, None)],
         };
         e.on_routing_state(&snap);
-        let before: std::collections::BTreeMap<_, _> = e.inbound_app_device.clone().into_iter().collect();
+        let before: std::collections::BTreeMap<_, _> =
+            e.inbound_app_device.clone().into_iter().collect();
         e.on_routing_state(&snap);
-        let after: std::collections::BTreeMap<_, _> = e.inbound_app_device.clone().into_iter().collect();
-        assert_eq!(before, after, "re-applying the same snapshot must be a no-op");
+        let after: std::collections::BTreeMap<_, _> =
+            e.inbound_app_device.clone().into_iter().collect();
+        assert_eq!(
+            before, after,
+            "re-applying the same snapshot must be a no-op"
+        );
         assert_eq!(before.get(&1).map(String::as_str), Some("A"));
         assert!(!before.contains_key(&2), "a None entry never sets a target");
     }
