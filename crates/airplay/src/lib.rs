@@ -9,6 +9,7 @@
 mod config;
 pub mod crypto;
 pub mod discovery;
+pub mod mirror;
 mod receiver;
 pub mod rtsp;
 pub mod video;
