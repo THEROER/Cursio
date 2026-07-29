@@ -10,6 +10,7 @@ path = "src/bin/cursio.rs"
 [dependencies]
 cursio-protocol.workspace = true
 cursio-transport.workspace = true
+cursio-airplay.workspace = true
 cursio-input.workspace = true
 cursio-audio.workspace = true
 cursio-window.workspace = true

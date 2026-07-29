@@ -17,14 +17,16 @@
 //! model doesn't have, and keeping all three meant the same session logic lived
 //! in three places — where a fix landed in one and not the others.)
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
 use cursio_core::session::{self};
 use cursio_core::NodeIdentity;
 use cursio_transport::discovery;
+use cursio_transport::discovery::DiscoveryConfig;
 use cursio_transport::pairing::{self, Role, TrustStore};
 use cursio_transport::tcp::{TcpListenerHandle, TcpTransport};
 use cursio_transport::Transport;
@@ -119,6 +121,27 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
     },
+    /// Receive an iPhone screen through AirPlay.
+    Airplay {
+        /// Name shown in the iPhone Screen Mirroring picker.
+        #[arg(long, default_value = "Cursio AirPlay")]
+        name: String,
+        /// AirPlay control port.
+        #[arg(long, default_value_t = 7000)]
+        port: u16,
+        /// Address on which the AirPlay control listener accepts connections.
+        #[arg(long, default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
+        bind: IpAddr,
+        /// Pin mDNS to the LAN interface with this address.
+        #[arg(long)]
+        interface: Option<IpAddr>,
+        /// Target output resolution.
+        #[arg(long, value_enum, default_value_t = AirPlayResolutionArg::FullHd)]
+        res: AirPlayResolutionArg,
+        /// Target output frame rate.
+        #[arg(long, default_value_t = 60)]
+        fps: u16,
+    },
 }
 
 /// Which of *this* machine's screen edges borders the peer, for edge-crossing
@@ -141,6 +164,23 @@ impl From<EdgeArg> for cursio_protocol::Edge {
             EdgeArg::Right => cursio_protocol::Edge::Right,
             EdgeArg::Top => cursio_protocol::Edge::Top,
             EdgeArg::Bottom => cursio_protocol::Edge::Bottom,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AirPlayResolutionArg {
+    #[value(name = "1080p")]
+    FullHd,
+    #[value(name = "2k")]
+    Qhd,
+}
+
+impl From<AirPlayResolutionArg> for Resolution {
+    fn from(resolution: AirPlayResolutionArg) -> Self {
+        match resolution {
+            AirPlayResolutionArg::FullHd => Self::FullHd,
+            AirPlayResolutionArg::Qhd => Self::Qhd,
         }
     }
 }
@@ -219,7 +259,48 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
+        Command::Airplay {
+            name,
+            port,
+            bind,
+            interface,
+            res,
+            fps,
+        } => run_airplay(identity, name, port, bind, interface, res, fps).await,
     }
+}
+
+async fn run_airplay(
+    identity: NodeIdentity,
+    name: String,
+    port: u16,
+    bind: IpAddr,
+    interface: Option<IpAddr>,
+    resolution: AirPlayResolutionArg,
+    fps: u16,
+) -> anyhow::Result<()> {
+    let profile = VideoProfile::new(resolution.into(), fps)?;
+    let hardware = cursio_airplay::hardware::HardwareInfo::detect();
+    for gpu in &hardware.gpus {
+        let vram = gpu
+            .dedicated_vram_bytes
+            .map(|bytes| format!("{:.1} GiB", bytes as f64 / 1024_f64.powi(3)))
+            .unwrap_or_else(|| "shared/unknown VRAM".to_string());
+        tracing::info!(gpu = %gpu.name, %vram, "AirPlay GPU");
+    }
+    for warning in hardware.profile_warnings(profile) {
+        tracing::warn!("{warning}");
+    }
+
+    let config = ReceiverConfig::new(name, identity.peer_id, SocketAddr::new(bind, port), profile)?;
+    let discovery = interface.map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
+    let receiver = Receiver::bind(config, discovery).await?;
+    tracing::info!(
+        address = %receiver.local_addr()?,
+        "AirPlay receiver is visible in iPhone Screen Mirroring"
+    );
+    receiver.serve().await?;
+    Ok(())
 }
 
 fn read_pairing_password() -> anyhow::Result<Zeroizing<String>> {

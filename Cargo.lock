@@ -1079,6 +1079,7 @@ dependencies = [
  "async-trait",
  "clap",
  "clipboard-core",
+ "cursio-airplay",
  "cursio-audio",
  "cursio-files",
  "cursio-input",
