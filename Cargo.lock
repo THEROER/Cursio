@@ -178,6 +178,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "astro-dnssd"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c247a5549f186c77fe07ee4420d52c7766da36de4560504b5ccde98a4f208f1"
+dependencies = [
+ "libc",
+ "log",
+ "pkg-config",
+ "thiserror 2.0.18",
+ "widestring",
+ "winapi",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1031,6 +1045,7 @@ dependencies = [
 name = "cursio-airplay"
 version = "0.1.0"
 dependencies = [
+ "astro-dnssd",
  "clap",
  "cursio-transport",
  "gstreamer",

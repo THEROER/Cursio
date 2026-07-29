@@ -3,7 +3,9 @@
 use std::net::IpAddr;
 
 use cursio_transport::discovery::DiscoveryConfig;
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+#[cfg(not(target_os = "macos"))]
+use mdns_sd::ServiceDaemon;
+use mdns_sd::ServiceInfo;
 
 use crate::{AirPlayError, ReceiverConfig};
 
@@ -24,11 +26,19 @@ pub(crate) const LEGACY_RECEIVER_PUBLIC_KEY: [u8; 32] = [
 ];
 
 /// Active registration for both service records.
+#[cfg(not(target_os = "macos"))]
 pub struct AirPlayAnnouncement {
     daemon: ServiceDaemon,
     fullnames: [String; 2],
 }
 
+#[cfg(target_os = "macos")]
+pub struct AirPlayAnnouncement {
+    _airplay: astro_dnssd::RegisteredDnsService,
+    _raop: astro_dnssd::RegisteredDnsService,
+}
+
+#[cfg(not(target_os = "macos"))]
 impl AirPlayAnnouncement {
     pub fn register(
         receiver: &ReceiverConfig,
@@ -51,6 +61,52 @@ impl AirPlayAnnouncement {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl AirPlayAnnouncement {
+    pub fn register(
+        receiver: &ReceiverConfig,
+        port: u16,
+        discovery: &DiscoveryConfig,
+    ) -> Result<Self, AirPlayError> {
+        let services = service_infos(receiver, port, discovery.pin_interface_addr)?;
+        let airplay = native_register("_airplay._tcp", receiver.name.trim(), port, &services[0])?;
+        let raop = native_register(
+            "_raop._tcp",
+            &format!(
+                "{}@{}",
+                receiver.device_id.raop_prefix(),
+                receiver.name.trim()
+            ),
+            port,
+            &services[1],
+        )?;
+        Ok(Self {
+            _airplay: airplay,
+            _raop: raop,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_register(
+    service_type: &str,
+    instance: &str,
+    port: u16,
+    info: &ServiceInfo,
+) -> Result<astro_dnssd::RegisteredDnsService, AirPlayError> {
+    let properties = info
+        .get_properties()
+        .iter()
+        .map(|property| (property.key().to_string(), property.val_str().to_string()))
+        .collect();
+    astro_dnssd::DNSServiceBuilder::new(service_type, port)
+        .with_name(instance)
+        .with_txt_record(properties)
+        .register()
+        .map_err(|error| AirPlayError::Mdns(format!("{error:?}")))
+}
+
+#[cfg(not(target_os = "macos"))]
 impl Drop for AirPlayAnnouncement {
     fn drop(&mut self) {
         for fullname in &self.fullnames {
