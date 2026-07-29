@@ -316,13 +316,16 @@ fn to_file_error(e: std::io::Error) -> FileError {
 /// free count makes others refuse to write, believing the disk full. A
 /// plausible figure is wrong in a way nothing crashes on; zero is wrong in a way
 /// that takes other programs down.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub(crate) const FALLBACK_TOTAL: u64 = 1 << 40; // 1 TiB
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub(crate) const FALLBACK_FREE: u64 = 1 << 39; // half of it
 
 /// Total and free bytes for the filesystem holding `path`.
 ///
 /// Falls back to [`FALLBACK_TOTAL`]/[`FALLBACK_FREE`] rather than zero when the
 /// query fails.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn capacity_of(path: &Path) -> (u64, u64) {
     match raw_capacity(path) {
         // A total of zero is as dangerous as a failed query, so treat it the
@@ -381,7 +384,7 @@ fn raw_capacity(path: &Path) -> Option<(u64, u64)> {
     Some((total, free_to_caller))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(all(not(any(target_os = "linux", target_os = "windows")), test))]
 fn raw_capacity(_path: &Path) -> Option<(u64, u64)> {
     None
 }

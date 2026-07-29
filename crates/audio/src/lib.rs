@@ -209,6 +209,7 @@ pub fn list_app_streams() -> Result<Vec<AppStream>, AudioError> {
 
 /// Marker in a device name that identifies one of Cursio's own mirrors, so
 /// enumeration can skip them (see [`list_output_devices`]).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MIRROR_MARKER: &str = "cursio";
 
 // ---------------------------------------------------------------------------
@@ -424,6 +425,9 @@ impl Capture {
             unreachable!("unsupported platforms cannot construct Capture")
         }
     }
+
+    /// Stop this capture and release its platform stream immediately.
+    pub fn stop(self) {}
 }
 
 /// A running whole-device playback node, on whichever backend this platform has.

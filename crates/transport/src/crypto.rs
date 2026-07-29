@@ -148,7 +148,7 @@ pub(crate) fn chunk_plaintext(msg: &Message) -> Result<Vec<Vec<u8>>, TransportEr
     let body = msg.to_bytes()?;
 
     // Fast path: fits whole. Tag byte + body in one frame.
-    if body.len() <= MAX_NOISE_PLAINTEXT - 1 {
+    if body.len() < MAX_NOISE_PLAINTEXT {
         let mut tagged = Vec::with_capacity(body.len() + 1);
         tagged.push(frame_tag::WHOLE);
         tagged.extend_from_slice(&body);

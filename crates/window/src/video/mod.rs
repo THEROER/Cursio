@@ -34,6 +34,7 @@ pub struct DecodedFrame {
 /// bitstream scan rather than a flag on our own message: it stays correct even
 /// if the encoder's packet boundaries change, and it is what actually decides
 /// whether the decoder can start here.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub(crate) fn contains_keyframe(packet: &[u8]) -> bool {
     // NAL units are separated by 0x000001 or 0x00000001; the byte after the
     // start code carries the type in its low 5 bits.

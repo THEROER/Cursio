@@ -981,7 +981,7 @@ impl AudioEngine {
         for app_node_id in expired {
             self.routed_app_expiry.remove(&app_node_id);
             if let Some((stream_id, cap)) = self.routed_apps.remove(&app_node_id) {
-                drop(cap); // stops the capture thread; the tunnel stays up
+                cap.stop(); // stops the capture thread; the tunnel stays up
                 let app = self.routed_app_names.remove(&app_node_id);
                 let still_live = app
                     .as_ref()
@@ -1936,14 +1936,16 @@ mod tests {
     /// shared channel — felt as mouse lag — right after connecting.
     #[test]
     fn streams_start_below_the_ceiling() {
-        assert!(
-            BITRATE_START < cursio_audio::codec::DEFAULT_BITRATE,
-            "opening bitrate must leave headroom for input"
-        );
-        assert!(
-            BITRATE_START >= BITRATE_MIN,
-            "opening bitrate should not start below the adaptation floor"
-        );
+        const {
+            assert!(
+                BITRATE_START < cursio_audio::codec::DEFAULT_BITRATE,
+                "opening bitrate must leave headroom for input"
+            );
+            assert!(
+                BITRATE_START >= BITRATE_MIN,
+                "opening bitrate should not start below the adaptation floor"
+            );
+        }
     }
 
     /// A healthy link must still reach full quality — starting low is a ramp, not
@@ -2050,11 +2052,12 @@ mod tests {
     #[test]
     fn silence_threshold_is_above_the_16_bit_noise_floor() {
         const S16_LSB: f32 = 1.0 / 32768.0;
-        assert!(
-            SILENCE_THRESHOLD > S16_LSB,
-            "threshold {SILENCE_THRESHOLD:e} must exceed one s16 LSB ({S16_LSB:e}), \
-             or idle streams are mistaken for audio"
-        );
+        const {
+            assert!(
+                SILENCE_THRESHOLD > S16_LSB,
+                "silence threshold must exceed one s16 LSB"
+            );
+        }
     }
 
     /// ...and still well below anything a listener would call audible, so real

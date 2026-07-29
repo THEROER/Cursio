@@ -605,18 +605,10 @@ mod tests {
     use tokio::sync::mpsc;
 
     /// Collects what the module sends, standing in for the transport.
+    #[derive(Default)]
     struct RecordingTx {
         sent: Vec<Message>,
         video_depth: QueueDepth,
-    }
-
-    impl Default for RecordingTx {
-        fn default() -> Self {
-            Self {
-                sent: Vec::new(),
-                video_depth: QueueDepth::default(),
-            }
-        }
     }
 
     #[async_trait]

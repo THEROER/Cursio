@@ -36,6 +36,12 @@ pub struct FrameDiffer {
     height: u32,
 }
 
+impl Default for FrameDiffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameDiffer {
     pub fn new() -> Self {
         Self {
