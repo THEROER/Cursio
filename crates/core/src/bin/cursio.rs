@@ -23,10 +23,10 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use cursio_core::session::{self};
 use cursio_core::NodeIdentity;
-use cursio_transport::discovery::{self, DiscoveredPeer};
+use cursio_transport::discovery;
 use cursio_transport::pairing::{self, Role, TrustStore};
 use cursio_transport::tcp::{TcpListenerHandle, TcpTransport};
-use cursio_transport::{EncryptedTransport, Transport};
+use cursio_transport::Transport;
 
 #[derive(Parser)]
 #[command(name = "cursio", about = "Cursio LAN session driver")]
@@ -284,29 +284,6 @@ fn module_registry(
     registry
 }
 
-/// Version of the input vocabulary (`Message::Input`, `Grab`, `CrossEdge`).
-/// Bump when those change shape.
-const INPUT_VERSION: u16 = 1;
-
-/// The registry's adverts, plus input's when this session actually has capture.
-///
-/// Input's advert follows the *capture*, not the `--send-input` flag: capture is
-/// one machine-wide resource, and a session that couldn't borrow it genuinely
-/// has no input to send, whatever the flag said.
-fn advertise_with_input(
-    registry: &cursio_core::module::ModuleRegistry,
-    has_capture: bool,
-) -> Vec<cursio_protocol::ModuleAdvert> {
-    let mut adverts = registry.advertise();
-    if has_capture {
-        adverts.push(cursio_protocol::ModuleAdvert::symmetric(
-            cursio_protocol::ModuleId::INPUT,
-            INPUT_VERSION,
-        ));
-    }
-    adverts
-}
-
 /// Run as a mesh node: listen and dial trusted peers simultaneously, forever.
 ///
 /// This is *the* way to run Cursio — every node accepts and every node dials,
@@ -351,7 +328,7 @@ async fn run_mesh(
     std::thread::Builder::new()
         .name("cursio-mesh-discovery".into())
         .spawn(move || {
-            let config = discovery_config();
+            let config = cursio_core::link::discovery_config();
             if let Err(e) = discovery::browse_with(self_id, &config, move |peer| {
                 let _ = seen_tx.send(peer);
             }) {
@@ -564,7 +541,7 @@ async fn join(
         Some(a) => a,
         None => {
             tracing::info!("browsing the LAN for a peer to pair with");
-            match discover_one(identity.peer_id, Duration::from_secs(discover_timeout_secs)).await {
+            match cursio_core::link::discover_one(identity.peer_id, Duration::from_secs(discover_timeout_secs)).await {
                 Some(peer) => {
                     tracing::info!(peer = %peer.display_name, addr = %peer.addr, "discovered peer");
                     peer.addr
@@ -619,10 +596,7 @@ async fn join(
     Ok(())
 }
 
-/// Called once a session learns who the peer is (from the Hello handshake).
-/// The mesh uses it to mark an inbound peer online — until the handshake, a
-/// peer that dialled *us* is just an anonymous socket.
-type IdentifiedCallback<'a> = dyn FnMut(cursio_protocol::PeerId, &str) + 'a;
+use cursio_core::link::IdentifiedCallback;
 
 /// Shared tail of `serve`/`connect`: Hello handshake, pair on first meeting,
 /// bring up a Noise-encrypted channel, then run heartbeats over it.
@@ -636,7 +610,7 @@ type IdentifiedCallback<'a> = dyn FnMut(cursio_protocol::PeerId, &str) + 'a;
 // per-module knobs — a new module adds nothing here.
 #[allow(clippy::too_many_arguments)]
 async fn run_pairing_and_session(
-    mut transport: TcpTransport,
+    transport: TcpTransport,
     identity: NodeIdentity,
     password: &str,
     role: Role,
@@ -655,89 +629,32 @@ async fn run_pairing_and_session(
     modules: &cursio_core::module::ModuleRegistry,
     on_identified: Option<&mut IdentifiedCallback<'_>>,
 ) -> anyhow::Result<()> {
-    // Hello first, so we learn the peer's identity *and* capabilities before
-    // deciding to pair or which modules to build.
-    //
-    let advertised = advertise_with_input(modules, capture.is_some());
-    let peer = session::handshake(
-        &mut transport,
-        &identity,
-        session::local_device_kind(),
-        &advertised,
+    // Handshake, pairing, Noise and module negotiation are the same five steps
+    // for every node, so they live in `link` — the app and a phone run this
+    // exact sequence rather than a second copy of it.
+    let link = cursio_core::link::establish(
+        transport,
+        cursio_core::link::Handshake {
+            identity: &identity,
+            password,
+            role,
+            registry: modules,
+            peer_edge,
+            sends_input: capture.is_some(),
+        },
+        on_identified,
     )
     .await?;
-    tracing::info!(
-        peer = %peer.display_name,
-        id = %peer.peer_id,
-        kind = ?peer.device_kind,
-        "handshake ok"
-    );
-
-    // Which modules actually run here. A module enabled on one side only is a
-    // log line now, not a silent half-configuration.
-    let negotiated = peer.negotiate(&advertised);
-    for id in &negotiated.agreed {
-        tracing::info!(module = %id, "module negotiated");
-    }
-    for (id, why) in &negotiated.skipped {
-        tracing::warn!(module = %id, reason = %why, "module not running on this link");
-    }
-
-    // Report who this turned out to be. For an *inbound* connection this is the
-    // first moment we know: a dialling peer is identified by address, but one
-    // that dials us is anonymous until it says hello.
-    if let Some(cb) = on_identified {
-        cb(peer.peer_id, &peer.display_name);
-    }
-
-    let mut store = TrustStore::load()?;
-    let shared_key = match store.get(&peer.peer_id) {
-        Some(trusted) => {
-            tracing::info!("peer already trusted; skipping pairing");
-            trusted.shared_key()?
-        }
-        None => {
-            tracing::info!("new peer; running pairing");
-            let paired = pairing::run_pairing(
-                &mut transport,
-                password,
-                role,
-                (peer.peer_id, peer.display_name.clone()),
-            )
-            .await?;
-            let key = paired.shared_key.clone();
-            store.add(&paired)?;
-            tracing::info!("paired and trust stored ✓");
-            key
-        }
-    };
-
-    // Upgrade to an encrypted channel keyed by the shared secret.
-    tracing::info!("establishing encrypted channel (Noise)");
-    let mut secure = EncryptedTransport::establish(transport, &shared_key, role).await?;
-    tracing::info!("encrypted channel up ({})", secure.kind());
-
-    // Modules are built from what was *negotiated*, not from the local flags
-    // alone: a module the peer doesn't have would otherwise sit here advertising
-    // into a void. `negotiated.agreed` already accounts for the flags, since
-    // only enabled modules were advertised in the first place.
-    //
-    // Note this replaced ~75 lines of per-module `if` and three `#[cfg]` blocks:
-    // the platform question now lives in each factory's `advert`, and a module
-    // that fails to build is skipped with a log rather than failing the session.
-    let ctx = cursio_core::module::SessionCtx {
-        local: &identity,
-        peer: &peer,
-        peer_edge,
-    };
-    let modules = modules.build_agreed(&negotiated, &ctx);
+    let peer = link.peer;
+    let mut secure = link.transport;
+    let modules = link.modules;
 
 
     // Test mode: stream a synthetic mouse pattern to the peer, then finish.
     // Lets us verify remote injection before the capture side exists.
     if test_input {
         tracing::info!("sending synthetic test input (a square) to the peer");
-        send_test_pattern(&mut secure).await?;
+        send_test_pattern(secure.as_mut()).await?;
         let _ = secure.send(&cursio_protocol::Message::Bye).await;
         tracing::info!("test input sent; closing");
         return Ok(());
@@ -770,23 +687,10 @@ async fn run_pairing_and_session(
     // and so does the cleanup after the session ends.
     let cursor = std::rc::Rc::new(std::cell::RefCell::new(make_cursor()));
 
-    // Exactly one machine starts active (holds the shared cursor).
-    //
-    // Derived from the two stable peer ids, NOT from who dialled whom: with no
-    // server, "the one that ran `serve`" isn't a meaningful distinction, and it
-    // flips when the same two machines reconnect the other way round — the
-    // cursor would land on a different machine each time. Comparing ids is
-    // deterministic, needs no negotiation, and each side independently computes
-    // the opposite answer, which is exactly the "exactly one active" invariant.
-    //
-    // What the ids cannot say is whether the peer is a machine that can hold a
-    // cursor at all, so the device kinds decide first — see `CursorSetup`.
-    let cursor_setup = session::CursorSetup::negotiate(
-        session::local_device_kind(),
-        identity.peer_id,
-        peer.device_kind,
-        peer.peer_id,
-    );
+    // Who starts with the shared cursor was settled while the link came up —
+    // see `CursorSetup`, which weighs what sort of machine the peer is before
+    // falling back to comparing ids.
+    let cursor_setup = link.cursor;
 
     tracing::info!(
         start_active = cursor_setup.start_active,
@@ -794,13 +698,12 @@ async fn run_pairing_and_session(
         peer_takes_cursor = cursor_setup.peer_takes_cursor,
         "session up — sharing input; press Ctrl+Alt+G to toggle control (Ctrl-C to stop)"
     );
-    let boxed: Box<dyn Transport> = Box::new(secure);
     let inject_ref = injector.clone();
     let release_ref = injector.clone();
     let grab_ref = grab.clone();
     let cursor_ref = cursor.clone();
     let result = session::run_session(
-        boxed,
+        secure,
         cursor_setup,
         captured,
         move |event| inject(inject_ref.borrow_mut().as_mut(), event),
@@ -1199,7 +1102,7 @@ async fn start_node(
         &identity.display_name,
         &instance,
         bound.port(),
-        &discovery_config(),
+        &cursio_core::link::discovery_config(),
     )?;
     tracing::info!("announced on the LAN as {instance}");
 
@@ -1300,7 +1203,7 @@ fn inject(
 async fn list_peers(identity: NodeIdentity, timeout_secs: u64) -> anyhow::Result<()> {
     tracing::info!("browsing for {timeout_secs}s...");
     let self_id = identity.peer_id;
-    let cfg = discovery_config();
+    let cfg = cursio_core::link::discovery_config();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = discovery::browse_with(self_id, &cfg, |peer| {
@@ -1320,37 +1223,7 @@ async fn list_peers(identity: NodeIdentity, timeout_secs: u64) -> anyhow::Result
     Ok(())
 }
 
-/// Browse until one peer is found or the timeout elapses.
-async fn discover_one(
-    self_id: cursio_protocol::PeerId,
-    timeout: Duration,
-) -> Option<DiscoveredPeer> {
-    let cfg = discovery_config();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = discovery::browse_with(self_id, &cfg, |peer| {
-            let _ = tx.send(peer);
-        });
-    });
-    rx.recv_timeout(timeout).ok()
-}
 
-/// Build the discovery config, pinning mDNS to the detected LAN interface when
-/// one is found. On hosts cluttered with VPNs (WireGuard, Tailscale, Hamachi)
-/// this keeps multicast off interfaces that reject it. Falls back to the
-/// default (auto-exclude known-virtual ranges) if no LAN address is detected.
-fn discovery_config() -> discovery::DiscoveryConfig {
-    match discovery::guess_lan_ipv4() {
-        Some(addr) => {
-            tracing::info!(%addr, "pinning discovery to LAN interface");
-            discovery::DiscoveryConfig::pinned_to(addr)
-        }
-        None => {
-            tracing::warn!("could not detect a LAN interface; using default discovery config");
-            discovery::DiscoveryConfig::default()
-        }
-    }
-}
 
 /// mDNS instance names must be simple; strip anything awkward from the hostname.
 fn sanitize_instance(name: &str) -> String {

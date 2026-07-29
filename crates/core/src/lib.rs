@@ -22,6 +22,10 @@ pub mod elevate;
 ))]
 pub mod files_session;
 pub mod identity;
+/// Bringing a link up to the point a session can start: handshake, pairing,
+/// encryption, module negotiation. Shared by the CLI and the app, desktop and
+/// mobile alike.
+pub mod link;
 pub mod logging;
 pub mod mesh;
 pub mod module;
