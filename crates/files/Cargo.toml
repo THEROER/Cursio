@@ -41,6 +41,8 @@ windows = { version = "0.61", features = ["Win32_Foundation"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
+    # Lowering the priority of the file worker threads; see background.rs.
+    "Win32_System_Threading",
     # Locating and loading WinFsp's side-by-side DLL; see winmount::fs.
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
