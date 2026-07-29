@@ -7,6 +7,7 @@
 //! FairPlay, and media setup fail closed until their protocol stages exist.
 
 mod config;
+pub mod crypto;
 pub mod discovery;
 mod receiver;
 pub mod rtsp;
@@ -32,4 +33,6 @@ pub enum AirPlayError {
     Config(#[from] ConfigError),
     #[error("video pipeline error: {0}")]
     Video(String),
+    #[error("AirPlay cryptography error: {0}")]
+    Crypto(String),
 }

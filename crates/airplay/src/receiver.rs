@@ -4,6 +4,7 @@ use cursio_transport::discovery::DiscoveryConfig;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::crypto::{CryptoProvider, CryptoSession};
 use crate::discovery::AirPlayAnnouncement;
 use crate::rtsp::{self, ProtocolError, RequestDecoder};
 use crate::{AirPlayError, ReceiverConfig};
@@ -13,6 +14,7 @@ pub struct Receiver {
     listener: TcpListener,
     config: Arc<ReceiverConfig>,
     _announcement: AirPlayAnnouncement,
+    crypto: Option<Arc<dyn CryptoProvider>>,
 }
 
 impl Receiver {
@@ -24,6 +26,22 @@ impl Receiver {
         config: ReceiverConfig,
         discovery: DiscoveryConfig,
     ) -> Result<Self, AirPlayError> {
+        Self::bind_inner(config, discovery, None).await
+    }
+
+    pub async fn bind_with_crypto(
+        config: ReceiverConfig,
+        discovery: DiscoveryConfig,
+        crypto: Arc<dyn CryptoProvider>,
+    ) -> Result<Self, AirPlayError> {
+        Self::bind_inner(config, discovery, Some(crypto)).await
+    }
+
+    async fn bind_inner(
+        config: ReceiverConfig,
+        discovery: DiscoveryConfig,
+        crypto: Option<Arc<dyn CryptoProvider>>,
+    ) -> Result<Self, AirPlayError> {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let announcement = AirPlayAnnouncement::register(&config, local_addr.port(), &discovery)?;
@@ -31,6 +49,7 @@ impl Receiver {
             listener,
             config: Arc::new(config),
             _announcement: announcement,
+            crypto,
         })
     }
 
@@ -44,8 +63,12 @@ impl Receiver {
             let (stream, peer) = self.listener.accept().await?;
             stream.set_nodelay(true)?;
             let config = self.config.clone();
+            let crypto = self
+                .crypto
+                .as_ref()
+                .map(|provider| provider.start_session());
             tokio::spawn(async move {
-                if let Err(error) = serve_connection(stream, config).await {
+                if let Err(error) = serve_connection(stream, config, crypto).await {
                     tracing::warn!(%peer, %error, "AirPlay control connection ended");
                 }
             });
@@ -53,7 +76,11 @@ impl Receiver {
     }
 }
 
-async fn serve_connection<T>(mut stream: T, config: Arc<ReceiverConfig>) -> Result<(), AirPlayError>
+async fn serve_connection<T>(
+    mut stream: T,
+    config: Arc<ReceiverConfig>,
+    mut crypto: Option<Box<dyn CryptoSession>>,
+) -> Result<(), AirPlayError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -71,7 +98,12 @@ where
         decoder.push(&read_buffer[..count])?;
 
         while let Some(request) = decoder.next_request()? {
-            let response = rtsp::route(&request, &config)?;
+            let response = match crypto.as_mut() {
+                Some(session) => {
+                    rtsp::route_with_crypto(&request, &config, Some(session.as_mut()))?
+                }
+                None => rtsp::route(&request, &config)?,
+            };
             let encoded = response.encode(request.version, request.header("CSeq"));
             stream.write_all(&encoded).await?;
             stream.flush().await?;
@@ -102,7 +134,7 @@ mod tests {
     #[tokio::test]
     async fn serves_fragmented_and_pipelined_requests() {
         let (mut client, server) = tokio::io::duplex(32 * 1024);
-        let task = tokio::spawn(serve_connection(server, config()));
+        let task = tokio::spawn(serve_connection(server, config(), None));
 
         client
             .write_all(b"GET /info RTSP/1.0\r\nCSeq: 1\r\nContent-L")
@@ -128,7 +160,7 @@ mod tests {
     #[tokio::test]
     async fn truncated_request_is_rejected() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(serve_connection(server, config()));
+        let task = tokio::spawn(serve_connection(server, config(), None));
         client
             .write_all(b"GET /info RTSP/1.0\r\nContent-Length: 4\r\n\r\nab")
             .await

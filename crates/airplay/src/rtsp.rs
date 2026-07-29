@@ -4,6 +4,7 @@ use std::fmt;
 
 use plist::{Dictionary, Value};
 
+use crate::crypto::{CryptoEndpoint, CryptoSession};
 use crate::discovery::AIRPLAY_FEATURES;
 use crate::{AirPlayError, ReceiverConfig};
 
@@ -252,6 +253,14 @@ impl Response {
 /// acknowledging those stages before their cryptographic state machines exist
 /// would leave the sender and receiver in inconsistent states.
 pub fn route(request: &Request, receiver: &ReceiverConfig) -> Result<Response, AirPlayError> {
+    route_with_crypto(request, receiver, None)
+}
+
+pub(crate) fn route_with_crypto(
+    request: &Request,
+    receiver: &ReceiverConfig,
+    crypto: Option<&mut dyn CryptoSession>,
+) -> Result<Response, AirPlayError> {
     let target = request.target.split('?').next().unwrap_or(&request.target);
     if request.method.eq_ignore_ascii_case("OPTIONS") {
         return Ok(Response::new(200, "OK").with_header(
@@ -266,7 +275,16 @@ pub fn route(request: &Request, receiver: &ReceiverConfig) -> Result<Response, A
             .with_body("application/x-apple-binary-plist", info_plist(receiver)?));
     }
 
-    let crypto_endpoint = matches!(target, "/pair-setup" | "/pair-verify" | "/fp-setup");
+    let crypto_endpoint = match target {
+        "/pair-setup" => Some(CryptoEndpoint::PairSetup),
+        "/pair-verify" => Some(CryptoEndpoint::PairVerify),
+        "/fp-setup" => Some(CryptoEndpoint::FairPlaySetup),
+        _ => None,
+    };
+    if let (Some(endpoint), Some(crypto)) = (crypto_endpoint, crypto) {
+        let body = crypto.handle(endpoint, &request.body)?;
+        return Ok(Response::new(200, "OK").with_body("application/octet-stream", body));
+    }
     let media_endpoint = matches!(target, "/stream" | "/feedback" | "/command" | "/audioMode");
     let media_method = matches!(
         request.method.to_ascii_uppercase().as_str(),
@@ -279,8 +297,8 @@ pub fn route(request: &Request, receiver: &ReceiverConfig) -> Result<Response, A
             | "GET_PARAMETER"
             | "SET_PARAMETER"
     );
-    if crypto_endpoint || media_endpoint || media_method {
-        let stage = if crypto_endpoint {
+    if crypto_endpoint.is_some() || media_endpoint || media_method {
+        let stage = if crypto_endpoint.is_some() {
             "airplay-crypto-pending"
         } else {
             "airplay-media-pending"
@@ -329,6 +347,7 @@ fn info_plist(receiver: &ReceiverConfig) -> Result<Vec<u8>, plist::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::CryptoSession;
     use crate::{Resolution, VideoProfile};
     use std::net::SocketAddr;
     use uuid::Uuid;
@@ -516,6 +535,44 @@ mod tests {
                 Some(stage)
             );
         }
+    }
+
+    struct TestCrypto {
+        called: Option<CryptoEndpoint>,
+    }
+
+    impl CryptoSession for TestCrypto {
+        fn handle(
+            &mut self,
+            endpoint: CryptoEndpoint,
+            request: &[u8],
+        ) -> Result<Vec<u8>, AirPlayError> {
+            self.called = Some(endpoint);
+            let mut response = b"reply:".to_vec();
+            response.extend_from_slice(request);
+            Ok(response)
+        }
+
+        fn unwrap_media_key(&mut self, _: &[u8]) -> Result<[u8; 16], AirPlayError> {
+            Ok([7; 16])
+        }
+    }
+
+    #[test]
+    fn configured_crypto_session_handles_pairing_endpoint() {
+        let request = Request {
+            method: "POST".to_string(),
+            target: "/fp-setup".to_string(),
+            version: Version::Rtsp10,
+            headers: Vec::new(),
+            body: b"challenge".to_vec(),
+        };
+        let mut crypto = TestCrypto { called: None };
+        let response = route_with_crypto(&request, &config(), Some(&mut crypto)).unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"reply:challenge");
+        assert_eq!(crypto.called, Some(CryptoEndpoint::FairPlaySetup));
     }
 
     #[test]
