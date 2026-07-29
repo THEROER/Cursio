@@ -9,8 +9,9 @@
 //! - `join` — one-time pairing with a new machine (the only place a password is used), then exit.
 //! - `peers` — list peers discovered on the LAN and exit.
 //!
-//! Typical use: `cursio join --password <same-on-both>` once per new machine,
-//! then `cursio mesh` on every machine, every time.
+//! Typical use: `cursio join` once per new machine, then `cursio mesh` on every
+//! machine, every time. `join` reads the shared password from the terminal
+//! without echoing it or exposing it in the process list.
 //!
 //! (`serve`/`connect` are gone: they encoded a client/server split that the mesh
 //! model doesn't have, and keeping all three meant the same session logic lived
@@ -27,6 +28,7 @@ use cursio_transport::discovery;
 use cursio_transport::pairing::{self, Role, TrustStore};
 use cursio_transport::tcp::{TcpListenerHandle, TcpTransport};
 use cursio_transport::Transport;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "cursio", about = "Cursio LAN session driver")]
@@ -46,9 +48,6 @@ enum Command {
         /// Explicit peer address (skips discovery), e.g. 192.168.1.20:9000.
         #[arg(long)]
         addr: Option<SocketAddr>,
-        /// Shared pairing password (must match the peer's).
-        #[arg(long)]
-        password: String,
         /// How long to browse for a peer before giving up.
         #[arg(long, default_value_t = 10)]
         discover_timeout_secs: u64,
@@ -59,7 +58,7 @@ enum Command {
     /// trust store), so one dying doesn't make the others forget it — they mark
     /// it offline, carry on with each other, and reconnect when it returns.
     ///
-    /// New peers still join explicitly via `join --password`; the mesh only
+    /// New peers still join explicitly via `join`; the mesh only
     /// auto-dials machines already paired with.
     Mesh {
         /// TCP port to listen on. A **stable default** (not 0/OS-assigned) is
@@ -180,9 +179,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Join {
             addr,
-            password,
             discover_timeout_secs,
-        } => join(identity, addr, &password, discover_timeout_secs).await,
+        } => {
+            let password = read_pairing_password()?;
+            join(identity, addr, &password, discover_timeout_secs).await
+        }
         Command::Mesh {
             port,
             send_input,
@@ -216,6 +217,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
     }
+}
+
+fn read_pairing_password() -> anyhow::Result<Zeroizing<String>> {
+    let password = Zeroizing::new(rpassword::prompt_password("Pairing password: ")?);
+    if password.is_empty() {
+        anyhow::bail!("pairing password cannot be empty");
+    }
+    Ok(password)
 }
 
 /// Audio-share options for a session. When `audio` is set, audio runs as a
