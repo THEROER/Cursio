@@ -4,27 +4,26 @@
 //! created it, and its message loop cannot be driven from anywhere else.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cursio_protocol::{MouseButton, Rect, WindowInput, WindowMeta};
 use tokio::sync::mpsc;
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, PAINTSTRUCT, SRCCOPY,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, InvalidateRect,
+    PAINTSTRUCT, SRCCOPY, StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, MSG, PM_REMOVE,
-    SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
+    RegisterClassW, SW_SHOW, SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
+use windows::core::{PCWSTR, w};
 
 use crate::framebuffer::Framebuffer;
 use crate::video_decoder_win::VideoDecoder;
@@ -40,6 +39,8 @@ struct WindowState {
     id: u32,
     fb: RefCell<Framebuffer>,
     input_tx: mpsc::UnboundedSender<WindowInput>,
+    presented_tx: mpsc::UnboundedSender<u32>,
+    pending_paint_seq: RefCell<Option<u32>>,
     closed: Arc<AtomicBool>,
 }
 
@@ -57,7 +58,10 @@ fn to_host(hwnd: HWND, state: &WindowState, lparam: LPARAM) -> (u32, u32) {
     let mut rect = RECT::default();
     let client_ok = unsafe { GetClientRect(hwnd, &mut rect) }.is_ok();
     let (cw, ch) = if client_ok {
-        ((rect.right - rect.left) as f64, (rect.bottom - rect.top) as f64)
+        (
+            (rect.right - rect.left) as f64,
+            (rect.bottom - rect.top) as f64,
+        )
     } else {
         (fb.width as f64, fb.height as f64)
     };
@@ -78,80 +82,75 @@ fn to_host(hwnd: HWND, state: &WindowState, lparam: LPARAM) -> (u32, u32) {
 /// in there.
 fn evdev_from_vk(vk: u16) -> Option<u16> {
     Some(match vk {
-        0x1B => 1,  // ESC
-        0x31..=0x39 => (vk - 0x31) as u16 + 2, // '1'..'9'
-        0x30 => 11, // '0'
-        0xBD => 12, // minus
-        0xBB => 13, // equal
-        0x08 => 14, // backspace
-        0x09 => 15, // tab
-        0x51 => 16, // q
-        0x57 => 17, // w
-        0x45 => 18, // e
-        0x52 => 19, // r
-        0x54 => 20, // t
-        0x59 => 21, // y
-        0x55 => 22, // u
-        0x49 => 23, // i
-        0x4F => 24, // o
-        0x50 => 25, // p
-        0xDB => 26, // [
-        0xDD => 27, // ]
-        0x0D => 28, // enter
-        0x11 => 29, // ctrl
-        0x41 => 30, // a
-        0x53 => 31, // s
-        0x44 => 32, // d
-        0x46 => 33, // f
-        0x47 => 34, // g
-        0x48 => 35, // h
-        0x4A => 36, // j
-        0x4B => 37, // k
-        0x4C => 38, // l
-        0xBA => 39, // ;
-        0xDE => 40, // '
-        0xC0 => 41, // `
-        0x10 => 42, // shift
-        0xDC => 43, // backslash
-        0x5A => 44, // z
-        0x58 => 45, // x
-        0x43 => 46, // c
-        0x56 => 47, // v
-        0x42 => 48, // b
-        0x4E => 49, // n
-        0x4D => 50, // m
-        0xBC => 51, // ,
-        0xBE => 52, // .
-        0xBF => 53, // /
-        0x12 => 56, // alt
-        0x20 => 57, // space
-        0x14 => 58, // caps lock
+        0x1B => 1,                              // ESC
+        0x31..=0x39 => (vk - 0x31) as u16 + 2,  // '1'..'9'
+        0x30 => 11,                             // '0'
+        0xBD => 12,                             // minus
+        0xBB => 13,                             // equal
+        0x08 => 14,                             // backspace
+        0x09 => 15,                             // tab
+        0x51 => 16,                             // q
+        0x57 => 17,                             // w
+        0x45 => 18,                             // e
+        0x52 => 19,                             // r
+        0x54 => 20,                             // t
+        0x59 => 21,                             // y
+        0x55 => 22,                             // u
+        0x49 => 23,                             // i
+        0x4F => 24,                             // o
+        0x50 => 25,                             // p
+        0xDB => 26,                             // [
+        0xDD => 27,                             // ]
+        0x0D => 28,                             // enter
+        0x11 => 29,                             // ctrl
+        0x41 => 30,                             // a
+        0x53 => 31,                             // s
+        0x44 => 32,                             // d
+        0x46 => 33,                             // f
+        0x47 => 34,                             // g
+        0x48 => 35,                             // h
+        0x4A => 36,                             // j
+        0x4B => 37,                             // k
+        0x4C => 38,                             // l
+        0xBA => 39,                             // ;
+        0xDE => 40,                             // '
+        0xC0 => 41,                             // `
+        0x10 => 42,                             // shift
+        0xDC => 43,                             // backslash
+        0x5A => 44,                             // z
+        0x58 => 45,                             // x
+        0x43 => 46,                             // c
+        0x56 => 47,                             // v
+        0x42 => 48,                             // b
+        0x4E => 49,                             // n
+        0x4D => 50,                             // m
+        0xBC => 51,                             // ,
+        0xBE => 52,                             // .
+        0xBF => 53,                             // /
+        0x12 => 56,                             // alt
+        0x20 => 57,                             // space
+        0x14 => 58,                             // caps lock
         0x70..=0x79 => (vk - 0x70) as u16 + 59, // F1..F10
-        0x7A => 87, // F11
-        0x7B => 88, // F12
-        0x24 => 102, // home
-        0x26 => 103, // up
-        0x21 => 104, // page up
-        0x25 => 105, // left
-        0x27 => 106, // right
-        0x23 => 107, // end
-        0x28 => 108, // down
-        0x22 => 109, // page down
-        0x2D => 110, // insert
-        0x2E => 111, // delete
-        0x5B => 125, // left Windows key
-        0x5C => 126, // right Windows key
+        0x7A => 87,                             // F11
+        0x7B => 88,                             // F12
+        0x24 => 102,                            // home
+        0x26 => 103,                            // up
+        0x21 => 104,                            // page up
+        0x25 => 105,                            // left
+        0x27 => 106,                            // right
+        0x23 => 107,                            // end
+        0x28 => 108,                            // down
+        0x22 => 109,                            // page down
+        0x2D => 110,                            // insert
+        0x2E => 111,                            // delete
+        0x5B => 125,                            // left Windows key
+        0x5C => 126,                            // right Windows key
         _ => return None,
     })
 }
 
 /// The window procedure: painting and input.
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState;
     if ptr.is_null() {
         // Messages arrive before the state is attached (WM_CREATE and friends).
@@ -164,6 +163,7 @@ unsafe extern "system" fn wndproc(
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
             let fb = state.fb.borrow();
+            let mut painted = false;
             if fb.width > 0 && fb.height > 0 {
                 let info = BITMAPINFO {
                     bmiHeader: BITMAPINFOHEADER {
@@ -182,7 +182,7 @@ unsafe extern "system" fn wndproc(
                 };
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
-                StretchDIBits(
+                painted = StretchDIBits(
                     hdc,
                     0,
                     0,
@@ -196,19 +196,22 @@ unsafe extern "system" fn wndproc(
                     &info,
                     DIB_RGB_COLORS,
                     SRCCOPY,
-                );
+                ) != 0;
             }
-            let _ = EndPaint(hwnd, &ps);
+            let ended = EndPaint(hwnd, &ps).as_bool();
+            if painted && ended {
+                if let Some(seq) = state.pending_paint_seq.borrow_mut().take() {
+                    let _ = state.presented_tx.send(seq);
+                }
+            }
             LRESULT(0)
         }
 
         WM_MOUSEMOVE => {
             let (x, y) = to_host(hwnd, state, lparam);
-            let _ = state.input_tx.send(WindowInput::PointerMove {
-                id: state.id,
-                x,
-                y,
-            });
+            let _ = state
+                .input_tx
+                .send(WindowInput::PointerMove { id: state.id, x, y });
             LRESULT(0)
         }
 
@@ -289,6 +292,7 @@ pub(crate) fn run(
     meta: WindowMeta,
     mut commands: mpsc::UnboundedReceiver<SurrogateCommand>,
     input_tx: mpsc::UnboundedSender<WindowInput>,
+    presented_tx: mpsc::UnboundedSender<u32>,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
     closed: Arc<AtomicBool>,
 ) {
@@ -346,6 +350,8 @@ pub(crate) fn run(
             id: meta.id,
             fb: RefCell::new(Framebuffer::new(meta.width, meta.height)),
             input_tx,
+            presented_tx,
+            pending_paint_seq: RefCell::new(None),
             closed: closed.clone(),
         });
         let state_ptr = Box::into_raw(state);
@@ -369,19 +375,22 @@ pub(crate) fn run(
             }
 
             let mut painted = false;
+            let mut presented_seq: Option<u32> = None;
             // Bounded per tick: a burst of frames must not starve the painting
             // that makes them visible.
             for _ in 0..16 {
                 match commands.try_recv() {
-                    Ok(SurrogateCommand::Frame { dirty, raw }) => {
+                    Ok(SurrogateCommand::Frame { seq, dirty, raw }) => {
                         let state = &*state_ptr;
                         if let Err(e) = state.fb.borrow_mut().blit(dirty, &raw) {
                             tracing::warn!(error = %e, "dropping malformed tile");
                             continue;
                         }
                         painted = true;
+                        presented_seq =
+                            Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
                     }
-                    Ok(SurrogateCommand::VideoPacket(packet)) => {
+                    Ok(SurrogateCommand::VideoPacket { seq, packet }) => {
                         if decoder.is_none() {
                             match VideoDecoder::open() {
                                 Ok(d) => decoder = Some(d),
@@ -391,7 +400,9 @@ pub(crate) fn run(
                                 }
                             }
                         }
-                        let Some(dec) = decoder.as_mut() else { continue };
+                        let Some(dec) = decoder.as_mut() else {
+                            continue;
+                        };
                         match dec.decode(&packet) {
                             Ok(pictures) => {
                                 let state = &*state_ptr;
@@ -411,6 +422,9 @@ pub(crate) fn run(
                                         continue;
                                     }
                                     painted = true;
+                                    presented_seq = Some(
+                                        presented_seq.map_or(seq, |previous| previous.max(seq)),
+                                    );
                                 }
                             }
                             Err(e) => tracing::warn!(error = %e, "video decode failed"),
@@ -433,6 +447,11 @@ pub(crate) fn run(
             if painted {
                 // One repaint per tick, not per tile: several tiles of the same
                 // visual update coalesce into a single present.
+                if let Some(seq) = presented_seq {
+                    let state = &*state_ptr;
+                    let mut pending = state.pending_paint_seq.borrow_mut();
+                    *pending = Some(pending.map_or(seq, |previous| previous.max(seq)));
+                }
                 let _ = InvalidateRect(Some(hwnd), None, false);
             } else {
                 // Nothing to do — yield rather than spin the CPU on an idle

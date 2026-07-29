@@ -26,8 +26,8 @@
 //! and only channels cross the boundary, exactly like the GTK surrogate:
 //! frames in, input and acks out.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cursio_protocol::{
     Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
@@ -36,24 +36,21 @@ use cursio_protocol::{
 use tokio::sync::mpsc;
 
 use crate::codec::decode_tile;
-use crate::{Surrogate, WindowError, WindowRenderer};
+use crate::{Surrogate, WindowError, WindowRenderer, presentation_ack::PresentationAcks};
 
 mod win32;
-
-/// How often an ack may be emitted — see the GTK surrogate for the reasoning.
-const ACK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// What the session hands the window thread.
 pub(crate) enum SurrogateCommand {
     /// A decoded tile to blit and present.
-    Frame { dirty: Rect, raw: Vec<u8> },
+    Frame { seq: u32, dirty: Rect, raw: Vec<u8> },
     /// A raw H.264 packet, decoded **on the window thread**.
     ///
     /// Same reasoning as the GTK side: a video decoder is stateful and its
     /// pieces are not `Send`, while [`SessionModule`] requires `Send`. Sending
     /// the packet rather than the pixels also saves a copy, since the decoded
     /// frame is wanted exactly where the framebuffer lives.
-    VideoPacket(Vec<u8>),
+    VideoPacket { seq: u32, packet: Vec<u8> },
     /// Window geometry changed; reallocate before the next blit.
     Resize { width: u32, height: u32 },
     /// Tear the window down.
@@ -67,22 +64,12 @@ pub struct Win32Surrogate {
     height: u32,
     commands: mpsc::UnboundedSender<SurrogateCommand>,
     input: mpsc::UnboundedReceiver<WindowInput>,
-    pending_ack: Option<u32>,
+    presented: mpsc::UnboundedReceiver<u32>,
+    acks: PresentationAcks,
     video_started: bool,
-    last_ack: std::time::Instant,
     /// Set by the window thread when the user closes the window, so the session
     /// learns about it even before the channels drop.
     closed: Arc<AtomicBool>,
-}
-
-impl Win32Surrogate {
-    /// Record that `seq` has been queued for paint, for the next due ack.
-    fn note_presented(&mut self, seq: u32) {
-        self.pending_ack = Some(match self.pending_ack {
-            Some(prev) => prev.max(seq),
-            None => seq,
-        });
-    }
 }
 
 impl Surrogate for Win32Surrogate {
@@ -108,9 +95,11 @@ impl Surrogate for Win32Surrogate {
                 tracing::info!(id = self.id, "host switched this window to a video stream");
             }
             self.commands
-                .send(SurrogateCommand::VideoPacket(frame.data.clone()))
+                .send(SurrogateCommand::VideoPacket {
+                    seq: frame.seq,
+                    packet: frame.data.clone(),
+                })
                 .map_err(|_| WindowError::Backend("surrogate window is gone".into()))?;
-            self.note_presented(frame.seq);
             return Ok(());
         }
 
@@ -120,12 +109,12 @@ impl Surrogate for Win32Surrogate {
         let raw = decode_tile(frame.codec, &frame.data, expected)?;
         self.commands
             .send(SurrogateCommand::Frame {
+                seq: frame.seq,
                 dirty: frame.dirty,
                 raw,
             })
             .map_err(|_| WindowError::Backend("surrogate window is gone".into()))?;
 
-        self.note_presented(frame.seq);
         Ok(())
     }
 
@@ -134,16 +123,10 @@ impl Surrogate for Win32Surrogate {
     }
 
     fn take_ack(&mut self) -> Option<WindowFrameAck> {
-        let seq = self.pending_ack?;
-        if self.last_ack.elapsed() < ACK_INTERVAL {
-            return None;
+        while let Ok(seq) = self.presented.try_recv() {
+            self.acks.note_presented(seq);
         }
-        self.last_ack = std::time::Instant::now();
-        self.pending_ack = None;
-        Some(WindowFrameAck {
-            id: self.id,
-            acked_seq: seq,
-        })
+        self.acks.take()
     }
 
     fn close(&mut self, reason: WindowCloseReason) {
@@ -169,6 +152,7 @@ impl WindowRenderer for Win32WindowRenderer {
     fn open(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (presented_tx, presented_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let closed = Arc::new(AtomicBool::new(false));
 
@@ -178,7 +162,14 @@ impl WindowRenderer for Win32WindowRenderer {
         std::thread::Builder::new()
             .name(format!("cursio-surrogate-{}", meta.id))
             .spawn(move || {
-                win32::run(thread_meta, cmd_rx, input_tx, ready_tx, thread_closed);
+                win32::run(
+                    thread_meta,
+                    cmd_rx,
+                    input_tx,
+                    presented_tx,
+                    ready_tx,
+                    thread_closed,
+                );
             })
             .map_err(|e| WindowError::Backend(format!("spawn surrogate thread: {e}")))?;
 
@@ -191,9 +182,9 @@ impl WindowRenderer for Win32WindowRenderer {
                 height: meta.height,
                 commands: cmd_tx,
                 input: input_rx,
-                pending_ack: None,
+                presented: presented_rx,
+                acks: PresentationAcks::new(meta.id),
                 video_started: false,
-                last_ack: std::time::Instant::now(),
                 closed,
             }),
             Ok(Err(e)) => Err(WindowError::Backend(e)),
