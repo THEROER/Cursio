@@ -5,6 +5,15 @@ use gstreamer_app as gst_app;
 use super::{PipelinePlan, VideoCodec};
 use crate::AirPlayError;
 
+pub(super) fn check_available(codec: VideoCodec) -> Result<(), AirPlayError> {
+    gst::init().map_err(|error| {
+        AirPlayError::Video(format!(
+            "GStreamer could not start ({error}); install GStreamer 1.x and its hardware video plugins"
+        ))
+    })?;
+    PipelinePlan::detect(codec, |name| gst::ElementFactory::find(name).is_some()).map(|_| ())
+}
+
 /// GStreamer pipeline that accepts Annex-B access units and renders decoded
 /// frames without downloading them from GPU memory.
 pub struct HardwareVideoPipeline {
@@ -14,7 +23,7 @@ pub struct HardwareVideoPipeline {
 
 impl HardwareVideoPipeline {
     pub fn new(codec: VideoCodec) -> Result<Self, AirPlayError> {
-        gst::init().map_err(|error| AirPlayError::Video(error.to_string()))?;
+        check_available(codec)?;
         let plan = PipelinePlan::detect(codec, |name| gst::ElementFactory::find(name).is_some())?;
         let pipeline = gst::parse::launch(&plan.launch_description())
             .map_err(|error| AirPlayError::Video(error.to_string()))?

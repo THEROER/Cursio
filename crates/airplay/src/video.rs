@@ -1,13 +1,17 @@
 //! Hardware-decoded, GPU-resident video presentation.
 //!
-//! The compressed access unit is copied once into GStreamer's `appsrc`; decoded
-//! pixels stay in GPU-owned memory from the hardware decoder to the video sink.
+//! The compressed access unit is copied once into the platform pipeline;
+//! decoded pixels stay in GPU-owned memory through presentation.
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod gstreamer;
+#[cfg(target_os = "macos")]
+mod macos;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub use gstreamer::HardwareVideoPipeline;
+#[cfg(target_os = "macos")]
+pub use macos::HardwareVideoPipeline;
 
 use crate::AirPlayError;
 
@@ -31,6 +35,32 @@ impl VideoCodec {
             Self::Hevc => "video/x-h265,stream-format=byte-stream,alignment=au",
         }
     }
+}
+
+/// Report missing runtime components before an iPhone starts a session.
+pub fn dependency_warnings(codec: VideoCodec) -> Vec<String> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        if let Err(error) = gstreamer::check_available(codec) {
+            return vec![format!("AirPlay video is unavailable: {error}")];
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = codec;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = codec;
+        return vec![
+            "AirPlay video is unavailable: this operating system has no presentation backend"
+                .to_string(),
+        ];
+    }
+
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

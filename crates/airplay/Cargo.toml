@@ -6,9 +6,15 @@ edition.workspace = true
 [dependencies]
 cursio-transport.workspace = true
 
+aes.workspace = true
+ctr.workspace = true
+ed25519-dalek.workspace = true
 mdns-sd.workspace = true
+rand.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 plist.workspace = true
+x25519-dalek.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true
@@ -20,6 +26,7 @@ gstreamer-app.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 astro-dnssd = "0.3"
+serde_json.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [
@@ -30,3 +37,6 @@ windows = { version = "0.61", features = [
 [dev-dependencies]
 clap.workspace = true
 tracing-subscriber.workspace = true
+
+[build-dependencies]
+cc.workspace = true

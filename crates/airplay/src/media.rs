@@ -280,24 +280,24 @@ trait VideoSink: Send {
     fn push(&mut self, access_unit: &[u8]) -> Result<(), AirPlayError>;
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 struct HardwareSink(crate::video::HardwareVideoPipeline);
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl VideoSink for HardwareSink {
     fn push(&mut self, access_unit: &[u8]) -> Result<(), AirPlayError> {
         self.0.push_access_unit(access_unit, None)
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn hardware_video_sink() -> Result<Box<dyn VideoSink>, AirPlayError> {
     Ok(Box::new(HardwareSink(
         crate::video::HardwareVideoPipeline::new(crate::video::VideoCodec::H264)?,
     )))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn hardware_video_sink() -> Result<Box<dyn VideoSink>, AirPlayError> {
     Err(AirPlayError::Video(
         "AirPlay hardware video output is supported on Linux and Windows".into(),

@@ -55,10 +55,17 @@ gstreamer = "0.25"
 gstreamer-app = "0.25"
 
 # Crypto / pairing
+aes = "0.8"
+ctr = "0.9"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 snow = "0.9"
 spake2 = "0.4"
 rand = "0.8"
 sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+# Native build helpers
+cc = "1"
 
 # Storage / config
 directories = "5"

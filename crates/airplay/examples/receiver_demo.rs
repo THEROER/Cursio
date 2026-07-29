@@ -1,6 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
+use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
 use cursio_transport::discovery::DiscoveryConfig;
 use tracing_subscriber::EnvFilter;
@@ -61,21 +63,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for warning in hardware.profile_warnings(profile) {
         eprintln!("warning: {warning}");
     }
+    for warning in
+        cursio_airplay::video::dependency_warnings(cursio_airplay::video::VideoCodec::H264)
+    {
+        eprintln!("warning: {warning}");
+    }
+    let receiver_name = args.name;
+    let crypto = Arc::new(AppleCryptoProvider::new());
     let config = ReceiverConfig::new(
-        args.name,
+        receiver_name.clone(),
         args.identity,
         SocketAddr::new(args.bind, args.port),
         profile,
-    )?;
+    )?
+    .with_pairing_public_key(crypto.public_key());
     let discovery = args
         .interface
         .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
-    let receiver = Receiver::bind(config, discovery).await?;
+    let receiver = Receiver::bind_with_crypto(config, discovery, crypto).await?;
     let address = receiver.local_addr()?;
 
-    println!("AirPlay demo is listening on {address}");
-    println!("Open Control Center → Screen Mirroring and select “Cursio AirPlay”.");
-    println!("Discovery and /info work; pairing and video SETUP currently fail closed.");
+    println!("AirPlay receiver is listening on {address}");
+    println!("Open Control Center → Screen Mirroring and select “{receiver_name}”.");
 
     receiver.serve().await?;
     Ok(())

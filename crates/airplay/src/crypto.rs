@@ -4,6 +4,10 @@
 //! mesh cryptography. The receiver owns the control flow, while an explicitly
 //! supplied provider owns the per-connection pairing/FairPlay implementation.
 
+mod apple;
+
+pub use apple::AppleCryptoProvider;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoEndpoint {
     PairSetup,

@@ -4,6 +4,7 @@ use crate::{Resolution, VideoProfile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuVendor {
+    Apple,
     Nvidia,
     Amd,
     Intel,
@@ -82,6 +83,60 @@ impl HardwareInfo {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn platform_gpus() -> Vec<GpuInfo> {
+    let Ok(output) = std::process::Command::new("/usr/sbin/system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_macos_displays(&output.stdout)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_displays(bytes: &[u8]) -> Vec<GpuInfo> {
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    root.get("SPDisplaysDataType")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|display| {
+            let name = display.get("_name")?.as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let vendor = display
+                .get("spdisplays_vendor")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let vendor = if vendor == "sppci_vendor_Apple" || name.starts_with("Apple ") {
+                GpuVendor::Apple
+            } else if vendor.contains("NVIDIA") || name.contains("NVIDIA") {
+                GpuVendor::Nvidia
+            } else if vendor.contains("AMD") || name.contains("AMD") || name.contains("Radeon") {
+                GpuVendor::Amd
+            } else if vendor.contains("Intel") || name.contains("Intel") {
+                GpuVendor::Intel
+            } else {
+                GpuVendor::Other(0)
+            };
+            Some(GpuInfo {
+                name: name.to_string(),
+                vendor,
+                // Apple Silicon uses unified memory; reporting system RAM as
+                // dedicated VRAM would make profile checks misleading.
+                dedicated_vram_bytes: None,
+            })
+        })
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 fn platform_gpus() -> Vec<GpuInfo> {
     let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
@@ -105,6 +160,7 @@ fn platform_gpus() -> Vec<GpuInfo> {
         let vendor = GpuVendor::from_pci_id(vendor_id);
         let dedicated_vram_bytes = read_decimal_u64(&device.join("mem_info_vram_total"));
         let label = match vendor {
+            GpuVendor::Apple => "Apple",
             GpuVendor::Nvidia => "NVIDIA",
             GpuVendor::Amd => "AMD",
             GpuVendor::Intel => "Intel",
@@ -168,7 +224,7 @@ fn platform_gpus() -> Vec<GpuInfo> {
     gpus
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn platform_gpus() -> Vec<GpuInfo> {
     Vec::new()
 }
@@ -201,5 +257,27 @@ mod tests {
         };
         let profile = VideoProfile::new(Resolution::FullHd, 60).unwrap();
         assert!(hardware.profile_warnings(profile).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parses_apple_silicon_gpu() {
+        let displays = parse_macos_displays(
+            br#"{
+                "SPDisplaysDataType": [{
+                    "_name": "Apple M4",
+                    "spdisplays_vendor": "sppci_vendor_Apple",
+                    "sppci_cores": "8"
+                }]
+            }"#,
+        );
+        assert_eq!(
+            displays,
+            vec![GpuInfo {
+                name: "Apple M4".into(),
+                vendor: GpuVendor::Apple,
+                dedicated_vram_bytes: None,
+            }]
+        );
     }
 }

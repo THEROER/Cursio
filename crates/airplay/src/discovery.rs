@@ -18,8 +18,6 @@ pub const RAOP_SERVICE_TYPE: &str = "_raop._tcp.local.";
 /// handlers must eventually narrow this value to what they actually implement.
 pub const AIRPLAY_FEATURES: u64 = 0x527f_fee6;
 const AIRPLAY_FEATURES_TXT: &str = "0x527FFEE6,0x0";
-const LEGACY_RECEIVER_PUBLIC_KEY_HEX: &str =
-    "b07727d6f6cd6e08b58ede525ec3cdeaa252ad9f683feb212ef8a205246554e7";
 pub(crate) const LEGACY_RECEIVER_PUBLIC_KEY: [u8; 32] = [
     0xb0, 0x77, 0x27, 0xd6, 0xf6, 0xcd, 0x6e, 0x08, 0xb5, 0x8e, 0xde, 0x52, 0x5e, 0xc3, 0xcd, 0xea,
     0xa2, 0x52, 0xad, 0x9f, 0x68, 0x3f, 0xeb, 0x21, 0x2e, 0xf8, 0xa2, 0x05, 0x24, 0x65, 0x54, 0xe7,
@@ -124,6 +122,11 @@ fn service_infos(
     let host = format!("{}.local.", host_label(instance));
     let device_id = receiver.device_id.to_string();
     let identity = receiver.identity.to_string();
+    let pairing_public_key = receiver
+        .pairing_public_key
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let airplay_properties = [
         ("acl", "0".to_string()),
         ("btaddr", "00:00:00:00:00:00".to_string()),
@@ -136,7 +139,7 @@ fn service_infos(
         ("igl", "0".to_string()),
         ("model", receiver.model.clone()),
         ("osvers", "15.6".to_string()),
-        ("pk", LEGACY_RECEIVER_PUBLIC_KEY_HEX.to_string()),
+        ("pk", pairing_public_key.clone()),
         ("pi", identity),
         ("protovers", "1.1".to_string()),
         ("srcvers", receiver.source_version.clone()),
@@ -150,7 +153,7 @@ fn service_infos(
         ("ft", AIRPLAY_FEATURES_TXT.to_string()),
         ("am", receiver.model.clone()),
         ("md", "0,1,2".to_string()),
-        ("pk", LEGACY_RECEIVER_PUBLIC_KEY_HEX.to_string()),
+        ("pk", pairing_public_key),
         ("pw", "false".to_string()),
         ("rhd", "5.6.0.0".to_string()),
         ("sr", "44100".to_string()),
@@ -241,7 +244,7 @@ mod tests {
 
     #[test]
     fn builds_matching_airplay_and_raop_records() {
-        let receiver = config("Living Room");
+        let receiver = config("Living Room").with_pairing_public_key([0xab; 32]);
         let services = service_infos(
             &receiver,
             7100,
@@ -265,6 +268,14 @@ mod tests {
         assert_eq!(
             services[0].get_property_val_str("model"),
             Some(receiver.model.as_str())
+        );
+        assert_eq!(
+            services[0].get_property_val_str("pk"),
+            Some("abababababababababababababababababababababababababababababababab")
+        );
+        assert_eq!(
+            services[1].get_property_val_str("pk"),
+            services[0].get_property_val_str("pk")
         );
         assert!(services[1]
             .get_fullname()

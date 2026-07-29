@@ -5,7 +5,7 @@ use std::fmt;
 use plist::{Dictionary, Value};
 
 use crate::crypto::{CryptoEndpoint, CryptoSession};
-use crate::discovery::{AIRPLAY_FEATURES, LEGACY_RECEIVER_PUBLIC_KEY};
+use crate::discovery::AIRPLAY_FEATURES;
 use crate::{AirPlayError, ReceiverConfig};
 
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -331,7 +331,7 @@ fn info_plist(receiver: &ReceiverConfig) -> Result<Vec<u8>, plist::Error> {
     info.insert("vv".to_string(), 2_u64.into());
     info.insert(
         "pk".to_string(),
-        Value::Data(LEGACY_RECEIVER_PUBLIC_KEY.to_vec()),
+        Value::Data(receiver.pairing_public_key.to_vec()),
     );
     info.insert("keepAliveLowPower".to_string(), true.into());
     info.insert("keepAliveSendStatsAsBody".to_string(), true.into());
@@ -498,6 +498,10 @@ mod tests {
         assert_eq!(
             dictionary["features"].as_unsigned_integer(),
             Some(AIRPLAY_FEATURES)
+        );
+        assert_eq!(
+            dictionary["pk"].as_data(),
+            Some(config().pairing_public_key.as_slice())
         );
         let displays = dictionary["displays"].as_array().unwrap();
         assert_eq!(

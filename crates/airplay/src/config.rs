@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 
 use uuid::Uuid;
 
+use crate::discovery::LEGACY_RECEIVER_PUBLIC_KEY;
+
 /// Default port used by Apple TV receivers for the AirPlay control connection.
 pub const DEFAULT_CONTROL_PORT: u16 = 7000;
 /// Compatibility model advertised during the initial AirPlay probe.
@@ -93,6 +95,7 @@ pub struct ReceiverConfig {
     pub model: String,
     pub source_version: String,
     pub profile: VideoProfile,
+    pub pairing_public_key: [u8; 32],
 }
 
 impl ReceiverConfig {
@@ -114,7 +117,13 @@ impl ReceiverConfig {
             model: DEFAULT_MODEL.to_string(),
             source_version: DEFAULT_SOURCE_VERSION.to_string(),
             profile,
+            pairing_public_key: LEGACY_RECEIVER_PUBLIC_KEY,
         })
+    }
+
+    pub fn with_pairing_public_key(mut self, public_key: [u8; 32]) -> Self {
+        self.pairing_public_key = public_key;
+        self
     }
 
     pub fn with_default_port(

@@ -19,9 +19,11 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
 use cursio_core::session::{self};
 use cursio_core::NodeIdentity;
@@ -35,6 +37,13 @@ use zeroize::Zeroizing;
 #[derive(Parser)]
 #[command(name = "cursio", about = "Cursio LAN session driver")]
 struct Cli {
+    /// Increase console logging detail (-v for debug, -vv for trace).
+    ///
+    /// May be placed before or after the subcommand. Explicit RUST_LOG and
+    /// CURSIO_LOG_FILE values take precedence.
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -116,8 +125,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         keep_window_visible: bool,
         /// Advertise an AirPlay receiver and accept iPhone screen mirroring.
-        #[arg(long, default_value_t = false)]
+        /// Enabled by default; use `--no-airplay` to turn it off.
+        #[arg(long, default_value_t = true, overrides_with = "no_airplay")]
         airplay: bool,
+        /// Disable the AirPlay receiver.
+        #[arg(long, default_value_t = false, overrides_with = "airplay")]
+        no_airplay: bool,
         /// Override the name shown in the iPhone Screen Mirroring picker.
         #[arg(long)]
         airplay_name: Option<String>,
@@ -184,12 +197,12 @@ impl From<AirPlayResolutionArg> for Resolution {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
     // Console (info) + rotating file (debug) logging. `_log` must live for the
     // whole run — dropping it flushes and stops the file writer. See
     // `cursio_core::logging` for the filters and log-file location.
-    let _log = cursio_core::logging::init("cursio");
-
-    let cli = Cli::parse();
+    let _log = cursio_core::logging::init_with_verbosity("cursio", cli.verbose);
 
     // Ask for admin rights before doing anything else, but only for `mesh` —
     // it's the mode that injects input, and Windows' UIPI silently discards
@@ -233,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
             share_window_title,
             keep_window_visible,
             airplay,
+            no_airplay,
             airplay_name,
             airplay_port,
             airplay_interface,
@@ -259,10 +273,11 @@ async fn main() -> anyhow::Result<()> {
                 peer_edge.map(Into::into),
                 modules,
             );
+            let airplay = airplay && !no_airplay;
             if !airplay {
                 mesh.await
             } else {
-                let receiver = bind_airplay(
+                match bind_airplay(
                     &identity,
                     AirPlayOpts {
                         name: airplay_name,
@@ -272,10 +287,20 @@ async fn main() -> anyhow::Result<()> {
                         fps,
                     },
                 )
-                .await?;
-                tokio::select! {
-                    result = mesh => result,
-                    result = receiver.serve() => result.map_err(Into::into),
+                .await
+                {
+                    Ok(receiver) => {
+                        tokio::select! {
+                            result = mesh => result,
+                            result = receiver.serve() => result.map_err(Into::into),
+                        }
+                    }
+                    // A busy port (e.g. macOS' own AirPlay receiver) must not
+                    // take the whole mesh down with it.
+                    Err(error) => {
+                        tracing::warn!(%error, "AirPlay receiver unavailable, continuing without it");
+                        mesh.await
+                    }
                 }
             }
         }
@@ -304,7 +329,13 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     for warning in hardware.profile_warnings(profile) {
         tracing::warn!("{warning}");
     }
+    for warning in
+        cursio_airplay::video::dependency_warnings(cursio_airplay::video::VideoCodec::H264)
+    {
+        tracing::warn!("{warning}");
+    }
 
+    let crypto = Arc::new(AppleCryptoProvider::new());
     let config = ReceiverConfig::new(
         options
             .name
@@ -312,11 +343,12 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
         identity.peer_id,
         SocketAddr::from(([0, 0, 0, 0], options.port)),
         profile,
-    )?;
+    )?
+    .with_pairing_public_key(crypto.public_key());
     let discovery = options
         .interface
         .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
-    let receiver = Receiver::bind(config, discovery).await?;
+    let receiver = Receiver::bind_with_crypto(config, discovery, crypto).await?;
     tracing::info!(
         address = %receiver.local_addr()?,
         "mesh AirPlay receiver is visible in iPhone Screen Mirroring"
@@ -1369,6 +1401,15 @@ fn sanitize_instance(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbose_is_global_and_counted() {
+        let before = Cli::try_parse_from(["cursio", "-v", "mesh"]).unwrap();
+        assert_eq!(before.verbose, 1);
+
+        let after = Cli::try_parse_from(["cursio", "mesh", "-vv"]).unwrap();
+        assert_eq!(after.verbose, 2);
+    }
 
     #[test]
     fn airplay_name_removes_mdns_suffix_and_dots() {

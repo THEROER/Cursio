@@ -3,8 +3,8 @@
 //! This crate deliberately owns a listener separate from Cursio's mesh
 //! transport. An iPhone speaks AirPlay control and media protocols, not the
 //! Cursio Hello/Noise session protocol. At this stage the crate provides
-//! discovery, bounded HTTP/RTSP framing, and the initial `/info` probe. Pairing,
-//! FairPlay, and media setup fail closed until their protocol stages exist.
+//! discovery, bounded HTTP/RTSP framing, transient pairing, FairPlay key
+//! handling, and mirroring media setup.
 
 mod config;
 pub mod crypto;

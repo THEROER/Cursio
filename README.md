@@ -122,6 +122,37 @@ Run tests:
 cargo test -p cursio-protocol -p cursio-transport -p cursio-core
 ```
 
+### AirPlay receiver
+
+`cursio mesh` advertises an AirPlay receiver by default. On an iPhone, open
+Control Center → Screen Mirroring and select `Cursio - <computer name>`.
+Use `--no-airplay` to disable it, or `--airplay-name <name>` and
+`--airplay-port <port>` to change the announcement.
+
+Current AirPlay scope:
+
+- iPhone/iPad screen mirroring into a native Cursio video window;
+- transient AirPlay pairing, FairPlay session setup, encrypted H.264 transport,
+  and hardware-backed presentation;
+- the audio that accompanies screen mirroring is planned but is not decoded
+  yet;
+- arbitrary file transfer is not an AirPlay feature. Cursio's own encrypted
+  mesh file channel is the intended path for sending files between computers.
+
+Platform video requirements:
+
+- macOS: the receiver includes its native AppKit/AVFoundation presentation
+  helper and uses Apple's hardware H.264 decoder; no GStreamer installation is
+  required;
+- Linux: GStreamer 1.x plus a hardware H.264 decoder (`nvh264dec`, `vah264dec`,
+  or `vaapih264dec`) and a compatible Wayland/GL sink;
+- Windows: GStreamer 1.x with `d3d11h264dec` and `d3d11videosink`.
+
+At startup the Rust CLI checks the platform video path and prints a concrete
+warning when GStreamer, a decoder, or a GPU-compatible sink is missing. AirPlay
+discovery remains available so the diagnostic is visible without taking the
+rest of the mesh offline.
+
 ### Build & install (`cargo xtask`)
 
 Project automation lives in `cargo xtask`, which wraps the env vars and target

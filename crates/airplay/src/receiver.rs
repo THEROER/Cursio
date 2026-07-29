@@ -60,10 +60,22 @@ impl Receiver {
 
     /// Accept control connections until the listener fails.
     pub async fn serve(self) -> Result<(), AirPlayError> {
+        tracing::info!(
+            address = %self.listener.local_addr()?,
+            name = %self.config.name,
+            crypto = if self.crypto.is_some() { "configured" } else { "unavailable" },
+            "cursio_airplay receiver started"
+        );
+        if self.crypto.is_none() {
+            tracing::warn!(
+                "AirPlay pairing and FairPlay are unavailable; this receiver currently supports discovery and /info probes only"
+            );
+        }
         loop {
             let (stream, peer) = self.listener.accept().await?;
             stream.set_nodelay(true)?;
             let local_addr = stream.local_addr()?;
+            tracing::debug!(%peer, %local_addr, "AirPlay control connection accepted");
             let config = self.config.clone();
             let crypto = self
                 .crypto
@@ -106,6 +118,37 @@ where
         decoder.push(&read_buffer[..count])?;
 
         while let Some(request) = decoder.next_request()? {
+            tracing::debug!(
+                method = %request.method,
+                target = %request.target,
+                version = %request.version,
+                headers = request.headers.len(),
+                body_bytes = request.body.len(),
+                cseq = request.header("CSeq").unwrap_or("<none>"),
+                "AirPlay request decoded"
+            );
+            let target = request.target.split('?').next().unwrap_or(&request.target);
+            if request.method.eq_ignore_ascii_case("POST") && target == "/reverse" {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\n\
+                          Upgrade: PTTH/1.0\r\n\
+                          Connection: Upgrade\r\n\r\n",
+                    )
+                    .await?;
+                stream.flush().await?;
+                tracing::info!(
+                    method = %request.method,
+                    target = %request.target,
+                    status = 101,
+                    "AirPlay reverse event channel upgraded"
+                );
+                loop {
+                    if stream.read(&mut read_buffer).await? == 0 {
+                        return Ok(());
+                    }
+                }
+            }
             let response = if let Some(response) = media
                 .handle_request(
                     &request,
@@ -126,6 +169,12 @@ where
                 }
             };
             let encoded = response.encode(request.version, request.header("CSeq"));
+            tracing::info!(
+                method = %request.method,
+                target = %request.target,
+                status = response.status,
+                "airplay request"
+            );
             stream.write_all(&encoded).await?;
             stream.flush().await?;
         }
@@ -193,5 +242,25 @@ mod tests {
             error,
             AirPlayError::Control(ProtocolError::UnexpectedEof)
         ));
+    }
+
+    #[tokio::test]
+    async fn upgrades_reverse_event_channel() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(serve_connection(server, config(), None, None));
+        client
+            .write_all(b"POST /reverse HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = [0_u8; 85];
+        let count = client.read(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response[..count]);
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        assert!(response.contains("Upgrade: PTTH/1.0\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+
+        client.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
     }
 }
