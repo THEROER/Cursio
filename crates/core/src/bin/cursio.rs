@@ -118,9 +118,9 @@ enum Command {
         /// Advertise an AirPlay receiver and accept iPhone screen mirroring.
         #[arg(long, default_value_t = false)]
         airplay: bool,
-        /// Name shown in the iPhone Screen Mirroring picker.
-        #[arg(long, default_value = "Cursio AirPlay")]
-        airplay_name: String,
+        /// Override the name shown in the iPhone Screen Mirroring picker.
+        #[arg(long)]
+        airplay_name: Option<String>,
         /// AirPlay control port.
         #[arg(long, default_value_t = 7000)]
         airplay_port: u16,
@@ -284,7 +284,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct AirPlayOpts {
-    name: String,
+    name: Option<String>,
     port: u16,
     interface: Option<IpAddr>,
     resolution: AirPlayResolutionArg,
@@ -306,7 +306,9 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     }
 
     let config = ReceiverConfig::new(
-        options.name,
+        options
+            .name
+            .unwrap_or_else(|| format!("Cursio - {}", identity.display_name)),
         identity.peer_id,
         SocketAddr::from(([0, 0, 0, 0], options.port)),
         profile,
