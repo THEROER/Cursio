@@ -249,7 +249,7 @@ impl CryptoSession for AppleCryptoSession {
                 encrypted_key.len()
             )));
         }
-        if !self.verified {
+        if self.shared_secret.is_some() && !self.verified {
             return Err(crypto_error(
                 "cannot unwrap the media key before pair-verify completes",
             ));
@@ -272,13 +272,12 @@ impl CryptoSession for AppleCryptoSession {
             ));
         }
 
-        let shared_secret = self
-            .shared_secret
-            .ok_or_else(|| crypto_error("missing pair-verify shared secret"))?;
-        let mut hasher = Sha512::new();
-        hasher.update(key);
-        hasher.update(shared_secret);
-        key.copy_from_slice(&hasher.finalize()[..16]);
+        if let Some(shared_secret) = self.shared_secret {
+            let mut hasher = Sha512::new();
+            hasher.update(key);
+            hasher.update(shared_secret);
+            key.copy_from_slice(&hasher.finalize()[..16]);
+        }
         Ok(key)
     }
 
@@ -397,6 +396,7 @@ mod tests {
         assert_eq!(response.len(), 32);
         assert_eq!(&response[..12], b"FPLY\x03\x01\x04\0\0\0\0\x14");
         assert_eq!(&response[12..], &handshake[144..]);
+        assert!(session.unwrap_media_key(&[0_u8; 72]).is_ok());
 
         setup[4] = 2;
         assert!(session

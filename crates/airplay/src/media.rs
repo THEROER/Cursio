@@ -60,9 +60,23 @@ impl MediaSession {
             return Ok(Some(Response::new(200, "OK")));
         }
 
+        if request.method.eq_ignore_ascii_case("GET_PARAMETER") && self.encrypted_key.is_some() {
+            let asks_for_volume = request
+                .body
+                .split(|byte| *byte == b'\n')
+                .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+                .any(|line| line == b"volume");
+            let response = if asks_for_volume {
+                Response::new(200, "OK").with_body("text/parameters", b"volume: 0.0\r\n".to_vec())
+            } else {
+                Response::new(200, "OK")
+            };
+            return Ok(Some(response));
+        }
+
         let session_method = matches!(
             request.method.to_ascii_uppercase().as_str(),
-            "RECORD" | "PAUSE" | "FLUSH" | "GET_PARAMETER" | "SET_PARAMETER"
+            "RECORD" | "PAUSE" | "FLUSH" | "SET_PARAMETER"
         );
         let session_endpoint = matches!(target, "/feedback" | "/command" | "/audioMode");
         if (session_method || session_endpoint) && self.encrypted_key.is_some() {
@@ -84,6 +98,11 @@ impl MediaSession {
                 return Ok(Response::new(400, "Bad Request").with_header("X-Cursio-Error", message));
             }
         };
+        tracing::debug!(
+            has_keys = setup.keys.is_some(),
+            mirror_stream_id = ?setup.mirror_stream_id,
+            "parsed AirPlay SETUP"
+        );
         let mut response = Dictionary::new();
 
         if let Some(keys) = setup.keys {
@@ -96,9 +115,15 @@ impl MediaSession {
                 )
                 .await?;
             response.insert("timingPort".into(), u64::from(timing_port).into());
-            response.insert(
-                "eventPort".into(),
-                u64::from(context.local_addr.port()).into(),
+            // Screen mirroring does not use AirPlay's reverse event socket.
+            // Advertising the control port here makes iOS open a second RTSP
+            // connection and abandon the two-stage SETUP flow.
+            response.insert("eventPort".into(), 0_u64.into());
+            tracing::info!(
+                local_timing_port = timing_port,
+                remote_timing_port = keys.remote_timing_port,
+                event_port = 0,
+                "AirPlay key session configured"
             );
         }
 
@@ -116,6 +141,11 @@ impl MediaSession {
             response.insert(
                 "streams".into(),
                 Value::Array(vec![Value::Dictionary(stream)]),
+            );
+            tracing::info!(
+                stream_connection_id,
+                data_port,
+                "AirPlay mirror stream configured"
             );
         }
 
@@ -445,7 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_setup_returns_live_timing_and_event_ports() {
+    async fn key_setup_returns_timing_port_and_disables_event_socket() {
         let timing_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut root = Dictionary::new();
         root.insert("ekey".into(), Value::Data(vec![7; 72]));
@@ -476,13 +506,41 @@ mod tests {
         let body = body.as_dictionary().unwrap();
         assert_eq!(
             body.get("eventPort").and_then(Value::as_unsigned_integer),
-            Some(7000)
+            Some(0)
         );
         assert_ne!(
             body.get("timingPort")
                 .and_then(Value::as_unsigned_integer)
                 .unwrap(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn get_parameter_returns_requested_volume() {
+        let request = Request {
+            method: "GET_PARAMETER".into(),
+            target: "rtsp://127.0.0.1/1".into(),
+            version: crate::rtsp::Version::Rtsp10,
+            headers: vec![("Content-Type".into(), "text/parameters".into())],
+            body: b"volume\r\n".to_vec(),
+        };
+        let mut media = MediaSession::default();
+        media.encrypted_key = Some(vec![7; 72]);
+        let response = media
+            .handle_request(&request, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"volume: 0.0\r\n");
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(name, _)| name == "Content-Type")
+                .map(|(_, value)| value.as_str()),
+            Some("text/parameters")
         );
     }
 
