@@ -81,10 +81,39 @@ pub trait Transport: Send {
     }
 }
 
+/// What one priority class has waiting, and what it has already got out.
+///
+/// A bulk producer (the files module) has no other way to tell whether the link
+/// is keeping up with it: [`TransportTx::send`] on the priority multiplexer only
+/// *queues*, so it succeeds just as quickly whether the socket is idle or an
+/// hour behind. Reading the depth back turns that blind write into a control
+/// loop — see `cursio_core::files_session`, which sizes its in-flight window
+/// from the delay these two numbers imply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueDepth {
+    /// Bytes queued in this class and not yet written to the socket.
+    pub queued_bytes: usize,
+    /// Bytes of this class written to the socket since the link came up.
+    ///
+    /// Monotonic, so the difference between two readings over a known interval
+    /// is the rate this class is actually draining at.
+    pub sent_bytes: u64,
+}
+
 /// The send half of a split [`Transport`].
 #[async_trait]
 pub trait TransportTx: Send {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError>;
+
+    /// How much of `priority` is queued here and how much has left.
+    ///
+    /// Zero for a sender that writes inside `send`: there is no queue to be
+    /// behind on, so a caller reading this sees a link that is never backed up
+    /// — which is the truth for a synchronous sender. Only the priority
+    /// multiplexer holds frames, and only it reports real numbers.
+    fn queue_depth(&self, _priority: cursio_protocol::Priority) -> QueueDepth {
+        QueueDepth::default()
+    }
 
     /// Flush any buffered outbound frames and wait until they have hit the
     /// wire.

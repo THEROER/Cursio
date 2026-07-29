@@ -57,16 +57,39 @@ fn class_index(p: Priority) -> usize {
 #[derive(Default)]
 struct Queues {
     classes: [VecDeque<Vec<u8>>; CLASS_COUNT],
+    /// Bytes waiting in each class, kept alongside the queues so a producer can
+    /// read its own backlog without walking a `VecDeque` of frames.
+    queued_bytes: [usize; CLASS_COUNT],
+    /// Bytes of each class actually written to the socket, ever. Paired with
+    /// `queued_bytes` in [`QueueDepth`]; see there for what it is for.
+    sent_bytes: [u64; CLASS_COUNT],
     /// Set once the sender side is gone *and* all queues are empty, so the
     /// drainer knows to exit cleanly rather than park forever.
     closed: bool,
 }
 
 impl Queues {
+    /// Queue one frame in `class`, keeping the byte count with it.
+    fn push(&mut self, class: usize, frame: Vec<u8>) {
+        self.queued_bytes[class] += frame.len();
+        self.classes[class].push_back(frame);
+    }
+
     /// Pop the next frame to send: the front of the highest-priority non-empty
     /// class. `None` when everything is empty.
-    fn pop_highest(&mut self) -> Option<Vec<u8>> {
-        self.classes.iter_mut().find_map(VecDeque::pop_front)
+    ///
+    /// Returns the class alongside the frame so the drainer can credit the
+    /// bytes to it once they are on the wire.
+    fn pop_highest(&mut self) -> Option<(usize, Vec<u8>)> {
+        let (idx, frame) = self
+            .classes
+            .iter_mut()
+            .enumerate()
+            .find_map(|(idx, q)| q.pop_front().map(|f| (idx, f)))?;
+        // Leaving the queue is what "no longer waiting" means; the bytes are
+        // credited as sent only after the socket takes them.
+        self.queued_bytes[idx] -= frame.len();
+        Some((idx, frame))
     }
 
     /// True when every class is empty — used by `flush` to know the drainer has
@@ -119,7 +142,8 @@ impl PrioritizedTx {
                 };
 
                 match frame {
-                    Some(tagged) => {
+                    Some((class, tagged)) => {
+                        let len = tagged.len();
                         let sealed = match seal_frame(&noise, &tagged) {
                             Ok(m) => m,
                             Err(e) => {
@@ -132,6 +156,10 @@ impl PrioritizedTx {
                             tracing::debug!(error = %e, "prioritized drainer: link closed");
                             break;
                         }
+                        // Credited only now: a producer pacing itself against
+                        // this rate must see bytes the socket has taken, not
+                        // bytes we merely intended to write.
+                        drain_shared.queues.lock().unwrap().sent_bytes[class] += len as u64;
                     }
                     None => {
                         // Queues are empty: wake anyone blocked in `flush`.
@@ -162,11 +190,20 @@ impl TransportTx for PrioritizedTx {
         {
             let mut q = self.shared.queues.lock().unwrap();
             for f in frames {
-                q.classes[idx].push_back(f);
+                q.push(idx, f);
             }
         }
         self.shared.wake.notify_one();
         Ok(())
+    }
+
+    fn queue_depth(&self, priority: cursio_protocol::Priority) -> crate::QueueDepth {
+        let idx = class_index(priority);
+        let q = self.shared.queues.lock().unwrap();
+        crate::QueueDepth {
+            queued_bytes: q.queued_bytes[idx],
+            sent_bytes: q.sent_bytes[idx],
+        }
     }
 
     async fn flush(&mut self) {
@@ -220,14 +257,42 @@ mod tests {
         const BULK: u8 = 0xBB;
         const INPUT: u8 = 0x11;
         const AUDIO: u8 = 0xAA;
-        q.classes[class_index(Priority::Bulk)].push_back(vec![BULK]);
-        q.classes[class_index(Priority::Input)].push_back(vec![INPUT]);
-        q.classes[class_index(Priority::Audio)].push_back(vec![AUDIO]);
+        q.push(class_index(Priority::Bulk), vec![BULK]);
+        q.push(class_index(Priority::Input), vec![INPUT]);
+        q.push(class_index(Priority::Audio), vec![AUDIO]);
         // Input must come out before audio, audio before bulk.
-        assert_eq!(q.pop_highest(), Some(vec![INPUT]));
-        assert_eq!(q.pop_highest(), Some(vec![AUDIO]));
-        assert_eq!(q.pop_highest(), Some(vec![BULK]));
-        assert_eq!(q.pop_highest(), None);
+        assert_eq!(q.pop_highest().map(|(_, f)| f), Some(vec![INPUT]));
+        assert_eq!(q.pop_highest().map(|(_, f)| f), Some(vec![AUDIO]));
+        assert_eq!(q.pop_highest().map(|(_, f)| f), Some(vec![BULK]));
+        assert!(q.pop_highest().is_none());
+    }
+
+    /// The backlog a class reports must be its own, and must fall as the
+    /// drainer takes frames.
+    ///
+    /// This is what the files module paces itself against: a count that never
+    /// dropped would read as a permanently congested link and throttle a
+    /// transfer to nothing, while one that counted every class would let a
+    /// burst of audio look like a file backlog.
+    #[test]
+    fn a_class_reports_only_its_own_backlog() {
+        let mut q = Queues::default();
+        q.push(class_index(Priority::Bulk), vec![0u8; 100]);
+        q.push(class_index(Priority::Bulk), vec![0u8; 50]);
+        q.push(class_index(Priority::Input), vec![0u8; 7]);
+
+        assert_eq!(q.queued_bytes[class_index(Priority::Bulk)], 150);
+        assert_eq!(q.queued_bytes[class_index(Priority::Input)], 7);
+
+        // Input drains first, leaving the bulk backlog untouched.
+        let (class, frame) = q.pop_highest().expect("a frame");
+        assert_eq!(class, class_index(Priority::Input));
+        assert_eq!(frame.len(), 7);
+        assert_eq!(q.queued_bytes[class_index(Priority::Bulk)], 150);
+        assert_eq!(q.queued_bytes[class_index(Priority::Input)], 0);
+
+        q.pop_highest().expect("a bulk frame");
+        assert_eq!(q.queued_bytes[class_index(Priority::Bulk)], 50);
     }
 
     // --- End-to-end scheduling + flush over the real encrypted transport. ---
@@ -306,5 +371,39 @@ mod tests {
 
         // Receiver already has it available.
         assert_eq!(rx.recv().await.unwrap(), Message::Bye);
+    }
+
+    /// A queued bulk payload must show up as a backlog, and be credited as sent
+    /// once it has left — the two readings a producer paces itself with.
+    #[tokio::test]
+    async fn the_backlog_a_producer_reads_tracks_the_wire() {
+        let (a, b) = MemTransport::pair();
+        let init = tokio::spawn(async move {
+            EncryptedTransport::establish(a, b"k", Role::Initiator)
+                .await
+                .unwrap()
+        });
+        let resp = EncryptedTransport::establish(b, b"k", Role::Responder)
+            .await
+            .unwrap();
+        let init = init.await.unwrap();
+
+        let (mut tx, _u) = Box::new(init).split_prioritized();
+        let (_u2, mut rx) = Box::new(resp).split();
+
+        assert_eq!(tx.queue_depth(Priority::Bulk), crate::QueueDepth::default());
+
+        tx.send(&Message::Opaque(vec![0u8; 800_000])).await.unwrap();
+        tx.flush().await;
+        let _ = rx.recv().await.unwrap();
+
+        let depth = tx.queue_depth(Priority::Bulk);
+        assert_eq!(depth.queued_bytes, 0, "nothing is left after a flush");
+        assert!(
+            depth.sent_bytes >= 800_000,
+            "the payload must be credited to its own class, got {depth:?}"
+        );
+        // Another class stays at zero: a bulk transfer is not audio's backlog.
+        assert_eq!(tx.queue_depth(Priority::Audio), crate::QueueDepth::default());
     }
 }
