@@ -175,6 +175,12 @@ cargo xtask logs --follow      # print the log dir and tail the current log
 Add `~/.local/bin` to your `PATH` if it isn't already. `clipd` is Linux-only,
 so macOS builds `cursio` and `cursio-app`. Android remains a placeholder.
 
+`windows` links AirPlay video against GStreamer, so it needs that project's
+MSVC *development* package unpacked on the build host and pointed at with
+`GSTREAMER_WINDOWS_SYSROOT` (the prefix holding `lib/pkgconfig`, typically
+`.../1.0/msvc_x86_64`). `xtask` checks for it before building and wires up
+`PKG_CONFIG_*` itself.
+
 > On this Ubuntu box `cargo xtask` sets `OPUS_TARGET=ubuntu-24.04_x86_64`
 > automatically for native builds (a plain `cargo build` still needs it set by
 > hand). Windows cross-builds compile libopus from source and don't need it.

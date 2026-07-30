@@ -273,6 +273,7 @@ fn windows(release: bool) -> Result<()> {
             ninja_install_hint()
         );
     }
+    let gstreamer = windows_gstreamer_sysroot()?;
 
     // clipd is GTK/Linux-only — never cross-build it for Windows.
     let selected: Vec<&Binary> = BINARIES.iter().filter(|b| b.bin != "clipd").collect();
@@ -295,6 +296,12 @@ fn windows(release: bool) -> Result<()> {
     // The prebuilt libopus for Windows; without this the crate tries to compile
     // it from source under the cross toolchain.
     cmd.env("OPUS_TARGET", OPUS_TARGET_WINDOWS);
+    // AirPlay video pulls in GStreamer, whose -sys crates resolve through
+    // pkg-config. Cross-compiling means pointing it at the Windows development
+    // files instead of the host's, which pkg-config refuses to do by default.
+    cmd.env("PKG_CONFIG_ALLOW_CROSS", "1");
+    cmd.env("PKG_CONFIG_SYSROOT_DIR", &gstreamer);
+    cmd.env("PKG_CONFIG_PATH", gstreamer.join("lib").join("pkgconfig"));
     // Ubuntu keeps lld-link out of PATH, and xwin links with it. `cargo-xwin`
     // itself may also live outside PATH, in `$CARGO_HOME/bin`.
     let mut extra_dirs: Vec<PathBuf> = Vec::new();
@@ -527,6 +534,42 @@ fn ensure_rust_target(target: &str) -> Result<()> {
          `rustc` is most likely a distribution package rather than rustup's shim; \
          check `which rustc` against `rustup which rustc`."
     )
+}
+
+/// Env var pointing at the unpacked GStreamer *Windows* development files.
+const GSTREAMER_WINDOWS_SYSROOT_ENV: &str = "GSTREAMER_WINDOWS_SYSROOT";
+
+/// Locate the GStreamer development files the Windows build links against.
+///
+/// `cursio-airplay` renders mirrored iPhone frames through GStreamer, so
+/// `glib-sys` and the `gstreamer-*-sys` crates run pkg-config during the cross
+/// build. Without a Windows sysroot they fail roughly two hundred crates in,
+/// behind a wall of `cargo:rerun-if-env-changed` noise that says nothing about
+/// what to install — so the requirement is checked up front instead.
+fn windows_gstreamer_sysroot() -> Result<PathBuf> {
+    let sysroot = std::env::var_os(GSTREAMER_WINDOWS_SYSROOT_ENV)
+        .map(PathBuf::from)
+        .with_context(|| {
+            format!(
+                "{GSTREAMER_WINDOWS_SYSROOT_ENV} is not set.\n\
+                 The Windows build needs GStreamer's MSVC *development* files \
+                 (the `-devel` package from https://gstreamer.freedesktop.org/download/), \
+                 unpacked somewhere this host can read:\n  \
+                 export {GSTREAMER_WINDOWS_SYSROOT_ENV}=/path/to/gstreamer/1.0/msvc_x86_64\n\
+                 That directory must contain lib/pkgconfig/gstreamer-1.0.pc."
+            )
+        })?;
+    let pkgconfig = sysroot.join("lib").join("pkgconfig");
+    if !pkgconfig.join("gstreamer-1.0.pc").is_file() {
+        bail!(
+            "{} does not look like a GStreamer Windows sysroot: {} is missing.\n\
+             Point {GSTREAMER_WINDOWS_SYSROOT_ENV} at the prefix that contains \
+             lib/pkgconfig (for the MSVC devel package that is .../1.0/msvc_x86_64).",
+            sysroot.display(),
+            pkgconfig.join("gstreamer-1.0.pc").display()
+        );
+    }
+    Ok(sysroot)
 }
 
 /// Package-manager hint for the host running the cross-build. `windows` is
