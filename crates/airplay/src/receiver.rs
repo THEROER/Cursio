@@ -133,6 +133,27 @@ impl Receiver {
     }
 }
 
+/// Whether a control exchange earns an `info` line.
+///
+/// A mirroring iPhone polls `/feedback` and `GET_PARAMETER` about once a
+/// second for the whole session. At `info` those bury the handful of exchanges
+/// that describe what the session is actually doing — pairing, FairPlay,
+/// `SETUP`, `RECORD`, `TEARDOWN` — so the routine polling drops to `debug`.
+/// Any non-success status stays visible whatever the endpoint.
+fn is_notable(request: &rtsp::Request, status: u16) -> bool {
+    if status >= 300 {
+        return true;
+    }
+    let target = request.target.split('?').next().unwrap_or(&request.target);
+    if matches!(target, "/feedback" | "/command" | "/audioMode") {
+        return false;
+    }
+    !matches!(
+        request.method.to_ascii_uppercase().as_str(),
+        "OPTIONS" | "GET_PARAMETER" | "SET_PARAMETER"
+    )
+}
+
 async fn serve_connection<T>(
     mut stream: T,
     config: Arc<ReceiverConfig>,
@@ -233,12 +254,21 @@ where
                 }
             };
             let encoded = response.encode(request.version, request.header("CSeq"));
-            tracing::info!(
-                method = %request.method,
-                target = %request.target,
-                status = response.status,
-                "airplay request"
-            );
+            if is_notable(&request, response.status) {
+                tracing::info!(
+                    method = %request.method,
+                    target = %request.target,
+                    status = response.status,
+                    "airplay request"
+                );
+            } else {
+                tracing::debug!(
+                    method = %request.method,
+                    target = %request.target,
+                    status = response.status,
+                    "airplay request"
+                );
+            }
             stream.write_all(&encoded).await?;
             stream.flush().await?;
         }
@@ -306,6 +336,27 @@ mod tests {
             error,
             AirPlayError::Control(ProtocolError::UnexpectedEof)
         ));
+    }
+
+    #[test]
+    fn routine_polling_is_not_logged_at_info() {
+        let request = |method: &str, target: &str| rtsp::Request {
+            method: method.to_string(),
+            target: target.to_string(),
+            version: rtsp::Version::Rtsp10,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+
+        assert!(!is_notable(&request("POST", "/feedback"), 200));
+        assert!(!is_notable(&request("GET_PARAMETER", "rtsp://x/1"), 200));
+        assert!(!is_notable(&request("OPTIONS", "*"), 200));
+
+        assert!(is_notable(&request("SETUP", "rtsp://x/1"), 200));
+        assert!(is_notable(&request("TEARDOWN", "rtsp://x/1"), 200));
+        assert!(is_notable(&request("GET", "/info"), 200));
+        // A failure is worth seeing even on an endpoint that normally is not.
+        assert!(is_notable(&request("POST", "/feedback"), 501));
     }
 
     #[tokio::test]
