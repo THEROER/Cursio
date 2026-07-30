@@ -7,6 +7,8 @@
 mod gstreamer;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows_window;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub use gstreamer::HardwareVideoPipeline;
@@ -187,7 +189,7 @@ impl PipelinePlan {
         format!(
             "appsrc name=airplay-source is-live=true block=false format=time \
              max-buffers=64 caps=\"{}\" ! \
-             {} config-interval=-1 ! {}{} ! {} ! {} sync=false qos=false",
+             {} config-interval=-1 ! {}{} ! {} ! {} name=airplay-sink sync=false qos=false",
             self.codec.caps(),
             self.codec.parser(),
             self.decoder,

@@ -53,6 +53,9 @@ mdns-sd = "0.11"
 # Hardware video decode/render
 gstreamer = "0.25"
 gstreamer-app = "0.25"
+# `GstVideoOverlay`, so the sink renders into a window Cursio named itself
+# rather than opening its own "Direct3D11 renderer".
+gstreamer-video = "0.25"
 
 # Crypto / pairing
 aes = "0.8"

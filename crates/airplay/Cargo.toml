@@ -29,9 +29,15 @@ astro-dnssd = "0.3"
 serde_json.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# The mirroring window Cursio owns, so the sink does not open an unnamed one of
+# its own. Same Win32 surface `cursio-window`'s surrogate uses.
+gstreamer-video.workspace = true
 windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]
