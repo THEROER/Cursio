@@ -11,6 +11,21 @@ pub(super) fn check_available(codec: VideoCodec) -> Result<(), AirPlayError> {
             "GStreamer could not start ({error}); install GStreamer 1.x and its hardware video plugins"
         ))
     })?;
+    // A missing hardware decoder and a GStreamer that loaded no plugins at all
+    // both surface as "element not found", but only the first is fixed by
+    // installing a codec. The second happens on Windows whenever the core
+    // GStreamer DLLs sit next to the executable: the plugin directory is
+    // resolved relative to those copies, so nothing is found however complete
+    // the installation is. `fakesink` ships in coreelements, so its absence
+    // means the registry rather than the codec.
+    if gst::ElementFactory::find("fakesink").is_none() {
+        return Err(AirPlayError::Video(
+            "GStreamer loaded no plugins; run with its own bin directory on PATH instead of \
+             copying its DLLs beside the executable, or point GST_PLUGIN_PATH at the \
+             gstreamer-1.0 plugin directory"
+                .into(),
+        ));
+    }
     PipelinePlan::detect(codec, |name| gst::ElementFactory::find(name).is_some()).map(|_| ())
 }
 
