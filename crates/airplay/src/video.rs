@@ -174,9 +174,19 @@ impl PipelinePlan {
         } else {
             ""
         };
+        // Nothing here may drop a buffer. These are H.264 access units, not
+        // finished pictures: discarding one costs every frame that references
+        // it, so the picture stays broken until the next IDR — seconds of
+        // blocky, wrongly-coloured output rather than the momentary hitch a
+        // leaky queue buys elsewhere. A bounded leaky queue was the original
+        // guard against latency building up behind a slow renderer, but a
+        // hardware decoder keeps ahead of a mirroring iPhone, and when it does
+        // not the honest fix is backpressure to the sender rather than
+        // corruption. `max-buffers` is left generous so it only ever signals
+        // `enough-data`.
         format!(
             "appsrc name=airplay-source is-live=true block=false format=time \
-             max-buffers=2 leaky-type=downstream caps=\"{}\" ! \
+             max-buffers=64 caps=\"{}\" ! \
              {} config-interval=-1 ! {}{} ! {} ! {} sync=false qos=false",
             self.codec.caps(),
             self.codec.parser(),
@@ -199,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_description_is_live_and_bounded() {
+    fn launch_description_is_live_and_never_drops_access_units() {
         let plan = PipelinePlan {
             codec: VideoCodec::H264,
             decoder: "vah264dec",
@@ -207,8 +217,10 @@ mod tests {
             memory: GpuMemory::DmaBuf,
         };
         let description = plan.launch_description();
-        assert!(description.contains("max-buffers=2"));
-        assert!(description.contains("leaky-type=downstream"));
+        assert!(description.contains("is-live=true"));
+        // Dropping a compressed access unit corrupts every frame that
+        // references it, so no stage of this pipeline may leak.
+        assert!(!description.contains("leaky"));
         assert!(description.contains("video/x-raw(memory:DMABuf)"));
         assert!(!description.contains("videoconvert"));
         assert!(!description.contains("appsink"));
