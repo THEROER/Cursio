@@ -56,9 +56,14 @@ impl Request {
 }
 
 /// Incremental decoder for a persistent control connection.
+///
+/// Consumed requests are released by advancing `start`; the buffer is compacted
+/// only once the consumed prefix outgrows the remainder, so pipelined requests
+/// do not each pay for a memmove of everything behind them.
 #[derive(Debug, Default)]
 pub struct RequestDecoder {
     buffered: Vec<u8>,
+    start: usize,
 }
 
 impl RequestDecoder {
@@ -67,16 +72,17 @@ impl RequestDecoder {
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
-        if self.buffered.len().saturating_add(bytes.len()) > MAX_BUFFERED_BYTES {
+        if self.pending().len().saturating_add(bytes.len()) > MAX_BUFFERED_BYTES {
             return Err(ProtocolError::BufferTooLarge);
         }
+        self.compact();
         self.buffered.extend_from_slice(bytes);
         Ok(())
     }
 
     pub fn next_request(&mut self) -> Result<Option<Request>, ProtocolError> {
-        let Some(header_offset) = find_header_end(&self.buffered) else {
-            if self.buffered.len() > MAX_HEADER_BYTES {
+        let Some(header_offset) = find_header_end(self.pending()) else {
+            if self.pending().len() > MAX_HEADER_BYTES {
                 return Err(ProtocolError::HeaderTooLarge);
             }
             return Ok(None);
@@ -86,7 +92,7 @@ impl RequestDecoder {
             return Err(ProtocolError::HeaderTooLarge);
         }
 
-        let header = std::str::from_utf8(&self.buffered[..header_offset])
+        let header = std::str::from_utf8(&self.pending()[..header_offset])
             .map_err(|_| ProtocolError::Malformed("headers are not UTF-8"))?;
         let mut lines = header.split("\r\n");
         let request_line = lines
@@ -147,12 +153,12 @@ impl RequestDecoder {
         let request_len = header_len
             .checked_add(body_len)
             .ok_or(ProtocolError::BodyTooLarge(body_len))?;
-        if self.buffered.len() < request_len {
+        if self.pending().len() < request_len {
             return Ok(None);
         }
 
-        let body = self.buffered[header_len..request_len].to_vec();
-        self.buffered.drain(..request_len);
+        let body = self.pending()[header_len..request_len].to_vec();
+        self.start += request_len;
         Ok(Some(Request {
             method,
             target,
@@ -163,7 +169,24 @@ impl RequestDecoder {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffered.is_empty()
+        self.pending().is_empty()
+    }
+
+    fn pending(&self) -> &[u8] {
+        &self.buffered[self.start..]
+    }
+
+    fn compact(&mut self) {
+        if self.start == 0 {
+            return;
+        }
+        if self.start == self.buffered.len() {
+            self.buffered.clear();
+            self.start = 0;
+        } else if self.start >= self.buffered.len() - self.start {
+            self.buffered.drain(..self.start);
+            self.start = 0;
+        }
     }
 }
 

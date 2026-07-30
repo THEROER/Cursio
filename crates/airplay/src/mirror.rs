@@ -31,9 +31,15 @@ pub struct MirrorPacket {
     pub payload: Vec<u8>,
 }
 
+/// Consumed packets are released by advancing `start` rather than by draining
+/// the front of the buffer: at 60 fps the stream delivers thousands of packets
+/// a second, and re-copying the remainder each time dominates the decode path.
+/// The buffer is compacted once the consumed prefix is at least as large as
+/// what is left, which keeps the amortized cost per byte constant.
 #[derive(Debug, Default)]
 pub struct MirrorPacketDecoder {
     buffered: Vec<u8>,
+    start: usize,
 }
 
 impl MirrorPacketDecoder {
@@ -42,29 +48,28 @@ impl MirrorPacketDecoder {
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), MirrorError> {
-        if self.buffered.len().saturating_add(bytes.len()) > MAX_BUFFERED_BYTES {
+        if self.pending().len().saturating_add(bytes.len()) > MAX_BUFFERED_BYTES {
             return Err(MirrorError::BufferTooLarge);
         }
+        self.compact();
         self.buffered.extend_from_slice(bytes);
         Ok(())
     }
 
     pub fn next_packet(&mut self) -> Result<Option<MirrorPacket>, MirrorError> {
-        if self.buffered.len() < MIRROR_HEADER_BYTES {
+        let pending = self.pending();
+        if pending.len() < MIRROR_HEADER_BYTES {
             return Ok(None);
         }
-        let payload_len = u32::from_le_bytes(
-            self.buffered[..4]
-                .try_into()
-                .expect("four-byte payload length"),
-        ) as usize;
+        let payload_len =
+            u32::from_le_bytes(pending[..4].try_into().expect("four-byte payload length")) as usize;
         if payload_len > MAX_MIRROR_PAYLOAD_BYTES {
             return Err(MirrorError::PayloadTooLarge(payload_len));
         }
         let packet_len = MIRROR_HEADER_BYTES
             .checked_add(payload_len)
             .ok_or(MirrorError::PayloadTooLarge(payload_len))?;
-        if self.buffered.len() < packet_len {
+        if pending.len() < packet_len {
             return Ok(None);
         }
 
@@ -72,21 +77,35 @@ impl MirrorPacketDecoder {
         // (notably 0x10 for an IDR frame), not the high byte of a u16 type.
         // Treating 00 10 as type 0x1000 skips the first encrypted IDR payload
         // and permanently desynchronizes the continuous AES-CTR stream.
-        let payload_type = u16::from(self.buffered[4]).into();
-        let flags = u16::from_le_bytes([self.buffered[6], self.buffered[7]]);
-        let timestamp = u64::from_le_bytes(
-            self.buffered[8..16]
-                .try_into()
-                .expect("eight-byte timestamp"),
-        );
-        let payload = self.buffered[MIRROR_HEADER_BYTES..packet_len].to_vec();
-        self.buffered.drain(..packet_len);
+        let payload_type = u16::from(pending[4]).into();
+        let flags = u16::from_le_bytes([pending[6], pending[7]]);
+        let timestamp =
+            u64::from_le_bytes(pending[8..16].try_into().expect("eight-byte timestamp"));
+        let payload = pending[MIRROR_HEADER_BYTES..packet_len].to_vec();
+        self.start += packet_len;
         Ok(Some(MirrorPacket {
             payload_type,
             flags,
             timestamp,
             payload,
         }))
+    }
+
+    fn pending(&self) -> &[u8] {
+        &self.buffered[self.start..]
+    }
+
+    fn compact(&mut self) {
+        if self.start == 0 {
+            return;
+        }
+        if self.start == self.buffered.len() {
+            self.buffered.clear();
+            self.start = 0;
+        } else if self.start >= self.buffered.len() - self.start {
+            self.buffered.drain(..self.start);
+            self.start = 0;
+        }
     }
 }
 
@@ -129,8 +148,21 @@ impl AvcConfig {
 
     /// Convert one AVC access unit to Annex-B start-code framing.
     pub fn convert_access_unit(&self, bytes: &[u8]) -> Result<Vec<u8>, MirrorError> {
-        let mut offset = 0;
         let mut annex_b = Vec::with_capacity(bytes.len() + 16);
+        self.convert_access_unit_into(bytes, &mut annex_b)?;
+        Ok(annex_b)
+    }
+
+    /// Append the Annex-B form of one access unit to `annex_b`.
+    ///
+    /// The caller owns the buffer so the mirroring path can reuse one
+    /// allocation for every frame instead of one per frame at 60 fps.
+    pub fn convert_access_unit_into(
+        &self,
+        bytes: &[u8],
+        annex_b: &mut Vec<u8>,
+    ) -> Result<(), MirrorError> {
+        let mut offset = 0;
         while offset < bytes.len() {
             let end = offset
                 .checked_add(self.nal_length_bytes)
@@ -155,7 +187,7 @@ impl AvcConfig {
             annex_b.extend_from_slice(&bytes[offset..nal_end]);
             offset = nal_end;
         }
-        Ok(annex_b)
+        Ok(())
     }
 }
 
@@ -241,6 +273,23 @@ mod tests {
             decoder.next_packet().unwrap().unwrap().payload_type,
             PayloadType::Video
         );
+    }
+
+    /// The buffer is consumed with a cursor, so a long stream must keep
+    /// decoding correctly while the backing allocation stays bounded.
+    #[test]
+    fn long_streams_decode_without_growing_the_buffer() {
+        let mut decoder = MirrorPacketDecoder::new();
+        for index in 0..512_u16 {
+            decoder
+                .push(&packet(0, u64::from(index), &[index as u8; 200]))
+                .unwrap();
+            let decoded = decoder.next_packet().unwrap().unwrap();
+            assert_eq!(decoded.timestamp, u64::from(index));
+            assert_eq!(decoded.payload, [index as u8; 200]);
+            assert!(decoder.next_packet().unwrap().is_none());
+        }
+        assert!(decoder.buffered.len() <= 2 * (MIRROR_HEADER_BYTES + 200));
     }
 
     #[test]
