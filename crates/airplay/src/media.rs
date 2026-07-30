@@ -10,13 +10,16 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 
 use crate::crypto::{CryptoSession, MirrorDecryptor};
-use crate::mirror::{AvcConfig, MirrorPacketDecoder, PayloadType};
+use crate::mirror::{AvcConfig, MirrorPacket, MirrorPacketDecoder, PayloadType};
 use crate::rtsp::{Request, Response};
 use crate::AirPlayError;
 
 const MIRROR_STREAM_TYPE: u64 = 110;
 const TIMING_PACKET_BYTES: usize = 32;
 const NTP_UNIX_EPOCH_OFFSET: u64 = 2_208_988_800;
+/// How long the advertised `dataPort` waits for the sender before giving the
+/// listener and the video window back.
+const MIRROR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConnectionContext {
@@ -65,7 +68,7 @@ impl MediaSession {
         }
 
         if request.method.eq_ignore_ascii_case("TEARDOWN") {
-            self.stop();
+            self.teardown(&request.body);
             return Ok(Some(Response::new(200, "OK")));
         }
 
@@ -215,15 +218,46 @@ impl MediaSession {
         Ok(local_port)
     }
 
+    /// True once the sender has negotiated its media key on this connection.
+    pub(crate) fn is_active(&self) -> bool {
+        self.encrypted_key.is_some()
+    }
+
+    /// A `TEARDOWN` carrying a `streams` array ends that stream only; iOS
+    /// reuses the same control session for the next `SETUP`. Dropping the
+    /// negotiated key there would answer that `SETUP` with 455 and leave
+    /// mirroring unable to restart without a full reconnect.
+    fn teardown(&mut self, body: &[u8]) {
+        if teardown_targets_streams(body) {
+            self.stop_mirror();
+        } else {
+            self.stop();
+        }
+    }
+
+    fn stop_mirror(&mut self) {
+        if let Some(task) = self.mirror_task.take() {
+            task.abort();
+        }
+    }
+
     fn stop(&mut self) {
         if let Some(task) = self.timing_task.take() {
             task.abort();
         }
-        if let Some(task) = self.mirror_task.take() {
-            task.abort();
-        }
+        self.stop_mirror();
         self.encrypted_key = None;
     }
+}
+
+fn teardown_targets_streams(body: &[u8]) -> bool {
+    Value::from_reader(Cursor::new(body))
+        .ok()
+        .as_ref()
+        .and_then(Value::as_dictionary)
+        .and_then(|root| root.get("streams"))
+        .and_then(Value::as_array)
+        .is_some_and(|streams| !streams.is_empty())
 }
 
 impl Drop for MediaSession {
@@ -373,7 +407,12 @@ async fn serve_mirror(
     sink: Box<dyn VideoSink>,
 ) -> Result<(), AirPlayError> {
     let mut stream = loop {
-        let (stream, peer) = listener.accept().await?;
+        let accepted = tokio::time::timeout(MIRROR_CONNECT_TIMEOUT, listener.accept())
+            .await
+            .map_err(|_| {
+                AirPlayError::Video("the AirPlay sender never opened the mirror stream".into())
+            })??;
+        let (stream, peer) = accepted;
         if peer.ip() == peer_ip {
             break stream;
         }
@@ -396,6 +435,9 @@ struct MirrorProcessor {
     decryptor: Box<dyn MirrorDecryptor>,
     sink: Box<dyn VideoSink>,
     avc: Option<AvcConfig>,
+    plaintext: Vec<u8>,
+    access_unit: Vec<u8>,
+    skipped: u64,
 }
 
 impl MirrorProcessor {
@@ -405,6 +447,9 @@ impl MirrorProcessor {
             decryptor,
             sink,
             avc: None,
+            plaintext: Vec::new(),
+            access_unit: Vec::new(),
+            skipped: 0,
         }
     }
 
@@ -417,31 +462,54 @@ impl MirrorProcessor {
             .next_packet()
             .map_err(|error| AirPlayError::Video(error.to_string()))?
         {
-            match packet.payload_type {
-                PayloadType::CodecConfig => {
-                    let config = AvcConfig::parse(&packet.payload)
-                        .map_err(|error| AirPlayError::Video(error.to_string()))?;
-                    self.sink.push(config.parameter_sets())?;
-                    self.avc = Some(config);
-                }
-                PayloadType::Video => {
-                    let config = self.avc.as_ref().ok_or_else(|| {
-                        AirPlayError::Video("video arrived before AVC configuration".into())
-                    })?;
-                    let mut plaintext = Vec::with_capacity(packet.payload.len());
-                    self.decryptor.decrypt(&packet.payload, &mut plaintext)?;
-                    if plaintext.len() != packet.payload.len() {
-                        return Err(AirPlayError::Crypto(
-                            "mirror decryptor returned a different payload length".into(),
-                        ));
-                    }
-                    let access_unit = config
-                        .convert_access_unit(&plaintext)
-                        .map_err(|error| AirPlayError::Video(error.to_string()))?;
-                    self.sink.push(&access_unit)?;
-                }
-                PayloadType::Heartbeat | PayloadType::Unknown(_) => {}
+            // Framing errors above desynchronize the stream and end it. A
+            // single undecodable payload does not: iOS recovers on its own at
+            // the next IDR, so skipping keeps the session alive instead of
+            // freezing the picture until the user reconnects.
+            if let Err(error) = self.process(&packet) {
+                self.skipped += 1;
+                tracing::warn!(
+                    %error,
+                    payload_type = ?packet.payload_type,
+                    skipped = self.skipped,
+                    "skipped an AirPlay mirror packet"
+                );
             }
+        }
+        Ok(())
+    }
+
+    fn process(&mut self, packet: &MirrorPacket) -> Result<(), AirPlayError> {
+        match packet.payload_type {
+            PayloadType::CodecConfig => {
+                let config = AvcConfig::parse(&packet.payload)
+                    .map_err(|error| AirPlayError::Video(error.to_string()))?;
+                self.sink.push(config.parameter_sets())?;
+                self.avc = Some(config);
+            }
+            PayloadType::Video => {
+                // The AES-CTR keystream spans the whole connection, so every
+                // video payload has to be decrypted in wire order even when it
+                // cannot be rendered. Skipping one before decryption would
+                // desynchronize the cipher for the rest of the session.
+                self.plaintext.clear();
+                self.decryptor
+                    .decrypt(&packet.payload, &mut self.plaintext)?;
+                if self.plaintext.len() != packet.payload.len() {
+                    return Err(AirPlayError::Crypto(
+                        "mirror decryptor returned a different payload length".into(),
+                    ));
+                }
+                let config = self.avc.as_ref().ok_or_else(|| {
+                    AirPlayError::Video("video arrived before AVC configuration".into())
+                })?;
+                self.access_unit.clear();
+                config
+                    .convert_access_unit_into(&self.plaintext, &mut self.access_unit)
+                    .map_err(|error| AirPlayError::Video(error.to_string()))?;
+                self.sink.push(&self.access_unit)?;
+            }
+            PayloadType::Heartbeat | PayloadType::Unknown(_) => {}
         }
         Ok(())
     }
@@ -594,6 +662,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_teardown_keeps_the_negotiated_session() {
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), MIRROR_STREAM_TYPE.into());
+        let mut root = Dictionary::new();
+        root.insert(
+            "streams".into(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        let request = Request {
+            method: "TEARDOWN".into(),
+            target: "rtsp://127.0.0.1/1".into(),
+            version: crate::rtsp::Version::Rtsp10,
+            headers: Vec::new(),
+            body: binary_plist(Value::Dictionary(root)),
+        };
+        let mut media = MediaSession::new(true);
+        media.encrypted_key = Some(vec![7; 72]);
+
+        let response = media
+            .handle_request(&request, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert!(media.is_active());
+    }
+
+    #[tokio::test]
+    async fn session_teardown_without_streams_clears_the_key() {
+        let request = Request {
+            method: "TEARDOWN".into(),
+            target: "rtsp://127.0.0.1/1".into(),
+            version: crate::rtsp::Version::Rtsp10,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let mut media = MediaSession::new(true);
+        media.encrypted_key = Some(vec![7; 72]);
+
+        let response = media
+            .handle_request(&request, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert!(!media.is_active());
+    }
+
+    #[tokio::test]
     async fn get_parameter_returns_requested_volume() {
         let request = Request {
             method: "GET_PARAMETER".into(),
@@ -667,5 +784,53 @@ mod tests {
         let frames = frames.lock().unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[1], [0, 0, 0, 1, 0x65, 0xaa]);
+    }
+
+    /// A packet that cannot be rendered must not end the stream, and it must
+    /// still pass through the decryptor: the AES-CTR keystream is continuous,
+    /// so skipping one before decryption corrupts every later frame.
+    #[test]
+    fn undecodable_packets_are_skipped_without_desyncing_the_cipher() {
+        struct Counting(Arc<Mutex<usize>>);
+
+        impl MirrorDecryptor for Counting {
+            fn decrypt(
+                &mut self,
+                ciphertext: &[u8],
+                plaintext: &mut Vec<u8>,
+            ) -> Result<(), AirPlayError> {
+                *self.0.lock().unwrap() += 1;
+                plaintext.extend_from_slice(ciphertext);
+                Ok(())
+            }
+        }
+
+        let decrypted = Arc::new(Mutex::new(0));
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut processor = MirrorProcessor::new(
+            Box::new(Counting(decrypted.clone())),
+            Box::new(RecordingSink(frames.clone())),
+        );
+
+        // Video before any codec configuration, then a malformed access unit,
+        // then a frame that is fine.
+        processor
+            .push(&mirror_packet(0, &[0, 0, 0, 2, 0x65, 0xaa]))
+            .unwrap();
+        let avcc = [
+            1, 100, 0, 31, 0xff, 0xe1, 0, 3, 0x67, 0x64, 0x00, 1, 0, 2, 0x68, 0xee,
+        ];
+        processor.push(&mirror_packet(1, &avcc)).unwrap();
+        processor
+            .push(&mirror_packet(0, &[0, 0, 0, 9, 0x65]))
+            .unwrap();
+        processor
+            .push(&mirror_packet(0, &[0, 0, 0, 2, 0x65, 0xbb]))
+            .unwrap();
+
+        assert_eq!(*decrypted.lock().unwrap(), 3);
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1], [0, 0, 0, 1, 0x65, 0xbb]);
     }
 }
