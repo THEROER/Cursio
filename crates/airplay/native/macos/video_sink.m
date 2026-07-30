@@ -4,8 +4,16 @@
 #import <QuartzCore/QuartzCore.h>
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <unistd.h>
+
+// The reader thread outruns AppKit whenever presentation stalls. Without a cap
+// the main queue accumulates access units nobody will see, trading latency and
+// memory for frames that are already stale by the time they are decoded.
+#define CURSIO_MAX_PENDING_UNITS 8
+
+static _Atomic int pending_units = 0;
 
 static BOOL read_exact(int fd, void *buffer, size_t length) {
     uint8_t *cursor = buffer;
@@ -134,8 +142,13 @@ static NSArray<NSData *> *annex_b_units(NSData *access_unit) {
             if (!read_exact(STDIN_FILENO, data.mutableBytes, size)) {
                 break;
             }
+            if (atomic_load(&pending_units) >= CURSIO_MAX_PENDING_UNITS) {
+                continue;
+            }
+            atomic_fetch_add(&pending_units, 1);
             dispatch_async(dispatch_get_main_queue(), ^{
                 [weakSelf consumeAccessUnit:data];
+                atomic_fetch_sub(&pending_units, 1);
             });
         }
         dispatch_async(dispatch_get_main_queue(), ^{
