@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use cursio_transport::discovery::DiscoveryConfig;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -9,6 +10,13 @@ use crate::discovery::AirPlayAnnouncement;
 use crate::media::{ConnectionContext, MediaSession};
 use crate::rtsp::{self, ProtocolError, RequestDecoder};
 use crate::{AirPlayError, ReceiverConfig};
+
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// A sender with a negotiated media key polls this connection continuously
+/// (`/feedback`, `GET_PARAMETER`). Silence for this long means it went away
+/// without closing the socket, and the session's timing socket, mirror listener
+/// and video window would otherwise be held until the process exits.
+const ACTIVE_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bound AirPlay control listener and its live mDNS registrations.
 pub struct Receiver {
@@ -84,9 +92,25 @@ impl Receiver {
             );
         }
         loop {
-            let (stream, peer) = self.listener.accept().await?;
-            stream.set_nodelay(true)?;
-            let local_addr = stream.local_addr()?;
+            // A transient accept failure (descriptor exhaustion, an aborted
+            // connection) must not retire the receiver for the lifetime of the
+            // process; the mesh keeps running and AirPlay would silently stay
+            // gone until the next restart.
+            let (stream, peer) = match self.listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(%error, "AirPlay control accept failed");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
+            };
+            let local_addr = match stream.set_nodelay(true).and_then(|_| stream.local_addr()) {
+                Ok(local_addr) => local_addr,
+                Err(error) => {
+                    tracing::warn!(%peer, %error, "AirPlay control connection unusable");
+                    continue;
+                }
+            };
             tracing::debug!(%peer, %local_addr, "AirPlay control connection accepted");
             let config = self.config.clone();
             let crypto = self
@@ -123,7 +147,19 @@ where
     let mut media = MediaSession::new(screen_enabled);
     let mut read_buffer = [0_u8; 8192];
     loop {
-        let count = stream.read(&mut read_buffer).await?;
+        let count = if media.is_active() {
+            match tokio::time::timeout(ACTIVE_SESSION_IDLE_TIMEOUT, stream.read(&mut read_buffer))
+                .await
+            {
+                Ok(count) => count?,
+                Err(_) => {
+                    tracing::warn!("AirPlay sender went silent; ending the media session");
+                    return Ok(());
+                }
+            }
+        } else {
+            stream.read(&mut read_buffer).await?
+        };
         if count == 0 {
             return if decoder.is_empty() {
                 Ok(())
@@ -149,7 +185,12 @@ where
                 && request.method.eq_ignore_ascii_case("GET")
                 && matches!(target, "/info" | "/server-info")
             {
-                crate::video::prepare_window()?;
+                // Presentation is optional: a receiver that cannot open its
+                // window must still answer probes instead of dropping the
+                // connection the sender is negotiating on.
+                if let Err(error) = crate::video::prepare_window() {
+                    tracing::warn!(%error, "AirPlay screen window is unavailable");
+                }
             }
             if request.method.eq_ignore_ascii_case("POST") && target == "/reverse" {
                 stream
