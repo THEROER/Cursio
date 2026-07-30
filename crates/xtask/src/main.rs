@@ -267,9 +267,10 @@ fn windows(release: bool) -> Result<()> {
     if which("ninja").is_none() {
         bail!(
             "ninja not found. Install it with:\n  \
-             sudo apt install ninja-build\n\
+             {}\n\
              (cmake builds libopus with it; without it the build fails with \
-             \"unable to find a build program corresponding to Ninja\")"
+             \"unable to find a build program corresponding to Ninja\")",
+            ninja_install_hint()
         );
     }
 
@@ -526,6 +527,17 @@ fn ensure_rust_target(target: &str) -> Result<()> {
          `rustc` is most likely a distribution package rather than rustup's shim; \
          check `which rustc` against `rustup which rustc`."
     )
+}
+
+/// Package-manager hint for the host running the cross-build. `windows` is
+/// documented as a Linux workflow but does run elsewhere, and an apt command on
+/// a Mac is worse than no hint at all.
+fn ninja_install_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "brew install ninja"
+    } else {
+        "sudo apt install ninja-build"
+    }
 }
 
 /// Whether the active `rustc` has a standard library for `target`.
