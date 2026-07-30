@@ -255,14 +255,14 @@ fn windows(release: bool) -> Result<()> {
     }
     ensure_rust_target(WINDOWS_TARGET)?;
 
-    if which("cargo-xwin").is_none() {
-        bail!(
+    let xwin = which("cargo-xwin").with_context(|| {
+        format!(
             "cargo-xwin not found. Install it with:\n  \
              cargo install cargo-xwin\n\
              (it downloads the MSVC CRT and Windows SDK so {WINDOWS_TARGET} \
              links without Visual Studio)"
-        );
-    }
+        )
+    })?;
     // libopus is built with cmake, which invokes ninja specifically.
     if which("ninja").is_none() {
         bail!(
@@ -294,10 +294,17 @@ fn windows(release: bool) -> Result<()> {
     // The prebuilt libopus for Windows; without this the crate tries to compile
     // it from source under the cross toolchain.
     cmd.env("OPUS_TARGET", OPUS_TARGET_WINDOWS);
-    // Ubuntu keeps lld-link out of PATH, and xwin links with it.
-    if let Some(dir) = llvm_bin_dir() {
-        let path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{path}", dir.display()));
+    // Ubuntu keeps lld-link out of PATH, and xwin links with it. `cargo-xwin`
+    // itself may also live outside PATH, in `$CARGO_HOME/bin`.
+    let mut extra_dirs: Vec<PathBuf> = Vec::new();
+    extra_dirs.extend(llvm_bin_dir());
+    extra_dirs.extend(xwin.parent().map(Path::to_path_buf));
+    if !extra_dirs.is_empty() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let joined =
+            std::env::join_paths(extra_dirs.into_iter().chain(std::env::split_paths(&path)))
+                .context("building the cross-build PATH")?;
+        cmd.env("PATH", joined);
     }
     run(cmd).context("windows cross-build failed")?;
 
@@ -489,29 +496,71 @@ fn warn_if_not_on_path(bin_dir: &Path) {
     }
 }
 
-/// Ensure a rustup target is installed, installing it if missing.
+/// Ensure the *active* toolchain can compile for `target`, installing it with
+/// rustup when it can't.
+///
+/// Asking `rustup target list` is not enough: a host where `rustc` resolves to
+/// a distribution package (Homebrew, apt) while `rustup` is also installed will
+/// happily report the target as present and then fail the build much later with
+/// an opaque `can't find crate for core`. The standard library directory the
+/// active `rustc` would actually use is the thing worth checking.
 fn ensure_rust_target(target: &str) -> Result<()> {
-    let installed = Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output();
-    if let Ok(out) = installed {
-        let list = String::from_utf8_lossy(&out.stdout);
-        if list.lines().any(|l| l.trim() == target) {
-            return Ok(());
-        }
+    if has_target_libdir(target) {
+        return Ok(());
+    }
+    if which("rustup").is_none() {
+        bail!(
+            "the active rust toolchain cannot build for {target} and rustup is not installed.\n\
+             Install rustup, or build on a host whose toolchain ships {target}."
+        );
     }
     println!("→ installing rust target {target}");
     let mut cmd = Command::new("rustup");
     cmd.args(["target", "add", target]);
-    run(cmd)
+    run(cmd)?;
+    if has_target_libdir(target) {
+        return Ok(());
+    }
+    bail!(
+        "rustup installed {target} but the active `rustc` still cannot use it.\n\
+         `rustc` is most likely a distribution package rather than rustup's shim; \
+         check `which rustc` against `rustup which rustc`."
+    )
+}
+
+/// Whether the active `rustc` has a standard library for `target`.
+fn has_target_libdir(target: &str) -> bool {
+    let Ok(out) = Command::new("rustc")
+        .args(["--print", "target-libdir", "--target", target])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout);
+    Path::new(dir.trim()).is_dir()
 }
 
 /// Locate an executable on PATH (`which`-style), returning its path.
+///
+/// `$CARGO_HOME/bin` is searched too: that is where `cargo install` puts cargo
+/// subcommands, and it is missing from PATH whenever cargo itself came from a
+/// package manager rather than from rustup.
 fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
+        .chain(cargo_bin_dir())
         .map(|d| d.join(name))
         .find(|p| p.is_file())
+}
+
+fn cargo_bin_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))?;
+    Some(home.join("bin"))
 }
 
 /// Newest regular file in a directory by mtime, or None if the dir is empty.
