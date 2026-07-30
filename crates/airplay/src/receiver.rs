@@ -25,6 +25,7 @@ pub struct Receiver {
     _announcement: AirPlayAnnouncement,
     crypto: Option<Arc<dyn CryptoProvider>>,
     screen_enabled: bool,
+    tap: Option<crate::MirrorTap>,
 }
 
 impl Receiver {
@@ -61,6 +62,7 @@ impl Receiver {
             _announcement: announcement,
             crypto,
             screen_enabled: false,
+            tap: None,
         })
     }
 
@@ -70,6 +72,15 @@ impl Receiver {
     /// `SETUP` requests are rejected before a decoder or window is created.
     pub fn with_screen_enabled(mut self, enabled: bool) -> Self {
         self.screen_enabled = enabled;
+        self
+    }
+
+    /// Publish the mirrored screen so the rest of Cursio can show it too.
+    ///
+    /// Without a tap the iPhone's screen exists only on this machine, which is
+    /// what makes AirPlay feel bolted on rather than part of the mesh.
+    pub fn with_mirror_tap(mut self, tap: crate::MirrorTap) -> Self {
+        self.tap = Some(tap);
         self
     }
 
@@ -118,13 +129,15 @@ impl Receiver {
                 .as_ref()
                 .map(|provider| provider.start_session());
             let screen_enabled = self.screen_enabled;
+            let tap = self.tap.clone();
             tokio::spawn(async move {
                 let context = ConnectionContext {
                     local_addr,
                     peer_addr: peer,
                 };
                 if let Err(error) =
-                    serve_connection(stream, config, crypto, Some(context), screen_enabled).await
+                    serve_connection(stream, config, crypto, Some(context), screen_enabled, tap)
+                        .await
                 {
                     tracing::warn!(%peer, %error, "AirPlay control connection ended");
                 }
@@ -160,12 +173,13 @@ async fn serve_connection<T>(
     mut crypto: Option<Box<dyn CryptoSession>>,
     context: Option<ConnectionContext>,
     screen_enabled: bool,
+    tap: Option<crate::MirrorTap>,
 ) -> Result<(), AirPlayError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut decoder = RequestDecoder::new();
-    let mut media = MediaSession::new(screen_enabled);
+    let mut media = MediaSession::new(screen_enabled, tap);
     let mut read_buffer = [0_u8; 8192];
     loop {
         let count = if media.is_active() {
@@ -298,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn serves_fragmented_and_pipelined_requests() {
         let (mut client, server) = tokio::io::duplex(32 * 1024);
-        let task = tokio::spawn(serve_connection(server, config(), None, None, false));
+        let task = tokio::spawn(serve_connection(server, config(), None, None, false, None));
 
         client
             .write_all(b"GET /info RTSP/1.0\r\nCSeq: 1\r\nContent-L")
@@ -324,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn truncated_request_is_rejected() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(serve_connection(server, config(), None, None, false));
+        let task = tokio::spawn(serve_connection(server, config(), None, None, false, None));
         client
             .write_all(b"GET /info RTSP/1.0\r\nContent-Length: 4\r\n\r\nab")
             .await
@@ -362,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn upgrades_reverse_event_channel() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(serve_connection(server, config(), None, None, false));
+        let task = tokio::spawn(serve_connection(server, config(), None, None, false, None));
         client
             .write_all(b"POST /reverse HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
             .await

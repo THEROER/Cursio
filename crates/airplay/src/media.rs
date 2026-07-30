@@ -32,15 +32,18 @@ pub(crate) struct MediaSession {
     timing_task: Option<JoinHandle<()>>,
     mirror_task: Option<JoinHandle<()>>,
     screen_enabled: bool,
+    /// Present when the mesh should be able to watch along.
+    tap: Option<crate::MirrorTap>,
 }
 
 impl MediaSession {
-    pub(crate) fn new(screen_enabled: bool) -> Self {
+    pub(crate) fn new(screen_enabled: bool, tap: Option<crate::MirrorTap>) -> Self {
         Self {
             encrypted_key: None,
             timing_task: None,
             mirror_task: None,
             screen_enabled,
+            tap,
         }
     }
 
@@ -210,8 +213,9 @@ impl MediaSession {
         let listener = TcpListener::bind(SocketAddr::new(local_ip, 0)).await?;
         let local_port = listener.local_addr()?.port();
         let sink = hardware_video_sink()?;
+        let tap = self.tap.clone();
         self.mirror_task = Some(tokio::spawn(async move {
-            if let Err(error) = serve_mirror(listener, peer_ip, decryptor, sink).await {
+            if let Err(error) = serve_mirror(listener, peer_ip, decryptor, sink, tap).await {
                 tracing::warn!(%error, "AirPlay mirroring stream ended");
             }
         }));
@@ -405,6 +409,7 @@ async fn serve_mirror(
     peer_ip: IpAddr,
     decryptor: Box<dyn MirrorDecryptor>,
     sink: Box<dyn VideoSink>,
+    tap: Option<crate::MirrorTap>,
 ) -> Result<(), AirPlayError> {
     let mut stream = loop {
         let accepted = tokio::time::timeout(MIRROR_CONNECT_TIMEOUT, listener.accept())
@@ -419,7 +424,7 @@ async fn serve_mirror(
         tracing::warn!(%peer, expected = %peer_ip, "rejected foreign AirPlay media connection");
     };
     stream.set_nodelay(true)?;
-    let mut processor = MirrorProcessor::new(decryptor, sink);
+    let mut processor = MirrorProcessor::new(decryptor, sink, tap);
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = stream.read(&mut buffer).await?;
@@ -434,6 +439,8 @@ struct MirrorProcessor {
     decoder: MirrorPacketDecoder,
     decryptor: Box<dyn MirrorDecryptor>,
     sink: Box<dyn VideoSink>,
+    /// Where the mesh listens in, when the receiver was given a tap.
+    tap: Option<crate::MirrorTap>,
     avc: Option<AvcConfig>,
     plaintext: Vec<u8>,
     access_unit: Vec<u8>,
@@ -441,11 +448,16 @@ struct MirrorProcessor {
 }
 
 impl MirrorProcessor {
-    fn new(decryptor: Box<dyn MirrorDecryptor>, sink: Box<dyn VideoSink>) -> Self {
+    fn new(
+        decryptor: Box<dyn MirrorDecryptor>,
+        sink: Box<dyn VideoSink>,
+        tap: Option<crate::MirrorTap>,
+    ) -> Self {
         Self {
             decoder: MirrorPacketDecoder::new(),
             decryptor,
             sink,
+            tap,
             avc: None,
             plaintext: Vec::new(),
             access_unit: Vec::new(),
@@ -485,6 +497,9 @@ impl MirrorProcessor {
                 let config = AvcConfig::parse(&packet.payload)
                     .map_err(|error| AirPlayError::Video(error.to_string()))?;
                 self.sink.push(config.parameter_sets())?;
+                if let Some(tap) = self.tap.as_ref() {
+                    tap.publish_parameter_sets(config.parameter_sets());
+                }
                 self.avc = Some(config);
             }
             PayloadType::Video => {
@@ -508,6 +523,10 @@ impl MirrorProcessor {
                     .convert_access_unit_into(&self.plaintext, &mut self.access_unit)
                     .map_err(|error| AirPlayError::Video(error.to_string()))?;
                 self.sink.push(&self.access_unit)?;
+                // Only pay for the copy when a peer is actually watching.
+                if let Some(tap) = self.tap.as_ref().filter(|tap| tap.has_readers()) {
+                    tap.publish_access_unit(&self.access_unit);
+                }
             }
             PayloadType::Heartbeat | PayloadType::Unknown(_) => {}
         }
@@ -606,7 +625,7 @@ mod tests {
             local_addr: "127.0.0.1:7000".parse().unwrap(),
             peer_addr: "127.0.0.1:50000".parse().unwrap(),
         };
-        let mut media = MediaSession::new(false);
+        let mut media = MediaSession::new(false, None);
         let response = media
             .handle_request(&request, Some(context), Some(&mut TestCrypto))
             .await
@@ -648,7 +667,7 @@ mod tests {
             local_addr: "127.0.0.1:7000".parse().unwrap(),
             peer_addr: "127.0.0.1:50000".parse().unwrap(),
         };
-        let mut media = MediaSession::new(false);
+        let mut media = MediaSession::new(false, None);
         let response = media
             .handle_request(&request, Some(context), Some(&mut TestCrypto))
             .await
@@ -677,7 +696,7 @@ mod tests {
             headers: Vec::new(),
             body: binary_plist(Value::Dictionary(root)),
         };
-        let mut media = MediaSession::new(true);
+        let mut media = MediaSession::new(true, None);
         media.encrypted_key = Some(vec![7; 72]);
 
         let response = media
@@ -698,7 +717,7 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
         };
-        let mut media = MediaSession::new(true);
+        let mut media = MediaSession::new(true, None);
         media.encrypted_key = Some(vec![7; 72]);
 
         let response = media
@@ -719,7 +738,7 @@ mod tests {
             headers: vec![("Content-Type".into(), "text/parameters".into())],
             body: b"volume\r\n".to_vec(),
         };
-        let mut media = MediaSession::new(false);
+        let mut media = MediaSession::new(false, None);
         media.encrypted_key = Some(vec![7; 72]);
         let response = media
             .handle_request(&request, None, None)
@@ -772,7 +791,7 @@ mod tests {
     fn decrypts_and_converts_video_for_the_sink() {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let sink = RecordingSink(frames.clone());
-        let mut processor = MirrorProcessor::new(Box::new(Passthrough), Box::new(sink));
+        let mut processor = MirrorProcessor::new(Box::new(Passthrough), Box::new(sink), None);
         let avcc = [
             1, 100, 0, 31, 0xff, 0xe1, 0, 3, 0x67, 0x64, 0x00, 1, 0, 2, 0x68, 0xee,
         ];
@@ -810,6 +829,7 @@ mod tests {
         let mut processor = MirrorProcessor::new(
             Box::new(Counting(decrypted.clone())),
             Box::new(RecordingSink(frames.clone())),
+            None,
         );
 
         // Video before any codec configuration, then a malformed access unit,

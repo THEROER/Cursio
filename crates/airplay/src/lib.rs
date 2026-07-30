@@ -14,10 +14,12 @@ mod media;
 pub mod mirror;
 mod receiver;
 pub mod rtsp;
+mod tap;
 pub mod video;
 
 pub use config::{ConfigError, DeviceId, ReceiverConfig, Resolution, VideoProfile};
 pub use receiver::Receiver;
+pub use tap::{MirrorReader, MirrorTap, MirrorUnit};
 
 /// Errors produced while advertising or serving the receiver.
 #[derive(Debug, thiserror::Error)]
