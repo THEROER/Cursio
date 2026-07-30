@@ -124,6 +124,14 @@ enum Command {
         /// separates "capture is broken" from "hiding broke the capture".
         #[arg(long, default_value_t = false)]
         keep_window_visible: bool,
+        /// Accept a first-time pairing from another machine for the next ten
+        /// minutes, using a password read from the terminal.
+        ///
+        /// Needed on the machine that is *waiting*: `cursio join` on the other
+        /// one dials this node, and without an open window an unknown machine
+        /// is refused before pairing can run.
+        #[arg(long, default_value_t = false)]
+        pair: bool,
         /// Decode iPhone mirroring video and show it in a native window.
         ///
         /// Without this flag the AirPlay RTSP control receiver still runs, but
@@ -247,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
             share_window,
             share_window_title,
             keep_window_visible,
+            pair,
             airplay_screen,
             no_airplay,
             airplay_name,
@@ -255,6 +264,18 @@ async fn main() -> anyhow::Result<()> {
             res,
             fps,
         } => {
+            // Read before anything binds a port, so a mistyped password costs
+            // nothing and the prompt is not buried under startup logging.
+            let pairing = if pair {
+                let password = read_pairing_password()?;
+                tracing::info!(
+                    minutes = PAIRING_WINDOW.as_secs() / 60,
+                    "pairing window open; run `cursio join` on the other machine"
+                );
+                PairingWindow::open(password, PAIRING_WINDOW)
+            } else {
+                PairingWindow::closed()
+            };
             // The CLI's only job for modules is to build the registry; from here
             // on nothing names a specific module.
             let modules = module_registry(
@@ -274,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
                 send_input,
                 peer_edge.map(Into::into),
                 modules,
+                pairing,
             );
             if no_airplay {
                 mesh.await
@@ -455,6 +477,7 @@ async fn run_mesh(
     send_input: bool,
     peer_edge: Option<cursio_protocol::Edge>,
     modules: cursio_core::module::ModuleRegistry,
+    pairing: PairingWindow,
 ) -> anyhow::Result<()> {
     let NodeBase {
         listener,
@@ -514,6 +537,7 @@ async fn run_mesh(
                             Role::Responder,
                             None,
                             registry.clone(),
+                            pairing.clone(),
                             capture.clone(),
                             peer_edge,
                             modules.clone(),
@@ -566,6 +590,7 @@ async fn run_mesh(
                                 Role::Initiator,
                                 Some(target.peer_id),
                                 registry.clone(),
+                                pairing.clone(),
                                 capture.clone(),
                                 peer_edge,
                                 modules.clone(),
@@ -589,12 +614,75 @@ async fn run_mesh(
 // plumbing (transport, identity, role, registry, capture, edge), not module
 // configuration. The five module flags that used to be here are gone.
 #[allow(clippy::too_many_arguments)]
+/// How long `--pair` stays willing to meet a machine it has never seen.
+const PAIRING_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// A time-boxed willingness to pair with an unknown machine.
+///
+/// A mesh node refuses an inbound stranger outright: the trust store is the
+/// only way in, which is what keeps joining the mesh an explicit act. That left
+/// no way to *become* trusted, because the other machine's `cursio join` needs
+/// this side to run its half of SPAKE2 — and a node with no password bails
+/// before that. `--pair` opens this window so a first meeting can happen, and
+/// the deadline closes it again so a node left running overnight is not
+/// standing open to the LAN.
+#[derive(Clone)]
+struct PairingWindow(std::rc::Rc<std::cell::RefCell<Option<OpenPairingWindow>>>);
+
+struct OpenPairingWindow {
+    password: Zeroizing<String>,
+    closes_at: std::time::Instant,
+}
+
+impl PairingWindow {
+    fn closed() -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(None)))
+    }
+
+    fn open(password: Zeroizing<String>, for_: Duration) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(Some(
+            OpenPairingWindow {
+                password,
+                closes_at: std::time::Instant::now() + for_,
+            },
+        ))))
+    }
+
+    fn is_open(&self) -> bool {
+        self.0
+            .borrow()
+            .as_ref()
+            .is_some_and(|open| open.closes_at > std::time::Instant::now())
+    }
+
+    /// The password to offer an inbound peer, or empty once the window shut.
+    ///
+    /// An expired window drops the password rather than merely ignoring it, so
+    /// it stops existing in the process at the moment it stops being usable.
+    fn password(&self) -> Zeroizing<String> {
+        let mut slot = self.0.borrow_mut();
+        match slot.as_ref() {
+            Some(open) if open.closes_at > std::time::Instant::now() => open.password.clone(),
+            Some(_) => {
+                *slot = None;
+                tracing::info!("pairing window closed; unknown machines are refused again");
+                Zeroizing::new(String::new())
+            }
+            None => Zeroizing::new(String::new()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_peer_session(
     transport: TcpTransport,
     identity: NodeIdentity,
     role: Role,
     expected: Option<cursio_protocol::PeerId>,
     registry: cursio_core::mesh::SharedRegistry,
+    // Only consulted for an inbound connection: a peer we dialled is one we
+    // already trust, so it never needs a password.
+    pairing: PairingWindow,
     // Shared with every other mesh session: capture is one machine-wide
     // resource (one portal permission, one grab), so sessions take turns on it
     // rather than each building their own. See [`PersistentCapture`].
@@ -622,6 +710,7 @@ fn spawn_peer_session(
         let identified = std::rc::Rc::new(std::cell::RefCell::new(expected));
         let seen = identified.clone();
         let reg_for_cb = registry.clone();
+        let pairing_for_cb = pairing.clone();
         let mut on_identified = move |id: cursio_protocol::PeerId, name: &str| {
             *seen.borrow_mut() = Some(id);
             let mut reg = reg_for_cb.borrow_mut();
@@ -631,6 +720,8 @@ fn spawn_peer_session(
             if reg.is_known(&id) {
                 reg.set_state(id, cursio_core::registry::PeerState::Online);
                 tracing::info!(peer = %name, "peer online");
+            } else if pairing_for_cb.is_open() {
+                tracing::info!(peer = %name, %id, "unknown machine dialled in; pairing it");
             } else {
                 tracing::warn!(peer = %name, %id, "untrusted peer dialled in; not admitted");
             }
@@ -647,14 +738,18 @@ fn spawn_peer_session(
             while capture.commands.try_recv().is_ok() {}
         }
 
-        // Mesh sessions only ever run between already-paired peers, so no
-        // password is needed: the trust store holds the key and pairing is
-        // skipped entirely. A machine we haven't paired with can't get here —
-        // we never dial one, and an inbound stranger fails the key lookup.
+        // A dialled peer is already trusted, so its key comes from the store and
+        // pairing is skipped. An inbound stranger is refused the same way —
+        // unless `--pair` is holding a window open, which is the one path by
+        // which a machine becomes trusted in the first place.
+        let password = match role {
+            Role::Responder => pairing.password(),
+            Role::Initiator => Zeroizing::new(String::new()),
+        };
         let result = run_pairing_and_session(
             transport,
             identity,
-            "",
+            &password,
             role,
             false,
             capture_for_session,
