@@ -72,7 +72,10 @@ impl MirrorTap {
         MirrorReader { stream, replay }
     }
 
-    pub(crate) fn publish_parameter_sets(&self, bytes: &[u8]) {
+    /// Publish decoder configuration. The receiver is the normal producer;
+    /// this is public so anything driving a stream (a test, a future source)
+    /// can feed one without reaching inside the crate.
+    pub fn publish_parameter_sets(&self, bytes: &[u8]) {
         let sets: Arc<[u8]> = Arc::from(bytes);
         if let Ok(mut stored) = self.parameter_sets.lock() {
             *stored = Some(sets.clone());
@@ -80,13 +83,13 @@ impl MirrorTap {
         let _ = self.sender.send(MirrorUnit::ParameterSets(sets));
     }
 
-    pub(crate) fn publish_access_unit(&self, bytes: &[u8]) {
+    pub fn publish_access_unit(&self, bytes: &[u8]) {
         let _ = self.sender.send(MirrorUnit::AccessUnit(Arc::from(bytes)));
     }
 
-    /// Whether anything is listening, so the receiver can skip the copy when
+    /// Whether anything is listening, so a producer can skip the copy when
     /// nothing is.
-    pub(crate) fn has_readers(&self) -> bool {
+    pub fn has_readers(&self) -> bool {
         self.sender.receiver_count() != 0
     }
 }

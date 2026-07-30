@@ -172,6 +172,8 @@ The AES-CTR keystream is continuous for the life of a mirror data connection. Ev
 
 `--airplay-screen` (alias `--airplay`) gates video; without it the control receiver still runs and mirror `SETUP` answers 501. `--no-airplay` disables the listener. A busy port 7000 (macOS' own receiver) logs a warning and leaves the mesh running.
 
+**Reaching the rest of the mesh** is `tap.rs` plus `core/src/airplay_window.rs`. The phone never becomes a peer — it has no identity, runs no modules, and is absent from the registry. Instead the receiving host offers its screen through the ordinary window-transfer path: AirPlay produces H.264 and `TileCodec::LossyVideo` already carries H.264, so access units go out untouched and the viewer decodes them with the surrogate it already has. The tap retains the last SPS/PPS and replays them to each new subscriber, because a machine that joins mid-stream would otherwise have nothing to configure a decoder with. `--share-airplay` (requires `--airplay-screen`) turns it on, and hosting needs a window backend, so a Mac can receive AirPlay but not yet share it onward.
+
 ### Wire compatibility
 
 Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 13) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.

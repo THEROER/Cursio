@@ -9,6 +9,7 @@
 //! now this is the layer that proves two machines can find, pair, and hold a
 //! live session.
 
+pub mod airplay_window;
 pub mod audio_session;
 pub mod clipboard_session;
 /// Windows self-elevation, so injected input isn't blocked by UIPI.

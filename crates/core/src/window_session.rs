@@ -457,6 +457,10 @@ where
 /// advertises nothing.
 pub struct WindowFactory {
     pub enabled: bool,
+    /// When set, this node shares whatever an iPhone is mirroring to it instead
+    /// of one of its own windows. The two are alternatives rather than both at
+    /// once: an engine hosts a single window per session.
+    pub airplay: Option<(cursio_airplay::MirrorTap, u32, u32)>,
     /// Windows only: share the window whose title contains this, immediately,
     /// without waiting for a drag. Empty means "wait for a drag".
     pub title_hint: String,
@@ -485,6 +489,15 @@ impl crate::module::ModuleFactory for WindowFactory {
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         #[cfg(target_os = "linux")]
         {
+            if let Some((tap, width, height)) = self.airplay.clone() {
+                return Ok(Box::new(airplay_engine(
+                    tap,
+                    width,
+                    height,
+                    cursio_window::GtkWindowRenderer,
+                    ctx,
+                )));
+            }
             // On Linux the portal runs its own window picker, so there is no
             // title to match and no window of ours to hide — both options are
             // Windows-only and deliberately ignored here.
@@ -498,6 +511,15 @@ impl crate::module::ModuleFactory for WindowFactory {
         }
         #[cfg(target_os = "windows")]
         {
+            if let Some((tap, width, height)) = self.airplay.clone() {
+                return Ok(Box::new(airplay_engine(
+                    tap,
+                    width,
+                    height,
+                    cursio_window::Win32WindowRenderer,
+                    ctx,
+                )));
+            }
             let mut engine = WindowEngine::new(
                 cursio_window::WgcWindowCapture {
                     title_hint: self.title_hint.clone(),
@@ -1003,4 +1025,30 @@ mod tests {
         eng.share_window().unwrap();
         assert!(matches!(eng.share_window(), Err(WindowError::Backend(_))));
     }
+}
+
+/// Build an engine that hosts the mirrored iPhone screen.
+///
+/// Sharing starts immediately rather than waiting for a drag: there is no
+/// window to drag, and the offer must already be out when the phone connects so
+/// the peer has a surrogate ready for the first frame. `begin` never fails, so
+/// there is no error to handle here.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn airplay_engine<R: cursio_window::WindowRenderer>(
+    tap: cursio_airplay::MirrorTap,
+    width: u32,
+    height: u32,
+    renderer: R,
+    ctx: &crate::module::SessionCtx,
+) -> WindowEngine<crate::airplay_window::AirPlayWindowCapture, R> {
+    let mut engine = WindowEngine::new(
+        crate::airplay_window::AirPlayWindowCapture::new(tap, width, height),
+        renderer,
+        ctx.peer_name().to_string(),
+    );
+    match engine.share_window() {
+        Ok(id) => tracing::info!(id, peer = %ctx.peer_name(), "sharing the iPhone screen"),
+        Err(error) => tracing::error!(%error, "could not share the iPhone screen"),
+    }
+    engine
 }

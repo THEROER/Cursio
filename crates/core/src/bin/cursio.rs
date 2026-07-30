@@ -124,6 +124,13 @@ enum Command {
         /// separates "capture is broken" from "hiding broke the capture".
         #[arg(long, default_value_t = false)]
         keep_window_visible: bool,
+        /// Share whatever an iPhone mirrors to this machine with the mesh,
+        /// instead of one of this machine's own windows.
+        ///
+        /// The peer sees it as an ordinary transferred window: the H.264 from
+        /// AirPlay is forwarded untouched, so nothing is re-encoded on the way.
+        #[arg(long, default_value_t = false, requires = "airplay_screen")]
+        share_airplay: bool,
         /// Accept a first-time pairing from another machine for the next ten
         /// minutes, using a password read from the terminal.
         ///
@@ -255,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
             share_window,
             share_window_title,
             keep_window_visible,
+            share_airplay,
             pair,
             airplay_screen,
             no_airplay,
@@ -276,6 +284,12 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 PairingWindow::closed()
             };
+            // One tap feeds both the local window and every peer that asks
+            // for the phone's screen; without `--share-airplay` there is no
+            // tap at all and the receiver keeps the stream to itself.
+            let (width, height) = Resolution::from(res).dimensions();
+            let airplay_tap = share_airplay.then(cursio_airplay::MirrorTap::new);
+
             // The CLI's only job for modules is to build the registry; from here
             // on nothing names a specific module.
             let modules = module_registry(
@@ -288,6 +302,9 @@ async fn main() -> anyhow::Result<()> {
                 share_window,
                 share_window_title,
                 keep_window_visible,
+                airplay_tap
+                    .clone()
+                    .map(|tap| (tap, u32::from(width), u32::from(height))),
             );
             let mesh = run_mesh(
                 identity.clone(),
@@ -309,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
                         resolution: res,
                         fps,
                         screen_enabled: airplay_screen,
+                        tap: airplay_tap,
                     },
                 )
                 .await
@@ -339,6 +357,8 @@ struct AirPlayOpts {
     resolution: AirPlayResolutionArg,
     fps: u16,
     screen_enabled: bool,
+    /// Set when peers should be able to watch the mirrored screen too.
+    tap: Option<cursio_airplay::MirrorTap>,
 }
 
 async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::Result<Receiver> {
@@ -374,9 +394,12 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     let discovery = options
         .interface
         .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
-    let receiver = Receiver::bind_with_crypto(config, discovery, crypto)
+    let mut receiver = Receiver::bind_with_crypto(config, discovery, crypto)
         .await?
         .with_screen_enabled(options.screen_enabled);
+    if let Some(tap) = options.tap {
+        receiver = receiver.with_mirror_tap(tap);
+    }
     tracing::info!(
         address = %receiver.local_addr()?,
         screen = options.screen_enabled,
@@ -429,6 +452,7 @@ fn module_registry(
     share_window: bool,
     share_window_title: String,
     keep_window_visible: bool,
+    airplay: Option<(cursio_airplay::MirrorTap, u32, u32)>,
 ) -> cursio_core::module::ModuleRegistry {
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut registry = cursio_core::module::ModuleRegistry::new()
@@ -440,9 +464,12 @@ fn module_registry(
             enabled: clipboard,
         }))
         .with(Box::new(cursio_core::window_session::WindowFactory {
-            enabled: share_window,
+            // Sharing the phone's screen is window transfer, so the module has
+            // to be running even when no local window was asked for.
+            enabled: share_window || airplay.is_some(),
             title_hint: share_window_title,
             keep_visible: keep_window_visible,
+            airplay,
         }));
 
     // File sharing needs a mount implementation: FUSE on Linux, WinFsp on
