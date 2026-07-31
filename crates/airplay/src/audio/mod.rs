@@ -246,6 +246,13 @@ pub(crate) async fn observe(
         None
     };
 
+    // The stored volume is applied straight away. Waiting for the next change
+    // would start every new stream at full volume, which is what made a phone
+    // set to a whisper come back loud after each reconnection.
+    if let Some(playback) = playback.as_ref() {
+        playback.set_volume(*volume.borrow_and_update());
+    }
+
     let mut sequences = SequenceFilter::default();
     let mut datagram = [0_u8; MAX_AUDIO_DATAGRAM];
     let mut received = 0_u64;

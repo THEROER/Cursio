@@ -40,8 +40,12 @@ pub(crate) struct MediaSession {
     screen_enabled: bool,
     /// Present when the mesh should be able to watch along.
     tap: Option<crate::MirrorTap>,
-    /// The sender's volume, in AirPlay's decibel scale, shared with the task
-    /// that plays the sound.
+    /// The sender's volume, in AirPlay's decibel scale.
+    ///
+    /// Owned by the receiver rather than by this session: an iPhone drops and
+    /// remakes its control connection constantly — locking the screen, opening
+    /// a video — and a per-session volume would silently return to full every
+    /// time, undoing whatever the user had set.
     volume: tokio::sync::watch::Sender<f32>,
     /// Fired when the user closes the window the screen was appearing in.
     ///
@@ -54,7 +58,11 @@ pub(crate) struct MediaSession {
 }
 
 impl MediaSession {
-    pub(crate) fn new(screen_enabled: bool, tap: Option<crate::MirrorTap>) -> Self {
+    pub(crate) fn new(
+        screen_enabled: bool,
+        tap: Option<crate::MirrorTap>,
+        volume: tokio::sync::watch::Sender<f32>,
+    ) -> Self {
         Self {
             encrypted_key: None,
             timing_task: None,
@@ -64,7 +72,7 @@ impl MediaSession {
             screen_enabled,
             tap,
             screen_closed: Arc::new(Notify::new()),
-            volume: tokio::sync::watch::Sender::new(0.0),
+            volume,
         }
     }
 
@@ -124,7 +132,11 @@ impl MediaSession {
         if request.method.eq_ignore_ascii_case("SET_PARAMETER") && self.encrypted_key.is_some() {
             if let Some(volume) = parse_volume(&request.body) {
                 tracing::debug!(volume, "AirPlay volume changed");
-                let _ = self.volume.send(volume);
+                // Replaced rather than sent: `send` fails when nothing is
+                // listening yet, and a sender sets the volume before the audio
+                // stream exists — losing it there is what made a quiet phone
+                // come back loud.
+                self.volume.send_replace(volume);
             }
             return Ok(Some(Response::new(200, "OK")));
         }
@@ -709,6 +721,10 @@ mod tests {
     use super::*;
     use crate::crypto::CryptoEndpoint;
 
+    fn test_volume() -> tokio::sync::watch::Sender<f32> {
+        tokio::sync::watch::Sender::new(0.0)
+    }
+
     fn binary_plist(value: Value) -> Vec<u8> {
         let mut bytes = Vec::new();
         value.to_writer_binary(&mut bytes).unwrap();
@@ -793,7 +809,7 @@ mod tests {
             local_addr: "127.0.0.1:7000".parse().unwrap(),
             peer_addr: "127.0.0.1:50000".parse().unwrap(),
         };
-        let mut media = MediaSession::new(false, None);
+        let mut media = MediaSession::new(false, None, test_volume());
         let response = media
             .handle_request(&request, Some(context), Some(&mut TestCrypto))
             .await
@@ -835,7 +851,7 @@ mod tests {
             local_addr: "127.0.0.1:7000".parse().unwrap(),
             peer_addr: "127.0.0.1:50000".parse().unwrap(),
         };
-        let mut media = MediaSession::new(false, None);
+        let mut media = MediaSession::new(false, None, test_volume());
         let response = media
             .handle_request(&request, Some(context), Some(&mut TestCrypto))
             .await
@@ -864,7 +880,7 @@ mod tests {
             headers: Vec::new(),
             body: binary_plist(Value::Dictionary(root)),
         };
-        let mut media = MediaSession::new(true, None);
+        let mut media = MediaSession::new(true, None, test_volume());
         media.encrypted_key = Some(vec![7; 72]);
 
         let response = media
@@ -924,7 +940,7 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
         };
-        let mut media = MediaSession::new(true, None);
+        let mut media = MediaSession::new(true, None, test_volume());
         media.encrypted_key = Some(vec![7; 72]);
 
         let response = media
@@ -936,6 +952,60 @@ mod tests {
         assert!(!media.is_active());
     }
 
+    /// What the sender set has to survive the reconnection it makes moments
+    /// later, or the user's choice is undone by a screen lock.
+    #[tokio::test]
+    async fn a_volume_the_sender_set_is_reported_back() {
+        let volume = test_volume();
+        let mut media = MediaSession::new(false, None, volume.clone());
+        media.encrypted_key = Some(vec![7; 72]);
+
+        let set = Request {
+            method: "SET_PARAMETER".into(),
+            target: "rtsp://127.0.0.1/1".into(),
+            version: crate::rtsp::Version::Rtsp10,
+            headers: vec![("Content-Type".into(), "text/parameters".into())],
+            body: b"volume: -23.500000\r\n".to_vec(),
+        };
+        assert_eq!(
+            media
+                .handle_request(&set, None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(*volume.borrow(), -23.5);
+
+        // A new connection reuses the receiver's volume rather than resetting.
+        let mut reconnected = MediaSession::new(false, None, volume);
+        reconnected.encrypted_key = Some(vec![7; 72]);
+        let get = Request {
+            method: "GET_PARAMETER".into(),
+            target: "rtsp://127.0.0.1/1".into(),
+            version: crate::rtsp::Version::Rtsp10,
+            headers: Vec::new(),
+            body: b"volume\r\n".to_vec(),
+        };
+        let response = reconnected
+            .handle_request(&get, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.body, b"volume: -23.500000\r\n");
+    }
+
+    #[test]
+    fn a_volume_line_is_read_from_a_set_parameter_body() {
+        assert_eq!(parse_volume(b"volume: -30.000000\r\n"), Some(-30.0));
+        assert_eq!(parse_volume(b"volume: 0.000000\r\n"), Some(0.0));
+        // Muting is its own value rather than a very small one.
+        assert_eq!(parse_volume(b"volume: -144.000000\r\n"), Some(-144.0));
+        assert_eq!(parse_volume(b"progress: 1/2/3\r\n"), None);
+        assert_eq!(parse_volume(&[0xff, 0xfe]), None);
+    }
+
     #[tokio::test]
     async fn get_parameter_returns_requested_volume() {
         let request = Request {
@@ -945,7 +1015,7 @@ mod tests {
             headers: vec![("Content-Type".into(), "text/parameters".into())],
             body: b"volume\r\n".to_vec(),
         };
-        let mut media = MediaSession::new(false, None);
+        let mut media = MediaSession::new(false, None, test_volume());
         media.encrypted_key = Some(vec![7; 72]);
         let response = media
             .handle_request(&request, None, None)

@@ -26,6 +26,9 @@ pub struct Receiver {
     crypto: Option<Arc<dyn CryptoProvider>>,
     screen_enabled: bool,
     tap: Option<crate::MirrorTap>,
+    /// Survives the control connections that come and go, so a volume the user
+    /// set once stays set.
+    volume: tokio::sync::watch::Sender<f32>,
 }
 
 impl Receiver {
@@ -63,6 +66,7 @@ impl Receiver {
             crypto,
             screen_enabled: false,
             tap: None,
+            volume: tokio::sync::watch::Sender::new(0.0),
         })
     }
 
@@ -130,14 +134,22 @@ impl Receiver {
                 .map(|provider| provider.start_session());
             let screen_enabled = self.screen_enabled;
             let tap = self.tap.clone();
+            let volume = self.volume.clone();
             tokio::spawn(async move {
                 let context = ConnectionContext {
                     local_addr,
                     peer_addr: peer,
                 };
-                if let Err(error) =
-                    serve_connection(stream, config, crypto, Some(context), screen_enabled, tap)
-                        .await
+                if let Err(error) = serve_connection(
+                    stream,
+                    config,
+                    crypto,
+                    Some(context),
+                    screen_enabled,
+                    tap,
+                    volume,
+                )
+                .await
                 {
                     tracing::warn!(%peer, %error, "AirPlay control connection ended");
                 }
@@ -174,12 +186,13 @@ async fn serve_connection<T>(
     context: Option<ConnectionContext>,
     screen_enabled: bool,
     tap: Option<crate::MirrorTap>,
+    volume: tokio::sync::watch::Sender<f32>,
 ) -> Result<(), AirPlayError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut decoder = RequestDecoder::new();
-    let mut media = MediaSession::new(screen_enabled, tap);
+    let mut media = MediaSession::new(screen_enabled, tap, volume);
     let mut read_buffer = [0_u8; 8192];
     loop {
         let count = if media.is_active() {
@@ -319,7 +332,15 @@ mod tests {
     #[tokio::test]
     async fn serves_fragmented_and_pipelined_requests() {
         let (mut client, server) = tokio::io::duplex(32 * 1024);
-        let task = tokio::spawn(serve_connection(server, config(), None, None, false, None));
+        let task = tokio::spawn(serve_connection(
+            server,
+            config(),
+            None,
+            None,
+            false,
+            None,
+            tokio::sync::watch::Sender::new(0.0),
+        ));
 
         client
             .write_all(b"GET /info RTSP/1.0\r\nCSeq: 1\r\nContent-L")
@@ -345,7 +366,15 @@ mod tests {
     #[tokio::test]
     async fn truncated_request_is_rejected() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(serve_connection(server, config(), None, None, false, None));
+        let task = tokio::spawn(serve_connection(
+            server,
+            config(),
+            None,
+            None,
+            false,
+            None,
+            tokio::sync::watch::Sender::new(0.0),
+        ));
         client
             .write_all(b"GET /info RTSP/1.0\r\nContent-Length: 4\r\n\r\nab")
             .await
@@ -383,7 +412,15 @@ mod tests {
     #[tokio::test]
     async fn upgrades_reverse_event_channel() {
         let (mut client, server) = tokio::io::duplex(1024);
-        let task = tokio::spawn(serve_connection(server, config(), None, None, false, None));
+        let task = tokio::spawn(serve_connection(
+            server,
+            config(),
+            None,
+            None,
+            false,
+            None,
+            tokio::sync::watch::Sender::new(0.0),
+        ));
         client
             .write_all(b"POST /reverse HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
             .await
