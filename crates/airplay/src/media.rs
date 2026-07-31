@@ -9,6 +9,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 
+use crate::audio::{self, AudioStreamRequest};
 use crate::crypto::{CryptoSession, MirrorDecryptor};
 use crate::mirror::{AvcConfig, MirrorPacket, MirrorPacketDecoder, PayloadType};
 use crate::rtsp::{Request, Response};
@@ -31,6 +32,7 @@ pub(crate) struct MediaSession {
     encrypted_key: Option<Vec<u8>>,
     timing_task: Option<JoinHandle<()>>,
     mirror_task: Option<JoinHandle<()>>,
+    audio_task: Option<JoinHandle<()>>,
     screen_enabled: bool,
     /// Present when the mesh should be able to watch along.
     tap: Option<crate::MirrorTap>,
@@ -42,6 +44,7 @@ impl MediaSession {
             encrypted_key: None,
             timing_task: None,
             mirror_task: None,
+            audio_task: None,
             screen_enabled,
             tap,
         }
@@ -177,6 +180,18 @@ impl MediaSession {
             );
         }
 
+        if let Some(request) = setup.audio {
+            let ports = self.start_audio(context.local_addr.ip(), request).await?;
+            // A `SETUP` may carry video and audio together, so this appends to
+            // whatever the mirror stream already put there.
+            match response.get_mut("streams").and_then(Value::as_array_mut) {
+                Some(streams) => streams.push(ports),
+                None => {
+                    response.insert("streams".into(), Value::Array(vec![ports]));
+                }
+            }
+        }
+
         if response.is_empty() {
             return Ok(Response::new(461, "Unsupported Transport"));
         }
@@ -243,6 +258,30 @@ impl MediaSession {
         if let Some(task) = self.mirror_task.take() {
             task.abort();
         }
+        if let Some(task) = self.audio_task.take() {
+            task.abort();
+        }
+    }
+
+    /// Accept the audio that accompanies mirroring.
+    ///
+    /// Answering at all is the point: an unanswered audio stream makes iOS
+    /// mirror silently, and nothing about the sound can be learned from a
+    /// sender that never sends it.
+    async fn start_audio(
+        &mut self,
+        local_ip: IpAddr,
+        request: AudioStreamRequest,
+    ) -> Result<Value, AirPlayError> {
+        if let Some(task) = self.audio_task.take() {
+            task.abort();
+        }
+        let (data, control) = audio::bind_ports(local_ip).await?;
+        let data_port = data.local_addr()?.port();
+        let control_port = control.local_addr()?.port();
+        tracing::info!(data_port, control_port, setup = %request.describe(), "AirPlay audio stream configured");
+        self.audio_task = Some(tokio::spawn(audio::observe(data, request)));
+        Ok(audio::setup_response(data_port, control_port))
     }
 
     fn stop(&mut self) {
@@ -278,6 +317,7 @@ struct SetupKeys {
 struct SetupRequest {
     keys: Option<SetupKeys>,
     mirror_stream_id: Option<u64>,
+    audio: Option<AudioStreamRequest>,
 }
 
 impl SetupRequest {
@@ -308,6 +348,7 @@ impl SetupRequest {
         };
 
         let mut mirror_stream_id = None;
+        let mut audio = None;
         if let Some(streams) = root.get("streams") {
             for stream in streams
                 .as_array()
@@ -328,6 +369,13 @@ impl SetupRequest {
                             .and_then(plist_u64_bits)
                             .ok_or("mirror stream has no streamConnectionID")?,
                     );
+                } else if stream.get("type").and_then(Value::as_unsigned_integer)
+                    == Some(audio::AUDIO_STREAM_TYPE)
+                {
+                    if audio.is_some() {
+                        return Err("AirPlay SETUP contains multiple audio streams");
+                    }
+                    audio = Some(AudioStreamRequest::parse(stream));
                 }
             }
         }
@@ -335,6 +383,7 @@ impl SetupRequest {
         Ok(Self {
             keys,
             mirror_stream_id,
+            audio,
         })
     }
 }
@@ -343,7 +392,7 @@ impl SetupRequest {
 /// high bit set are decoded by some plist producers/readers as negative i64,
 /// while AirPlay defines streamConnectionID as an opaque u64. Preserve the
 /// original two's-complement bits in either representation.
-fn plist_u64_bits(value: &Value) -> Option<u64> {
+pub(crate) fn plist_u64_bits(value: &Value) -> Option<u64> {
     value
         .as_unsigned_integer()
         .or_else(|| value.as_signed_integer().map(|value| value as u64))

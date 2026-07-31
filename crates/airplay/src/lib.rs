@@ -6,6 +6,7 @@
 //! discovery, bounded HTTP/RTSP framing, transient pairing, FairPlay key
 //! handling, and mirroring media setup.
 
+mod audio;
 mod config;
 pub mod crypto;
 pub mod discovery;
