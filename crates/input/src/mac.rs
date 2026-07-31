@@ -64,13 +64,12 @@ pub struct MacInjector {
 impl MacInjector {
     /// Create the injector, or explain why the Mac will not accept input.
     pub fn new(style: ModifierStyle) -> Result<Self, InputError> {
-        // SAFETY: no arguments, no pointers; the call only reads the process's
-        // own Accessibility authorisation.
-        if !unsafe { AXIsProcessTrusted() } {
+        if !accessibility_granted() {
             return Err(InputError::Unavailable(
-                "macOS has not granted Cursio the Accessibility permission, so injected input is \
-                 discarded without an error; enable it under System Settings > Privacy & \
-                 Security > Accessibility and restart cursio"
+                "macOS has not granted the Accessibility permission, so injected input is \
+                 discarded without an error; grant it under System Settings > Privacy & Security \
+                 > Accessibility, to whichever application launched cursio (a terminal grants it \
+                 on behalf of what it runs), then start cursio again"
                     .into(),
             ));
         }
@@ -397,6 +396,45 @@ impl Drop for Event {
     }
 }
 
+/// Whether macOS will let this process post events, asking the user if it has
+/// not been decided yet.
+///
+/// The prompting form rather than the silent one, because the failure it
+/// prevents is invisible: without Accessibility every `CGEventPost` is
+/// discarded and reports success, so a user who was never asked experiences it
+/// as "the mouse does not move" with nothing anywhere to search for. macOS
+/// shows the dialog once per application and remembers the answer, so this
+/// cannot turn into nagging.
+///
+/// The permission belongs to whatever macOS holds *responsible* for the
+/// process, which for a binary started from a shell is the terminal — the same
+/// attribution that decides Screen Recording. So the dialog may name Terminal
+/// rather than cursio, and granting it there is what actually works.
+fn accessibility_granted() -> bool {
+    // SAFETY: the dictionary is built from one borrowed CoreFoundation
+    // constant key and value with the standard retaining callbacks, and is
+    // released before returning. A null result falls back to the check that
+    // needs no dictionary at all.
+    unsafe {
+        let key = kAXTrustedCheckOptionPrompt;
+        let value = kCFBooleanTrue;
+        let options = CFDictionaryCreate(
+            std::ptr::null(),
+            &key,
+            &value,
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        );
+        if options.is_null() {
+            return AXIsProcessTrusted();
+        }
+        let trusted = AXIsProcessTrustedWithOptions(options);
+        CFRelease(options as *mut c_void);
+        trusted
+    }
+}
+
 /// Where the cursor is right now, according to the window server.
 ///
 /// A null event source is valid here and means "whatever the system state is",
@@ -508,12 +546,35 @@ extern "C" {
     fn CGEventPost(tap: u32, event: *mut c_void);
 }
 
+/// The callback tables `CFDictionaryCreate` takes by address. Opaque because
+/// nothing here reads them — only CoreFoundation does, and only through the
+/// pointer.
+#[repr(C)]
+struct CFDictionaryCallBacks {
+    _opaque: [u8; 0],
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
+    static kCFBooleanTrue: *const c_void;
+    static kCFTypeDictionaryKeyCallBacks: CFDictionaryCallBacks;
+    static kCFTypeDictionaryValueCallBacks: CFDictionaryCallBacks;
+
+    fn CFDictionaryCreate(
+        allocator: *const c_void,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        count: isize,
+        key_callbacks: *const CFDictionaryCallBacks,
+        value_callbacks: *const CFDictionaryCallBacks,
+    ) -> *const c_void;
     fn CFRelease(reference: *mut c_void);
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    static kAXTrustedCheckOptionPrompt: *const c_void;
+
     fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
 }

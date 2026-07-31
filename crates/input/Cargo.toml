@@ -43,3 +43,18 @@ windows-sys = { version = "0.61", features = [
 tracing-subscriber.workspace = true
 tokio.workspace = true
 futures-util = "0.3"
+
+# The Linux probes drive evdev and the Wayland InputCapture portal, so they
+# cannot compile anywhere else. Gating them behind a feature keeps
+# `cargo clippy -p cursio-input --all-targets` working on macOS and Windows,
+# where the library itself builds fine. Same arrangement as cursio-window.
+[features]
+linux-probes = []
+
+[[example]]
+name = "grab_cycle"
+required-features = ["linux-probes"]
+
+[[example]]
+name = "wayland_capture_smoke"
+required-features = ["linux-probes"]
