@@ -23,8 +23,17 @@
 
 use crate::AirPlayError;
 
+/// How far sound may fall behind the picture before the oldest is dropped.
+///
+/// Two frames' worth, so a hiccup in delivery is absorbed but a persistent
+/// surplus is not: lip-sync is lost well before this is audible as a gap, and
+/// the gap is a click while the lag would last the whole session.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const MAX_AUDIO_LAG_NS: u64 = 40_000_000;
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod backend {
+    use super::MAX_AUDIO_LAG_NS;
     use gstreamer as gst;
     use gstreamer::prelude::*;
     use gstreamer_app as gst_app;
@@ -54,11 +63,21 @@ mod backend {
                 ));
             }
 
-            let pipeline = gst::parse::launch(
+            // The queue is capped and leaky, and that is the whole point.
+            // Picture is rendered the moment it arrives, while sound has to
+            // pass through the output device's buffer — so audio is behind from
+            // the start, and any excess pushed into it stays there. Bounding
+            // the queue turns a permanent lag into a momentary one: the oldest
+            // sound is dropped instead of pushing everything after it further
+            // out of step with the screen.
+            let pipeline = gst::parse::launch(&format!(
                 "appsrc name=airplay-audio is-live=true format=time ! \
                  avdec_aac ! audioconvert ! audioresample ! \
-                 volume name=airplay-volume ! autoaudiosink sync=false",
-            )
+                 volume name=airplay-volume ! \
+                 queue max-size-buffers=0 max-size-bytes=0 \
+                 max-size-time={MAX_AUDIO_LAG_NS} leaky=downstream ! \
+                 autoaudiosink sync=false"
+            ))
             .map_err(|error| AirPlayError::Video(error.to_string()))?
             .downcast::<gst::Pipeline>()
             .map_err(|_| AirPlayError::Video("GStreamer did not create a pipeline".into()))?;
