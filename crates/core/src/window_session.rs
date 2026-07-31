@@ -486,12 +486,20 @@ impl crate::module::ModuleFactory for WindowFactory {
         ModuleId::WINDOW
     }
 
+    /// Advertised by any machine that *could* show a window, not only by one
+    /// that wants to send one.
+    ///
+    /// Negotiation is symmetric: a module runs only when both sides advertise
+    /// it. Gating this on `--share-window` therefore made the flag mean two
+    /// unrelated things — "offer my window" and "be willing to see yours" — and
+    /// a viewer that had not thought to pass it got no window, no prompt, and
+    /// no error, because nothing downstream ever ran. Receiving is passive and
+    /// costs an idle engine; offering stays the deliberate act.
     fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
         if self.enabled && !SUPPORTED {
             tracing::warn!("window transfer isn't supported on this platform; not advertising it");
         }
-        (self.enabled && SUPPORTED)
-            .then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::WINDOW, VERSION))
+        SUPPORTED.then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::WINDOW, VERSION))
     }
 
     #[allow(unused_variables)]
@@ -572,9 +580,11 @@ impl crate::module::ModuleFactory for WindowFactory {
             // Sharing starts on its own here. There is no drag detector on
             // macOS, so waiting for one would mean `--share-window` did nothing
             // at all; an empty title shares the screen, a title picks a window.
-            match engine.share_window() {
-                Ok(id) => tracing::info!(id, "window transfer started"),
-                Err(e) => tracing::error!(error = %e, "could not start window transfer"),
+            if self.enabled {
+                match engine.share_window() {
+                    Ok(id) => tracing::info!(id, "window transfer started"),
+                    Err(e) => tracing::error!(error = %e, "could not start window transfer"),
+                }
             }
             Ok(Box::new(engine))
         }
