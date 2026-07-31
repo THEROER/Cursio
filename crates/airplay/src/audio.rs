@@ -95,6 +95,13 @@ pub(crate) struct AudioPacket {
     pub sequence: u16,
     pub timestamp: u32,
     pub payload_bytes: usize,
+    /// The first bytes of the payload, hex-encoded.
+    ///
+    /// This is the one thing a log can say that settles what the payload
+    /// actually is: AAC-ELD framing has recognisable leading bits, while
+    /// ciphertext has none — so a glance decides whether the decode stage needs
+    /// a key first, without a packet capture or a guess.
+    pub prefix: String,
 }
 
 impl AudioPacket {
@@ -102,12 +109,18 @@ impl AudioPacket {
         if datagram.len() <= RTP_HEADER_BYTES || datagram.len() > MAX_AUDIO_DATAGRAM {
             return None;
         }
+        let payload = &datagram[RTP_HEADER_BYTES..];
         Some(Self {
             // The top bit is the marker flag, not part of the payload type.
             payload_type: datagram[1] & 0x7f,
             sequence: u16::from_be_bytes([datagram[2], datagram[3]]),
             timestamp: u32::from_be_bytes([datagram[4], datagram[5], datagram[6], datagram[7]]),
-            payload_bytes: datagram.len() - RTP_HEADER_BYTES,
+            payload_bytes: payload.len(),
+            prefix: payload
+                .iter()
+                .take(16)
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
         })
     }
 }
@@ -145,6 +158,7 @@ pub(crate) async fn observe(socket: UdpSocket, request: AudioStreamRequest) {
                         sequence = packet.sequence,
                         timestamp = packet.timestamp,
                         payload_bytes = packet.payload_bytes,
+                        prefix = %packet.prefix,
                         setup = %request.describe(),
                         "AirPlay audio packet"
                     );
@@ -184,6 +198,16 @@ mod tests {
         assert_eq!(packet.sequence, 7);
         assert_eq!(packet.timestamp, 1234);
         assert_eq!(packet.payload_bytes, 4);
+        assert_eq!(packet.prefix, "01020304");
+    }
+
+    /// Long payloads are summarised, not dumped: the point is to identify the
+    /// format, and a log line per 10 ms of sound must stay readable.
+    #[test]
+    fn only_the_start_of_a_payload_is_logged() {
+        let packet = AudioPacket::parse(&rtp(96, 1, 0, &[0xab; 400])).unwrap();
+        assert_eq!(packet.payload_bytes, 400);
+        assert_eq!(packet.prefix.len(), 32);
     }
 
     /// The marker bit rides in the same byte as the payload type and must not
