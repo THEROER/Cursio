@@ -37,7 +37,7 @@ pub(super) fn check_available(codec: VideoCodec) -> Result<(), AirPlayError> {
 /// because a title could not be set would be the worse trade.
 #[cfg(target_os = "windows")]
 fn adopt_window(pipeline: &gst::Pipeline) -> Option<super::windows_window::MirrorWindow> {
-    use gstreamer_video::prelude::VideoOverlayExt;
+    use gstreamer_video::prelude::VideoOverlayExtManual;
 
     let sink = pipeline.by_name("airplay-sink")?;
     let overlay = sink.dynamic_cast::<gstreamer_video::VideoOverlay>().ok()?;
