@@ -9,7 +9,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 
-use crate::audio::{self, AudioStreamRequest};
+use crate::audio::{self, AudioDecryptor, AudioStreamRequest};
 use crate::crypto::{CryptoSession, MirrorDecryptor};
 use crate::mirror::{AvcConfig, MirrorPacket, MirrorPacketDecoder, PayloadType};
 use crate::rtsp::{Request, Response};
@@ -33,6 +33,8 @@ pub(crate) struct MediaSession {
     timing_task: Option<JoinHandle<()>>,
     mirror_task: Option<JoinHandle<()>>,
     audio_task: Option<JoinHandle<()>>,
+    /// Kept from the key exchange: audio needs it for every packet.
+    iv: Option<[u8; 16]>,
     screen_enabled: bool,
     /// Present when the mesh should be able to watch along.
     tap: Option<crate::MirrorTap>,
@@ -45,6 +47,7 @@ impl MediaSession {
             timing_task: None,
             mirror_task: None,
             audio_task: None,
+            iv: None,
             screen_enabled,
             tap,
         }
@@ -130,6 +133,7 @@ impl MediaSession {
 
         if let Some(keys) = setup.keys {
             self.encrypted_key = Some(keys.encrypted_key);
+            self.iv = Some(keys.iv);
             let timing_port = self
                 .start_timing(
                     context.local_addr.ip(),
@@ -181,7 +185,21 @@ impl MediaSession {
         }
 
         if let Some(request) = setup.audio {
-            let ports = self.start_audio(context.local_addr.ip(), request).await?;
+            // Unwrapped here because the FairPlay session belongs to this
+            // control connection; the receiving task only needs the result.
+            let decryptor = match (self.encrypted_key.as_deref(), self.iv) {
+                (Some(encrypted_key), Some(iv)) => match crypto.unwrap_media_key(encrypted_key) {
+                    Ok(key) => Some(AudioDecryptor::new(key, iv)),
+                    Err(error) => {
+                        tracing::warn!(%error, "AirPlay audio will arrive encrypted");
+                        None
+                    }
+                },
+                _ => None,
+            };
+            let ports = self
+                .start_audio(context.local_addr.ip(), request, decryptor)
+                .await?;
             // A `SETUP` may carry video and audio together, so this appends to
             // whatever the mirror stream already put there.
             match response.get_mut("streams").and_then(Value::as_array_mut) {
@@ -272,6 +290,7 @@ impl MediaSession {
         &mut self,
         local_ip: IpAddr,
         request: AudioStreamRequest,
+        decryptor: Option<AudioDecryptor>,
     ) -> Result<Value, AirPlayError> {
         if let Some(task) = self.audio_task.take() {
             task.abort();
@@ -279,8 +298,14 @@ impl MediaSession {
         let (data, control) = audio::bind_ports(local_ip).await?;
         let data_port = data.local_addr()?.port();
         let control_port = control.local_addr()?.port();
-        tracing::info!(data_port, control_port, setup = %request.describe(), "AirPlay audio stream configured");
-        self.audio_task = Some(tokio::spawn(audio::observe(data, request)));
+        tracing::info!(
+            data_port,
+            control_port,
+            encrypted = decryptor.is_some(),
+            setup = %request.describe(),
+            "AirPlay audio stream configured"
+        );
+        self.audio_task = Some(tokio::spawn(audio::observe(data, request, decryptor)));
         Ok(audio::setup_response(data_port, control_port))
     }
 
@@ -290,6 +315,7 @@ impl MediaSession {
         }
         self.stop_mirror();
         self.encrypted_key = None;
+        self.iv = None;
     }
 }
 
@@ -311,6 +337,8 @@ impl Drop for MediaSession {
 
 struct SetupKeys {
     encrypted_key: Vec<u8>,
+    /// The audio stream's CBC initialisation vector, reused for every packet.
+    iv: [u8; 16],
     remote_timing_port: u16,
 }
 
@@ -341,6 +369,7 @@ impl SetupRequest {
                     .ok_or("AirPlay SETUP has an invalid timingPort")?;
                 Some(SetupKeys {
                     encrypted_key: key.to_vec(),
+                    iv: iv.try_into().expect("length checked above"),
                     remote_timing_port: timing_port,
                 })
             }

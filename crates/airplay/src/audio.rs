@@ -6,21 +6,35 @@
 //! recognised and was answered `461 Unsupported Transport`, so iOS mirrored
 //! silently.
 //!
-//! ## What this stage does and does not do
+//! ## How the payload is protected
 //!
-//! It negotiates the stream, receives it, and reports exactly what the sender
-//! is sending. It does **not** yet decrypt or decode: the payload is AAC-ELD
-//! under a key whose derivation this crate has not established, and writing
-//! either from guesswork produces code that looks plausible, runs, and is
-//! silently wrong forever. The description logged here is what pins those down
-//! against a real device.
+//! AES-128-CBC with the key from `ekey` (unwrapped by FairPlay) and the IV from
+//! `eiv`, **reset for every packet**, covering only whole 16-byte blocks — the
+//! trailing bytes travel in the clear.
+//!
+//! That shape was read off a real iPhone rather than assumed. Silent frames are
+//! four bytes and arrive byte-identical packet after packet (`00683400`); a
+//! stream cipher would have made each one different, so the tail cannot be
+//! encrypted, and a payload shorter than one block is therefore plaintext
+//! throughout. Frames carrying sound are 140-155 bytes: eight encrypted blocks
+//! plus a short clear tail.
+//!
+//! Decoding the AAC-ELD underneath is the next stage; this one delivers the
+//! plaintext it operates on.
 
 use std::net::{IpAddr, SocketAddr};
 
+use aes::Aes128;
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
 use plist::{Dictionary, Value};
 use tokio::net::UdpSocket;
 
 use crate::AirPlayError;
+
+type Aes128CbcDec = cbc::Decryptor<Aes128>;
+
+/// AES block size; only whole blocks of a payload are encrypted.
+const AES_BLOCK_BYTES: usize = 16;
 
 /// AirPlay's stream type for the audio that accompanies mirroring.
 pub(crate) const AUDIO_STREAM_TYPE: u64 = 96;
@@ -125,6 +139,41 @@ impl AudioPacket {
     }
 }
 
+/// Undoes the per-packet AES-128-CBC that AirPlay audio arrives under.
+///
+/// Holds no state between packets on purpose: the IV is reset for every one, so
+/// a lost datagram costs that datagram and nothing after it. This is the
+/// opposite of the mirroring video stream, whose CTR keystream is continuous
+/// and where a single skipped packet ruins everything that follows.
+#[derive(Clone)]
+pub(crate) struct AudioDecryptor {
+    key: [u8; 16],
+    iv: [u8; 16],
+}
+
+impl AudioDecryptor {
+    pub(crate) fn new(key: [u8; 16], iv: [u8; 16]) -> Self {
+        Self { key, iv }
+    }
+
+    /// Decrypt in place, leaving the sub-block tail untouched.
+    pub(crate) fn decrypt(&self, payload: &mut [u8]) {
+        let whole = payload.len() - payload.len() % AES_BLOCK_BYTES;
+        if whole == 0 {
+            return;
+        }
+        let cipher = Aes128CbcDec::new(&self.key.into(), &self.iv.into());
+        // The length is a block multiple by construction, so the only way this
+        // fails is a programming error rather than anything on the wire.
+        if cipher
+            .decrypt_padded_mut::<NoPadding>(&mut payload[..whole])
+            .is_err()
+        {
+            tracing::warn!(bytes = whole, "AirPlay audio block decrypt refused");
+        }
+    }
+}
+
 /// Bind the pair of UDP sockets an audio stream needs.
 pub(crate) async fn bind_ports(local_ip: IpAddr) -> Result<(UdpSocket, UdpSocket), AirPlayError> {
     let data = UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?;
@@ -137,7 +186,11 @@ pub(crate) async fn bind_ports(local_ip: IpAddr) -> Result<(UdpSocket, UdpSocket
 /// Deliberately observational for now. Every field logged here is one that the
 /// decode stage needs to get right, and reading them off a real iPhone is the
 /// only way to know them.
-pub(crate) async fn observe(socket: UdpSocket, request: AudioStreamRequest) {
+pub(crate) async fn observe(
+    socket: UdpSocket,
+    request: AudioStreamRequest,
+    decryptor: Option<AudioDecryptor>,
+) {
     let mut datagram = [0_u8; MAX_AUDIO_DATAGRAM];
     let mut received = 0_u64;
     let mut malformed = 0_u64;
@@ -146,6 +199,11 @@ pub(crate) async fn observe(socket: UdpSocket, request: AudioStreamRequest) {
             tracing::debug!(received, "AirPlay audio stream ended");
             return;
         };
+        if let Some(decryptor) = decryptor.as_ref() {
+            if count > RTP_HEADER_BYTES {
+                decryptor.decrypt(&mut datagram[RTP_HEADER_BYTES..count]);
+            }
+        }
         match AudioPacket::parse(&datagram[..count]) {
             Some(packet) => {
                 received += 1;
@@ -223,6 +281,43 @@ mod tests {
         assert_eq!(AudioPacket::parse(&rtp(96, 1, 0, &[])), None);
         assert_eq!(AudioPacket::parse(&[0; 4]), None);
         assert_eq!(AudioPacket::parse(&vec![0; MAX_AUDIO_DATAGRAM + 1]), None);
+    }
+
+    /// The short packets a silent iPhone sends are below one AES block, so they
+    /// must come through untouched — that is what proved the tail is in the
+    /// clear in the first place.
+    #[test]
+    fn a_payload_shorter_than_a_block_is_left_alone() {
+        let decryptor = AudioDecryptor::new([0x11; 16], [0x22; 16]);
+        let mut payload = [0x00, 0x68, 0x34, 0x00];
+        decryptor.decrypt(&mut payload);
+        assert_eq!(payload, [0x00, 0x68, 0x34, 0x00]);
+    }
+
+    /// A real frame is whole blocks plus a short tail; only the blocks change.
+    #[test]
+    fn only_whole_blocks_are_decrypted() {
+        let decryptor = AudioDecryptor::new([0x11; 16], [0x22; 16]);
+        let mut payload = vec![0xab_u8; 141];
+        let tail = payload[128..].to_vec();
+        decryptor.decrypt(&mut payload);
+        assert_ne!(&payload[..128], &[0xab_u8; 128][..]);
+        assert_eq!(&payload[128..], &tail[..]);
+    }
+
+    /// Every packet starts from the same IV, so two identical frames decrypt
+    /// identically however far apart they arrived.
+    #[test]
+    fn packets_do_not_depend_on_the_ones_before_them() {
+        let decryptor = AudioDecryptor::new([0x5a; 16], [0x3c; 16]);
+        let mut first = vec![0x77_u8; 32];
+        let mut later = vec![0x77_u8; 32];
+        decryptor.decrypt(&mut first);
+        for _ in 0..10 {
+            decryptor.decrypt(&mut [0x01_u8; 48]);
+        }
+        decryptor.decrypt(&mut later);
+        assert_eq!(first, later);
     }
 
     #[test]

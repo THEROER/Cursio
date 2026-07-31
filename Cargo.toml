@@ -60,6 +60,8 @@ gstreamer-video = "0.25"
 # Crypto / pairing
 aes = "0.8"
 ctr = "0.9"
+# AirPlay audio packets are AES-128-CBC with the IV reset per packet.
+cbc = "0.1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 snow = "0.9"
 spake2 = "0.4"

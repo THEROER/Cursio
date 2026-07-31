@@ -7,6 +7,7 @@ edition.workspace = true
 cursio-transport.workspace = true
 
 aes.workspace = true
+cbc.workspace = true
 ctr.workspace = true
 ed25519-dalek.workspace = true
 mdns-sd.workspace = true
