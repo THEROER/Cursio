@@ -39,6 +39,13 @@ pub enum AirPlayError {
     Config(#[from] ConfigError),
     #[error("video pipeline error: {0}")]
     Video(String),
+    /// The user closed the window the mirrored screen was appearing in.
+    ///
+    /// Separate from [`AirPlayError::Video`] because it is not a fault: it is
+    /// the user saying "stop showing me this", and the session ends rather than
+    /// the packet being skipped.
+    #[error("the AirPlay screen window was closed")]
+    ScreenClosed,
     #[error("AirPlay cryptography error: {0}")]
     Crypto(String),
 }

@@ -183,10 +183,17 @@ where
     let mut read_buffer = [0_u8; 8192];
     loop {
         let count = if media.is_active() {
-            match tokio::time::timeout(ACTIVE_SESSION_IDLE_TIMEOUT, stream.read(&mut read_buffer))
-                .await
-            {
-                Ok(count) => count?,
+            // Dropping this connection is how the phone is told to stop: there
+            // is no AirPlay message meaning "the viewer closed the window".
+            let read = tokio::time::timeout(ACTIVE_SESSION_IDLE_TIMEOUT, async {
+                tokio::select! {
+                    read = stream.read(&mut read_buffer) => Some(read),
+                    () = media.screen_closed() => None,
+                }
+            });
+            match read.await {
+                Ok(Some(count)) => count?,
+                Ok(None) => return Ok(()),
                 Err(_) => {
                     tracing::warn!("AirPlay sender went silent; ending the media session");
                     return Ok(());

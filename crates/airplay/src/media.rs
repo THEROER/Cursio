@@ -2,11 +2,13 @@
 
 use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plist::{Dictionary, Value};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::audio::{self, AudioDecryptor, AudioStreamRequest};
@@ -38,6 +40,14 @@ pub(crate) struct MediaSession {
     screen_enabled: bool,
     /// Present when the mesh should be able to watch along.
     tap: Option<crate::MirrorTap>,
+    /// Fired when the user closes the window the screen was appearing in.
+    ///
+    /// Closing it means "stop sending me this", and the only way to tell an
+    /// iPhone that is to end the control connection — there is no AirPlay
+    /// message for "the viewer went away". So the mirror task raises this and
+    /// the connection loop drops the socket, which takes the phone out of
+    /// Screen Mirroring instead of leaving it broadcasting to nothing.
+    screen_closed: Arc<Notify>,
 }
 
 impl MediaSession {
@@ -50,7 +60,13 @@ impl MediaSession {
             iv: None,
             screen_enabled,
             tap,
+            screen_closed: Arc::new(Notify::new()),
         }
+    }
+
+    /// Resolves when the screen window is closed and the session should end.
+    pub(crate) async fn screen_closed(&self) {
+        self.screen_closed.notified().await;
     }
 
     pub(crate) async fn handle_request(
@@ -247,9 +263,15 @@ impl MediaSession {
         let local_port = listener.local_addr()?.port();
         let sink = hardware_video_sink()?;
         let tap = self.tap.clone();
+        let closed = self.screen_closed.clone();
         self.mirror_task = Some(tokio::spawn(async move {
-            if let Err(error) = serve_mirror(listener, peer_ip, decryptor, sink, tap).await {
-                tracing::warn!(%error, "AirPlay mirroring stream ended");
+            match serve_mirror(listener, peer_ip, decryptor, sink, tap).await {
+                Ok(()) => {}
+                Err(AirPlayError::ScreenClosed) => {
+                    tracing::info!("AirPlay screen window closed; ending the session");
+                    closed.notify_waiters();
+                }
+                Err(error) => tracing::warn!(%error, "AirPlay mirroring stream ended"),
             }
         }));
         Ok(local_port)
@@ -580,6 +602,11 @@ impl MirrorProcessor {
             // the next IDR, so skipping keeps the session alive instead of
             // freezing the picture until the user reconnects.
             if let Err(error) = self.process(&packet) {
+                // Not a fault to skip past: there is nothing left to show it
+                // on, and the caller ends the session so the sender stops.
+                if matches!(error, AirPlayError::ScreenClosed) {
+                    return Err(error);
+                }
                 self.skipped += 1;
                 tracing::warn!(
                     %error,
