@@ -40,6 +40,9 @@ pub(crate) struct MediaSession {
     screen_enabled: bool,
     /// Present when the mesh should be able to watch along.
     tap: Option<crate::MirrorTap>,
+    /// The sender's volume, in AirPlay's decibel scale, shared with the task
+    /// that plays the sound.
+    volume: tokio::sync::watch::Sender<f32>,
     /// Fired when the user closes the window the screen was appearing in.
     ///
     /// Closing it means "stop sending me this", and the only way to tell an
@@ -61,6 +64,7 @@ impl MediaSession {
             screen_enabled,
             tap,
             screen_closed: Arc::new(Notify::new()),
+            volume: tokio::sync::watch::Sender::new(0.0),
         }
     }
 
@@ -104,11 +108,25 @@ impl MediaSession {
                 .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
                 .any(|line| line == b"volume");
             let response = if asks_for_volume {
-                Response::new(200, "OK").with_body("text/parameters", b"volume: 0.0\r\n".to_vec())
+                // Reporting what the sender last set, not a constant: an iPhone
+                // reads this back to draw its own slider, and a receiver that
+                // always answers 0.0 makes the slider jump back every time.
+                Response::new(200, "OK").with_body(
+                    "text/parameters",
+                    format!("volume: {:.6}\r\n", *self.volume.borrow()).into_bytes(),
+                )
             } else {
                 Response::new(200, "OK")
             };
             return Ok(Some(response));
+        }
+
+        if request.method.eq_ignore_ascii_case("SET_PARAMETER") && self.encrypted_key.is_some() {
+            if let Some(volume) = parse_volume(&request.body) {
+                tracing::debug!(volume, "AirPlay volume changed");
+                let _ = self.volume.send(volume);
+            }
+            return Ok(Some(Response::new(200, "OK")));
         }
 
         let session_method = matches!(
@@ -341,7 +359,12 @@ impl MediaSession {
             setup = %request.describe(),
             "AirPlay audio stream configured"
         );
-        self.audio_task = Some(tokio::spawn(audio::observe(data, request, decryptor)));
+        self.audio_task = Some(tokio::spawn(audio::observe(
+            data,
+            request,
+            decryptor,
+            self.volume.subscribe(),
+        )));
         Ok(audio::setup_response(data_port, control_port))
     }
 
@@ -354,6 +377,18 @@ impl MediaSession {
         self.encrypted_key = None;
         self.iv = None;
     }
+}
+
+/// Read `volume: <decibels>` out of a `SET_PARAMETER` body.
+///
+/// AirPlay states volume in decibels: 0 is full, negative is quieter, and
+/// -144 means muted.
+fn parse_volume(body: &[u8]) -> Option<f32> {
+    std::str::from_utf8(body)
+        .ok()?
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("volume:"))
+        .and_then(|value| value.trim().parse::<f32>().ok())
 }
 
 /// The stream types a `TEARDOWN` names, or `None` when it names none and
@@ -608,12 +643,17 @@ impl MirrorProcessor {
                     return Err(error);
                 }
                 self.skipped += 1;
-                tracing::warn!(
-                    %error,
-                    payload_type = ?packet.payload_type,
-                    skipped = self.skipped,
-                    "skipped an AirPlay mirror packet"
-                );
+                // One line per skipped frame is one line per 16 ms once
+                // something goes persistently wrong, which buries whatever
+                // else the log was about to say.
+                if self.skipped.is_power_of_two() {
+                    tracing::warn!(
+                        %error,
+                        payload_type = ?packet.payload_type,
+                        skipped = self.skipped,
+                        "skipped an AirPlay mirror packet"
+                    );
+                }
             }
         }
         Ok(())
@@ -913,7 +953,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"volume: 0.0\r\n");
+        assert_eq!(response.body, b"volume: 0.000000\r\n");
         assert_eq!(
             response
                 .headers

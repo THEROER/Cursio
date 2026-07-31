@@ -223,6 +223,7 @@ pub(crate) async fn observe(
     socket: UdpSocket,
     request: AudioStreamRequest,
     decryptor: Option<AudioDecryptor>,
+    mut volume: tokio::sync::watch::Receiver<f32>,
 ) {
     // Playback needs the stream described up front. An iPhone leaves `ch` out,
     // and mirroring is always stereo at 44100, so the gaps are filled with what
@@ -251,9 +252,22 @@ pub(crate) async fn observe(
     let mut duplicates = 0_u64;
     let mut malformed = 0_u64;
     loop {
-        let Ok(count) = socket.recv(&mut datagram).await else {
-            tracing::debug!(received, "AirPlay audio stream ended");
-            return;
+        // The volume slider moves while sound is playing, so it is watched
+        // alongside the stream rather than read once at setup.
+        let count = tokio::select! {
+            datagram = socket.recv(&mut datagram) => match datagram {
+                Ok(count) => count,
+                Err(_) => {
+                    tracing::debug!(received, "AirPlay audio stream ended");
+                    return;
+                }
+            },
+            Ok(()) = volume.changed() => {
+                if let Some(playback) = playback.as_ref() {
+                    playback.set_volume(*volume.borrow_and_update());
+                }
+                continue;
+            }
         };
         if let Some(decryptor) = decryptor.as_ref() {
             if count > RTP_HEADER_BYTES {
