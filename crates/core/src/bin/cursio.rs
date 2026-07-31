@@ -163,6 +163,15 @@ enum Command {
         /// Target AirPlay output frame rate.
         #[arg(long, default_value_t = 60)]
         fps: u16,
+        /// How a peer's modifier keys land on this machine (macOS only).
+        ///
+        /// A Mac's shortcuts live on Command, which a PC keyboard does not
+        /// have, so `pc` — the default — makes the peer's Control act as
+        /// Command and its Windows key act as Control. Use `mac` when the peer
+        /// types on an Apple keyboard, where the keys already sit where macOS
+        /// expects them.
+        #[arg(long, value_enum, default_value_t = ModifierStyleArg::Pc)]
+        mac_modifiers: ModifierStyleArg,
     },
     /// List peers discovered on the LAN, then exit.
     Peers {
@@ -211,6 +220,26 @@ impl From<AirPlayResolutionArg> for Resolution {
         }
     }
 }
+
+/// Which keyboard the peer is typing on, as far as modifiers are concerned. A
+/// clap-parseable mirror of `cursio_input::ModifierStyle`, declared on every
+/// platform so `--help` reads the same everywhere and only consulted where
+/// there is a Mac to inject into.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ModifierStyleArg {
+    /// The peer types on a PC keyboard: its Control becomes Command.
+    Pc,
+    /// The peer types on an Apple keyboard: modifiers keep their names.
+    Mac,
+}
+
+/// How this machine should map a peer's modifiers, decided once at startup.
+///
+/// Not threaded through the session layers because it is not a property of any
+/// session: there is one keyboard policy per machine, settled before the first
+/// peer connects, exactly like the capture backend. Passing it down would add a
+/// tenth argument to a call chain that was deliberately cut back to nine.
+static MODIFIER_STYLE: std::sync::OnceLock<ModifierStyleArg> = std::sync::OnceLock::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -271,7 +300,9 @@ async fn main() -> anyhow::Result<()> {
             airplay_interface,
             res,
             fps,
+            mac_modifiers,
         } => {
+            let _ = MODIFIER_STYLE.set(mac_modifiers);
             // Read before anything binds a port, so a mistyped password costs
             // nothing and the prompt is not buried under startup logging.
             let pairing = if pair {
@@ -1246,9 +1277,9 @@ async fn send_test_pattern<T: Transport + ?Sized>(transport: &mut T) -> anyhow::
 
 /// Create the platform input injector, or `None` if unavailable / unsupported.
 ///
-/// Linux uses a uinput virtual pointer; Windows uses `SendInput`. On any other
-/// platform there's no backend yet, so injection falls back to logging (see
-/// [`inject`]).
+/// Linux uses a uinput virtual pointer, Windows `SendInput`, macOS a `CGEvent`
+/// posted at the HID tap. On any other platform there's no backend yet, so
+/// injection falls back to logging (see [`inject`]).
 fn make_injector() -> Option<Box<dyn cursio_input::InputInjector>> {
     #[cfg(target_os = "linux")]
     {
@@ -1278,7 +1309,25 @@ fn make_injector() -> Option<Box<dyn cursio_input::InputInjector>> {
             }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        use cursio_input::InputInjector as _;
+        let style = match MODIFIER_STYLE.get() {
+            Some(ModifierStyleArg::Mac) => cursio_input::ModifierStyle::Mac,
+            _ => cursio_input::ModifierStyle::Pc,
+        };
+        match cursio_input::MacInjector::new(style) {
+            Ok(inj) => {
+                tracing::info!(backend = inj.backend(), "input injector ready");
+                Some(Box::new(inj))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no input injector; peer input will be logged only");
+                None
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         tracing::warn!("no input backend on this platform yet; peer input will be logged only");
         None

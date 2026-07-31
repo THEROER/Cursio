@@ -15,6 +15,10 @@ use cursio_protocol::InputEvent;
 pub mod capture;
 #[cfg(target_os = "linux")]
 pub mod lin_cursor;
+#[cfg(target_os = "macos")]
+pub mod mac;
+#[cfg(target_os = "macos")]
+pub mod mac_keymap;
 #[cfg(target_os = "linux")]
 pub mod uinput;
 #[cfg(target_os = "windows")]
@@ -30,6 +34,10 @@ pub mod wl_capture;
 
 #[cfg(target_os = "linux")]
 pub use lin_cursor::LinuxCursor;
+#[cfg(target_os = "macos")]
+pub use mac::MacInjector;
+#[cfg(target_os = "macos")]
+pub use mac_keymap::ModifierStyle;
 #[cfg(target_os = "linux")]
 pub use uinput::UinputInjector;
 #[cfg(target_os = "windows")]
