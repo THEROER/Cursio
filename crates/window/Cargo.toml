@@ -62,9 +62,6 @@ ffmpeg-next = "8.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
-[target.'cfg(target_os = "macos")'.build-dependencies]
-cc.workspace = true
-
 # Windows window capture (Graphics Capture / Desktop Duplication by HWND) and
 # surrogate rendering land here as they're implemented. The behaviour of a
 # *hidden* window under Windows.Graphics.Capture is being settled first, by the
@@ -101,6 +98,12 @@ windows = { version = "0.61", features = [
     # `ICodecAPI` passes its encoder settings as VARIANTs.
     "Win32_System_Variant",
 ] }
+
+# Unconditional on purpose: a build script is compiled for the host whatever the
+# target is, so gating this behind `cfg(target_os = "macos")` left `build.rs`
+# referring to a crate that was not there when building on Windows or Linux.
+[build-dependencies]
+cc.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
