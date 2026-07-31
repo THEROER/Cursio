@@ -569,14 +569,12 @@ impl crate::module::ModuleFactory for WindowFactory {
                 cursio_window::MacWindowRenderer,
                 ctx.peer_name().to_string(),
             );
-            // There is no drag detector on macOS yet, so a title is the only
-            // way to say which window to share — and without one there is
-            // nothing to start.
-            if !self.title_hint.is_empty() {
-                match engine.share_window() {
-                    Ok(id) => tracing::info!(id, "window transfer started"),
-                    Err(e) => tracing::error!(error = %e, "could not start window transfer"),
-                }
+            // Sharing starts on its own here. There is no drag detector on
+            // macOS, so waiting for one would mean `--share-window` did nothing
+            // at all; an empty title shares the screen, a title picks a window.
+            match engine.share_window() {
+                Ok(id) => tracing::info!(id, "window transfer started"),
+                Err(e) => tracing::error!(error = %e, "could not start window transfer"),
             }
             Ok(Box::new(engine))
         }

@@ -46,8 +46,8 @@ const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Selects and captures a macOS window.
 pub struct MacWindowCapture {
-    /// Substring of the window title to capture. Empty takes the first
-    /// ordinary window the system lists.
+    /// Substring of the window title to capture. Empty shares the whole
+    /// screen, which is the case that needs no explaining.
     pub title_hint: String,
     /// Ceiling on frames per second; the system sends nothing while the window
     /// is still, so this costs nothing on a static window.
@@ -67,6 +67,11 @@ impl WindowCapture for MacWindowCapture {
     type Session = MacCaptureSession;
 
     fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError> {
+        let shared = if self.title_hint.is_empty() {
+            "Mac screen".to_string()
+        } else {
+            self.title_hint.clone()
+        };
         let mut helper = spawn_helper(&self.title_hint, self.fps)?;
         let mut stdout = helper
             .stdout
@@ -94,7 +99,7 @@ impl WindowCapture for MacWindowCapture {
         Ok(MacCaptureSession {
             meta: WindowMeta {
                 id,
-                title: format!("macOS window {id}"),
+                title: format!("Cursio ({shared})"),
                 width,
                 height,
             },

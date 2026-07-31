@@ -108,18 +108,17 @@ static void put_be32(uint8_t *out, uint32_t value) {
 
 @end
 
-/// Pick the window to capture: the first whose title contains `needle`, or the
-/// frontmost ordinary window when `needle` is empty.
+/// Pick the window whose title contains `needle`.
+///
+/// Only ever called with a non-empty needle: sharing without naming a window
+/// means the whole screen, because "the first window the system happens to
+/// list" is not something a user can predict or want.
 static SCWindow *choose_window(SCShareableContent *content, NSString *needle) {
     for (SCWindow *window in content.windows) {
         if (window.title.length == 0 || window.frame.size.width < 2) {
             continue;
         }
-        if (needle.length == 0) {
-            return window;
-        }
-        if ([window.title rangeOfString:needle
-                                options:NSCaseInsensitiveSearch]
+        if ([window.title rangeOfString:needle options:NSCaseInsensitiveSearch]
                 .location != NSNotFound) {
             return window;
         }
@@ -148,21 +147,43 @@ int main(int argc, const char *argv[]) {
                           "Security\n");
                   exit(2);
               }
-              SCWindow *window = choose_window(content, needle);
-              if (window == nil) {
-                  fprintf(stderr, "cursio: no window matched \"%s\"\n",
-                          needle.UTF8String);
-                  exit(3);
+              SCContentFilter *filter = nil;
+              size_t width = 0;
+              size_t height = 0;
+              if (needle.length == 0) {
+                  // No window named: share the screen. This is the simple case
+                  // and deserves to be the default — asking someone to name a
+                  // window before they can show anything is a poor first step.
+                  SCDisplay *display = content.displays.firstObject;
+                  if (display == nil) {
+                      fprintf(stderr, "cursio: no display to capture\n");
+                      exit(3);
+                  }
+                  fprintf(stderr, "cursio: capturing the whole screen %zux%zu\n",
+                          (size_t)display.width, (size_t)display.height);
+                  filter = [[SCContentFilter alloc] initWithDisplay:display
+                                                   excludingWindows:@[]];
+                  width = (size_t)display.width;
+                  height = (size_t)display.height;
+              } else {
+                  SCWindow *window = choose_window(content, needle);
+                  if (window == nil) {
+                      fprintf(stderr, "cursio: no window matched \"%s\"\n",
+                              needle.UTF8String);
+                      exit(3);
+                  }
+                  fprintf(stderr, "cursio: capturing \"%s\" %.0fx%.0f\n",
+                          window.title.UTF8String, window.frame.size.width,
+                          window.frame.size.height);
+                  filter = [[SCContentFilter alloc]
+                      initWithDesktopIndependentWindow:window];
+                  width = (size_t)window.frame.size.width;
+                  height = (size_t)window.frame.size.height;
               }
-              fprintf(stderr, "cursio: capturing \"%s\" %.0fx%.0f\n",
-                      window.title.UTF8String, window.frame.size.width,
-                      window.frame.size.height);
 
-              SCContentFilter *filter =
-                  [[SCContentFilter alloc] initWithDesktopIndependentWindow:window];
               SCStreamConfiguration *configuration = [SCStreamConfiguration new];
-              configuration.width = (size_t)window.frame.size.width;
-              configuration.height = (size_t)window.frame.size.height;
+              configuration.width = width;
+              configuration.height = height;
               configuration.pixelFormat = kCVPixelFormatType_32BGRA;
               configuration.showsCursor = NO;
               // Frames arrive only when something changed, so this is a ceiling
