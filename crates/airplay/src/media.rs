@@ -260,15 +260,26 @@ impl MediaSession {
         self.encrypted_key.is_some()
     }
 
-    /// A `TEARDOWN` carrying a `streams` array ends that stream only; iOS
+    /// A `TEARDOWN` carrying a `streams` array ends **those streams only**; iOS
     /// reuses the same control session for the next `SETUP`. Dropping the
     /// negotiated key there would answer that `SETUP` with 455 and leave
     /// mirroring unable to restart without a full reconnect.
+    ///
+    /// Which streams matters as much as how many. Screen and sound are torn
+    /// down independently — locking the phone ends one and leaves the other —
+    /// and closing both when asked for one loses the picture for good, because
+    /// the sender never asked for it back.
     fn teardown(&mut self, body: &[u8]) {
-        if teardown_targets_streams(body) {
-            self.stop_mirror();
-        } else {
-            self.stop();
+        match teardown_stream_types(body) {
+            Some(types) => {
+                if types.contains(&MIRROR_STREAM_TYPE) {
+                    self.stop_mirror();
+                }
+                if types.contains(&audio::AUDIO_STREAM_TYPE) {
+                    self.stop_audio();
+                }
+            }
+            None => self.stop(),
         }
     }
 
@@ -276,6 +287,9 @@ impl MediaSession {
         if let Some(task) = self.mirror_task.take() {
             task.abort();
         }
+    }
+
+    fn stop_audio(&mut self) {
         if let Some(task) = self.audio_task.take() {
             task.abort();
         }
@@ -314,19 +328,28 @@ impl MediaSession {
             task.abort();
         }
         self.stop_mirror();
+        self.stop_audio();
         self.encrypted_key = None;
         self.iv = None;
     }
 }
 
-fn teardown_targets_streams(body: &[u8]) -> bool {
-    Value::from_reader(Cursor::new(body))
-        .ok()
-        .as_ref()
-        .and_then(Value::as_dictionary)
-        .and_then(|root| root.get("streams"))
-        .and_then(Value::as_array)
-        .is_some_and(|streams| !streams.is_empty())
+/// The stream types a `TEARDOWN` names, or `None` when it names none and
+/// therefore ends the session.
+fn teardown_stream_types(body: &[u8]) -> Option<Vec<u64>> {
+    let value = Value::from_reader(Cursor::new(body)).ok()?;
+    let streams = value.as_dictionary()?.get("streams")?.as_array()?;
+    if streams.is_empty() {
+        return None;
+    }
+    Some(
+        streams
+            .iter()
+            .filter_map(Value::as_dictionary)
+            .filter_map(|stream| stream.get("type"))
+            .filter_map(plist_u64_bits)
+            .collect(),
+    )
 }
 
 impl Drop for MediaSession {
@@ -784,6 +807,45 @@ mod tests {
             .unwrap();
         assert_eq!(response.status, 200);
         assert!(media.is_active());
+    }
+
+    /// Locking the phone tears down one stream and leaves the other running.
+    /// Closing both would lose the picture permanently, because the sender only
+    /// re-creates what it asked to close.
+    #[tokio::test]
+    async fn tearing_down_audio_leaves_the_mirror_alone() {
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), crate::audio::AUDIO_STREAM_TYPE.into());
+        let mut root = Dictionary::new();
+        root.insert(
+            "streams".into(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        let body = binary_plist(Value::Dictionary(root));
+
+        let types = teardown_stream_types(&body).unwrap();
+        assert!(types.contains(&crate::audio::AUDIO_STREAM_TYPE));
+        assert!(!types.contains(&MIRROR_STREAM_TYPE));
+    }
+
+    #[test]
+    fn a_teardown_naming_the_mirror_names_only_it() {
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), MIRROR_STREAM_TYPE.into());
+        let mut root = Dictionary::new();
+        root.insert(
+            "streams".into(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        let types = teardown_stream_types(&binary_plist(Value::Dictionary(root))).unwrap();
+        assert_eq!(types, vec![MIRROR_STREAM_TYPE]);
+    }
+
+    #[test]
+    fn a_teardown_naming_nothing_ends_the_session() {
+        assert_eq!(teardown_stream_types(&[]), None);
+        let empty = binary_plist(Value::Dictionary(Dictionary::new()));
+        assert_eq!(teardown_stream_types(&empty), None);
     }
 
     #[tokio::test]
