@@ -4,41 +4,21 @@ fn main() {
     }
 }
 
-/// Compile the ScreenCaptureKit helper and leave it in `OUT_DIR`, where the
-/// crate embeds it. Same arrangement as `cursio-airplay`'s presentation helper:
-/// the binary ships inside the Rust one, so there is nothing to install
-/// alongside it.
+/// Compile the ScreenCaptureKit capture **into** the binary.
+///
+/// Not a spawned helper: macOS grants Screen Recording to the responsible
+/// application, and a separate executable unpacked to a temporary path is not
+/// covered by the approval the user gave their terminal. Linked in, the request
+/// belongs to the process the user actually launched.
 fn build_macos_window_capture() {
-    let output =
-        std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo always sets OUT_DIR"))
-            .join("cursio-window-capture");
-    let status = std::process::Command::new("xcrun")
-        .args([
-            "--sdk",
-            "macosx",
-            "clang",
-            "-fobjc-arc",
-            "-fblocks",
-            "-O2",
-            "native/macos/window_capture.m",
-            "-o",
-        ])
-        .arg(&output)
-        .args([
-            "-framework",
-            "AppKit",
-            "-framework",
-            "CoreMedia",
-            "-framework",
-            "CoreVideo",
-            "-framework",
-            "ScreenCaptureKit",
-        ])
-        .status()
-        .expect("failed to launch the macOS Objective-C compiler");
-    assert!(
-        status.success(),
-        "failed to compile the macOS window capture helper"
-    );
+    cc::Build::new()
+        .file("native/macos/window_capture.m")
+        .flag("-fobjc-arc")
+        .flag("-fblocks")
+        .compile("cursio_window_capture");
+
+    for framework in ["CoreMedia", "CoreVideo", "Foundation", "ScreenCaptureKit"] {
+        println!("cargo:rustc-link-lib=framework={framework}");
+    }
     println!("cargo:rerun-if-changed=native/macos/window_capture.m");
 }

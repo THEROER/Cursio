@@ -3,17 +3,22 @@
 //! The host side on macOS. Like Wayland, macOS does not let a process read
 //! another window's pixels on its own — the sanctioned route is
 //! ScreenCaptureKit, which is asynchronous Objective-C built on delegates and
-//! `CMSampleBuffer`s. Rather than bind that from Rust, a small helper does the
-//! capture and writes tightly packed BGRA frames to its stdout, the same
-//! arrangement `cursio-airplay` uses for presentation. See
-//! `native/macos/window_capture.m` for the wire format.
+//! `CMSampleBuffer`s. That part lives in `native/macos/window_capture.m` and is
+//! **compiled into this crate**, writing tightly packed BGRA frames into a pipe
+//! this module reads.
 //!
-//! ## Screen Recording permission
+//! ## Why not a helper process
 //!
-//! The first capture on a machine fails until the user grants Screen Recording
-//! to whatever launched Cursio, in System Settings. That is a TCC decision no
-//! amount of code can make, so the helper's diagnosis is passed through
-//! verbatim rather than flattened into "capture failed".
+//! It was one at first, and it could never work. macOS grants Screen Recording
+//! to the *responsible application*; a separate unsigned executable unpacked
+//! into a temporary directory is not covered by the approval the user gave
+//! their terminal, so every capture was refused with "the user declined" no
+//! matter how many times they approved. Linked in, the request belongs to the
+//! process the user actually launched.
+//!
+//! The first capture still needs Screen Recording granted, and macOS evaluates
+//! that when the *launching* application starts — so a terminal approved while
+//! already running has to be quit and reopened.
 //!
 //! ## Codecs
 //!
@@ -24,7 +29,7 @@
 //! next step and changes nothing above this file.
 
 use std::io::Read;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -36,7 +41,16 @@ use tokio::sync::mpsc;
 use crate::frame_pipeline::{pick_codec, FrameDiffer};
 use crate::{CaptureSession, WindowCapture, WindowError, CAPTURE_FRAME_QUEUE_CAPACITY};
 
-static CAPTURE_HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cursio-window-capture"));
+unsafe extern "C" {
+    /// Blocks until the capture is running or refused; takes ownership of the
+    /// descriptor on success. See `native/macos/window_capture.m`.
+    fn cursio_window_capture_start(needle: *const std::ffi::c_char, fps: i32, out_fd: i32) -> i32;
+    fn cursio_window_capture_stop();
+}
+
+const CAPTURE_OK: i32 = 0;
+const CAPTURE_DENIED: i32 = -1;
+const CAPTURE_NO_MATCH: i32 = -2;
 
 /// Bytes of frame header the helper writes: width, height, payload length.
 const FRAME_HEADER_BYTES: usize = 12;
@@ -72,17 +86,13 @@ impl WindowCapture for MacWindowCapture {
         } else {
             self.title_hint.clone()
         };
-        let mut helper = spawn_helper(&self.title_hint, self.fps)?;
-        let mut stdout = helper
-            .stdout
-            .take()
-            .ok_or_else(|| WindowError::Backend("capture helper has no output pipe".into()))?;
+        let mut frames_in = start_capture(&self.title_hint, self.fps)?;
 
-        // The first frame establishes the geometry, so the offer describes the
-        // window the peer is actually about to see rather than a guess.
-        let first = read_frame(&mut stdout).map_err(|error| {
-            let _ = helper.kill();
-            WindowError::Backend(format!("no frame from the macOS capture helper: {error}"))
+        // The first frame establishes the geometry, so the offer describes what
+        // the peer is actually about to see rather than a guess.
+        let first = read_frame(&mut frames_in).map_err(|error| {
+            unsafe { cursio_window_capture_stop() };
+            WindowError::Backend(format!("no frame from the macOS capture: {error}"))
         })?;
 
         let (width, height) = (first.width, first.height);
@@ -92,7 +102,7 @@ impl WindowCapture for MacWindowCapture {
         std::thread::Builder::new()
             .name(format!("cursio-mac-capture-{id}"))
             .spawn(move || {
-                pump(stdout, frames_tx, id, first, thread_ended);
+                pump(frames_in, frames_tx, id, first, thread_ended);
             })
             .map_err(|error| WindowError::Backend(format!("spawn capture thread: {error}")))?;
 
@@ -104,7 +114,6 @@ impl WindowCapture for MacWindowCapture {
                 height,
             },
             frames: frames_rx,
-            helper,
             ended,
             reported_input: false,
         })
@@ -118,50 +127,53 @@ struct CapturedFrame {
     pixels: Vec<u8>,
 }
 
-fn spawn_helper(title_hint: &str, fps: u32) -> Result<Child, WindowError> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+/// Start the linked capture and return the read end of its frame pipe.
+///
+/// The pipe rather than a channel because the Objective-C side writes from a
+/// dispatch queue that knows nothing about Rust: a descriptor is the one thing
+/// both halves already agree on.
+fn start_capture(title_hint: &str, fps: u32) -> Result<std::fs::File, WindowError> {
+    let needle = std::ffi::CString::new(title_hint)
+        .map_err(|_| WindowError::Backend("window title contains a NUL byte".into()))?;
+    let mut fds = [0_i32; 2];
+    // SAFETY: `fds` is a two-element array, which is what `pipe` writes into.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(WindowError::Backend(format!(
+            "cannot create a capture pipe: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
 
-    let path = std::env::temp_dir().join(format!("cursio-window-capture-{}", std::process::id()));
-    // `create_new` rather than truncate: refusing to reuse a path someone else
-    // created is what keeps this from executing a file we did not write.
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(&path)
-        .or_else(|_| {
-            let _ = std::fs::remove_file(&path);
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o700)
-                .open(&path)
-        })
-        .map_err(|error| WindowError::Backend(format!("prepare capture helper: {error}")))?;
-    file.write_all(CAPTURE_HELPER)
-        .and_then(|_| file.flush())
-        .map_err(|error| WindowError::Backend(format!("install capture helper: {error}")))?;
-    drop(file);
-
-    let child = Command::new(&path)
-        .arg(title_hint)
-        .arg(fps.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn();
-    let _ = std::fs::remove_file(&path);
-    child.map_err(|error| WindowError::Backend(format!("start capture helper: {error}")))
+    // SAFETY: `write_fd` is a fresh descriptor this call takes ownership of on
+    // success, and `needle` outlives the call.
+    let status = unsafe { cursio_window_capture_start(needle.as_ptr(), fps as i32, write_fd) };
+    if status != CAPTURE_OK {
+        // SAFETY: both descriptors are ours and still open on failure.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(WindowError::Backend(match status {
+            CAPTURE_DENIED => "screen recording is not permitted; grant it to the application \
+                 that launched Cursio in System Settings > Privacy & Security > Screen Recording, \
+                 then quit and reopen that application"
+                .to_string(),
+            CAPTURE_NO_MATCH => format!("no window matched \"{title_hint}\""),
+            other => format!("screen capture failed to start ({other})"),
+        }));
+    }
+    // SAFETY: `read_fd` is open, owned here, and not used anywhere else.
+    Ok(unsafe { std::fs::File::from_raw_fd(read_fd) })
 }
 
-fn read_exact(stdout: &mut ChildStdout, buffer: &mut [u8]) -> std::io::Result<()> {
-    stdout.read_exact(buffer)
+fn read_exact(frames: &mut std::fs::File, buffer: &mut [u8]) -> std::io::Result<()> {
+    frames.read_exact(buffer)
 }
 
-fn read_frame(stdout: &mut ChildStdout) -> std::io::Result<CapturedFrame> {
+fn read_frame(frames: &mut std::fs::File) -> std::io::Result<CapturedFrame> {
     let mut header = [0_u8; FRAME_HEADER_BYTES];
-    read_exact(stdout, &mut header)?;
+    read_exact(frames, &mut header)?;
     let width = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     let height = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
     let length = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
@@ -172,7 +184,7 @@ fn read_frame(stdout: &mut ChildStdout) -> std::io::Result<CapturedFrame> {
         ));
     }
     let mut pixels = vec![0_u8; length];
-    read_exact(stdout, &mut pixels)?;
+    read_exact(frames, &mut pixels)?;
     Ok(CapturedFrame {
         width,
         height,
@@ -182,7 +194,7 @@ fn read_frame(stdout: &mut ChildStdout) -> std::io::Result<CapturedFrame> {
 
 /// Read frames forever, diff them, and hand tiles to the session.
 fn pump(
-    mut stdout: ChildStdout,
+    mut frames_in: std::fs::File,
     frames: mpsc::Sender<WindowFrame>,
     id: WindowId,
     first: CapturedFrame,
@@ -201,7 +213,7 @@ fn pump(
         return;
     }
     loop {
-        let frame = match read_frame(&mut stdout) {
+        let frame = match read_frame(&mut frames_in) {
             Ok(frame) => frame,
             Err(error) => {
                 tracing::info!(%error, id, "macOS window capture ended");
@@ -275,7 +287,6 @@ impl PumpState {
 pub struct MacCaptureSession {
     meta: WindowMeta,
     frames: mpsc::Receiver<WindowFrame>,
-    helper: Child,
     ended: Arc<AtomicBool>,
     reported_input: bool,
 }
@@ -311,16 +322,16 @@ impl CaptureSession for MacCaptureSession {
     fn close(&mut self, reason: WindowCloseReason) {
         tracing::info!(id = self.meta.id, ?reason, "stopping macOS window capture");
         if !self.ended.load(Ordering::Relaxed) {
-            let _ = self.helper.kill();
+            // SAFETY: stopping a capture that is not running is a no-op.
+            unsafe { cursio_window_capture_stop() };
         }
-        let _ = self.helper.wait();
     }
 }
 
 impl Drop for MacCaptureSession {
     fn drop(&mut self) {
-        let _ = self.helper.kill();
-        let _ = self.helper.wait();
+        // SAFETY: stopping a capture that is not running is a no-op.
+        unsafe { cursio_window_capture_stop() };
     }
 }
 
@@ -366,6 +377,27 @@ impl crate::Surrogate for MacSurrogate {
 mod tests {
     use super::*;
 
+    /// Real capture against the running desktop, so the permission story can be
+    /// checked rather than assumed. Ignored by default: it needs a logged-in
+    /// session with Screen Recording granted, which CI does not have.
+    ///
+    ///     cargo test -p cursio-window -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn captures_the_screen_for_real() {
+        let mut capture = MacWindowCapture::default();
+        let mut session = capture.begin(1).expect("capture should start");
+        println!(
+            "offered {}x{} as {:?}",
+            session.meta().width,
+            session.meta().height,
+            session.meta().title
+        );
+        assert!(session.meta().width > 0);
+        assert!(session.meta().height > 0);
+        session.close(WindowCloseReason::HostClosed);
+    }
+
     fn header(width: u32, height: u32, length: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&width.to_be_bytes());
@@ -384,10 +416,5 @@ mod tests {
         let height = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let length = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
         assert_ne!(length, (width as usize) * (height as usize) * 4);
-    }
-
-    #[test]
-    fn the_helper_is_embedded_in_the_binary() {
-        assert!(!CAPTURE_HELPER.is_empty());
     }
 }

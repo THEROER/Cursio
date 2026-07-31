@@ -1,15 +1,21 @@
-// Captures one macOS window with ScreenCaptureKit and writes its pixels to
-// stdout, one frame at a time.
+// Captures a macOS window or the whole screen with ScreenCaptureKit and writes
+// the pixels to a file descriptor.
 //
-// Why a helper process rather than bindings: ScreenCaptureKit is an
-// asynchronous Objective-C API built on delegates, blocks and a run loop, and
-// the frames arrive as CMSampleBuffers that must be locked and copied on the
-// callback queue. Wrapping that in Rust would mean hand-written bindings for a
-// framework that already has a perfectly good C entry point — and this crate
-// already spawns an Objective-C helper for AirPlay presentation, so the shape
-// is the established one here rather than a new idea.
+// ## Why this is linked in rather than spawned
 //
-// Wire format, repeated per frame:
+// It began as a helper process, which does not work: macOS attributes Screen
+// Recording permission to the *responsible* application, and an unsigned binary
+// unpacked into a temporary directory is nobody's responsibility. The user
+// could approve their terminal as many times as they liked and the helper would
+// still be told the user declined, because the approval was never about it.
+// Compiled into the Rust binary, the request belongs to whatever launched
+// Cursio — the terminal the user already approved.
+//
+// No `NSApplication` either, for the same class of reason: this is a library
+// inside somebody else's process, and it must not take over the main thread.
+// `SCStream` delivers on a dispatch queue, which is all it needs.
+//
+// Wire format written to `out_fd`, repeated per frame:
 //
 //   width:  u32 big-endian
 //   height: u32 big-endian
@@ -17,24 +23,34 @@
 //   pixels: BGRA, tightly packed, no row padding
 //
 // Rows are repacked here because CVPixelBuffer rows are padded to a stride the
-// GPU likes, while the wire format Cursio uses has no padding. Doing it in the
-// helper keeps one copy out of the Rust side.
+// GPU likes, while Cursio's wire format has none. Doing it here keeps one copy
+// out of the Rust side.
 
-#import <AppKit/AppKit.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <Foundation/Foundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+/// Matches `CaptureError` on the Rust side.
+enum {
+    CURSIO_CAPTURE_OK = 0,
+    CURSIO_CAPTURE_DENIED = -1,
+    CURSIO_CAPTURE_NO_MATCH = -2,
+    CURSIO_CAPTURE_FAILED = -3,
+};
 
 static BOOL write_exact(int fd, const void *buffer, size_t length) {
     const uint8_t *cursor = buffer;
     while (length != 0) {
         ssize_t count = write(fd, cursor, length);
         if (count <= 0) {
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
             return NO;
         }
         cursor += count;
@@ -50,17 +66,18 @@ static void put_be32(uint8_t *out, uint32_t value) {
     out[3] = (uint8_t)value;
 }
 
-@interface CursioWindowCapture : NSObject <SCStreamOutput, SCStreamDelegate>
+@interface CursioCapture : NSObject <SCStreamOutput, SCStreamDelegate>
 @property(nonatomic, strong) SCStream *stream;
+@property(nonatomic, assign) int fd;
 @end
 
-@implementation CursioWindowCapture
+@implementation CursioCapture
 
 - (void)stream:(SCStream *)stream
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                    ofType:(SCStreamOutputType)type {
     (void)stream;
-    if (type != SCStreamOutputTypeScreen) {
+    if (type != SCStreamOutputTypeScreen || self.fd < 0) {
         return;
     }
     CVImageBufferRef image = CMSampleBufferGetImageBuffer(sampleBuffer);
@@ -82,18 +99,17 @@ static void put_be32(uint8_t *out, uint32_t value) {
         put_be32(header, (uint32_t)width);
         put_be32(header + 4, (uint32_t)height);
         put_be32(header + 8, (uint32_t)(row_bytes * height));
-        if (!write_exact(STDOUT_FILENO, header, sizeof(header))) {
-            CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
-            [NSApp terminate:nil];
-            return;
+        BOOL ok = write_exact(self.fd, header, sizeof(header));
+        for (size_t row = 0; ok && row < height; row++) {
+            ok = write_exact(self.fd, base + row * stride, row_bytes);
         }
-        for (size_t row = 0; row < height; row++) {
-            if (!write_exact(STDOUT_FILENO, base + row * stride, row_bytes)) {
-                CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
-                // The reader is gone; there is nothing left to capture for.
-                [NSApp terminate:nil];
-                return;
-            }
+        if (!ok) {
+            // The reader closed the pipe; there is nothing to capture for.
+            close(self.fd);
+            self.fd = -1;
+            [self.stream stopCaptureWithCompletionHandler:^(NSError *error) {
+              (void)error;
+            }];
         }
     }
     CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
@@ -101,18 +117,18 @@ static void put_be32(uint8_t *out, uint32_t value) {
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
     (void)stream;
-    fprintf(stderr, "cursio: capture stopped: %s\n",
-            error.localizedDescription.UTF8String);
-    [NSApp terminate:nil];
+    NSLog(@"cursio: screen capture stopped: %@", error.localizedDescription);
+    if (self.fd >= 0) {
+        close(self.fd);
+        self.fd = -1;
+    }
 }
 
 @end
 
-/// Pick the window whose title contains `needle`.
-///
-/// Only ever called with a non-empty needle: sharing without naming a window
-/// means the whole screen, because "the first window the system happens to
-/// list" is not something a user can predict or want.
+/// Pick the window whose title contains `needle`. Never called with an empty
+/// needle: sharing without naming a window means the whole screen, because
+/// "whichever window the system lists first" is not something a user can want.
 static SCWindow *choose_window(SCShareableContent *content, NSString *needle) {
     for (SCWindow *window in content.windows) {
         if (window.title.length == 0 || window.frame.size.width < 2) {
@@ -126,41 +142,43 @@ static SCWindow *choose_window(SCShareableContent *content, NSString *needle) {
     return nil;
 }
 
-int main(int argc, const char *argv[]) {
-    @autoreleasepool {
-        NSString *needle = argc > 1 ? @(argv[1]) : @"";
-        const int fps = argc > 2 ? atoi(argv[2]) : 30;
+/// Keeps the capture alive for the life of the process. One window is shared at
+/// a time, so one slot is enough; a second call replaces the first.
+static CursioCapture *g_capture = nil;
 
-        NSApplication *application = [NSApplication sharedApplication];
-        application.activationPolicy = NSApplicationActivationPolicyAccessory;
-        CursioWindowCapture *capture = [CursioWindowCapture new];
+/// Start capturing, writing frames to `out_fd` until the reader closes it.
+///
+/// Blocks until the stream is running or has failed, so the caller learns about
+/// a refusal here rather than by waiting forever for a frame that never comes.
+/// `out_fd` is owned by this function once it succeeds.
+int cursio_window_capture_start(const char *needle_utf8, int fps, int out_fd) {
+    @autoreleasepool {
+        NSString *needle = needle_utf8 != NULL ? @(needle_utf8) : @"";
+        __block int result = CURSIO_CAPTURE_FAILED;
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
 
         [SCShareableContent
             getShareableContentWithCompletionHandler:^(SCShareableContent *content,
                                                        NSError *error) {
               if (error != nil) {
-                  fprintf(stderr, "cursio: cannot list windows: %s\n",
-                          error.localizedDescription.UTF8String);
-                  fprintf(stderr,
-                          "cursio: grant Screen Recording to the app that "
-                          "launched this, in System Settings > Privacy & "
-                          "Security\n");
-                  exit(2);
+                  NSLog(@"cursio: cannot list windows: %@", error.localizedDescription);
+                  result = CURSIO_CAPTURE_DENIED;
+                  dispatch_semaphore_signal(done);
+                  return;
               }
+
               SCContentFilter *filter = nil;
               size_t width = 0;
               size_t height = 0;
               if (needle.length == 0) {
-                  // No window named: share the screen. This is the simple case
-                  // and deserves to be the default — asking someone to name a
-                  // window before they can show anything is a poor first step.
                   SCDisplay *display = content.displays.firstObject;
                   if (display == nil) {
-                      fprintf(stderr, "cursio: no display to capture\n");
-                      exit(3);
+                      result = CURSIO_CAPTURE_NO_MATCH;
+                      dispatch_semaphore_signal(done);
+                      return;
                   }
-                  fprintf(stderr, "cursio: capturing the whole screen %zux%zu\n",
-                          (size_t)display.width, (size_t)display.height);
+                  NSLog(@"cursio: capturing the whole screen %zux%zu",
+                        (size_t)display.width, (size_t)display.height);
                   filter = [[SCContentFilter alloc] initWithDisplay:display
                                                    excludingWindows:@[]];
                   width = (size_t)display.width;
@@ -168,13 +186,13 @@ int main(int argc, const char *argv[]) {
               } else {
                   SCWindow *window = choose_window(content, needle);
                   if (window == nil) {
-                      fprintf(stderr, "cursio: no window matched \"%s\"\n",
-                              needle.UTF8String);
-                      exit(3);
+                      NSLog(@"cursio: no window matched \"%@\"", needle);
+                      result = CURSIO_CAPTURE_NO_MATCH;
+                      dispatch_semaphore_signal(done);
+                      return;
                   }
-                  fprintf(stderr, "cursio: capturing \"%s\" %.0fx%.0f\n",
-                          window.title.UTF8String, window.frame.size.width,
-                          window.frame.size.height);
+                  NSLog(@"cursio: capturing \"%@\" %.0fx%.0f", window.title,
+                        window.frame.size.width, window.frame.size.height);
                   filter = [[SCContentFilter alloc]
                       initWithDesktopIndependentWindow:window];
                   width = (size_t)window.frame.size.width;
@@ -186,11 +204,13 @@ int main(int argc, const char *argv[]) {
               configuration.height = height;
               configuration.pixelFormat = kCVPixelFormatType_32BGRA;
               configuration.showsCursor = NO;
-              // Frames arrive only when something changed, so this is a ceiling
-              // rather than a rate: a still window costs nothing.
+              // A ceiling, not a rate: frames arrive only when something
+              // changed, so a still window costs nothing.
               configuration.minimumFrameInterval = CMTimeMake(1, fps);
               configuration.queueDepth = 3;
 
+              CursioCapture *capture = [CursioCapture new];
+              capture.fd = out_fd;
               capture.stream = [[SCStream alloc] initWithFilter:filter
                                                   configuration:configuration
                                                        delegate:capture];
@@ -201,20 +221,47 @@ int main(int argc, const char *argv[]) {
                                                   QOS_CLASS_USER_INTERACTIVE, 0)
                                         error:&addError];
               if (addError != nil) {
-                  fprintf(stderr, "cursio: cannot attach output: %s\n",
-                          addError.localizedDescription.UTF8String);
-                  exit(4);
+                  NSLog(@"cursio: cannot attach capture output: %@",
+                        addError.localizedDescription);
+                  result = CURSIO_CAPTURE_FAILED;
+                  dispatch_semaphore_signal(done);
+                  return;
               }
               [capture.stream startCaptureWithCompletionHandler:^(NSError *startError) {
                 if (startError != nil) {
-                    fprintf(stderr, "cursio: cannot start capture: %s\n",
-                            startError.localizedDescription.UTF8String);
-                    exit(5);
+                    NSLog(@"cursio: cannot start capture: %@",
+                          startError.localizedDescription);
+                    result = CURSIO_CAPTURE_DENIED;
+                } else {
+                    g_capture = capture;
+                    result = CURSIO_CAPTURE_OK;
                 }
+                dispatch_semaphore_signal(done);
               }];
             }];
 
-        [application run];
+        // Ten seconds covers the permission dialog appearing and being answered.
+        if (dispatch_semaphore_wait(
+                done, dispatch_time(DISPATCH_TIME_NOW, 10ll * NSEC_PER_SEC)) != 0) {
+            NSLog(@"cursio: screen capture did not start in time");
+            return CURSIO_CAPTURE_FAILED;
+        }
+        return result;
     }
-    return 0;
+}
+
+/// Stop the running capture, if any, and close its pipe.
+void cursio_window_capture_stop(void) {
+    CursioCapture *capture = g_capture;
+    g_capture = nil;
+    if (capture == nil) {
+        return;
+    }
+    [capture.stream stopCaptureWithCompletionHandler:^(NSError *error) {
+      (void)error;
+    }];
+    if (capture.fd >= 0) {
+        close(capture.fd);
+        capture.fd = -1;
+    }
 }

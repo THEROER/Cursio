@@ -133,7 +133,7 @@ Capture: evdev on X11-ish Linux, the `InputCapture` portal + libei on Wayland (p
 
 One window's pixels stream to a peer while the app keeps running on its host (RemoteApp/Xpra model, bidirectional and cross-OS). One engine serves both roles at once, since either machine may host a window while viewing another.
 
-Capture: `ScreenCast` portal → PipeWire on Linux, `Windows.Graphics.Capture` on Windows. Both hand a full BGRA frame to the shared `frame_pipeline.rs`, which diffs against the previous frame and routes the change to a lossless tile or the video encoder. Surrogate (viewer) windows: GTK4 on Linux, raw Win32 on Windows, both blitting into the shared `Framebuffer`.
+Capture: `ScreenCast` portal → PipeWire on Linux, `Windows.Graphics.Capture` on Windows, ScreenCaptureKit on macOS. The macOS half is Objective-C **compiled into the crate**, not a spawned helper: macOS grants Screen Recording to the responsible application, and a separate unsigned binary in a temp directory is covered by no approval the user can give — it is refused with "the user declined" however many times they approve. A Mac can host but not yet view; `MacWindowRenderer` says so rather than failing obscurely. Both hand a full BGRA frame to the shared `frame_pipeline.rs`, which diffs against the previous frame and routes the change to a lossless tile or the video encoder. Surrogate (viewer) windows: GTK4 on Linux, raw Win32 on Windows, both blitting into the shared `Framebuffer`.
 
 Video encoding exists because zstd on a *moving* window measured ~742 Mbit/s — past gigabit. H.264 via `ffmpeg-next` on Linux, Media Foundation on Windows. Decoders are stateful: one packet may yield zero frames or several, and "no output yet" is the ordinary case.
 
@@ -172,7 +172,7 @@ The AES-CTR keystream is continuous for the life of a mirror data connection. Ev
 
 `--airplay-screen` (alias `--airplay`) gates video; without it the control receiver still runs and mirror `SETUP` answers 501. `--no-airplay` disables the listener. A busy port 7000 (macOS' own receiver) logs a warning and leaves the mesh running.
 
-**Reaching the rest of the mesh** is `tap.rs` plus `core/src/airplay_window.rs`. The phone never becomes a peer — it has no identity, runs no modules, and is absent from the registry. Instead the receiving host offers its screen through the ordinary window-transfer path: AirPlay produces H.264 and `TileCodec::LossyVideo` already carries H.264, so access units go out untouched and the viewer decodes them with the surrogate it already has. The tap retains the last SPS/PPS and replays them to each new subscriber, because a machine that joins mid-stream would otherwise have nothing to configure a decoder with. `--share-airplay` (requires `--airplay-screen`) turns it on, and hosting needs a window backend, so a Mac can receive AirPlay but not yet share it onward.
+**Reaching the rest of the mesh** is `tap.rs` plus `core/src/airplay_window.rs`. The phone never becomes a peer — it has no identity, runs no modules, and is absent from the registry. Instead the receiving host offers its screen through the ordinary window-transfer path: AirPlay produces H.264 and `TileCodec::LossyVideo` already carries H.264, so access units go out untouched and the viewer decodes them with the surrogate it already has. The tap retains the last SPS/PPS and replays them to each new subscriber, because a machine that joins mid-stream would otherwise have nothing to configure a decoder with. `--share-airplay` (requires `--airplay-screen`) turns it on.
 
 ### Wire compatibility
 

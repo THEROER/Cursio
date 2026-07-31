@@ -55,6 +55,16 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
 # against the system libav* (7.1 here); no vendored FFmpeg build.
 ffmpeg-next = "8.1"
 
+# macOS window capture. ScreenCaptureKit is Objective-C, and it is compiled
+# into this crate rather than spawned as a helper: Screen Recording permission
+# belongs to the responsible application, which a temporary unpacked binary is
+# not. `libc` is only for the pipe the capture writes frames into.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc.workspace = true
+
 # Windows window capture (Graphics Capture / Desktop Duplication by HWND) and
 # surrogate rendering land here as they're implemented. The behaviour of a
 # *hidden* window under Windows.Graphics.Capture is being settled first, by the

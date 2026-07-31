@@ -1222,11 +1222,13 @@ name = "cursio-window"
 version = "0.1.0"
 dependencies = [
  "ashpd",
+ "cc",
  "cursio-protocol",
  "directories",
  "ffmpeg-next",
  "futures-util",
  "gtk4",
+ "libc",
  "pipewire",
  "serde",
  "serde_json",
