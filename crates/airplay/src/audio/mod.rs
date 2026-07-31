@@ -19,8 +19,12 @@
 //! throughout. Frames carrying sound are 140-155 bytes: eight encrypted blocks
 //! plus a short clear tail.
 //!
-//! Decoding the AAC-ELD underneath is the next stage; this one delivers the
-//! plaintext it operates on.
+//! The plaintext underneath is raw AAC-ELD, decoded and played by
+//! [`playback`] — there is no header in the stream, so [`config`] builds the
+//! description a decoder needs from what `SETUP` said.
+
+mod config;
+mod playback;
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -191,6 +195,27 @@ pub(crate) async fn observe(
     request: AudioStreamRequest,
     decryptor: Option<AudioDecryptor>,
 ) {
+    // Playback needs the stream described up front. An iPhone leaves `ch` out,
+    // and mirroring is always stereo at 44100, so the gaps are filled with what
+    // it actually sends rather than treated as a reason to stay silent.
+    let sample_rate = request.sample_rate.unwrap_or(44100) as u32;
+    let channels = request.channels.unwrap_or(2) as u8;
+    let samples_per_frame = request.samples_per_frame.unwrap_or(480) as u32;
+    let mut playback = if decryptor.is_some() {
+        match playback::AudioPlayback::new(sample_rate, channels, samples_per_frame) {
+            Ok(playback) => Some(playback),
+            Err(error) => {
+                tracing::warn!(%error, "AirPlay audio will not be played");
+                None
+            }
+        }
+    } else {
+        // Undecrypted frames are noise; feeding them to a decoder would be
+        // worse than silence.
+        tracing::warn!("AirPlay audio arrived without a key; not playing it");
+        None
+    };
+
     let mut datagram = [0_u8; MAX_AUDIO_DATAGRAM];
     let mut received = 0_u64;
     let mut malformed = 0_u64;
@@ -207,6 +232,13 @@ pub(crate) async fn observe(
         match AudioPacket::parse(&datagram[..count]) {
             Some(packet) => {
                 received += 1;
+                // A frame shorter than one AES block is the sender's idle
+                // filler, not audio; the decoder has nothing to do with it.
+                if let Some(playback) = playback.as_mut() {
+                    if packet.payload_bytes > AES_BLOCK_BYTES {
+                        playback.push(&datagram[RTP_HEADER_BYTES..count]);
+                    }
+                }
                 // The first few describe the stream; after that this would be
                 // one line per 10 ms of sound.
                 if received <= 3 || received.is_power_of_two() {
