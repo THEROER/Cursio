@@ -7,13 +7,19 @@
 //! from Apple's own receiver, so it is the least useful place to spend the
 //! effort.
 //!
-//! ## Why the pipeline is allowed to drop
+//! ## Every frame counts, including the silent ones
 //!
-//! The opposite of the video path, deliberately. A dropped video access unit
-//! corrupts every frame that references it until the next IDR; an AAC-ELD frame
-//! stands alone, so losing one costs ten milliseconds of sound and nothing
-//! else. Sound that runs late is worse than sound with a gap, so the sink does
-//! not synchronise and the queue stays shallow.
+//! Sound is a continuous line, not a series of pictures. A gap in it is
+//! audible immediately as a click or a stutter, so nothing is skipped: the
+//! short frames a quiet iPhone sends decode to silence and keep the timeline
+//! whole, and dropping them as "filler" is what makes playback stutter in time
+//! with the sound rather than run quietly underneath it.
+//!
+//! Buffers are timestamped from a frame counter for the same reason. `spf`
+//! samples arrive every frame at a fixed rate, so the timeline is exactly
+//! computable — and without it the sink has no idea when anything should be
+//! heard and simply renders whatever turns up, which is what UDP jitter turns
+//! into chopping.
 
 use crate::AirPlayError;
 
@@ -78,7 +84,12 @@ mod backend {
             Ok(Self { pipeline, source })
         }
 
-        pub(super) fn push(&self, frame: &[u8]) -> Result<(), AirPlayError> {
+        pub(super) fn push(
+            &self,
+            frame: &[u8],
+            pts: std::time::Duration,
+            duration: std::time::Duration,
+        ) -> Result<(), AirPlayError> {
             let mut buffer = gst::Buffer::with_size(frame.len())
                 .map_err(|error| AirPlayError::Video(error.to_string()))?;
             {
@@ -88,6 +99,8 @@ mod backend {
                 buffer
                     .copy_from_slice(0, frame)
                     .map_err(|error| AirPlayError::Video(error.to_string()))?;
+                buffer.set_pts(gst::ClockTime::from_nseconds(pts.as_nanos() as u64));
+                buffer.set_duration(gst::ClockTime::from_nseconds(duration.as_nanos() as u64));
             }
             self.source
                 .push_buffer(buffer)
@@ -116,7 +129,12 @@ mod backend {
             ))
         }
 
-        pub(super) fn push(&self, _: &[u8]) -> Result<(), AirPlayError> {
+        pub(super) fn push(
+            &self,
+            _: &[u8],
+            _: std::time::Duration,
+            _: std::time::Duration,
+        ) -> Result<(), AirPlayError> {
             Ok(())
         }
     }
@@ -125,6 +143,10 @@ mod backend {
 /// Plays decrypted AAC-ELD frames on this machine's default output.
 pub(crate) struct AudioPlayback {
     player: backend::AudioPlayer,
+    /// How many frames have been handed over, which is the whole timeline: at a
+    /// fixed rate and frame size, frame *n* starts at `n * spf / rate`.
+    frames: u64,
+    frame_duration: std::time::Duration,
     /// Reported once rather than per frame: at 480 samples a failing decoder
     /// would otherwise log a hundred times a second.
     failed: bool,
@@ -146,6 +168,10 @@ impl AudioPlayback {
         );
         Ok(Self {
             player: backend::AudioPlayer::new(sample_rate, channels, &config)?,
+            frames: 0,
+            frame_duration: std::time::Duration::from_nanos(
+                1_000_000_000 * u64::from(samples_per_frame) / u64::from(sample_rate.max(1)),
+            ),
             failed: false,
         })
     }
@@ -154,7 +180,9 @@ impl AudioPlayback {
         if self.failed {
             return;
         }
-        if let Err(error) = self.player.push(frame) {
+        let pts = self.frame_duration.saturating_mul(self.frames as u32);
+        self.frames += 1;
+        if let Err(error) = self.player.push(frame, pts, self.frame_duration) {
             self.failed = true;
             tracing::warn!(%error, "AirPlay audio playback stopped");
         }

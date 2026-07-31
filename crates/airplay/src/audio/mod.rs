@@ -178,6 +178,35 @@ impl AudioDecryptor {
     }
 }
 
+/// Tracks which RTP sequence numbers have already been played.
+///
+/// An iPhone sends each audio packet more than once — plain redundancy against
+/// UDP loss, and visible in any capture as the same sequence number arriving
+/// two or three times. Handing every copy to the decoder plays the same ten
+/// milliseconds repeatedly, which is heard as stuttering rather than as an
+/// echo, because the timeline stops matching the sound.
+#[derive(Default)]
+pub(crate) struct SequenceFilter {
+    newest: Option<u16>,
+}
+
+impl SequenceFilter {
+    /// Whether this packet is new. Late duplicates and re-orderings are refused.
+    pub(crate) fn accept(&mut self, sequence: u16) -> bool {
+        match self.newest {
+            // Half the sequence space ahead counts as newer, which is how the
+            // wrap from 65535 back to 0 stays a step forward rather than a
+            // jump backwards that silences the stream for a minute.
+            Some(newest) if sequence.wrapping_sub(newest) == 0 => false,
+            Some(newest) if sequence.wrapping_sub(newest) >= 0x8000 => false,
+            _ => {
+                self.newest = Some(sequence);
+                true
+            }
+        }
+    }
+}
+
 /// Bind the pair of UDP sockets an audio stream needs.
 pub(crate) async fn bind_ports(local_ip: IpAddr) -> Result<(UdpSocket, UdpSocket), AirPlayError> {
     let data = UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?;
@@ -216,8 +245,10 @@ pub(crate) async fn observe(
         None
     };
 
+    let mut sequences = SequenceFilter::default();
     let mut datagram = [0_u8; MAX_AUDIO_DATAGRAM];
     let mut received = 0_u64;
+    let mut duplicates = 0_u64;
     let mut malformed = 0_u64;
     loop {
         let Ok(count) = socket.recv(&mut datagram).await else {
@@ -232,12 +263,18 @@ pub(crate) async fn observe(
         match AudioPacket::parse(&datagram[..count]) {
             Some(packet) => {
                 received += 1;
-                // A frame shorter than one AES block is the sender's idle
-                // filler, not audio; the decoder has nothing to do with it.
-                if let Some(playback) = playback.as_mut() {
-                    if packet.payload_bytes > AES_BLOCK_BYTES {
-                        playback.push(&datagram[RTP_HEADER_BYTES..count]);
+                if !sequences.accept(packet.sequence) {
+                    duplicates += 1;
+                    if duplicates.is_power_of_two() {
+                        tracing::debug!(duplicates, "ignored a repeated AirPlay audio packet");
                     }
+                    continue;
+                }
+                // Every frame, including the short quiet ones: a gap in sound is
+                // audible at once, and those decode to the silence that belongs
+                // between the loud parts.
+                if let Some(playback) = playback.as_mut() {
+                    playback.push(&datagram[RTP_HEADER_BYTES..count]);
                 }
                 // The first few describe the stream; after that this would be
                 // one line per 10 ms of sound.
@@ -350,6 +387,31 @@ mod tests {
         }
         decryptor.decrypt(&mut later);
         assert_eq!(first, later);
+    }
+
+    /// The repeats an iPhone actually sends: 19344 arrives three times around
+    /// its neighbours, exactly as captured from a real device.
+    #[test]
+    fn repeated_packets_are_played_once() {
+        let mut filter = SequenceFilter::default();
+        assert!(filter.accept(19344));
+        assert!(!filter.accept(19344));
+        assert!(filter.accept(19345));
+        assert!(!filter.accept(19344));
+        assert!(filter.accept(19346));
+    }
+
+    /// The counter is 16 bits, so it wraps every eleven minutes of sound. That
+    /// must read as one step forward, not as a jump backwards that would mute
+    /// everything until the counter caught up again.
+    #[test]
+    fn the_sequence_counter_may_wrap() {
+        let mut filter = SequenceFilter::default();
+        assert!(filter.accept(65534));
+        assert!(filter.accept(65535));
+        assert!(filter.accept(0));
+        assert!(filter.accept(1));
+        assert!(!filter.accept(65535));
     }
 
     #[test]
