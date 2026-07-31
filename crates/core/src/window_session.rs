@@ -470,7 +470,16 @@ pub struct WindowFactory {
 }
 
 /// Whether this build has a window-transfer backend at all.
-const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "windows"));
+///
+/// macOS counts even though it can only host: a Mac that shares its screen with
+/// a Windows peer is the whole point of the backend, and negotiation would skip
+/// the module entirely if this said otherwise. Its renderer refuses politely,
+/// so a peer offering *it* a window gets a clear error rather than silence.
+const SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "macos"
+));
 
 impl crate::module::ModuleFactory for WindowFactory {
     fn id(&self) -> ModuleId {
@@ -541,7 +550,37 @@ impl crate::module::ModuleFactory for WindowFactory {
             }
             Ok(Box::new(engine))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(target_os = "macos")]
+        {
+            if let Some((tap, width, height)) = self.airplay.clone() {
+                return Ok(Box::new(airplay_engine(
+                    tap,
+                    width,
+                    height,
+                    cursio_window::MacWindowRenderer,
+                    ctx,
+                )));
+            }
+            let mut engine = WindowEngine::new(
+                cursio_window::MacWindowCapture {
+                    title_hint: self.title_hint.clone(),
+                    ..Default::default()
+                },
+                cursio_window::MacWindowRenderer,
+                ctx.peer_name().to_string(),
+            );
+            // There is no drag detector on macOS yet, so a title is the only
+            // way to say which window to share — and without one there is
+            // nothing to start.
+            if !self.title_hint.is_empty() {
+                match engine.share_window() {
+                    Ok(id) => tracing::info!(id, "window transfer started"),
+                    Err(e) => tracing::error!(error = %e, "could not start window transfer"),
+                }
+            }
+            Ok(Box::new(engine))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {
             // Unreachable in practice: `advert` returns `None` here, so
             // negotiation never agrees on this module.
@@ -616,6 +655,32 @@ fn spawn_drag_trigger(
     });
 
     rx
+}
+
+/// Build an engine that hosts the mirrored iPhone screen.
+///
+/// Sharing starts immediately rather than waiting for a drag: there is no
+/// window to drag, and the offer must already be out when the phone connects so
+/// the peer has a surrogate ready for the first frame. `begin` never fails, so
+/// there is no error to handle here.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn airplay_engine<R: cursio_window::WindowRenderer>(
+    tap: cursio_airplay::MirrorTap,
+    width: u32,
+    height: u32,
+    renderer: R,
+    ctx: &crate::module::SessionCtx,
+) -> WindowEngine<crate::airplay_window::AirPlayWindowCapture, R> {
+    let mut engine = WindowEngine::new(
+        crate::airplay_window::AirPlayWindowCapture::new(tap, width, height),
+        renderer,
+        ctx.peer_name().to_string(),
+    );
+    match engine.share_window() {
+        Ok(id) => tracing::info!(id, peer = %ctx.peer_name(), "sharing the iPhone screen"),
+        Err(error) => tracing::error!(%error, "could not share the iPhone screen"),
+    }
+    engine
 }
 
 #[cfg(test)]
@@ -1025,30 +1090,4 @@ mod tests {
         eng.share_window().unwrap();
         assert!(matches!(eng.share_window(), Err(WindowError::Backend(_))));
     }
-}
-
-/// Build an engine that hosts the mirrored iPhone screen.
-///
-/// Sharing starts immediately rather than waiting for a drag: there is no
-/// window to drag, and the offer must already be out when the phone connects so
-/// the peer has a surrogate ready for the first frame. `begin` never fails, so
-/// there is no error to handle here.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn airplay_engine<R: cursio_window::WindowRenderer>(
-    tap: cursio_airplay::MirrorTap,
-    width: u32,
-    height: u32,
-    renderer: R,
-    ctx: &crate::module::SessionCtx,
-) -> WindowEngine<crate::airplay_window::AirPlayWindowCapture, R> {
-    let mut engine = WindowEngine::new(
-        crate::airplay_window::AirPlayWindowCapture::new(tap, width, height),
-        renderer,
-        ctx.peer_name().to_string(),
-    );
-    match engine.share_window() {
-        Ok(id) => tracing::info!(id, peer = %ctx.peer_name(), "sharing the iPhone screen"),
-        Err(error) => tracing::error!(%error, "could not share the iPhone screen"),
-    }
-    engine
 }

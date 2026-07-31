@@ -104,3 +104,22 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # encode_bench calls ffmpeg_next::init() directly before benchmarking.
 ffmpeg-next = "8.1"
+
+# The probes drive Linux-only backends (portal capture, the GNOME drag
+# extension, the ffmpeg encoder), so they cannot compile anywhere else. Gating
+# them behind a feature keeps `cargo test -p cursio-window` working on macOS and
+# Windows, where the library itself builds fine.
+[features]
+linux-probes = []
+
+[[example]]
+name = "capture_probe"
+required-features = ["linux-probes"]
+
+[[example]]
+name = "drag_probe"
+required-features = ["linux-probes"]
+
+[[example]]
+name = "encode_bench"
+required-features = ["linux-probes"]

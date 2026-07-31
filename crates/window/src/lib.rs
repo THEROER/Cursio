@@ -66,6 +66,11 @@ mod linux_capture;
 #[cfg(target_os = "linux")]
 pub use linux_capture::{PortalCaptureSession, PortalWindowCapture};
 
+#[cfg(target_os = "macos")]
+mod macos_capture;
+#[cfg(target_os = "macos")]
+pub use macos_capture::{MacCaptureSession, MacWindowCapture, MacWindowRenderer};
+
 #[cfg(target_os = "windows")]
 pub mod video_decoder_win;
 #[cfg(target_os = "windows")]
