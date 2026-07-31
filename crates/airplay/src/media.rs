@@ -55,6 +55,8 @@ pub(crate) struct MediaSession {
     /// the connection loop drops the socket, which takes the phone out of
     /// Screen Mirroring instead of leaving it broadcasting to nothing.
     screen_closed: Arc<Notify>,
+    /// How large to open the window the screen appears in.
+    screen_size: crate::video::ScreenSize,
 }
 
 impl MediaSession {
@@ -62,6 +64,7 @@ impl MediaSession {
         screen_enabled: bool,
         tap: Option<crate::MirrorTap>,
         volume: tokio::sync::watch::Sender<f32>,
+        screen_size: crate::video::ScreenSize,
     ) -> Self {
         Self {
             encrypted_key: None,
@@ -73,6 +76,7 @@ impl MediaSession {
             tap,
             screen_closed: Arc::new(Notify::new()),
             volume,
+            screen_size,
         }
     }
 
@@ -291,7 +295,7 @@ impl MediaSession {
         }
         let listener = TcpListener::bind(SocketAddr::new(local_ip, 0)).await?;
         let local_port = listener.local_addr()?.port();
-        let sink = hardware_video_sink()?;
+        let sink = hardware_video_sink(self.screen_size)?;
         let tap = self.tap.clone();
         let closed = self.screen_closed.clone();
         self.mirror_task = Some(tokio::spawn(async move {
@@ -561,14 +565,16 @@ impl VideoSink for HardwareSink {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn hardware_video_sink() -> Result<Box<dyn VideoSink>, AirPlayError> {
+fn hardware_video_sink(size: crate::video::ScreenSize) -> Result<Box<dyn VideoSink>, AirPlayError> {
     Ok(Box::new(HardwareSink(
-        crate::video::HardwareVideoPipeline::new(crate::video::VideoCodec::H264)?,
+        crate::video::HardwareVideoPipeline::new(crate::video::VideoCodec::H264, size)?,
     )))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn hardware_video_sink() -> Result<Box<dyn VideoSink>, AirPlayError> {
+fn hardware_video_sink(
+    _size: crate::video::ScreenSize,
+) -> Result<Box<dyn VideoSink>, AirPlayError> {
     Err(AirPlayError::Video(
         "AirPlay hardware video output is supported on Linux and Windows".into(),
     ))
@@ -725,6 +731,10 @@ mod tests {
         tokio::sync::watch::Sender::new(0.0)
     }
 
+    fn test_screen_size() -> crate::video::ScreenSize {
+        crate::video::ScreenSize::new(1920, 1080)
+    }
+
     fn binary_plist(value: Value) -> Vec<u8> {
         let mut bytes = Vec::new();
         value.to_writer_binary(&mut bytes).unwrap();
@@ -809,7 +819,7 @@ mod tests {
             local_addr: "127.0.0.1:7000".parse().unwrap(),
             peer_addr: "127.0.0.1:50000".parse().unwrap(),
         };
-        let mut media = MediaSession::new(false, None, test_volume());
+        let mut media = MediaSession::new(false, None, test_volume(), test_screen_size());
         let response = media
             .handle_request(&request, Some(context), Some(&mut TestCrypto))
             .await
@@ -851,7 +861,7 @@ mod tests {
             local_addr: "127.0.0.1:7000".parse().unwrap(),
             peer_addr: "127.0.0.1:50000".parse().unwrap(),
         };
-        let mut media = MediaSession::new(false, None, test_volume());
+        let mut media = MediaSession::new(false, None, test_volume(), test_screen_size());
         let response = media
             .handle_request(&request, Some(context), Some(&mut TestCrypto))
             .await
@@ -880,7 +890,7 @@ mod tests {
             headers: Vec::new(),
             body: binary_plist(Value::Dictionary(root)),
         };
-        let mut media = MediaSession::new(true, None, test_volume());
+        let mut media = MediaSession::new(true, None, test_volume(), test_screen_size());
         media.encrypted_key = Some(vec![7; 72]);
 
         let response = media
@@ -940,7 +950,7 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
         };
-        let mut media = MediaSession::new(true, None, test_volume());
+        let mut media = MediaSession::new(true, None, test_volume(), test_screen_size());
         media.encrypted_key = Some(vec![7; 72]);
 
         let response = media
@@ -957,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn a_volume_the_sender_set_is_reported_back() {
         let volume = test_volume();
-        let mut media = MediaSession::new(false, None, volume.clone());
+        let mut media = MediaSession::new(false, None, volume.clone(), test_screen_size());
         media.encrypted_key = Some(vec![7; 72]);
 
         let set = Request {
@@ -979,7 +989,7 @@ mod tests {
         assert_eq!(*volume.borrow(), -23.5);
 
         // A new connection reuses the receiver's volume rather than resetting.
-        let mut reconnected = MediaSession::new(false, None, volume);
+        let mut reconnected = MediaSession::new(false, None, volume, test_screen_size());
         reconnected.encrypted_key = Some(vec![7; 72]);
         let get = Request {
             method: "GET_PARAMETER".into(),
@@ -1015,7 +1025,7 @@ mod tests {
             headers: vec![("Content-Type".into(), "text/parameters".into())],
             body: b"volume\r\n".to_vec(),
         };
-        let mut media = MediaSession::new(false, None, test_volume());
+        let mut media = MediaSession::new(false, None, test_volume(), test_screen_size());
         media.encrypted_key = Some(vec![7; 72]);
         let response = media
             .handle_request(&request, None, None)

@@ -38,7 +38,10 @@ struct HelperProcess {
 }
 
 impl HardwareVideoPipeline {
-    pub fn new(codec: VideoCodec) -> Result<Self, AirPlayError> {
+    /// `size` is ignored here: the helper's `AVSampleBufferDisplayLayer` sizes
+    /// its window from the first decoded frame, so it already shows the stream
+    /// at whatever the sender chose to encode.
+    pub fn new(codec: VideoCodec, _size: super::ScreenSize) -> Result<Self, AirPlayError> {
         if codec != VideoCodec::H264 {
             return Err(AirPlayError::Video(
                 "the macOS AirPlay backend currently accepts H.264 only".into(),

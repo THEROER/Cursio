@@ -21,9 +21,9 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-    RegisterClassW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, SW_SHOW,
-    WINDOW_EX_STYLE, WM_DESTROY, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
+    PostQuitMessage, RegisterClassW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG,
+    SW_SHOW, WINDOW_EX_STYLE, WM_DESTROY, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::AirPlayError;
@@ -39,6 +39,11 @@ pub(super) struct MirrorWindow {
 
 impl MirrorWindow {
     /// Create the window and wait until it exists.
+    ///
+    /// `width`/`height` are the size of the picture, not of the window: the
+    /// frame and title bar are added on top, so a 1920x1080 stream really does
+    /// arrive as 1920x1080 pixels instead of being scaled down into what is
+    /// left after the borders.
     ///
     /// Blocking until the handle is real matters: the sink must be given a
     /// window before the pipeline starts, or it opens its own and the name is
@@ -108,6 +113,16 @@ fn run(
             .chain(std::iter::once(0))
             .collect();
 
+        let mut frame = windows::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        // Failure only means the frame is not accounted for, which costs a
+        // slightly small picture — not a reason to open no window at all.
+        let _ = AdjustWindowRect(&mut frame, WS_OVERLAPPEDWINDOW, false);
+
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
@@ -115,8 +130,8 @@ fn run(
             WS_OVERLAPPEDWINDOW,
             i32::MIN, // CW_USEDEFAULT
             i32::MIN,
-            width as i32,
-            height as i32,
+            frame.right - frame.left,
+            frame.bottom - frame.top,
             None,
             None,
             Some(instance),

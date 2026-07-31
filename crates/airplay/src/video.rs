@@ -22,6 +22,33 @@ pub fn prepare_window() -> Result<(), crate::AirPlayError> {
 
 use crate::AirPlayError;
 
+/// How large the mirrored screen should appear locally.
+///
+/// Carried from the configured [`VideoProfile`](crate::VideoProfile) rather
+/// than read off the stream: the window has to exist before the sink starts,
+/// which is before any frame — and before the encoded size is known — has
+/// arrived. It is what the sender was told to produce in `/info`, so the two
+/// agree unless the sender chose otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenSize {
+    width: u16,
+    height: u16,
+}
+
+impl ScreenSize {
+    pub const fn new(width: u16, height: u16) -> Self {
+        Self { width, height }
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width as u32
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height as u32
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
     H264,

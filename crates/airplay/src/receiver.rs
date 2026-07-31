@@ -192,7 +192,13 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut decoder = RequestDecoder::new();
-    let mut media = MediaSession::new(screen_enabled, tap, volume);
+    let (width, height) = config.profile.resolution.dimensions();
+    let mut media = MediaSession::new(
+        screen_enabled,
+        tap,
+        volume,
+        crate::video::ScreenSize::new(width, height),
+    );
     let mut read_buffer = [0_u8; 8192];
     loop {
         let count = if media.is_active() {

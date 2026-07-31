@@ -36,12 +36,15 @@ pub(super) fn check_available(codec: VideoCodec) -> Result<(), AirPlayError> {
 /// mirrored screen, just under GStreamer's name. Losing the picture entirely
 /// because a title could not be set would be the worse trade.
 #[cfg(target_os = "windows")]
-fn adopt_window(pipeline: &gst::Pipeline) -> Option<super::windows_window::MirrorWindow> {
+fn adopt_window(
+    pipeline: &gst::Pipeline,
+    size: super::ScreenSize,
+) -> Option<super::windows_window::MirrorWindow> {
     use gstreamer_video::prelude::VideoOverlayExtManual;
 
     let sink = pipeline.by_name("airplay-sink")?;
     let overlay = sink.dynamic_cast::<gstreamer_video::VideoOverlay>().ok()?;
-    let window = match super::windows_window::MirrorWindow::open(1280, 720) {
+    let window = match super::windows_window::MirrorWindow::open(size.width(), size.height()) {
         Ok(window) => window,
         Err(error) => {
             tracing::warn!(%error, "falling back to GStreamer's own video window");
@@ -65,7 +68,7 @@ pub struct HardwareVideoPipeline {
 }
 
 impl HardwareVideoPipeline {
-    pub fn new(codec: VideoCodec) -> Result<Self, AirPlayError> {
+    pub fn new(codec: VideoCodec, size: super::ScreenSize) -> Result<Self, AirPlayError> {
         check_available(codec)?;
         let plan = PipelinePlan::detect(codec, |name| gst::ElementFactory::find(name).is_some())?;
         let pipeline = gst::parse::launch(&plan.launch_description())
@@ -78,7 +81,9 @@ impl HardwareVideoPipeline {
             .downcast::<gst_app::AppSrc>()
             .map_err(|_| AirPlayError::Video("AirPlay source is not an appsrc".into()))?;
         #[cfg(target_os = "windows")]
-        let window = adopt_window(&pipeline);
+        let window = adopt_window(&pipeline, size);
+        #[cfg(not(target_os = "windows"))]
+        let _ = size;
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|error| AirPlayError::Video(error.to_string()))?;
