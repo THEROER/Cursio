@@ -251,6 +251,16 @@ pub struct Ownership {
     /// (which on Wayland would re-arm barriers). Normal handoffs leave this
     /// `false`.
     pub panic: bool,
+    /// Set only for the state a session starts in, never for a handoff.
+    ///
+    /// The difference decides what a machine that does *not* hold the cursor
+    /// does with its own keyboard. Having handed the cursor over, it is the
+    /// machine the user is sitting at, so its input is grabbed and streamed —
+    /// that is what driving the peer means. At startup nobody has handed
+    /// anything anywhere and the user may be at either machine, so grabbing
+    /// there means a Mac's trackpad silently drives a Windows cursor from the
+    /// moment the link comes up, while the Mac's own pointer never moves.
+    pub initial: bool,
 }
 
 /// Run the session loop until the peer leaves or the link drops.
@@ -261,6 +271,10 @@ pub struct Ownership {
 ///   captured input is *not* forwarded (it already acts locally).
 /// - **Dormant**: local input is grabbed and streamed to the active peer;
 ///   inbound input is *not* injected (we're not the one holding the cursor).
+///   Reached only by *handing the cursor over*, never at startup — see
+///   [`Ownership::initial`].
+/// - **Idle**: what the machine without the cursor does before anyone has
+///   handed anything anywhere. Its own keyboard and mouse act on it, normally.
 ///
 /// Exactly one side is active at any moment. The two sides start in opposite
 /// states (`start_active`) and every handoff flips *both* atomically: the
@@ -365,6 +379,7 @@ where
     on_ownership(Ownership {
         active: am_active,
         panic: false,
+        initial: true,
     });
     tracing::info!(am_active, "initial ownership");
 
@@ -463,7 +478,7 @@ where
                     Some(OwnershipCmd::Toggle) => {
                         am_active = !am_active;
                         tracing::info!(am_active, "hotkey toggled ownership");
-                        on_ownership(Ownership { active: am_active, panic: false });
+                        on_ownership(Ownership { active: am_active, panic: false, initial: false });
                         // Peer takes the opposite of our new state.
                         if let Err(e) = tx.send(&Message::Grab { active: !am_active }).await {
                             break Err(SessionError::from(e));
@@ -481,7 +496,7 @@ where
                         if am_active {
                             am_active = false;
                             tracing::info!(?edge, pos_norm, "cursor crossed peer edge; handing off");
-                            on_ownership(Ownership { active: am_active, panic: false });
+                            on_ownership(Ownership { active: am_active, panic: false, initial: false });
                             // Peer becomes active, entering on its opposite edge.
                             let msg = Message::CrossEdge { edge: edge.opposite(), pos_norm };
                             if let Err(e) = tx.send(&msg).await {
@@ -500,7 +515,7 @@ where
                     Some(OwnershipCmd::Panic) => {
                         tracing::warn!("PANIC: forcing control back to this machine");
                         am_active = true;
-                        on_ownership(Ownership { active: am_active, panic: true });
+                        on_ownership(Ownership { active: am_active, panic: true, initial: false });
                         let _ = tx.send(&Message::Grab { active: false }).await;
                     }
                     None => commands = None,
@@ -562,7 +577,7 @@ where
                             // hunting through the motion path while diagnosing a
                             // frozen cursor.
                             tracing::info!(am_active, "peer handed ownership over (Grab)");
-                            on_ownership(Ownership { active: am_active, panic: false });
+                            on_ownership(Ownership { active: am_active, panic: false, initial: false });
                         }
                     }
                     Some(Message::CrossEdge { edge, pos_norm }) => {
@@ -574,7 +589,7 @@ where
                         if !am_active {
                             am_active = true;
                             tracing::info!(?edge, pos_norm, "cursor crossed in from peer");
-                            on_ownership(Ownership { active: am_active, panic: false });
+                            on_ownership(Ownership { active: am_active, panic: false, initial: false });
                         }
                     }
                     Some(Message::Bye) => {
