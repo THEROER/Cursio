@@ -4,10 +4,14 @@
 //! terminal. What differs between platforms is only *which* terminal, and that
 //! is the whole content of this file.
 //!
-//! A terminal is spawned rather than a window drawn: the point of this build is
-//! to watch what the daemon is doing, and a real terminal already scrolls,
-//! selects, searches and copies. Reimplementing that in a tray application
-//! would be a worse version of something every desktop ships.
+//! A terminal is spawned rather than a window drawn, because a real terminal
+//! already scrolls, selects, searches and copies. Drawing a log viewer would be
+//! a worse version of something every desktop ships.
+//!
+//! This matters most where the daemon has no console of its own: started by a
+//! launcher, or — on Windows — relaunched elevated, where the original process
+//! steps aside and the one doing the work has no window attached to anything
+//! the user can see.
 
 use std::path::{Path, PathBuf};
 

@@ -13,7 +13,6 @@ members = [
     "crates/core",
     "app",
     "apps/clipd",
-    "apps/tray",
     "crates/xtask",
     "tools/wgc-probe",
 ]
