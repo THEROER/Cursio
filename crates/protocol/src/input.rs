@@ -62,74 +62,82 @@ pub enum Edge {
     Bottom,
 }
 
-/// Where a machine sits in the user's physical layout.
+/// Where a machine sits in the user's layout, as a cell on a grid.
 ///
-/// Declared per machine instead of per link, which is what makes more than two
-/// of them workable. `--peer-edge right` answers "which way is the peer", and
-/// that question has one answer only while there is one peer: a third machine
-/// needs every node to know where every *other* node is, and asking the user to
-/// spell out each pair is O(n²) configuration for a layout they can describe in
-/// one word each.
+/// Coordinates rather than a named side, because a side cannot express order.
+/// Four machines in a row are all "to the right" of the first, and nothing in
+/// that vocabulary says which of them the cursor reaches first — so the moment
+/// there are more than two, the layout stops being describable at all.
 ///
-/// So the layout is a hub and its spokes: one machine is [`Position::Center`]
-/// — the one whose keyboard the user actually sits at — and every other names
-/// the side of it that it stands on. Adding a machine is then one flag on that
-/// machine and nothing at all on the others.
+/// Nor is there a hub. A designated centre would make every other machine
+/// depend on one being up, which is the arrangement the mesh exists to avoid:
+/// with `0,0 — 1,0 — 2,0`, the middle machine going away leaves the other two
+/// still knowing exactly where they stand relative to each other.
+///
+/// The units are cells, not pixels: `--at 1,0` means "one machine to the
+/// right", and nothing here needs to know how wide anybody's screen is. A GUI
+/// that later lets the user drag machines around writes the same two numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub enum Position {
-    /// The hub. The machine the user sits at; every other borders it.
-    #[default]
-    Center,
-    /// To the left of the centre.
-    Left,
-    /// To the right of the centre.
-    Right,
-    /// Above the centre.
-    Above,
-    /// Below the centre.
-    Below,
+pub struct Position {
+    /// Increases to the right.
+    pub x: i32,
+    /// Increases downward, matching screen coordinates rather than graphs.
+    pub y: i32,
 }
 
 impl Position {
-    /// Which of *this* machine's edges borders `peer`, if the two are
-    /// neighbours at all.
+    pub const fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+
+    /// Which of *this* machine's edges faces `peer`.
     ///
-    /// `None` when neither is the centre: two spokes do not touch, so a cursor
-    /// travels between them through the hub rather than teleporting. Saying so
-    /// is better than inventing an adjacency, which would let the cursor leave
-    /// a machine across an edge the user has nothing standing at.
+    /// The dominant axis wins: a machine one cell right and one cell down is
+    /// reached rightward, because a diagonal is not an edge a cursor can cross.
+    /// Ties break horizontal, since machines stand side by side far more often
+    /// than stacked.
+    ///
+    /// `None` for a peer in the same cell — two machines nobody has placed yet
+    /// (both at the `0,0` default) border nothing, and inventing an edge for
+    /// them would send the cursor away on a shove the user did not mean.
     pub fn edge_toward(self, peer: Position) -> Option<Edge> {
-        match (self, peer) {
-            // The same side twice is one machine described twice, or two
-            // stacked in a spot the layout cannot tell apart.
-            (a, b) if a == b => None,
-            (Position::Center, other) => other.edge_from_center(),
-            (own, Position::Center) => own.edge_from_center().map(Edge::opposite),
-            _ => None,
+        let dx = peer.x - self.x;
+        let dy = peer.y - self.y;
+        if dx == 0 && dy == 0 {
+            return None;
+        }
+        if dx.abs() >= dy.abs() {
+            Some(if dx > 0 { Edge::Right } else { Edge::Left })
+        } else {
+            Some(if dy > 0 { Edge::Bottom } else { Edge::Top })
         }
     }
 
-    /// The one edge this machine can hand the cursor across, when that is not
-    /// ambiguous.
+    /// How far away `peer` is, for picking between several in one direction.
     ///
-    /// A spoke has exactly one neighbour — the hub — so it needs no
-    /// configuration at all beyond naming its own side. The hub borders every
-    /// spoke, so which of its edges to watch is a question only the set of
-    /// connected peers can answer, and `None` says so rather than guessing.
-    pub fn own_edge(self) -> Option<Edge> {
-        self.edge_toward(Position::Center)
+    /// Manhattan distance, because movement here is along edges rather than
+    /// through space: two cells right is two crossings whatever the diagonal
+    /// measures.
+    fn distance_to(self, peer: Position) -> u32 {
+        self.x.abs_diff(peer.x) + self.y.abs_diff(peer.y)
     }
+}
 
-    /// The centre's edge that faces this position.
-    fn edge_from_center(self) -> Option<Edge> {
-        match self {
-            Position::Center => None,
-            Position::Left => Some(Edge::Left),
-            Position::Right => Some(Edge::Right),
-            Position::Above => Some(Edge::Top),
-            Position::Below => Some(Edge::Bottom),
-        }
-    }
+/// Which peer the cursor reaches when it leaves across `edge`.
+///
+/// The nearest one in that direction, which is the whole reason coordinates
+/// beat named sides: with `0,0 — 1,0 — 2,0` the first machine's right-hand
+/// neighbour is the second, not the third, and only a distance can say so.
+///
+/// `peers` carries whatever positions this node has learned from greetings, so
+/// a machine that is offline is simply absent and the one behind it becomes the
+/// neighbour — the layout heals instead of leaving a hole.
+pub fn neighbour_across<T: Copy>(own: Position, edge: Edge, peers: &[(T, Position)]) -> Option<T> {
+    peers
+        .iter()
+        .filter(|(_, position)| own.edge_toward(*position) == Some(edge))
+        .min_by_key(|(_, position)| own.distance_to(*position))
+        .map(|(peer, _)| *peer)
 }
 
 impl Edge {
@@ -157,67 +165,67 @@ impl Edge {
 mod position_tests {
     use super::*;
 
-    /// The layout the flag exists for: the user sits at the centre, the Mac
-    /// stands to its right, and the cursor leaves rightward and comes back
-    /// leftward.
     #[test]
-    fn the_centre_and_a_spoke_face_each_other() {
-        assert_eq!(
-            Position::Center.edge_toward(Position::Right),
-            Some(Edge::Right)
-        );
-        assert_eq!(
-            Position::Right.edge_toward(Position::Center),
-            Some(Edge::Left)
-        );
+    fn a_machine_to_the_right_is_reached_rightward_and_answers_leftward() {
+        let here = Position::new(0, 0);
+        let there = Position::new(1, 0);
+        assert_eq!(here.edge_toward(there), Some(Edge::Right));
+        assert_eq!(there.edge_toward(here), Some(Edge::Left));
     }
 
     #[test]
-    fn every_side_of_the_centre_has_an_edge() {
-        for (position, edge) in [
-            (Position::Left, Edge::Left),
-            (Position::Right, Edge::Right),
-            (Position::Above, Edge::Top),
-            (Position::Below, Edge::Bottom),
-        ] {
-            assert_eq!(Position::Center.edge_toward(position), Some(edge));
-            assert_eq!(
-                position.edge_toward(Position::Center),
-                Some(edge.opposite())
-            );
-        }
+    fn stacking_uses_the_vertical_edges() {
+        let here = Position::new(0, 0);
+        assert_eq!(here.edge_toward(Position::new(0, 1)), Some(Edge::Bottom));
+        assert_eq!(here.edge_toward(Position::new(0, -1)), Some(Edge::Top));
     }
 
-    /// Two spokes do not touch: the cursor travels between them through the
-    /// hub. Inventing an adjacency here would let it leave across an edge the
-    /// user has nothing standing at.
+    /// A diagonal is not an edge a cursor can cross, so one axis has to win.
     #[test]
-    fn two_machines_on_opposite_sides_do_not_border_each_other() {
-        assert_eq!(Position::Left.edge_toward(Position::Right), None);
-        assert_eq!(Position::Above.edge_toward(Position::Left), None);
+    fn a_diagonal_neighbour_is_reached_along_its_dominant_axis() {
+        let here = Position::new(0, 0);
+        assert_eq!(here.edge_toward(Position::new(3, 1)), Some(Edge::Right));
+        assert_eq!(here.edge_toward(Position::new(1, 3)), Some(Edge::Bottom));
+        // Machines stand side by side more often than stacked, so an exact tie
+        // goes horizontal.
+        assert_eq!(here.edge_toward(Position::new(1, 1)), Some(Edge::Right));
     }
 
-    /// A spoke needs no configuration beyond its own side; the hub cannot know
-    /// which edge to watch until it knows who is connected.
+    /// Two machines nobody has placed both sit at the default, and must not
+    /// invent an edge between them.
     #[test]
-    fn a_spoke_knows_its_own_edge_and_the_hub_does_not() {
-        assert_eq!(Position::Right.own_edge(), Some(Edge::Left));
-        assert_eq!(Position::Below.own_edge(), Some(Edge::Top));
-        assert_eq!(Position::Center.own_edge(), None);
+    fn an_unplaced_pair_borders_nothing() {
+        let unplaced = Position::default();
+        assert_eq!(unplaced, Position::new(0, 0));
+        assert_eq!(unplaced.edge_toward(unplaced), None);
     }
 
-    /// Two machines claiming one spot cannot be told apart, so neither gets an
-    /// edge rather than both getting the same one.
+    /// The case a named side cannot express: with three in a row, the first
+    /// machine's right-hand neighbour is the second, not the third.
     #[test]
-    fn a_position_does_not_border_itself() {
-        for position in [
-            Position::Center,
-            Position::Left,
-            Position::Right,
-            Position::Above,
-            Position::Below,
-        ] {
-            assert_eq!(position.edge_toward(position), None);
-        }
+    fn the_nearest_machine_in_a_row_is_the_neighbour() {
+        let own = Position::new(0, 0);
+        let peers = [
+            ("middle", Position::new(1, 0)),
+            ("far", Position::new(2, 0)),
+        ];
+        assert_eq!(neighbour_across(own, Edge::Right, &peers), Some("middle"));
+    }
+
+    /// And when the middle machine is not there, the layout heals rather than
+    /// leaving a hole — which is what a designated centre could not do.
+    #[test]
+    fn a_missing_machine_hands_its_place_to_the_next_one() {
+        let own = Position::new(0, 0);
+        let peers = [("far", Position::new(2, 0))];
+        assert_eq!(neighbour_across(own, Edge::Right, &peers), Some("far"));
+    }
+
+    #[test]
+    fn nothing_in_a_direction_means_no_neighbour() {
+        let own = Position::new(0, 0);
+        let peers = [("right", Position::new(1, 0))];
+        assert_eq!(neighbour_across(own, Edge::Left, &peers), None);
+        assert_eq!(neighbour_across::<&str>(own, Edge::Right, &[]), None);
     }
 }

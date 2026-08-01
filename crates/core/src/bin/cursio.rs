@@ -82,17 +82,18 @@ enum Command {
         /// Capture this machine's mouse/keyboard and share it with peers.
         #[arg(long, default_value_t = false)]
         send_input: bool,
-        /// Where this machine stands in your layout.
+        /// Where this machine stands, as a cell on a grid: `--at 1,0` is one
+        /// machine to the right of `0,0`.
         ///
-        /// One machine is `center` — the one you sit at — and every other
-        /// names the side of it that it stands on. Each side then works out
-        /// which of its own edges borders which peer, so adding a third
-        /// machine is one flag on that machine and nothing on the others.
-        #[arg(long, value_enum, default_value_t = PositionArg::Center)]
-        position: PositionArg,
+        /// Cells, not pixels — nothing needs to know how wide anybody's screen
+        /// is. Four machines in a row are `0,0 1,0 2,0 3,0`, and each works out
+        /// for itself which of its edges faces which peer, and which peer is
+        /// nearest in that direction. Left unset every machine sits at `0,0`,
+        /// where nothing borders anything and Ctrl+Alt+G is the only handoff.
+        #[arg(long, value_name = "X,Y", default_value = "0,0", value_parser = parse_position)]
+        at: cursio_protocol::Position,
         /// Which of this machine's screen edges borders the peer, overriding
-        /// what `--position` implies. Only needed for a layout the centre-plus-
-        /// spokes model does not describe.
+        /// what `--at` implies. For a layout the grid does not describe.
         #[arg(long, value_enum)]
         peer_edge: Option<EdgeArg>,
         /// Share audio with peers.
@@ -214,27 +215,24 @@ impl From<EdgeArg> for cursio_protocol::Edge {
     }
 }
 
-/// A clap-parseable mirror of [`cursio_protocol::Position`].
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum PositionArg {
-    /// The machine you sit at; every other borders it.
-    Center,
-    Left,
-    Right,
-    Above,
-    Below,
-}
-
-impl From<PositionArg> for cursio_protocol::Position {
-    fn from(position: PositionArg) -> Self {
-        match position {
-            PositionArg::Center => Self::Center,
-            PositionArg::Left => Self::Left,
-            PositionArg::Right => Self::Right,
-            PositionArg::Above => Self::Above,
-            PositionArg::Below => Self::Below,
-        }
-    }
+/// Parse `--at X,Y` into a grid cell.
+///
+/// Spelled out rather than derived so the error names both the input and the
+/// shape expected: a mistyped layout is otherwise discovered as "the cursor
+/// does not cross", which is a long way from the comma that was missing.
+fn parse_position(value: &str) -> Result<cursio_protocol::Position, String> {
+    let (x, y) = value
+        .split_once(',')
+        .ok_or_else(|| format!("expected X,Y (for example 1,0), got {value:?}"))?;
+    let parse = |part: &str, axis: &str| {
+        part.trim()
+            .parse::<i32>()
+            .map_err(|_| format!("{axis} of {value:?} is not a whole number"))
+    };
+    Ok(cursio_protocol::Position::new(
+        parse(x, "the x")?,
+        parse(y, "the y")?,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -316,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Mesh {
             port,
             send_input,
-            position,
+            at,
             peer_edge,
             audio,
             audio_render_device,
@@ -375,7 +373,7 @@ async fn main() -> anyhow::Result<()> {
                 identity.clone(),
                 port,
                 send_input,
-                position.into(),
+                at,
                 peer_edge.map(Into::into),
                 modules,
                 pairing,
@@ -1511,20 +1509,21 @@ async fn start_node(
     // Capture comes up ONCE here, before any session: the portal permission is
     // asked a single time and survives peers coming and going. See
     // [`PersistentCapture`].
-    // A spoke borders only the hub, so it derives its own barrier edge and
-    // needs no `--peer-edge` at all. The hub borders every spoke, so until the
-    // capture backends can arm more than one edge it still has to be told
-    // which — hence the explicit flag winning here.
-    let barrier_edge = peer_edge.or_else(|| position.own_edge());
-    if barrier_edge.is_none() && send_input {
+    // Which edge the capture watches is still one edge, and still the flag's
+    // to name. `--at` decides where each *peer* is, which is a per-link answer
+    // a session learns from the greeting — but the barrier is armed before any
+    // peer has said hello, and the backends take a single edge (a Windows
+    // atomic, one Wayland barrier). Arming every edge is the change that closes
+    // this, and it belongs in those backends rather than here.
+    if peer_edge.is_none() && send_input && position != cursio_protocol::Position::default() {
         tracing::info!(
             ?position,
-            "no edge to watch: the centre borders every machine, so pass --peer-edge to pick one, \
-             or use Ctrl+Alt+G"
+            "placed on the layout grid, but no edge is being watched yet: pass --peer-edge to arm \
+             one, or hand over with Ctrl+Alt+G"
         );
     }
     let capture: SharedCapture = std::rc::Rc::new(std::cell::RefCell::new(
-        make_persistent_capture(send_input, barrier_edge),
+        make_persistent_capture(send_input, peer_edge),
     ));
 
     Ok(NodeBase {
@@ -1671,41 +1670,50 @@ mod tests {
     }
 
     #[test]
-    /// The default has to be the hub, or a machine started with no flag at all
-    /// would claim a side of a centre that may not exist.
-    fn a_node_is_the_centre_unless_told_otherwise() {
-        let Command::Mesh {
-            position,
-            peer_edge,
-            ..
-        } = Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
+    /// Unplaced machines must border nothing: a default that implied adjacency
+    /// would hand the cursor away on a shove the user never meant.
+    fn an_unplaced_node_sits_at_the_origin() {
+        let Command::Mesh { at, peer_edge, .. } =
+            Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
         else {
             panic!("expected mesh");
         };
-        assert!(matches!(position, PositionArg::Center));
+        assert_eq!(at, cursio_protocol::Position::new(0, 0));
         assert!(peer_edge.is_none());
+        assert_eq!(at.edge_toward(at), None);
+    }
+
+    #[test]
+    /// The case named sides could not express: with three in a row, each knows
+    /// which way its neighbour lies without anyone being a designated centre.
+    fn a_row_of_machines_faces_the_right_way() {
+        let Command::Mesh { at, .. } = Cli::try_parse_from(["cursio", "mesh", "--at", "1,0"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected mesh");
+        };
+        assert_eq!(at, cursio_protocol::Position::new(1, 0));
         assert_eq!(
-            cursio_protocol::Position::from(position).own_edge(),
-            None,
-            "the centre borders every machine, so it has no single edge"
+            at.edge_toward(cursio_protocol::Position::new(2, 0)),
+            Some(cursio_protocol::Edge::Right)
+        );
+        assert_eq!(
+            at.edge_toward(cursio_protocol::Position::new(0, 0)),
+            Some(cursio_protocol::Edge::Left)
         );
     }
 
     #[test]
-    /// A spoke needs one word and no edge: the layout answers the rest.
-    fn a_spoke_derives_the_edge_facing_the_centre() {
-        let Command::Mesh { position, .. } =
-            Cli::try_parse_from(["cursio", "mesh", "--position", "right"])
-                .unwrap()
-                .command
-        else {
-            panic!("expected mesh");
+    /// A mistyped layout is otherwise discovered as "the cursor does not
+    /// cross", which is a long way from the comma that was missing.
+    fn a_malformed_position_is_refused_with_its_shape_named() {
+        let Err(error) = Cli::try_parse_from(["cursio", "mesh", "--at", "1"]) else {
+            panic!("a position without a comma must be refused");
         };
-        assert_eq!(
-            cursio_protocol::Position::from(position).own_edge(),
-            Some(cursio_protocol::Edge::Left),
-            "standing to the right of the centre, the centre is off our left"
-        );
+        let error = error.to_string();
+        assert!(error.contains("1,0"), "should show the shape: {error}");
+        assert!(Cli::try_parse_from(["cursio", "mesh", "--at", "a,0"]).is_err());
     }
 
     #[test]
