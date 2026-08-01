@@ -441,6 +441,17 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 {
                     Ok(receiver) => {
+                        // Published before serving, so a peer's query is
+                        // answered from what is actually bound rather than from
+                        // what was asked for on the command line.
+                        if let Ok(addr) = receiver.local_addr() {
+                            let reachable = SocketAddr::new(
+                                discovery::guess_lan_ipv4()
+                                    .unwrap_or_else(|| IpAddr::from([127, 0, 0, 1])),
+                                addr.port(),
+                            );
+                            service_state.now_hosting(ServiceId::AIRPLAY, reachable);
+                        }
                         tokio::select! {
                             result = mesh => result,
                             result = receiver.serve() => result.map_err(Into::into),

@@ -68,6 +68,26 @@ impl std::fmt::Display for ServiceId {
 /// The service module's wire vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServiceMsg {
+    /// "Is anybody already doing this?"
+    ///
+    /// Asked before taking a duty on rather than after. Two machines that both
+    /// decide for themselves — by rank, by who booted first, by anything not
+    /// involving the other — both decide yes, and an iPhone is offered two
+    /// receivers called Cursio. Asking costs one round trip on a link that is
+    /// already up and removes the guess entirely.
+    Query { service: ServiceId },
+
+    /// The answer: whether this machine is carrying `service`, and where.
+    ///
+    /// `addr` is where the duty is actually reachable, not where the mesh link
+    /// is: a receiver binds its own port, and a peer that wants to point
+    /// something at it needs that one. `None` when not hosting.
+    Status {
+        service: ServiceId,
+        hosting: bool,
+        addr: Option<std::net::SocketAddr>,
+    },
+
     /// "I cannot carry this duty; will you?"
     ///
     /// `reason` is what the asking machine could not do, in the words the user
@@ -94,7 +114,9 @@ impl ServiceMsg {
     /// Which duty this message concerns, whatever kind it is.
     pub fn service(&self) -> ServiceId {
         match self {
-            ServiceMsg::Request { service, .. }
+            ServiceMsg::Query { service }
+            | ServiceMsg::Status { service, .. }
+            | ServiceMsg::Request { service, .. }
             | ServiceMsg::Accepted { service }
             | ServiceMsg::Refused { service, .. }
             | ServiceMsg::Released { service } => *service,
@@ -131,6 +153,12 @@ mod tests {
     fn every_message_names_the_duty_it_concerns() {
         let service = ServiceId::AIRPLAY;
         for msg in [
+            ServiceMsg::Query { service },
+            ServiceMsg::Status {
+                service,
+                hosting: true,
+                addr: Some("192.168.1.5:7000".parse().unwrap()),
+            },
             ServiceMsg::Request {
                 service,
                 reason: "port 7000 is in use".into(),

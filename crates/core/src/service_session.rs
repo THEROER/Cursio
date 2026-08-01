@@ -56,8 +56,11 @@ struct Inner {
     /// Duties this machine has asked a peer to take on, so a second session
     /// does not repeat a request already answered.
     asked_by_us: HashSet<ServiceId>,
-    /// Duties some peer has confirmed it is actually running.
-    hosted_elsewhere: HashSet<ServiceId>,
+    /// Duties some peer has confirmed it is actually running, and where.
+    hosted_elsewhere: std::collections::HashMap<ServiceId, Option<std::net::SocketAddr>>,
+    /// Duties this machine is carrying, and the address they answer on — what
+    /// a peer's [`ServiceMsg::Query`] is answered with.
+    hosted_here: std::collections::HashMap<ServiceId, std::net::SocketAddr>,
 }
 
 impl ServiceState {
@@ -82,7 +85,29 @@ impl ServiceState {
 
     /// Whether a peer has confirmed it is running `service`.
     pub fn is_hosted_elsewhere(&self, service: ServiceId) -> bool {
-        self.lock().hosted_elsewhere.contains(&service)
+        self.lock().hosted_elsewhere.contains_key(&service)
+    }
+
+    /// Where a peer said it is running `service`, if it said.
+    pub fn host_address(&self, service: ServiceId) -> Option<std::net::SocketAddr> {
+        self.lock()
+            .hosted_elsewhere
+            .get(&service)
+            .copied()
+            .flatten()
+    }
+
+    /// Record that this machine is carrying `service`, reachable at `addr`.
+    ///
+    /// Set by whatever actually started it, so a peer's query is answered from
+    /// what is running rather than from what was intended.
+    pub fn now_hosting(&self, service: ServiceId, addr: std::net::SocketAddr) {
+        self.lock().hosted_here.insert(service, addr);
+    }
+
+    /// Whether this machine is carrying `service`.
+    pub fn is_hosted_here(&self, service: ServiceId) -> bool {
+        self.lock().hosted_here.contains_key(&service)
     }
 
     /// Whether a peer has asked this machine to take `service` on.
@@ -137,6 +162,8 @@ pub struct ServiceEngine {
     outbound: Vec<ServiceMsg>,
     /// Requests already sent on this link, so a pump does not repeat them.
     requested: HashSet<ServiceId>,
+    /// Whether the opening round of queries has gone out on this link.
+    queried: bool,
     /// Why this machine cannot carry each duty it is asking about.
     reasons: Arc<Mutex<std::collections::HashMap<ServiceId, String>>>,
 }
@@ -154,6 +181,7 @@ impl ServiceEngine {
             host,
             outbound: Vec::new(),
             requested: HashSet::new(),
+            queried: false,
             reasons,
         }
     }
@@ -202,6 +230,16 @@ impl SessionModule for ServiceEngine {
     }
 
     async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
+        // Ask before deciding anything. A machine that works out on its own
+        // whether to host is a machine that reaches the same answer as its
+        // peer, and the user is shown two receivers called Cursio.
+        if !self.queried {
+            self.queried = true;
+            for &service in KNOWN_SERVICES {
+                self.outbound.push(ServiceMsg::Query { service });
+            }
+        }
+
         // Ask about anything this machine has found it cannot do. Checked every
         // pump rather than once at startup, because the thing that fails — a
         // port bind — may fail long after the session came up.
@@ -251,13 +289,36 @@ impl SessionModule for ServiceEngine {
             }
         };
         match decoded {
+            ServiceMsg::Query { service } => {
+                let addr = self.state.lock().hosted_here.get(&service).copied();
+                self.outbound.push(ServiceMsg::Status {
+                    service,
+                    hosting: addr.is_some(),
+                    addr,
+                });
+            }
+            ServiceMsg::Status {
+                service,
+                hosting,
+                addr,
+            } => {
+                if hosting {
+                    tracing::info!(peer = %self.peer_name, %service, ?addr, "peer already hosts this");
+                    self.state.lock().hosted_elsewhere.insert(service, addr);
+                } else {
+                    // Removed rather than left: an answer of "not me" from the
+                    // peer that used to host it is how this machine learns the
+                    // duty is free again.
+                    self.state.lock().hosted_elsewhere.remove(&service);
+                }
+            }
             ServiceMsg::Request { service, reason } => {
                 let answer = self.answer(service, reason);
                 self.outbound.push(answer);
             }
             ServiceMsg::Accepted { service } => {
                 tracing::info!(peer = %self.peer_name, %service, "peer is hosting this for us");
-                self.state.lock().hosted_elsewhere.insert(service);
+                self.state.lock().hosted_elsewhere.insert(service, None);
             }
             ServiceMsg::Refused { service, reason } => {
                 // Not an error: the whole point of asking several peers is that
@@ -450,10 +511,97 @@ mod tests {
     #[tokio::test]
     async fn losing_the_link_forgets_that_the_peer_was_hosting() {
         let (mut engine, state, _seen) = engine(true);
-        state.lock().hosted_elsewhere.insert(ServiceId::AIRPLAY);
+        state
+            .lock()
+            .hosted_elsewhere
+            .insert(ServiceId::AIRPLAY, None);
         let mut tx = NullTx;
         engine.shutdown(&mut tx).await;
         assert!(!state.is_hosted_elsewhere(ServiceId::AIRPLAY));
+    }
+
+    /// The exchange the user described: ask first, answer with where.
+    #[test]
+    fn a_query_is_answered_with_where_the_duty_is_running() {
+        let (mut engine, state, _seen) = engine(true);
+        let here: std::net::SocketAddr = "192.168.1.35:7000".parse().unwrap();
+        state.now_hosting(ServiceId::AIRPLAY, here);
+
+        let query = Message::module(
+            ModuleId::SERVICE,
+            Priority::Control,
+            &ServiceMsg::Query {
+                service: ServiceId::AIRPLAY,
+            },
+        )
+        .unwrap();
+        assert!(engine.handle_message(&query));
+        assert_eq!(
+            engine.outbound,
+            vec![ServiceMsg::Status {
+                service: ServiceId::AIRPLAY,
+                hosting: true,
+                addr: Some(here),
+            }]
+        );
+    }
+
+    /// A machine carrying nothing must say so plainly, or the asker cannot tell
+    /// "no" from a message that never arrived.
+    #[test]
+    fn a_machine_hosting_nothing_answers_that_it_is_not() {
+        let (mut engine, _state, _seen) = engine(true);
+        let query = Message::module(
+            ModuleId::SERVICE,
+            Priority::Control,
+            &ServiceMsg::Query {
+                service: ServiceId::AIRPLAY,
+            },
+        )
+        .unwrap();
+        engine.handle_message(&query);
+        assert_eq!(
+            engine.outbound,
+            vec![ServiceMsg::Status {
+                service: ServiceId::AIRPLAY,
+                hosting: false,
+                addr: None,
+            }]
+        );
+    }
+
+    /// An answer of "yes, here" is what stops this machine starting a second
+    /// receiver — and the address is what lets anything be pointed at it.
+    #[test]
+    fn a_peers_answer_records_both_that_and_where() {
+        let (mut engine, state, _seen) = engine(true);
+        let there: std::net::SocketAddr = "192.168.1.140:7000".parse().unwrap();
+        let status = Message::module(
+            ModuleId::SERVICE,
+            Priority::Control,
+            &ServiceMsg::Status {
+                service: ServiceId::AIRPLAY,
+                hosting: true,
+                addr: Some(there),
+            },
+        )
+        .unwrap();
+        engine.handle_message(&status);
+        assert!(state.is_hosted_elsewhere(ServiceId::AIRPLAY));
+        assert_eq!(state.host_address(ServiceId::AIRPLAY), Some(there));
+    }
+
+    /// The peer that used to host it saying "not me" is how this machine learns
+    /// the duty is free again.
+    #[tokio::test]
+    async fn the_opening_round_asks_every_known_duty() {
+        let (mut engine, _state, _seen) = engine(true);
+        let mut tx = NullTx;
+        engine.pump(&mut tx).await.unwrap();
+        // Queued and sent in one pump, so nothing is left to assert on
+        // `outbound`; asking twice is what the flag prevents.
+        engine.pump(&mut tx).await.unwrap();
+        assert!(engine.queried);
     }
 
     #[test]
