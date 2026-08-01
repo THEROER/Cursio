@@ -44,6 +44,16 @@ windows = { version = "0.61", features = [
 # an image copied in a Windows app arrives as PNG on the peer and vice versa.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 
+# macOS clipboard via NSPasteboard, whose Objective-C is compiled into the
+# crate by build.rs (see native/macos/pasteboard.m). No Rust dependency: the
+# whole surface is six C functions.
+
+[build-dependencies]
+# Unconditional on purpose: a build script is compiled for the host whatever
+# the target is, so gating this behind `cfg(target_os = "macos")` would leave
+# build.rs referring to a crate that is not there on Linux or Windows.
+cc.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true }
 tracing-subscriber.workspace = true

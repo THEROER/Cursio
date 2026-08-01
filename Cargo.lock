@@ -837,6 +837,7 @@ name = "clipboard-core"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "cc",
  "image",
  "serde",
  "thiserror 1.0.69",
