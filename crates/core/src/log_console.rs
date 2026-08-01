@@ -32,9 +32,16 @@ pub fn newest_log() -> Result<PathBuf> {
         if !entry.file_type()?.is_file() {
             continue;
         }
-        // The lock file the daemon uses to claim AirPlay lives here too, and
-        // following it would show an empty window forever.
-        if entry.path().extension().is_some_and(|ext| ext == "lock") {
+        // Matched by name rather than by excluding what is not wanted. The
+        // directory also holds the AirPlay lock and the script this console is
+        // launched from — and that script, written moments before the search,
+        // is reliably the newest file in there. A console following its own
+        // launcher shows one line and never another.
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(LOG_FILE_PREFIX)
+        {
             continue;
         }
         let modified = entry.metadata()?.modified()?;
@@ -50,6 +57,24 @@ pub fn newest_log() -> Result<PathBuf> {
     })
 }
 
+/// What the rotating appender names its files, before the date suffix.
+const LOG_FILE_PREFIX: &str = "cursio.log";
+
+/// What the console window calls itself.
+///
+/// A terminal titles itself after whatever it is running, which here is a path
+/// to a log file inside the platform's data directory — long, identical
+/// between machines up to the username, and telling the user nothing they did
+/// not already know. Every terminal worth the name honours the OSC 0 escape
+/// below, so the name is set from inside the script rather than by arguing with
+/// each emulator's own flag for it.
+const CONSOLE_TITLE: &str = "cursiod";
+
+/// The escape sequence that renames the window, ready to be run by a shell.
+fn title_command() -> String {
+    format!("printf '\\033]0;{CONSOLE_TITLE}\\007'")
+}
+
 /// Open a terminal following `path`.
 pub fn open_console(path: &Path) -> Result<()> {
     spawn_terminal(path).with_context(|| format!("opening a console on {}", path.display()))
@@ -57,14 +82,25 @@ pub fn open_console(path: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn spawn_terminal(path: &Path) -> Result<()> {
-    // `open -a Terminal <file>` opens the file, not a command, so the command
-    // goes through a throwaway script Terminal is asked to run. AppleScript
-    // would avoid the file but needs Automation permission, which is a consent
-    // dialog for something the user just clicked a button to ask for.
-    let script = std::env::temp_dir().join("cursio-logs.command");
+    // The command goes through a throwaway script because `open` launches
+    // files, not command lines. AppleScript would avoid the file but needs
+    // Automation permission — a consent dialog for something the user just
+    // asked for outright.
+    //
+    // Written under the log directory rather than the temp one: a `.command`
+    // in `$TMPDIR` is launched by whatever happens to be registered for the
+    // extension, and when that is an editor — or nothing — `open` reports
+    // success and no window appears.
+    // Named after the daemon, because Terminal falls back to the script's own
+    // name whenever the title has not been set yet.
+    let script = cursio_log::log_dir().join(format!("{CONSOLE_TITLE}.command"));
     std::fs::write(
         &script,
-        format!("#!/bin/sh\nexec tail -n 200 -f {}\n", shell_quote(path)),
+        format!(
+            "#!/bin/sh\n{}\nexec tail -n 200 -f {}\n",
+            title_command(),
+            shell_quote(path)
+        ),
     )?;
     // Executable, or Terminal opens it in an editor instead of running it.
     #[cfg(unix)]
@@ -72,7 +108,17 @@ fn spawn_terminal(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
     }
-    std::process::Command::new("open").arg(&script).spawn()?;
+    // `-a Terminal` names the application instead of trusting the extension's
+    // handler, and `-n` forces a new instance so an already-running Terminal
+    // with no windows still produces one.
+    let status = std::process::Command::new("open")
+        .arg("-a")
+        .arg("Terminal")
+        .arg(&script)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("Terminal refused to open the log script ({status})");
+    }
     Ok(())
 }
 
@@ -82,7 +128,17 @@ fn spawn_terminal(path: &Path) -> Result<()> {
     // /c start` so the console gets a window of its own rather than inheriting
     // this process's (which, for a tray application, is none at all).
     std::process::Command::new("cmd")
-        .args(["/c", "start", "", "powershell", "-NoExit", "-Command"])
+        // The first quoted argument to `start` is the window title, not a
+        // stray empty string: leaving it blank is what left the console named
+        // after the full path to the log.
+        .args([
+            "/c",
+            "start",
+            CONSOLE_TITLE,
+            "powershell",
+            "-NoExit",
+            "-Command",
+        ])
         .arg(format!(
             "Get-Content -Path '{}' -Tail 200 -Wait",
             path.display()
@@ -97,7 +153,7 @@ fn spawn_terminal(path: &Path) -> Result<()> {
     // convention rather than a standard — so the ones people actually have are
     // tried in turn. `-e` is understood by all of them; the newer ones prefer
     // their own spelling but keep accepting this one.
-    let command = format!("tail -n 200 -f {}", shell_quote(path));
+    let command = format!("{}; tail -n 200 -f {}", title_command(), shell_quote(path));
     let candidates = [
         "x-terminal-emulator",
         "gnome-terminal",
