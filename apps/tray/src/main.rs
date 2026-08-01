@@ -166,6 +166,14 @@ fn spawn_daemon(args: &[String]) -> Result<Child> {
 
     let mut command = Command::new(&program);
     command.arg("mesh").args(args);
+    // Detached from whatever started us. The daemon writes to the rotating log
+    // regardless, so inheriting these buys nothing and costs the thing the tray
+    // exists for: on macOS the output lands in the terminal the tray was
+    // launched from, which is exactly the window the user wanted gone.
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     // The daemon is a console binary, and a console binary started from a
     // windowed one is given a console window of its own. Suppressing it is the
     // difference between "starts hidden in the tray" and "starts hidden in the
