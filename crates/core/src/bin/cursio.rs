@@ -381,9 +381,14 @@ async fn main() -> anyhow::Result<()> {
             if no_airplay {
                 mesh.await
             } else {
+                // Asked before binding: a node that stands down still serves,
+                // so a phone pointed at it directly works, but it must not put
+                // a second Cursio in the picker.
+                let announce = airplay_name.is_some() || claims_airplay(&identity).await;
                 match bind_airplay(
                     &identity,
                     AirPlayOpts {
+                        announce,
                         name: airplay_name,
                         port: airplay_port,
                         interface: airplay_interface,
@@ -415,6 +420,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct AirPlayOpts {
+    /// Whether to put this receiver in an iPhone's picker. False on every node
+    /// but the one that won the election; see [`claims_airplay`].
+    announce: bool,
     name: Option<String>,
     port: u16,
     interface: Option<IpAddr>,
@@ -449,7 +457,7 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     let config = ReceiverConfig::new(
         options
             .name
-            .unwrap_or_else(|| airplay_receiver_name(&identity.display_name)),
+            .unwrap_or_else(|| AIRPLAY_RECEIVER_NAME.to_string()),
         identity.peer_id,
         SocketAddr::from(([0, 0, 0, 0], options.port)),
         profile,
@@ -458,27 +466,95 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     let discovery = options
         .interface
         .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
-    let mut receiver = Receiver::bind_with_crypto(config, discovery, crypto)
-        .await?
-        .with_screen_enabled(options.screen_enabled);
+    let mut receiver = if options.announce {
+        Receiver::bind_with_crypto(config, discovery, crypto).await?
+    } else {
+        Receiver::bind_silently(config, discovery, crypto).await?
+    }
+    .with_screen_enabled(options.screen_enabled);
     if let Some(tap) = options.tap {
         receiver = receiver.with_mirror_tap(tap);
     }
     tracing::info!(
         address = %receiver.local_addr()?,
         screen = options.screen_enabled,
+        announced = options.announce,
         "mesh AirPlay RTSP receiver is available"
     );
     Ok(receiver)
 }
 
-fn airplay_receiver_name(display_name: &str) -> String {
-    let hostname = display_name
-        .trim()
-        .trim_end_matches('.')
-        .trim_end_matches(".local");
-    format!("Cursio - {}", sanitize_instance(hostname))
+/// What an iPhone shows in its Screen Mirroring list.
+///
+/// One name for the whole mesh, not one per machine. Which machine actually
+/// decodes the stream is Cursio's business — the phone is picking "my
+/// desktop", and offering it `Cursio - macbook` beside `Cursio - desktop`
+/// makes the user choose between two answers to a question they did not ask.
+/// Exactly one node announces it; see [`claims_airplay`].
+const AIRPLAY_RECEIVER_NAME: &str = "Cursio";
+
+/// Whether this node should be the one visible to an iPhone.
+///
+/// The lowest peer id wins — an arbitrary rule, but a *stable* one every node
+/// computes identically from the trust store without exchanging a message. A
+/// vote would need a protocol, a leader would need the mesh to have one, and
+/// both would need to survive the elected machine being switched off.
+///
+/// Which is the case this also handles: losing the election only stands us
+/// down if the winner is actually there. It is asked directly, over TCP at the
+/// address it was last reached at, because a machine that is off answers
+/// nothing and its record is exactly the one the phone must not be shown.
+async fn claims_airplay(identity: &NodeIdentity) -> bool {
+    let Ok(store) = TrustStore::load() else {
+        // No trust store is a machine with no peers, which makes it the only
+        // candidate by default.
+        return true;
+    };
+    let mut winner: Option<(cursio_protocol::PeerId, Option<SocketAddr>)> =
+        Some((identity.peer_id, None));
+    for peer in store.peers() {
+        if peer.peer_id < winner.expect("seeded above").0 {
+            winner = Some((peer.peer_id, peer.last_addr));
+        }
+    }
+    let (winner_id, winner_addr) = winner.expect("seeded above");
+    if winner_id == identity.peer_id {
+        return true;
+    }
+
+    let Some(addr) = winner_addr else {
+        tracing::info!(
+            peer = %winner_id,
+            "another node should host AirPlay but has never been reached; announcing here instead"
+        );
+        return true;
+    };
+    match tokio::time::timeout(AIRPLAY_ELECTION_PROBE, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => {
+            tracing::info!(
+                peer = %winner_id,
+                %addr,
+                "another node is hosting AirPlay for the mesh; not announcing a second receiver"
+            );
+            false
+        }
+        _ => {
+            tracing::info!(
+                peer = %winner_id,
+                %addr,
+                "the node that would host AirPlay is not answering; announcing here instead"
+            );
+            true
+        }
+    }
 }
+
+/// How long to wait for the elected node before concluding it is not there.
+///
+/// Short on purpose: this runs before the receiver binds, so every millisecond
+/// is startup the user waits through. A machine on the same LAN answers a TCP
+/// connect in single-digit milliseconds or not at all.
+const AIRPLAY_ELECTION_PROBE: Duration = Duration::from_millis(700);
 
 fn read_pairing_password() -> anyhow::Result<Zeroizing<String>> {
     let password = Zeroizing::new(rpassword::prompt_password("Pairing password: ")?);
@@ -1744,15 +1820,11 @@ mod tests {
         assert!(airplay_screen);
     }
 
+    /// The phone is picking "my desktop", not a machine. A name carrying the
+    /// hostname is what produced two entries for one mesh.
     #[test]
-    fn airplay_name_removes_mdns_suffix_and_dots() {
-        assert_eq!(
-            airplay_receiver_name("gaming-pc.local"),
-            "Cursio - gaming-pc"
-        );
-        assert_eq!(
-            airplay_receiver_name("office.pc.local."),
-            "Cursio - office-pc"
-        );
+    fn the_mesh_offers_one_name_whatever_the_hostname_is() {
+        assert_eq!(AIRPLAY_RECEIVER_NAME, "Cursio");
+        assert!(!AIRPLAY_RECEIVER_NAME.contains('-'));
     }
 }

@@ -22,7 +22,10 @@ const ACTIVE_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Receiver {
     listener: TcpListener,
     config: Arc<ReceiverConfig>,
-    _announcement: AirPlayAnnouncement,
+    /// `None` when this node deliberately stays out of the picker: the control
+    /// listener still serves, so a sender pointed at it directly works, but it
+    /// publishes no mDNS record and so does not appear as a second Cursio.
+    _announcement: Option<AirPlayAnnouncement>,
     crypto: Option<Arc<dyn CryptoProvider>>,
     screen_enabled: bool,
     tap: Option<crate::MirrorTap>,
@@ -40,7 +43,7 @@ impl Receiver {
         config: ReceiverConfig,
         discovery: DiscoveryConfig,
     ) -> Result<Self, AirPlayError> {
-        Self::bind_inner(config, discovery, None).await
+        Self::bind_inner(config, discovery, None, true).await
     }
 
     pub async fn bind_with_crypto(
@@ -48,17 +51,41 @@ impl Receiver {
         discovery: DiscoveryConfig,
         crypto: Arc<dyn CryptoProvider>,
     ) -> Result<Self, AirPlayError> {
-        Self::bind_inner(config, discovery, Some(crypto)).await
+        Self::bind_inner(config, discovery, Some(crypto), true).await
+    }
+
+    /// Bind without publishing an mDNS record.
+    ///
+    /// For a node that lost the mesh's AirPlay election: it must not appear in
+    /// a sender's list, but it stays ready to serve so that pointing at it
+    /// directly — or taking over when the announcing node goes away — needs no
+    /// restart.
+    pub async fn bind_silently(
+        config: ReceiverConfig,
+        discovery: DiscoveryConfig,
+        crypto: Arc<dyn CryptoProvider>,
+    ) -> Result<Self, AirPlayError> {
+        Self::bind_inner(config, discovery, Some(crypto), false).await
     }
 
     async fn bind_inner(
         config: ReceiverConfig,
         discovery: DiscoveryConfig,
         crypto: Option<Arc<dyn CryptoProvider>>,
+        announce: bool,
     ) -> Result<Self, AirPlayError> {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
-        let announcement = AirPlayAnnouncement::register(&config, local_addr.port(), &discovery)?;
+        let announcement = if announce {
+            Some(AirPlayAnnouncement::register(
+                &config,
+                local_addr.port(),
+                &discovery,
+            )?)
+        } else {
+            tracing::info!(name = %config.name, "AirPlay receiver bound without announcing");
+            None
+        };
         Ok(Self {
             listener,
             config: Arc::new(config),
