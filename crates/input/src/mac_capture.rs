@@ -319,8 +319,20 @@ unsafe extern "C" fn tap_callback(
     // SAFETY: `event` is a live CGEventRef for the duration of the callback.
     let injected = unsafe { CGEventGetIntegerValueField(event, FIELD_SOURCE_USER_DATA) };
     if injected == INJECTED_TAG {
-        // Our own injection, on its way into this machine. Passing it through
-        // is the point; capturing it would send it straight back.
+        // Our own injection, on its way into this machine. Not captured —
+        // sending it back is an echo — but the edge still has to be watched,
+        // because while this machine holds the cursor it is the *peer* moving
+        // it. Skipping the check here is why the cursor could be sent here and
+        // never pushed back out: every move that could reach the edge is an
+        // injected one.
+        if matches!(event_type, EVENT_MOUSE_MOVED | EVENT_LEFT_MOUSE_DRAGGED) {
+            // SAFETY: a live event for the duration of the callback.
+            unsafe {
+                let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as i32;
+                let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as i32;
+                state.check_edge(event, dx, dy);
+            }
+        }
         return event;
     }
 

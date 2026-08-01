@@ -385,6 +385,15 @@ where
     // driving anybody, and treating it as if it were is what made a Mac's
     // trackpad move a Windows cursor from the moment the link came up.
     let mut driving = false;
+    // Whether we hold the cursor *because the peer sent it to us*, which means
+    // the user is over there and the peer is the one driving.
+    //
+    // It decides what happens when the cursor goes back. A machine that was
+    // given the cursor and pushes it away is returning it, not taking over —
+    // and starting to drive there would grab a keyboard nobody is sitting at,
+    // which is the same "both mice move at once" the `driving` flag exists to
+    // prevent, one handoff later.
+    let mut peer_driving = false;
     on_ownership(Ownership {
         active: am_active,
         panic: false,
@@ -435,6 +444,14 @@ where
         // audio path needs. Module sending happens above, outside the
         // `select!`, so a busy module can't crowd out inbound messages anyway.
         tokio::select! {
+            // Ordered, not random. The branches are already written most- to
+            // least- urgent, and an ownership change queued alongside input has
+            // to be applied first: the same events mean different things either
+            // side of it — forwarded to the peer, or acting locally — and
+            // letting the race decide drops the ones read too early. The timers
+            // above it fire on their own schedule, so nothing starves.
+            biased;
+
             // Just a wakeup: the work happens in the pump phase above, so this
             // arm intentionally does nothing.
             _ = pace.tick() => {}
@@ -486,10 +503,12 @@ where
                     }
                     Some(OwnershipCmd::Toggle) => {
                         am_active = !am_active;
-                        // Going inactive by the hotkey means the user pressed it
-                        // *here*, so this is the machine they are at and its
-                        // input is what should reach the peer.
-                        driving = !am_active;
+                        // Going inactive means the cursor leaves us: we drive
+                        // the peer only if we were not merely holding what it
+                        // lent us. Going active means we hold it ourselves, so
+                        // we drive nobody.
+                        driving = !am_active && !peer_driving;
+                        peer_driving = false;
                         tracing::info!(am_active, driving, "hotkey toggled ownership");
                         on_ownership(Ownership { active: am_active, panic: false, driving });
                         // Peer takes the opposite of our new state.
@@ -513,7 +532,10 @@ where
                         // is how they say so.
                         if !driving {
                             am_active = false;
-                            driving = true;
+                            // Returning what we were lent, or taking over: the
+                            // difference is who put the cursor here.
+                            driving = !peer_driving;
+                            peer_driving = false;
                             tracing::info!(?edge, pos_norm, "cursor crossed peer edge; handing off");
                             on_ownership(Ownership { active: am_active, panic: false, driving });
                             // Peer becomes active, entering on its opposite edge.
@@ -535,6 +557,7 @@ where
                         tracing::warn!("PANIC: forcing control back to this machine");
                         am_active = true;
                         driving = false;
+                        peer_driving = false;
                         on_ownership(Ownership { active: am_active, panic: true, driving });
                         let _ = tx.send(&Message::Grab { active: false }).await;
                     }
@@ -598,6 +621,10 @@ where
                             // Never a reason to *start* driving: the peer asking
                             // us to stand down means the user is over there.
                             driving = false;
+                            // Handed the cursor rather than told to drop it: the
+                            // peer is driving, and giving it back should leave
+                            // us idle rather than make us the driver.
+                            peer_driving = active;
                             // Named for what it is: a Grab message, NOT motion.
                             // The old wording ("peer moved the cursor") sent me
                             // hunting through the motion path while diagnosing a
@@ -614,8 +641,10 @@ where
                         // for cursor placement.
                         if !am_active {
                             am_active = true;
-                            // Whatever we were doing, we hold the cursor now.
+                            // Whatever we were doing, we hold the cursor now —
+                            // and the peer, having pushed it here, is driving.
                             driving = false;
+                            peer_driving = true;
                             tracing::info!(?edge, pos_norm, "cursor crossed in from peer");
                             on_ownership(Ownership { active: am_active, panic: false, driving });
                         }
