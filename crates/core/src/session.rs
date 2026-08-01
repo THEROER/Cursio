@@ -251,16 +251,20 @@ pub struct Ownership {
     /// (which on Wayland would re-arm barriers). Normal handoffs leave this
     /// `false`.
     pub panic: bool,
-    /// Set only for the state a session starts in, never for a handoff.
+    /// Whether this machine is streaming its input to the peer.
     ///
-    /// The difference decides what a machine that does *not* hold the cursor
-    /// does with its own keyboard. Having handed the cursor over, it is the
-    /// machine the user is sitting at, so its input is grabbed and streamed —
-    /// that is what driving the peer means. At startup nobody has handed
-    /// anything anywhere and the user may be at either machine, so grabbing
-    /// there means a Mac's trackpad silently drives a Windows cursor from the
-    /// moment the link comes up, while the Mac's own pointer never moves.
-    pub initial: bool,
+    /// Not the opposite of [`active`](Self::active), and that is the whole
+    /// point. A machine drives the peer only when the user *at this machine*
+    /// sent the cursor across — by the hotkey or by shoving it off the peer
+    /// edge. A machine that has handed nothing over is one the user may not
+    /// even be sitting at, and grabbing its keyboard because it does not hold
+    /// the shared cursor is what made a Mac's trackpad drive a Windows cursor
+    /// from the moment the link came up, while the Mac's own pointer never
+    /// moved again.
+    ///
+    /// Never set by something the peer said: taking the cursor back tells us to
+    /// stop driving, never to start.
+    pub driving: bool,
 }
 
 /// Run the session loop until the peer leaves or the link drops.
@@ -376,10 +380,15 @@ where
     // Ownership: is THIS machine the active one (holds the shared cursor)?
     // Peers start in opposite states so exactly one is active from the outset.
     let mut am_active = cursor.start_active;
+    // Whether this machine is streaming its input to the peer. Not the same as
+    // `!am_active`: a machine that has never handed anything over is not
+    // driving anybody, and treating it as if it were is what made a Mac's
+    // trackpad move a Windows cursor from the moment the link came up.
+    let mut driving = false;
     on_ownership(Ownership {
         active: am_active,
         panic: false,
-        initial: true,
+        driving,
     });
     tracing::info!(am_active, "initial ownership");
 
@@ -477,8 +486,12 @@ where
                     }
                     Some(OwnershipCmd::Toggle) => {
                         am_active = !am_active;
-                        tracing::info!(am_active, "hotkey toggled ownership");
-                        on_ownership(Ownership { active: am_active, panic: false, initial: false });
+                        // Going inactive by the hotkey means the user pressed it
+                        // *here*, so this is the machine they are at and its
+                        // input is what should reach the peer.
+                        driving = !am_active;
+                        tracing::info!(am_active, driving, "hotkey toggled ownership");
+                        on_ownership(Ownership { active: am_active, panic: false, driving });
                         // Peer takes the opposite of our new state.
                         if let Err(e) = tx.send(&Message::Grab { active: !am_active }).await {
                             break Err(SessionError::from(e));
@@ -493,17 +506,23 @@ where
                         tracing::trace!(?edge, "edge crossing ignored: peer cannot hold the cursor");
                     }
                     Some(OwnershipCmd::HandoffToPeer { edge, pos_norm }) => {
-                        if am_active {
+                        // Honoured unless we are already driving the peer. Being
+                        // inactive is not enough to refuse: a machine that has
+                        // handed nothing over is exactly the one the user is
+                        // sitting at, and shoving its cursor at the peer's edge
+                        // is how they say so.
+                        if !driving {
                             am_active = false;
+                            driving = true;
                             tracing::info!(?edge, pos_norm, "cursor crossed peer edge; handing off");
-                            on_ownership(Ownership { active: am_active, panic: false, initial: false });
+                            on_ownership(Ownership { active: am_active, panic: false, driving });
                             // Peer becomes active, entering on its opposite edge.
                             let msg = Message::CrossEdge { edge: edge.opposite(), pos_norm };
                             if let Err(e) = tx.send(&msg).await {
                                 break Err(SessionError::from(e));
                             }
                         } else {
-                            tracing::trace!(?edge, "edge crossing while dormant; ignoring");
+                            tracing::trace!(?edge, "edge crossing while already driving; ignoring");
                         }
                     }
                     // Emergency: unconditionally take control back here. Become
@@ -515,7 +534,8 @@ where
                     Some(OwnershipCmd::Panic) => {
                         tracing::warn!("PANIC: forcing control back to this machine");
                         am_active = true;
-                        on_ownership(Ownership { active: am_active, panic: true, initial: false });
+                        driving = false;
+                        on_ownership(Ownership { active: am_active, panic: true, driving });
                         let _ = tx.send(&Message::Grab { active: false }).await;
                     }
                     None => commands = None,
@@ -523,10 +543,13 @@ where
             }
             local = recv_maybe(&mut captured) => {
                 match local {
-                    // Forward local input only while dormant (active side's
-                    // input already acts locally, so it isn't streamed).
+                    // Forwarded only while actually driving the peer. The
+                    // active side's input already acts locally; so does the
+                    // input of a machine that has handed nothing over, which is
+                    // what lets a second keyboard stay usable on its own
+                    // machine while the first drives across.
                     Some(event) => {
-                        if !am_active {
+                        if driving {
                             // `captured` is an Option<&mut _>, so reborrow through
                             // it rather than handing over an &mut &mut.
                             if let Err(e) =
@@ -572,12 +595,15 @@ where
                         // time, preserving the "exactly one active" invariant.
                         if active != am_active {
                             am_active = active;
+                            // Never a reason to *start* driving: the peer asking
+                            // us to stand down means the user is over there.
+                            driving = false;
                             // Named for what it is: a Grab message, NOT motion.
                             // The old wording ("peer moved the cursor") sent me
                             // hunting through the motion path while diagnosing a
                             // frozen cursor.
                             tracing::info!(am_active, "peer handed ownership over (Grab)");
-                            on_ownership(Ownership { active: am_active, panic: false, initial: false });
+                            on_ownership(Ownership { active: am_active, panic: false, driving });
                         }
                     }
                     Some(Message::CrossEdge { edge, pos_norm }) => {
@@ -588,8 +614,10 @@ where
                         // for cursor placement.
                         if !am_active {
                             am_active = true;
+                            // Whatever we were doing, we hold the cursor now.
+                            driving = false;
                             tracing::info!(?edge, pos_norm, "cursor crossed in from peer");
-                            on_ownership(Ownership { active: am_active, panic: false, initial: false });
+                            on_ownership(Ownership { active: am_active, panic: false, driving });
                         }
                     }
                     Some(Message::Bye) => {

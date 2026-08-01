@@ -170,6 +170,11 @@ struct TapState {
 impl TapState {
     /// Report a crossing if the cursor is being pushed off the peer-facing edge.
     ///
+    /// Checked in every mode but Dormant, deliberately. Idle — nothing handed
+    /// over yet — is exactly the state the machine the user is sitting at
+    /// starts in, and refusing to look at the edge there means the first shove
+    /// of the session does nothing.
+    ///
     /// # Safety
     ///
     /// `event` must be a live `CGEventRef`.
@@ -177,9 +182,9 @@ impl TapState {
         let Some(edge) = self.peer_edge else {
             return;
         };
-        if !self.forwarding.load(Ordering::Relaxed) || self.grabbed.load(Ordering::Relaxed) {
-            // Already driving the peer, or not in a session: there is nothing
-            // to hand over.
+        if self.grabbed.load(Ordering::Relaxed) {
+            // Already driving the peer: the cursor the user is pushing is on
+            // the far machine, and this edge is not the one it would leave by.
             return;
         }
         // SAFETY: the caller guarantees a live event.

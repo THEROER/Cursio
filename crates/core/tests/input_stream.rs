@@ -85,13 +85,25 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
     }
     drop(tx); // capture channel closes after draining
 
-    // Run the initiator/client session. It starts DORMANT, so it forwards its
-    // captured input straight to the active server — no hotkey needed.
+    // The client hands the cursor over before sending anything. Starting
+    // inactive is not enough any more: a machine forwards its input only once
+    // the user *at it* has sent the cursor across, so that a second keyboard
+    // stays usable on its own machine rather than silently driving the first.
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    cmd_tx
+        .send(session::OwnershipCmd::HandoffToPeer {
+            edge: cursio_protocol::Edge::Right,
+            pos_norm: 0.5,
+        })
+        .expect("the session has not started yet, so the channel is open");
+    drop(cmd_tx);
+
     let client_task = tokio::spawn(async move {
         let client: Box<dyn Transport> = Box::new(client);
         // `run_session` borrows the capture channel now: it outlives a single
         // session in real use, so sessions read from it rather than own it.
         let mut rx = rx;
+        let mut cmd_rx = cmd_rx;
         let _ = tokio::time::timeout(
             Duration::from_secs(3),
             session::run_session(
@@ -102,7 +114,7 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
                 },
                 Some(&mut rx),
                 |_| {},
-                None,
+                Some(&mut cmd_rx),
                 |_| {},
                 Vec::new(),
             ),

@@ -1381,17 +1381,15 @@ async fn run_pairing_and_session(
                 return;
             }
             // Three states, not two. Dormant grabs local input and streams it,
-            // because our input now acts on the peer — but that is only true
-            // once we have *handed the cursor over*. The state a session starts
-            // in is Idle: nobody has handed anything anywhere, the user may be
-            // sitting at either machine, and grabbing here is what made a Mac's
-            // trackpad drive a Windows cursor from the moment the link came up.
-            let dormant = !ownership.active && !ownership.initial;
+            // and that is only true while we are actually driving the peer.
+            // Holding the cursor is Active; neither is Idle, where this
+            // machine's own keyboard and mouse simply act on it.
+            let dormant = ownership.driving;
             if let Some(g) = grab_ref.as_ref() {
-                g.set_mode(match (ownership.active, ownership.initial) {
+                g.set_mode(match (ownership.active, ownership.driving) {
                     (true, _) => cursio_input::InputMode::Active,
-                    (false, true) => cursio_input::InputMode::Idle,
-                    (false, false) => cursio_input::InputMode::Dormant,
+                    (false, true) => cursio_input::InputMode::Dormant,
+                    (false, false) => cursio_input::InputMode::Idle,
                 });
             }
             set_cursor_hidden(cursor_ref.borrow_mut().as_mut(), dormant);
