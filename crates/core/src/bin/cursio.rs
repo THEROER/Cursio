@@ -91,7 +91,17 @@ enum Command {
         /// for itself which of its edges faces which peer, and which peer is
         /// nearest in that direction. Left unset every machine sits at `0,0`,
         /// where nothing borders anything and Ctrl+Alt+G is the only handoff.
-        #[arg(long, value_name = "X,Y", default_value = "0,0", value_parser = parse_position)]
+        ///
+        /// `allow_hyphen_values` because half the grid is negative: a machine
+        /// to the left of the origin is `-1,0`, and clap would otherwise read
+        /// the leading minus as the start of another flag and refuse it.
+        #[arg(
+            long,
+            value_name = "X,Y",
+            default_value = "0,0",
+            allow_hyphen_values = true,
+            value_parser = parse_position
+        )]
         at: cursio_protocol::Position,
         /// Which of this machine's screen edges borders the peer, overriding
         /// what `--at` implies. For a layout the grid does not describe.
@@ -1875,6 +1885,27 @@ mod tests {
             at.edge_toward(cursio_protocol::Position::new(0, 0)),
             Some(cursio_protocol::Edge::Left)
         );
+    }
+
+    #[test]
+    /// Half the grid is negative, and clap reads a leading minus as a flag
+    /// unless told otherwise — so `--at -1,0` was refused outright.
+    fn a_machine_left_of_the_origin_can_be_placed() {
+        for argv in [
+            vec!["cursio", "mesh", "--at", "-1,0"],
+            vec!["cursio", "mesh", "--at=-1,0"],
+            vec!["cursio", "mesh", "--at", "-2,-3"],
+        ] {
+            let expected = if argv.last().unwrap().contains("-2") {
+                cursio_protocol::Position::new(-2, -3)
+            } else {
+                cursio_protocol::Position::new(-1, 0)
+            };
+            let Command::Mesh { at, .. } = Cli::try_parse_from(&argv).unwrap().command else {
+                panic!("expected mesh");
+            };
+            assert_eq!(at, expected, "{argv:?}");
+        }
     }
 
     #[test]
