@@ -82,7 +82,17 @@ enum Command {
         /// Capture this machine's mouse/keyboard and share it with peers.
         #[arg(long, default_value_t = false)]
         send_input: bool,
-        /// Which of this machine's screen edges borders the peer.
+        /// Where this machine stands in your layout.
+        ///
+        /// One machine is `center` — the one you sit at — and every other
+        /// names the side of it that it stands on. Each side then works out
+        /// which of its own edges borders which peer, so adding a third
+        /// machine is one flag on that machine and nothing on the others.
+        #[arg(long, value_enum, default_value_t = PositionArg::Center)]
+        position: PositionArg,
+        /// Which of this machine's screen edges borders the peer, overriding
+        /// what `--position` implies. Only needed for a layout the centre-plus-
+        /// spokes model does not describe.
         #[arg(long, value_enum)]
         peer_edge: Option<EdgeArg>,
         /// Share audio with peers.
@@ -204,6 +214,29 @@ impl From<EdgeArg> for cursio_protocol::Edge {
     }
 }
 
+/// A clap-parseable mirror of [`cursio_protocol::Position`].
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PositionArg {
+    /// The machine you sit at; every other borders it.
+    Center,
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
+impl From<PositionArg> for cursio_protocol::Position {
+    fn from(position: PositionArg) -> Self {
+        match position {
+            PositionArg::Center => Self::Center,
+            PositionArg::Left => Self::Left,
+            PositionArg::Right => Self::Right,
+            PositionArg::Above => Self::Above,
+            PositionArg::Below => Self::Below,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AirPlayResolutionArg {
     #[value(name = "1080p")]
@@ -283,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Mesh {
             port,
             send_input,
+            position,
             peer_edge,
             audio,
             audio_render_device,
@@ -341,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
                 identity.clone(),
                 port,
                 send_input,
+                position.into(),
                 peer_edge.map(Into::into),
                 modules,
                 pairing,
@@ -533,6 +568,7 @@ async fn run_mesh(
     identity: NodeIdentity,
     port: u16,
     send_input: bool,
+    position: cursio_protocol::Position,
     peer_edge: Option<cursio_protocol::Edge>,
     modules: cursio_core::module::ModuleRegistry,
     pairing: PairingWindow,
@@ -541,7 +577,7 @@ async fn run_mesh(
         listener,
         _announcement,
         capture,
-    } = start_node(&identity, port, send_input, peer_edge).await?;
+    } = start_node(&identity, port, send_input, position, peer_edge).await?;
 
     // One registry for the whole process, shared by every session. Sessions are
     // single-threaded by design, so `Rc` is the right sharing primitive here.
@@ -598,6 +634,7 @@ async fn run_mesh(
                             pairing.clone(),
                             capture.clone(),
                             peer_edge,
+                            position,
                             modules.clone(),
                         );
                     }
@@ -651,6 +688,7 @@ async fn run_mesh(
                                 pairing.clone(),
                                 capture.clone(),
                                 peer_edge,
+                                position,
                                 modules.clone(),
                             );
                         }
@@ -750,6 +788,8 @@ fn spawn_peer_session(
     // The *window drag* trigger does: it compares the pointer against the
     // peer-facing edge itself, independently of who owns the cursor.
     peer_edge: Option<cursio_protocol::Edge>,
+    // Where this machine stands, from which the edge to each peer is derived.
+    position: cursio_protocol::Position,
     // Shared rather than cloned: the registry is built once per process and read
     // by every session. `Rc` because sessions are deliberately single-threaded
     // (see the mesh module's threading note).
@@ -812,6 +852,7 @@ fn spawn_peer_session(
             false,
             capture_for_session,
             peer_edge,
+            position,
             &modules,
             Some(&mut on_identified),
         )
@@ -877,8 +918,14 @@ async fn join(
 
     // Hello first, so we know who we're pairing with before spending a password
     // on them. Pairing is a one-shot: it runs no modules, so it advertises none.
-    let peer =
-        session::handshake(&mut transport, &identity, session::local_device_kind(), &[]).await?;
+    let peer = session::handshake(
+        &mut transport,
+        &identity,
+        session::local_device_kind(),
+        &[],
+        cursio_protocol::Position::default(),
+    )
+    .await?;
     tracing::info!(peer = %peer.display_name, id = %peer.peer_id, "handshake ok");
 
     let mut store = TrustStore::load()?;
@@ -934,6 +981,10 @@ async fn run_pairing_and_session(
     // the peer". The window-drag trigger does need it — it compares the pointer
     // against the peer-facing edge itself, independently of who owns the cursor.
     peer_edge: Option<cursio_protocol::Edge>,
+    // Where this machine stands. Travels with `peer_edge` because it answers
+    // the same question one step earlier: the edge to *this* peer is derived
+    // from the two positions unless the user named it outright.
+    position: cursio_protocol::Position,
     // Everything this node can run. Built once by the caller; a session takes
     // what negotiation agreed on. Replaces the five per-module flags that used
     // to be threaded through here.
@@ -951,6 +1002,7 @@ async fn run_pairing_and_session(
             role,
             registry: modules,
             peer_edge,
+            position,
             sends_input: capture.is_some(),
         },
         on_identified,
@@ -1437,6 +1489,7 @@ async fn start_node(
     identity: &NodeIdentity,
     port: u16,
     send_input: bool,
+    position: cursio_protocol::Position,
     peer_edge: Option<cursio_protocol::Edge>,
 ) -> anyhow::Result<NodeBase> {
     let listener = TcpListenerHandle::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
@@ -1458,8 +1511,20 @@ async fn start_node(
     // Capture comes up ONCE here, before any session: the portal permission is
     // asked a single time and survives peers coming and going. See
     // [`PersistentCapture`].
+    // A spoke borders only the hub, so it derives its own barrier edge and
+    // needs no `--peer-edge` at all. The hub borders every spoke, so until the
+    // capture backends can arm more than one edge it still has to be told
+    // which — hence the explicit flag winning here.
+    let barrier_edge = peer_edge.or_else(|| position.own_edge());
+    if barrier_edge.is_none() && send_input {
+        tracing::info!(
+            ?position,
+            "no edge to watch: the centre borders every machine, so pass --peer-edge to pick one, \
+             or use Ctrl+Alt+G"
+        );
+    }
     let capture: SharedCapture = std::rc::Rc::new(std::cell::RefCell::new(
-        make_persistent_capture(send_input, peer_edge),
+        make_persistent_capture(send_input, barrier_edge),
     ));
 
     Ok(NodeBase {
@@ -1603,6 +1668,44 @@ mod tests {
 
         let after = Cli::try_parse_from(["cursio", "mesh", "-vv"]).unwrap();
         assert_eq!(after.verbose, 2);
+    }
+
+    #[test]
+    /// The default has to be the hub, or a machine started with no flag at all
+    /// would claim a side of a centre that may not exist.
+    fn a_node_is_the_centre_unless_told_otherwise() {
+        let Command::Mesh {
+            position,
+            peer_edge,
+            ..
+        } = Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
+        else {
+            panic!("expected mesh");
+        };
+        assert!(matches!(position, PositionArg::Center));
+        assert!(peer_edge.is_none());
+        assert_eq!(
+            cursio_protocol::Position::from(position).own_edge(),
+            None,
+            "the centre borders every machine, so it has no single edge"
+        );
+    }
+
+    #[test]
+    /// A spoke needs one word and no edge: the layout answers the rest.
+    fn a_spoke_derives_the_edge_facing_the_centre() {
+        let Command::Mesh { position, .. } =
+            Cli::try_parse_from(["cursio", "mesh", "--position", "right"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected mesh");
+        };
+        assert_eq!(
+            cursio_protocol::Position::from(position).own_edge(),
+            Some(cursio_protocol::Edge::Left),
+            "standing to the right of the centre, the centre is off our left"
+        );
     }
 
     #[test]

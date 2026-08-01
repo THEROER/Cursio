@@ -24,6 +24,9 @@ pub struct PeerHello {
     /// Modules the peer advertised. Raw; use [`PeerHello::negotiate`] to decide
     /// what actually runs.
     pub modules: Vec<ModuleAdvert>,
+    /// Where the peer stands in the layout, which is what decides the edge the
+    /// cursor crosses to reach it.
+    pub position: cursio_protocol::Position,
 }
 
 impl PeerHello {
@@ -87,6 +90,7 @@ pub async fn handshake<T: Transport + ?Sized>(
     local: &crate::NodeIdentity,
     device_kind: DeviceKind,
     modules: &[ModuleAdvert],
+    position: cursio_protocol::Position,
 ) -> Result<PeerHello, SessionError> {
     transport
         .send(&Message::Hello(Hello {
@@ -95,6 +99,7 @@ pub async fn handshake<T: Transport + ?Sized>(
             display_name: local.display_name.clone(),
             device_kind,
             modules: modules.to_vec(),
+            position,
         }))
         .await?;
 
@@ -115,6 +120,7 @@ pub async fn handshake<T: Transport + ?Sized>(
         display_name: hello.display_name,
         device_kind: hello.device_kind,
         modules: hello.modules,
+        position: hello.position,
     })
 }
 

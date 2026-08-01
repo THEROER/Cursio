@@ -35,7 +35,7 @@ pub use files::{
     Chunk, FileError, FileHandle, FileKind, FileMeta, FileReqId, FilesMsg, OpenMode, Volume,
 };
 pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
-pub use input::{Edge, InputEvent, MouseButton};
+pub use input::{Edge, InputEvent, MouseButton, Position};
 pub use window::{
     Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
     WindowMeta, WindowMsg,
@@ -52,8 +52,9 @@ pub use window::{
 /// per-module, so an audio change no longer locks out a peer that only wanted
 /// clipboard. v12 introduced that split; v13 moved module traffic onto
 /// [`Message::Module`], which is what makes it real — a new module now adds no
-/// variant here at all.
-pub const PROTOCOL_VERSION: u16 = 13;
+/// variant here at all. v14 added [`Hello::position`], which every node must
+/// read to place the cursor's neighbours.
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
@@ -220,6 +221,9 @@ pub struct Hello {
     /// Subsystems this node has available on this link. A module runs only if
     /// both sides advertise it compatibly; see [`capability::negotiate`].
     pub modules: Vec<ModuleAdvert>,
+    /// Where this machine stands in the user's layout, so each side can work
+    /// out which of its own edges borders the other. See [`Position`].
+    pub position: Position,
 }
 
 impl Hello {
@@ -235,6 +239,7 @@ impl Hello {
             display_name: display_name.into(),
             device_kind: DeviceKind::Desktop,
             modules: Vec::new(),
+            position: Position::default(),
         }
     }
 }
@@ -393,6 +398,7 @@ mod tests {
                 ModuleAdvert::symmetric(ModuleId::AUDIO, 1),
                 ModuleAdvert::new(ModuleId::INPUT, 1, ModuleRole::Source),
             ],
+            position: Position::Right,
         });
         let bytes = msg.to_bytes().unwrap();
         let back = Message::from_bytes(&bytes).unwrap();

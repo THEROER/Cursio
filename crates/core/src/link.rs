@@ -57,8 +57,13 @@ pub struct Handshake<'a> {
     /// property of the connection — whoever dialled — not a hierarchy.
     pub role: Role,
     pub registry: &'a ModuleRegistry,
-    /// Which of our screen edges borders the peer, when that is configured.
+    /// Which of our screen edges borders the peer, when the user named it
+    /// explicitly. An override: left unset, the edge is derived from the two
+    /// machines' [`Position`](cursio_protocol::Position)s instead, which is the
+    /// arrangement that scales past two machines.
     pub peer_edge: Option<cursio_protocol::Edge>,
+    /// Where this machine stands in the user's layout.
+    pub position: cursio_protocol::Position,
     /// Whether this machine has input to send the peer.
     ///
     /// Follow the *capture*, not a command-line flag: capture is one
@@ -107,12 +112,22 @@ where
         plan.identity,
         session::local_device_kind(),
         &advertised,
+        plan.position,
     )
     .await?;
+    // Derived per link, not per process: with a hub and several spokes the
+    // answer differs for every peer, and the flag can only ever state one of
+    // them. An explicit `--peer-edge` still wins, for a layout the hub model
+    // does not describe.
+    let peer_edge = plan
+        .peer_edge
+        .or_else(|| plan.position.edge_toward(peer.position));
     tracing::info!(
         peer = %peer.display_name,
         id = %peer.peer_id,
         kind = ?peer.device_kind,
+        position = ?peer.position,
+        ?peer_edge,
         "handshake ok"
     );
 
@@ -169,7 +184,7 @@ where
     let ctx = SessionCtx {
         local: plan.identity,
         peer: &peer,
-        peer_edge: plan.peer_edge,
+        peer_edge,
     };
     let modules = plan.registry.build_agreed(&negotiated, &ctx);
 
