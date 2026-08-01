@@ -1597,11 +1597,15 @@ fn spawn_hotkey_filter(
 fn spawn_edge_handoff(
     mut edges: tokio::sync::mpsc::UnboundedReceiver<cursio_input::EdgeCrossing>,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<session::OwnershipCmd>,
-    peer_edge: Option<cursio_protocol::Edge>,
 ) {
     tokio::spawn(async move {
         while let Some(crossing) = edges.recv().await {
-            match peer_edge {
+            // Read now, not captured when this task started. The edge is
+            // learned from the peer's position in its greeting, which is after
+            // this forwarder exists — comparing against the command-line flag
+            // meant every crossing was discarded the moment `--peer-edge`
+            // stopped being required.
+            match cursio_input::peer_edge() {
                 Some(edge) if edge == crossing.edge => {
                     tracing::info!(?edge, pos = crossing.pos_norm, "edge crossing toward peer");
                     let cmd = session::OwnershipCmd::HandoffToPeer {
@@ -1881,7 +1885,7 @@ fn make_persistent_capture(
     // hotkey and an edge crossing are just two ways to ask for the same handoff.
     let (cmd_tx, commands) = tokio::sync::mpsc::unbounded_channel();
     let events = spawn_hotkey_filter(handle.events, cmd_tx.clone(), grab.clone());
-    spawn_edge_handoff(handle.edges, cmd_tx, peer_edge);
+    spawn_edge_handoff(handle.edges, cmd_tx);
 
     Some(PersistentCapture {
         events,

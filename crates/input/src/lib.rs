@@ -126,6 +126,11 @@ pub fn set_peer_edge(edge: Option<cursio_protocol::Edge>) {
     if PEER_EDGE.swap(code, std::sync::atomic::Ordering::SeqCst) != code {
         tracing::info!(?edge, "watching this edge for a crossing toward the peer");
     }
+    // The Windows hook keeps its own copy, because it is read from inside a
+    // low-level hook where nothing may allocate or lock and the module's own
+    // static is what that code already reaches for.
+    #[cfg(target_os = "windows")]
+    win_capture::set_watched_edge(edge);
 }
 
 /// Which edge capture is watching, if any.

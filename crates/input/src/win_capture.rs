@@ -475,6 +475,15 @@ fn push(event: InputEvent) {
 }
 
 /// Encode an optional peer [`Edge`] into the [`PEER_EDGE`] code the hook reads.
+/// Point the jump-zone watch at a different edge while capture is running.
+///
+/// Set from [`crate::set_peer_edge`] once the peer's position is known, which
+/// is after the hooks are installed. An atomic store because the hook reads it,
+/// and a hook cannot take a lock.
+pub(crate) fn set_watched_edge(edge: Option<Edge>) {
+    PEER_EDGE.store(edge_to_code(edge), Ordering::SeqCst);
+}
+
 fn edge_to_code(edge: Option<Edge>) -> usize {
     match edge {
         None => 0,
