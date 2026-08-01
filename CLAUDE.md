@@ -123,6 +123,8 @@ SPAKE2 in symmetric mode: same password both sides, one message each, password n
 
 ### Input
 
+Machines are placed by **grid coordinates** (`--at 1,0`), not by naming a side. A side cannot express order — four machines in a row are all "to the right" of the first, and nothing in that vocabulary says which one the cursor reaches first — and a designated centre would make every other machine depend on one being up, which is what the mesh exists to avoid. `Position::edge_toward` takes the dominant axis (ties break horizontal); `neighbour_across` picks the nearest peer in a direction, so a machine going away lets the one behind it become the neighbour. Positions ride in `Hello`, so the edge is derived per link. `--peer-edge` still overrides, and is currently what arms the capture's barrier: the backends take one edge (a Windows atomic, one Wayland barrier), and arming a set is the change that would let `--at` drive that too.
+
 Wire events are OS-agnostic and **relative** (`dx`/`dy`, never absolute) — absolute positioning teleports the cursor and breaks games reading raw input. The wire keycode namespace is Linux **evdev**; Windows translates both directions through `win_keymap.rs` by physical position via PS/2 scancode set 1.
 
 Capture: evdev on X11-ish Linux, the `InputCapture` portal + libei on Wayland (pointer barriers on screen edges — this is how edge-crossing works there), RawInput on a message-only window on Windows, a `CGEventTap` on macOS (an *active* tap, since deleting the event is the only way to freeze local input; it runs its own `CFRunLoop` on a dedicated thread and must be re-enabled after the system times it out). Injection: two persistent uinput devices on Linux (pointer and keyboard kept separate so the compositor doesn't misclassify them), `SendInput` on Windows, `CGEventPost` at the HID tap on macOS. Cursor hiding: `SetSystemCursor` on Windows, `CGDisplayHideCursor` on macOS (real, but the window server restores it whenever Cursio is not frontmost), an honest logged no-op on Wayland.
@@ -176,13 +178,15 @@ An iPhone speaks Apple's protocols, not Cursio's Hello/Noise session, so `crates
 
 The AES-CTR keystream is continuous for the life of a mirror data connection. Every video payload must pass the decryptor **in wire order**, even one that will be discarded — skipping before decryption corrupts every later frame. Framing errors end the stream; a single undecodable payload is logged and skipped.
 
+**One receiver per mesh, not per machine.** An iPhone is picking "my desktop", so every node advertising `Cursio - <hostname>` made the user choose between two answers to a question they did not ask. The name is plain `Cursio` and exactly one node announces it: the lowest peer id wins, which every node computes identically from the trust store without exchanging a message. Losing only stands a node down if the winner actually answers a TCP probe at its last known address — otherwise the elected machine being switched off would mean no AirPlay at all. A stood-down node still binds and serves, so pointing a sender at it directly works.
+
 `--airplay-screen` (alias `--airplay`) gates video; without it the control receiver still runs and mirror `SETUP` answers 501. `--no-airplay` disables the listener. A busy port 7000 (macOS' own receiver) logs a warning and leaves the mesh running.
 
 **Reaching the rest of the mesh** is `tap.rs` plus `core/src/airplay_window.rs`. The phone never becomes a peer — it has no identity, runs no modules, and is absent from the registry. Instead the receiving host offers its screen through the ordinary window-transfer path: AirPlay produces H.264 and `TileCodec::LossyVideo` already carries H.264, so access units go out untouched and the viewer decodes them with the surrogate it already has. The tap retains the last SPS/PPS and replays them to each new subscriber, because a machine that joins mid-stream would otherwise have nothing to configure a decoder with. `--share-airplay` (requires `--airplay-screen`) turns it on.
 
 ### Wire compatibility
 
-Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 13) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
+Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 14) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
 
 ### Native and tooling directories
 
