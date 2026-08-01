@@ -177,6 +177,92 @@ pub enum OwnershipCmd {
     Panic,
 }
 
+/// Who holds the shared cursor and who is driving whom.
+///
+/// Three booleans that have to move together, extracted because getting them
+/// out of step is not a subtle bug: the machine the user is sitting at stops
+/// reaching the other one, and the only way back is to shove the cursor by hand
+/// from the far end. Every transition below is one line in a log somewhere, and
+/// each was wrong at least once before the tests underneath pinned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorRole {
+    /// This machine holds the shared cursor.
+    active: bool,
+    /// This machine's own input is being streamed to the peer.
+    driving: bool,
+    /// We hold the cursor because the peer sent it, so the user is over there.
+    peer_driving: bool,
+}
+
+impl CursorRole {
+    /// The state a session starts in. Nobody has handed anything anywhere.
+    pub fn new(start_active: bool) -> Self {
+        Self {
+            active: start_active,
+            driving: false,
+            peer_driving: false,
+        }
+    }
+
+    pub fn active(self) -> bool {
+        self.active
+    }
+
+    pub fn driving(self) -> bool {
+        self.driving
+    }
+
+    /// Send the cursor to the peer, by the hotkey or across an edge.
+    ///
+    /// Whether that makes us the driver depends on how we came to hold it:
+    /// returning what was lent leaves us idle, while sending our own cursor
+    /// across means the user is here and our input follows it.
+    pub fn hand_over(&mut self) {
+        self.active = false;
+        self.driving = !self.peer_driving;
+        self.peer_driving = false;
+    }
+
+    /// Take the cursor because the peer sent it here.
+    ///
+    /// The peer is driving — unless we were driving *it*, in which case this is
+    /// the cursor we lent coming home and we are still the user's machine.
+    pub fn take_over(&mut self) {
+        self.active = true;
+        self.peer_driving = !self.driving;
+        self.driving = false;
+    }
+
+    /// The hotkey, which flips whichever side we are on.
+    pub fn toggle(&mut self) {
+        if self.active {
+            self.hand_over();
+        } else {
+            self.take_over();
+        }
+    }
+
+    /// Adopt the state the peer dictates with [`Message::Grab`].
+    pub fn adopt(&mut self, active: bool) {
+        if active {
+            self.take_over();
+        } else {
+            // Told to stand down: the user is over there, so we hold nothing
+            // and drive nobody.
+            self.active = false;
+            self.driving = false;
+            self.peer_driving = false;
+        }
+    }
+
+    /// Emergency: take everything back to this machine.
+    pub fn panic(&mut self) {
+        self.active = true;
+        self.driving = false;
+        self.peer_driving = false;
+    }
+}
+
 /// How a session treats the shared cursor, decided before the loop starts.
 ///
 /// Two machines with screens pass the cursor back and forth, and which one
@@ -379,25 +465,12 @@ where
 
     // Ownership: is THIS machine the active one (holds the shared cursor)?
     // Peers start in opposite states so exactly one is active from the outset.
-    let mut am_active = cursor.start_active;
-    // Whether this machine is streaming its input to the peer. Not the same as
-    // `!am_active`: a machine that has never handed anything over is not
-    // driving anybody, and treating it as if it were is what made a Mac's
-    // trackpad move a Windows cursor from the moment the link came up.
-    let mut driving = false;
-    // Whether we hold the cursor *because the peer sent it to us*, which means
-    // the user is over there and the peer is the one driving.
-    //
-    // It decides what happens when the cursor goes back. A machine that was
-    // given the cursor and pushes it away is returning it, not taking over —
-    // and starting to drive there would grab a keyboard nobody is sitting at,
-    // which is the same "both mice move at once" the `driving` flag exists to
-    // prevent, one handoff later.
-    let mut peer_driving = false;
+    let mut role = CursorRole::new(cursor.start_active);
+    let mut am_active = role.active();
     on_ownership(Ownership {
         active: am_active,
         panic: false,
-        driving,
+        driving: role.driving(),
     });
     tracing::info!(am_active, "initial ownership");
 
@@ -502,15 +575,10 @@ where
                         );
                     }
                     Some(OwnershipCmd::Toggle) => {
-                        am_active = !am_active;
-                        // Going inactive means the cursor leaves us: we drive
-                        // the peer only if we were not merely holding what it
-                        // lent us. Going active means we hold it ourselves, so
-                        // we drive nobody.
-                        driving = !am_active && !peer_driving;
-                        peer_driving = false;
-                        tracing::info!(am_active, driving, "hotkey toggled ownership");
-                        on_ownership(Ownership { active: am_active, panic: false, driving });
+                        role.toggle();
+                        am_active = role.active();
+                        tracing::info!(am_active, driving = role.driving(), "hotkey toggled ownership");
+                        on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
                         // Peer takes the opposite of our new state.
                         if let Err(e) = tx.send(&Message::Grab { active: !am_active }).await {
                             break Err(SessionError::from(e));
@@ -530,14 +598,11 @@ where
                         // handed nothing over is exactly the one the user is
                         // sitting at, and shoving its cursor at the peer's edge
                         // is how they say so.
-                        if !driving {
-                            am_active = false;
-                            // Returning what we were lent, or taking over: the
-                            // difference is who put the cursor here.
-                            driving = !peer_driving;
-                            peer_driving = false;
+                        if !role.driving() {
+                            role.hand_over();
+                            am_active = role.active();
                             tracing::info!(?edge, pos_norm, "cursor crossed peer edge; handing off");
-                            on_ownership(Ownership { active: am_active, panic: false, driving });
+                            on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
                             // Peer becomes active, entering on its opposite edge.
                             let msg = Message::CrossEdge { edge: edge.opposite(), pos_norm };
                             if let Err(e) = tx.send(&msg).await {
@@ -555,10 +620,9 @@ where
                     // recovers even if the link is dead.
                     Some(OwnershipCmd::Panic) => {
                         tracing::warn!("PANIC: forcing control back to this machine");
-                        am_active = true;
-                        driving = false;
-                        peer_driving = false;
-                        on_ownership(Ownership { active: am_active, panic: true, driving });
+                        role.panic();
+                        am_active = role.active();
+                        on_ownership(Ownership { active: am_active, panic: true, driving: role.driving() });
                         let _ = tx.send(&Message::Grab { active: false }).await;
                     }
                     None => commands = None,
@@ -572,7 +636,7 @@ where
                     // what lets a second keyboard stay usable on its own
                     // machine while the first drives across.
                     Some(event) => {
-                        if driving {
+                        if role.driving() {
                             // `captured` is an Option<&mut _>, so reborrow through
                             // it rather than handing over an &mut &mut.
                             if let Err(e) =
@@ -617,20 +681,14 @@ where
                         // the sender flips itself to the opposite at the same
                         // time, preserving the "exactly one active" invariant.
                         if active != am_active {
-                            am_active = active;
-                            // Never a reason to *start* driving: the peer asking
-                            // us to stand down means the user is over there.
-                            driving = false;
-                            // Handed the cursor rather than told to drop it: the
-                            // peer is driving, and giving it back should leave
-                            // us idle rather than make us the driver.
-                            peer_driving = active;
+                            role.adopt(active);
+                            am_active = role.active();
                             // Named for what it is: a Grab message, NOT motion.
                             // The old wording ("peer moved the cursor") sent me
                             // hunting through the motion path while diagnosing a
                             // frozen cursor.
                             tracing::info!(am_active, "peer handed ownership over (Grab)");
-                            on_ownership(Ownership { active: am_active, panic: false, driving });
+                            on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
                         }
                     }
                     Some(Message::CrossEdge { edge, pos_norm }) => {
@@ -640,13 +698,10 @@ where
                         // ownership flip as Grab{active:true}, with entry geometry
                         // for cursor placement.
                         if !am_active {
-                            am_active = true;
-                            // Whatever we were doing, we hold the cursor now —
-                            // and the peer, having pushed it here, is driving.
-                            driving = false;
-                            peer_driving = true;
+                            role.take_over();
+                            am_active = role.active();
                             tracing::info!(?edge, pos_norm, "cursor crossed in from peer");
-                            on_ownership(Ownership { active: am_active, panic: false, driving });
+                            on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
                         }
                     }
                     Some(Message::Bye) => {
@@ -883,5 +938,155 @@ mod tests {
         let setup = CursorSetup::negotiate(DeviceKind::Desktop, id(9), DeviceKind::Headless, id(1));
         assert!(setup.start_active);
         assert!(!setup.peer_takes_cursor);
+    }
+}
+
+#[cfg(test)]
+mod cursor_role_tests {
+    use super::CursorRole;
+
+    /// Two machines, one user, replayed as the pair of state machines they
+    /// really are. Written because the alternative — reading it back off two
+    /// logs side by side — is how three separate versions of this shipped
+    /// broken.
+    struct Pair {
+        /// Where the user is sitting.
+        here: CursorRole,
+        there: CursorRole,
+    }
+
+    impl Pair {
+        fn new() -> Self {
+            Self {
+                here: CursorRole::new(true),
+                there: CursorRole::new(false),
+            }
+        }
+
+        /// The cursor leaves `here` across the shared edge.
+        fn push_across(&mut self) {
+            self.here.hand_over();
+            self.there.take_over();
+        }
+
+        /// And back the other way.
+        fn push_back(&mut self) {
+            self.there.hand_over();
+            self.here.take_over();
+        }
+    }
+
+    /// Nobody streams anything until a cursor has actually been sent
+    /// somewhere. Both keyboards work on their own machines.
+    #[test]
+    fn a_fresh_link_leaves_both_keyboards_at_home() {
+        let pair = Pair::new();
+        assert!(!pair.here.driving());
+        assert!(!pair.there.driving());
+        assert!(pair.here.active());
+        assert!(!pair.there.active());
+    }
+
+    /// Sending the cursor across makes this machine the driver: the user is
+    /// here, so this keyboard is what should reach the other one.
+    #[test]
+    fn sending_the_cursor_across_starts_driving() {
+        let mut pair = Pair::new();
+        pair.push_across();
+        assert!(pair.here.driving(), "the user's machine drives");
+        assert!(pair.there.active(), "the far machine holds the cursor");
+        assert!(!pair.there.driving(), "and drives nobody");
+    }
+
+    /// The failure the whole type exists for. Pushing the cursor back must
+    /// return the *user's* machine to driving on the next crossing — getting it
+    /// backwards left that machine idle, its hooks down, unable to reach the
+    /// peer until the cursor was shoved home by hand from the far end.
+    #[test]
+    fn the_cursor_can_be_sent_across_twice_in_a_row() {
+        let mut pair = Pair::new();
+        pair.push_across();
+        pair.push_back();
+        assert!(pair.here.active(), "the cursor came home");
+        assert!(!pair.here.driving(), "and nothing is being driven");
+        assert!(!pair.there.driving(), "least of all by the empty machine");
+
+        // The second crossing is the one that used to break.
+        pair.push_across();
+        assert!(pair.here.driving(), "the user's machine drives again");
+        assert!(pair.there.active());
+    }
+
+    /// Ten round trips, because a state machine that survives one and not five
+    /// is a state machine with a flag it forgot to clear.
+    #[test]
+    fn many_round_trips_never_leave_both_or_neither_in_charge() {
+        let mut pair = Pair::new();
+        for trip in 0..10 {
+            pair.push_across();
+            assert!(pair.here.driving(), "trip {trip}: nobody driving outbound");
+            assert!(!pair.there.driving(), "trip {trip}: both driving");
+            pair.push_back();
+            assert!(!pair.here.driving(), "trip {trip}: still driving inbound");
+            assert!(!pair.there.driving(), "trip {trip}: far side left driving");
+            assert!(pair.here.active(), "trip {trip}: cursor did not come home");
+        }
+    }
+
+    /// Exactly one machine holds the cursor at every point, which is the
+    /// invariant an input feedback loop violates.
+    #[test]
+    fn exactly_one_machine_holds_the_cursor() {
+        let mut pair = Pair::new();
+        for step in 0..6 {
+            assert_ne!(
+                pair.here.active(),
+                pair.there.active(),
+                "step {step}: both or neither hold it"
+            );
+            if step % 2 == 0 {
+                pair.push_across();
+            } else {
+                pair.push_back();
+            }
+        }
+    }
+
+    /// The hotkey has to work from either side and leave the same state a
+    /// crossing would.
+    #[test]
+    fn the_hotkey_matches_what_an_edge_crossing_does() {
+        let mut hotkey = Pair::new();
+        hotkey.here.toggle();
+        hotkey.there.adopt(true);
+
+        let mut edge = Pair::new();
+        edge.push_across();
+
+        assert_eq!(hotkey.here.driving(), edge.here.driving());
+        assert_eq!(hotkey.here.active(), edge.here.active());
+        assert_eq!(hotkey.there.active(), edge.there.active());
+    }
+
+    /// Being told to stand down is never a reason to start driving: the peer
+    /// saying so means the user is over there.
+    #[test]
+    fn standing_down_never_starts_driving() {
+        let mut role = CursorRole::new(true);
+        role.adopt(false);
+        assert!(!role.active());
+        assert!(!role.driving());
+    }
+
+    /// The panic hotkey exists for a wedged link, so it must reach a state this
+    /// machine can be used from whatever it was doing.
+    #[test]
+    fn panic_returns_everything_to_this_machine() {
+        let mut role = CursorRole::new(false);
+        role.hand_over();
+        assert!(role.driving());
+        role.panic();
+        assert!(role.active());
+        assert!(!role.driving());
     }
 }
