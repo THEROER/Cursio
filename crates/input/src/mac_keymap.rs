@@ -38,6 +38,9 @@ pub enum ModifierStyle {
 impl ModifierStyle {
     /// Apply the style *before* the keycode lookup, so the table itself only
     /// ever states the by-name mapping.
+    ///
+    /// Its own inverse: swapping Control and Meta twice returns the original,
+    /// which is what lets [`mac_to_evdev`] reuse it to undo the swap.
     fn remap(self, evdev: u16) -> u16 {
         match self {
             Self::Mac => evdev,
@@ -64,6 +67,21 @@ pub fn evdev_to_mac(evdev: u16, style: ModifierStyle) -> Option<u16> {
         .map(|(_, mac)| *mac)
 }
 
+/// Translate a macOS virtual keycode back to evdev, for the capture side.
+///
+/// The style is undone here, not applied: a Mac sending Command+C to a PC peer
+/// must put Control on the wire, or the swap that [`evdev_to_mac`] performs
+/// would have to be configured identically on both machines to cancel out.
+pub fn mac_to_evdev(mac_key: u16, style: ModifierStyle) -> Option<u16> {
+    let evdev = TABLE
+        .iter()
+        .find(|(_, mac)| *mac == mac_key)
+        .map(|(code, _)| *code)?;
+    // `remap` swaps Control and Meta, and swapping twice is the identity — so
+    // the same function inverts itself.
+    Some(style.remap(evdev))
+}
+
 /// The `CGEventFlags` bits a macOS modifier keycode contributes, or `None` if
 /// it is not a modifier.
 ///
@@ -85,6 +103,22 @@ pub fn modifier_flags(mac_key: u16) -> Option<u64> {
     };
     Some(mask | side)
 }
+
+/// Every modifier keycode, so the capture side can work out which one moved.
+///
+/// A `flagsChanged` event names a key but carries the whole mask, and the mask
+/// is the only thing that says up or down — so capture compares the new mask
+/// against the previous one, over this list.
+pub const MODIFIER_KEYS: &[u16] = &[
+    VK_CONTROL,
+    VK_RIGHT_CONTROL,
+    VK_SHIFT,
+    VK_RIGHT_SHIFT,
+    VK_OPTION,
+    VK_RIGHT_OPTION,
+    VK_COMMAND,
+    VK_RIGHT_COMMAND,
+];
 
 /// Whether this macOS keycode is Caps Lock.
 ///
@@ -640,6 +674,25 @@ mod tests {
         const KEY_COMPOSE: u16 = 127;
         assert_eq!(evdev_to_mac(KEY_SCROLLLOCK, ModifierStyle::Pc), None);
         assert_eq!(evdev_to_mac(KEY_COMPOSE, ModifierStyle::Pc), None);
+    }
+
+    /// Capture and injection must cancel out, or a Mac driving a PC would send
+    /// the swap that the PC never applied.
+    #[test]
+    fn translating_to_macos_and_back_returns_the_original_key() {
+        for style in [ModifierStyle::Pc, ModifierStyle::Mac] {
+            for &(evdev, _) in TABLE {
+                let mac = evdev_to_mac(evdev, style).expect("in the table");
+                assert_eq!(mac_to_evdev(mac, style), Some(evdev), "style {style:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_modifier_key_reports_flags() {
+        for &key in MODIFIER_KEYS {
+            assert!(modifier_flags(key).is_some(), "keycode {key:#x}");
+        }
     }
 
     /// Two evdev keys landing on one macOS keycode would make the second

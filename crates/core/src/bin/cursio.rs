@@ -1497,8 +1497,9 @@ fn make_persistent_capture(
 /// channel + grab control), or `None` if unavailable / unsupported.
 ///
 /// On Linux this reads `/dev/input/event*` via evdev (needs `input`-group
-/// access). Other platforms have no capture backend yet.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// access) or the Wayland portal; on Windows it installs RawInput hooks; on
+/// macOS it opens a `CGEventTap` (needs the Accessibility permission).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn make_capture(peer_edge: Option<cursio_protocol::Edge>) -> Option<cursio_input::CaptureHandle> {
     match cursio_input::spawn_capture(peer_edge) {
         Ok(handle) => {
@@ -1512,7 +1513,7 @@ fn make_capture(peer_edge: Option<cursio_protocol::Edge>) -> Option<cursio_input
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn make_capture(_peer_edge: Option<cursio_protocol::Edge>) -> Option<cursio_input::CaptureHandle> {
     tracing::warn!("no input capture backend on this platform yet");
     None

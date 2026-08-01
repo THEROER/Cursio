@@ -18,6 +18,8 @@ pub mod lin_cursor;
 #[cfg(target_os = "macos")]
 pub mod mac;
 #[cfg(target_os = "macos")]
+pub mod mac_capture;
+#[cfg(target_os = "macos")]
 pub mod mac_keymap;
 #[cfg(target_os = "linux")]
 pub mod uinput;
@@ -55,6 +57,16 @@ pub fn spawn_capture(
     peer_edge: Option<cursio_protocol::Edge>,
 ) -> Result<CaptureHandle, InputError> {
     win_capture::spawn_capture_with_edge(peer_edge)
+}
+
+/// Start macOS capture through a `CGEventTap`. Same signature as the other
+/// platforms so callers stay platform-agnostic. `peer_edge` is ignored: macOS
+/// has no pointer barriers, so the hotkey is what hands control over.
+#[cfg(target_os = "macos")]
+pub fn spawn_capture(
+    peer_edge: Option<cursio_protocol::Edge>,
+) -> Result<CaptureHandle, InputError> {
+    mac_capture::spawn_capture(peer_edge)
 }
 
 /// Start local input capture, picking the backend for this Linux session.
@@ -181,7 +193,7 @@ pub struct GrabControl {
 
 impl GrabControl {
     /// Create a control paired with the receiver the capture tasks watch.
-    #[cfg(any(target_os = "linux", target_os = "windows", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
     pub(crate) fn new() -> (Self, tokio::sync::watch::Receiver<InputMode>) {
         let (tx, rx) = tokio::sync::watch::channel(InputMode::Idle);
         (Self { tx }, rx)

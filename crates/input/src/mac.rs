@@ -305,7 +305,13 @@ impl EventSource {
             ));
         }
         // SAFETY: `source` is non-null and owned by us.
-        unsafe { CGEventSourceSetLocalEventsSuppressionInterval(source, 0.0) };
+        unsafe {
+            CGEventSourceSetLocalEventsSuppressionInterval(source, 0.0);
+            // Stamps every event posted from this source, so the capture tap
+            // recognises our own injection and does not send it back to the
+            // peer that produced it.
+            CGEventSourceSetUserData(source, crate::mac_capture::INJECTED_TAG);
+        }
         Ok(Self(source))
     }
 }
@@ -524,6 +530,7 @@ const SOURCE_STATE_HID_SYSTEM: i32 = 1;
 extern "C" {
     fn CGEventSourceCreate(state: i32) -> *mut c_void;
     fn CGEventSourceSetLocalEventsSuppressionInterval(source: *mut c_void, seconds: f64);
+    fn CGEventSourceSetUserData(source: *mut c_void, data: i64);
     fn CGEventCreate(source: *mut c_void) -> *mut c_void;
     fn CGEventCreateMouseEvent(
         source: *mut c_void,
