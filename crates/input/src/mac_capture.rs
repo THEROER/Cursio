@@ -23,6 +23,17 @@
 //! is caught and the tap switched straight back on. A tap that is not
 //! re-enabled looks exactly like a keyboard that stopped working.
 //!
+//! ## Finding the edge without barriers
+//!
+//! macOS has nothing like a pointer barrier: no compositor primitive says "the
+//! cursor tried to leave here". What it does have is the absolute position on
+//! every event, which is enough — the cursor is at the edge when it is a pixel
+//! from the union of the displays and still being pushed outwards. That last
+//! part matters: a cursor merely *resting* against the edge, which is where it
+//! ends up any time the user throws the mouse at a menu, is not a request to
+//! leave. Windows draws the same distinction with its jump zone, for the same
+//! reason.
+//!
 //! ## Not capturing our own injection
 //!
 //! [`MacInjector`](crate::MacInjector) stamps every event it posts, and this
@@ -45,24 +56,13 @@ pub(crate) const INJECTED_TAG: i64 = 0x0C_09_50_10;
 
 /// Start capturing this Mac's keyboard and mouse.
 ///
-/// `peer_edge` is accepted for signature parity with the other platforms and
-/// ignored: macOS has no pointer barriers, so edge crossing is not detected
-/// here and the hotkey is what hands control over. The edges channel stays
-/// empty rather than being absent, so callers do not branch on the platform.
+/// `peer_edge` is which of this machine's edges borders the peer. With `None`
+/// nothing is watched and the hotkey is the only handoff.
 pub fn spawn_capture(
     peer_edge: Option<cursio_protocol::Edge>,
 ) -> Result<CaptureHandle, InputError> {
-    if peer_edge.is_some() {
-        tracing::info!(
-            "macOS has no pointer barriers; edge crossing is off and Ctrl+Alt+G hands over control"
-        );
-    }
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
-    // Never written to: macOS detects no crossings. Held so the receiver stays
-    // open and a caller awaiting it simply never wakes, instead of seeing the
-    // channel close and treating capture as dead.
     let (edges_tx, edges) = tokio::sync::mpsc::unbounded_channel::<EdgeCrossing>();
-    std::mem::forget(edges_tx);
 
     let (grab, mode_rx) = GrabControl::new();
     // The callback runs on a run-loop thread and cannot await a watch channel,
@@ -80,6 +80,10 @@ pub fn spawn_capture(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let state = Box::new(TapState {
         events: events_tx,
+        edges: edges_tx,
+        peer_edge,
+        bounds: crate::mac::Bounds::of_all_displays(),
+        crossed: false,
         grabbed,
         forwarding,
         stopped,
@@ -144,6 +148,16 @@ fn spawn_mode_mirror(
 /// What the tap callback needs, handed to it as its user pointer.
 struct TapState {
     events: tokio::sync::mpsc::UnboundedSender<InputEvent>,
+    edges: tokio::sync::mpsc::UnboundedSender<EdgeCrossing>,
+    /// Which of this machine's edges borders the peer, if any.
+    peer_edge: Option<cursio_protocol::Edge>,
+    /// Where the displays end. Read once: a monitor being plugged in mid-session
+    /// is rare, and re-reading it per mouse event would be a syscall at a
+    /// thousand hertz.
+    bounds: crate::mac::Bounds,
+    /// Set once a crossing has been reported, so a cursor parked in the edge
+    /// zone does not report one per event until it moves away.
+    crossed: bool,
     grabbed: Arc<AtomicBool>,
     forwarding: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -154,6 +168,58 @@ struct TapState {
 }
 
 impl TapState {
+    /// Report a crossing if the cursor is being pushed off the peer-facing edge.
+    ///
+    /// # Safety
+    ///
+    /// `event` must be a live `CGEventRef`.
+    unsafe fn check_edge(&mut self, event: *mut c_void, dx: i32, dy: i32) {
+        let Some(edge) = self.peer_edge else {
+            return;
+        };
+        if !self.forwarding.load(Ordering::Relaxed) || self.grabbed.load(Ordering::Relaxed) {
+            // Already driving the peer, or not in a session: there is nothing
+            // to hand over.
+            return;
+        }
+        // SAFETY: the caller guarantees a live event.
+        let at = unsafe { CGEventGetLocation(event) };
+
+        // Pushed outwards, not merely resting. A cursor sits against an edge
+        // constantly — every time the user throws the mouse at a menu — and
+        // treating that as a request to leave would hand the machine away by
+        // accident several times a minute.
+        let outwards = match edge {
+            cursio_protocol::Edge::Left => dx < 0,
+            cursio_protocol::Edge::Right => dx > 0,
+            cursio_protocol::Edge::Top => dy < 0,
+            cursio_protocol::Edge::Bottom => dy > 0,
+        };
+        let at_edge = match edge {
+            cursio_protocol::Edge::Left => at.x <= self.bounds.min_x + EDGE_ZONE,
+            cursio_protocol::Edge::Right => at.x >= self.bounds.max_x - 1.0 - EDGE_ZONE,
+            cursio_protocol::Edge::Top => at.y <= self.bounds.min_y + EDGE_ZONE,
+            cursio_protocol::Edge::Bottom => at.y >= self.bounds.max_y - 1.0 - EDGE_ZONE,
+        };
+        if !at_edge {
+            self.crossed = false;
+            return;
+        }
+        if !outwards || self.crossed {
+            return;
+        }
+        self.crossed = true;
+
+        // Where along the edge, as a fraction: the peer uses it to bring the
+        // cursor in at the same height it left at, rather than in a corner.
+        let pos_norm = if edge.is_horizontal() {
+            fraction(at.x, self.bounds.min_x, self.bounds.max_x)
+        } else {
+            fraction(at.y, self.bounds.min_y, self.bounds.max_y)
+        };
+        let _ = self.edges.send(EdgeCrossing { edge, pos_norm });
+    }
+
     fn emit(&self, event: InputEvent) {
         if !self.forwarding.load(Ordering::Relaxed) {
             return;
@@ -280,6 +346,7 @@ unsafe fn translate(state: &mut TapState, event_type: u32, event: *mut c_void) {
                 let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as i32;
                 let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as i32;
                 if dx != 0 || dy != 0 {
+                    state.check_edge(event, dx, dy);
                     state.emit(InputEvent::PointerMotion { dx, dy });
                 }
             }
@@ -366,6 +433,22 @@ fn button_from_number(number: i64) -> Option<MouseButton> {
     }
 }
 
+/// How close to the edge counts as being at it.
+///
+/// One pixel, matching what Windows uses: a wider zone fires while the cursor
+/// is still visibly inside the screen, which reads as the machine giving itself
+/// away early.
+const EDGE_ZONE: f64 = 1.0;
+
+/// Where `value` sits between `low` and `high`, as `0.0`..=`1.0`.
+fn fraction(value: f64, low: f64, high: f64) -> f32 {
+    let span = high - low;
+    if span <= 0.0 {
+        return 0.5;
+    }
+    (((value - low) / span) as f32).clamp(0.0, 1.0)
+}
+
 /// Every documented `CGEventFlags` mask bit, so the device-dependent bits can
 /// be isolated from them.
 const MODIFIER_MASKS: u64 = 0x00FF_0000;
@@ -438,6 +521,7 @@ extern "C" {
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
     fn CGEventGetIntegerValueField(event: *mut c_void, field: u32) -> i64;
     fn CGEventGetFlags(event: *mut c_void) -> u64;
+    fn CGEventGetLocation(event: *mut c_void) -> crate::mac::Point;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -488,6 +572,23 @@ mod tests {
         assert_ne!(left, right);
         assert_ne!(left, 0);
         assert_ne!(right, 0);
+    }
+
+    #[test]
+    fn a_position_maps_to_its_fraction_along_the_edge() {
+        assert!((fraction(0.0, 0.0, 100.0) - 0.0).abs() < 1e-6);
+        assert!((fraction(50.0, 0.0, 100.0) - 0.5).abs() < 1e-6);
+        assert!((fraction(100.0, 0.0, 100.0) - 1.0).abs() < 1e-6);
+        // Off the end is clamped rather than reported past the edge: the peer
+        // uses this to place a cursor, and 1.4 is not a place.
+        assert!((fraction(140.0, 0.0, 100.0) - 1.0).abs() < 1e-6);
+    }
+
+    /// A single display with zero span would otherwise divide by zero and hand
+    /// the peer a NaN to position a cursor with.
+    #[test]
+    fn a_degenerate_span_answers_the_middle() {
+        assert!((fraction(5.0, 5.0, 5.0) - 0.5).abs() < 1e-6);
     }
 
     #[test]

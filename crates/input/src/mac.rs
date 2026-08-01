@@ -513,15 +513,15 @@ fn mouse_button_number(button: MouseButton) -> u32 {
 /// rectangles a stepped arrangement leaves over are the same ones macOS itself
 /// refuses to put the cursor in.
 #[derive(Debug, Clone, Copy)]
-struct Bounds {
-    min_x: f64,
-    min_y: f64,
-    max_x: f64,
-    max_y: f64,
+pub(crate) struct Bounds {
+    pub(crate) min_x: f64,
+    pub(crate) min_y: f64,
+    pub(crate) max_x: f64,
+    pub(crate) max_y: f64,
 }
 
 impl Bounds {
-    fn of_all_displays() -> Self {
+    pub(crate) fn of_all_displays() -> Self {
         let mut ids = [0_u32; 16];
         let mut count = 0_u32;
         // SAFETY: the buffer holds `ids.len()` entries and the count is written
@@ -594,9 +594,9 @@ struct Rect {
 /// top-left of the main display.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct Point {
-    x: f64,
-    y: f64,
+pub(crate) struct Point {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
 }
 
 // `CGEventType`, from CoreGraphics/CGEventTypes.h.
