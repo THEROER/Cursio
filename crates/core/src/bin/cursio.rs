@@ -416,10 +416,15 @@ async fn main() -> anyhow::Result<()> {
             if no_airplay {
                 mesh.await
             } else {
-                // Asked before binding: a node that stands down still serves,
-                // so a phone pointed at it directly works, but it must not put
-                // a second Cursio in the picker.
-                let announce = airplay_name.is_some() || claims_airplay(&identity).await;
+                // Two questions, in order of cost. Is another cursio on *this*
+                // machine already announcing — which no peer can answer, since
+                // both processes are the same peer — and then, is another
+                // machine doing it. An explicit `--airplay-name` overrides only
+                // the second: a name the user chose does not make a duplicate
+                // on one machine any less of a duplicate.
+                let airplay_lock = claim_local_airplay();
+                let announce = airplay_lock.is_some()
+                    && (airplay_name.is_some() || claims_airplay(&identity).await);
                 match bind_airplay(
                     &identity,
                     AirPlayOpts {
@@ -596,6 +601,49 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
 /// makes the user choose between two answers to a question they did not ask.
 /// Exactly one node announces it; see [`claims_airplay`].
 const AIRPLAY_RECEIVER_NAME: &str = "Cursio";
+
+/// Hold the machine-wide claim on announcing AirPlay, if it is free.
+///
+/// Two `cursio` processes on one machine put two `Cursio` entries in an
+/// iPhone's list, and no amount of talking to *peers* fixes that: both are the
+/// same peer, with the same id, so the mesh election ranks them identically
+/// and both conclude they won. The question "is one already running here" has
+/// a local answer, and a lock file is it.
+///
+/// The returned file must be held for as long as the process announces —
+/// dropping it releases the lock, and closing it on exit is what lets the next
+/// run take over even after a crash, since the kernel releases the lock with
+/// the descriptor rather than leaving a stale file behind.
+fn claim_local_airplay() -> Option<std::fs::File> {
+    take_lock(&cursio_log::log_dir().join("airplay.lock"))
+}
+
+/// Take an exclusive lock on `path`, or report that somebody else holds it.
+fn take_lock(path: &std::path::Path) -> Option<std::fs::File> {
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            // Not fatal: without the lock the worst case is the duplicate entry
+            // this is meant to prevent, which beats refusing to run at all.
+            tracing::warn!(%error, path = %path.display(), "cannot take the AirPlay lock");
+            return None;
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(_) => {
+            tracing::info!(
+                "another cursio on this machine is already announcing AirPlay; not adding a second"
+            );
+            None
+        }
+    }
+}
 
 /// Whether this node should be the one visible to an iPhone.
 ///
@@ -1885,6 +1933,27 @@ mod tests {
             at.edge_toward(cursio_protocol::Position::new(0, 0)),
             Some(cursio_protocol::Edge::Left)
         );
+    }
+
+    /// Two processes on one machine are the same peer, with the same id, so
+    /// the mesh election ranks them identically and both conclude they won.
+    /// The lock is the only thing that tells them apart.
+    #[test]
+    fn only_one_holder_of_the_local_claim_at_a_time() {
+        let path = std::env::temp_dir().join(format!("cursio-test-{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let first = take_lock(&path).expect("the first caller takes it");
+        assert!(
+            take_lock(&path).is_none(),
+            "a second caller must be refused"
+        );
+
+        // Released with the descriptor, so the next run takes over even if the
+        // holder crashed without cleaning up.
+        drop(first);
+        assert!(take_lock(&path).is_some(), "releasing must hand it on");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
