@@ -6,9 +6,11 @@
 //! microseconds once at startup and gives every size for free, at whatever the
 //! display's scale is.
 //!
-//! The mark is a pointer inside a rounded square: the pointer because that is
-//! what Cursio moves between machines, the square because a bare arrow on a
-//! menu bar is indistinguishable from the real cursor sitting on top of it.
+//! The mark is two screens with a pointer crossing between them: the screens
+//! because that is what Cursio joins, the pointer because moving it across
+//! them is what the thing does. A bare arrow was the first attempt and read
+//! badly — on a menu bar it is indistinguishable from the real cursor sitting
+//! on top of it, and it says nothing about there being a second machine.
 //!
 //! Everything is drawn by asking, for each pixel, how far inside the shape it
 //! is — a signed distance — and using that as coverage. That is what makes the
@@ -35,7 +37,7 @@ pub fn draw(size: u32) -> Icon {
             let py = (y as f32 + 0.5) / scale;
 
             let badge = coverage(rounded_square(px, py), scale);
-            let arrow = coverage(pointer(px, py), scale);
+            let arrow = coverage(mark(px, py), scale);
             if badge <= 0.0 {
                 continue;
             }
@@ -98,25 +100,92 @@ fn rounded_square(x: f32, y: f32) -> f32 {
     outside + dx.max(dy).min(0.0) - RADIUS
 }
 
-/// Signed distance to the pointer: a triangle with a tail, the shape every
-/// desktop draws for a mouse cursor.
+/// Signed distance to the whole mark: two screens and the pointer between
+/// them.
 ///
-/// Built from half-plane distances rather than from a polygon fill, so the
-/// same function gives smooth edges and the tail can simply be unioned on.
-fn pointer(x: f32, y: f32) -> f32 {
-    // The arrow head. Wound clockwise in screen coordinates — y grows
-    // downward — so all three edge distances are negative inside and `max`
-    // gives a usable distance. Wound the other way every edge flips sign and
-    // the head silently vanishes, leaving only the tail.
-    let tip = (0.35, 0.24);
-    let left = (0.35, 0.68);
-    let right = (0.64, 0.50);
+/// Unioned rather than drawn in layers, because everything is punched out of
+/// the badge in one pass — a shape that overlapped another would otherwise
+/// show a seam where the two coverages met.
+fn mark(x: f32, y: f32) -> f32 {
+    /// How much dark to leave between the pointer and anything it crosses.
+    const GAP: f32 = 0.028;
+
+    let screens = screen_outline(x, y, 0.135, 0.285, 0.27, 0.22)
+        .min(screen_outline(x, y, 0.595, 0.285, 0.27, 0.22));
+    // Between the two, overlapping both: a pointer parked on one screen says
+    // "there is a cursor", a pointer spanning the gap says it moves across.
+    let arrow = pointer(x, y, 0.395, 0.375, 0.265);
+
+    // Cut a gap out of the screens around the pointer. Both are punched out of
+    // the badge in the same light colour, so where they touched they merged
+    // into one blob and the arrow stopped being an arrow.
+    let separated = screens.max(-(arrow - GAP));
+    separated.min(arrow)
+}
+
+/// A screen: a rounded rectangle outline with a stand under it.
+///
+/// An outline rather than a filled block, so the pointer resting on one is
+/// still visible against it at menu-bar sizes.
+fn screen_outline(x: f32, y: f32, left: f32, top: f32, width: f32, height: f32) -> f32 {
+    const STROKE: f32 = 0.030;
+
+    let outer = rounded_rect(x, y, left, top, width, height, 0.035);
+    // Hollowed by subtracting a smaller copy: the inside of a stroked shape is
+    // the outside of the shape one stroke in.
+    let inner = rounded_rect(
+        x,
+        y,
+        left + STROKE,
+        top + STROKE,
+        width - STROKE * 2.0,
+        height - STROKE * 2.0,
+        0.020,
+    );
+    let frame = outer.max(-inner);
+
+    // The stand, centred under the screen. Short and wide, which is what makes
+    // the rectangle above it read as a display rather than as a window.
+    let stand = rounded_rect(
+        x,
+        y,
+        left + width * 0.5 - 0.045,
+        top + height,
+        0.090,
+        0.045,
+        0.012,
+    );
+    frame.min(stand)
+}
+
+/// Signed distance to a rounded rectangle given by its top-left corner.
+fn rounded_rect(x: f32, y: f32, left: f32, top: f32, width: f32, height: f32, radius: f32) -> f32 {
+    let centre_x = left + width * 0.5;
+    let centre_y = top + height * 0.5;
+    let dx = (x - centre_x).abs() - (width * 0.5 - radius);
+    let dy = (y - centre_y).abs() - (height * 0.5 - radius);
+    let outside = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt();
+    outside + dx.max(dy).min(0.0) - radius
+}
+
+/// Signed distance to a pointer whose tip is at `(tip_x, tip_y)`, `size` tall.
+///
+/// Wound clockwise in screen coordinates — y grows downward — so all three edge
+/// distances are negative inside and `max` gives a usable distance. Wound the
+/// other way every edge flips sign and the head silently vanishes.
+fn pointer(x: f32, y: f32, tip_x: f32, tip_y: f32, size: f32) -> f32 {
+    let tip = (tip_x, tip_y);
+    let left = (tip_x, tip_y + size);
+    let right = (tip_x + size * 0.66, tip_y + size * 0.60);
     let head = triangle(x, y, tip, right, left);
 
-    // The tail, leaving the head's lower edge at the angle a real pointer's
-    // does. Rounded caps, so it meets the head without a visible seam.
-    let tail = bar(x, y, (0.49, 0.58), (0.57, 0.74), 0.052);
-
+    let tail = bar(
+        x,
+        y,
+        (tip_x + size * 0.34, tip_y + size * 0.62),
+        (tip_x + size * 0.52, tip_y + size * 0.98),
+        size * 0.115,
+    );
     head.min(tail)
 }
 
@@ -183,7 +252,7 @@ mod tests {
         assert_eq!(alpha_at(&icon, 63, 0), 0);
         assert_eq!(alpha_at(&icon, 0, 63), 0);
         assert_eq!(alpha_at(&icon, 63, 63), 0);
-        assert_eq!(alpha_at(&icon, 32, 32), 255);
+        assert_eq!(alpha_at(&icon, 32, 32), 255, "the badge fills the middle");
     }
 
     /// The pointer is punched out light; without the contrast the mark is a
