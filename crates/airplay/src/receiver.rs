@@ -22,10 +22,12 @@ const ACTIVE_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Receiver {
     listener: TcpListener,
     config: Arc<ReceiverConfig>,
-    /// `None` when this node deliberately stays out of the picker: the control
-    /// listener still serves, so a sender pointed at it directly works, but it
-    /// publishes no mDNS record and so does not appear as a second Cursio.
-    _announcement: Option<AirPlayAnnouncement>,
+    /// Behind a handle rather than owned outright, because whether this node
+    /// belongs in a sender's list is not settled when it binds. A peer only
+    /// says it is already hosting once a session is up, which is after this —
+    /// so the record has to be withdrawable, and re-publishable when that peer
+    /// goes away. Empty means bound but deliberately invisible.
+    announcement: Announcer,
     crypto: Option<Arc<dyn CryptoProvider>>,
     screen_enabled: bool,
     tap: Option<crate::MirrorTap>,
@@ -76,20 +78,16 @@ impl Receiver {
     ) -> Result<Self, AirPlayError> {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
-        let announcement = if announce {
-            Some(AirPlayAnnouncement::register(
-                &config,
-                local_addr.port(),
-                &discovery,
-            )?)
+        let announcement = Announcer::new(config.clone(), discovery, local_addr.port());
+        if announce {
+            announcement.announce()?;
         } else {
             tracing::info!(name = %config.name, "AirPlay receiver bound without announcing");
-            None
-        };
+        }
         Ok(Self {
             listener,
             config: Arc::new(config),
-            _announcement: announcement,
+            announcement,
             crypto,
             screen_enabled: false,
             tap: None,
@@ -117,6 +115,15 @@ impl Receiver {
 
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
         self.listener.local_addr()
+    }
+
+    /// A handle for publishing or withdrawing the mDNS record while running.
+    ///
+    /// Taken before [`serve`](Self::serve) consumes the receiver, so whoever
+    /// learns that a peer is already hosting can act on it without owning the
+    /// listener.
+    pub fn announcer(&self) -> Announcer {
+        self.announcement.clone()
     }
 
     /// Accept control connections until the listener fails.
@@ -468,5 +475,67 @@ mod tests {
 
         client.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
+    }
+}
+
+/// Publishes and withdraws the receiver's mDNS record on demand.
+///
+/// Cheap to clone; the lock is held only while registering or dropping, and
+/// both are rare — a record changes when a peer appears or goes away, not on
+/// any traffic.
+#[derive(Clone)]
+pub struct Announcer {
+    config: Arc<ReceiverConfig>,
+    discovery: DiscoveryConfig,
+    port: u16,
+    live: Arc<std::sync::Mutex<Option<AirPlayAnnouncement>>>,
+}
+
+impl Announcer {
+    fn new(config: ReceiverConfig, discovery: DiscoveryConfig, port: u16) -> Self {
+        Self {
+            config: Arc::new(config),
+            discovery,
+            port,
+            live: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Publish the record, if it is not already published.
+    pub fn announce(&self) -> Result<(), AirPlayError> {
+        let mut live = self.lock();
+        if live.is_some() {
+            return Ok(());
+        }
+        *live = Some(AirPlayAnnouncement::register(
+            &self.config,
+            self.port,
+            &self.discovery,
+        )?);
+        tracing::info!(name = %self.config.name, "announcing the AirPlay receiver");
+        Ok(())
+    }
+
+    /// Take the record down, leaving the listener serving.
+    ///
+    /// A sender pointed at this machine directly still reaches it; it simply
+    /// stops being offered as a second Cursio in the list.
+    pub fn withdraw(&self) {
+        if self.lock().take().is_some() {
+            tracing::info!(name = %self.config.name, "withdrew the AirPlay announcement");
+        }
+    }
+
+    /// Whether the record is currently published.
+    pub fn is_announced(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<AirPlayAnnouncement>> {
+        // Recovered rather than propagated: a panic while holding this would
+        // otherwise make the receiver permanently unannounceable.
+        self.live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }

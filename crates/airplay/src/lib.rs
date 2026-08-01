@@ -21,7 +21,7 @@ mod tap;
 pub mod video;
 
 pub use config::{ConfigError, DeviceId, ReceiverConfig, Resolution, VideoProfile};
-pub use receiver::Receiver;
+pub use receiver::{Announcer, Receiver};
 pub use tap::{MirrorReader, MirrorTap, MirrorUnit};
 
 /// Errors produced while advertising or serving the receiver.

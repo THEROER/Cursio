@@ -452,9 +452,16 @@ async fn main() -> anyhow::Result<()> {
                             );
                             service_state.now_hosting(ServiceId::AIRPLAY, reachable);
                         }
+                        // Whether this node belongs in a sender's list is not
+                        // settled at bind time: a peer only says it is already
+                        // hosting once a session is up. Watching the answer is
+                        // what finally removes the second `Cursio`.
+                        let follower =
+                            follow_airplay_answers(receiver.announcer(), service_state.clone());
                         tokio::select! {
                             result = mesh => result,
                             result = receiver.serve() => result.map_err(Into::into),
+                            () = follower => Ok(()),
                         }
                     }
                     // A busy port — macOS' own receiver holds 7000 — must not
@@ -535,6 +542,37 @@ impl cursio_core::service_session::ServiceHost for AirPlayHost {
                 Ok(())
             }
             Err(error) => Err(format!("port {} is not available here: {error}", self.port)),
+        }
+    }
+}
+
+/// Keep the mDNS record in step with what peers say they are hosting.
+///
+/// Polled rather than pushed: the answer arrives on whichever peer session
+/// happens to be up, and there may be several coming and going, so the state
+/// they all write is the one thing that outlives them. A second is far below
+/// what a user notices between plugging a machine in and finding one Cursio in
+/// the list, and costs one atomic read.
+async fn follow_airplay_answers(
+    announcer: cursio_airplay::Announcer,
+    state: cursio_core::service_session::ServiceState,
+) {
+    const POLL: Duration = Duration::from_secs(1);
+    loop {
+        tokio::time::sleep(POLL).await;
+        let elsewhere = state.is_hosted_elsewhere(ServiceId::AIRPLAY);
+        if elsewhere && announcer.is_announced() {
+            tracing::info!(
+                addr = ?state.host_address(ServiceId::AIRPLAY),
+                "a peer is hosting AirPlay for the mesh; standing down"
+            );
+            announcer.withdraw();
+        } else if !elsewhere && !announcer.is_announced() {
+            // The peer that was hosting has gone, or said it stopped. Nobody is
+            // offering the mesh a receiver, so this node takes it back.
+            if let Err(error) = announcer.announce() {
+                tracing::warn!(%error, "could not take the AirPlay announcement back");
+            }
         }
     }
 }
