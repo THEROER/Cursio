@@ -688,6 +688,28 @@ mod tests {
         }
     }
 
+    /// The other direction, which is what a Mac driving a Linux or Windows peer
+    /// depends on: Command must arrive there as Control, or the shortcut the
+    /// user meant lands on the Super key and opens the activities overview
+    /// instead of copying.
+    #[test]
+    fn a_mac_sending_command_puts_control_on_the_wire() {
+        assert_eq!(
+            mac_to_evdev(VK_COMMAND, ModifierStyle::Pc),
+            Some(KEY_LEFTCTRL)
+        );
+        assert_eq!(
+            mac_to_evdev(VK_RIGHT_COMMAND, ModifierStyle::Pc),
+            Some(KEY_RIGHTCTRL)
+        );
+        // And the mirror: the Mac's own Control becomes the peer's Super, so
+        // the two keys swap as a pair rather than colliding.
+        assert_eq!(
+            mac_to_evdev(VK_CONTROL, ModifierStyle::Pc),
+            Some(KEY_LEFTMETA)
+        );
+    }
+
     #[test]
     fn every_modifier_key_reports_flags() {
         for &key in MODIFIER_KEYS {

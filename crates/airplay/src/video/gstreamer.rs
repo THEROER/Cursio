@@ -82,6 +82,12 @@ impl HardwareVideoPipeline {
             .map_err(|_| AirPlayError::Video("AirPlay source is not an appsrc".into()))?;
         #[cfg(target_os = "windows")]
         let window = adopt_window(&pipeline, size);
+        // Linux ignores the configured size, and says so rather than pretending
+        // otherwise: `glimagesink` and `waylandsink` open their own window and
+        // take it from the stream. Sizing it would mean handing them a window
+        // of ours, as the Windows path does — a GTK one, since a Wayland client
+        // needs a toolkit to have a surface at all. Scaling the picture instead
+        // is not the same thing and would distort a portrait phone.
         #[cfg(not(target_os = "windows"))]
         let _ = size;
         pipeline
