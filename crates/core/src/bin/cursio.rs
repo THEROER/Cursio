@@ -456,8 +456,11 @@ async fn main() -> anyhow::Result<()> {
                         // settled at bind time: a peer only says it is already
                         // hosting once a session is up. Watching the answer is
                         // what finally removes the second `Cursio`.
-                        let follower =
-                            follow_airplay_answers(receiver.announcer(), service_state.clone());
+                        let follower = follow_airplay_answers(
+                            receiver.announcer(),
+                            service_state.clone(),
+                            airplay_lock.is_some(),
+                        );
                         tokio::select! {
                             result = mesh => result,
                             result = receiver.serve() => result.map_err(Into::into),
@@ -556,6 +559,11 @@ impl cursio_core::service_session::ServiceHost for AirPlayHost {
 async fn follow_airplay_answers(
     announcer: cursio_airplay::Announcer,
     state: cursio_core::service_session::ServiceState,
+    // Whether this process may announce at all. False when another cursio on
+    // this machine holds the claim — a question no peer can answer, since both
+    // processes are the same peer, so it has to be carried in rather than
+    // rediscovered here.
+    may_announce: bool,
 ) {
     const POLL: Duration = Duration::from_secs(1);
     loop {
@@ -567,7 +575,7 @@ async fn follow_airplay_answers(
                 "a peer is hosting AirPlay for the mesh; standing down"
             );
             announcer.withdraw();
-        } else if !elsewhere && !announcer.is_announced() {
+        } else if may_announce && !elsewhere && !announcer.is_announced() {
             // The peer that was hosting has gone, or said it stopped. Nobody is
             // offering the mesh a receiver, so this node takes it back.
             if let Err(error) = announcer.announce() {
