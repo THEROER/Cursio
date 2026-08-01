@@ -104,7 +104,13 @@ enum Command {
         )]
         at: cursio_protocol::Position,
         /// Which of this machine's screen edges borders the peer, overriding
-        /// what `--at` implies. For a layout the grid does not describe.
+        /// what `--at` implies.
+        ///
+        /// Rarely needed: with `--at` set on both machines each side works the
+        /// edge out from the two positions once they greet each other. Kept for
+        /// a layout the grid does not describe, and for **Wayland**, whose
+        /// pointer barriers are placed when capture starts and so cannot follow
+        /// a peer that connects later.
         #[arg(long, value_enum)]
         peer_edge: Option<EdgeArg>,
         /// Share audio with peers.
@@ -863,7 +869,7 @@ async fn run_mesh(
         listener,
         _announcement,
         capture,
-    } = start_node(&identity, port, send_input, position, peer_edge).await?;
+    } = start_node(&identity, port, send_input, peer_edge).await?;
 
     // One registry for the whole process, shared by every session. Sessions are
     // single-threaded by design, so `Rc` is the right sharing primitive here.
@@ -1294,6 +1300,12 @@ async fn run_pairing_and_session(
         on_identified,
     )
     .await?;
+    // Now that the peer has said where it stands, capture can watch the edge
+    // between us. This is what makes `--peer-edge` unnecessary: both machines
+    // already know, and the flag only existed because the barrier had to be
+    // armed before anyone had spoken.
+    cursio_input::set_peer_edge(link.peer_edge);
+
     let peer = link.peer;
     let mut secure = link.transport;
     let modules = link.modules;
@@ -1781,7 +1793,6 @@ async fn start_node(
     identity: &NodeIdentity,
     port: u16,
     send_input: bool,
-    position: cursio_protocol::Position,
     peer_edge: Option<cursio_protocol::Edge>,
 ) -> anyhow::Result<NodeBase> {
     let listener = TcpListenerHandle::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
@@ -1809,13 +1820,6 @@ async fn start_node(
     // peer has said hello, and the backends take a single edge (a Windows
     // atomic, one Wayland barrier). Arming every edge is the change that closes
     // this, and it belongs in those backends rather than here.
-    if peer_edge.is_none() && send_input && position != cursio_protocol::Position::default() {
-        tracing::info!(
-            ?position,
-            "placed on the layout grid, but no edge is being watched yet: pass --peer-edge to arm \
-             one, or hand over with Ctrl+Alt+G"
-        );
-    }
     let capture: SharedCapture = std::rc::Rc::new(std::cell::RefCell::new(
         make_persistent_capture(send_input, peer_edge),
     ));

@@ -88,6 +88,11 @@ pub struct Link {
     pub modules: Vec<Box<dyn SessionModule>>,
     /// Who holds the shared cursor, and whether the peer can hold it at all.
     pub cursor: CursorSetup,
+    /// Which of this machine's edges borders this peer, derived from the two
+    /// positions unless the user named it outright. The caller points capture
+    /// at it: the answer is only knowable once the peer has said hello, which
+    /// is after capture exists.
+    pub peer_edge: Option<cursio_protocol::Edge>,
 }
 
 /// Run steps 1–5 on an open transport.
@@ -196,6 +201,7 @@ where
     );
 
     Ok(Link {
+        peer_edge,
         transport: Box::new(secure),
         peer,
         modules,

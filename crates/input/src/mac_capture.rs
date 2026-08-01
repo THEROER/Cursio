@@ -56,11 +56,13 @@ pub(crate) const INJECTED_TAG: i64 = 0x0C_09_50_10;
 
 /// Start capturing this Mac's keyboard and mouse.
 ///
-/// `peer_edge` is which of this machine's edges borders the peer. With `None`
-/// nothing is watched and the hotkey is the only handoff.
+/// `peer_edge` is a starting value only: the real answer arrives with the
+/// peer's greeting, and [`crate::set_peer_edge`] is what carries it here after
+/// the tap is already running.
 pub fn spawn_capture(
     peer_edge: Option<cursio_protocol::Edge>,
 ) -> Result<CaptureHandle, InputError> {
+    crate::set_peer_edge(peer_edge);
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (edges_tx, edges) = tokio::sync::mpsc::unbounded_channel::<EdgeCrossing>();
 
@@ -81,7 +83,6 @@ pub fn spawn_capture(
     let state = Box::new(TapState {
         events: events_tx,
         edges: edges_tx,
-        peer_edge,
         bounds: crate::mac::Bounds::of_all_displays(),
         crossed: false,
         grabbed,
@@ -149,8 +150,6 @@ fn spawn_mode_mirror(
 struct TapState {
     events: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     edges: tokio::sync::mpsc::UnboundedSender<EdgeCrossing>,
-    /// Which of this machine's edges borders the peer, if any.
-    peer_edge: Option<cursio_protocol::Edge>,
     /// Where the displays end. Read once: a monitor being plugged in mid-session
     /// is rare, and re-reading it per mouse event would be a syscall at a
     /// thousand hertz.
@@ -179,7 +178,10 @@ impl TapState {
     ///
     /// `event` must be a live `CGEventRef`.
     unsafe fn check_edge(&mut self, event: *mut c_void, dx: i32, dy: i32) {
-        let Some(edge) = self.peer_edge else {
+        // Read per event rather than captured at startup: the answer comes
+        // from the peer's position in its greeting, which arrives after this
+        // tap already exists.
+        let Some(edge) = crate::peer_edge() else {
             return;
         };
         if self.grabbed.load(Ordering::Relaxed) {

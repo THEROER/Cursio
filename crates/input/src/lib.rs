@@ -101,6 +101,44 @@ pub fn spawn_capture(
     }
 }
 
+/// Which of this machine's edges borders the peer the cursor would leave to.
+///
+/// Machine-wide rather than per session, and settable after capture has
+/// started, because those are the two facts that decide where it lives. There
+/// is one physical mouse, so there is one edge it can leave by; and the answer
+/// comes from the peer's position in the greeting, which arrives seconds
+/// *after* the barrier has to exist. Passing it at construction meant the user
+/// had to state on the command line something both machines already knew.
+///
+/// Encoded as a number so the capture backends — which read it from a signal
+/// handler, a Win32 hook and a `CFRunLoop` callback — can do so without a lock.
+static PEER_EDGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Tell capture which edge borders the peer. `None` turns edge crossing off.
+pub fn set_peer_edge(edge: Option<cursio_protocol::Edge>) {
+    let code = match edge {
+        None => 0,
+        Some(cursio_protocol::Edge::Left) => 1,
+        Some(cursio_protocol::Edge::Right) => 2,
+        Some(cursio_protocol::Edge::Top) => 3,
+        Some(cursio_protocol::Edge::Bottom) => 4,
+    };
+    if PEER_EDGE.swap(code, std::sync::atomic::Ordering::SeqCst) != code {
+        tracing::info!(?edge, "watching this edge for a crossing toward the peer");
+    }
+}
+
+/// Which edge capture is watching, if any.
+pub fn peer_edge() -> Option<cursio_protocol::Edge> {
+    match PEER_EDGE.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => Some(cursio_protocol::Edge::Left),
+        2 => Some(cursio_protocol::Edge::Right),
+        3 => Some(cursio_protocol::Edge::Top),
+        4 => Some(cursio_protocol::Edge::Bottom),
+        _ => None,
+    }
+}
+
 /// A screen-edge crossing detected by the capture backend: the shared cursor
 /// was shoved past `edge` at `pos_norm` along it (`0.0`..=`1.0`). The session
 /// turns this into an edge-crossing ownership handoff (if that edge borders the
