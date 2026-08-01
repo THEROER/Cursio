@@ -56,6 +56,9 @@ impl ModuleId {
     pub const WINDOW: ModuleId = ModuleId(4);
     /// Filesystem sharing: the peer's volumes, mounted here as ordinary folders.
     pub const FILES: ModuleId = ModuleId(5);
+    /// Asking a peer to carry a duty this machine cannot; see
+    /// [`service`](crate::service).
+    pub const SERVICE: ModuleId = ModuleId(6);
 
     /// Human-readable name, for logs and diagnostics. Unknown ids are rendered
     /// numerically rather than hidden — that is exactly the case worth seeing in
@@ -67,6 +70,7 @@ impl ModuleId {
             ModuleId::CLIPBOARD => "clipboard",
             ModuleId::WINDOW => "window",
             ModuleId::FILES => "files",
+            ModuleId::SERVICE => "service",
             _ => "unknown",
         }
     }

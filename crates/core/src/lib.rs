@@ -28,6 +28,7 @@ pub mod logging;
 pub mod mesh;
 pub mod module;
 pub mod registry;
+pub mod service_session;
 pub mod session;
 pub mod window_session;
 

@@ -27,6 +27,7 @@ use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
 use cursio_core::session::{self};
 use cursio_core::NodeIdentity;
+use cursio_protocol::ServiceId;
 use cursio_transport::discovery;
 use cursio_transport::discovery::DiscoveryConfig;
 use cursio_transport::pairing::{self, Role, TrustStore};
@@ -347,6 +348,14 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 PairingWindow::closed()
             };
+            // Everything the service module needs, built before the registry
+            // so the same state is read by the AirPlay bring-up below.
+            let service_state = cursio_core::service_session::ServiceState::new();
+            let service_reasons: Arc<
+                std::sync::Mutex<std::collections::HashMap<ServiceId, String>>,
+            > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let airplay_claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
             // One tap feeds both the local window and every peer that asks
             // for the phone's screen; without `--share-airplay` there is no
             // tap at all and the receiver keeps the stream to itself.
@@ -362,12 +371,28 @@ async fn main() -> anyhow::Result<()> {
                 },
                 clipboard,
                 files,
-                share_window,
-                share_window_title,
-                keep_window_visible,
-                airplay_tap
-                    .clone()
-                    .map(|tap| (tap, u32::from(width), u32::from(height))),
+                WindowOpts {
+                    share: share_window,
+                    title_hint: share_window_title,
+                    keep_visible: keep_window_visible,
+                    airplay: airplay_tap
+                        .clone()
+                        .map(|tap| (tap, u32::from(width), u32::from(height))),
+                },
+                ServiceSetup {
+                    state: service_state.clone(),
+                    reasons: service_reasons.clone(),
+                    make_host: {
+                        let claimed = airplay_claimed.clone();
+                        let port = airplay_port;
+                        Box::new(move || {
+                            Box::new(AirPlayHost {
+                                port,
+                                claimed: claimed.clone(),
+                            })
+                        })
+                    },
+                },
             );
             let mesh = run_mesh(
                 identity.clone(),
@@ -406,16 +431,85 @@ async fn main() -> anyhow::Result<()> {
                             result = receiver.serve() => result.map_err(Into::into),
                         }
                     }
-                    // A busy port (e.g. macOS' own AirPlay receiver) must not
-                    // take the whole mesh down with it.
+                    // A busy port — macOS' own receiver holds 7000 — must not
+                    // take the mesh down, and must not end in silence either.
+                    // The machine says what it could not do, and every session
+                    // asks its peer to host it instead; the phone then mirrors
+                    // to that peer, which streams the picture back here through
+                    // the ordinary window path. Which machine holds the socket
+                    // stops being something the user has to know.
                     Err(error) => {
-                        tracing::warn!(%error, "AirPlay receiver unavailable, continuing without it");
+                        tracing::warn!(
+                            %error,
+                            "cannot host AirPlay here; asking a peer to host it for the mesh"
+                        );
+                        service_reasons
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(ServiceId::AIRPLAY, error.to_string());
+                        service_state.needs_host(ServiceId::AIRPLAY);
                         mesh.await
                     }
                 }
             }
         }
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
+    }
+}
+
+/// Window-transfer options, grouped for the same reason [`AudioOpts`] is: the
+/// registry builder should gain a struct field per subsystem, not four
+/// positional arguments.
+struct WindowOpts {
+    share: bool,
+    title_hint: String,
+    keep_visible: bool,
+    /// Set when this node shares whatever an iPhone mirrors to it, rather than
+    /// one of its own windows.
+    airplay: Option<(cursio_airplay::MirrorTap, u32, u32)>,
+}
+
+/// What the service module needs, gathered so `module_registry` takes one
+/// parameter rather than three.
+struct ServiceSetup {
+    state: cursio_core::service_session::ServiceState,
+    reasons: Arc<std::sync::Mutex<std::collections::HashMap<ServiceId, String>>>,
+    make_host: Box<dyn Fn() -> Box<dyn cursio_core::service_session::ServiceHost> + Send + Sync>,
+}
+
+/// Answers a peer's request to host AirPlay by actually binding the port.
+///
+/// Trying is the only honest answer: "can this machine hold 7000" has no
+/// cheaper test, and a node that said yes without checking would leave the
+/// asking machine believing a receiver exists.
+struct AirPlayHost {
+    port: u16,
+    /// Set when this machine has taken the duty on, so the receiver task is
+    /// started once rather than per request.
+    claimed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl cursio_core::service_session::ServiceHost for AirPlayHost {
+    fn accept(&mut self, service: ServiceId, _reason: &str) -> Result<(), String> {
+        if service != ServiceId::AIRPLAY {
+            return Err(format!("this machine does not host {service}"));
+        }
+        if self.claimed.load(std::sync::atomic::Ordering::SeqCst) {
+            // Already ours, from an earlier peer's request. Saying yes again is
+            // correct: the duty is being carried.
+            return Ok(());
+        }
+        // A blocking probe, deliberately: it is one syscall pair, and the
+        // answer must be true before the acceptance leaves this machine.
+        match std::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], self.port))) {
+            Ok(listener) => {
+                drop(listener);
+                self.claimed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) => Err(format!("port {} is not available here: {error}", self.port)),
+        }
     }
 }
 
@@ -589,10 +683,8 @@ fn module_registry(
     audio: &AudioOpts,
     clipboard: bool,
     files: bool,
-    share_window: bool,
-    share_window_title: String,
-    keep_window_visible: bool,
-    airplay: Option<(cursio_airplay::MirrorTap, u32, u32)>,
+    window: WindowOpts,
+    services: ServiceSetup,
 ) -> cursio_core::module::ModuleRegistry {
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut registry = cursio_core::module::ModuleRegistry::new()
@@ -606,10 +698,15 @@ fn module_registry(
         .with(Box::new(cursio_core::window_session::WindowFactory {
             // Sharing the phone's screen is window transfer, so the module has
             // to be running even when no local window was asked for.
-            enabled: share_window || airplay.is_some(),
-            title_hint: share_window_title,
-            keep_visible: keep_window_visible,
-            airplay,
+            enabled: window.share || window.airplay.is_some(),
+            title_hint: window.title_hint,
+            keep_visible: window.keep_visible,
+            airplay: window.airplay,
+        }))
+        .with(Box::new(cursio_core::service_session::ServiceFactory {
+            state: services.state,
+            reasons: services.reasons,
+            make_host: services.make_host,
         }));
 
     // File sharing needs a mount implementation: FUSE on Linux, WinFsp on

@@ -13,6 +13,7 @@ pub mod clipboard;
 pub mod files;
 pub mod frame;
 pub mod input;
+pub mod service;
 pub mod window;
 
 pub use capability::{
@@ -36,6 +37,7 @@ pub use files::{
 };
 pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
 pub use input::{neighbour_across, Edge, InputEvent, MouseButton, Position};
+pub use service::{ServiceId, ServiceMsg};
 pub use window::{
     Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
     WindowMeta, WindowMsg,
