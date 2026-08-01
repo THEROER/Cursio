@@ -271,6 +271,15 @@ impl InputInjector for MacInjector {
         if active && !self.active {
             self.position = current_pointer_position();
             self.bounds = Bounds::of_all_displays();
+            // Nothing may carry over from before. While inactive every event is
+            // dropped, including the key-up half of a modifier — so Command can
+            // be recorded as held with no key left to release it, and from then
+            // on the mask is stamped onto everything. A drag with a modifier
+            // held is not a drag: it resizes the window instead of moving what
+            // is under the pointer, which is exactly what "it stretches
+            // windows" looks like.
+            let _ = self.release_all();
+            self.flags &= mac_keymap::CAPS_LOCK_FLAG;
         }
         self.active = active;
     }
