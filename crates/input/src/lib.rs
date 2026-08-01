@@ -20,6 +20,8 @@ pub mod mac;
 #[cfg(target_os = "macos")]
 pub mod mac_capture;
 #[cfg(target_os = "macos")]
+pub mod mac_cursor;
+#[cfg(target_os = "macos")]
 pub mod mac_keymap;
 #[cfg(target_os = "linux")]
 pub mod uinput;
@@ -38,6 +40,8 @@ pub mod wl_capture;
 pub use lin_cursor::LinuxCursor;
 #[cfg(target_os = "macos")]
 pub use mac::MacInjector;
+#[cfg(target_os = "macos")]
+pub use mac_cursor::MacCursor;
 #[cfg(target_os = "macos")]
 pub use mac_keymap::ModifierStyle;
 #[cfg(target_os = "linux")]

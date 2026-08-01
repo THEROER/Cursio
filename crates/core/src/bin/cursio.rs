@@ -1336,7 +1336,8 @@ fn make_injector() -> Option<Box<dyn cursio_input::InputInjector>> {
 
 /// Create the platform cursor controller (hide/show our own cursor), or `None`
 /// if unsupported. Linux is currently a no-op backend (Wayland can't hide; X11
-/// XFixes not wired yet); Windows really hides the cursor.
+/// XFixes not wired yet); Windows really hides the cursor, and macOS hides it
+/// for as long as Cursio is the frontmost application.
 fn make_cursor() -> Option<Box<dyn cursio_input::CursorControl>> {
     #[cfg(target_os = "linux")]
     {
@@ -1366,7 +1367,21 @@ fn make_cursor() -> Option<Box<dyn cursio_input::CursorControl>> {
             }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        use cursio_input::CursorControl as _;
+        match cursio_input::MacCursor::new() {
+            Ok(c) => {
+                tracing::info!(backend = c.backend(), "cursor control ready");
+                Some(Box::new(c))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no cursor control");
+                None
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         None
     }
