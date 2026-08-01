@@ -32,8 +32,8 @@ pub struct AirPlayAnnouncement {
 
 #[cfg(target_os = "macos")]
 pub struct AirPlayAnnouncement {
-    _airplay: astro_dnssd::RegisteredDnsService,
-    _raop: astro_dnssd::RegisteredDnsService,
+    _airplay: crate::bonjour::BonjourService,
+    _raop: crate::bonjour::BonjourService,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -85,23 +85,25 @@ impl AirPlayAnnouncement {
     }
 }
 
+/// Register through macOS' own responder.
+///
+/// The `ServiceInfo` is built the same way as on every other platform and then
+/// only its TXT properties are used: `mdns-sd` cannot publish here (see
+/// [`crate::bonjour`]), but keeping one description of the records means the
+/// two paths cannot drift apart in what they advertise.
 #[cfg(target_os = "macos")]
 fn native_register(
     service_type: &str,
     instance: &str,
     port: u16,
     info: &ServiceInfo,
-) -> Result<astro_dnssd::RegisteredDnsService, AirPlayError> {
-    let properties = info
+) -> Result<crate::bonjour::BonjourService, AirPlayError> {
+    let properties: Vec<(String, String)> = info
         .get_properties()
         .iter()
         .map(|property| (property.key().to_string(), property.val_str().to_string()))
         .collect();
-    astro_dnssd::DNSServiceBuilder::new(service_type, port)
-        .with_name(instance)
-        .with_txt_record(properties)
-        .register()
-        .map_err(|error| AirPlayError::Mdns(format!("{error:?}")))
+    crate::bonjour::BonjourService::register(service_type, instance, port, &properties)
 }
 
 #[cfg(not(target_os = "macos"))]

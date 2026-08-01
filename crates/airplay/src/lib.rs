@@ -7,6 +7,8 @@
 //! handling, and mirroring media setup.
 
 mod audio;
+#[cfg(target_os = "macos")]
+mod bonjour;
 mod config;
 pub mod crypto;
 pub mod discovery;
