@@ -12,18 +12,22 @@ use tokio::sync::mpsc;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, EndPaint, InvalidateRect, SetBrushOrgEx, SetStretchBltMode, StretchDIBits,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, MSG, PM_REMOVE, SW_SHOW,
-    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, MSG,
+    PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE,
+    WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::framebuffer::Framebuffer;
@@ -150,6 +154,50 @@ fn evdev_from_vk(vk: u16) -> Option<u16> {
     })
 }
 
+/// Size the window so its *client area* is exactly `width` × `height` device
+/// pixels — the host's own resolution, blitted 1:1.
+///
+/// `CreateWindowExW` takes the outer size, which includes the frame and the
+/// title bar. Passing the picture's size there leaves a client area some 16 by
+/// 39 pixels smaller, so every frame arrived downscaled by an arbitrary,
+/// non-integer ratio: text lost strokes and edges crawled, on a link that had
+/// just carried the pixels perfectly. The frame is measured at the window's own
+/// DPI rather than the system's, because the two differ on any mixed-scale
+/// desktop.
+unsafe fn fit_client(hwnd: HWND, width: u32, height: u32) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: width as i32,
+        bottom: height as i32,
+    };
+    let dpi = GetDpiForWindow(hwnd);
+    if dpi == 0
+        || AdjustWindowRectExForDpi(
+            &mut rect,
+            WS_OVERLAPPEDWINDOW,
+            false,
+            WINDOW_EX_STYLE(0),
+            dpi,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+}
+
 /// The window procedure: painting and input.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState;
@@ -183,6 +231,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 };
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
+                // The client area is kept at the host's resolution, so this is
+                // normally a straight copy. It stops being one the moment the
+                // user resizes the surrogate, and GDI's default stretch mode
+                // (`BLACKONWHITE`) then *drops* whole rows and columns rather
+                // than resampling — which is what turned a scaled window into
+                // broken text and jagged edges. `HALFTONE` averages instead,
+                // and requires the brush origin to be reset after it or later
+                // fills tile from the wrong offset.
+                SetStretchBltMode(hdc, HALFTONE);
+                let _ = SetBrushOrgEx(hdc, 0, 0, None);
                 painted = StretchDIBits(
                     hdc,
                     0,
@@ -298,6 +356,15 @@ pub(crate) fn run(
     closed: Arc<AtomicBool>,
 ) {
     unsafe {
+        // Declared before any window exists, because Windows fixes a process's
+        // awareness at that moment. Left unaware, this process is told the
+        // desktop is 96 DPI and the compositor bitmap-stretches the whole
+        // window up to the monitor's real scale — so on a 125% or 150% display
+        // the host's pixels were resampled twice before reaching the screen.
+        // Failure only means someone (a manifest, an earlier surrogate) already
+        // set it, which is fine.
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
         let instance: HINSTANCE = match GetModuleHandleW(None) {
             Ok(h) => h.into(),
             Err(e) => {
@@ -358,6 +425,11 @@ pub(crate) fn run(
         let state_ptr = Box::into_raw(state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
 
+        // Only now can the frame be measured at this window's DPI, so the size
+        // passed to `CreateWindowExW` is corrected here rather than guessed
+        // above.
+        fit_client(hwnd, meta.width, meta.height);
+
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = ready_tx.send(Ok(()));
 
@@ -411,6 +483,10 @@ pub(crate) fn run(
                                     let mut fb = state.fb.borrow_mut();
                                     if fb.width != pic.width || fb.height != pic.height {
                                         fb.resize(pic.width, pic.height);
+                                        // The encoder changed resolution
+                                        // mid-stream; follow it, or every frame
+                                        // from here is scaled to the old size.
+                                        fit_client(hwnd, pic.width, pic.height);
                                     }
                                     let full = Rect {
                                         x: 0,
@@ -434,6 +510,9 @@ pub(crate) fn run(
                     Ok(SurrogateCommand::Resize { width, height }) => {
                         let state = &*state_ptr;
                         state.fb.borrow_mut().resize(width, height);
+                        // The host's window was resized, so this one follows it
+                        // and keeps showing the pixels at their own size.
+                        fit_client(hwnd, width, height);
                         painted = true;
                     }
                     Ok(SurrogateCommand::Close(reason)) => {

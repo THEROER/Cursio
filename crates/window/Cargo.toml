@@ -87,6 +87,10 @@ windows = { version = "0.61", features = [
     "Win32_System_WinRT_Graphics_Capture",
     # Finding the window, hiding it (layered alpha), and PostMessage replay.
     "Win32_UI_WindowsAndMessaging",
+    # Per-monitor DPI awareness for the surrogate. Without it the client area is
+    # reported in virtual pixels and DWM rescales the finished window, so the
+    # host's frames reach the screen resampled twice.
+    "Win32_UI_HiDpi",
     "Win32_Foundation",
     # H.264 decoding for the surrogate. Media Foundation is the answer to
     # `ffmpeg-next` needing system libav*, which Windows does not have: the
