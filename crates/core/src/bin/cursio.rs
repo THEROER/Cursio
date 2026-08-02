@@ -106,8 +106,8 @@ enum Command {
         /// Share audio with peers.
         #[arg(long, default_value_t = false)]
         audio: bool,
-        /// Windows: render peer audio into the output device whose name
-        /// contains this.
+        /// Render peer audio into the output device whose name contains this
+        /// (Windows only; ignored elsewhere, with a line in the log saying so).
         #[arg(long)]
         audio_render_device: Option<String>,
         /// Share the clipboard with peers (text, images, and other formats).
@@ -132,8 +132,11 @@ enum Command {
         share_window: bool,
         /// Which window to share, matched against its title (case-insensitive
         /// substring). Without this the foreground window is taken — which,
-        /// when you start the daemon from a terminal, is that terminal. Ignored
-        /// unless `--share-window` is given.
+        /// when you start the daemon from a terminal, is that terminal.
+        ///
+        /// Needs something to share: `--share-window`, or `--share-airplay`,
+        /// which shares the iPhone's screen instead of one of this machine's
+        /// own windows.
         #[arg(long, default_value = "")]
         share_window_title: String,
         /// Keep the shared window visible on this machine instead of hiding it.

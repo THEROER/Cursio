@@ -81,7 +81,10 @@ mod tests {
             &tile,
         )
         .unwrap();
-        let i = ((1 * 4 + 2) * 4) as usize;
+        // (y * width + x) * bytes-per-pixel, spelled out rather than written as
+        // 24: the point of the test is that the offset follows the formula.
+        let (x, y, width) = (2_usize, 1_usize, 4_usize);
+        let i = (y * width + x) * 4;
         assert_eq!(&fb.pixels[i..i + 4], &tile);
         assert!(fb.pixels[..i].iter().all(|&b| b == 0));
     }
