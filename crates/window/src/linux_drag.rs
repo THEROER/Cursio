@@ -12,12 +12,9 @@
 //! extension in `native/cursio-shell-extension/`, which re-publishes Mutter's
 //! own grab-op signals on the session bus.
 //!
-//! **The extension is optional.** It is an accelerator for a feature that also
-//! works from the command line (`--share-window-title`), so every failure here
-//! — not installed, disabled, D-Bus unavailable, a version mismatch — must
-//! degrade to "no drag detection" and never to a broken session. That is why
-//! [`DragWatcher::spawn`] cannot fail: it reports what happened through the log
-//! and simply yields no events.
+//! **The extension is optional.** Its absence disables drag transfer but must
+//! not break the rest of a session. That is why [`DragWatcher::spawn`] cannot
+//! fail: it reports what happened through the log and simply yields no events.
 
 use tokio::sync::mpsc;
 
@@ -116,10 +113,7 @@ async fn listen(tx: mpsc::UnboundedSender<DragEvent>) {
         }
     };
 
-    tracing::info!(
-        "watching for window drags (needs the Cursio GNOME extension; \
-         without it, share a window with --share-window-title)"
-    );
+    tracing::info!("watching for window drags through the Cursio GNOME extension");
 
     use futures_util::StreamExt;
     while let Some(Ok(msg)) = stream.next().await {
