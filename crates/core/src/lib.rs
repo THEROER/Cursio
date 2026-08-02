@@ -24,7 +24,6 @@ pub mod identity;
 /// encryption, module negotiation. Shared by the CLI and the app, desktop and
 /// mobile alike.
 pub mod link;
-pub mod log_console;
 pub mod logging;
 pub mod mesh;
 pub mod module;

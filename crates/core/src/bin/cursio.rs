@@ -182,14 +182,6 @@ enum Command {
         /// Target AirPlay output frame rate.
         #[arg(long, default_value_t = 60)]
         fps: u16,
-        /// Open a separate terminal window following this machine's log.
-        ///
-        /// For when the daemon has no console of its own worth reading:
-        /// started from a launcher, or — on Windows — relaunched elevated,
-        /// where the process the user started steps aside and the one doing
-        /// the work writes only to the file.
-        #[arg(long, default_value_t = false)]
-        console: bool,
         /// How a peer's modifier keys land on this machine (macOS only).
         ///
         /// A Mac's shortcuts live on Command, which a PC keyboard does not
@@ -323,21 +315,9 @@ async fn main() -> anyhow::Result<()> {
             airplay_interface,
             res,
             fps,
-            console,
             mac_modifiers,
         } => {
             let _ = MODIFIER_STYLE.set(mac_modifiers);
-            if console {
-                // After logging is up, so the file exists to be followed, and
-                // best-effort: failing to open a window is no reason to refuse
-                // to run the mesh.
-                match cursio_core::log_console::newest_log()
-                    .and_then(|path| cursio_core::log_console::open_console(&path))
-                {
-                    Ok(()) => tracing::info!("opened a console on this machine's log"),
-                    Err(error) => tracing::warn!(%error, "could not open a log console"),
-                }
-            }
             // Read before anything binds a port, so a mistyped password costs
             // nothing and the prompt is not buried under startup logging.
             let pairing = if pair {
