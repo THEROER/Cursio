@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cursio_protocol::{Message, ModuleId, Priority, ServiceId, ServiceMsg};
+use cursio_protocol::{Message, ModuleId, PeerId, Priority, ServiceId, ServiceMsg};
 use cursio_transport::{TransportError, TransportTx};
 
 use crate::module::SessionModule;
@@ -49,6 +49,16 @@ pub struct ServiceState {
     inner: Arc<Mutex<Inner>>,
 }
 
+/// Which peer is carrying a duty, and where it answers.
+#[derive(Clone, Copy)]
+struct HostedBy {
+    peer: PeerId,
+    /// Where the duty itself is reachable — a receiver binds its own port, not
+    /// the mesh link's. `None` when the peer accepted a request but has not
+    /// said where yet.
+    addr: Option<std::net::SocketAddr>,
+}
+
 #[derive(Default)]
 struct Inner {
     /// Duties a peer has asked this machine to take on.
@@ -56,8 +66,14 @@ struct Inner {
     /// Duties this machine has asked a peer to take on, so a second session
     /// does not repeat a request already answered.
     asked_by_us: HashSet<ServiceId>,
-    /// Duties some peer has confirmed it is actually running, and where.
-    hosted_elsewhere: std::collections::HashMap<ServiceId, Option<std::net::SocketAddr>>,
+    /// Duties some peer has confirmed it is actually running: which peer, and
+    /// where it answers.
+    ///
+    /// The peer id is not decoration. A session ending has to forget what *that*
+    /// peer was carrying and nothing else — with three machines, B losing its
+    /// link to C would otherwise make B forget that A holds the receiver, and B
+    /// would announce a second one.
+    hosted_elsewhere: std::collections::HashMap<ServiceId, HostedBy>,
     /// Duties any peer has answered a query about, either way.
     ///
     /// Distinct from `hosted_elsewhere` being empty, which means both "no peer
@@ -96,6 +112,17 @@ impl ServiceState {
         self.lock().hosted_elsewhere.contains_key(&service)
     }
 
+    /// Forget what `peer` was carrying, because its link has gone.
+    ///
+    /// Scoped to that peer: another one may still be hosting the same duty,
+    /// and dropping its answer too would have this machine announce a second
+    /// receiver over the top of a working one.
+    pub fn forget_peer(&self, peer: PeerId) {
+        self.lock()
+            .hosted_elsewhere
+            .retain(|_, hosted| hosted.peer != peer);
+    }
+
     /// Whether any peer has answered a query about `service` yet, either way.
     ///
     /// "Nobody hosts it" and "nobody has spoken" are the same absence in
@@ -109,8 +136,7 @@ impl ServiceState {
         self.lock()
             .hosted_elsewhere
             .get(&service)
-            .copied()
-            .flatten()
+            .and_then(|hosted| hosted.addr)
     }
 
     /// Record that this machine is carrying `service`, reachable at `addr`.
@@ -171,6 +197,9 @@ impl ServiceHost for RefuseAll {
 /// The session module that exchanges [`ServiceMsg`]s.
 pub struct ServiceEngine {
     peer_name: String,
+    /// Which peer this session talks to, so what it said can be forgotten on
+    /// its own when the link goes — and only what *it* said.
+    peer_id: PeerId,
     /// Whether this peer wins a tie when both machines carry the same duty.
     ///
     /// Lowest peer id, which both sides compute identically from ids they have
@@ -193,6 +222,7 @@ pub struct ServiceEngine {
 impl ServiceEngine {
     pub fn new(
         peer_name: String,
+        peer_id: PeerId,
         peer_outranks_us: bool,
         state: ServiceState,
         host: Box<dyn ServiceHost>,
@@ -200,6 +230,7 @@ impl ServiceEngine {
     ) -> Self {
         Self {
             peer_name,
+            peer_id,
             peer_outranks_us,
             state,
             host,
@@ -358,7 +389,13 @@ impl SessionModule for ServiceEngine {
                     );
                 } else if hosting {
                     tracing::info!(peer = %self.peer_name, %service, ?addr, "peer already hosts this");
-                    self.state.lock().hosted_elsewhere.insert(service, addr);
+                    self.state.lock().hosted_elsewhere.insert(
+                        service,
+                        HostedBy {
+                            peer: self.peer_id,
+                            addr,
+                        },
+                    );
                 } else {
                     // Removed rather than left: an answer of "not me" from the
                     // peer that used to host it is how this machine learns the
@@ -372,7 +409,13 @@ impl SessionModule for ServiceEngine {
             }
             ServiceMsg::Accepted { service } => {
                 tracing::info!(peer = %self.peer_name, %service, "peer is hosting this for us");
-                self.state.lock().hosted_elsewhere.insert(service, None);
+                self.state.lock().hosted_elsewhere.insert(
+                    service,
+                    HostedBy {
+                        peer: self.peer_id,
+                        addr: None,
+                    },
+                );
             }
             ServiceMsg::Refused { service, reason } => {
                 // Not an error: the whole point of asking several peers is that
@@ -391,12 +434,12 @@ impl SessionModule for ServiceEngine {
     }
 
     async fn shutdown(&mut self, _tx: &mut dyn TransportTx) {
-        // What this peer was hosting stops being true the moment the link goes,
-        // whether or not it said so. Leaving the flag set would keep this
-        // machine believing a receiver exists somewhere it can no longer reach.
-        for service in KNOWN_SERVICES {
-            self.state.lock().hosted_elsewhere.remove(service);
-        }
+        // What *this* peer was hosting stops being true the moment its link
+        // goes, whether or not it said so. Leaving it set would keep this
+        // machine believing a receiver exists somewhere it can no longer reach
+        // — which is exactly what has to be noticed for the duty to move to
+        // another machine.
+        self.state.forget_peer(self.peer_id);
     }
 }
 
@@ -426,6 +469,7 @@ impl crate::module::ModuleFactory for ServiceFactory {
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         Ok(Box::new(ServiceEngine::new(
             ctx.peer_name().to_string(),
+            ctx.peer.peer_id,
             // Lowest id wins a tie. Computed here, from the greeting, because
             // it is a property of the pair rather than of either machine.
             ctx.peer.peer_id < ctx.local.peer_id,
@@ -469,10 +513,21 @@ mod tests {
 
     /// `peer_outranks_us` decides who keeps a duty both machines are carrying.
     fn engine_ranked(accept: bool, peer_outranks_us: bool) -> (ServiceEngine, ServiceState, Seen) {
+        engine_for(accept, peer_outranks_us, PeerId::new_v4())
+    }
+
+    /// A session with a named peer, for the cases where *which* peer said
+    /// something is the point.
+    fn engine_for(
+        accept: bool,
+        peer_outranks_us: bool,
+        peer_id: PeerId,
+    ) -> (ServiceEngine, ServiceState, Seen) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let state = ServiceState::new();
         let engine = ServiceEngine::new(
             "peer".into(),
+            peer_id,
             peer_outranks_us,
             state.clone(),
             Box::new(ScriptedHost {
@@ -570,17 +625,86 @@ mod tests {
     }
 
     /// A link going down takes the host with it, said so or not. Believing
-    /// otherwise leaves this machine pointing at a receiver it cannot reach.
+    /// otherwise leaves this machine pointing at a receiver it cannot reach —
+    /// and is what has to be noticed for the duty to move somewhere else.
     #[tokio::test]
     async fn losing_the_link_forgets_that_the_peer_was_hosting() {
-        let (mut engine, state, _seen) = engine(true);
-        state
-            .lock()
-            .hosted_elsewhere
-            .insert(ServiceId::AIRPLAY, None);
+        let host = PeerId::new_v4();
+        let (mut engine, state, _seen) = engine_for(true, false, host);
+        state.lock().hosted_elsewhere.insert(
+            ServiceId::AIRPLAY,
+            HostedBy {
+                peer: host,
+                addr: None,
+            },
+        );
         let mut tx = NullTx;
         engine.shutdown(&mut tx).await;
         assert!(!state.is_hosted_elsewhere(ServiceId::AIRPLAY));
+    }
+
+    /// The whole reason the duty can move: the machine holding it goes away,
+    /// and the one that stood down for it takes it back.
+    ///
+    /// Each step is what the announcer actually reads — `is_hosted_elsewhere`
+    /// to decide whether to withdraw, `has_been_answered` to tell "nobody
+    /// hosts it" from "nobody has said".
+    #[tokio::test]
+    async fn a_host_going_away_frees_the_duty_for_whoever_is_left() {
+        let host = PeerId::new_v4();
+        let (mut engine, state, _seen) = engine_for(true, true, host);
+        let here: std::net::SocketAddr = "192.168.1.35:7000".parse().unwrap();
+        state.now_hosting(ServiceId::AIRPLAY, here);
+
+        // Both machines bound; the peer outranks us, so we yield to it.
+        let peer_hosts = Message::module(
+            ModuleId::SERVICE,
+            Priority::Control,
+            &ServiceMsg::Status {
+                service: ServiceId::AIRPLAY,
+                hosting: true,
+                addr: Some("192.168.1.140:7000".parse().unwrap()),
+            },
+        )
+        .unwrap();
+        assert!(engine.handle_message(&peer_hosts));
+        assert!(state.is_hosted_elsewhere(ServiceId::AIRPLAY));
+
+        // The host's link drops. Nothing announces the duty now, and this
+        // machine knows the difference between that and never having asked.
+        let mut tx = NullTx;
+        engine.shutdown(&mut tx).await;
+        assert!(!state.is_hosted_elsewhere(ServiceId::AIRPLAY));
+        assert!(state.has_been_answered(ServiceId::AIRPLAY));
+        assert!(
+            state.is_hosted_here(ServiceId::AIRPLAY),
+            "the receiver stayed bound while it was stood down, so it can \
+             simply announce again"
+        );
+    }
+
+    /// With three machines, B keeps a link to both A and C. A holds the
+    /// receiver; C going away must not make B forget that, or B announces a
+    /// second `Cursio` over a working one.
+    #[tokio::test]
+    async fn losing_one_link_does_not_forget_what_another_peer_hosts() {
+        let hosting_peer = PeerId::new_v4();
+        let other_peer = PeerId::new_v4();
+        let (mut to_other, state, _seen) = engine_for(true, false, other_peer);
+        state.lock().hosted_elsewhere.insert(
+            ServiceId::AIRPLAY,
+            HostedBy {
+                peer: hosting_peer,
+                addr: Some("192.168.1.5:7000".parse().unwrap()),
+            },
+        );
+
+        let mut tx = NullTx;
+        to_other.shutdown(&mut tx).await;
+        assert!(
+            state.is_hosted_elsewhere(ServiceId::AIRPLAY),
+            "a link to a peer that hosts nothing must not clear the real host"
+        );
     }
 
     /// The exchange the user described: ask first, answer with where.
