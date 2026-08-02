@@ -131,6 +131,12 @@ pub fn set_peer_edge(edge: Option<cursio_protocol::Edge>) {
     // static is what that code already reaches for.
     #[cfg(target_os = "windows")]
     win_capture::set_watched_edge(edge);
+    // Wayland does not read this value, it acts on it: a barrier is a D-Bus
+    // object placed on one edge, so moving the watch means taking capture down
+    // and putting a new list up. Harmless when the evdev backend is the one
+    // running — nobody is listening.
+    #[cfg(target_os = "linux")]
+    wl_capture::set_watched_edge(edge);
 }
 
 /// Which edge capture is watching, if any.
