@@ -469,7 +469,7 @@ fn accessibility_granted() -> bool {
 ///
 /// A null event source is valid here and means "whatever the system state is",
 /// which is exactly the question being asked.
-fn current_pointer_position() -> Point {
+pub(crate) fn current_pointer_position() -> Point {
     // SAFETY: CGEventCreate accepts a null source; the returned event is
     // released before the point (a plain copy) is returned.
     unsafe {
@@ -572,7 +572,7 @@ impl Bounds {
 
     /// Hold a point inside the displays. The one-pixel inset keeps the pointer
     /// addressable: a point exactly on `max_x` is outside the last column.
-    fn clamp(self, point: Point) -> Point {
+    pub(crate) fn clamp(self, point: Point) -> Point {
         Point {
             x: point
                 .x

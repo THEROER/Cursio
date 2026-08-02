@@ -1332,6 +1332,7 @@ async fn run_pairing_and_session(
                     g.set_mode(cursio_input::InputMode::Idle);
                 }
                 set_cursor_hidden(cursor_ref.borrow_mut().as_mut(), false);
+                set_injecting(release_ref.borrow_mut().as_mut(), true);
                 tracing::warn!("panic recovery: input returned to this machine, barriers down");
                 return;
             }
@@ -1347,7 +1348,14 @@ async fn run_pairing_and_session(
                     (false, false) => cursio_input::InputMode::Idle,
                 });
             }
+            // Cursor visibility before the injector, and both before the log
+            // line. On macOS showing the cursor also warps it back from the
+            // corner it was parked in, and the injector re-seeds its shadow
+            // position from the real pointer the moment it goes active — in the
+            // other order it seeds from the parking corner, and the peer's next
+            // movement teleports the pointer there.
             set_cursor_hidden(cursor_ref.borrow_mut().as_mut(), dormant);
+            set_injecting(release_ref.borrow_mut().as_mut(), ownership.active);
             tracing::info!(active = ownership.active, "ownership changed");
         },
         modules,
@@ -1687,6 +1695,22 @@ fn make_cursor() -> Option<Box<dyn cursio_input::CursorControl>> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         None
+    }
+}
+
+/// Tell the injector whether peer events should act on this machine.
+///
+/// Only true while this machine holds the shared cursor — which is also the
+/// only time a peer sends any. Setting it matters beyond dropping stray events:
+/// a backend uses the transition to false→true to re-read state that went stale
+/// while it was idle, and the macOS one in particular re-seeds the shadow
+/// cursor it has to keep because `CGEvent` has no relative motion. Left
+/// permanently active, that shadow drifts from the real pointer every time the
+/// user moves this machine's own mouse, and the peer's first movement afterwards
+/// teleports the cursor to wherever the shadow had got to.
+fn set_injecting(injector: Option<&mut Box<dyn cursio_input::InputInjector>>, active: bool) {
+    if let Some(inj) = injector {
+        inj.set_active(active);
     }
 }
 
