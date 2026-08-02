@@ -223,7 +223,16 @@ impl CursorRole {
     /// Whether that makes us the driver depends on how we came to hold it:
     /// returning what was lent leaves us idle, while sending our own cursor
     /// across means the user is here and our input follows it.
+    ///
+    /// Refused unless we hold it. Nothing else can be right — you cannot send
+    /// away what you do not have — and the check lives here because getting it
+    /// wrong is invisible until the cursor will not come back: an idle machine
+    /// that "hands over" sets `driving` from `!peer_driving`, so it starts
+    /// streaming its keyboard at a peer the user is not sitting at.
     pub fn hand_over(&mut self) {
+        if !self.active {
+            return;
+        }
         self.active = false;
         self.driving = !self.peer_driving;
         self.peer_driving = false;
@@ -243,12 +252,27 @@ impl CursorRole {
         self.driving = false;
     }
 
+    /// Take the cursor because the user asked for it here.
+    ///
+    /// Distinct from [`Self::take_over`], and the difference is who is holding
+    /// the mouse. When the peer sends the cursor, the user is over there and
+    /// `peer_driving` records it. When the hotkey is pressed *here*, the user
+    /// is at this keyboard — recording the peer as driving would then make the
+    /// next edge crossing hand the cursor back without this machine becoming
+    /// the driver, so pressing the hotkey and shoving the cursor across left
+    /// the user with a cursor on the far screen and no input reaching it.
+    pub fn seize(&mut self) {
+        self.active = true;
+        self.driving = false;
+        self.peer_driving = false;
+    }
+
     /// The hotkey, which flips whichever side we are on.
     pub fn toggle(&mut self) {
         if self.active {
             self.hand_over();
         } else {
-            self.take_over();
+            self.seize();
         }
     }
 
@@ -603,12 +627,18 @@ where
                         tracing::trace!(?edge, "edge crossing ignored: peer cannot hold the cursor");
                     }
                     Some(OwnershipCmd::HandoffToPeer { edge, pos_norm }) => {
-                        // Honoured unless we are already driving the peer. Being
-                        // inactive is not enough to refuse: a machine that has
-                        // handed nothing over is exactly the one the user is
-                        // sitting at, and shoving its cursor at the peer's edge
-                        // is how they say so.
-                        if !role.driving() {
+                        // Only the machine holding the cursor can send it away.
+                        //
+                        // This used to accept an idle machine too, reasoning
+                        // that one which has handed nothing over is the one the
+                        // user is sitting at. True at the start of a session and
+                        // false ever after: a machine that gave the cursor back
+                        // is also idle, and its own pointer drifting into the
+                        // edge then read as a second handoff — leaving it
+                        // convinced it drove a peer nobody was at, with no way
+                        // to get the cursor back. Ctrl+Alt+G is how an idle
+                        // machine takes control, on every platform.
+                        if role.active() {
                             role.hand_over();
                             am_active = role.active();
                             tracing::info!(?edge, pos_norm, "cursor crossed peer edge; handing off");
@@ -619,7 +649,11 @@ where
                                 break Err(SessionError::from(e));
                             }
                         } else {
-                            tracing::trace!(?edge, "edge crossing while already driving; ignoring");
+                            tracing::debug!(
+                                ?edge,
+                                driving = role.driving(),
+                                "edge crossing while not holding the cursor; ignoring"
+                            );
                         }
                     }
                     // Emergency: unconditionally take control back here. Become
@@ -1033,32 +1067,46 @@ mod cursor_role_tests {
     }
 
     /// Peer ids choose an initial holder, not which physical mouse the user is
-    /// allowed to use. The initially idle machine may send its own cursor into
-    /// the already-active screen; that screen must remember who is driving so
-    /// the first crossing back returns control instead of starting a second
-    /// driver.
+    /// allowed to use — but taking the cursor from an idle machine is the
+    /// hotkey's job, not the edge's.
+    ///
+    /// The edge cannot serve here: an idle machine is *also* what a machine
+    /// that just handed the cursor back looks like, so honouring a crossing
+    /// from idle meant its own pointer drifting into the edge started it
+    /// driving a peer the user was not sitting at. Every backend but macOS
+    /// already refused to report that crossing at all.
     #[test]
-    fn the_initially_idle_machine_can_drive_and_get_control_back() {
+    fn an_idle_machine_takes_the_cursor_with_the_hotkey_not_the_edge() {
         let mut holder = CursorRole::new(true);
         let mut source = CursorRole::new(false);
 
+        // The edge does nothing from idle.
+        source.hand_over();
+        assert!(!source.active());
+        assert!(
+            !source.driving(),
+            "an idle machine must not become a driver"
+        );
+        assert!(holder.active(), "and the holder still holds it");
+
+        // The hotkey does. The peer is told to stand down, and from there a
+        // shove at the edge sends the cursor back and leaves this machine
+        // driving — which is what the user pressing it wanted.
+        source.toggle();
+        holder.adopt(false);
+        assert!(source.active());
+        assert!(!holder.active());
+
         source.hand_over();
         holder.take_over();
-        assert!(holder.active());
-        assert!(source.driving());
-
-        holder.hand_over();
-        source.take_over();
-        assert!(source.active(), "the source got its cursor back");
-        assert!(!source.driving(), "the source no longer streams input");
         assert!(
-            !holder.driving(),
-            "the holder did not become a second driver"
+            source.driving(),
+            "after taking the cursor by hotkey, sending it across drives the peer"
         );
+        assert!(holder.active());
+        assert!(!holder.driving(), "and the holder is not a second driver");
     }
 
-    /// Ten round trips, because a state machine that survives one and not five
-    /// is a state machine with a flag it forgot to clear.
     #[test]
     fn many_round_trips_never_leave_both_or_neither_in_charge() {
         let mut pair = Pair::new();
@@ -1118,11 +1166,59 @@ mod cursor_role_tests {
         assert!(!role.driving());
     }
 
+    /// The exact sequence from the 18:23 logs, in the order it happened.
+    ///
+    /// The Mac starts idle, is lent the cursor, gives it back — and is idle
+    /// again. Its own pointer drifting into the edge minutes later used to make
+    /// it the driver, and from there the cursor could not come back: the peer
+    /// held it, and this side dismissed every crossing as "already driving".
+    #[test]
+    fn a_returned_cursor_leaves_a_machine_whose_edge_is_inert() {
+        let mut mac = CursorRole::new(false);
+        let mut windows = CursorRole::new(true);
+
+        // The user at Windows shoves the cursor across.
+        windows.hand_over();
+        mac.take_over();
+        assert!(mac.active());
+        assert!(
+            windows.driving(),
+            "the user is at Windows, so Windows drives"
+        );
+
+        // And pushes it back.
+        mac.hand_over();
+        windows.take_over();
+        assert!(!mac.active());
+        assert!(
+            !mac.driving(),
+            "the Mac returned what was lent; it drives nobody"
+        );
+        assert!(windows.active());
+
+        // Now the Mac's pointer wanders into the edge, repeatedly.
+        let idle = mac;
+        for _ in 0..5 {
+            mac.hand_over();
+        }
+        assert_eq!(mac, idle, "an idle machine's edge must be inert");
+        assert!(
+            windows.active(),
+            "the cursor is still where the user left it"
+        );
+
+        // And the ordinary way across still works.
+        windows.hand_over();
+        mac.take_over();
+        assert!(mac.active());
+        assert!(windows.driving());
+    }
+
     /// The panic hotkey exists for a wedged link, so it must reach a state this
     /// machine can be used from whatever it was doing.
     #[test]
     fn panic_returns_everything_to_this_machine() {
-        let mut role = CursorRole::new(false);
+        let mut role = CursorRole::new(true);
         role.hand_over();
         assert!(role.driving());
         role.panic();

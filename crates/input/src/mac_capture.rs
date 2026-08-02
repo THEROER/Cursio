@@ -166,10 +166,20 @@ struct TapState {
 impl TapState {
     /// Report a crossing if the cursor is being pushed off the peer-facing edge.
     ///
-    /// Checked in every mode but Dormant, deliberately. Idle — nothing handed
-    /// over yet — is exactly the state the machine the user is sitting at
-    /// starts in, and refusing to look at the edge there means the first shove
-    /// of the session does nothing.
+    /// **Only while this machine holds the cursor.** Sending it away is
+    /// something only its holder can do, and the other two backends already
+    /// work this way: Wayland checks `InputMode::Active` before reporting a
+    /// barrier hit, and Windows takes its hooks down entirely when idle. macOS
+    /// watched the edge in every mode but Dormant, on the reasoning that an
+    /// idle machine is the one the user is sitting at — which is true for the
+    /// first shove of a session and false for every one after it.
+    ///
+    /// What that cost: a Mac that had handed the cursor back sat idle with its
+    /// own pointer near the edge, and the next nudge of its trackpad — five
+    /// minutes later, with the user at the other machine — read as a second
+    /// handoff. Two in a row with nothing returning between them leave this
+    /// machine believing it drives a peer nobody is sitting at, and the cursor
+    /// cannot be sent back. Taking control from idle is what Ctrl+Alt+G is for.
     ///
     /// # Safety
     ///
@@ -181,9 +191,11 @@ impl TapState {
         let Some(edge) = crate::peer_edge() else {
             return;
         };
-        if self.grabbed.load(Ordering::Relaxed) {
-            // Already driving the peer: the cursor the user is pushing is on
-            // the far machine, and this edge is not the one it would leave by.
+        // Active is `forwarding && !grabbed`: Dormant forwards and grabs, Idle
+        // does neither.
+        let holds_cursor =
+            self.forwarding.load(Ordering::Relaxed) && !self.grabbed.load(Ordering::Relaxed);
+        if !holds_cursor {
             return;
         }
         // SAFETY: the caller guarantees a live event.

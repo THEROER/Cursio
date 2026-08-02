@@ -85,10 +85,13 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
     }
     drop(tx); // capture channel closes after draining
 
-    // The client hands the cursor over before sending anything. Starting
-    // inactive is not enough any more: a machine forwards its input only once
-    // the user *at it* has sent the cursor across, so that a second keyboard
-    // stays usable on its own machine rather than silently driving the first.
+    // The client holds the cursor and hands it over before sending anything,
+    // which is the whole sequence a real handoff is: a machine forwards its
+    // input only once the user *at it* has sent the cursor across, so a second
+    // keyboard stays usable on its own machine rather than silently driving the
+    // first. Sending the cursor away is also something only its holder can do —
+    // an idle machine's pointer drifting into the edge is not a handoff, and
+    // treating it as one left a Mac driving a peer nobody was sitting at.
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     cmd_tx
         .send(session::OwnershipCmd::HandoffToPeer {
@@ -109,7 +112,7 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
             session::run_session(
                 client,
                 session::CursorSetup {
-                    start_active: false,
+                    start_active: true,
                     peer_takes_cursor: true,
                 },
                 Some(&mut rx),
