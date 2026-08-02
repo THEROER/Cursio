@@ -98,9 +98,14 @@ impl FrameQueue {
             .lock()
             .map_err(|_| AirPlayError::Video("macOS video queue lock is poisoned".into()))?;
         if state.closed {
-            return Err(AirPlayError::Video(
-                "the macOS video window stopped receiving frames".into(),
-            ));
+            // `ScreenClosed`, not a generic video fault. The queue is closed by
+            // the writer thread when the pipe to the helper breaks, and the
+            // helper exits when its last window does — so this *is* the user
+            // closing the window, which the caller ends the session for. Called
+            // it a `Video` error and that path never ran: the session stayed up
+            // with nothing to draw on, and every later access unit was pushed
+            // into a queue nobody was reading and logged as another drop.
+            return Err(AirPlayError::ScreenClosed);
         }
         if state.frames.len() == MAX_QUEUED_FRAMES {
             state.frames.pop_front();
@@ -253,4 +258,37 @@ fn shared_helper() -> Result<Arc<Mutex<HelperProcess>>, AirPlayError> {
     let helper = Arc::new(Mutex::new(HelperProcess::spawn()?));
     *slot = Some(helper.clone());
     Ok(helper)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Closing the window has to be distinguishable from a video fault. The
+    /// caller ends the session on `ScreenClosed` and skips past anything else —
+    /// so reporting the wrong one left the session running with nothing to draw
+    /// on, dropping every later frame into a queue nobody was reading.
+    #[test]
+    fn a_closed_window_is_reported_as_the_screen_closing() {
+        let frames = FrameQueue::default();
+        assert!(frames.push(b"unit").is_ok());
+        frames.close();
+        assert!(matches!(
+            frames.push(b"unit"),
+            Err(AirPlayError::ScreenClosed)
+        ));
+    }
+
+    /// The queue drops the *oldest* frame: mirroring recovers at the next IDR,
+    /// so the newest picture is the one worth keeping.
+    #[test]
+    fn a_full_queue_drops_the_oldest_frame_not_the_newest() {
+        let frames = FrameQueue::default();
+        for i in 0..MAX_QUEUED_FRAMES {
+            frames.push(&[i as u8]).unwrap();
+        }
+        frames.push(b"newest").unwrap();
+        let first = frames.pop().unwrap();
+        assert_eq!(first, vec![1_u8], "the oldest frame should have gone");
+    }
 }
