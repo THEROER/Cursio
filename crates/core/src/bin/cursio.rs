@@ -793,9 +793,36 @@ async fn follow_airplay_answers(
 ) -> LocalAirPlayPlacement {
     const POLL: Duration = Duration::from_secs(1);
     let running = local_airplay_placement(&state, local);
+    // How long a machine has to look like the host before it acts on it.
+    //
+    // A peer's offer is forgotten the instant its link drops, so a reconnect —
+    // which the mesh attempts every two seconds — briefly looks exactly like
+    // that peer being gone for good. Acting on it immediately meant every blink
+    // of the link cost two receiver restarts: this node took the duty, the peer
+    // came back a second later and took it again.
+    //
+    // Only *taking* the duty waits. Standing down stays immediate, because the
+    // failure it prevents is worse: two `Cursio` in an iPhone's picker, which
+    // is what the user sees and has to choose between.
+    const SETTLE: u32 = 5;
+    // How many consecutive polls have agreed on `settled`. Counted against the
+    // reading itself rather than against what is running, so an announcement
+    // that drifted out of step with the placement is still corrected — a node
+    // that bound silently because a peer looked reachable, and then turned out
+    // to be the host after all, would otherwise stay silent forever.
+    let mut settled = local_airplay_placement(&state, local);
+    let mut steady = 0_u32;
     loop {
         tokio::time::sleep(POLL).await;
         let wanted = local_airplay_placement(&state, local);
+        steady = match wanted == settled {
+            true => steady.saturating_add(1),
+            false => {
+                settled = wanted;
+                1
+            }
+        };
+
         let should_announce = may_announce && wanted.selected;
         if !should_announce && announcer.is_announced() {
             tracing::info!(
@@ -803,7 +830,7 @@ async fn follow_airplay_answers(
                 "the mesh selected another AirPlay host; standing down"
             );
             announcer.withdraw();
-        } else if should_announce && !announcer.is_announced() {
+        } else if should_announce && !announcer.is_announced() && steady >= SETTLE {
             if let Err(error) = announcer.announce() {
                 tracing::warn!(%error, "could not announce the selected AirPlay host");
             }
@@ -812,8 +839,19 @@ async fn follow_airplay_answers(
         // A host change also rebuilds when the quality is the same: local
         // window/tap behaviour belongs to the selected receiver, not merely to
         // a numeric profile.
-        if wanted != running {
+        if wanted == running {
+            continue;
+        }
+        // Losing the duty is acted on at once; gaining it waits out a peer that
+        // is merely reconnecting.
+        if !wanted.selected || steady >= SETTLE {
             return wanted;
+        }
+        if steady == 1 {
+            tracing::debug!(
+                seconds = SETTLE,
+                "this machine would take AirPlay; waiting in case the peer is reconnecting"
+            );
         }
     }
 }
