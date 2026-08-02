@@ -563,9 +563,19 @@ async fn follow_airplay_answers(
                 "a peer is hosting AirPlay for the mesh; standing down"
             );
             announcer.withdraw();
-        } else if may_announce && !elsewhere && !announcer.is_announced() {
+        } else if may_announce
+            && !elsewhere
+            && state.has_been_answered(ServiceId::AIRPLAY)
+            && !announcer.is_announced()
+        {
             // The peer that was hosting has gone, or said it stopped. Nobody is
             // offering the mesh a receiver, so this node takes it back.
+            //
+            // `has_been_answered` is what keeps this from firing a second after
+            // startup: until some peer has spoken, "nobody hosts it" is
+            // indistinguishable from "nobody has said", and a node that
+            // correctly declined to announce would put the record straight back
+            // — two `Cursio` in the picker until the query round settled it.
             if let Err(error) = announcer.announce() {
                 tracing::warn!(%error, "could not take the AirPlay announcement back");
             }

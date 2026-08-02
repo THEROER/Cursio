@@ -58,6 +58,14 @@ struct Inner {
     asked_by_us: HashSet<ServiceId>,
     /// Duties some peer has confirmed it is actually running, and where.
     hosted_elsewhere: std::collections::HashMap<ServiceId, Option<std::net::SocketAddr>>,
+    /// Duties any peer has answered a query about, either way.
+    ///
+    /// Distinct from `hosted_elsewhere` being empty, which means both "no peer
+    /// hosts this" and "nobody has said yet" — and those need opposite
+    /// behaviour from whatever is deciding whether to advertise. Acting on the
+    /// second as though it were the first is how a node that correctly stood
+    /// down at startup put its announcement straight back a second later.
+    answered: HashSet<ServiceId>,
     /// Duties this machine is carrying, and the address they answer on — what
     /// a peer's [`ServiceMsg::Query`] is answered with.
     hosted_here: std::collections::HashMap<ServiceId, std::net::SocketAddr>,
@@ -86,6 +94,14 @@ impl ServiceState {
     /// Whether a peer has confirmed it is running `service`.
     pub fn is_hosted_elsewhere(&self, service: ServiceId) -> bool {
         self.lock().hosted_elsewhere.contains_key(&service)
+    }
+
+    /// Whether any peer has answered a query about `service` yet, either way.
+    ///
+    /// "Nobody hosts it" and "nobody has spoken" are the same absence in
+    /// [`Self::is_hosted_elsewhere`], and they call for opposite decisions.
+    pub fn has_been_answered(&self, service: ServiceId) -> bool {
+        self.lock().answered.contains(&service)
     }
 
     /// Where a peer said it is running `service`, if it said.
@@ -155,6 +171,12 @@ impl ServiceHost for RefuseAll {
 /// The session module that exchanges [`ServiceMsg`]s.
 pub struct ServiceEngine {
     peer_name: String,
+    /// Whether this peer wins a tie when both machines carry the same duty.
+    ///
+    /// Lowest peer id, which both sides compute identically from ids they have
+    /// already exchanged — so no message is needed to settle it and the two
+    /// answers cannot disagree. See [`ServiceEngine::yield_to`].
+    peer_outranks_us: bool,
     state: ServiceState,
     host: Box<dyn ServiceHost>,
     /// Queued for the next pump, because `handle_message` is synchronous while
@@ -171,12 +193,14 @@ pub struct ServiceEngine {
 impl ServiceEngine {
     pub fn new(
         peer_name: String,
+        peer_outranks_us: bool,
         state: ServiceState,
         host: Box<dyn ServiceHost>,
         reasons: Arc<Mutex<std::collections::HashMap<ServiceId, String>>>,
     ) -> Self {
         Self {
             peer_name,
+            peer_outranks_us,
             state,
             host,
             outbound: Vec::new(),
@@ -184,6 +208,22 @@ impl ServiceEngine {
             queried: false,
             reasons,
         }
+    }
+
+    /// Whether a peer's "I am hosting this" should make this machine stand down.
+    ///
+    /// Only interesting when *both* are hosting, which is the ordinary opening
+    /// of a mesh: each node binds its port before any peer has said hello,
+    /// because the alternative is a receiver that appears seconds late. Both
+    /// then answer a [`ServiceMsg::Query`] truthfully with `hosting: true`.
+    ///
+    /// Without a tie-break each believed the other had it and *both* withdrew,
+    /// leaving an iPhone with no `Cursio` at all while two machines sat holding
+    /// port 7000. Yielding to the lower peer id settles it in one exchange with
+    /// no extra message: the two sides compute opposite answers from the same
+    /// pair of ids, so exactly one stands down.
+    fn yield_to(&self, service: ServiceId) -> bool {
+        !self.state.is_hosted_here(service) || self.peer_outranks_us
     }
 
     /// Answer one request, by actually trying to take the duty on.
@@ -302,7 +342,21 @@ impl SessionModule for ServiceEngine {
                 hosting,
                 addr,
             } => {
-                if hosting {
+                // Recorded before the tie-break, because the fact worth
+                // remembering is that a peer spoke at all — even when what it
+                // said does not change anything here.
+                self.state.lock().answered.insert(service);
+                if hosting && !self.yield_to(service) {
+                    // Both of us have it and we win the tie. Say so rather than
+                    // logging nothing: from the peer's side this is the moment
+                    // it stands down, and the two lines belong together when
+                    // someone reads the pair of logs afterwards.
+                    tracing::info!(
+                        peer = %self.peer_name,
+                        %service,
+                        "peer hosts this too, but this machine keeps it (lower id)"
+                    );
+                } else if hosting {
                     tracing::info!(peer = %self.peer_name, %service, ?addr, "peer already hosts this");
                     self.state.lock().hosted_elsewhere.insert(service, addr);
                 } else {
@@ -372,6 +426,9 @@ impl crate::module::ModuleFactory for ServiceFactory {
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         Ok(Box::new(ServiceEngine::new(
             ctx.peer_name().to_string(),
+            // Lowest id wins a tie. Computed here, from the greeting, because
+            // it is a property of the pair rather than of either machine.
+            ctx.peer.peer_id < ctx.local.peer_id,
             self.state.clone(),
             (self.make_host)(),
             self.reasons.clone(),
@@ -407,10 +464,16 @@ mod tests {
     type Seen = Arc<Mutex<Vec<(ServiceId, String)>>>;
 
     fn engine(accept: bool) -> (ServiceEngine, ServiceState, Seen) {
+        engine_ranked(accept, false)
+    }
+
+    /// `peer_outranks_us` decides who keeps a duty both machines are carrying.
+    fn engine_ranked(accept: bool, peer_outranks_us: bool) -> (ServiceEngine, ServiceState, Seen) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let state = ServiceState::new();
         let engine = ServiceEngine::new(
             "peer".into(),
+            peer_outranks_us,
             state.clone(),
             Box::new(ScriptedHost {
                 accept,
@@ -544,6 +607,96 @@ mod tests {
                 addr: Some(here),
             }]
         );
+    }
+
+    /// Both machines bind before either has said hello, so both answer a query
+    /// with `hosting: true`. Without a tie-break each believed the other had
+    /// it and *both* withdrew — an iPhone was offered no `Cursio` at all while
+    /// two machines held port 7000.
+    #[test]
+    fn two_machines_hosting_the_same_duty_do_not_both_stand_down() {
+        let here: std::net::SocketAddr = "192.168.1.35:7000".parse().unwrap();
+        let theirs: std::net::SocketAddr = "192.168.1.140:7000".parse().unwrap();
+        let peer_says_yes = Message::module(
+            ModuleId::SERVICE,
+            Priority::Control,
+            &ServiceMsg::Status {
+                service: ServiceId::AIRPLAY,
+                hosting: true,
+                addr: Some(theirs),
+            },
+        )
+        .unwrap();
+
+        // The higher-id side yields, which is the side that must.
+        let (mut engine, state, _seen) = engine_ranked(true, true);
+        state.now_hosting(ServiceId::AIRPLAY, here);
+        assert!(engine.handle_message(&peer_says_yes));
+        assert!(
+            state.is_hosted_elsewhere(ServiceId::AIRPLAY),
+            "the outranked machine must stand down"
+        );
+
+        // The lower-id side keeps it, from the very same message.
+        let (mut engine, state, _seen) = engine_ranked(true, false);
+        state.now_hosting(ServiceId::AIRPLAY, here);
+        assert!(engine.handle_message(&peer_says_yes));
+        assert!(
+            !state.is_hosted_elsewhere(ServiceId::AIRPLAY),
+            "the winning machine must keep its announcement"
+        );
+    }
+
+    /// The tie-break applies only to a tie. A machine hosting nothing believes
+    /// its peer whichever way the ids fall — otherwise the lower-id node would
+    /// ignore the only answer it ever gets.
+    #[test]
+    fn a_machine_hosting_nothing_believes_the_peer_whatever_its_id() {
+        for peer_outranks_us in [true, false] {
+            let (mut engine, state, _seen) = engine_ranked(true, peer_outranks_us);
+            let status = Message::module(
+                ModuleId::SERVICE,
+                Priority::Control,
+                &ServiceMsg::Status {
+                    service: ServiceId::AIRPLAY,
+                    hosting: true,
+                    addr: None,
+                },
+            )
+            .unwrap();
+            assert!(engine.handle_message(&status));
+            assert!(
+                state.is_hosted_elsewhere(ServiceId::AIRPLAY),
+                "peer_outranks_us={peer_outranks_us}"
+            );
+        }
+    }
+
+    /// "Nobody hosts it" and "nobody has spoken" must not look alike, or a node
+    /// that correctly declined to announce puts its record back a second later
+    /// and the picker shows two.
+    #[test]
+    fn silence_is_distinguishable_from_a_peer_saying_no() {
+        let (mut engine, state, _seen) = engine(true);
+        assert!(
+            !state.has_been_answered(ServiceId::AIRPLAY),
+            "nothing has been said yet"
+        );
+        assert!(!state.is_hosted_elsewhere(ServiceId::AIRPLAY));
+
+        let says_no = Message::module(
+            ModuleId::SERVICE,
+            Priority::Control,
+            &ServiceMsg::Status {
+                service: ServiceId::AIRPLAY,
+                hosting: false,
+                addr: None,
+            },
+        )
+        .unwrap();
+        assert!(engine.handle_message(&says_no));
+        assert!(state.has_been_answered(ServiceId::AIRPLAY));
+        assert!(!state.is_hosted_elsewhere(ServiceId::AIRPLAY));
     }
 
     /// A machine carrying nothing must say so plainly, or the asker cannot tell
