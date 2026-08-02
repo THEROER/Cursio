@@ -35,19 +35,10 @@ OS to re-init the device, producing lag/flicker).
 - It carries an **`active` / `inactive`** flag.
   - **Active** → peer's motion/keys are injected (cursor moves here).
   - **Inactive** → we simply stop injecting motion; the cursor freezes in place.
-- "Hiding" the cursor fully (parking it in a corner, and grabbing the local
-  real mouse so it can't nudge the frozen cursor) is deferred to the
-  **transition milestone**, because grabbing local input is a separate,
-  capture-side concern. First milestone = active/inactive only.
-
-### Why not fully hide the cursor now
-
-On GNOME/Wayland an app cannot globally hide the system cursor. While the cursor
-is logically "on the other PC", this machine's **real physical mouse still moves
-its local cursor** (the OS doesn't know about our logical transition). Truly
-making the cursor "disappear" here needs (a) parking the cursor and (b)
-suppressing local input via an evdev grab — both belong to the capture/transition
-work, not to basic injection.
+- Grabbing local input so the real mouse can't nudge the frozen cursor is a
+  capture-side concern, and landed with the transition milestone. What became of
+  the "park it in a corner" half is under [Hiding this machine's
+  cursor](#hiding-this-machines-cursor) below.
 
 ## Wire protocol
 
@@ -100,8 +91,76 @@ crate, kept out of the transport crate.
      first mouse-named node; `spawn_capture` opens all, so this is handled.
    - Gotcha: `evdev::enumerate()` yields lower-level devices whose async stream
      didn't deliver here; reopening each path with `Device::open` fixed it.
-4. **Virtual keyboard via uinput (NEXT)** — keycode injection; `InputEvent::Key`
-   is captured and carried on the wire but not yet injected (needs a virtual
-   keyboard device).
-5. Transition logic (whose cursor / when it crosses / parking + local grab).
-6. Later backends: libei/portal (Wayland), Windows (SendInput).
+4. **Virtual keyboard via uinput — DONE ✅** — a second uinput device, kept
+   separate from the pointer so the compositor classifies each as the plain
+   mouse/keyboard it is rather than as a touchpad.
+5. **Transition logic — DONE ✅** — `CursorRole` in `core/src/session.rs` owns
+   who holds the cursor and who is driving whom; edge crossings and the
+   Ctrl+Alt+G hotkey are two ways to ask for the same handoff.
+6. **Other backends — DONE ✅** — libei/portal (Wayland), `SendInput`
+   (Windows), `CGEventPost` (macOS), each behind the same two traits.
+
+## Where a machine stands, and which edge that makes
+
+Machines are placed on a **grid**: `--at X,Y`, defaulting to `0,0`. A side
+cannot express order — four machines in a row are all "to the right" of the
+first, and that vocabulary cannot say which one the cursor reaches first — and a
+designated centre would make every other machine depend on one being switched
+on, which is the arrangement the mesh exists to avoid.
+
+`Position::edge_toward` (`protocol/src/input.rs`) takes the dominant axis, ties
+breaking horizontal; `neighbour_across` picks the nearest peer in a direction,
+so a machine going away lets the one behind it become the neighbour.
+
+Positions ride in `Hello`, so **the edge is derived per link**, during the
+handshake, from the two positions. That is seconds after capture starts — one
+portal permission, one set of hooks, for the life of the process — so capture
+comes up watching nothing and is pointed at an edge afterwards by
+`set_peer_edge`. Each backend follows that differently, and the difference is
+the whole reason the call exists rather than a constructor argument:
+
+| backend | how it follows the edge |
+| --- | --- |
+| Windows | an atomic the low-level mouse hook reads; a hook may not lock |
+| macOS | read from the event tap on every event |
+| Wayland | capture is taken down, a new barrier placed, capture re-armed — a barrier is a D-Bus object living on one edge |
+| evdev | **cannot**: `REL_X`/`REL_Y` is a device, not a desktop |
+
+The evdev gap is not an unfinished backend. Summing deltas does not recover the
+pointer position either — the compositor applies acceleration and clamps at the
+edge, so the sum drifts within seconds. Answering it needs the display server,
+and on X11 that means `XQueryPointer` and a dependency; deliberately not taken.
+A non-Wayland Linux session says so at startup and hands over by hotkey.
+
+Several peers still mean one watched edge, because there is one physical mouse
+and the backends each hold a single edge. Arming a *set* is the change that
+would let one machine border two peers at once.
+
+## Hiding this machine's cursor
+
+While a machine drives its peer, its own pointer should get out of the way.
+What that means is wildly platform-dependent, and only one platform can do it
+outright:
+
+- **Windows** — swaps the system cursors for blank ones. Real, and it holds.
+- **macOS** — `CGDisplayHideCursor` works only while Cursio is the *frontmost*
+  application, and the window server restores the pointer the moment it is not,
+  which for a daemon is nearly always. So the pointer is **also parked**: warped
+  into the corner furthest from the peer-facing edge, and restored on takeback
+  to where the user left it, pulled 12 px inside that edge. Landing exactly on
+  the edge it crossed would read as a fresh crossing on the next small movement.
+- **Linux** — neither half is available from a background process. Wayland lets
+  only a focused client with its own surface touch the cursor, and there is no
+  absolute warp to park with; X11 could hide via XFixes, but an X11 session
+  cannot detect an edge crossing anyway. The pointer stops moving (local input
+  is grabbed) and stays visible; the log says so once. The supported way through
+  is for Cursio to own a fullscreen transparent GTK4 surface with an empty input
+  region and its cursor set to `none` — real work in `cursio-window`, not a call
+  to add in `cursio-input`.
+
+The injector is told when it is allowed to act (`InputInjector::set_active`),
+and that transition is where a backend re-reads what went stale while it was
+idle — on macOS, the shadow cursor it must keep because `CGEvent` carries no
+relative motion. Showing the cursor happens *before* activating the injector,
+so the shadow is seeded from the restored pointer rather than the parking
+corner.
