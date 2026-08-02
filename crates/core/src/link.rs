@@ -155,7 +155,7 @@ where
         None => {
             if plan.password.is_empty() {
                 anyhow::bail!(
-                    "peer {} is not trusted; pair it explicitly with `cursio join`",
+                    "peer {} is not trusted; run `cursio mesh --pair` on both machines",
                     peer.peer_id
                 );
             }

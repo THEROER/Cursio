@@ -28,7 +28,7 @@ cargo xtask build | install | macos | windows | logs --follow
 Running:
 
 ```sh
-cargo run -p cursio-core -- join            # once per new machine, prompts for the password
+cargo run -p cursio-core -- mesh --pair     # on BOTH machines once, prompts for the password
 cargo run -p cursio-core -- mesh --airplay 1080p60 --airplay-window
 cargo run -p cursio-core -- peers
 RUST_LOG=cursio_airplay=debug,info cargo run -p cursio-core -- mesh
@@ -119,7 +119,7 @@ Everything rides one Noise link, so `transport/src/priority.rs` chunks and queue
 
 ### Pairing and trust
 
-SPAKE2 in symmetric mode: same password both sides, one message each, password never on the wire. A wrong password yields two *different* keys rather than an error, so an explicit key-confirmation step follows; only after confirmation is the peer persisted to the trust store. Identity (`PeerId` + display name) and trusted peers live in the platform config dir. `join` is the only place a password is used and reads it without echoing.
+SPAKE2 in symmetric mode: same password both sides, one message each, password never on the wire. A wrong password yields two *different* keys rather than an error, so an explicit key-confirmation step follows; only after confirmation is the peer persisted to the trust store. Identity (`PeerId` + display name) and trusted peers live in the platform config dir. `mesh --pair` is the only place a password is used and reads it without echoing. It is run on **both** machines rather than paired with a separate `join`: the mesh already listens and dials at once, and `should_dial` picks which side places the call to a machine neither has met. `--pair-addr` names that machine where mDNS will not.
 
 ### Input
 

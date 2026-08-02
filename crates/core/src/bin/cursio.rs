@@ -6,16 +6,19 @@
 //!
 //! Subcommands:
 //! - `mesh` — run a node: listen, dial every trusted peer, share input/audio/clipboard.
-//! - `join` — one-time pairing with a new machine (the only place a password is used), then exit.
 //! - `peers` — list peers discovered on the LAN and exit.
 //!
-//! Typical use: `cursio join` once per new machine, then `cursio mesh` on every
-//! machine, every time. `join` reads the shared password from the terminal
-//! without echoing it or exposing it in the process list.
+//! Typical use: `cursio mesh --pair` on both machines once, with the same
+//! password, then `cursio mesh` on every machine, every time. The password is
+//! read from the terminal without echoing it or exposing it in the process
+//! list.
 //!
 //! (`serve`/`connect` are gone: they encoded a client/server split that the mesh
-//! model doesn't have, and keeping all three meant the same session logic lived
-//! in three places — where a fix landed in one and not the others.)
+//! model doesn't have. `join` was the last of that split to go — it was the
+//! *dialling* half of pairing while `mesh --pair` was the listening half, two
+//! commands for one handshake that had to be run on the right two machines in
+//! the right order. The mesh already listens and dials at once, so pairing does
+//! too, and `should_dial` settles which side places the call.)
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc;
@@ -27,10 +30,10 @@ use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
 use cursio_core::session::{self};
 use cursio_core::NodeIdentity;
-use cursio_protocol::{Fitness, Quality, ServiceId, ServiceOffer};
+use cursio_protocol::{Fitness, PeerId, Quality, ServiceId, ServiceOffer};
 use cursio_transport::discovery;
 use cursio_transport::discovery::DiscoveryConfig;
-use cursio_transport::pairing::{self, Role, TrustStore};
+use cursio_transport::pairing::{Role, TrustStore};
 use cursio_transport::tcp::{TcpListenerHandle, TcpTransport};
 use cursio_transport::Transport;
 use zeroize::Zeroizing;
@@ -51,27 +54,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Pair with a new machine, once, then exit.
-    ///
-    /// The password is only ever needed here: after this both machines hold
-    /// each other's key and `mesh` connects them automatically. There is no
-    /// long-running "client" mode — `mesh` is how you run Cursio.
-    Join {
-        /// Explicit peer address (skips discovery), e.g. 192.168.1.20:9000.
-        #[arg(long)]
-        addr: Option<SocketAddr>,
-        /// How long to browse for a peer before giving up.
-        #[arg(long, default_value_t = 10)]
-        discover_timeout_secs: u64,
-    },
     /// Run as a mesh node: listen *and* dial every trusted peer at once.
     ///
     /// No server. Each node keeps its own list of known machines (from the
     /// trust store), so one dying doesn't make the others forget it — they mark
     /// it offline, carry on with each other, and reconnect when it returns.
     ///
-    /// New peers still join explicitly via `join`; the mesh only
-    /// auto-dials machines already paired with.
+    /// New machines are met explicitly, with `--pair` on both; the mesh
+    /// only auto-dials machines already paired with.
     Mesh {
         /// TCP port to listen on. A **stable default** (not 0/OS-assigned) is
         /// deliberate: the peer caches our last address to reconnect when mDNS is
@@ -128,14 +118,22 @@ enum Command {
         /// AirPlay is forwarded untouched, so nothing is re-encoded on the way.
         #[arg(long, default_value_t = false)]
         share_airplay: bool,
-        /// Accept a first-time pairing from another machine for the next ten
-        /// minutes, using a password read from the terminal.
+        /// Pair with a machine that is not trusted yet: run this on **both**,
+        /// with the same password, for the next ten minutes.
         ///
-        /// Needed on the machine that is *waiting*: `cursio join` on the other
-        /// one dials this node, and without an open window an unknown machine
-        /// is refused before pairing can run.
+        /// Not two commands. The mesh already listens and dials at once; the
+        /// only thing it will not do on its own is call a machine it has never
+        /// met, because joining has to stay a deliberate, password-gated act.
+        /// This opens that window at both ends and lets the two sort out which
+        /// one places the call, the same way two trusted nodes do.
         #[arg(long, default_value_t = false)]
         pair: bool,
+        /// Where to find the machine to pair with, when mDNS will not say.
+        ///
+        /// Only consulted while `--pair` is open. Naming an address also means
+        /// this side places the call rather than waiting to be called.
+        #[arg(long, value_name = "HOST:PORT", requires = "pair")]
+        pair_addr: Option<SocketAddr>,
         /// What this machine asks of the mesh's AirPlay receiver. On by
         /// default.
         ///
@@ -417,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
     // Ask for admin rights before doing anything else, but only for `mesh` —
     // it's the mode that injects input, and Windows' UIPI silently discards
     // injected events aimed at higher-integrity windows (an elevated console,
-    // Task Manager) unless we match them. `join` and `peers` never inject, so
+    // Task Manager) unless we match them. `peers` never injects, so
     // prompting there would be a UAC dialog for nothing.
     //
     // Declining is fine and expected: `ensure_elevated` logs what will and won't
@@ -437,13 +435,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     match cli.command {
-        Command::Join {
-            addr,
-            discover_timeout_secs,
-        } => {
-            let password = read_pairing_password()?;
-            join(identity, addr, &password, discover_timeout_secs).await
-        }
         Command::Mesh {
             port,
             send_input,
@@ -454,6 +445,7 @@ async fn main() -> anyhow::Result<()> {
             files,
             share_airplay,
             pair,
+            pair_addr,
             airplay,
             airplay_window,
             airplay_port,
@@ -493,9 +485,9 @@ async fn main() -> anyhow::Result<()> {
                 let password = read_pairing_password()?;
                 tracing::info!(
                     minutes = PAIRING_WINDOW.as_secs() / 60,
-                    "pairing window open; run `cursio join` on the other machine"
+                    "pairing window open; run `cursio mesh --pair` on the other machine too"
                 );
-                PairingWindow::open(password, PAIRING_WINDOW)
+                PairingWindow::open(password, PAIRING_WINDOW, pair_addr)
             } else {
                 PairingWindow::closed()
             };
@@ -1088,6 +1080,21 @@ async fn run_mesh(
             }
         })?;
 
+    // Machines seen announcing themselves that this node does not trust yet.
+    // Only ever filled while `--pair` holds a window open; emptied by the sweep
+    // that dials them, so a machine that refuses is retried on the next
+    // sighting rather than hammered every two seconds.
+    let mut strangers: std::collections::HashMap<PeerId, (String, SocketAddr)> =
+        std::collections::HashMap::new();
+    if let Some(addr) = pairing.addr() {
+        // An address given on the command line stands in for a sighting, for
+        // the LAN where mDNS is blocked. The id is not known until the
+        // handshake, so a nil one is used purely to key the map — `should_dial`
+        // would otherwise decide the call, and a machine the user named
+        // explicitly is one they want called.
+        strangers.insert(PeerId::nil(), ("the machine you named".into(), addr));
+    }
+
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
@@ -1128,6 +1135,18 @@ async fn run_mesh(
                         );
                         if known {
                             tracing::debug!(peer = %peer.display_name, addr = %peer.addr, "trusted peer seen");
+                        } else if pairing.is_open() {
+                            // The one window in which a stranger is interesting.
+                            // Outside it an unknown machine announcing itself is
+                            // ignored, which is what keeps joining the mesh an
+                            // explicit, password-gated act.
+                            if strangers.insert(peer.peer_id, (peer.display_name.clone(), peer.addr)).is_none() {
+                                tracing::info!(
+                                    peer = %peer.display_name,
+                                    addr = %peer.addr,
+                                    "unpaired machine found; will offer it the pairing password"
+                                );
+                            }
                         } else {
                             tracing::trace!(peer = %peer.display_name, "ignoring untrusted peer");
                         }
@@ -1135,6 +1154,46 @@ async fn run_mesh(
 
                     // Time to dial whoever is known, offline, and ours to call.
                     _ = sweep.tick() => {
+                        // A machine that is not trusted yet, while the window is
+                        // open. This is what `join` used to be: the mesh only
+                        // ever dials the trust store, so somebody has to make
+                        // the first call to a stranger. Both sides run the same
+                        // command and `should_dial` settles which one calls —
+                        // the same rule that stops two trusted nodes dialling
+                        // each other at once.
+                        if pairing.is_open() {
+                            for (peer_id, (name, addr)) in std::mem::take(&mut strangers) {
+                                // A nil id is the `--addr` placeholder: the user
+                                // named this machine, so this side calls it
+                                // rather than waiting to be called.
+                                if peer_id != PeerId::nil()
+                                    && !cursio_core::registry::should_dial(self_id, peer_id)
+                                {
+                                    tracing::debug!(peer = %name, "letting the other machine call us");
+                                    continue;
+                                }
+                                let transport = match TcpTransport::connect(addr).await {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        tracing::warn!(peer = %name, %addr, error = %e, "could not reach the machine to pair with");
+                                        continue;
+                                    }
+                                };
+                                tracing::info!(peer = %name, %addr, "dialled an unpaired machine to pair with it");
+                                spawn_peer_session(
+                                    transport,
+                                    identity.clone(),
+                                    Role::Initiator,
+                                    None,
+                                    registry.clone(),
+                                    pairing.clone(),
+                                    capture.clone(),
+                                    position,
+                                    modules.clone(),
+                                    offer,
+                                );
+                            }
+                        }
                         for target in cursio_core::mesh::next_dial_targets(self_id, &registry) {
                             let transport = match TcpTransport::connect(target.addr).await {
                                 Ok(t) => t,
@@ -1193,17 +1252,21 @@ const PAIRING_WINDOW: Duration = Duration::from_secs(10 * 60);
 ///
 /// A mesh node refuses an inbound stranger outright: the trust store is the
 /// only way in, which is what keeps joining the mesh an explicit act. That left
-/// no way to *become* trusted, because the other machine's `cursio join` needs
-/// this side to run its half of SPAKE2 — and a node with no password bails
-/// before that. `--pair` opens this window so a first meeting can happen, and
-/// the deadline closes it again so a node left running overnight is not
-/// standing open to the LAN.
+/// no way to *become* trusted: SPAKE2 needs both halves, and a node with no
+/// password bails before running its own. `--pair` opens this window at both
+/// ends so a first meeting can happen — it is what lets the mesh dial a machine
+/// it has never met, as well as accept one — and the deadline closes it again
+/// so a node left running overnight is not standing open to the LAN.
 #[derive(Clone)]
 struct PairingWindow(std::rc::Rc<std::cell::RefCell<Option<OpenPairingWindow>>>);
 
 struct OpenPairingWindow {
     password: Zeroizing<String>,
     closes_at: std::time::Instant,
+    /// Where to find the machine to pair with, when mDNS will not say. Part of
+    /// the window rather than carried beside it: both are the same fact —
+    /// this node is trying to meet a stranger, and here is what it knows.
+    addr: Option<SocketAddr>,
 }
 
 impl PairingWindow {
@@ -1211,13 +1274,23 @@ impl PairingWindow {
         Self(std::rc::Rc::new(std::cell::RefCell::new(None)))
     }
 
-    fn open(password: Zeroizing<String>, for_: Duration) -> Self {
+    fn open(password: Zeroizing<String>, for_: Duration, addr: Option<SocketAddr>) -> Self {
         Self(std::rc::Rc::new(std::cell::RefCell::new(Some(
             OpenPairingWindow {
                 password,
+                addr,
                 closes_at: std::time::Instant::now() + for_,
             },
         ))))
+    }
+
+    /// The address the user named, while the window is open.
+    fn addr(&self) -> Option<SocketAddr> {
+        self.0
+            .borrow()
+            .as_ref()
+            .filter(|open| open.closes_at > std::time::Instant::now())
+            .and_then(|open| open.addr)
     }
 
     fn is_open(&self) -> bool {
@@ -1308,14 +1381,13 @@ fn spawn_peer_session(
             while capture.commands.try_recv().is_ok() {}
         }
 
-        // A dialled peer is already trusted, so its key comes from the store and
-        // pairing is skipped. An inbound stranger is refused the same way —
-        // unless `--pair` is holding a window open, which is the one path by
-        // which a machine becomes trusted in the first place.
-        let password = match role {
-            Role::Responder => pairing.password(),
-            Role::Initiator => Zeroizing::new(String::new()),
-        };
+        // Whichever way the call went, the password only matters on a first
+        // meeting: `link::establish` uses the trust store when it has an entry
+        // and reaches for this when it does not. Both roles get it because
+        // either can be the one that dialled a stranger — the mesh calls a
+        // machine it has never met while `--pair` is open, and used to leave
+        // this empty on the assumption that a dialled peer is always trusted.
+        let password = pairing.password();
         let result = run_pairing_and_session(
             transport,
             identity,
@@ -1342,89 +1414,6 @@ fn spawn_peer_session(
             registry.borrow_mut().mark_offline(id);
         }
     });
-}
-
-/// Pair with a new machine, then exit.
-///
-/// This is a **setup** step, not a way to run Cursio: joining is the one moment
-/// a password is needed, and it happens once per machine. Afterwards both sides
-/// hold each other's key in the trust store, and `mesh` dials the peer on its
-/// own — so there is no "client" mode to keep running here.
-///
-/// Deliberately one-shot: no reconnect loop, no capture, no session modules.
-/// Running the pairing session for real would duplicate `mesh`, which is what
-/// the old `serve`/`connect` split did.
-async fn join(
-    identity: NodeIdentity,
-    addr: Option<SocketAddr>,
-    password: &str,
-    discover_timeout_secs: u64,
-) -> anyhow::Result<()> {
-    // Find the peer: an explicit address wins, otherwise browse the LAN.
-    let target = match addr {
-        Some(a) => a,
-        None => {
-            tracing::info!("browsing the LAN for a peer to pair with");
-            match cursio_core::link::discover_one(
-                identity.peer_id,
-                Duration::from_secs(discover_timeout_secs),
-            )
-            .await
-            {
-                Some(peer) => {
-                    tracing::info!(peer = %peer.display_name, addr = %peer.addr, "discovered peer");
-                    peer.addr
-                }
-                None => {
-                    anyhow::bail!(
-                        "no peer found on the LAN; start `cursio mesh` on the other machine, \
-                         or pass --addr"
-                    );
-                }
-            }
-        }
-    };
-
-    let mut transport = TcpTransport::connect(target).await?;
-    tracing::info!(addr = %target, "connected to peer");
-
-    // Hello first, so we know who we're pairing with before spending a password
-    // on them. Pairing is a one-shot: it runs no modules, so it advertises none.
-    let peer = session::handshake(
-        &mut transport,
-        &identity,
-        session::local_device_kind(),
-        &[],
-        cursio_protocol::Position::default(),
-        ServiceOffer::none(),
-    )
-    .await?;
-    tracing::info!(peer = %peer.display_name, id = %peer.peer_id, "handshake ok");
-
-    let mut store = TrustStore::load()?;
-    if store.get(&peer.peer_id).is_some() {
-        tracing::info!(
-            peer = %peer.display_name,
-            "already paired with this machine; nothing to do — run `cursio mesh` on both"
-        );
-        return Ok(());
-    }
-
-    // SPAKE2 over the plaintext transport: safe, because the password itself is
-    // never sent. Both sides end up holding the same shared key.
-    let paired = pairing::run_pairing(
-        &mut transport,
-        password,
-        Role::Initiator,
-        (peer.peer_id, peer.display_name.clone()),
-    )
-    .await?;
-    store.add(&paired)?;
-    tracing::info!(
-        peer = %peer.display_name,
-        "paired — run `cursio mesh` on both machines and they will find each other"
-    );
-    Ok(())
 }
 
 use cursio_core::link::IdentifiedCallback;
@@ -2247,6 +2236,49 @@ mod tests {
         let error = error.to_string();
         assert!(error.contains("1,0"), "should show the shape: {error}");
         assert!(Cli::try_parse_from(["cursio", "mesh", "--at", "a,0"]).is_err());
+    }
+
+    /// Pairing used to be two commands that had to be run on the right two
+    /// machines in the right order. It is one now, run on both.
+    #[test]
+    fn there_is_one_command_and_pairing_is_a_flag_on_it() {
+        assert!(
+            Cli::try_parse_from(["cursio", "join"]).is_err(),
+            "join is gone; `mesh --pair` is both halves"
+        );
+        let Command::Mesh { pair, .. } = Cli::try_parse_from(["cursio", "mesh", "--pair"])
+            .unwrap()
+            .command
+        else {
+            unreachable!();
+        };
+        assert!(pair);
+    }
+
+    /// An address is only meaningful while a window is open, so naming one
+    /// without `--pair` is a mistake worth catching at the command line rather
+    /// than by silently doing nothing.
+    #[test]
+    fn an_address_to_pair_with_needs_the_window_open() {
+        assert!(
+            Cli::try_parse_from(["cursio", "mesh", "--pair-addr", "192.168.1.5:46073"]).is_err()
+        );
+        let Command::Mesh { pair_addr, .. } = Cli::try_parse_from([
+            "cursio",
+            "mesh",
+            "--pair",
+            "--pair-addr",
+            "192.168.1.5:46073",
+        ])
+        .unwrap()
+        .command
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            pair_addr,
+            Some("192.168.1.5:46073".parse::<SocketAddr>().unwrap())
+        );
     }
 
     /// Receiving is on by default: a user who wants an iPhone to find this
