@@ -114,6 +114,28 @@ impl CursorControl for MacCursor {
         Ok(())
     }
 
+    /// Move the pointer clear of the peer-facing edge, wherever it is.
+    ///
+    /// Distinct from the un-park in [`Self::show`], which only runs when this
+    /// machine had hidden the pointer — that is, when it went on to *drive* the
+    /// peer. Returning a borrowed cursor never hides anything, so nothing moved
+    /// the pointer off the edge it was just shoved through, and it sat there
+    /// waiting to fire a second crossing.
+    fn nudge_off_peer_edge(&mut self) {
+        let Some(edge) = crate::peer_edge() else {
+            return;
+        };
+        let bounds = Bounds::of_all_displays();
+        let at = current_pointer_position();
+        let clear = bounds.clamp(off_edge(at, bounds, Some(edge), EDGE_INSET));
+        // Compared rather than warped unconditionally: a pointer already well
+        // inside the screen must not be moved, and a warp is visible.
+        if (clear.x - at.x).abs() > f64::EPSILON || (clear.y - at.y).abs() > f64::EPSILON {
+            tracing::debug!(?edge, "pulling the pointer clear of the peer-facing edge");
+            warp_to(clear);
+        }
+    }
+
     fn backend(&self) -> &'static str {
         "coregraphics"
     }
@@ -254,6 +276,33 @@ mod tests {
         let back = off_edge(at_edge, screen(), Some(Edge::Right), EDGE_INSET);
         assert_eq!(back.x, 1920.0 - EDGE_INSET);
         assert_eq!(back.y, 500.0, "the other axis must not move");
+    }
+
+    /// The exact geometry the log showed going wrong: a crossing leaves the
+    /// pointer at `pos_norm` 0.0 or ~1.0, and from there the next movement
+    /// outward is read as a second crossing. Clearing the zone is what makes
+    /// the machine wait for the cursor to actually come back.
+    #[test]
+    fn a_pointer_left_on_the_edge_is_pulled_clear_of_it() {
+        // pos_norm 0.9989 on a 1920-wide screen is x = 1917.
+        let pinned = Point {
+            x: 1917.0,
+            y: 540.0,
+        };
+        let clear = off_edge(pinned, screen(), Some(Edge::Right), EDGE_INSET);
+        assert!(
+            clear.x <= 1920.0 - EDGE_INSET,
+            "still inside the jump zone at {}",
+            clear.x
+        );
+        // And the other extreme, which is what a Left-edge crossing leaves.
+        let pinned = Point { x: 0.0, y: 540.0 };
+        let clear = off_edge(pinned, screen(), Some(Edge::Left), EDGE_INSET);
+        assert!(
+            clear.x >= EDGE_INSET,
+            "still on the left edge at {}",
+            clear.x
+        );
     }
 
     /// A pointer that was nowhere near the edge is put back exactly where the

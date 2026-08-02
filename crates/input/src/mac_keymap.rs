@@ -294,6 +294,16 @@ impl ModifierMap {
         self.target_of(evdev)
     }
 
+    /// Whether this wire key was assigned to the Mac's Globe key.
+    ///
+    /// A synthetic `flagsChanged` event for virtual keycode 63 carries the Fn
+    /// flag but does not invoke macOS' hardware-level "press Globe to" action.
+    /// The injector uses this answer to perform the promised input-source
+    /// action through Text Input Sources instead.
+    pub(crate) fn targets_globe(self, evdev: u16) -> bool {
+        self.forward(evdev) == KEY_FN
+    }
+
     /// Undo the map, for the capture side.
     ///
     /// A target nothing maps onto passes through unchanged: the user has moved
@@ -1013,6 +1023,8 @@ mod tests {
     fn a_pc_key_can_be_pointed_at_the_globe_key() {
         let map = ModifierMap::parse("rightalt=globe").unwrap();
         assert_eq!(evdev_to_mac(KEY_RIGHTALT, map), Some(VK_FUNCTION));
+        assert!(map.targets_globe(KEY_RIGHTALT));
+        assert!(!map.targets_globe(KEY_LEFTALT));
         // The left one is untouched: only what was named moves.
         assert_eq!(evdev_to_mac(KEY_LEFTALT, map), Some(VK_OPTION));
     }
@@ -1048,6 +1060,17 @@ mod tests {
         let map = ModifierMap::parse("right-alt=globe").unwrap();
         assert_eq!(evdev_to_mac(KEY_RIGHTALT, map), Some(VK_FUNCTION));
         assert_eq!(evdev_to_mac(KEY_LEFTALT, map), Some(VK_OPTION));
+    }
+
+    /// PC muscle memory: left Alt+Tab should become Command+Tab, while the
+    /// Windows key keeps Option available and right Alt remains the language
+    /// switch. This is the concrete map shown to Windows-to-Mac users.
+    #[test]
+    fn windows_alt_tab_and_globe_can_be_mapped_together() {
+        let map = ModifierMap::parse("leftalt=cmd,leftwin=option,rightalt=globe").unwrap();
+        assert_eq!(evdev_to_mac(KEY_LEFTALT, map), Some(VK_COMMAND));
+        assert_eq!(evdev_to_mac(KEY_LEFTMETA, map), Some(VK_OPTION));
+        assert!(map.targets_globe(KEY_RIGHTALT));
     }
 
     /// A side-less target follows the side it came from, so one pair moves a

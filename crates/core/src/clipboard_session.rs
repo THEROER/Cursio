@@ -135,6 +135,13 @@ pub struct ClipboardEngine {
     /// pump is enough.
     pending_failures: Vec<ClipboardFailed>,
 
+    /// The last copy pulled from the peer and written locally. Clipboard APIs
+    /// report our own write as a local change; retaining its bytes lets the
+    /// worker recognise and suppress that echo. It stays until a genuinely
+    /// different local copy appears, which also covers platforms that emit
+    /// more than one notification for a single write.
+    last_remote_copy: Option<ClipboardContent>,
+
     /// The peer's display name, for logs.
     peer_name: String,
 
@@ -179,6 +186,7 @@ impl ClipboardEngine {
             outbound: HashMap::new(),
             pending_request: None,
             pending_failures: Vec::new(),
+            last_remote_copy: None,
             peer_name,
             offered: 0,
             pulled: 0,
@@ -259,6 +267,23 @@ impl ClipboardEngine {
         // would starve the session's inbound branch, same discipline as audio.
         if !self.worker.clipboard_changed() {
             return Ok(());
+        }
+
+        if let Some(remote) = &self.last_remote_copy {
+            match self.worker.matches(remote) {
+                Ok(true) => {
+                    tracing::debug!("ignoring clipboard change caused by peer copy");
+                    return Ok(());
+                }
+                Ok(false) => self.last_remote_copy = None,
+                Err(error) => {
+                    // Do not let an optional echo check disable ordinary local
+                    // sharing. A normal list/read below will report any real
+                    // backend failure in its existing path.
+                    tracing::debug!(%error, "could not compare clipboard with peer copy");
+                    self.last_remote_copy = None;
+                }
+            }
         }
 
         let formats = match self.worker.list_formats() {
@@ -614,6 +639,7 @@ impl ClipboardEngine {
             let content = ClipboardContent {
                 entries: vec![ClipboardEntry::loaded(format, buf)],
             };
+            self.last_remote_copy = Some(content.clone());
             self.worker.write(content);
             self.pulled += 1;
         }

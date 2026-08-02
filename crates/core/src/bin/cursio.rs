@@ -1527,6 +1527,13 @@ async fn run_pairing_and_session(
                 if let Some(g) = grab_ref.as_ref() {
                     g.set_mode(cursio_input::InputMode::Idle);
                 }
+                // `Idle` deliberately still observes edges on macOS so the
+                // initially non-owning machine can start a handoff. Panic is
+                // different: it promises that barriers are DOWN. Forget the
+                // edge until the next handshake restores it, otherwise a mouse
+                // still moving toward the edge immediately hands control away
+                // again (the repeated PANIC -> crossing loop in the logs).
+                cursio_input::set_peer_edge(None);
                 set_cursor_hidden(cursor_ref.borrow_mut().as_mut(), false);
                 set_injecting(release_ref.borrow_mut().as_mut(), true);
                 tracing::warn!("panic recovery: input returned to this machine, barriers down");
@@ -1551,6 +1558,18 @@ async fn run_pairing_and_session(
             // other order it seeds from the parking corner, and the peer's next
             // movement teleports the pointer there.
             set_cursor_hidden(cursor_ref.borrow_mut().as_mut(), dormant);
+            // The cursor just left across the peer-facing edge, so this
+            // machine's own pointer is pinned against it — a `pos_norm` of
+            // exactly 0.0 or 0.9989 in the log is that. Left there, the next
+            // small movement is outward and reads as another crossing, and two
+            // handoffs with no return between them leave this machine believing
+            // it drives a peer the user is not sitting at. Windows already does
+            // this from its hook; macOS had no equivalent.
+            if !ownership.active {
+                if let Some(c) = cursor_ref.borrow_mut().as_mut() {
+                    c.nudge_off_peer_edge();
+                }
+            }
             set_injecting(release_ref.borrow_mut().as_mut(), ownership.active);
             tracing::info!(active = ownership.active, "ownership changed");
         },

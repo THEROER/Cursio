@@ -328,6 +328,23 @@ pub trait CursorControl {
     /// Restore this machine's system cursor. Idempotent.
     fn show(&mut self) -> Result<(), InputError>;
 
+    /// Pull this machine's pointer clear of the edge that borders the peer.
+    ///
+    /// Called when the cursor leaves for the peer, and it is what stops the
+    /// crossing from happening again by itself. A crossing leaves the local
+    /// pointer pinned against the edge — `pos_norm` of exactly `0.0` or
+    /// `0.9989` in a log is that, not a coincidence — so the next small
+    /// movement is outward from the edge and reads as a fresh crossing. Two in
+    /// a row with no return between them is what makes a machine believe it is
+    /// driving the peer while the user is sitting at the other end, and from
+    /// there the cursor cannot be sent back.
+    ///
+    /// The Wayland backend has always done this from inside its capture loop
+    /// (`nudge_off_edge`, after Deskflow's `avoidJumpZone`); this is the same
+    /// idea for the platforms whose pointer is moved rather than barriered.
+    /// Default is a no-op, for a backend with no way to move the pointer.
+    fn nudge_off_peer_edge(&mut self) {}
+
     /// Short label for logs/UI, e.g. `"windows"`, `"x11"`, `"wayland-noop"`.
     fn backend(&self) -> &'static str;
 }

@@ -243,6 +243,17 @@ impl InputInjector for MacInjector {
                 event.post();
                 Ok(())
             }
+            // macOS handles the physical Globe key below the CGEvent layer.
+            // Posting keycode 63 + the Fn flag looks correct to applications,
+            // but never invokes "Press Globe key to: Change Input Source".
+            // Use the public Text Input Sources API for a key explicitly aimed
+            // at Globe, so `rightalt=globe` does what its name promises.
+            InputEvent::Key { key, pressed } if self.map.targets_globe(key) => {
+                if pressed {
+                    cycle_keyboard_input_source()?;
+                }
+                Ok(())
+            }
             InputEvent::Key { key, pressed } => match mac_keymap::evdev_to_mac(key, self.map) {
                 Some(mac_key) => {
                     if pressed {
@@ -308,6 +319,79 @@ impl InputInjector for MacInjector {
 
     fn backend(&self) -> &'static str {
         "cgevent"
+    }
+}
+
+/// Select the next enabled keyboard input source.
+///
+/// Globe's user-visible input-source action is owned by the HID/system layer,
+/// not by the `CGEvent` Fn modifier. Text Input Sources is the supported API for
+/// the same positive operation. The enabled list is filtered to selectable
+/// keyboard sources so palettes and disabled input methods are never chosen.
+fn cycle_keyboard_input_source() -> Result<(), InputError> {
+    // SAFETY: every returned CoreFoundation object is checked for null and the
+    // two Copy/Create results are held by `CfOwned` until after all borrowed
+    // array values have been used.
+    unsafe {
+        let sources = CfOwned::new(TISCreateInputSourceList(std::ptr::null(), 0))
+            .ok_or_else(|| InputError::Unavailable("macOS returned no input-source list".into()))?;
+        let current = CfOwned::new(TISCopyCurrentKeyboardInputSource()).ok_or_else(|| {
+            InputError::Unavailable("macOS returned no current input source".into())
+        })?;
+
+        let mut selectable = Vec::new();
+        let count = CFArrayGetCount(sources.0);
+        for index in 0..count {
+            let source = CFArrayGetValueAtIndex(sources.0, index);
+            if source.is_null() {
+                continue;
+            }
+            let category = TISGetInputSourceProperty(source, kTISPropertyInputSourceCategory);
+            let can_select =
+                TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelectCapable);
+            if !category.is_null()
+                && CFEqual(category, kTISCategoryKeyboardInputSource) != 0
+                && !can_select.is_null()
+                && CFBooleanGetValue(can_select) != 0
+            {
+                selectable.push(source);
+            }
+        }
+
+        if selectable.len() < 2 {
+            return Err(InputError::Unavailable(
+                "macOS has fewer than two enabled keyboard input sources".into(),
+            ));
+        }
+        let next = selectable
+            .iter()
+            .position(|&source| CFEqual(source, current.0) != 0)
+            .map_or(0, |index| (index + 1) % selectable.len());
+        let status = TISSelectInputSource(selectable[next]);
+        if status != 0 {
+            return Err(InputError::Unavailable(format!(
+                "macOS refused to select the next input source (OSStatus {status})"
+            )));
+        }
+        tracing::info!("changed macOS input source via Globe mapping");
+        Ok(())
+    }
+}
+
+/// Owned CoreFoundation reference returned under the Create/Copy rule.
+struct CfOwned(*const c_void);
+
+impl CfOwned {
+    fn new(reference: *const c_void) -> Option<Self> {
+        (!reference.is_null()).then_some(Self(reference))
+    }
+}
+
+impl Drop for CfOwned {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from a Create/Copy function and is released
+        // exactly once here after all borrowed values derived from it are gone.
+        unsafe { CFRelease(self.0.cast_mut()) };
     }
 }
 
@@ -687,7 +771,29 @@ extern "C" {
         key_callbacks: *const CFDictionaryCallBacks,
         value_callbacks: *const CFDictionaryCallBacks,
     ) -> *const c_void;
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    fn CFBooleanGetValue(boolean: *const c_void) -> u8;
+    fn CFEqual(left: *const c_void, right: *const c_void) -> u8;
     fn CFRelease(reference: *mut c_void);
+}
+
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    static kTISPropertyInputSourceCategory: *const c_void;
+    static kTISPropertyInputSourceIsSelectCapable: *const c_void;
+    static kTISCategoryKeyboardInputSource: *const c_void;
+
+    fn TISCreateInputSourceList(
+        properties: *const c_void,
+        include_all_installed: u8,
+    ) -> *const c_void;
+    fn TISCopyCurrentKeyboardInputSource() -> *const c_void;
+    fn TISGetInputSourceProperty(
+        input_source: *const c_void,
+        property_key: *const c_void,
+    ) -> *const c_void;
+    fn TISSelectInputSource(input_source: *const c_void) -> i32;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
