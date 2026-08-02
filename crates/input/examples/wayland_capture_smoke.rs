@@ -28,8 +28,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("bringing up capture (approve the portal dialog if shown)...");
     // Arm the right edge so pushing into it activates capture (the whole point
-    // of this smoke test). Real sessions get the edge from --peer-edge.
-    let mut handle = spawn_capture(Some(cursio_protocol::Edge::Right))?;
+    // of this smoke test). A real session sets this from the peer's `--at`
+    // position once the two have greeted each other; here there is no peer, so
+    // the same call is made by hand.
+    cursio_input::set_peer_edge(Some(cursio_protocol::Edge::Right));
+    let mut handle = spawn_capture()?;
     println!("capture up: {:?}", handle.devices);
 
     // Enable capture (this is what a dormant machine does). On Wayland this

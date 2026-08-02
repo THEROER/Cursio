@@ -57,11 +57,6 @@ pub struct Handshake<'a> {
     /// property of the connection — whoever dialled — not a hierarchy.
     pub role: Role,
     pub registry: &'a ModuleRegistry,
-    /// Which of our screen edges borders the peer, when the user named it
-    /// explicitly. An override: left unset, the edge is derived from the two
-    /// machines' [`Position`](cursio_protocol::Position)s instead, which is the
-    /// arrangement that scales past two machines.
-    pub peer_edge: Option<cursio_protocol::Edge>,
     /// Where this machine stands in the user's layout.
     pub position: cursio_protocol::Position,
     /// Whether this machine has input to send the peer.
@@ -89,9 +84,8 @@ pub struct Link {
     /// Who holds the shared cursor, and whether the peer can hold it at all.
     pub cursor: CursorSetup,
     /// Which of this machine's edges borders this peer, derived from the two
-    /// positions unless the user named it outright. The caller points capture
-    /// at it: the answer is only knowable once the peer has said hello, which
-    /// is after capture exists.
+    /// positions. The caller points capture at it: the answer is only knowable
+    /// once the peer has said hello, which is after capture exists.
     pub peer_edge: Option<cursio_protocol::Edge>,
 }
 
@@ -120,13 +114,10 @@ where
         plan.position,
     )
     .await?;
-    // Derived per link, not per process: with a hub and several spokes the
-    // answer differs for every peer, and the flag can only ever state one of
-    // them. An explicit `--peer-edge` still wins, for a layout the hub model
-    // does not describe.
-    let peer_edge = plan
-        .peer_edge
-        .or_else(|| plan.position.edge_toward(peer.position));
+    // Derived per link, not per process: four machines in a row each border a
+    // different neighbour, and a single machine-wide setting can only ever
+    // state one of those answers.
+    let peer_edge = plan.position.edge_toward(peer.position);
     tracing::info!(
         peer = %peer.display_name,
         id = %peer.peer_id,

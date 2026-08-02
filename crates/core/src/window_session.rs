@@ -636,8 +636,8 @@ fn spawn_drag_trigger(
         };
         if peer_edge.is_none() {
             tracing::info!(
-                "no --peer-edge set, so dragging a window off an edge does nothing; \
-                 window transfer still works with --share-window"
+                "this peer borders no edge of this screen, so dragging a window off one does \
+                 nothing; window transfer still works with --share-window"
             );
         }
         tracing::info!(

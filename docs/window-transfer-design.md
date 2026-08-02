@@ -365,7 +365,8 @@ of the capture backend work.
 4. **Lossy codecs** — implement `LossyImage` then `LossyVideo` behind the
    existing `TileCodec` tags; host picks per-tile by region kind.
 5. **The edge-drag trigger — CODE COMPLETE, NOT YET RUN (2026-07-20)** — drag a
-   window past `--peer-edge` and it transfers; drag it back and it returns
+   window past the edge that borders the peer (derived from the two machines'
+   `--at` positions) and it transfers; drag it back and it returns
    (`WindowCloseReason::Returned`).
    - Detection is *not* shared with the cursor's edge crossing, and cannot be:
      that signal carries no window, and on Wayland it only fires while input

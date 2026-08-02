@@ -123,17 +123,19 @@ const BTN_EXTRA: u32 = 0x114;
 /// `LocalSet`, and hand only the (Send) channels back out. Blocks until the
 /// portal session + libei handshake are up (so a grant failure or a declined
 /// dialog surfaces here) via a oneshot readiness signal.
-pub fn spawn_wayland_capture(peer_edge: Option<Edge>) -> Result<CaptureHandle, InputError> {
+pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (edges_tx, edges_rx) = mpsc::unbounded_channel();
     let (grab, grab_rx) = crate::GrabControl::new();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    // Seed the shared edge with whatever the caller knows now (normally
-    // nothing) and subscribe before the thread starts, so an edge set while the
-    // portal handshake is still running is not missed.
-    watched_edge().send_replace(peer_edge);
+    // Subscribed before the thread starts, so an edge set while the portal
+    // handshake is still running wakes the loop rather than being missed. On a
+    // first run the shared value is `None` and the first barriers go up when a
+    // peer greets us; on a capture restarted mid-mesh it already holds the
+    // right edge.
     let edge_rx = watched_edge().subscribe();
+    let peer_edge = *edge_rx.borrow();
 
     std::thread::Builder::new()
         .name("cursio-wayland".into())

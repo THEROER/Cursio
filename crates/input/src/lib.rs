@@ -51,26 +51,19 @@ pub use win::WinInjector;
 #[cfg(target_os = "windows")]
 pub use win_cursor::WinCursor;
 
-/// Start Windows RawInput capture, wiring edge-crossing detection to
-/// `peer_edge`. Same signature as the Linux [`spawn_capture`] so callers are
-/// platform-agnostic. Unlike Linux (where the Wayland portal watches all edges
-/// and the caller filters), the Windows jump-zone watch lives in the mouse hook,
-/// so the edge is pushed down into the backend here.
+/// Start Windows RawInput capture. Same signature as the other platforms so
+/// callers stay platform-agnostic; the jump-zone watch lives in the mouse hook
+/// and is pointed at an edge by [`set_peer_edge`].
 #[cfg(target_os = "windows")]
-pub fn spawn_capture(
-    peer_edge: Option<cursio_protocol::Edge>,
-) -> Result<CaptureHandle, InputError> {
-    win_capture::spawn_capture_with_edge(peer_edge)
+pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
+    win_capture::spawn_capture_with_edge(peer_edge())
 }
 
-/// Start macOS capture through a `CGEventTap`. Same signature as the other
-/// platforms so callers stay platform-agnostic. `peer_edge` is ignored: macOS
-/// has no pointer barriers, so the hotkey is what hands control over.
+/// Start macOS capture through a `CGEventTap`. The tap reads the watched edge
+/// per event, so there is nothing to arm here.
 #[cfg(target_os = "macos")]
-pub fn spawn_capture(
-    peer_edge: Option<cursio_protocol::Edge>,
-) -> Result<CaptureHandle, InputError> {
-    mac_capture::spawn_capture(peer_edge)
+pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
+    mac_capture::spawn_capture()
 }
 
 /// Start local input capture, picking the backend for this Linux session.
@@ -78,25 +71,26 @@ pub fn spawn_capture(
 /// On **Wayland** we can't grab `/dev/input` usefully, so we use the
 /// `InputCapture` portal + libei ([`wl_capture`]) — which also gives us edge
 /// crossing. On X11 / no display server we fall back to the evdev backend
-/// ([`capture`]). The caller gets the same [`CaptureHandle`] either way.
-///
-/// `peer_edge` (which of our edges borders the peer) is passed to the Wayland
-/// backend so it only arms a barrier on *that* edge — a barrier on any other
-/// edge would still grab input on activation (locking the user), even though the
-/// caller later filters the crossing out. With `None`, no barrier is armed, so
-/// edge-crossing is off (only the hotkey hands off). The evdev backend has no
-/// edge detection, so it ignores this.
+/// ([`capture`]), which cannot detect an edge at all. The caller gets the same
+/// [`CaptureHandle`] either way.
 #[cfg(target_os = "linux")]
-pub fn spawn_capture(
-    peer_edge: Option<cursio_protocol::Edge>,
-) -> Result<CaptureHandle, InputError> {
+pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland");
     if wayland {
         tracing::info!("using Wayland InputCapture portal for capture");
-        wl_capture::spawn_wayland_capture(peer_edge)
+        wl_capture::spawn_wayland_capture()
     } else {
+        // Stated rather than left to be discovered. evdev reports `REL_X`/
+        // `REL_Y` and nothing else, so "the cursor reached the edge" is not a
+        // question this backend can answer — and a mesh where the cursor simply
+        // stops dead at the screen edge, with nothing in the log, is
+        // indistinguishable from one where the peer is misplaced.
         tracing::info!("using evdev for capture");
+        tracing::warn!(
+            "this session is not Wayland: edge crossing is unavailable (evdev has no cursor \
+             position), so Ctrl+Alt+G is the only way to hand the cursor over"
+        );
         capture::spawn_capture()
     }
 }

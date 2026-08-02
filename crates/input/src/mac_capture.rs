@@ -56,13 +56,10 @@ pub(crate) const INJECTED_TAG: i64 = 0x0C_09_50_10;
 
 /// Start capturing this Mac's keyboard and mouse.
 ///
-/// `peer_edge` is a starting value only: the real answer arrives with the
-/// peer's greeting, and [`crate::set_peer_edge`] is what carries it here after
-/// the tap is already running.
-pub fn spawn_capture(
-    peer_edge: Option<cursio_protocol::Edge>,
-) -> Result<CaptureHandle, InputError> {
-    crate::set_peer_edge(peer_edge);
+/// Nothing about the peer is needed here: the tap reads the watched edge from
+/// [`crate::peer_edge`] on every event, so it follows a peer that greets us
+/// long after the tap is running.
+pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (edges_tx, edges) = tokio::sync::mpsc::unbounded_channel::<EdgeCrossing>();
 

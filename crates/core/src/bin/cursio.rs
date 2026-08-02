@@ -103,16 +103,6 @@ enum Command {
             value_parser = parse_position
         )]
         at: cursio_protocol::Position,
-        /// Which of this machine's screen edges borders the peer, overriding
-        /// what `--at` implies.
-        ///
-        /// Rarely needed: with `--at` set on both machines each side works the
-        /// edge out from the two positions once they greet each other. Kept for
-        /// a layout the grid does not describe, and for **Wayland**, whose
-        /// pointer barriers are placed when capture starts and so cannot follow
-        /// a peer that connects later.
-        #[arg(long, value_enum)]
-        peer_edge: Option<EdgeArg>,
         /// Share audio with peers.
         #[arg(long, default_value_t = false)]
         audio: bool,
@@ -131,8 +121,9 @@ enum Command {
         /// cannot yet mount the peer's.
         #[arg(long, default_value_t = false)]
         files: bool,
-        /// Let windows move to the peer: drag one past the `--peer-edge` and it
-        /// appears on the peer's desktop, while the app keeps running here.
+        /// Let windows move to the peer: drag one past the edge that borders
+        /// it (see `--at`) and it appears on the peer's desktop, while the app
+        /// keeps running here.
         ///
         /// Dragging needs the Cursio GNOME extension on Linux (a Wayland client
         /// cannot see other windows being dragged); Windows needs nothing extra.
@@ -214,30 +205,6 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
     },
-}
-
-/// Which of *this* machine's screen edges borders the peer, for edge-crossing
-/// handoff. A clap-parseable mirror of [`cursio_protocol::Edge`]. When set,
-/// shoving the shared cursor off this edge hands control to the peer (in
-/// addition to the Ctrl+Alt+G hotkey). Only the Wayland capture backend detects
-/// crossings today.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum EdgeArg {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-impl From<EdgeArg> for cursio_protocol::Edge {
-    fn from(e: EdgeArg) -> Self {
-        match e {
-            EdgeArg::Left => cursio_protocol::Edge::Left,
-            EdgeArg::Right => cursio_protocol::Edge::Right,
-            EdgeArg::Top => cursio_protocol::Edge::Top,
-            EdgeArg::Bottom => cursio_protocol::Edge::Bottom,
-        }
-    }
 }
 
 /// Parse `--at X,Y` into a grid cell.
@@ -340,7 +307,6 @@ async fn main() -> anyhow::Result<()> {
             port,
             send_input,
             at,
-            peer_edge,
             audio,
             audio_render_device,
             clipboard,
@@ -430,15 +396,7 @@ async fn main() -> anyhow::Result<()> {
                     },
                 },
             );
-            let mesh = run_mesh(
-                identity.clone(),
-                port,
-                send_input,
-                at,
-                peer_edge.map(Into::into),
-                modules,
-                pairing,
-            );
+            let mesh = run_mesh(identity.clone(), port, send_input, at, modules, pairing);
             if no_airplay {
                 mesh.await
             } else {
@@ -881,7 +839,6 @@ async fn run_mesh(
     port: u16,
     send_input: bool,
     position: cursio_protocol::Position,
-    peer_edge: Option<cursio_protocol::Edge>,
     modules: cursio_core::module::ModuleRegistry,
     pairing: PairingWindow,
 ) -> anyhow::Result<()> {
@@ -889,7 +846,7 @@ async fn run_mesh(
         listener,
         _announcement,
         capture,
-    } = start_node(&identity, port, send_input, peer_edge).await?;
+    } = start_node(&identity, port, send_input).await?;
 
     // One registry for the whole process, shared by every session. Sessions are
     // single-threaded by design, so `Rc` is the right sharing primitive here.
@@ -945,7 +902,6 @@ async fn run_mesh(
                             registry.clone(),
                             pairing.clone(),
                             capture.clone(),
-                            peer_edge,
                             position,
                             modules.clone(),
                         );
@@ -999,7 +955,6 @@ async fn run_mesh(
                                 registry.clone(),
                                 pairing.clone(),
                                 capture.clone(),
-                                peer_edge,
                                 position,
                                 modules.clone(),
                             );
@@ -1095,11 +1050,6 @@ fn spawn_peer_session(
     // resource (one portal permission, one grab), so sessions take turns on it
     // rather than each building their own. See [`PersistentCapture`].
     capture: SharedCapture,
-    // Ownership handoff doesn't need this — the topology lives in the shared
-    // capture's edge forwarder, so sessions only see "hand off to the peer".
-    // The *window drag* trigger does: it compares the pointer against the
-    // peer-facing edge itself, independently of who owns the cursor.
-    peer_edge: Option<cursio_protocol::Edge>,
     // Where this machine stands, from which the edge to each peer is derived.
     position: cursio_protocol::Position,
     // Shared rather than cloned: the registry is built once per process and read
@@ -1163,7 +1113,6 @@ fn spawn_peer_session(
             role,
             false,
             capture_for_session,
-            peer_edge,
             position,
             &modules,
             Some(&mut on_identified),
@@ -1288,14 +1237,9 @@ async fn run_pairing_and_session(
     // Capture is created ONCE by the caller and lent to each peer session — see
     // [`PersistentCapture`] for why it must not be rebuilt per connection.
     capture: Option<&mut PersistentCapture>,
-    // Cursor *ownership* handoff doesn't need this: that topology is baked into
-    // the shared capture's edge forwarder, so a session only sees "hand off to
-    // the peer". The window-drag trigger does need it — it compares the pointer
-    // against the peer-facing edge itself, independently of who owns the cursor.
-    peer_edge: Option<cursio_protocol::Edge>,
-    // Where this machine stands. Travels with `peer_edge` because it answers
-    // the same question one step earlier: the edge to *this* peer is derived
-    // from the two positions unless the user named it outright.
+    // Where this machine stands. The edge to *this* peer is derived from it and
+    // the peer's own position during the handshake — both the cursor handoff
+    // and the window-drag trigger read that answer back off the link.
     position: cursio_protocol::Position,
     // Everything this node can run. Built once by the caller; a session takes
     // what negotiation agreed on. Replaces the five per-module flags that used
@@ -1313,7 +1257,6 @@ async fn run_pairing_and_session(
             password,
             role,
             registry: modules,
-            peer_edge,
             position,
             sends_input: capture.is_some(),
         },
@@ -1321,9 +1264,9 @@ async fn run_pairing_and_session(
     )
     .await?;
     // Now that the peer has said where it stands, capture can watch the edge
-    // between us. This is what makes `--peer-edge` unnecessary: both machines
-    // already know, and the flag only existed because the barrier had to be
-    // armed before anyone had spoken.
+    // between us. This is what replaced `--peer-edge`: both machines already
+    // know, and the flag only existed because the barrier had to be armed
+    // before anyone had spoken.
     cursio_input::set_peer_edge(link.peer_edge);
 
     let peer = link.peer;
@@ -1590,10 +1533,10 @@ fn spawn_hotkey_filter(
 /// stops there as usual.
 ///
 /// This is where the screen topology lives; the session stays topology-agnostic
-/// (it only sees "hand off to the peer"). With no `peer_edge` configured, edge
-/// crossings are ignored entirely (the receiver still drains so the channel
-/// doesn't back up). Shares `cmd_tx` with the hotkey filter: both are just ways
-/// to ask for the same handoff.
+/// (it only sees "hand off to the peer"). Until a peer has greeted us there is
+/// no edge to match against, so crossings are ignored entirely (the receiver
+/// still drains so the channel doesn't back up). Shares `cmd_tx` with the
+/// hotkey filter: both are just ways to ask for the same handoff.
 fn spawn_edge_handoff(
     mut edges: tokio::sync::mpsc::UnboundedReceiver<cursio_input::EdgeCrossing>,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<session::OwnershipCmd>,
@@ -1817,7 +1760,6 @@ async fn start_node(
     identity: &NodeIdentity,
     port: u16,
     send_input: bool,
-    peer_edge: Option<cursio_protocol::Edge>,
 ) -> anyhow::Result<NodeBase> {
     let listener = TcpListenerHandle::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
     let bound = listener.local_addr();
@@ -1838,15 +1780,13 @@ async fn start_node(
     // Capture comes up ONCE here, before any session: the portal permission is
     // asked a single time and survives peers coming and going. See
     // [`PersistentCapture`].
-    // Which edge the capture watches is still one edge, and still the flag's
-    // to name. `--at` decides where each *peer* is, which is a per-link answer
-    // a session learns from the greeting — but the barrier is armed before any
-    // peer has said hello, and the backends take a single edge (a Windows
-    // atomic, one Wayland barrier). Arming every edge is the change that closes
-    // this, and it belongs in those backends rather than here.
-    let capture: SharedCapture = std::rc::Rc::new(std::cell::RefCell::new(
-        make_persistent_capture(send_input, peer_edge),
-    ));
+    //
+    // It is started without an edge on purpose. Which edge borders a peer is a
+    // per-link answer derived from the two `--at` positions, and no peer has
+    // said hello yet; each backend is pointed at one later through
+    // [`cursio_input::set_peer_edge`].
+    let capture: SharedCapture =
+        std::rc::Rc::new(std::cell::RefCell::new(make_persistent_capture(send_input)));
 
     Ok(NodeBase {
         listener,
@@ -1869,15 +1809,12 @@ type SharedCapture = std::rc::Rc<std::cell::RefCell<Option<PersistentCapture>>>;
 ///
 /// Returns `None` when capture is disabled or unavailable, in which case
 /// sessions simply run without local input sharing.
-fn make_persistent_capture(
-    enabled: bool,
-    peer_edge: Option<cursio_protocol::Edge>,
-) -> Option<PersistentCapture> {
+fn make_persistent_capture(enabled: bool) -> Option<PersistentCapture> {
     if !enabled {
         return None;
     }
 
-    let handle = make_capture(peer_edge)?;
+    let handle = make_capture()?;
     let grab = handle.grab.clone();
 
     // Both forwarders are permanent too: they own the raw receivers and feed the
@@ -1901,8 +1838,8 @@ fn make_persistent_capture(
 /// access) or the Wayland portal; on Windows it installs RawInput hooks; on
 /// macOS it opens a `CGEventTap` (needs the Accessibility permission).
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn make_capture(peer_edge: Option<cursio_protocol::Edge>) -> Option<cursio_input::CaptureHandle> {
-    match cursio_input::spawn_capture(peer_edge) {
+fn make_capture() -> Option<cursio_input::CaptureHandle> {
+    match cursio_input::spawn_capture() {
         Ok(handle) => {
             tracing::info!(devices = ?handle.devices, "capturing local input");
             Some(handle)
@@ -1915,7 +1852,7 @@ fn make_capture(peer_edge: Option<cursio_protocol::Edge>) -> Option<cursio_input
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn make_capture(_peer_edge: Option<cursio_protocol::Edge>) -> Option<cursio_input::CaptureHandle> {
+fn make_capture() -> Option<cursio_input::CaptureHandle> {
     tracing::warn!("no input capture backend on this platform yet");
     None
 }
@@ -1995,13 +1932,11 @@ mod tests {
     /// Unplaced machines must border nothing: a default that implied adjacency
     /// would hand the cursor away on a shove the user never meant.
     fn an_unplaced_node_sits_at_the_origin() {
-        let Command::Mesh { at, peer_edge, .. } =
-            Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
+        let Command::Mesh { at, .. } = Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
         else {
             panic!("expected mesh");
         };
         assert_eq!(at, cursio_protocol::Position::new(0, 0));
-        assert!(peer_edge.is_none());
         assert_eq!(at.edge_toward(at), None);
     }
 
