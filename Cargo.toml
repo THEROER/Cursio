@@ -48,7 +48,7 @@ bincode = "1.3"
 plist = "1"
 
 # Discovery
-mdns-sd = "0.11"
+mdns-sd = "0.20"
 
 # Hardware video decode/render
 gstreamer = "0.25"

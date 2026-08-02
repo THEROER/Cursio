@@ -8,7 +8,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use cursio_protocol::PeerId;
-use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{IfKind, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use crate::TransportError;
 
@@ -355,7 +355,7 @@ where
 
 /// Build a [`DiscoveredPeer`] from a resolved service, or `None` if it's us,
 /// malformed, or has no reachable address.
-fn peer_from_info(info: &ServiceInfo, self_id: PeerId) -> Option<DiscoveredPeer> {
+fn peer_from_info(info: &ResolvedService, self_id: PeerId) -> Option<DiscoveredPeer> {
     let peer_id: PeerId = info
         .get_property_val_str(TXT_PEER_ID)
         .and_then(|s| s.parse().ok())?;
@@ -375,7 +375,7 @@ fn peer_from_info(info: &ServiceInfo, self_id: PeerId) -> Option<DiscoveredPeer>
         .iter()
         .find(|a| a.is_ipv4())
         .or_else(|| info.get_addresses().iter().next())
-        .copied()?;
+        .map(|address| address.to_ip_addr())?;
 
     Some(DiscoveredPeer {
         peer_id,
