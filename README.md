@@ -30,6 +30,9 @@ Windows 11
 
 Linux (Wayland)
 
+macOS 13+ — input, clipboard, AirPlay and window *hosting*. A Mac cannot yet
+display a peer's window, and has no audio or file-sharing backend.
+
 Wayland support depends on compositor security policies and may vary.
 
 Core concepts
@@ -40,7 +43,7 @@ Only the window surface and input are transferred
 
 When a window is moved:
 
-it is hidden or minimized on the source (configurable)
+it is hidden on the source (Windows), so the transfer feels like a move
 
 and appears as a native window on the target
 
@@ -54,7 +57,8 @@ System shortcuts (e.g. Alt-Tab) remain local
 
 Performance
 
-Hardware encoding via NVIDIA NVENC
+Hardware H.264 encoding where the platform provides it — ffmpeg on Linux, Media
+Foundation on Windows
 
 Focus on low latency and high visual quality
 
@@ -62,11 +66,11 @@ LAN-only transport
 
 User interaction
 
-Move windows by dragging them across screen edges
+Move windows by dragging them across screen edges — the only way to offer one,
+so nothing is transferred by accident
 
-Or via configurable hotkeys (e.g. Super + Arrow)
-
-System tray + GUI for control and settings
+Take the cursor back with Ctrl+Alt+G (in the wire key namespace, so a Mac's own
+mapping is logged at startup)
 
 Device pairing with password authentication
 
@@ -82,15 +86,11 @@ Latency depends on network and hardware capabilities
 
 Roadmap
 
-v0.1: single-window streaming, input proxy, pairing
+Done: encrypted mesh, input proxy, drag-to-edge window movement, per-application
+audio, clipboard, file sharing, AirPlay receiver
 
-v0.2: multiple windows, bi-directional sessions
-
-v0.3: seamless drag-to-edge window movement
-
-v0.4: optional audio streaming and A/V sync
-
-Later: encryption, adaptive bitrate, compositor integrations
+Next: displaying a peer's window on macOS, VideoToolbox encoding, adaptive
+bitrate, compositor integrations
 
 ## Project layout
 
@@ -202,35 +202,37 @@ Override the levels via env vars:
 
 ### Pairing two machines on your LAN
 
-On machine A (e.g. Ubuntu), start a node that announces itself and waits:
+Run the *same* command on **both** machines, with the same password:
 
 ```sh
-cargo run -p cursio-core -- serve --password <shared-secret>
+cargo run -p cursio-core -- mesh --pair
 ```
 
-On machine B (e.g. Windows), discover A on the LAN and connect:
+It prompts for the password without echoing it. There is no separate "listen"
+and "join" side: a mesh node already listens and dials at once, and the two ends
+sort out which one places the call. `--pair` only opens the ten-minute window in
+which a machine neither has met is allowed to be called at all.
 
-```sh
-cargo run -p cursio-core -- connect --password <shared-secret>
-```
-
-Both must use the **same password**. On first contact they run SPAKE2 pairing,
-confirm the derived key, remember each other, and hold a heartbeat session. On a
-later run they skip pairing (`peer already trusted`). A wrong password is
-rejected at key confirmation and no trust is stored.
+On first contact they run SPAKE2 pairing, confirm the derived key, remember each
+other, and hold a session. Later runs skip pairing (`peer already trusted`), so
+plain `mesh` is enough. A wrong password is rejected at key confirmation and no
+trust is stored.
 
 Useful flags:
 
-- `connect --addr <ip:port>` — skip discovery and dial a peer directly.
+- `mesh --pair-addr <ip:port>` — name the machine to pair with when mDNS will
+  not; also means this side places the call.
+- `mesh --port <n>` — pin the listening port.
 - `peers` — list peers discovered on the LAN and exit.
-- `serve --port <n>` — pin the listening port (default: OS-assigned).
 - `RUST_LOG=debug` — verbose logging (heartbeats etc.).
 
 Identity and trusted peers are persisted under the platform config directory
-(`~/.config/cursio` on Linux; `%APPDATA%\cursio` on Windows).
+(`~/.config/cursio` on Linux; `%APPDATA%\cursio` on Windows; `~/Library/
+Application Support/cursio` on macOS).
 
-> Note: post-pairing session traffic is not yet encrypted — the derived key is
-> stored for the upcoming Noise channel. Encryption is on the roadmap (below).
+Session traffic runs over a Noise `NNpsk0` channel keyed by the paired secret —
+input, audio, clipboard, windows and file requests all share that one encrypted
+link.
 
 License
 
