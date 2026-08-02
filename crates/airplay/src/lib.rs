@@ -12,7 +12,6 @@ mod bonjour;
 mod config;
 pub mod crypto;
 pub mod discovery;
-pub mod hardware;
 mod media;
 pub mod mirror;
 mod receiver;

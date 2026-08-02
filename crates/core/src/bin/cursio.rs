@@ -699,17 +699,6 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
         None => VideoProfile::new(Resolution::FullHd, DEFAULT_AIRPLAY_FPS)?,
     };
     if options.profile.is_some() {
-        let hardware = cursio_airplay::hardware::HardwareInfo::detect();
-        for gpu in &hardware.gpus {
-            let vram = gpu
-                .dedicated_vram_bytes
-                .map(|bytes| format!("{:.1} GiB", bytes as f64 / 1024_f64.powi(3)))
-                .unwrap_or_else(|| "shared/unknown VRAM".to_string());
-            tracing::info!(gpu = %gpu.name, %vram, "AirPlay GPU");
-        }
-        for warning in hardware.profile_warnings(profile) {
-            tracing::warn!("{warning}");
-        }
         for warning in
             cursio_airplay::video::dependency_warnings(cursio_airplay::video::VideoCodec::H264)
         {
