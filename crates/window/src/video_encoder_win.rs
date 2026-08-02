@@ -74,7 +74,7 @@ impl VideoEncoder {
     pub fn open(width: u32, height: u32) -> Result<Self, WindowError> {
         // 4:2:0 chroma is subsampled by two on both axes, so odd dimensions
         // have no valid chroma plane. Reject rather than silently skew.
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(WindowError::Backend(format!(
                 "video encoder needs even dimensions, got {width}x{height}"
             )));

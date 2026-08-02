@@ -261,6 +261,11 @@ pub(crate) fn texture_to_bgra(
 /// ([`video_encoder_win`](crate::video_encoder_win)); small ones stay on
 /// lossless zstd tiles. Same routing as the Linux path, and the same reason: a
 /// moving window costs 742 Mbit/s as lossless tiles, which fits nowhere.
+///
+/// The arguments are the capture loop's own state, borrowed for one frame.
+/// Bundling them into a struct would only move the same fields somewhere the
+/// loop then has to keep in step.
+#[allow(clippy::too_many_arguments)]
 fn emit_frame(
     id: WindowId,
     frame: &[u8],

@@ -144,7 +144,7 @@ impl InputInjector for WinInjector {
                 // then every 120th move, so both cases are distinguishable
                 // without drowning the log.
                 self.motion_seq = self.motion_seq.wrapping_add(1);
-                if result.is_err() || self.motion_seq % 120 == 0 {
+                if result.is_err() || self.motion_seq.is_multiple_of(120) {
                     tracing::debug!(
                         dx,
                         dy,
