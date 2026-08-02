@@ -229,10 +229,14 @@ impl CursorRole {
         self.peer_driving = false;
     }
 
-    /// Take the cursor because the peer sent it here.
+    /// Record that the peer sent its cursor here.
     ///
     /// The peer is driving — unless we were driving *it*, in which case this is
-    /// the cursor we lent coming home and we are still the user's machine.
+    /// the cursor we lent coming home and we are still the user's machine. This
+    /// transition also matters when we already hold the shared cursor: an idle
+    /// second machine may start driving us without changing which screen is
+    /// active, and the next crossing must still return the cursor to that
+    /// machine rather than turn both sides into drivers.
     pub fn take_over(&mut self) {
         self.active = true;
         self.peer_driving = !self.driving;
@@ -698,16 +702,21 @@ where
                         }
                     }
                     Some(Message::CrossEdge { edge, pos_norm }) => {
-                        // The peer's cursor crossed the edge toward us: we become
-                        // active, the cursor entering on `edge` (already the edge
-                        // on OUR side — the sender flipped it) at `pos_norm`. Same
-                        // ownership flip as Grab{active:true}, with entry geometry
-                        // for cursor placement.
-                        if !am_active {
-                            role.take_over();
-                            am_active = role.active();
+                        // The peer's cursor crossed the edge toward us. Record
+                        // that peer even when we are already active: an idle
+                        // second machine can begin driving the screen that
+                        // already holds the shared cursor, and ignoring that
+                        // crossing loses who must regain control on the way
+                        // back. That was the one-way mouse failure after a
+                        // successful first round trip.
+                        let was_active = am_active;
+                        role.take_over();
+                        am_active = role.active();
+                        if !was_active {
                             tracing::info!(?edge, pos_norm, "cursor crossed in from peer");
                             on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
+                        } else {
+                            tracing::info!(?edge, pos_norm, "peer began driving the cursor held here");
                         }
                     }
                     Some(Message::Bye) => {
@@ -1021,6 +1030,31 @@ mod cursor_role_tests {
         pair.push_across();
         assert!(pair.here.driving(), "the user's machine drives again");
         assert!(pair.there.active());
+    }
+
+    /// Peer ids choose an initial holder, not which physical mouse the user is
+    /// allowed to use. The initially idle machine may send its own cursor into
+    /// the already-active screen; that screen must remember who is driving so
+    /// the first crossing back returns control instead of starting a second
+    /// driver.
+    #[test]
+    fn the_initially_idle_machine_can_drive_and_get_control_back() {
+        let mut holder = CursorRole::new(true);
+        let mut source = CursorRole::new(false);
+
+        source.hand_over();
+        holder.take_over();
+        assert!(holder.active());
+        assert!(source.driving());
+
+        holder.hand_over();
+        source.take_over();
+        assert!(source.active(), "the source got its cursor back");
+        assert!(!source.driving(), "the source no longer streams input");
+        assert!(
+            !holder.driving(),
+            "the holder did not become a second driver"
+        );
     }
 
     /// Ten round trips, because a state machine that survives one and not five
