@@ -208,7 +208,12 @@ pub fn screen_size() -> Option<crate::drag_trigger::ScreenBounds> {
     }
 
     let (min_x, min_y, max_x, max_y) = union?;
+    // The union's corner, not just its size: a display to the left of the main
+    // one has a negative `CGDisplayBounds` origin, and the event tap reports
+    // pointer positions in that same space.
     Some(crate::drag_trigger::ScreenBounds {
+        x: min_x as i32,
+        y: min_y as i32,
         width: (max_x - min_x) as i32,
         height: (max_y - min_y) as i32,
     })

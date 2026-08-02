@@ -90,11 +90,14 @@ impl DragWatcher {
 /// monitor's size would put the edge in the middle of a multi-monitor desktop.
 pub fn screen_size() -> Option<crate::drag_trigger::ScreenBounds> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
     };
     // SAFETY: a pure query with no arguments to get wrong.
-    let (width, height) = unsafe {
+    let (x, y, width, height) = unsafe {
         (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
             GetSystemMetrics(SM_CXVIRTUALSCREEN),
             GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
@@ -102,7 +105,16 @@ pub fn screen_size() -> Option<crate::drag_trigger::ScreenBounds> {
     if width <= 0 || height <= 0 {
         return None;
     }
-    Some(crate::drag_trigger::ScreenBounds { width, height })
+    // The origin is only zero when the primary monitor is also the leftmost and
+    // topmost one. Arrange a second monitor to the left and every pointer
+    // coordinate on the primary is positive while the desktop's left edge sits
+    // at a negative x — which is why this is read rather than assumed.
+    Some(crate::drag_trigger::ScreenBounds {
+        x,
+        y,
+        width,
+        height,
+    })
 }
 
 /// What the poller knows about the drag currently in progress.

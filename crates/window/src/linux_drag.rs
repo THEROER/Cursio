@@ -77,7 +77,14 @@ pub async fn screen_size() -> Option<crate::drag_trigger::ScreenBounds> {
     .ok()?;
 
     let (width, height): (i32, i32) = proxy.get_property("ScreenSize").await.ok()?;
-    Some(crate::drag_trigger::ScreenBounds { width, height })
+    // GNOME's logical screen always starts at the origin, however the monitors
+    // are arranged, so unlike Windows and macOS there is nothing to read here.
+    Some(crate::drag_trigger::ScreenBounds {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    })
 }
 
 /// The listener proper: connect, subscribe, and forward until the bus dies.
