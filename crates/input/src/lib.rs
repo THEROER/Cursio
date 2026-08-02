@@ -147,8 +147,10 @@ pub fn peer_edge() -> Option<cursio_protocol::Edge> {
 /// A screen-edge crossing detected by the capture backend: the shared cursor
 /// was shoved past `edge` at `pos_norm` along it (`0.0`..=`1.0`). The session
 /// turns this into an edge-crossing ownership handoff (if that edge borders the
-/// peer). Only the Wayland backend emits these today (via portal barriers);
-/// evdev/Windows will grow their own edge detection later.
+/// peer).
+///
+/// Emitted by the Wayland portal barriers, the Windows mouse hook and the macOS
+/// event tap. The evdev backend never emits one and cannot: see [`capture`].
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeCrossing {
     /// Which of this machine's edges the cursor left across.
