@@ -990,8 +990,14 @@ fn module_registry(
     window: WindowOpts,
     services: ServiceSetup,
 ) -> cursio_core::module::ModuleRegistry {
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut registry = cursio_core::module::ModuleRegistry::new()
+    // Said once at startup rather than left to a peer that agreed to run audio
+    // and then hears nothing: a flag that does nothing has to say so.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    if audio.audio {
+        tracing::warn!("no audio backend on this platform; --audio is not advertised to peers");
+    }
+
+    cursio_core::module::ModuleRegistry::new()
         .with(Box::new(cursio_core::audio_session::AudioFactory {
             enabled: audio.audio,
             render_device: audio.audio_render_device.clone(),
@@ -1008,18 +1014,16 @@ fn module_registry(
         // before the AirPlay window trigger makes a placement decision.
         .with(Box::new(cursio_core::window_session::WindowFactory {
             airplay: window.airplay,
-        }));
-
-    // Registered everywhere, including the platforms with no mount backend.
-    // Sharing is two independent halves and only one of them needs FUSE or
-    // WinFsp: a Mac that cannot show the peer's disks can still serve its own,
-    // and skipping the module entirely meant a Linux peer could not reach them
-    // either — with `--files` accepted and silently doing nothing.
-    registry = registry.with(Box::new(cursio_core::files_session::FilesFactory {
-        enabled: files,
-    }));
-
-    registry
+        }))
+        // Registered everywhere, including the platforms with no mount backend.
+        // Sharing is two independent halves and only one of them needs FUSE or
+        // WinFsp: a Mac that cannot show the peer's disks can still serve its
+        // own, and skipping the module entirely meant a Linux peer could not
+        // reach them either — with `--files` accepted and silently doing
+        // nothing.
+        .with(Box::new(cursio_core::files_session::FilesFactory {
+            enabled: files,
+        }))
 }
 
 /// Run as a mesh node: listen and dial trusted peers simultaneously, forever.
