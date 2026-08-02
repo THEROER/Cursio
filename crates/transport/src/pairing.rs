@@ -321,6 +321,14 @@ impl TrustStore {
     }
 }
 
+/// Narrow the trust store's directory to this user.
+///
+/// Unix does it by mode. Windows has no `chmod`, and the store lives under
+/// `%APPDATA%`, whose default ACL already grants only this user and the
+/// administrators — so the protection is the profile's, not ours. That is worth
+/// saying out loud rather than leaving as an empty function: an administrator
+/// who moved the config directory somewhere world-readable would get no
+/// warning from us, and this is where the paired keys are.
 fn restrict_directory(path: &std::path::Path) -> Result<(), PairingError> {
     #[cfg(unix)]
     {
@@ -328,6 +336,13 @@ fn restrict_directory(path: &std::path::Path) -> Result<(), PairingError> {
 
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| PairingError::Store(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        tracing::debug!(
+            path = %path.display(),
+            "no permission model here; the trust store inherits the profile directory's ACL"
+        );
     }
     Ok(())
 }
@@ -351,6 +366,8 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), Pairin
         .map_err(|e| PairingError::Store(e.to_string()))
 }
 
+/// The same, for the file itself. See [`restrict_directory`] for why the
+/// non-Unix arm only reports.
 fn restrict_file(path: &std::path::Path) -> Result<(), PairingError> {
     #[cfg(unix)]
     {
@@ -358,6 +375,13 @@ fn restrict_file(path: &std::path::Path) -> Result<(), PairingError> {
 
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| PairingError::Store(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        tracing::debug!(
+            path = %path.display(),
+            "no permission model here; the trust store inherits the profile directory's ACL"
+        );
     }
     Ok(())
 }
