@@ -263,6 +263,11 @@ type Mount = cursio_files::mount::MountHandle;
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 type Mount = cursio_files::winmount::MountHandle;
 
+/// Uninhabited where no mount implementation exists, so `Option<Mount>` is
+/// always `None` and every path that reads it stays compiled and honest.
+#[cfg(not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))))]
+enum Mount {}
+
 /// Mount the peer's volumes with whatever this platform provides.
 ///
 /// The two implementations differ in everything the OS cares about — a
@@ -280,6 +285,19 @@ fn mount_peer(peer: PeerLink, peer_name: &str) -> anyhow::Result<Mount> {
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 fn mount_peer(peer: PeerLink, peer_name: &str) -> anyhow::Result<Mount> {
     cursio_files::winmount::mount(peer, peer_name)
+}
+
+/// Serving is portable; mounting is not.
+///
+/// macOS has no mount backend here (FUSE needs a kernel extension the user must
+/// install and approve), and a MinGW build has none either — `winfsp-sys`
+/// refuses that target. Failing only *this* half is what lets the module still
+/// run: the engine already treats an absent mount as "still sharing ours", so a
+/// Mac serves its volumes to a Linux peer that can mount them, and says plainly
+/// why the reverse direction is missing.
+#[cfg(not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))))]
+fn mount_peer(_peer: PeerLink, _peer_name: &str) -> anyhow::Result<Mount> {
+    anyhow::bail!("no mount backend on this platform; install FUSE (Linux) or WinFsp (Windows)")
 }
 
 /// One request we sent that has not been answered yet.

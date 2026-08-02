@@ -107,8 +107,8 @@ enum Command {
         /// and the peer's appear here under `~/Cursio/<peer>/`.
         ///
         /// Mounted read-write, so anything either machine can reach, the other
-        /// can change. Linux mounts with FUSE; Windows shares its drives but
-        /// cannot yet mount the peer's.
+        /// can change. Linux mounts with FUSE and Windows with WinFsp; macOS
+        /// serves its own volumes but cannot yet mount the peer's.
         #[arg(long, default_value_t = false)]
         files: bool,
         /// When this machine is the selected AirPlay host, offer the mirrored
@@ -1010,18 +1010,14 @@ fn module_registry(
             airplay: window.airplay,
         }));
 
-    // File sharing needs a mount implementation: FUSE on Linux, WinFsp on
-    // Windows. A MinGW build has neither — `winfsp-sys` refuses that target —
-    // so there the flag is accepted and does nothing, rather than failing a
-    // session over a capability this binary genuinely cannot honour.
-    #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
-    {
-        registry = registry.with(Box::new(cursio_core::files_session::FilesFactory {
-            enabled: files,
-        }));
-    }
-    #[cfg(not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))))]
-    let _ = files;
+    // Registered everywhere, including the platforms with no mount backend.
+    // Sharing is two independent halves and only one of them needs FUSE or
+    // WinFsp: a Mac that cannot show the peer's disks can still serve its own,
+    // and skipping the module entirely meant a Linux peer could not reach them
+    // either — with `--files` accepted and silently doing nothing.
+    registry = registry.with(Box::new(cursio_core::files_session::FilesFactory {
+        enabled: files,
+    }));
 
     registry
 }
