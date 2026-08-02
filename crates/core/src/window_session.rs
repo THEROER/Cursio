@@ -154,6 +154,11 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                         continue;
                     }
                     tracing::info!(%title, "window dragged to the peer edge");
+                    // Told which window before being asked for one: the drag
+                    // detector is the only thing that knows, and a backend that
+                    // has to guess picks the foreground window — right on
+                    // Windows by coincidence, the whole screen on macOS.
+                    self.capture.aim_at(&title);
                     if let Err(e) = self.share_window() {
                         tracing::warn!(error = %e, "could not start the dragged transfer");
                     }
@@ -571,15 +576,12 @@ impl crate::module::ModuleFactory for WindowFactory {
                     ctx,
                 )));
             }
-            // A Mac can view a peer's window but not start a transfer of its
-            // own: there is no drag detector on this platform, and the flag
-            // that used to stand in for one is gone. The engine is built anyway
-            // so the module is symmetric and a peer's window still arrives.
             let engine = WindowEngine::new(
                 cursio_window::MacWindowCapture::default(),
                 cursio_window::MacWindowRenderer,
                 ctx.peer_name().to_string(),
-            );
+            )
+            .with_requests(spawn_drag_trigger(ctx.peer_edge));
             Ok(Box::new(engine))
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
@@ -602,7 +604,7 @@ pub const VERSION: u16 = 1;
 /// transfer *is* on each platform — the same reason the capture backends do.
 /// Returns an empty-forever channel if the platform can't detect drags, which
 /// the engine handles as "no drag trigger attached".
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn spawn_drag_trigger(
     peer_edge: Option<cursio_protocol::Edge>,
 ) -> tokio::sync::mpsc::UnboundedReceiver<TransferRequest> {
@@ -620,6 +622,11 @@ fn spawn_drag_trigger(
         let (mut watcher, screen) = (
             cursio_window::windows_drag::DragWatcher::spawn(),
             cursio_window::windows_drag::screen_size(),
+        );
+        #[cfg(target_os = "macos")]
+        let (mut watcher, screen) = (
+            cursio_window::macos_drag::DragWatcher::spawn(),
+            cursio_window::macos_drag::screen_size(),
         );
 
         // Without a screen size there is no edge to compare against. Bail

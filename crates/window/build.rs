@@ -13,12 +13,23 @@ fn main() {
 fn build_macos_window_capture() {
     cc::Build::new()
         .file("native/macos/window_capture.m")
+        // The drag detector rides along rather than getting its own archive:
+        // it is the other half of the same feature and needs the same
+        // frameworks and the same Screen Recording grant.
+        .file("native/macos/window_drag.m")
         .flag("-fobjc-arc")
         .flag("-fblocks")
         .compile("cursio_window_capture");
 
-    for framework in ["CoreMedia", "CoreVideo", "Foundation", "ScreenCaptureKit"] {
+    for framework in [
+        "CoreGraphics",
+        "CoreMedia",
+        "CoreVideo",
+        "Foundation",
+        "ScreenCaptureKit",
+    ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     println!("cargo:rerun-if-changed=native/macos/window_capture.m");
+    println!("cargo:rerun-if-changed=native/macos/window_drag.m");
 }

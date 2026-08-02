@@ -69,6 +69,8 @@ pub use linux_capture::{PortalCaptureSession, PortalWindowCapture};
 #[cfg(target_os = "macos")]
 mod macos_capture;
 #[cfg(target_os = "macos")]
+pub mod macos_drag;
+#[cfg(target_os = "macos")]
 pub use macos_capture::{MacCaptureSession, MacWindowCapture, MacWindowRenderer};
 
 #[cfg(target_os = "windows")]
@@ -169,6 +171,18 @@ pub trait WindowCapture {
     /// Begin transferring the window the user is dragging out. Returns a running
     /// capture, or an error if no suitable window is available.
     fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError>;
+
+    /// Aim the next [`begin`](Self::begin) at the window whose title contains
+    /// this.
+    ///
+    /// The drag detector knows which window the user grabbed and the capture
+    /// does not, so it has to be told. Leaving it out worked on Windows by
+    /// accident — the window being dragged is the foreground one, which is what
+    /// an empty hint selects there — and could never work on macOS, where an
+    /// empty hint means the whole screen. Default is a no-op, for a backend
+    /// that picks its window some other way (the Wayland portal opens its own
+    /// chooser, and no title of ours would be honoured).
+    fn aim_at(&mut self, _title: &str) {}
 }
 
 /// A surrogate window shown on the **viewer** side.

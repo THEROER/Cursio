@@ -78,6 +78,10 @@ impl Default for MacWindowCapture {
 }
 
 impl WindowCapture for MacWindowCapture {
+    fn aim_at(&mut self, title: &str) {
+        self.title_hint = title.to_string();
+    }
+
     type Session = MacCaptureSession;
 
     fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError> {

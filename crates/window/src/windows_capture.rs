@@ -123,6 +123,10 @@ impl Default for WgcWindowCapture {
 impl WindowCapture for WgcWindowCapture {
     type Session = WgcCaptureSession;
 
+    fn aim_at(&mut self, title: &str) {
+        self.title_hint = title.to_string();
+    }
+
     fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError> {
         let (hwnd, title) = window_pick::find(&self.title_hint)?;
         tracing::info!(title = %title, "capturing window");
