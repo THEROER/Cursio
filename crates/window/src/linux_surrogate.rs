@@ -227,9 +227,12 @@ fn gtk_thread(
     let fb = Rc::new(RefCell::new(Framebuffer::new(meta.width, meta.height)));
 
     let picture = gtk::Picture::builder()
-        // The surrogate must show the host's pixels 1:1; letting GTK scale to
-        // fit would blur text and desynchronise the input coordinates we send
-        // back, which are in the *host's* pixel space.
+        // `Fill` maps the texture onto the whole allocation, which keeps the
+        // widget↔host coordinate mapping a single ratio (see `to_host`) — the
+        // letterboxing of `Contain` would put the host's origin at an offset
+        // this code would then have to track. Sharpness comes from the window
+        // being resized to the source's resolution whenever that changes, so
+        // the ratio stays 1:1 and nothing is resampled.
         .content_fit(gtk::ContentFit::Fill)
         .build();
     picture.set_paintable(Some(&to_texture(&fb.borrow())));
@@ -301,6 +304,15 @@ fn gtk_thread(
                                 // it disagrees, rather than refusing the blit.
                                 if fb.width != pic.width || fb.height != pic.height {
                                     fb.resize(pic.width, pic.height);
+                                    // The window follows too. `ContentFit::Fill`
+                                    // stretches the texture across whatever
+                                    // allocation it is given, so a stream that
+                                    // changes resolution — a quality change, or
+                                    // an encoder rounding up to whole macroblocks
+                                    // — would otherwise be scaled into the old
+                                    // window's size for the rest of the session.
+                                    main_loop_window
+                                        .set_default_size(pic.width as i32, pic.height as i32);
                                 }
                                 let full = Rect {
                                     x: 0,
