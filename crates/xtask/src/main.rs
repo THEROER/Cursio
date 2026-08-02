@@ -4,7 +4,7 @@
 //! triples remembered by hand:
 //! - `build`   — release build for this host (Linux/macOS/Windows).
 //! - `install` — build release, then copy binaries into `~/.local/bin` and
-//!               install `.desktop` launchers (Linux).
+//!   install `.desktop` launchers (Linux).
 //! - `windows` — cross-compile the `.exe`s from Linux (mingw), no Windows box.
 //! - `logs`    — print the log directory (and `tail -f` it with `--follow`).
 //!
