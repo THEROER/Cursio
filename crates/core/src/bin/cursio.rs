@@ -121,31 +121,6 @@ enum Command {
         /// cannot yet mount the peer's.
         #[arg(long, default_value_t = false)]
         files: bool,
-        /// Let windows move to the peer: drag one past the edge that borders
-        /// it (see `--at`) and it appears on the peer's desktop, while the app
-        /// keeps running here.
-        ///
-        /// Dragging needs the Cursio GNOME extension on Linux (a Wayland client
-        /// cannot see other windows being dragged); Windows needs nothing extra.
-        /// Without it, `--share-window-title` still shares a window directly.
-        #[arg(long, default_value_t = false)]
-        share_window: bool,
-        /// Which window to share, matched against its title (case-insensitive
-        /// substring). Without this the foreground window is taken — which,
-        /// when you start the daemon from a terminal, is that terminal.
-        ///
-        /// Needs something to share: `--share-window`, or `--share-airplay`,
-        /// which shares the iPhone's screen instead of one of this machine's
-        /// own windows.
-        #[arg(long, default_value = "")]
-        share_window_title: String,
-        /// Keep the shared window visible on this machine instead of hiding it.
-        ///
-        /// Hiding is what makes a transfer feel like the window *moved*, but it
-        /// is also the most likely reason a capture produces no frames — so this
-        /// separates "capture is broken" from "hiding broke the capture".
-        #[arg(long, default_value_t = false)]
-        keep_window_visible: bool,
         /// Share whatever an iPhone mirrors to this machine with the mesh,
         /// instead of one of this machine's own windows.
         ///
@@ -405,9 +380,6 @@ async fn main() -> anyhow::Result<()> {
             audio_render_device,
             clipboard,
             files,
-            share_window,
-            share_window_title,
-            keep_window_visible,
             share_airplay,
             pair,
             airplay,
@@ -467,9 +439,6 @@ async fn main() -> anyhow::Result<()> {
                 clipboard,
                 files,
                 WindowOpts {
-                    share: share_window,
-                    title_hint: share_window_title,
-                    keep_visible: keep_window_visible,
                     airplay: airplay_tap
                         .clone()
                         .map(|tap| (tap, u32::from(width), u32::from(height))),
@@ -580,14 +549,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Window-transfer options, grouped for the same reason [`AudioOpts`] is: the
-/// registry builder should gain a struct field per subsystem, not four
-/// positional arguments.
+/// registry builder should gain a struct field per subsystem, not a positional
+/// argument.
 struct WindowOpts {
-    share: bool,
-    title_hint: String,
-    keep_visible: bool,
-    /// Set when this node shares whatever an iPhone mirrors to it, rather than
-    /// one of its own windows.
+    /// Set when this node shares whatever an iPhone mirrors to it. A window of
+    /// this machine's own moves by being dragged across the peer-facing edge,
+    /// which needs no flag — the drag is the request.
     airplay: Option<(cursio_airplay::MirrorTap, u32, u32)>,
 }
 
@@ -895,11 +862,6 @@ fn module_registry(
             enabled: clipboard,
         }))
         .with(Box::new(cursio_core::window_session::WindowFactory {
-            // Sharing the phone's screen is window transfer, so the module has
-            // to be running even when no local window was asked for.
-            enabled: window.share || window.airplay.is_some(),
-            title_hint: window.title_hint,
-            keep_visible: window.keep_visible,
             airplay: window.airplay,
         }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {

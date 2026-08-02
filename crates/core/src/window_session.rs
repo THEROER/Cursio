@@ -456,17 +456,15 @@ where
 /// question is answered once, here, and a machine with no backend simply
 /// advertises nothing.
 pub struct WindowFactory {
-    pub enabled: bool,
     /// When set, this node shares whatever an iPhone is mirroring to it instead
     /// of one of its own windows. The two are alternatives rather than both at
     /// once: an engine hosts a single window per session.
+    ///
+    /// The only option there is. A window of this machine's own transfers by
+    /// being dragged across the peer-facing edge — the drag is the request, and
+    /// a flag that meant the same thing was a second way to say it that had to
+    /// agree with the first.
     pub airplay: Option<(cursio_airplay::MirrorTap, u32, u32)>,
-    /// Windows only: share the window whose title contains this, immediately,
-    /// without waiting for a drag. Empty means "wait for a drag".
-    pub title_hint: String,
-    /// Windows only: keep the shared window visible locally instead of hiding
-    /// it. Hiding is what makes a transfer feel like the window *moved*.
-    pub keep_visible: bool,
 }
 
 /// Whether this build has a window-transfer backend at all.
@@ -496,9 +494,6 @@ impl crate::module::ModuleFactory for WindowFactory {
     /// no error, because nothing downstream ever ran. Receiving is passive and
     /// costs an idle engine; offering stays the deliberate act.
     fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
-        if self.enabled && !SUPPORTED {
-            tracing::warn!("window transfer isn't supported on this platform; not advertising it");
-        }
         SUPPORTED.then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::WINDOW, VERSION))
     }
 
@@ -537,25 +532,18 @@ impl crate::module::ModuleFactory for WindowFactory {
                     ctx,
                 )));
             }
-            let mut engine = WindowEngine::new(
+            // Hiding the source is what makes a transfer feel like the window
+            // moved rather than been copied; the drag that started it is the
+            // user saying they want it over there.
+            let engine = WindowEngine::new(
                 cursio_window::WgcWindowCapture {
-                    title_hint: self.title_hint.clone(),
-                    hide_source: !self.keep_visible,
+                    title_hint: String::new(),
+                    hide_source: true,
                 },
                 cursio_window::Win32WindowRenderer,
                 ctx.peer_name().to_string(),
             )
             .with_requests(spawn_drag_trigger(ctx.peer_edge));
-
-            // An explicit title means "share this one now", without waiting for
-            // a drag. A failure shouldn't kill the module, let alone the
-            // session — the drag path may still work.
-            if !self.title_hint.is_empty() {
-                match engine.share_window() {
-                    Ok(id) => tracing::info!(id, "window transfer started"),
-                    Err(e) => tracing::error!(error = %e, "could not start window transfer"),
-                }
-            }
             Ok(Box::new(engine))
         }
         #[cfg(target_os = "macos")]
@@ -569,23 +557,15 @@ impl crate::module::ModuleFactory for WindowFactory {
                     ctx,
                 )));
             }
-            let mut engine = WindowEngine::new(
-                cursio_window::MacWindowCapture {
-                    title_hint: self.title_hint.clone(),
-                    ..Default::default()
-                },
+            // A Mac can view a peer's window but not start a transfer of its
+            // own: there is no drag detector on this platform, and the flag
+            // that used to stand in for one is gone. The engine is built anyway
+            // so the module is symmetric and a peer's window still arrives.
+            let engine = WindowEngine::new(
+                cursio_window::MacWindowCapture::default(),
                 cursio_window::MacWindowRenderer,
                 ctx.peer_name().to_string(),
             );
-            // Sharing starts on its own here. There is no drag detector on
-            // macOS, so waiting for one would mean `--share-window` did nothing
-            // at all; an empty title shares the screen, a title picks a window.
-            if self.enabled {
-                match engine.share_window() {
-                    Ok(id) => tracing::info!(id, "window transfer started"),
-                    Err(e) => tracing::error!(error = %e, "could not start window transfer"),
-                }
-            }
             Ok(Box::new(engine))
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]

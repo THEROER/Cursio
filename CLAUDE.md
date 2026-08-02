@@ -145,6 +145,8 @@ Capture: `ScreenCast` portal → PipeWire on Linux, `Windows.Graphics.Capture` o
 
 Video encoding exists because zstd on a *moving* window measured ~742 Mbit/s — past gigabit. H.264 via `ffmpeg-next` on Linux, Media Foundation on Windows. Decoders are stateful: one packet may yield zero frames or several, and "no output yet" is the ordinary case.
 
+**A drag is the only way to start one.** There is no flag: `--share-window` and its two companions were a second way of saying what the drag already says, and the two had to be kept in agreement. Receiving stays passive — every supported platform advertises the module, so a peer's window always arrives — while offering one is the deliberate act of dragging it across the peer-facing edge. A Mac can therefore view but not send, since macOS has no drag detector.
+
 Drag detection is asymmetric by necessity: Windows asks `GetGUIThreadInfo`; Wayland forbids a client from knowing other windows exist, so GNOME needs the Shell extension in `native/cursio-shell-extension`. Both emit the same `DragEvent` vocabulary, and `drag_trigger.rs` decides when a drag becomes a transfer with no OS knowledge at all. Viewer input replays via `PostMessage`, not `SendInput` — the host's window is deliberately hidden and hijacking its real cursor would fight the user sitting there.
 
 ### Audio
