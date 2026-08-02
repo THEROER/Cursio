@@ -182,15 +182,24 @@ enum Command {
         /// Target AirPlay output frame rate.
         #[arg(long, default_value_t = 60)]
         fps: u16,
-        /// How a peer's modifier keys land on this machine (macOS only).
+        /// Where a peer's modifier keys land on this machine (macOS only).
         ///
-        /// A Mac's shortcuts live on Command, which a PC keyboard does not
-        /// have, so `pc` — the default — makes the peer's Control act as
-        /// Command and its Windows key act as Control. Use `mac` when the peer
-        /// types on an Apple keyboard, where the keys already sit where macOS
-        /// expects them.
-        #[arg(long, value_enum, default_value_t = ModifierStyleArg::Pc)]
-        mac_modifiers: ModifierStyleArg,
+        /// `positional` — the default — puts every key where the hardware says
+        /// it is: Alt is Option, Ctrl is Control, the Windows key is Command.
+        /// `swapped` trades Control and the Windows key instead, so a PC
+        /// keyboard's Ctrl+C copies.
+        ///
+        /// Anything else can be written out as `from=to` pairs, e.g.
+        /// `ctrl=cmd,win=ctrl` (the swap spelled by hand) or
+        /// `rightalt=globe` (the right Alt changes input source, which is what
+        /// a modern MacBook's Globe key does and no PC keyboard has). Names:
+        /// ctrl, alt/option, win/cmd, shift, caps, globe/fn — each optionally
+        /// prefixed `left` or `right`.
+        ///
+        /// This also decides where the Ctrl+Alt+G hotkey lands on a Mac's own
+        /// keyboard; the log says which keys, at startup.
+        #[arg(long, default_value = "positional", value_name = "SPEC")]
+        mac_modifiers: String,
     },
     /// List peers discovered on the LAN, then exit.
     Peers {
@@ -236,25 +245,40 @@ impl From<AirPlayResolutionArg> for Resolution {
     }
 }
 
-/// Which keyboard the peer is typing on, as far as modifiers are concerned. A
-/// clap-parseable mirror of `cursio_input::ModifierStyle`, declared on every
-/// platform so `--help` reads the same everywhere and only consulted where
-/// there is a Mac to inject into.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ModifierStyleArg {
-    /// The peer types on a PC keyboard: its Control becomes Command.
-    Pc,
-    /// The peer types on an Apple keyboard: modifiers keep their names.
-    Mac,
-}
-
-/// How this machine should map a peer's modifiers, decided once at startup.
+/// Read `--mac-modifiers` and hand it to the keymap, or refuse to start.
 ///
-/// Not threaded through the session layers because it is not a property of any
-/// session: there is one keyboard policy per machine, settled before the first
-/// peer connects, exactly like the capture backend. Passing it down would add a
-/// tenth argument to a call chain that was deliberately cut back to nine.
-static MODIFIER_STYLE: std::sync::OnceLock<ModifierStyleArg> = std::sync::OnceLock::new();
+/// Refusing is deliberate. A mistyped map would otherwise be silently ignored
+/// and the user would spend the session wondering why Command is still in the
+/// wrong place — and the parse error already names what it could not read.
+///
+/// The map is stored in the keymap rather than threaded through the session
+/// layers because it is not a property of any session: there is one keyboard
+/// per machine, settled before the first peer connects, exactly like the
+/// capture backend.
+fn apply_modifier_map(spec: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let map = cursio_input::ModifierMap::parse(spec)
+            .map_err(|e| anyhow::anyhow!("--mac-modifiers: {e}"))?;
+        cursio_input::mac_keymap::configure(map);
+        tracing::info!(
+            modifiers = %map.describe(),
+            hotkey = %map.hotkey_on_this_mac(),
+            "keyboard mapping"
+        );
+    }
+    // Elsewhere the flag is accepted and does nothing: the mapping happens
+    // entirely on the Mac, in both directions. Saying so beats a user setting
+    // it on the wrong machine and watching nothing change.
+    #[cfg(not(target_os = "macos"))]
+    if spec != "positional" {
+        tracing::warn!(
+            spec,
+            "--mac-modifiers only applies on a Mac; set it there, on the machine being driven"
+        );
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -317,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
             fps,
             mac_modifiers,
         } => {
-            let _ = MODIFIER_STYLE.set(mac_modifiers);
+            apply_modifier_map(&mac_modifiers)?;
             // Read before anything binds a port, so a mistyped password costs
             // nothing and the prompt is not buried under startup logging.
             let pairing = if pair {
@@ -1623,11 +1647,7 @@ fn make_injector() -> Option<Box<dyn cursio_input::InputInjector>> {
     #[cfg(target_os = "macos")]
     {
         use cursio_input::InputInjector as _;
-        let style = match MODIFIER_STYLE.get() {
-            Some(ModifierStyleArg::Mac) => cursio_input::ModifierStyle::Mac,
-            _ => cursio_input::ModifierStyle::Pc,
-        };
-        match cursio_input::MacInjector::new(style) {
+        match cursio_input::MacInjector::new() {
             Ok(inj) => {
                 tracing::info!(backend = inj.backend(), "input injector ready");
                 Some(Box::new(inj))

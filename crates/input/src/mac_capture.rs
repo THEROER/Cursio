@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use cursio_protocol::{InputEvent, MouseButton};
 
-use crate::mac_keymap::{self, ModifierStyle};
+use crate::mac_keymap::{self, ModifierMap};
 use crate::{CaptureHandle, EdgeCrossing, GrabControl, InputError, InputMode};
 
 /// Stamped into every event [`MacInjector`](crate::MacInjector) posts, and
@@ -86,7 +86,7 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
         forwarding,
         stopped,
         flags: 0,
-        style: ModifierStyle::default(),
+        map: mac_keymap::configured(),
     });
 
     std::thread::Builder::new()
@@ -160,7 +160,7 @@ struct TapState {
     /// The modifier mask as of the previous `flagsChanged`, which is the only
     /// way to tell a modifier going down from one coming up.
     flags: u64,
-    style: ModifierStyle,
+    map: ModifierMap,
 }
 
 impl TapState {
@@ -396,7 +396,7 @@ unsafe fn translate(state: &mut TapState, event_type: u32, event: *mut c_void) {
             }
             EVENT_KEY_DOWN | EVENT_KEY_UP => {
                 let mac_key = CGEventGetIntegerValueField(event, FIELD_KEYCODE) as u16;
-                if let Some(key) = mac_keymap::mac_to_evdev(mac_key, state.style) {
+                if let Some(key) = mac_keymap::mac_to_evdev(mac_key, state.map) {
                     state.emit(InputEvent::Key {
                         key,
                         pressed: event_type == EVENT_KEY_DOWN,
@@ -416,23 +416,20 @@ unsafe fn translate(state: &mut TapState, event_type: u32, event: *mut c_void) {
 /// Work out which modifier moved, by comparing the new mask against the old.
 ///
 /// A `flagsChanged` event names a keycode but says nothing about direction, and
-/// the mask is shared between the two sides of each modifier — so the
-/// device-dependent bits are what make "left Shift went down" distinguishable
-/// from "right Shift came up".
+/// the mask is shared between the two sides of each modifier — so what
+/// distinguishes "left Shift went down" from "right Shift came up" is the
+/// device-dependent bit, which [`mac_keymap::identifying_flags`] picks out.
 fn emit_modifier_changes(state: &TapState, flags: u64) {
     for &mac_key in mac_keymap::MODIFIER_KEYS {
-        let Some(bits) = mac_keymap::modifier_flags(mac_key) else {
+        let Some(bits) = mac_keymap::identifying_flags(mac_key) else {
             continue;
         };
-        // Only the side bit: the shared mask stays set while the *other* side
-        // of the same modifier is held, so testing it would report no change.
-        let side = bits & !MODIFIER_MASKS;
-        let was = state.flags & side != 0;
-        let now = flags & side != 0;
+        let was = state.flags & bits != 0;
+        let now = flags & bits != 0;
         if was == now {
             continue;
         }
-        if let Some(key) = mac_keymap::mac_to_evdev(mac_key, state.style) {
+        if let Some(key) = mac_keymap::mac_to_evdev(mac_key, state.map) {
             state.emit(InputEvent::Key { key, pressed: now });
         }
     }
@@ -464,10 +461,6 @@ fn fraction(value: f64, low: f64, high: f64) -> f32 {
     }
     (((value - low) / span) as f32).clamp(0.0, 1.0)
 }
-
-/// Every documented `CGEventFlags` mask bit, so the device-dependent bits can
-/// be isolated from them.
-const MODIFIER_MASKS: u64 = 0x00FF_0000;
 
 // `CGEventType`, as in `mac.rs`.
 const EVENT_LEFT_MOUSE_DOWN: u32 = 1;
@@ -565,17 +558,17 @@ extern "C" {
 mod tests {
     use super::*;
 
-    /// The device-dependent bits must survive the mask being stripped, or no
-    /// modifier change is ever detected.
+    /// Every modifier must have something to watch, or its changes are never
+    /// detected at all — which reads as a modifier key that does nothing.
     #[test]
-    fn a_modifiers_side_bit_is_not_part_of_the_shared_mask() {
+    fn every_modifier_has_bits_that_identify_it() {
         for &key in mac_keymap::MODIFIER_KEYS {
-            let bits = mac_keymap::modifier_flags(key).unwrap();
             assert_ne!(
-                bits & !MODIFIER_MASKS,
-                0,
-                "keycode {key:#x} has no side bit"
+                mac_keymap::identifying_flags(key),
+                Some(0),
+                "keycode {key:#x} has nothing to watch"
             );
+            assert!(mac_keymap::identifying_flags(key).is_some());
         }
     }
 
@@ -583,8 +576,8 @@ mod tests {
     /// tell them apart, which is what `emit_modifier_changes` relies on.
     #[test]
     fn the_two_sides_of_a_modifier_have_different_side_bits() {
-        let left = mac_keymap::modifier_flags(0x37).unwrap() & !MODIFIER_MASKS;
-        let right = mac_keymap::modifier_flags(0x36).unwrap() & !MODIFIER_MASKS;
+        let left = mac_keymap::identifying_flags(0x37).unwrap();
+        let right = mac_keymap::identifying_flags(0x36).unwrap();
         assert_ne!(left, right);
         assert_ne!(left, 0);
         assert_ne!(right, 0);

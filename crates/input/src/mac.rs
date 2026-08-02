@@ -39,14 +39,14 @@ use std::ffi::c_void;
 
 use cursio_protocol::{InputEvent, MouseButton};
 
-use crate::mac_keymap::{self, ModifierStyle};
+use crate::mac_keymap::{self, ModifierMap};
 use crate::{InputError, InputInjector};
 
 /// A macOS-flavoured injector, posting `CGEvent`s at the HID tap.
 pub struct MacInjector {
     active: bool,
     source: EventSource,
-    style: ModifierStyle,
+    map: ModifierMap,
     /// Where the shared cursor is, in global display coordinates. macOS has no
     /// relative motion, so this is what deltas accumulate into.
     position: Point,
@@ -67,7 +67,7 @@ pub struct MacInjector {
 
 impl MacInjector {
     /// Create the injector, or explain why the Mac will not accept input.
-    pub fn new(style: ModifierStyle) -> Result<Self, InputError> {
+    pub fn new() -> Result<Self, InputError> {
         if !accessibility_granted() {
             return Err(InputError::Unavailable(
                 "macOS has not granted the Accessibility permission, so injected input is \
@@ -77,14 +77,15 @@ impl MacInjector {
                     .into(),
             ));
         }
+        let map = mac_keymap::configured();
         let source = EventSource::new()?;
         let position = current_pointer_position();
         let bounds = Bounds::of_all_displays();
-        tracing::info!(?style, "macOS CGEvent injector ready");
+        tracing::info!(modifiers = %map.describe(), "macOS CGEvent injector ready");
         Ok(Self {
             active: true,
             source,
-            style,
+            map,
             position,
             bounds,
             flags: 0,
@@ -242,7 +243,7 @@ impl InputInjector for MacInjector {
                 event.post();
                 Ok(())
             }
-            InputEvent::Key { key, pressed } => match mac_keymap::evdev_to_mac(key, self.style) {
+            InputEvent::Key { key, pressed } => match mac_keymap::evdev_to_mac(key, self.map) {
                 Some(mac_key) => {
                     if pressed {
                         self.held_keys.insert(mac_key);

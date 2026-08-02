@@ -136,6 +136,39 @@ Several peers still mean one watched edge, because there is one physical mouse
 and the backends each hold a single edge. Arming a *set* is the change that
 would let one machine border two peers at once.
 
+## Where a peer's modifiers land on a Mac
+
+A Mac's shortcuts live on Command; a PC keyboard has Control, Alt and a Windows
+key. `ModifierMap` (`input/src/mac_keymap.rs`) says where each **physical**
+modifier key lands, and `--mac-modifiers` takes either a preset or a list of
+`from=to` pairs:
+
+| value | effect |
+| --- | --- |
+| `positional` (default) | Ctrl is Control, Alt is Option, Win is Command |
+| `swapped` | Control acts as Command, Win acts as Control — Ctrl+C copies |
+| `ctrl=cmd,win=ctrl` | the swap, spelled out |
+| `rightalt=globe` | the right Alt becomes the Globe key, which is how a modern MacBook changes input source |
+
+Names are `ctrl`, `alt`/`option`, `win`/`cmd`, `shift`, `caps`, `globe`/`fn`,
+each optionally prefixed `left` or `right`. Sides are separable for exactly the
+Globe case: aiming both Options at it would cost every accented character the
+user can type. A side-less target keeps the side it came from, so `ctrl=cmd`
+sends left to left and right to right.
+
+The map runs in both directions — applied on injection, undone on capture —
+so a Mac sending Command+C puts on the wire whichever key the peer turns back
+into Command. Undoing is why a collision has to be settled rather than ignored:
+two keys the user **named** are refused with both named, while a named key beats
+one still sitting at its default. That second rule is what makes
+`rightalt=globe` mean something: Globe was already pointing at itself.
+
+The ownership hotkey is Ctrl+Alt+G in the **wire** namespace, so it follows the
+map: by position it is the Mac's own Control+Option+G, and under the swap it is
+Command+Option+G — which is consistent, since the swap is a statement that
+Command is where Control belongs. Startup logs the physical keys, because a
+hotkey that moved silently is one the user cannot find.
+
 ## Hiding this machine's cursor
 
 While a machine drives its peer, its own pointer should get out of the way.

@@ -43,7 +43,7 @@ pub use mac::MacInjector;
 #[cfg(target_os = "macos")]
 pub use mac_cursor::MacCursor;
 #[cfg(target_os = "macos")]
-pub use mac_keymap::ModifierStyle;
+pub use mac_keymap::ModifierMap;
 #[cfg(target_os = "linux")]
 pub use uinput::UinputInjector;
 #[cfg(target_os = "windows")]

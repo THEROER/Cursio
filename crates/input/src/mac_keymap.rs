@@ -7,60 +7,390 @@
 //! numbering that happens to be ordered by nothing in particular. There is no
 //! arithmetic relation to evdev, so the table below is the whole mapping.
 //!
-//! ## The Command key a PC keyboard does not have
+//! ## Where the modifiers land is the user's choice
 //!
 //! A Mac's shortcuts live on Command; a PC keyboard has Control, Alt and a
-//! Windows key. Mapping purely by name (Meta → Command) is faithful to the
-//! hardware but means every shortcut moves under the little finger's *other*
-//! neighbour: Ctrl+C stops copying and Win+C starts. That is correct and
-//! useless, because the muscle memory belongs to Ctrl.
+//! Windows key. Neither arrangement of the two is right for everybody:
 //!
-//! So [`ModifierStyle::Pc`] — the default — swaps the two: Control becomes
-//! Command and Meta becomes Control, which is what every long-lived
-//! keyboard-sharing tool ends up doing. [`ModifierStyle::Mac`] keeps the names,
-//! for an Apple keyboard plugged into the sending machine, where the physical
-//! keys already sit where macOS expects them.
+//! - By **position** — Control is Control, Alt is Option, Win is Command — the
+//!   keys are where the hardware says they are, and Command sits under the
+//!   thumb exactly where an Apple keyboard puts it. This is the default.
+//! - **Swapped** — Control acts as Command, Win acts as Control — keeps the
+//!   muscle memory instead, so Ctrl+C copies. Several keyboard-sharing tools do
+//!   this unconditionally, which is why the option exists at all.
 //!
-//! Option/Alt is never touched: it is the same key under both names.
+//! So rather than a fixed choice between the two, [`ModifierMap`] states where
+//! each modifier key lands, and those are just names for common answers.
+//! Anything else can be written out: `ctrl=cmd,win=ctrl` is the swap, and
+//! `rightalt=globe` puts the Globe key — the one a new MacBook changes input
+//! source with — under a key a PC keyboard actually has. Sides are separable
+//! precisely for that case: taking *both* Options away would cost every
+//! accented character the user can type.
+//!
+//! The map applies in **both** directions. [`evdev_to_mac`] uses it to decide
+//! what a peer's key does here; [`mac_to_evdev`] undoes it, so a Mac sending
+//! Command+C to a Linux peer puts on the wire whichever key that peer turns
+//! back into Command. Undoing is why two keys landing on one target has to be
+//! resolved rather than shrugged at: two the user *named* are refused, and a
+//! named one beats a key still sitting at its default.
 
-/// How a sending keyboard's modifiers land on this Mac.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ModifierStyle {
-    /// The sender types on a PC keyboard: its Control acts as Command here and
-    /// its Meta (Windows) key acts as Control, so Ctrl+C copies.
-    #[default]
-    Pc,
-    /// The sender's modifiers keep their names: Control is Control, Meta is
-    /// Command. Right for an Apple keyboard.
-    Mac,
+/// A modifier key position, named the way a person would ask for it.
+///
+/// One enum for both keyboards, because the positions *are* the same: evdev's
+/// Meta and macOS' Command are one key, as are Alt and Option. Only the names
+/// differ, so both spellings are accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modifier {
+    /// `ctrl`, `control`.
+    Ctrl,
+    /// `alt`, `option`, `opt`.
+    Alt,
+    /// `win`, `meta`, `super`, `cmd`, `command`.
+    Meta,
+    /// `shift`.
+    Shift,
+    /// `caps`, `capslock`.
+    CapsLock,
+    /// `globe`, `fn`, `function` — what a MacBook changes input source with.
+    /// No PC keyboard has one, which is the point of being able to target it.
+    Globe,
 }
 
-impl ModifierStyle {
-    /// Apply the style *before* the keycode lookup, so the table itself only
-    /// ever states the by-name mapping.
-    ///
-    /// Its own inverse: swapping Control and Meta twice returns the original,
-    /// which is what lets [`mac_to_evdev`] reuse it to undo the swap.
-    fn remap(self, evdev: u16) -> u16 {
-        match self {
-            Self::Mac => evdev,
-            Self::Pc => match evdev {
-                KEY_LEFTCTRL => KEY_LEFTMETA,
-                KEY_RIGHTCTRL => KEY_RIGHTMETA,
-                KEY_LEFTMETA => KEY_LEFTCTRL,
-                KEY_RIGHTMETA => KEY_RIGHTCTRL,
-                other => other,
-            },
+impl Modifier {
+    /// Parse one of the names above, in any case.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => Some(Self::Ctrl),
+            "alt" | "option" | "opt" => Some(Self::Alt),
+            "win" | "meta" | "super" | "cmd" | "command" => Some(Self::Meta),
+            "shift" => Some(Self::Shift),
+            "caps" | "capslock" => Some(Self::CapsLock),
+            "globe" | "fn" | "function" => Some(Self::Globe),
+            _ => None,
         }
     }
+
+    /// What this key is called on a Mac, for messages a user has to act on.
+    pub fn mac_name(self) -> &'static str {
+        match self {
+            Self::Ctrl => "Control",
+            Self::Alt => "Option",
+            Self::Meta => "Command",
+            Self::Shift => "Shift",
+            Self::CapsLock => "Caps Lock",
+            Self::Globe => "Globe",
+        }
+    }
+}
+
+/// Which side of the keyboard a modifier came from.
+///
+/// Carried through the map rather than mapped by it: `ctrl=cmd` means both
+/// Controls, and a left key arriving as a right one would be a surprise nobody
+/// asked for. Keys that exist only once are [`Side::Only`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+    Only,
+}
+
+/// Split an evdev modifier keycode into what it is and which side it is on.
+fn split(evdev: u16) -> Option<(Modifier, Side)> {
+    Some(match evdev {
+        KEY_LEFTCTRL => (Modifier::Ctrl, Side::Left),
+        KEY_RIGHTCTRL => (Modifier::Ctrl, Side::Right),
+        KEY_LEFTALT => (Modifier::Alt, Side::Left),
+        KEY_RIGHTALT => (Modifier::Alt, Side::Right),
+        KEY_LEFTMETA => (Modifier::Meta, Side::Left),
+        KEY_RIGHTMETA => (Modifier::Meta, Side::Right),
+        KEY_LEFTSHIFT => (Modifier::Shift, Side::Left),
+        KEY_RIGHTSHIFT => (Modifier::Shift, Side::Right),
+        KEY_CAPSLOCK => (Modifier::CapsLock, Side::Only),
+        KEY_FN => (Modifier::Globe, Side::Only),
+        _ => return None,
+    })
+}
+
+/// Rebuild an evdev keycode from a modifier and the side it came from.
+///
+/// A side the target does not have collapses onto its only key: mapping both
+/// Controls onto Globe is meaningful, and there is exactly one Globe.
+fn join(modifier: Modifier, side: Side) -> u16 {
+    match (modifier, side) {
+        (Modifier::Ctrl, Side::Right) => KEY_RIGHTCTRL,
+        (Modifier::Ctrl, _) => KEY_LEFTCTRL,
+        (Modifier::Alt, Side::Right) => KEY_RIGHTALT,
+        (Modifier::Alt, _) => KEY_LEFTALT,
+        (Modifier::Meta, Side::Right) => KEY_RIGHTMETA,
+        (Modifier::Meta, _) => KEY_LEFTMETA,
+        (Modifier::Shift, Side::Right) => KEY_RIGHTSHIFT,
+        (Modifier::Shift, _) => KEY_LEFTSHIFT,
+        (Modifier::CapsLock, _) => KEY_CAPSLOCK,
+        (Modifier::Globe, _) => KEY_FN,
+    }
+}
+
+/// Where each of a sending keyboard's modifier keys lands on this Mac.
+///
+/// Keyed by the *physical key*, not by the modifier, because the two sides are
+/// worth telling apart: aiming the Globe key at `alt` would take both Options
+/// away and with them every accented character, whereas `rightalt=globe` gives
+/// up the one nobody is typing with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModifierMap {
+    /// The evdev code the key at each index acts as.
+    targets: [u16; MODIFIER_KEY_CODES.len()],
+    /// Whether that entry was asked for by name. An entry the user wrote wins
+    /// over one that is merely still at its default — see [`ModifierMap::parse`].
+    explicit: [bool; MODIFIER_KEY_CODES.len()],
+}
+
+/// Every modifier key the map can move, in the order it indexes them.
+const MODIFIER_KEY_CODES: [u16; 10] = [
+    KEY_LEFTCTRL,
+    KEY_RIGHTCTRL,
+    KEY_LEFTALT,
+    KEY_RIGHTALT,
+    KEY_LEFTMETA,
+    KEY_RIGHTMETA,
+    KEY_LEFTSHIFT,
+    KEY_RIGHTSHIFT,
+    KEY_CAPSLOCK,
+    KEY_FN,
+];
+
+fn index_of(evdev: u16) -> Option<usize> {
+    MODIFIER_KEY_CODES.iter().position(|&code| code == evdev)
+}
+
+/// Name one modifier key the way an error message or a log line should.
+fn key_name(evdev: u16) -> String {
+    let Some((modifier, side)) = split(evdev) else {
+        return format!("key {evdev}");
+    };
+    match side {
+        Side::Right => format!("right {}", modifier.mac_name()),
+        _ => modifier.mac_name().to_string(),
+    }
+}
+
+impl Default for ModifierMap {
+    fn default() -> Self {
+        Self {
+            targets: MODIFIER_KEY_CODES,
+            explicit: [false; MODIFIER_KEY_CODES.len()],
+        }
+    }
+}
+
+impl ModifierMap {
+    /// The by-position map: every modifier key acts as itself.
+    pub fn positional() -> Self {
+        Self::default()
+    }
+
+    /// Control acts as Command and the Windows key as Control, so a PC
+    /// keyboard's Ctrl+C copies.
+    pub fn swapped() -> Self {
+        Self::parse("ctrl=cmd,win=ctrl").expect("a preset must parse")
+    }
+
+    /// Read a map from a command-line value: a preset name, or a
+    /// comma-separated list of `from=to` pairs.
+    ///
+    /// Names are the ones in [`Modifier`], optionally prefixed `left` or
+    /// `right`; `-`, `_` and spaces inside a name are ignored, so `right-alt`
+    /// and `rightalt` are the same key. A side-less name means both sides, and
+    /// a side-less *target* keeps the side it came from — `ctrl=cmd` sends left
+    /// to left and right to right.
+    ///
+    /// Keys not named keep their position, so only the difference has to be
+    /// written. Two *named* keys landing on one target is refused: capture has
+    /// to undo this map, and there would be no answer to give. A named key
+    /// landing where an unnamed one already sits is fine and wins — that is
+    /// what `rightalt=globe` is, and the Globe key nobody mentioned yields.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        match spec.trim().to_ascii_lowercase().as_str() {
+            // `pc` and `mac` are what this flag used to take. Still accepted:
+            // a user who learned them should not have to relearn them.
+            "positional" | "mac" => return Ok(Self::positional()),
+            "swapped" | "pc" => return Ok(Self::swapped()),
+            _ => {}
+        }
+
+        let mut map = Self::default();
+        for pair in spec.split(',').filter(|p| !p.trim().is_empty()) {
+            let (from, to) = pair
+                .split_once('=')
+                .ok_or_else(|| format!("`{}` is not a `from=to` pair", pair.trim()))?;
+            let (from_modifier, from_side) = parse_key(from)?;
+            let (to_modifier, to_side) = parse_key(to)?;
+
+            for side in sides_of(from_modifier, from_side) {
+                let source = join(from_modifier, side);
+                let index = index_of(source).expect("a modifier key is in the table");
+                if map.explicit[index] {
+                    return Err(format!("{} is assigned twice", key_name(source)));
+                }
+                // A side-less target follows the side it came from, so one pair
+                // can move a whole modifier without saying it twice.
+                map.targets[index] = join(to_modifier, to_side.unwrap_or(side));
+                map.explicit[index] = true;
+            }
+        }
+
+        map.resolve_collisions()?;
+        Ok(map)
+    }
+
+    /// Settle what happens when two keys point at the same target.
+    ///
+    /// Two named keys is a mistake worth refusing. A named key colliding with
+    /// one still at its default is the ordinary case — `rightalt=globe` leaves
+    /// Globe pointing at itself — and there the named one wins, so the reverse
+    /// direction has exactly one answer.
+    fn resolve_collisions(&mut self) -> Result<(), String> {
+        for (i, &source) in MODIFIER_KEY_CODES.iter().enumerate() {
+            for (j, &other) in MODIFIER_KEY_CODES.iter().enumerate().skip(i + 1) {
+                if self.targets[i] != self.targets[j] {
+                    continue;
+                }
+                if self.explicit[i] && self.explicit[j] {
+                    return Err(format!(
+                        "{} and {} would both be {}; give one of them somewhere else",
+                        key_name(source),
+                        key_name(other),
+                        key_name(self.targets[i])
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Where the key `evdev` lands.
+    fn target_of(self, evdev: u16) -> u16 {
+        match index_of(evdev) {
+            Some(i) => self.targets[i],
+            None => evdev,
+        }
+    }
+
+    /// Which key lands on `evdev`, preferring one the user named.
+    fn source_of(self, evdev: u16) -> Option<u16> {
+        let matching = |want_explicit: bool| {
+            (0..self.targets.len())
+                .find(|&i| self.targets[i] == evdev && self.explicit[i] == want_explicit)
+        };
+        matching(true)
+            .or_else(|| matching(false))
+            .map(|i| MODIFIER_KEY_CODES[i])
+    }
+
+    /// Apply the map *before* the keycode lookup, so the table itself only ever
+    /// states the by-position mapping.
+    fn forward(self, evdev: u16) -> u16 {
+        self.target_of(evdev)
+    }
+
+    /// Undo the map, for the capture side.
+    ///
+    /// A target nothing maps onto passes through unchanged: the user has moved
+    /// that key's source elsewhere, and inventing a substitute would put a key
+    /// on the wire they never pressed.
+    fn backward(self, evdev: u16) -> u16 {
+        match index_of(evdev) {
+            Some(_) => self.source_of(evdev).unwrap_or(evdev),
+            None => evdev,
+        }
+    }
+
+    /// The physical keys on this Mac that produce the ownership hotkey.
+    ///
+    /// The hotkey is Ctrl+Alt+G in the *wire* namespace, and capture puts a key
+    /// on the wire by undoing this map — so the key that arrives as wire Ctrl
+    /// is whichever one Ctrl was sent to. By position that is the Mac's own
+    /// Control, which is where a user's fingers already go; under the swap it
+    /// is Command, because the swap is a statement that Command is where
+    /// Control belongs.
+    pub fn hotkey_on_this_mac(self) -> String {
+        format!(
+            "{}+{}+G",
+            key_name(self.target_of(KEY_LEFTCTRL)),
+            key_name(self.target_of(KEY_LEFTALT))
+        )
+    }
+
+    /// How this map reads in a log line: only what moved.
+    pub fn describe(self) -> String {
+        let moved: Vec<String> = MODIFIER_KEY_CODES
+            .iter()
+            .enumerate()
+            .filter(|&(i, &code)| self.targets[i] != code)
+            .map(|(i, &code)| format!("{} acts as {}", key_name(code), key_name(self.targets[i])))
+            .collect();
+        match moved.is_empty() {
+            true => "every modifier acts as itself".to_string(),
+            false => moved.join(", "),
+        }
+    }
+}
+
+/// Parse a modifier name, with an optional `left`/`right` prefix.
+fn parse_key(name: &str) -> Result<(Modifier, Option<Side>), String> {
+    let cleaned: String = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
+        .collect();
+    for (prefix, side) in [("left", Side::Left), ("right", Side::Right)] {
+        if let Some(rest) = cleaned.strip_prefix(prefix) {
+            if let Some(modifier) = Modifier::parse(rest) {
+                return Ok((modifier, Some(side)));
+            }
+        }
+    }
+    Modifier::parse(&cleaned)
+        .map(|modifier| (modifier, None))
+        .ok_or_else(|| format!("no modifier is called `{}`", name.trim()))
+}
+
+/// Which sides a name refers to: the one it asked for, or both.
+fn sides_of(modifier: Modifier, side: Option<Side>) -> Vec<Side> {
+    match (modifier, side) {
+        // Keys that exist once are the same key however they are spelled.
+        (Modifier::CapsLock | Modifier::Globe, _) => vec![Side::Only],
+        (_, Some(side)) => vec![side],
+        (_, None) => vec![Side::Left, Side::Right],
+    }
+}
+
+/// The map this process was told to use, shared by injection and capture.
+///
+/// One keyboard, one answer, and both halves must agree or a Mac would send
+/// what it did not mean: the injector applies the map and capture undoes it, so
+/// two different maps would not cancel. Set once from the command line, before
+/// either backend exists.
+static CONFIGURED: std::sync::OnceLock<ModifierMap> = std::sync::OnceLock::new();
+
+/// Set the map for this process. Only the first call takes effect.
+pub fn configure(map: ModifierMap) {
+    let _ = CONFIGURED.set(map);
+}
+
+/// The configured map, or the by-position default if none was set.
+pub fn configured() -> ModifierMap {
+    CONFIGURED.get().copied().unwrap_or_default()
 }
 
 /// Translate one evdev keycode to a macOS virtual keycode.
 ///
 /// `None` for keys macOS has no equivalent of (Scroll Lock, Menu, Print
 /// Screen); the caller drops those rather than guessing at a substitute.
-pub fn evdev_to_mac(evdev: u16, style: ModifierStyle) -> Option<u16> {
-    let evdev = style.remap(evdev);
+pub fn evdev_to_mac(evdev: u16, map: ModifierMap) -> Option<u16> {
+    let evdev = map.forward(evdev);
     TABLE
         .iter()
         .find(|(code, _)| *code == evdev)
@@ -69,17 +399,16 @@ pub fn evdev_to_mac(evdev: u16, style: ModifierStyle) -> Option<u16> {
 
 /// Translate a macOS virtual keycode back to evdev, for the capture side.
 ///
-/// The style is undone here, not applied: a Mac sending Command+C to a PC peer
-/// must put Control on the wire, or the swap that [`evdev_to_mac`] performs
-/// would have to be configured identically on both machines to cancel out.
-pub fn mac_to_evdev(mac_key: u16, style: ModifierStyle) -> Option<u16> {
+/// The map is undone here, not applied: a Mac sending Command+C to a PC peer
+/// must put on the wire whichever key that peer turns back into Command, or the
+/// mapping would have to be configured identically on both machines to cancel
+/// out.
+pub fn mac_to_evdev(mac_key: u16, map: ModifierMap) -> Option<u16> {
     let evdev = TABLE
         .iter()
         .find(|(_, mac)| *mac == mac_key)
         .map(|(code, _)| *code)?;
-    // `remap` swaps Control and Meta, and swapping twice is the identity — so
-    // the same function inverts itself.
-    Some(style.remap(evdev))
+    Some(map.backward(evdev))
 }
 
 /// The `CGEventFlags` bits a macOS modifier keycode contributes, or `None` if
@@ -99,10 +428,33 @@ pub fn modifier_flags(mac_key: u16) -> Option<u64> {
         VK_RIGHT_OPTION => (FLAG_OPTION, DEVICE_RIGHT_OPTION),
         VK_COMMAND => (FLAG_COMMAND, DEVICE_LEFT_COMMAND),
         VK_RIGHT_COMMAND => (FLAG_COMMAND, DEVICE_RIGHT_COMMAND),
+        // Globe has no side and no device bit — there is only one of it, so
+        // the shared mask already identifies it exactly.
+        VK_FUNCTION => (FLAG_SECONDARY_FN, 0),
         _ => return None,
     };
     Some(mask | side)
 }
+
+/// The bits that identify *this* modifier key rather than the pair it belongs
+/// to.
+///
+/// The documented mask says "a Command is down" and stays set while the other
+/// Command is held, so watching it cannot tell one side going up from the other
+/// staying down. The device-dependent bit can. Globe is the exception: it has
+/// no twin and no device bit, so its own mask is what identifies it.
+pub fn identifying_flags(mac_key: u16) -> Option<u64> {
+    let bits = modifier_flags(mac_key)?;
+    let side = bits & !MODIFIER_MASKS;
+    Some(match side {
+        0 => bits,
+        _ => side,
+    })
+}
+
+/// The documented `CGEventFlags` modifier bits, as opposed to the
+/// device-dependent ones in the low half.
+const MODIFIER_MASKS: u64 = 0x00FF_0000;
 
 /// Every modifier keycode, so the capture side can work out which one moved.
 ///
@@ -118,6 +470,7 @@ pub const MODIFIER_KEYS: &[u16] = &[
     VK_RIGHT_OPTION,
     VK_COMMAND,
     VK_RIGHT_COMMAND,
+    VK_FUNCTION,
 ];
 
 /// Whether this macOS keycode is Caps Lock.
@@ -284,6 +637,11 @@ const KEY_F17: u16 = 187;
 const KEY_F18: u16 = 188;
 const KEY_F19: u16 = 189;
 const KEY_F20: u16 = 190;
+/// `KEY_FN`. Well outside the PS/2-derived range because no PS/2 keyboard had
+/// one; the kernel reports it for laptop Fn keys that are not handled purely in
+/// firmware. Here it is the wire code for the Mac's Globe key, so a peer can
+/// aim a key it *does* have at input-source switching.
+const KEY_FN: u16 = 464;
 
 // macOS virtual keycodes (`kVK_*` from HIToolbox/Events.h). Named so the table
 // is readable; the numbering itself follows no pattern worth deriving.
@@ -351,6 +709,9 @@ const VK_CONTROL: u16 = 0x3B;
 const VK_RIGHT_SHIFT: u16 = 0x3C;
 const VK_RIGHT_OPTION: u16 = 0x3D;
 const VK_RIGHT_CONTROL: u16 = 0x3E;
+/// `kVK_Function`: the Globe key, which a modern MacBook changes input source
+/// with. Reported through `flagsChanged` like any other modifier.
+const VK_FUNCTION: u16 = 0x3F;
 const VK_F17: u16 = 0x40;
 const VK_KEYPAD_DECIMAL: u16 = 0x41;
 const VK_KEYPAD_MULTIPLY: u16 = 0x43;
@@ -462,8 +823,8 @@ const FUNCTION_KEYS: &[u16] = &[
     VK_F20,
 ];
 
-/// evdev keycode → macOS virtual keycode, by name. Any Control/Command swap has
-/// already happened in [`ModifierStyle::remap`] before this is consulted.
+/// evdev keycode → macOS virtual keycode, by position. Any modifier remapping
+/// has already happened in [`ModifierMap::forward`] before this is consulted.
 const TABLE: &[(u16, u16)] = &[
     (KEY_ESC, VK_ESCAPE),
     (KEY_1, VK_1),
@@ -570,6 +931,7 @@ const TABLE: &[(u16, u16)] = &[
     (KEY_KPEQUAL, VK_KEYPAD_EQUALS),
     (KEY_LEFTMETA, VK_COMMAND),
     (KEY_RIGHTMETA, VK_RIGHT_COMMAND),
+    (KEY_FN, VK_FUNCTION),
     (KEY_F13, VK_F13),
     (KEY_F14, VK_F14),
     (KEY_F15, VK_F15),
@@ -588,59 +950,135 @@ mod tests {
     fn letters_and_digits_map_to_apples_numbering() {
         // A worthwhile check precisely because the numbering is arbitrary: if
         // it were derivable, the table would not need to exist.
-        assert_eq!(evdev_to_mac(KEY_A, ModifierStyle::Mac), Some(VK_A));
-        assert_eq!(evdev_to_mac(KEY_Z, ModifierStyle::Mac), Some(VK_Z));
-        assert_eq!(evdev_to_mac(KEY_5, ModifierStyle::Mac), Some(VK_5));
-        assert_eq!(evdev_to_mac(KEY_6, ModifierStyle::Mac), Some(VK_6));
+        let map = ModifierMap::positional();
+        assert_eq!(evdev_to_mac(KEY_A, map), Some(VK_A));
+        assert_eq!(evdev_to_mac(KEY_Z, map), Some(VK_Z));
+        assert_eq!(evdev_to_mac(KEY_5, map), Some(VK_5));
+        assert_eq!(evdev_to_mac(KEY_6, map), Some(VK_6));
+    }
+
+    /// The default, and what a user reaching for Command under their thumb
+    /// expects: nothing moves.
+    #[test]
+    fn by_default_every_modifier_lands_where_the_hardware_puts_it() {
+        let map = ModifierMap::default();
+        assert_eq!(evdev_to_mac(KEY_LEFTCTRL, map), Some(VK_CONTROL));
+        assert_eq!(evdev_to_mac(KEY_LEFTMETA, map), Some(VK_COMMAND));
+        assert_eq!(evdev_to_mac(KEY_LEFTALT, map), Some(VK_OPTION));
+        assert_eq!(map.describe(), "every modifier acts as itself");
     }
 
     #[test]
-    fn a_pc_keyboards_control_becomes_command() {
+    fn the_swapped_preset_puts_command_under_control() {
+        let map = ModifierMap::swapped();
+        assert_eq!(evdev_to_mac(KEY_LEFTCTRL, map), Some(VK_COMMAND));
+        assert_eq!(evdev_to_mac(KEY_RIGHTCTRL, map), Some(VK_RIGHT_COMMAND));
+        assert_eq!(evdev_to_mac(KEY_LEFTMETA, map), Some(VK_CONTROL));
+    }
+
+    /// The names the flag used to take still mean what they meant, so an
+    /// existing command line keeps working.
+    #[test]
+    fn the_old_preset_names_still_parse() {
+        assert_eq!(ModifierMap::parse("pc").unwrap(), ModifierMap::swapped());
         assert_eq!(
-            evdev_to_mac(KEY_LEFTCTRL, ModifierStyle::Pc),
-            Some(VK_COMMAND)
+            ModifierMap::parse("mac").unwrap(),
+            ModifierMap::positional()
         );
         assert_eq!(
-            evdev_to_mac(KEY_RIGHTCTRL, ModifierStyle::Pc),
-            Some(VK_RIGHT_COMMAND)
-        );
-        assert_eq!(
-            evdev_to_mac(KEY_LEFTMETA, ModifierStyle::Pc),
-            Some(VK_CONTROL)
+            ModifierMap::parse("swapped").unwrap(),
+            ModifierMap::swapped()
         );
     }
 
+    /// Spelling the swap out by hand must produce the preset exactly, or the
+    /// preset is a second implementation waiting to disagree with this one.
     #[test]
-    fn an_apple_keyboards_modifiers_keep_their_names() {
+    fn writing_the_swap_out_by_hand_gives_the_same_map() {
         assert_eq!(
-            evdev_to_mac(KEY_LEFTCTRL, ModifierStyle::Mac),
-            Some(VK_CONTROL)
+            ModifierMap::parse("ctrl=cmd,win=ctrl").unwrap(),
+            ModifierMap::swapped()
         );
+        // Every alias for the same two keys, since a user will reach for
+        // whichever name their keyboard is printed with.
         assert_eq!(
-            evdev_to_mac(KEY_LEFTMETA, ModifierStyle::Mac),
-            Some(VK_COMMAND)
+            ModifierMap::parse("control=command, super=control").unwrap(),
+            ModifierMap::swapped()
         );
     }
 
-    /// Option is the same key under either name, so neither style may move it.
+    /// The point of naming the Globe key: a PC keyboard has no such key, so
+    /// switching input source on a modern MacBook needs one aimed at it.
     #[test]
-    fn alt_is_option_whichever_keyboard_is_sending() {
-        for style in [ModifierStyle::Pc, ModifierStyle::Mac] {
-            assert_eq!(evdev_to_mac(KEY_LEFTALT, style), Some(VK_OPTION));
-            assert_eq!(evdev_to_mac(KEY_RIGHTALT, style), Some(VK_RIGHT_OPTION));
-        }
+    fn a_pc_key_can_be_pointed_at_the_globe_key() {
+        let map = ModifierMap::parse("rightalt=globe").unwrap();
+        assert_eq!(evdev_to_mac(KEY_RIGHTALT, map), Some(VK_FUNCTION));
+        // The left one is untouched: only what was named moves.
+        assert_eq!(evdev_to_mac(KEY_LEFTALT, map), Some(VK_OPTION));
+    }
+
+    /// Two keys the user named landing on one target cannot be undone, and
+    /// capture has to undo it — so it is refused with both keys named rather
+    /// than silently half-applied.
+    #[test]
+    fn two_named_keys_cannot_land_on_the_same_target() {
+        let error = ModifierMap::parse("ctrl=cmd,shift=cmd").unwrap_err();
+        assert!(error.contains("Control"), "{error}");
+        assert!(error.contains("Shift"), "{error}");
+        assert!(error.contains("Command"), "{error}");
+    }
+
+    /// Colliding with a key nobody mentioned is the ordinary case, not a
+    /// mistake: `ctrl=cmd` on its own leaves the Windows key on Command too,
+    /// and both doing Command is a perfectly good arrangement. The named key
+    /// wins the one direction that has to pick — what the Mac's own Command
+    /// becomes on the wire.
+    #[test]
+    fn a_named_key_wins_over_one_left_at_its_default() {
+        let map = ModifierMap::parse("ctrl=cmd").unwrap();
+        assert_eq!(evdev_to_mac(KEY_LEFTCTRL, map), Some(VK_COMMAND));
+        assert_eq!(evdev_to_mac(KEY_LEFTMETA, map), Some(VK_COMMAND));
+        assert_eq!(mac_to_evdev(VK_COMMAND, map), Some(KEY_LEFTCTRL));
+    }
+
+    /// The whole point of naming a side: aiming both Options at Globe would
+    /// take away every accented character the user can type.
+    #[test]
+    fn naming_a_side_moves_only_that_key() {
+        let map = ModifierMap::parse("right-alt=globe").unwrap();
+        assert_eq!(evdev_to_mac(KEY_RIGHTALT, map), Some(VK_FUNCTION));
+        assert_eq!(evdev_to_mac(KEY_LEFTALT, map), Some(VK_OPTION));
+    }
+
+    /// A side-less target follows the side it came from, so one pair moves a
+    /// whole modifier without the user writing it twice.
+    #[test]
+    fn a_sideless_target_keeps_the_side_it_came_from() {
+        let map = ModifierMap::parse("ctrl=cmd").unwrap();
+        assert_eq!(evdev_to_mac(KEY_LEFTCTRL, map), Some(VK_COMMAND));
+        assert_eq!(evdev_to_mac(KEY_RIGHTCTRL, map), Some(VK_RIGHT_COMMAND));
+    }
+
+    #[test]
+    fn a_misspelt_modifier_is_refused_by_name() {
+        assert!(ModifierMap::parse("ctlr=cmd").unwrap_err().contains("ctlr"));
+        assert!(ModifierMap::parse("ctrl").unwrap_err().contains("ctrl"));
+    }
+
+    /// A side must survive the map: pressing the left key and having the right
+    /// one arrive would be its own bug report.
+    #[test]
+    fn a_remapped_modifier_keeps_the_side_it_was_pressed_on() {
+        let map = ModifierMap::swapped();
+        assert_eq!(evdev_to_mac(KEY_LEFTCTRL, map), Some(VK_COMMAND));
+        assert_eq!(evdev_to_mac(KEY_RIGHTCTRL, map), Some(VK_RIGHT_COMMAND));
     }
 
     #[test]
     fn backspace_and_delete_are_different_keys() {
-        assert_eq!(
-            evdev_to_mac(KEY_BACKSPACE, ModifierStyle::Pc),
-            Some(VK_DELETE)
-        );
-        assert_eq!(
-            evdev_to_mac(KEY_DELETE, ModifierStyle::Pc),
-            Some(VK_FORWARD_DELETE)
-        );
+        let map = ModifierMap::default();
+        assert_eq!(evdev_to_mac(KEY_BACKSPACE, map), Some(VK_DELETE));
+        assert_eq!(evdev_to_mac(KEY_DELETE, map), Some(VK_FORWARD_DELETE));
     }
 
     #[test]
@@ -650,6 +1088,19 @@ mod tests {
         assert_ne!(left, right);
         assert_eq!(left & FLAG_COMMAND, FLAG_COMMAND);
         assert_eq!(right & FLAG_COMMAND, FLAG_COMMAND);
+    }
+
+    /// Globe has no twin and no device bit, so the shared mask is what
+    /// identifies it. Watching only the device bits — which is right for every
+    /// other modifier — would never see it move.
+    #[test]
+    fn the_globe_key_is_identified_by_its_own_mask() {
+        assert_eq!(identifying_flags(VK_FUNCTION), Some(FLAG_SECONDARY_FN));
+        assert_eq!(
+            identifying_flags(VK_COMMAND),
+            Some(DEVICE_LEFT_COMMAND),
+            "a sided modifier is identified by its device bit, not the mask"
+        );
     }
 
     #[test]
@@ -672,41 +1123,64 @@ mod tests {
     fn keys_macos_has_no_equivalent_of_are_dropped() {
         const KEY_SCROLLLOCK: u16 = 70;
         const KEY_COMPOSE: u16 = 127;
-        assert_eq!(evdev_to_mac(KEY_SCROLLLOCK, ModifierStyle::Pc), None);
-        assert_eq!(evdev_to_mac(KEY_COMPOSE, ModifierStyle::Pc), None);
+        let map = ModifierMap::default();
+        assert_eq!(evdev_to_mac(KEY_SCROLLLOCK, map), None);
+        assert_eq!(evdev_to_mac(KEY_COMPOSE, map), None);
     }
 
     /// Capture and injection must cancel out, or a Mac driving a PC would send
-    /// the swap that the PC never applied.
+    /// a mapping that the PC never applied.
     #[test]
     fn translating_to_macos_and_back_returns_the_original_key() {
-        for style in [ModifierStyle::Pc, ModifierStyle::Mac] {
+        let maps = [
+            ModifierMap::positional(),
+            ModifierMap::swapped(),
+            ModifierMap::parse("rightalt=globe,globe=rightalt").unwrap(),
+        ];
+        for map in maps {
             for &(evdev, _) in TABLE {
-                let mac = evdev_to_mac(evdev, style).expect("in the table");
-                assert_eq!(mac_to_evdev(mac, style), Some(evdev), "style {style:?}");
+                let mac = evdev_to_mac(evdev, map).expect("in the table");
+                assert_eq!(mac_to_evdev(mac, map), Some(evdev), "map {map:?}");
             }
         }
     }
 
-    /// The other direction, which is what a Mac driving a Linux or Windows peer
-    /// depends on: Command must arrive there as Control, or the shortcut the
-    /// user meant lands on the Super key and opens the activities overview
-    /// instead of copying.
+    /// What a Mac driving a Linux or Windows peer depends on under the swap:
+    /// Command must arrive there as Control, or the shortcut lands on the Super
+    /// key and opens the activities overview instead of copying.
     #[test]
-    fn a_mac_sending_command_puts_control_on_the_wire() {
-        assert_eq!(
-            mac_to_evdev(VK_COMMAND, ModifierStyle::Pc),
-            Some(KEY_LEFTCTRL)
-        );
-        assert_eq!(
-            mac_to_evdev(VK_RIGHT_COMMAND, ModifierStyle::Pc),
-            Some(KEY_RIGHTCTRL)
-        );
+    fn a_mac_sending_command_puts_the_peers_own_key_on_the_wire() {
+        let map = ModifierMap::swapped();
+        assert_eq!(mac_to_evdev(VK_COMMAND, map), Some(KEY_LEFTCTRL));
+        assert_eq!(mac_to_evdev(VK_RIGHT_COMMAND, map), Some(KEY_RIGHTCTRL));
         // And the mirror: the Mac's own Control becomes the peer's Super, so
         // the two keys swap as a pair rather than colliding.
+        assert_eq!(mac_to_evdev(VK_CONTROL, map), Some(KEY_LEFTMETA));
+        // By position, nothing moves in either direction.
+        let map = ModifierMap::positional();
+        assert_eq!(mac_to_evdev(VK_COMMAND, map), Some(KEY_LEFTMETA));
+        assert_eq!(mac_to_evdev(VK_CONTROL, map), Some(KEY_LEFTCTRL));
+    }
+
+    /// The ownership hotkey is Ctrl+Alt+G in the wire namespace, and capture
+    /// applies the map in reverse — so by position it is the Mac's own
+    /// Control+Option+G, which is where a user's fingers go.
+    #[test]
+    fn the_hotkey_is_control_option_g_on_the_macs_own_keyboard() {
+        let map = ModifierMap::positional();
+        assert_eq!(mac_to_evdev(VK_CONTROL, map), Some(KEY_LEFTCTRL));
+        assert_eq!(mac_to_evdev(VK_OPTION, map), Some(KEY_LEFTALT));
+        assert_eq!(mac_to_evdev(VK_G, map), Some(KEY_G));
+        assert_eq!(map.hotkey_on_this_mac(), "Control+Option+G");
+    }
+
+    /// Under the swap it moves with the map, and has to be said out loud —
+    /// a hotkey that quietly relocated is one the user cannot find.
+    #[test]
+    fn the_swap_moves_the_hotkey_onto_command() {
         assert_eq!(
-            mac_to_evdev(VK_CONTROL, ModifierStyle::Pc),
-            Some(KEY_LEFTMETA)
+            ModifierMap::swapped().hotkey_on_this_mac(),
+            "Command+Option+G"
         );
     }
 

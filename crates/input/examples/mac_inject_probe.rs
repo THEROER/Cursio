@@ -15,15 +15,16 @@
 //! ```
 //!
 //! The pointer should trace a square, the page under it should scroll, `hi`
-//! should appear, and Ctrl+A should select all — that last one being the whole
-//! point of [`ModifierStyle::Pc`], since the Mac must see Command.
+//! should appear, and Ctrl+A should reach the Mac as Control+A. It selects all
+//! only under the `swapped` modifier map, which this probe does not set — the
+//! default is by position, so Control stays Control.
 
 #[cfg(target_os = "macos")]
 fn main() {
     use std::thread::sleep;
     use std::time::Duration;
 
-    use cursio_input::{InputInjector, MacInjector, ModifierStyle};
+    use cursio_input::{InputInjector, MacInjector};
     use cursio_protocol::InputEvent;
 
     // evdev codes for the keys used below.
@@ -39,7 +40,7 @@ fn main() {
         )
         .init();
 
-    let mut injector = match MacInjector::new(ModifierStyle::Pc) {
+    let mut injector = match MacInjector::new() {
         Ok(injector) => injector,
         Err(error) => {
             eprintln!("cannot inject: {error}");
