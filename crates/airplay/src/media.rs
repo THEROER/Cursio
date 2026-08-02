@@ -37,7 +37,8 @@ pub(crate) struct MediaSession {
     audio_task: Option<JoinHandle<()>>,
     /// Kept from the key exchange: audio needs it for every packet.
     iv: Option<[u8; 16]>,
-    screen_enabled: bool,
+    /// Whether the mirrored picture is drawn on this machine.
+    show_window: bool,
     /// Present when the mesh should be able to watch along.
     tap: Option<crate::MirrorTap>,
     /// The sender's volume, in AirPlay's decibel scale.
@@ -61,7 +62,7 @@ pub(crate) struct MediaSession {
 
 impl MediaSession {
     pub(crate) fn new(
-        screen_enabled: bool,
+        show_window: bool,
         tap: Option<crate::MirrorTap>,
         volume: tokio::sync::watch::Sender<f32>,
         screen_size: crate::video::ScreenSize,
@@ -72,12 +73,22 @@ impl MediaSession {
             mirror_task: None,
             audio_task: None,
             iv: None,
-            screen_enabled,
+            show_window,
             tap,
             screen_closed: Arc::new(Notify::new()),
             volume,
             screen_size,
         }
+    }
+
+    /// Whether a mirror `SETUP` is answered at all.
+    ///
+    /// Two reasons to say yes and they are independent: a window to draw it in,
+    /// or peers waiting for it through the tap. Only "neither" is a refusal —
+    /// tying acceptance to the window meant a machine sharing the phone's
+    /// screen with the mesh had to open one locally to do it.
+    fn accepts_mirror(&self) -> bool {
+        self.show_window || self.tap.is_some()
     }
 
     /// Resolves when the screen window is closed and the session should end.
@@ -199,7 +210,7 @@ impl MediaSession {
         }
 
         if let Some(stream_connection_id) = setup.mirror_stream_id {
-            if !self.screen_enabled {
+            if !self.accepts_mirror() {
                 tracing::info!(
                     stream_connection_id,
                     "AirPlay screen mirroring rejected because it is disabled"
@@ -289,7 +300,14 @@ impl MediaSession {
         }
         let listener = TcpListener::bind(SocketAddr::new(local_ip, 0)).await?;
         let local_port = listener.local_addr()?.port();
-        let sink = hardware_video_sink(self.screen_size)?;
+        // A machine that only passes the picture on to peers still has to
+        // decrypt and reframe it, but has nothing to draw it with — and
+        // building a decoder to throw its output away would open a window
+        // nobody asked for.
+        let sink: Box<dyn VideoSink> = match self.show_window {
+            true => hardware_video_sink(self.screen_size)?,
+            false => Box::new(DiscardingSink),
+        };
         let tap = self.tap.clone();
         let closed = self.screen_closed.clone();
         self.mirror_task = Some(tokio::spawn(async move {
@@ -546,6 +564,21 @@ fn timing_request() -> [u8; TIMING_PACKET_BYTES] {
 
 trait VideoSink: Send {
     fn push(&mut self, access_unit: &[u8]) -> Result<(), AirPlayError>;
+}
+
+/// Accepts access units and draws nothing.
+///
+/// For a machine that receives the phone's screen only to pass it to peers.
+/// The units still have to travel this far — the tap is fed from the same
+/// processor, and every payload must cross the decryptor in wire order or the
+/// AES-CTR keystream desynchronises — but nothing here has a window to put
+/// them in.
+struct DiscardingSink;
+
+impl VideoSink for DiscardingSink {
+    fn push(&mut self, _access_unit: &[u8]) -> Result<(), AirPlayError> {
+        Ok(())
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -866,6 +899,17 @@ mod tests {
         assert!(response.headers.iter().any(|(name, value)| {
             name == "X-Cursio-Stage" && value == "airplay-screen-disabled"
         }));
+    }
+
+    #[test]
+    fn a_mesh_tap_accepts_mirroring_without_a_local_window() {
+        let media = MediaSession::new(
+            false,
+            Some(crate::MirrorTap::new()),
+            test_volume(),
+            test_screen_size(),
+        );
+        assert!(media.accepts_mirror());
     }
 
     #[tokio::test]

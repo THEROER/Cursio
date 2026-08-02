@@ -36,13 +36,42 @@ const AIRPLAY_WINDOW_TITLE: &str = "Cursio (iPhone)";
 /// Offers whatever an iPhone is currently mirroring to this machine.
 pub struct AirPlayWindowCapture {
     tap: MirrorTap,
-    width: u32,
-    height: u32,
+    size: AirPlayWindowSize,
+}
+
+enum AirPlayWindowSize {
+    Fixed(u32, u32),
+    Mesh {
+        state: crate::service_session::ServiceState,
+    },
 }
 
 impl AirPlayWindowCapture {
     pub fn new(tap: MirrorTap, width: u32, height: u32) -> Self {
-        Self { tap, width, height }
+        Self {
+            tap,
+            size: AirPlayWindowSize::Fixed(width, height),
+        }
+    }
+
+    /// Size each new surrogate from the mesh's current AirPlay agreement.
+    pub fn for_mesh(tap: MirrorTap, state: crate::service_session::ServiceState) -> Self {
+        Self {
+            tap,
+            size: AirPlayWindowSize::Mesh { state },
+        }
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        match &self.size {
+            AirPlayWindowSize::Fixed(width, height) => (*width, *height),
+            AirPlayWindowSize::Mesh { state } => state
+                .placement()
+                .and_then(|placement| placement.quality)
+                .map_or((1920, 1080), |quality| {
+                    (u32::from(quality.width), u32::from(quality.height))
+                }),
+        }
     }
 }
 
@@ -56,21 +85,22 @@ impl WindowCapture for AirPlayWindowCapture {
     /// Screen Mirroring — rather than requiring the user to arrange the two
     /// events in the right order.
     fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError> {
+        let (width, height) = self.dimensions();
         let (frames_tx, frames_rx) = mpsc::channel(CAPTURE_FRAME_QUEUE_CAPACITY);
         let reader = self.tap.subscribe();
         let dirty = Rect {
             x: 0,
             y: 0,
-            width: self.width,
-            height: self.height,
+            width,
+            height,
         };
         let forward = tokio::spawn(forward_stream(reader, frames_tx, id, dirty));
         Ok(AirPlayCaptureSession {
             meta: WindowMeta {
                 id,
                 title: AIRPLAY_WINDOW_TITLE.to_string(),
-                width: self.width,
-                height: self.height,
+                width,
+                height,
             },
             frames: frames_rx,
             forward,
@@ -173,6 +203,23 @@ mod tests {
         assert_eq!(session.meta().title, AIRPLAY_WINDOW_TITLE);
         assert_eq!(session.meta().width, 1920);
         assert_eq!(session.meta().height, 1080);
+    }
+
+    #[tokio::test]
+    async fn a_mesh_offer_uses_the_agreed_quality() {
+        let local = cursio_protocol::PeerId::from_u128(1);
+        let state = crate::service_session::ServiceState::new();
+        state.note_offer(
+            local,
+            cursio_protocol::ServiceOffer {
+                fitness: cursio_protocol::Fitness::Full,
+                wanted: Some(cursio_protocol::Quality::new(2560, 1440, 30)),
+                show_window: false,
+            },
+        );
+        let mut capture = AirPlayWindowCapture::for_mesh(MirrorTap::new(), state);
+        let session = capture.begin(1).unwrap();
+        assert_eq!((session.meta().width, session.meta().height), (2560, 1440));
     }
 
     /// The parameter sets have to reach the peer as an ordinary frame, because

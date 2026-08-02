@@ -27,6 +27,9 @@ pub struct PeerHello {
     /// Where the peer stands in the layout, which is what decides the edge the
     /// cursor crosses to reach it.
     pub position: cursio_protocol::Position,
+    /// What the peer can carry for the mesh, and what quality it wants from a
+    /// duty the mesh places. See [`cursio_protocol::ServiceOffer`].
+    pub service: cursio_protocol::ServiceOffer,
 }
 
 impl PeerHello {
@@ -91,6 +94,7 @@ pub async fn handshake<T: Transport + ?Sized>(
     device_kind: DeviceKind,
     modules: &[ModuleAdvert],
     position: cursio_protocol::Position,
+    service: cursio_protocol::ServiceOffer,
 ) -> Result<PeerHello, SessionError> {
     transport
         .send(&Message::Hello(Hello {
@@ -100,6 +104,7 @@ pub async fn handshake<T: Transport + ?Sized>(
             device_kind,
             modules: modules.to_vec(),
             position,
+            service,
         }))
         .await?;
 
@@ -121,6 +126,7 @@ pub async fn handshake<T: Transport + ?Sized>(
         device_kind: hello.device_kind,
         modules: hello.modules,
         position: hello.position,
+        service: hello.service,
     })
 }
 

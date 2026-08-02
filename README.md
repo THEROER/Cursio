@@ -124,15 +124,15 @@ cargo test -p cursio-protocol -p cursio-transport -p cursio-core
 
 ### AirPlay receiver
 
-`cursio mesh` starts the AirPlay RTSP control receiver without creating a
-decoder or screen window. Add `--airplay-screen` (or its compatibility alias
-`--airplay`) to accept iPhone screen video: open Control Center → Screen
-Mirroring and select `Cursio - <computer name>`. Use `--no-airplay` to disable
-the RTSP listener completely. `--airplay-name <name>` and `--airplay-port
-<port>` change the announcement.
+`cursio mesh` participates in one AirPlay receiver for the whole mesh. Open
+Control Center → Screen Mirroring and select `Cursio`. The mesh chooses a host
+with a free control port and prefers one with hardware H.264 decoding.
 
-The `Cursio - AirPlay Screen` window opens only after an iPhone connects and
-requests receiver information, and only when `--airplay-screen` is set.
+`--airplay 1440p:30fps` asks the mesh for that quality without implying a local
+window; a better request rebuilds the selected receiver. Add
+`--airplay-window` on the machine where the mirrored screen should appear, even
+when another machine hosts the receiver. `--airplay off` removes this machine
+from hosting, while `--airplay-port <port>` changes its control port.
 
 Current AirPlay scope:
 
@@ -153,10 +153,9 @@ Platform video requirements:
   or `vaapih264dec`) and a compatible Wayland/GL sink;
 - Windows: GStreamer 1.x with `d3d11h264dec` and `d3d11videosink`.
 
-At startup the Rust CLI checks the platform video path and prints a concrete
-warning when GStreamer, a decoder, or a GPU-compatible sink is missing. AirPlay
-discovery remains available so the diagnostic is visible without taking the
-rest of the mesh offline.
+At startup the Rust CLI checks the platform video path and port availability.
+Those results and the requested quality travel in the mesh greeting, so every
+node computes the same placement and failover when a host disconnects.
 
 ### Build & install (`cargo xtask`)
 

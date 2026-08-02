@@ -29,7 +29,7 @@ pub struct Receiver {
     /// goes away. Empty means bound but deliberately invisible.
     announcement: Announcer,
     crypto: Arc<dyn CryptoProvider>,
-    screen_enabled: bool,
+    show_window: bool,
     tap: Option<crate::MirrorTap>,
     /// Survives the control connections that come and go, so a volume the user
     /// set once stays set.
@@ -66,7 +66,7 @@ impl Receiver {
             config: Arc::new(config),
             announcement,
             crypto,
-            screen_enabled: false,
+            show_window: false,
             tap: None,
             volume: tokio::sync::watch::Sender::new(0.0),
         })
@@ -74,10 +74,10 @@ impl Receiver {
 
     /// Enable the mirroring video sink and its native presentation window.
     ///
-    /// The control listener remains usable when this is false, but mirror
-    /// `SETUP` requests are rejected before a decoder or window is created.
+    /// With this false, mirroring is still accepted when a mesh tap is present;
+    /// only a receiver with neither a window nor a tap rejects mirror `SETUP`.
     pub fn with_screen_enabled(mut self, enabled: bool) -> Self {
-        self.screen_enabled = enabled;
+        self.show_window = enabled;
         self
     }
 
@@ -108,7 +108,7 @@ impl Receiver {
         tracing::info!(
             address = %self.listener.local_addr()?,
             name = %self.config.name,
-            screen = if self.screen_enabled { "enabled" } else { "disabled" },
+            screen = if self.show_window { "enabled" } else { "disabled" },
             "cursio_airplay receiver started"
         );
         loop {
@@ -134,7 +134,7 @@ impl Receiver {
             tracing::debug!(%peer, %local_addr, "AirPlay control connection accepted");
             let config = self.config.clone();
             let crypto = self.crypto.start_session();
-            let screen_enabled = self.screen_enabled;
+            let show_window = self.show_window;
             let tap = self.tap.clone();
             let volume = self.volume.clone();
             tokio::spawn(async move {
@@ -147,7 +147,7 @@ impl Receiver {
                     config,
                     crypto,
                     Some(context),
-                    screen_enabled,
+                    show_window,
                     tap,
                     volume,
                 )
@@ -186,7 +186,7 @@ async fn serve_connection<T>(
     config: Arc<ReceiverConfig>,
     mut crypto: Box<dyn CryptoSession>,
     context: Option<ConnectionContext>,
-    screen_enabled: bool,
+    show_window: bool,
     tap: Option<crate::MirrorTap>,
     volume: tokio::sync::watch::Sender<f32>,
 ) -> Result<(), AirPlayError>
@@ -196,7 +196,7 @@ where
     let mut decoder = RequestDecoder::new();
     let (width, height) = config.profile.resolution.dimensions();
     let mut media = MediaSession::new(
-        screen_enabled,
+        show_window,
         tap,
         volume,
         crate::video::ScreenSize::new(width, height),
@@ -243,7 +243,7 @@ where
                 "AirPlay request decoded"
             );
             let target = request.target.split('?').next().unwrap_or(&request.target);
-            if screen_enabled
+            if show_window
                 && context.is_some()
                 && request.method.eq_ignore_ascii_case("GET")
                 && matches!(target, "/info" | "/server-info")

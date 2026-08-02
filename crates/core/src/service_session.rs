@@ -1,17 +1,11 @@
 //! Carrying "I cannot do this, will you?" between machines.
 //!
 //! The policy half of [`cursio_protocol::service`]. A duty that must live on
-//! exactly one machine — hosting the AirPlay receiver, so far — cannot be
-//! placed by each node ranking itself against the others, because ranking
-//! answers "who should" and the question is "who *can*". A Mac is reachable,
-//! willing, and still unable to hold port 7000, because Apple's own receiver
-//! has it. Ranking hands it the duty; nothing happens; the mesh has no
-//! receiver and no line in any log says why.
-//!
-//! So the machine that cannot serve says so, out loud, and a peer that can
-//! answers. What arrives here is the *decision* — this node is now hosting
-//! something the user started elsewhere — which the rest of the process reads
-//! through a [`ServiceState`] handle rather than by being called back.
+//! exactly one machine — hosting the AirPlay receiver, so far — is placed from
+//! offers exchanged in `Hello`: port availability, decoder fitness and the
+//! quality/window each node wants. Query/status messages then report what is
+//! actually bound, and the request/refusal path handles a bind that changed
+//! after the greeting.
 //!
 //! ## Why a shared handle and not a channel
 //!
@@ -25,7 +19,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cursio_protocol::{Message, ModuleId, PeerId, Priority, ServiceId, ServiceMsg};
+use cursio_protocol::{
+    Message, ModuleId, PeerId, Priority, Quality, ServiceId, ServiceMsg, ServiceOffer,
+};
 use cursio_transport::{TransportError, TransportTx};
 
 use crate::module::SessionModule;
@@ -38,7 +34,7 @@ const KNOWN_SERVICES: &[ServiceId] = &[ServiceId::AIRPLAY];
 
 /// Version of this module's wire vocabulary ([`ServiceMsg`]). Bump when those
 /// types change shape; peers run the module only on an exact match.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// What this machine has been asked to carry, and what it has asked for.
 ///
@@ -49,6 +45,15 @@ pub struct ServiceState {
     inner: Arc<Mutex<Inner>>,
 }
 
+/// What this machine is running for a duty it carries.
+#[derive(Clone, Copy)]
+struct Hosting {
+    addr: std::net::SocketAddr,
+    /// The picture quality, for duties that have one. `None` for a receiver
+    /// answering an iPhone without decoding anything.
+    quality: Option<Quality>,
+}
+
 /// Which peer is carrying a duty, and where it answers.
 #[derive(Clone, Copy)]
 struct HostedBy {
@@ -57,6 +62,9 @@ struct HostedBy {
     /// the mesh link's. `None` when the peer accepted a request but has not
     /// said where yet.
     addr: Option<std::net::SocketAddr>,
+    /// What the peer is running it at, so this machine can tell "somebody has
+    /// it" from "somebody has it, worse than was asked for".
+    quality: Option<Quality>,
 }
 
 #[derive(Default)]
@@ -82,9 +90,14 @@ struct Inner {
     /// second as though it were the first is how a node that correctly stood
     /// down at startup put its announcement straight back a second later.
     answered: HashSet<ServiceId>,
-    /// Duties this machine is carrying, and the address they answer on — what
-    /// a peer's [`ServiceMsg::Query`] is answered with.
-    hosted_here: std::collections::HashMap<ServiceId, std::net::SocketAddr>,
+    /// Duties this machine is carrying: where they answer and what they are
+    /// running at — the whole of what a peer's [`ServiceMsg::Query`] is
+    /// answered with.
+    hosted_here: std::collections::HashMap<ServiceId, Hosting>,
+    /// What each peer brought to the mesh, from its greeting. Placement is a
+    /// comparison across all of them, so it needs them all in one place rather
+    /// than one per session.
+    offers: std::collections::HashMap<PeerId, ServiceOffer>,
 }
 
 impl ServiceState {
@@ -118,9 +131,11 @@ impl ServiceState {
     /// and dropping its answer too would have this machine announce a second
     /// receiver over the top of a working one.
     pub fn forget_peer(&self, peer: PeerId) {
-        self.lock()
+        let mut inner = self.lock();
+        inner
             .hosted_elsewhere
             .retain(|_, hosted| hosted.peer != peer);
+        inner.offers.remove(&peer);
     }
 
     /// Whether any peer has answered a query about `service` yet, either way.
@@ -139,12 +154,65 @@ impl ServiceState {
             .and_then(|hosted| hosted.addr)
     }
 
-    /// Record that this machine is carrying `service`, reachable at `addr`.
+    /// What quality a peer says it is running `service` at.
+    pub fn host_quality(&self, service: ServiceId) -> Option<Quality> {
+        self.lock()
+            .hosted_elsewhere
+            .get(&service)
+            .and_then(|hosted| hosted.quality)
+    }
+
+    /// Record that this machine is carrying `service`, reachable at `addr` and
+    /// running at `quality`.
     ///
     /// Set by whatever actually started it, so a peer's query is answered from
     /// what is running rather than from what was intended.
-    pub fn now_hosting(&self, service: ServiceId, addr: std::net::SocketAddr) {
-        self.lock().hosted_here.insert(service, addr);
+    pub fn now_hosting(
+        &self,
+        service: ServiceId,
+        addr: std::net::SocketAddr,
+        quality: Option<Quality>,
+    ) {
+        self.lock()
+            .hosted_here
+            .insert(service, Hosting { addr, quality });
+    }
+
+    /// Stop claiming `service`, because this machine gave it up.
+    pub fn no_longer_hosting(&self, service: ServiceId) {
+        self.lock().hosted_here.remove(&service);
+    }
+
+    /// Where this machine answers `service`, if it carries it.
+    pub fn host_here_addr(&self, service: ServiceId) -> Option<std::net::SocketAddr> {
+        self.lock().hosted_here.get(&service).map(|h| h.addr)
+    }
+
+    /// What this machine is running `service` at, if it is.
+    pub fn hosting_quality(&self, service: ServiceId) -> Option<Quality> {
+        self.lock()
+            .hosted_here
+            .get(&service)
+            .and_then(|hosting| hosting.quality)
+    }
+
+    /// Record what a peer brings to the mesh, from its greeting.
+    pub fn note_offer(&self, peer: PeerId, offer: ServiceOffer) {
+        self.lock().offers.insert(peer, offer);
+    }
+
+    /// Every peer's offer, as last greeted.
+    pub fn offers(&self) -> Vec<(PeerId, ServiceOffer)> {
+        self.lock()
+            .offers
+            .iter()
+            .map(|(peer, offer)| (*peer, *offer))
+            .collect()
+    }
+
+    /// Current deterministic placement from every connected node's offer.
+    pub fn placement(&self) -> Option<Placement> {
+        choose_host(&self.offers())
     }
 
     /// Whether this machine is carrying `service`.
@@ -167,11 +235,61 @@ impl ServiceState {
     }
 }
 
-/// Decides what this machine answers when a peer asks it to host something.
+/// Who should hold a duty, and what it should run at.
 ///
-/// A trait rather than a closure because the answer is genuinely per-duty and
-/// involves real resources: hosting AirPlay means binding port 7000, and the
-/// only honest way to answer is to try.
+/// The two questions are one answer because they constrain each other: the
+/// quality is whatever any node asked for — a request is about the picture,
+/// not about the machine that decodes it — and the host must be a machine that
+/// can actually deliver it.
+///
+/// Ranking, in order:
+///
+/// 1. **Fitness.** A machine with a hardware decoder beats one without, which
+///    beats one whose user switched AirPlay off. Placing a picture on a
+///    machine that cannot decode it is how the mesh ends up with a receiver
+///    that answers and then shows nothing.
+/// 2. **Lowest peer id.** Arbitrary, and that is the point: every node
+///    computes the same answer from ids they have already exchanged, so no
+///    message is needed to agree and two nodes cannot reach opposite
+///    conclusions.
+///
+/// A `None` result means nobody will take it — every machine is switched off —
+/// which is a real answer and not a failure.
+pub fn choose_host(candidates: &[(PeerId, ServiceOffer)]) -> Option<Placement> {
+    // The quality is the mesh's, not the winner's: a user asking for 1440p on
+    // the machine they are sitting at is asking for the *picture* to be that,
+    // whichever machine turns out to decode it.
+    let wanted = candidates
+        .iter()
+        .filter_map(|(_, offer)| offer.wanted)
+        .max_by_key(|quality| quality.selection_key());
+
+    let (host, _offer) = candidates
+        .iter()
+        .filter(|(_, offer)| offer.fitness.takes_part())
+        // `min_by_key` keeps the first of equals, so the id has to be part of
+        // the key rather than left to iteration order — a `HashMap`'s order is
+        // not the same on two machines.
+        .min_by_key(|(peer, offer)| (std::cmp::Reverse(offer.fitness), *peer))?;
+
+    Some(Placement {
+        host: *host,
+        // A control-only host can still decrypt and forward H.264 without
+        // decoding it locally, so the mesh request remains valid there too.
+        quality: wanted,
+    })
+}
+
+/// Where a duty belongs and what it should be doing there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    pub host: PeerId,
+    /// The highest explicit quality request, or `None` when the receiver may
+    /// use its local default.
+    pub quality: Option<Quality>,
+}
+
+/// Decides what this machine answers when a peer asks it to host something.
 pub trait ServiceHost: Send {
     /// Take `service` on, or explain why not.
     ///
@@ -254,6 +372,9 @@ impl ServiceEngine {
     /// no extra message: the two sides compute opposite answers from the same
     /// pair of ids, so exactly one stands down.
     fn yield_to(&self, service: ServiceId) -> bool {
+        if let Some(placement) = self.state.placement() {
+            return placement.host == self.peer_id;
+        }
         !self.state.is_hosted_here(service) || self.peer_outranks_us
     }
 
@@ -361,17 +482,19 @@ impl SessionModule for ServiceEngine {
         };
         match decoded {
             ServiceMsg::Query { service } => {
-                let addr = self.state.lock().hosted_here.get(&service).copied();
+                let hosting = self.state.lock().hosted_here.get(&service).copied();
                 self.outbound.push(ServiceMsg::Status {
                     service,
-                    hosting: addr.is_some(),
-                    addr,
+                    hosting: hosting.is_some(),
+                    addr: hosting.map(|h| h.addr),
+                    quality: hosting.and_then(|h| h.quality),
                 });
             }
             ServiceMsg::Status {
                 service,
                 hosting,
                 addr,
+                quality,
             } => {
                 // Recorded before the tie-break, because the fact worth
                 // remembering is that a peer spoke at all — even when what it
@@ -394,13 +517,21 @@ impl SessionModule for ServiceEngine {
                         HostedBy {
                             peer: self.peer_id,
                             addr,
+                            quality,
                         },
                     );
                 } else {
                     // Removed rather than left: an answer of "not me" from the
                     // peer that used to host it is how this machine learns the
                     // duty is free again.
-                    self.state.lock().hosted_elsewhere.remove(&service);
+                    let mut inner = self.state.lock();
+                    if inner
+                        .hosted_elsewhere
+                        .get(&service)
+                        .is_some_and(|hosted| hosted.peer == self.peer_id)
+                    {
+                        inner.hosted_elsewhere.remove(&service);
+                    }
                 }
             }
             ServiceMsg::Request { service, reason } => {
@@ -414,6 +545,7 @@ impl SessionModule for ServiceEngine {
                     HostedBy {
                         peer: self.peer_id,
                         addr: None,
+                        quality: None,
                     },
                 );
             }
@@ -425,7 +557,14 @@ impl SessionModule for ServiceEngine {
             }
             ServiceMsg::Released { service } => {
                 tracing::info!(peer = %self.peer_name, %service, "peer gave up hosting it");
-                self.state.lock().hosted_elsewhere.remove(&service);
+                let mut inner = self.state.lock();
+                if inner
+                    .hosted_elsewhere
+                    .get(&service)
+                    .is_some_and(|hosted| hosted.peer == self.peer_id)
+                {
+                    inner.hosted_elsewhere.remove(&service);
+                }
                 // Ask again on the next pump: whoever wanted it still does.
                 self.requested.remove(&service);
             }
@@ -467,6 +606,7 @@ impl crate::module::ModuleFactory for ServiceFactory {
     }
 
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
+        self.state.note_offer(ctx.peer.peer_id, ctx.peer.service);
         Ok(Box::new(ServiceEngine::new(
             ctx.peer_name().to_string(),
             ctx.peer.peer_id,
@@ -483,6 +623,7 @@ impl crate::module::ModuleFactory for ServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cursio_protocol::Fitness;
 
     /// A host that records what it was asked and answers as told.
     struct ScriptedHost {
@@ -549,6 +690,74 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn offer(fitness: Fitness, wanted: Option<Quality>) -> ServiceOffer {
+        ServiceOffer {
+            fitness,
+            wanted,
+            show_window: false,
+        }
+    }
+
+    #[test]
+    fn placement_prefers_a_hardware_decoder_then_uses_id_as_the_tie_break() {
+        let low = PeerId::from_u128(1);
+        let high = PeerId::from_u128(2);
+        let candidates = [
+            (low, offer(Fitness::ControlOnly, None)),
+            (high, offer(Fitness::Full, None)),
+        ];
+        assert_eq!(choose_host(&candidates).unwrap().host, high);
+
+        let tied = [
+            (high, offer(Fitness::Full, None)),
+            (low, offer(Fitness::Full, None)),
+        ];
+        assert_eq!(choose_host(&tied).unwrap().host, low);
+    }
+
+    #[test]
+    fn an_incapable_viewer_can_still_raise_the_mesh_quality() {
+        let host = PeerId::from_u128(1);
+        let viewer = PeerId::from_u128(2);
+        let wanted = Quality::new(2560, 1440, 30);
+        let placement = choose_host(&[
+            (host, offer(Fitness::Full, None)),
+            (viewer, offer(Fitness::No, Some(wanted))),
+        ])
+        .unwrap();
+        assert_eq!(placement.host, host);
+        assert_eq!(placement.quality, Some(wanted));
+    }
+
+    #[test]
+    fn a_higher_resolution_request_replaces_faster_lower_resolution() {
+        let host = PeerId::from_u128(1);
+        let placement = choose_host(&[
+            (
+                host,
+                offer(Fitness::Full, Some(Quality::new(1920, 1080, 60))),
+            ),
+            (
+                PeerId::from_u128(2),
+                offer(Fitness::Full, Some(Quality::new(2560, 1440, 30))),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(placement.quality, Some(Quality::new(2560, 1440, 30)));
+    }
+
+    #[test]
+    fn forgetting_a_host_recomputes_placement_from_the_nodes_left() {
+        let state = ServiceState::new();
+        let local = PeerId::from_u128(2);
+        let host = PeerId::from_u128(1);
+        state.note_offer(local, offer(Fitness::Full, None));
+        state.note_offer(host, offer(Fitness::Full, None));
+        assert_eq!(state.placement().unwrap().host, host);
+        state.forget_peer(host);
+        assert_eq!(state.placement().unwrap().host, local);
     }
 
     /// The case the whole module exists for: a Mac that cannot bind 7000 asks,
@@ -636,6 +845,7 @@ mod tests {
             HostedBy {
                 peer: host,
                 addr: None,
+                quality: None,
             },
         );
         let mut tx = NullTx;
@@ -654,7 +864,7 @@ mod tests {
         let host = PeerId::new_v4();
         let (mut engine, state, _seen) = engine_for(true, true, host);
         let here: std::net::SocketAddr = "192.168.1.35:7000".parse().unwrap();
-        state.now_hosting(ServiceId::AIRPLAY, here);
+        state.now_hosting(ServiceId::AIRPLAY, here, None);
 
         // Both machines bound; the peer outranks us, so we yield to it.
         let peer_hosts = Message::module(
@@ -664,6 +874,7 @@ mod tests {
                 service: ServiceId::AIRPLAY,
                 hosting: true,
                 addr: Some("192.168.1.140:7000".parse().unwrap()),
+                quality: None,
             },
         )
         .unwrap();
@@ -696,6 +907,7 @@ mod tests {
             HostedBy {
                 peer: hosting_peer,
                 addr: Some("192.168.1.5:7000".parse().unwrap()),
+                quality: None,
             },
         );
 
@@ -707,12 +919,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn one_peer_saying_no_does_not_erase_another_peers_host_status() {
+        let hosting_peer = PeerId::from_u128(1);
+        let other_peer = PeerId::from_u128(2);
+        let (mut to_other, state, _seen) = engine_for(true, false, other_peer);
+        state.lock().hosted_elsewhere.insert(
+            ServiceId::AIRPLAY,
+            HostedBy {
+                peer: hosting_peer,
+                addr: Some("192.168.1.5:7000".parse().unwrap()),
+                quality: None,
+            },
+        );
+        let says_no = Message::module(
+            ModuleId::SERVICE,
+            Priority::Control,
+            &ServiceMsg::Status {
+                service: ServiceId::AIRPLAY,
+                hosting: false,
+                addr: None,
+                quality: None,
+            },
+        )
+        .unwrap();
+        assert!(to_other.handle_message(&says_no));
+        assert_eq!(
+            state.host_address(ServiceId::AIRPLAY),
+            Some("192.168.1.5:7000".parse().unwrap())
+        );
+    }
+
     /// The exchange the user described: ask first, answer with where.
     #[test]
     fn a_query_is_answered_with_where_the_duty_is_running() {
         let (mut engine, state, _seen) = engine(true);
         let here: std::net::SocketAddr = "192.168.1.35:7000".parse().unwrap();
-        state.now_hosting(ServiceId::AIRPLAY, here);
+        let quality = Some(Quality::new(1920, 1080, 60));
+        state.now_hosting(ServiceId::AIRPLAY, here, quality);
 
         let query = Message::module(
             ModuleId::SERVICE,
@@ -729,6 +973,7 @@ mod tests {
                 service: ServiceId::AIRPLAY,
                 hosting: true,
                 addr: Some(here),
+                quality,
             }]
         );
     }
@@ -748,13 +993,14 @@ mod tests {
                 service: ServiceId::AIRPLAY,
                 hosting: true,
                 addr: Some(theirs),
+                quality: None,
             },
         )
         .unwrap();
 
         // The higher-id side yields, which is the side that must.
         let (mut engine, state, _seen) = engine_ranked(true, true);
-        state.now_hosting(ServiceId::AIRPLAY, here);
+        state.now_hosting(ServiceId::AIRPLAY, here, None);
         assert!(engine.handle_message(&peer_says_yes));
         assert!(
             state.is_hosted_elsewhere(ServiceId::AIRPLAY),
@@ -763,7 +1009,7 @@ mod tests {
 
         // The lower-id side keeps it, from the very same message.
         let (mut engine, state, _seen) = engine_ranked(true, false);
-        state.now_hosting(ServiceId::AIRPLAY, here);
+        state.now_hosting(ServiceId::AIRPLAY, here, None);
         assert!(engine.handle_message(&peer_says_yes));
         assert!(
             !state.is_hosted_elsewhere(ServiceId::AIRPLAY),
@@ -785,6 +1031,7 @@ mod tests {
                     service: ServiceId::AIRPLAY,
                     hosting: true,
                     addr: None,
+                    quality: None,
                 },
             )
             .unwrap();
@@ -815,6 +1062,7 @@ mod tests {
                 service: ServiceId::AIRPLAY,
                 hosting: false,
                 addr: None,
+                quality: None,
             },
         )
         .unwrap();
@@ -843,6 +1091,7 @@ mod tests {
                 service: ServiceId::AIRPLAY,
                 hosting: false,
                 addr: None,
+                quality: None,
             }]
         );
     }
@@ -860,12 +1109,17 @@ mod tests {
                 service: ServiceId::AIRPLAY,
                 hosting: true,
                 addr: Some(there),
+                quality: Some(Quality::new(2560, 1440, 30)),
             },
         )
         .unwrap();
         engine.handle_message(&status);
         assert!(state.is_hosted_elsewhere(ServiceId::AIRPLAY));
         assert_eq!(state.host_address(ServiceId::AIRPLAY), Some(there));
+        assert_eq!(
+            state.host_quality(ServiceId::AIRPLAY),
+            Some(Quality::new(2560, 1440, 30))
+        );
     }
 
     /// The peer that used to host it saying "not me" is how this machine learns

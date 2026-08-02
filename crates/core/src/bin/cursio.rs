@@ -27,7 +27,7 @@ use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
 use cursio_core::session::{self};
 use cursio_core::NodeIdentity;
-use cursio_protocol::ServiceId;
+use cursio_protocol::{Fitness, Quality, ServiceId, ServiceOffer};
 use cursio_transport::discovery;
 use cursio_transport::discovery::DiscoveryConfig;
 use cursio_transport::pairing::{self, Role, TrustStore};
@@ -121,8 +121,8 @@ enum Command {
         /// cannot yet mount the peer's.
         #[arg(long, default_value_t = false)]
         files: bool,
-        /// Share whatever an iPhone mirrors to this machine with the mesh,
-        /// instead of one of this machine's own windows.
+        /// When this machine is the selected AirPlay host, offer the mirrored
+        /// screen to every peer instead of only peers using --airplay-window.
         ///
         /// The peer sees it as an ordinary transferred window: the H.264 from
         /// AirPlay is forwarded untouched, so nothing is re-encoded on the way.
@@ -136,17 +136,29 @@ enum Command {
         /// is refused before pairing can run.
         #[arg(long, default_value_t = false)]
         pair: bool,
-        /// What this machine does about AirPlay. Receiving is on by default.
+        /// What this machine asks of the mesh's AirPlay receiver. On by
+        /// default.
         ///
-        /// `control` — the default — answers an iPhone and takes part in the
-        /// mesh's choice of who holds the receiver, but shows no picture.
-        /// `screen` decodes the mirrored video and shows it, at 1080p60.
-        /// A profile in place of `screen` sets the size and rate: `1080p30`,
-        /// `1440p60`, `2k`. `off` steps out entirely — nothing is bound, and a
-        /// peer asking this machine to host is refused, so the mesh picks
-        /// another. With every machine `off`, AirPlay simply does not run.
-        #[arg(long, default_value = "control", value_name = "MODE")]
+        /// `on` — the default — takes part: this machine will hold the receiver
+        /// if the mesh picks it, with no request about quality. A profile in
+        /// its place asks the *mesh* for that quality — `1440p:30fps`,
+        /// `1080p60`, `2k` — and the receiver moves to whichever machine can deliver it,
+        /// which need not be this one. `off` steps out entirely: nothing is
+        /// bound, and a peer asking this machine to host is refused, so the
+        /// mesh picks another. Every machine `off` means AirPlay does not run.
+        ///
+        /// Where the picture *appears* is `--airplay-window`, not this.
+        #[arg(long, default_value = "on", value_name = "MODE")]
         airplay: String,
+        /// Show the mirrored iPhone screen on this machine.
+        ///
+        /// Separate from `--airplay` because they answer different questions:
+        /// that one is about the picture the mesh receives, this one about
+        /// which desk it appears on. A machine can hold the receiver and show
+        /// nothing — passing the stream to peers with `--share-airplay` — or
+        /// show a picture another machine is receiving.
+        #[arg(long, default_value_t = false)]
+        airplay_window: bool,
         /// AirPlay control port.
         #[arg(long, default_value_t = cursio_airplay::DEFAULT_CONTROL_PORT)]
         airplay_port: u16,
@@ -210,17 +222,63 @@ enum AirPlayMode {
     /// Do not take part: nothing is bound, nothing announced, and a peer's
     /// request to host is refused so it keeps looking.
     Off,
-    /// Answer an iPhone, but show no picture. Mirror `SETUP` returns 501.
-    Control,
-    /// Decode the mirrored screen and show it, at this profile.
-    Screen(VideoProfile),
+    /// Take part, asking the mesh for `wanted` if anything.
+    ///
+    /// The quality is a request made *of the mesh*, not a local setting: the
+    /// receiver runs at the best any node asked for, on whichever machine can
+    /// deliver it. A user asking for 1440p at their desk is asking for the
+    /// picture to be that, and does not care which box decodes it.
+    On { wanted: Option<Quality> },
 }
 
-/// The profile `--airplay screen` means without one spelled out.
+/// The rate a profile means when it names only a size.
 const DEFAULT_AIRPLAY_FPS: u16 = 60;
 
+/// What the receiver runs at when nobody asked for anything in particular.
+const DEFAULT_AIRPLAY_QUALITY: Quality = Quality::new(1920, 1080, DEFAULT_AIRPLAY_FPS);
+
+/// How well this machine could hold the mesh's AirPlay receiver.
+///
+/// Two honest signals and no third. Whether the user let it take part, and
+/// whether a hardware video decoder is installed — which the video module
+/// answers by asking GStreamer for the elements it would actually use, rather
+/// than by reading a GPU's name and guessing. A machine without one still
+/// makes a fine control receiver; it is simply not where a picture should be
+/// decoded, since this codebase refuses to fall back to software.
+fn local_airplay_fitness(mode: AirPlayMode, port: u16) -> Fitness {
+    if !mode.participates() {
+        return Fitness::No;
+    }
+    // Port availability is part of capability, not a failure discovered after
+    // election. Advertising a great decoder that cannot bind the receiver
+    // would make every node consistently choose a host that can never start.
+    if let Err(error) = std::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))) {
+        tracing::info!(
+            port,
+            %error,
+            "AirPlay port is unavailable here; this node will only request/view the mesh receiver"
+        );
+        return Fitness::No;
+    }
+    match cursio_airplay::video::dependency_warnings(cursio_airplay::video::VideoCodec::H264)
+        .is_empty()
+    {
+        true => Fitness::Full,
+        false => Fitness::ControlOnly,
+    }
+}
+
+/// Map the protocol's numeric quality back to one of the receiver profiles.
+fn resolution_for(quality: Quality) -> Resolution {
+    if quality.height > 1080 {
+        Resolution::Qhd
+    } else {
+        Resolution::FullHd
+    }
+}
+
 impl AirPlayMode {
-    /// Read `off`, `control`, `screen`, or a profile like `1080p30`.
+    /// Read `off`, `on`, or a profile like `1080p30`.
     fn parse(spec: &str) -> Result<Self, String> {
         let cleaned: String = spec
             .trim()
@@ -230,23 +288,30 @@ impl AirPlayMode {
             .collect();
         match cleaned.as_str() {
             "off" | "no" | "none" => return Ok(Self::Off),
-            "control" | "on" => return Ok(Self::Control),
+            "on" | "control" => return Ok(Self::On { wanted: None }),
+            // Named its own thing until the window became a flag of its own.
+            // Refused rather than quietly re-read as `on`, which would leave a
+            // user waiting for a picture that now needs asking for.
             "screen" => {
-                return Ok(Self::Screen(
-                    VideoProfile::new(Resolution::FullHd, DEFAULT_AIRPLAY_FPS)
-                        .expect("the default profile is in range"),
-                ))
+                return Err(
+                    "`screen` no longer decides where the picture appears — pass \
+                     --airplay-window on the machine it should appear on, and use --airplay \
+                     on (or a profile like 1080p60) here"
+                        .into(),
+                )
             }
             _ => {}
         }
-        parse_video_profile(&cleaned).map(Self::Screen)
+        parse_video_profile(&cleaned).map(|wanted| Self::On {
+            wanted: Some(wanted),
+        })
     }
 
-    /// Whether the mirrored picture is shown here.
-    fn screen(self) -> Option<VideoProfile> {
+    /// The quality this machine is asking the mesh for.
+    fn wanted(self) -> Option<Quality> {
         match self {
-            Self::Screen(profile) => Some(profile),
-            _ => None,
+            Self::On { wanted } => wanted,
+            Self::Off => None,
         }
     }
 
@@ -256,28 +321,29 @@ impl AirPlayMode {
     }
 }
 
-/// Parse `1080p30`, `1440p`, `2k60` into a profile.
+/// Parse `1080p30`, `1440p`, `2k60` into a quality.
 ///
 /// The rate may be separated by `:` or `@` or by nothing at all, because all
 /// three are how people write it and none is ambiguous. Omitted, it is
 /// [`DEFAULT_AIRPLAY_FPS`].
-fn parse_video_profile(spec: &str) -> Result<VideoProfile, String> {
+fn parse_video_profile(spec: &str) -> Result<Quality, String> {
     // Longest name first, so `1080p60` is not read as `1080` followed by the
     // nonsense `p60`.
-    const NAMES: &[(&str, Resolution)] = &[
-        ("1080p", Resolution::FullHd),
-        ("fullhd", Resolution::FullHd),
-        ("1080", Resolution::FullHd),
-        ("1440p", Resolution::Qhd),
-        ("1440", Resolution::Qhd),
-        ("qhd", Resolution::Qhd),
-        ("2k", Resolution::Qhd),
+    const NAMES: &[(&str, u16, u16)] = &[
+        ("1080p", 1920, 1080),
+        ("fullhd", 1920, 1080),
+        ("1080", 1920, 1080),
+        ("1440p", 2560, 1440),
+        ("1440", 2560, 1440),
+        ("qhd", 2560, 1440),
+        ("2k", 2560, 1440),
     ];
-    for &(name, resolution) in NAMES {
+    for &(name, width, height) in NAMES {
         let Some(rest) = spec.strip_prefix(name) else {
             continue;
         };
         let rest = rest.trim_start_matches([':', '@']);
+        let rest = rest.strip_suffix("fps").unwrap_or(rest);
         // Anything but digits after the size means this was not the name we
         // took it for — `1080i` is a resolution nobody here supports, not a
         // 1080p at a frame rate called `i`. Fall through and let the error at
@@ -291,7 +357,13 @@ fn parse_video_profile(spec: &str) -> Result<VideoProfile, String> {
                 .parse::<u16>()
                 .map_err(|_| format!("`{rest}` is not a frame rate"))?,
         };
-        return VideoProfile::new(resolution, fps).map_err(|e| e.to_string());
+        // The same bound the receiver's own profile enforces, checked here so
+        // a typo is refused by the flag rather than by a bind three steps
+        // later.
+        if !(1..=120).contains(&fps) {
+            return Err(format!("frame rate must be in 1..=120, got {fps}"));
+        }
+        return Ok(Quality::new(width, height, fps));
     }
     Err(format!(
         "`{spec}` is not one of off, control, screen, or a profile such as 1080p60, 1080p30, 2k30"
@@ -383,6 +455,7 @@ async fn main() -> anyhow::Result<()> {
             share_airplay,
             pair,
             airplay,
+            airplay_window,
             airplay_port,
             airplay_interface,
             mac_modifiers,
@@ -391,15 +464,29 @@ async fn main() -> anyhow::Result<()> {
             let airplay =
                 AirPlayMode::parse(&airplay).map_err(|e| anyhow::anyhow!("--airplay: {e}"))?;
             // Checked here rather than with clap's `requires`, which cannot see
-            // inside a value: sharing the phone's screen with peers presupposes
-            // decoding it, and silently sharing nothing would be worse than
-            // refusing to start.
-            if share_airplay && airplay.screen().is_none() {
+            // inside a value: a machine that took itself out of AirPlay has
+            // nothing to share, and starting anyway would leave peers waiting
+            // on a stream that never comes.
+            if (share_airplay || airplay_window) && !airplay.participates() {
                 anyhow::bail!(
-                    "--share-airplay needs a picture to share; pass --airplay screen (or a \
-                     profile such as --airplay 1080p60)"
+                    "--airplay off leaves nothing to show or share; drop it, or drop \
+                     --airplay-window/--share-airplay"
                 );
             }
+            // What this machine brings to the mesh's choice of host, and what
+            // it wants from it. Both travel in the greeting, so placement is
+            // settled the moment two machines meet.
+            let offer = ServiceOffer {
+                fitness: local_airplay_fitness(airplay, airplay_port),
+                wanted: airplay.wanted(),
+                show_window: airplay_window,
+            };
+            tracing::info!(
+                fitness = ?offer.fitness,
+                wanted = ?offer.wanted.map(|q| q.to_string()),
+                window = airplay_window,
+                "AirPlay: what this machine offers the mesh"
+            );
             // Read before anything binds a port, so a mistyped password costs
             // nothing and the prompt is not buried under startup logging.
             let pairing = if pair {
@@ -418,16 +505,13 @@ async fn main() -> anyhow::Result<()> {
             let service_reasons: Arc<
                 std::sync::Mutex<std::collections::HashMap<ServiceId, String>>,
             > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-            let airplay_claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            service_state.note_offer(identity.peer_id, offer);
 
-            // One tap feeds both the local window and every peer that asks
-            // for the phone's screen; without `--share-airplay` there is no
-            // tap at all and the receiver keeps the stream to itself.
-            let profile = airplay.screen();
-            let (width, height) = profile
-                .map_or(Resolution::FullHd, |p| p.resolution)
-                .dimensions();
-            let airplay_tap = share_airplay.then(cursio_airplay::MirrorTap::new);
+            // Every participating receiver has a tap. It is also the sink that
+            // lets a selected host accept mirroring without opening a local
+            // window; the window module subscribes only for peers that asked
+            // for one (or when --share-airplay explicitly asks for all peers).
+            let airplay_tap = airplay.participates().then(cursio_airplay::MirrorTap::new);
 
             // The CLI's only job for modules is to build the registry; from here
             // on nothing names a specific module.
@@ -439,16 +523,20 @@ async fn main() -> anyhow::Result<()> {
                 clipboard,
                 files,
                 WindowOpts {
-                    airplay: airplay_tap
-                        .clone()
-                        .map(|tap| (tap, u32::from(width), u32::from(height))),
+                    airplay: airplay_tap.clone().map(|tap| {
+                        cursio_core::window_session::AirPlayShare {
+                            tap,
+                            state: service_state.clone(),
+                            local: identity.peer_id,
+                            force: share_airplay,
+                        }
+                    }),
                 },
                 ServiceSetup {
                     state: service_state.clone(),
                     reasons: service_reasons.clone(),
                     make_host: {
-                        let claimed = airplay_claimed.clone();
-                        let port = airplay_port;
+                        let state = service_state.clone();
                         // `off` refuses rather than declining to answer. A peer
                         // that asked and heard nothing waits forever for a
                         // receiver; one that hears "no" asks the next machine.
@@ -459,8 +547,7 @@ async fn main() -> anyhow::Result<()> {
                             }),
                             true => Box::new(move || {
                                 Box::new(AirPlayHost {
-                                    port,
-                                    claimed: claimed.clone(),
+                                    state: state.clone(),
                                 })
                                     as Box<dyn cursio_core::service_session::ServiceHost>
                             }),
@@ -468,7 +555,15 @@ async fn main() -> anyhow::Result<()> {
                     },
                 },
             );
-            let mesh = run_mesh(identity.clone(), port, send_input, at, modules, pairing);
+            let mesh = run_mesh(
+                identity.clone(),
+                port,
+                send_input,
+                at,
+                modules,
+                pairing,
+                offer,
+            );
             if !airplay.participates() {
                 // Nothing bound and nothing announced, and the service module
                 // is refusing on this machine's behalf, so a peer that asks
@@ -477,71 +572,24 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("AirPlay is off on this machine");
                 mesh.await
             } else {
-                // Two questions, in order of cost. Is another cursio on *this*
-                // machine already announcing — which no peer can answer, since
-                // both processes are the same peer — and then, is another
-                // machine doing it.
+                // Is another cursio on *this* machine already announcing? No
+                // peer can answer that — both processes are the same peer — so
+                // a lock file settles it locally, before anything binds.
                 let airplay_lock = claim_local_airplay();
-                let announce = airplay_lock.is_some() && claims_airplay(&identity).await;
-                match bind_airplay(
-                    &identity,
-                    AirPlayOpts {
-                        announce,
+                run_airplay(
+                    AirPlayHosting {
+                        identity: identity.clone(),
                         port: airplay_port,
                         interface: airplay_interface,
-                        profile,
+                        show_window: airplay_window,
                         tap: airplay_tap,
+                        may_announce: airplay_lock.is_some(),
+                        state: service_state.clone(),
+                        reasons: service_reasons.clone(),
                     },
+                    mesh,
                 )
                 .await
-                {
-                    Ok(receiver) => {
-                        // Published before serving, so a peer's query is
-                        // answered from what is actually bound rather than from
-                        // what was asked for on the command line.
-                        if let Ok(addr) = receiver.local_addr() {
-                            let reachable = SocketAddr::new(
-                                discovery::guess_lan_ipv4()
-                                    .unwrap_or_else(|| IpAddr::from([127, 0, 0, 1])),
-                                addr.port(),
-                            );
-                            service_state.now_hosting(ServiceId::AIRPLAY, reachable);
-                        }
-                        // Whether this node belongs in a sender's list is not
-                        // settled at bind time: a peer only says it is already
-                        // hosting once a session is up. Watching the answer is
-                        // what finally removes the second `Cursio`.
-                        let follower = follow_airplay_answers(
-                            receiver.announcer(),
-                            service_state.clone(),
-                            airplay_lock.is_some(),
-                        );
-                        tokio::select! {
-                            result = mesh => result,
-                            result = receiver.serve() => result.map_err(Into::into),
-                            () = follower => Ok(()),
-                        }
-                    }
-                    // A busy port — macOS' own receiver holds 7000 — must not
-                    // take the mesh down, and must not end in silence either.
-                    // The machine says what it could not do, and every session
-                    // asks its peer to host it instead; the phone then mirrors
-                    // to that peer, which streams the picture back here through
-                    // the ordinary window path. Which machine holds the socket
-                    // stops being something the user has to know.
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "cannot host AirPlay here; asking a peer to host it for the mesh"
-                        );
-                        service_reasons
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .insert(ServiceId::AIRPLAY, error.to_string());
-                        service_state.needs_host(ServiceId::AIRPLAY);
-                        mesh.await
-                    }
-                }
             }
         }
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
@@ -555,7 +603,7 @@ struct WindowOpts {
     /// Set when this node shares whatever an iPhone mirrors to it. A window of
     /// this machine's own moves by being dragged across the peer-facing edge,
     /// which needs no flag — the drag is the request.
-    airplay: Option<(cursio_airplay::MirrorTap, u32, u32)>,
+    airplay: Option<cursio_core::window_session::AirPlayShare>,
 }
 
 /// What the service module needs, gathered so `module_registry` takes one
@@ -566,16 +614,9 @@ struct ServiceSetup {
     make_host: Box<dyn Fn() -> Box<dyn cursio_core::service_session::ServiceHost> + Send + Sync>,
 }
 
-/// Answers a peer's request to host AirPlay by actually binding the port.
-///
-/// Trying is the only honest answer: "can this machine hold 7000" has no
-/// cheaper test, and a node that said yes without checking would leave the
-/// asking machine believing a receiver exists.
+/// Answers a peer's request only when a hidden receiver is already bound.
 struct AirPlayHost {
-    port: u16,
-    /// Set when this machine has taken the duty on, so the receiver task is
-    /// started once rather than per request.
-    claimed: Arc<std::sync::atomic::AtomicBool>,
+    state: cursio_core::service_session::ServiceState,
 }
 
 impl cursio_core::service_session::ServiceHost for AirPlayHost {
@@ -583,22 +624,153 @@ impl cursio_core::service_session::ServiceHost for AirPlayHost {
         if service != ServiceId::AIRPLAY {
             return Err(format!("this machine does not host {service}"));
         }
-        if self.claimed.load(std::sync::atomic::Ordering::SeqCst) {
-            // Already ours, from an earlier peer's request. Saying yes again is
-            // correct: the duty is being carried.
+        if self.state.is_hosted_here(service) {
+            // `answer` records that this peer asked us; the placement watcher
+            // then announces the receiver that is already serving.
             return Ok(());
         }
-        // A blocking probe, deliberately: it is one syscall pair, and the
-        // answer must be true before the acceptance leaves this machine.
-        match std::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], self.port))) {
-            Ok(listener) => {
-                drop(listener);
-                self.claimed
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
+        Err("this machine has no bound AirPlay receiver to take over with".into())
+    }
+}
+
+/// Everything hosting the mesh's AirPlay receiver needs from the command line.
+struct AirPlayHosting {
+    identity: NodeIdentity,
+    port: u16,
+    interface: Option<IpAddr>,
+    /// Whether the mirrored picture appears on this machine.
+    show_window: bool,
+    /// Set when peers may watch the phone's screen through this node.
+    tap: Option<cursio_airplay::MirrorTap>,
+    /// False when another cursio on this machine holds the local claim — a
+    /// question no peer can answer, since both processes are the same peer.
+    may_announce: bool,
+    state: cursio_core::service_session::ServiceState,
+    reasons: Arc<std::sync::Mutex<std::collections::HashMap<ServiceId, String>>>,
+}
+
+/// Hold the receiver for as long as the mesh wants it here, rebuilding it when
+/// the agreed quality changes, until the mesh itself ends.
+///
+/// A loop rather than a single bind, because the quality is the *mesh's* and
+/// can change under this machine: a peer joining and asking for 1440p is a
+/// request this node has to honour if it is the one holding the receiver. The
+/// mesh future is pinned across iterations — it is the thing that must not be
+/// restarted, since dropping it would take every peer session with it.
+async fn run_airplay(
+    opts: AirPlayHosting,
+    mesh: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    tokio::pin!(mesh);
+    let mut running = local_airplay_placement(&opts.state, opts.identity.peer_id);
+    loop {
+        // Asked before every bind, not once: a peer that joined during the
+        // last receiver's life may have raised what the mesh wants.
+        let announce = opts.may_announce && running.selected;
+        let receiver = match bind_airplay(
+            &opts.identity,
+            AirPlayOpts {
+                announce,
+                port: opts.port,
+                interface: opts.interface,
+                quality: running.quality,
+                show_window: opts.show_window && running.selected,
+                tap: opts.tap.clone(),
+            },
+        )
+        .await
+        {
+            Ok(receiver) => receiver,
+            // A busy port — macOS' own receiver holds 7000 — must not take the
+            // mesh down, and must not end in silence either. The machine says
+            // what it could not do, and every session asks its peer to host it
+            // instead; the phone then mirrors to that peer, which streams the
+            // picture back here through the ordinary window path. Which machine
+            // holds the socket stops being something the user has to know.
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "cannot host AirPlay here; asking a peer to host it for the mesh"
+                );
+                opts.reasons
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(ServiceId::AIRPLAY, error.to_string());
+                opts.state.needs_host(ServiceId::AIRPLAY);
+                return mesh.await;
             }
-            Err(error) => Err(format!("port {} is not available here: {error}", self.port)),
+        };
+
+        // Published before serving, so a peer's query is answered from what is
+        // actually bound rather than from what was asked for on the command
+        // line.
+        if let Ok(addr) = receiver.local_addr() {
+            let reachable = SocketAddr::new(
+                discovery::guess_lan_ipv4().unwrap_or_else(|| IpAddr::from([127, 0, 0, 1])),
+                addr.port(),
+            );
+            opts.state
+                .now_hosting(ServiceId::AIRPLAY, reachable, running.quality);
         }
+
+        let follower = follow_airplay_answers(
+            receiver.announcer(),
+            opts.state.clone(),
+            opts.identity.peer_id,
+            opts.may_announce,
+        );
+        let wanted = tokio::select! {
+            result = &mut mesh => return result,
+            result = receiver.serve() => return result.map_err(Into::into),
+            wanted = follower => wanted,
+        };
+
+        // Only a change gets here, and rebuilding costs the viewer a second of
+        // black screen — so say why in the log, where a user watching it happen
+        // will look.
+        tracing::info!(
+            from = ?running.quality.map(|q| q.to_string()),
+            to = ?wanted.quality.map(|q| q.to_string()),
+            was_host = running.selected,
+            is_host = wanted.selected,
+            "the mesh changed AirPlay placement; restarting the receiver"
+        );
+        opts.state.no_longer_hosting(ServiceId::AIRPLAY);
+        running = wanted;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalAirPlayPlacement {
+    selected: bool,
+    quality: Option<Quality>,
+}
+
+/// What this machine should run from the mesh's deterministic placement.
+fn local_airplay_placement(
+    state: &cursio_core::service_session::ServiceState,
+    local: cursio_protocol::PeerId,
+) -> LocalAirPlayPlacement {
+    if state.was_asked_to_host(ServiceId::AIRPLAY) && state.is_hosted_here(ServiceId::AIRPLAY) {
+        return LocalAirPlayPlacement {
+            selected: true,
+            quality: Some(
+                state
+                    .placement()
+                    .and_then(|placement| placement.quality)
+                    .unwrap_or(DEFAULT_AIRPLAY_QUALITY),
+            ),
+        };
+    }
+    match state.placement() {
+        Some(placement) if placement.host == local => LocalAirPlayPlacement {
+            selected: true,
+            quality: Some(placement.quality.unwrap_or(DEFAULT_AIRPLAY_QUALITY)),
+        },
+        _ => LocalAirPlayPlacement {
+            selected: false,
+            quality: None,
+        },
     }
 }
 
@@ -612,38 +784,36 @@ impl cursio_core::service_session::ServiceHost for AirPlayHost {
 async fn follow_airplay_answers(
     announcer: cursio_airplay::Announcer,
     state: cursio_core::service_session::ServiceState,
+    local: cursio_protocol::PeerId,
     // Whether this process may announce at all. False when another cursio on
     // this machine holds the claim — a question no peer can answer, since both
     // processes are the same peer, so it has to be carried in rather than
     // rediscovered here.
     may_announce: bool,
-) {
+) -> LocalAirPlayPlacement {
     const POLL: Duration = Duration::from_secs(1);
+    let running = local_airplay_placement(&state, local);
     loop {
         tokio::time::sleep(POLL).await;
-        let elsewhere = state.is_hosted_elsewhere(ServiceId::AIRPLAY);
-        if elsewhere && announcer.is_announced() {
+        let wanted = local_airplay_placement(&state, local);
+        let should_announce = may_announce && wanted.selected;
+        if !should_announce && announcer.is_announced() {
             tracing::info!(
                 addr = ?state.host_address(ServiceId::AIRPLAY),
-                "a peer is hosting AirPlay for the mesh; standing down"
+                "the mesh selected another AirPlay host; standing down"
             );
             announcer.withdraw();
-        } else if may_announce
-            && !elsewhere
-            && state.has_been_answered(ServiceId::AIRPLAY)
-            && !announcer.is_announced()
-        {
-            // The peer that was hosting has gone, or said it stopped. Nobody is
-            // offering the mesh a receiver, so this node takes it back.
-            //
-            // `has_been_answered` is what keeps this from firing a second after
-            // startup: until some peer has spoken, "nobody hosts it" is
-            // indistinguishable from "nobody has said", and a node that
-            // correctly declined to announce would put the record straight back
-            // — two `Cursio` in the picker until the query round settled it.
+        } else if should_announce && !announcer.is_announced() {
             if let Err(error) = announcer.announce() {
-                tracing::warn!(%error, "could not take the AirPlay announcement back");
+                tracing::warn!(%error, "could not announce the selected AirPlay host");
             }
+        }
+
+        // A host change also rebuilds when the quality is the same: local
+        // window/tap behaviour belongs to the selected receiver, not merely to
+        // a numeric profile.
+        if wanted != running {
+            return wanted;
         }
     }
 }
@@ -654,9 +824,11 @@ struct AirPlayOpts {
     announce: bool,
     port: u16,
     interface: Option<IpAddr>,
-    /// The size and rate to show the mirrored screen at, or `None` for a
-    /// control-only receiver that answers an iPhone but shows nothing.
-    profile: Option<VideoProfile>,
+    /// What the mesh agreed the picture should be, or `None` for a
+    /// control-only receiver that answers an iPhone and decodes nothing.
+    quality: Option<Quality>,
+    /// Whether the picture appears on this machine.
+    show_window: bool,
     /// Set when peers should be able to watch the mirrored screen too.
     tap: Option<cursio_airplay::MirrorTap>,
 }
@@ -664,11 +836,9 @@ struct AirPlayOpts {
 async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::Result<Receiver> {
     // A control-only receiver still needs a profile to describe itself with in
     // `/info`; it simply never decodes anything.
-    let profile = match options.profile {
-        Some(profile) => profile,
-        None => VideoProfile::new(Resolution::FullHd, DEFAULT_AIRPLAY_FPS)?,
-    };
-    if options.profile.is_some() {
+    let quality = options.quality.unwrap_or(DEFAULT_AIRPLAY_QUALITY);
+    let profile = VideoProfile::new(resolution_for(quality), quality.fps)?;
+    if options.quality.is_some() {
         for warning in
             cursio_airplay::video::dependency_warnings(cursio_airplay::video::VideoCodec::H264)
         {
@@ -688,13 +858,14 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
         .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
     let mut receiver = Receiver::bind(config, discovery, crypto, options.announce)
         .await?
-        .with_screen_enabled(options.profile.is_some());
+        .with_screen_enabled(options.show_window);
     if let Some(tap) = options.tap {
         receiver = receiver.with_mirror_tap(tap);
     }
     tracing::info!(
         address = %receiver.local_addr()?,
-        screen = options.profile.is_some(),
+        screen = options.show_window,
+        quality = %quality,
         announced = options.announce,
         "mesh AirPlay RTSP receiver is available"
     );
@@ -753,69 +924,6 @@ fn take_lock(path: &std::path::Path) -> Option<std::fs::File> {
     }
 }
 
-/// Whether this node should be the one visible to an iPhone.
-///
-/// The lowest peer id wins — an arbitrary rule, but a *stable* one every node
-/// computes identically from the trust store without exchanging a message. A
-/// vote would need a protocol, a leader would need the mesh to have one, and
-/// both would need to survive the elected machine being switched off.
-///
-/// Which is the case this also handles: losing the election only stands us
-/// down if the winner is actually there. It is asked directly, over TCP at the
-/// address it was last reached at, because a machine that is off answers
-/// nothing and its record is exactly the one the phone must not be shown.
-async fn claims_airplay(identity: &NodeIdentity) -> bool {
-    let Ok(store) = TrustStore::load() else {
-        // No trust store is a machine with no peers, which makes it the only
-        // candidate by default.
-        return true;
-    };
-    let mut winner: Option<(cursio_protocol::PeerId, Option<SocketAddr>)> =
-        Some((identity.peer_id, None));
-    for peer in store.peers() {
-        if peer.peer_id < winner.expect("seeded above").0 {
-            winner = Some((peer.peer_id, peer.last_addr));
-        }
-    }
-    let (winner_id, winner_addr) = winner.expect("seeded above");
-    if winner_id == identity.peer_id {
-        return true;
-    }
-
-    let Some(addr) = winner_addr else {
-        tracing::info!(
-            peer = %winner_id,
-            "another node should host AirPlay but has never been reached; announcing here instead"
-        );
-        return true;
-    };
-    match tokio::time::timeout(AIRPLAY_ELECTION_PROBE, tokio::net::TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => {
-            tracing::info!(
-                peer = %winner_id,
-                %addr,
-                "another node is hosting AirPlay for the mesh; not announcing a second receiver"
-            );
-            false
-        }
-        _ => {
-            tracing::info!(
-                peer = %winner_id,
-                %addr,
-                "the node that would host AirPlay is not answering; announcing here instead"
-            );
-            true
-        }
-    }
-}
-
-/// How long to wait for the elected node before concluding it is not there.
-///
-/// Short on purpose: this runs before the receiver binds, so every millisecond
-/// is startup the user waits through. A machine on the same LAN answers a TCP
-/// connect in single-digit milliseconds or not at all.
-const AIRPLAY_ELECTION_PROBE: Duration = Duration::from_millis(700);
-
 fn read_pairing_password() -> anyhow::Result<Zeroizing<String>> {
     let password = Zeroizing::new(rpassword::prompt_password("Pairing password: ")?);
     if password.is_empty() {
@@ -861,13 +969,15 @@ fn module_registry(
         .with(Box::new(cursio_core::clipboard_session::ClipboardFactory {
             enabled: clipboard,
         }))
-        .with(Box::new(cursio_core::window_session::WindowFactory {
-            airplay: window.airplay,
-        }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,
             reasons: services.reasons,
             make_host: services.make_host,
+        }))
+        // Service goes before window so its per-peer offer is in shared state
+        // before the AirPlay window trigger makes a placement decision.
+        .with(Box::new(cursio_core::window_session::WindowFactory {
+            airplay: window.airplay,
         }));
 
     // File sharing needs a mount implementation: FUSE on Linux, WinFsp on
@@ -903,6 +1013,7 @@ async fn run_mesh(
     position: cursio_protocol::Position,
     modules: cursio_core::module::ModuleRegistry,
     pairing: PairingWindow,
+    offer: ServiceOffer,
 ) -> anyhow::Result<()> {
     let NodeBase {
         listener,
@@ -966,6 +1077,7 @@ async fn run_mesh(
                             capture.clone(),
                             position,
                             modules.clone(),
+                            offer,
                         );
                     }
 
@@ -1019,6 +1131,7 @@ async fn run_mesh(
                                 capture.clone(),
                                 position,
                                 modules.clone(),
+                                offer,
                             );
                         }
                     }
@@ -1035,10 +1148,6 @@ async fn run_mesh(
 /// connection, where the identity is only known after the handshake. Either way
 /// the peer ends up `Offline` when the session finishes, so the next sweep can
 /// reconnect it.
-// Still over clippy's threshold at 8: what remains is genuinely per-session
-// plumbing (transport, identity, role, registry, capture, edge), not module
-// configuration. The five module flags that used to be here are gone.
-#[allow(clippy::too_many_arguments)]
 /// How long `--pair` stays willing to meet a machine it has never seen.
 const PAIRING_WINDOW: Duration = Duration::from_secs(10 * 60);
 
@@ -1118,6 +1227,7 @@ fn spawn_peer_session(
     // by every session. `Rc` because sessions are deliberately single-threaded
     // (see the mesh module's threading note).
     modules: std::rc::Rc<cursio_core::module::ModuleRegistry>,
+    offer: ServiceOffer,
 ) {
     tokio::task::spawn_local(async move {
         if let Some(id) = expected {
@@ -1177,6 +1287,7 @@ fn spawn_peer_session(
             capture_for_session,
             position,
             &modules,
+            offer,
             Some(&mut on_identified),
         )
         .await;
@@ -1247,6 +1358,7 @@ async fn join(
         session::local_device_kind(),
         &[],
         cursio_protocol::Position::default(),
+        ServiceOffer::none(),
     )
     .await?;
     tracing::info!(peer = %peer.display_name, id = %peer.peer_id, "handshake ok");
@@ -1287,7 +1399,7 @@ use cursio_core::link::IdentifiedCallback;
 /// (freshly paired, or recovered from the trust store), we wrap the transport
 /// in [`EncryptedTransport`] so all subsequent traffic (heartbeats today; input
 /// and video later) is confidential and integrity-protected.
-// Down from 13 arguments to 9, and the rest are session plumbing rather than
+// Down from 13 arguments to 10, and the rest are session plumbing rather than
 // per-module knobs — a new module adds nothing here.
 #[allow(clippy::too_many_arguments)]
 async fn run_pairing_and_session(
@@ -1307,6 +1419,7 @@ async fn run_pairing_and_session(
     // what negotiation agreed on. Replaces the five per-module flags that used
     // to be threaded through here.
     modules: &cursio_core::module::ModuleRegistry,
+    offer: ServiceOffer,
     on_identified: Option<&mut IdentifiedCallback<'_>>,
 ) -> anyhow::Result<()> {
     // Handshake, pairing, Noise and module negotiation are the same five steps
@@ -1320,6 +1433,7 @@ async fn run_pairing_and_session(
             role,
             registry: modules,
             position,
+            service: offer,
             sends_input: capture.is_some(),
         },
         on_identified,
@@ -2087,25 +2201,27 @@ mod tests {
         else {
             unreachable!();
         };
-        assert_eq!(AirPlayMode::parse(&airplay).unwrap(), AirPlayMode::Control);
+        assert_eq!(
+            AirPlayMode::parse(&airplay).unwrap(),
+            AirPlayMode::On { wanted: None }
+        );
     }
 
     #[test]
-    fn the_mode_covers_off_control_and_screen() {
+    fn the_mode_separates_participation_from_the_window_flag() {
         assert_eq!(AirPlayMode::parse("off").unwrap(), AirPlayMode::Off);
         assert!(!AirPlayMode::parse("off").unwrap().participates());
-        assert_eq!(AirPlayMode::parse("control").unwrap(), AirPlayMode::Control);
-        assert!(AirPlayMode::parse("control").unwrap().screen().is_none());
         assert_eq!(
-            AirPlayMode::parse("screen").unwrap().screen(),
-            Some(VideoProfile::new(Resolution::FullHd, 60).unwrap())
+            AirPlayMode::parse("control").unwrap(),
+            AirPlayMode::On { wanted: None }
         );
+        assert!(AirPlayMode::parse("screen").is_err());
     }
 
     /// A profile in place of `screen` says both things at once, which is the
     /// whole reason `--res` and `--fps` stopped being separate flags.
     #[test]
-    fn a_profile_turns_the_screen_on_and_sets_it() {
+    fn a_profile_requests_mesh_quality_without_implying_a_window() {
         let cases = [
             ("1080p30", Resolution::FullHd, 30),
             ("1080p", Resolution::FullHd, 60),
@@ -2113,12 +2229,12 @@ mod tests {
             ("1440p24", Resolution::Qhd, 24),
         ];
         for (spec, resolution, fps) in cases {
-            let profile = AirPlayMode::parse(spec)
+            let quality = AirPlayMode::parse(spec)
                 .unwrap_or_else(|e| panic!("{spec}: {e}"))
-                .screen()
-                .unwrap_or_else(|| panic!("{spec} should show a picture"));
+                .wanted()
+                .unwrap_or_else(|| panic!("{spec} should request a quality"));
             assert_eq!(
-                (profile.resolution, profile.fps),
+                (resolution_for(quality), quality.fps),
                 (resolution, fps),
                 "{spec}"
             );
@@ -2129,9 +2245,9 @@ mod tests {
     /// write it and none of them is ambiguous.
     #[test]
     fn the_rate_may_be_separated_or_not() {
-        for spec in ["1080p30", "1080p:30", "1080p@30", "1080P-30"] {
-            let profile = AirPlayMode::parse(spec).unwrap().screen().unwrap();
-            assert_eq!(profile.fps, 30, "{spec}");
+        for spec in ["1080p30", "1080p:30", "1080p@30", "1080P-30", "1080p:30fps"] {
+            let quality = AirPlayMode::parse(spec).unwrap().wanted().unwrap();
+            assert_eq!(quality.fps, 30, "{spec}");
         }
     }
 

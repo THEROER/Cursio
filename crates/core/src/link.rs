@@ -47,7 +47,7 @@ pub const INPUT_VERSION: u16 = 1;
 
 /// What a node needs to know to bring a link up.
 ///
-/// A struct rather than eight arguments: every caller sets most of these the
+/// A struct rather than a positional argument list: every caller sets most of these the
 /// same way, and the ones that differ are the interesting ones.
 pub struct Handshake<'a> {
     pub identity: &'a NodeIdentity,
@@ -59,6 +59,8 @@ pub struct Handshake<'a> {
     pub registry: &'a ModuleRegistry,
     /// Where this machine stands in the user's layout.
     pub position: cursio_protocol::Position,
+    /// What this machine can carry for the mesh, and what it wants from it.
+    pub service: cursio_protocol::ServiceOffer,
     /// Whether this machine has input to send the peer.
     ///
     /// Follow the *capture*, not a command-line flag: capture is one
@@ -112,6 +114,7 @@ where
         session::local_device_kind(),
         &advertised,
         plan.position,
+        plan.service,
     )
     .await?;
     // Derived per link, not per process: four machines in a row each border a

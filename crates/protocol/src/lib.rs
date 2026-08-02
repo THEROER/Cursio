@@ -37,7 +37,7 @@ pub use files::{
 };
 pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
 pub use input::{neighbour_across, Edge, InputEvent, MouseButton, Position};
-pub use service::{ServiceId, ServiceMsg};
+pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{
     Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
     WindowMeta, WindowMsg,
@@ -55,8 +55,9 @@ pub use window::{
 /// clipboard. v12 introduced that split; v13 moved module traffic onto
 /// [`Message::Module`], which is what makes it real — a new module now adds no
 /// variant here at all. v14 added [`Hello::position`], which every node must
-/// read to work out which of its edges faces which peer.
-pub const PROTOCOL_VERSION: u16 = 14;
+/// read to work out which of its edges faces which peer. v15 added
+/// [`Hello::service`] so placement and quality are agreed across the mesh.
+pub const PROTOCOL_VERSION: u16 = 15;
 
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
@@ -226,6 +227,12 @@ pub struct Hello {
     /// Where this machine stands on the layout grid, so each side can work out
     /// which of its own edges faces the other. See [`Position`].
     pub position: Position,
+    /// What this node can carry for the mesh, and what it wants from it.
+    ///
+    /// In the greeting rather than asked for, because placing a duty has to be
+    /// settled the moment two machines meet: a round trip later is a window in
+    /// which both of them, or neither, are running it. See [`ServiceOffer`].
+    pub service: ServiceOffer,
 }
 
 impl Hello {
@@ -242,6 +249,7 @@ impl Hello {
             device_kind: DeviceKind::Desktop,
             modules: Vec::new(),
             position: Position::default(),
+            service: ServiceOffer::none(),
         }
     }
 }
@@ -401,6 +409,11 @@ mod tests {
                 ModuleAdvert::new(ModuleId::INPUT, 1, ModuleRole::Source),
             ],
             position: Position::new(1, 0),
+            service: ServiceOffer {
+                fitness: Fitness::Full,
+                wanted: Some(Quality::new(2560, 1440, 30)),
+                show_window: true,
+            },
         });
         let bytes = msg.to_bytes().unwrap();
         let back = Message::from_bytes(&bytes).unwrap();

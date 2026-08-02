@@ -17,9 +17,8 @@
 //! - **Viewer** — on an inbound offer, opens a [`Surrogate`]; blits inbound
 //!   frames into it, and pumps the surrogate's input and acks back to the host.
 //!
-//! Milestone 2 starts a capture only when explicitly asked (see
-//! [`WindowEngine::share_window`]); the drag-past-the-edge trigger that starts
-//! one automatically is milestone 5.
+//! Capture starts only after an explicit transfer request, normally a window
+//! crossing the peer-facing screen edge.
 
 use async_trait::async_trait;
 use cursio_protocol::{Message, ModuleId, Priority, WindowCloseReason, WindowId, WindowMsg};
@@ -122,9 +121,8 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
 
     /// Accept transfer requests from the drag trigger.
     ///
-    /// Optional: without this the engine only shares when told to directly
-    /// (the `--share-window` path), which is what happens on a machine with no
-    /// drag detection.
+    /// Optional: without this the engine only shares when told directly by its
+    /// caller.
     pub fn with_requests(
         mut self,
         requests: tokio::sync::mpsc::UnboundedReceiver<TransferRequest>,
@@ -136,8 +134,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
     /// Act on anything the drag trigger asked for since the last pump.
     ///
     /// Failures are logged, not propagated: a window that can't be captured
-    /// must not take the session down with it, exactly as on the `--share-window`
-    /// path.
+    /// must not take the session down with it.
     fn apply_requests(&mut self) {
         // Drain rather than take one: the trigger is latched per drag, so a
         // backlog here would mean stale requests acting on later drags.
@@ -464,7 +461,18 @@ pub struct WindowFactory {
     /// being dragged across the peer-facing edge — the drag is the request, and
     /// a flag that meant the same thing was a second way to say it that had to
     /// agree with the first.
-    pub airplay: Option<(cursio_airplay::MirrorTap, u32, u32)>,
+    pub airplay: Option<AirPlayShare>,
+}
+
+/// The receiver stream this node can offer through the window module.
+#[derive(Clone)]
+pub struct AirPlayShare {
+    pub tap: cursio_airplay::MirrorTap,
+    pub state: crate::service_session::ServiceState,
+    pub local: cursio_protocol::PeerId,
+    /// Preserve `--share-airplay`: offer to every peer, not only peers that
+    /// explicitly asked for a local AirPlay window.
+    pub force: bool,
 }
 
 /// Whether this build has a window-transfer backend at all.
@@ -488,24 +496,26 @@ impl crate::module::ModuleFactory for WindowFactory {
     /// that wants to send one.
     ///
     /// Negotiation is symmetric: a module runs only when both sides advertise
-    /// it. Gating this on `--share-window` therefore made the flag mean two
-    /// unrelated things — "offer my window" and "be willing to see yours" — and
-    /// a viewer that had not thought to pass it got no window, no prompt, and
-    /// no error, because nothing downstream ever ran. Receiving is passive and
-    /// costs an idle engine; offering stays the deliberate act.
+    /// it. Receiving is passive and costs an idle engine; offering stays the
+    /// deliberate act of dragging a window across an edge.
     fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
         SUPPORTED.then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::WINDOW, VERSION))
     }
 
     #[allow(unused_variables)]
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
+        if let Some(share) = &self.airplay {
+            share.state.note_offer(ctx.peer.peer_id, ctx.peer.service);
+        }
         #[cfg(target_os = "linux")]
         {
-            if let Some((tap, width, height)) = self.airplay.clone() {
+            if let Some(airplay) = self
+                .airplay
+                .clone()
+                .filter(|share| share.force || ctx.peer.service.show_window)
+            {
                 return Ok(Box::new(airplay_engine(
-                    tap,
-                    width,
-                    height,
+                    airplay,
                     cursio_window::GtkWindowRenderer,
                     ctx,
                 )));
@@ -523,11 +533,13 @@ impl crate::module::ModuleFactory for WindowFactory {
         }
         #[cfg(target_os = "windows")]
         {
-            if let Some((tap, width, height)) = self.airplay.clone() {
+            if let Some(airplay) = self
+                .airplay
+                .clone()
+                .filter(|share| share.force || ctx.peer.service.show_window)
+            {
                 return Ok(Box::new(airplay_engine(
-                    tap,
-                    width,
-                    height,
+                    airplay,
                     cursio_window::Win32WindowRenderer,
                     ctx,
                 )));
@@ -548,11 +560,13 @@ impl crate::module::ModuleFactory for WindowFactory {
         }
         #[cfg(target_os = "macos")]
         {
-            if let Some((tap, width, height)) = self.airplay.clone() {
+            if let Some(airplay) = self
+                .airplay
+                .clone()
+                .filter(|share| share.force || ctx.peer.service.show_window)
+            {
                 return Ok(Box::new(airplay_engine(
-                    tap,
-                    width,
-                    height,
+                    airplay,
                     cursio_window::MacWindowRenderer,
                     ctx,
                 )));
@@ -617,7 +631,7 @@ fn spawn_drag_trigger(
         if peer_edge.is_none() {
             tracing::info!(
                 "this peer borders no edge of this screen, so dragging a window off one does \
-                 nothing; window transfer still works with --share-window"
+                 nothing; configure distinct --at positions to enable window transfer"
             );
         }
         tracing::info!(
@@ -647,28 +661,58 @@ fn spawn_drag_trigger(
 
 /// Build an engine that hosts the mirrored iPhone screen.
 ///
-/// Sharing starts immediately rather than waiting for a drag: there is no
-/// window to drag, and the offer must already be out when the phone connects so
-/// the peer has a surrogate ready for the first frame. `begin` never fails, so
-/// there is no error to handle here.
+/// Sharing follows mesh placement rather than a drag: only the selected host
+/// offers a surrogate, and a host or quality change closes and recreates it.
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn airplay_engine<R: cursio_window::WindowRenderer>(
-    tap: cursio_airplay::MirrorTap,
-    width: u32,
-    height: u32,
+    share: AirPlayShare,
     renderer: R,
     ctx: &crate::module::SessionCtx,
 ) -> WindowEngine<crate::airplay_window::AirPlayWindowCapture, R> {
-    let mut engine = WindowEngine::new(
-        crate::airplay_window::AirPlayWindowCapture::new(tap, width, height),
+    let requests = spawn_airplay_trigger(share.state.clone(), share.local);
+    WindowEngine::new(
+        crate::airplay_window::AirPlayWindowCapture::for_mesh(share.tap, share.state),
         renderer,
         ctx.peer_name().to_string(),
-    );
-    match engine.share_window() {
-        Ok(id) => tracing::info!(id, peer = %ctx.peer_name(), "sharing the iPhone screen"),
-        Err(error) => tracing::error!(%error, "could not share the iPhone screen"),
-    }
-    engine
+    )
+    .with_requests(requests)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn spawn_airplay_trigger(
+    state: crate::service_session::ServiceState,
+    local: cursio_protocol::PeerId,
+) -> tokio::sync::mpsc::UnboundedReceiver<TransferRequest> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut last: Option<Option<cursio_protocol::Quality>> = None;
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            poll.tick().await;
+            let placement = state.placement();
+            let selected = placement.is_some_and(|placement| placement.host == local)
+                || (state.was_asked_to_host(cursio_protocol::ServiceId::AIRPLAY)
+                    && state.is_hosted_here(cursio_protocol::ServiceId::AIRPLAY));
+            let wanted = selected.then(|| placement.and_then(|placement| placement.quality));
+            if wanted == last {
+                continue;
+            }
+            if last.is_some() && tx.send(TransferRequest::BringBack).is_err() {
+                return;
+            }
+            if wanted.is_some()
+                && tx
+                    .send(TransferRequest::Send {
+                        title: "Cursio (iPhone)".into(),
+                    })
+                    .is_err()
+            {
+                return;
+            }
+            last = wanted;
+        }
+    });
+    rx
 }
 
 #[cfg(test)]
@@ -678,6 +722,47 @@ mod tests {
     use cursio_transport::QueueDepth;
     use cursio_window::{window_test_support::*, WindowError};
     use tokio::sync::mpsc;
+
+    fn airplay_offer(
+        fitness: cursio_protocol::Fitness,
+        wanted: Option<cursio_protocol::Quality>,
+    ) -> cursio_protocol::ServiceOffer {
+        cursio_protocol::ServiceOffer {
+            fitness,
+            wanted,
+            show_window: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn airplay_window_transfer_follows_host_and_quality_changes() {
+        let local = cursio_protocol::PeerId::from_u128(1);
+        let peer = cursio_protocol::PeerId::from_u128(2);
+        let state = crate::service_session::ServiceState::new();
+        state.note_offer(local, airplay_offer(cursio_protocol::Fitness::Full, None));
+        let mut requests = spawn_airplay_trigger(state.clone(), local);
+
+        assert!(matches!(
+            requests.recv().await,
+            Some(TransferRequest::Send { .. })
+        ));
+
+        state.note_offer(
+            peer,
+            airplay_offer(
+                cursio_protocol::Fitness::Full,
+                Some(cursio_protocol::Quality::new(2560, 1440, 30)),
+            ),
+        );
+        assert_eq!(requests.recv().await, Some(TransferRequest::BringBack));
+        assert!(matches!(
+            requests.recv().await,
+            Some(TransferRequest::Send { .. })
+        ));
+
+        state.note_offer(local, airplay_offer(cursio_protocol::Fitness::No, None));
+        assert_eq!(requests.recv().await, Some(TransferRequest::BringBack));
+    }
 
     /// Collects what the module sends, standing in for the transport.
     #[derive(Default)]
@@ -835,8 +920,8 @@ mod tests {
 
     #[tokio::test]
     async fn requests_are_ignored_without_a_trigger_attached() {
-        // The plain `--share-window` path has no request channel; the engine
-        // must pump normally rather than assume one exists.
+        // An engine without an external trigger must pump normally rather than
+        // assume one exists.
         let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
