@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let discovery = args
         .interface
         .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
-    let receiver = Receiver::bind_with_crypto(config, discovery, crypto)
+    let receiver = Receiver::bind(config, discovery, crypto, true)
         .await?
         .with_screen_enabled(true);
     let address = receiver.local_addr()?;

@@ -170,7 +170,7 @@ enum Command {
         #[arg(long, default_value = "control", value_name = "MODE")]
         airplay: String,
         /// AirPlay control port.
-        #[arg(long, default_value_t = 7000)]
+        #[arg(long, default_value_t = cursio_airplay::DEFAULT_CONTROL_PORT)]
         airplay_port: u16,
         /// Pin AirPlay mDNS to the LAN interface with this address.
         #[arg(long)]
@@ -727,12 +727,9 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     let discovery = options
         .interface
         .map_or_else(DiscoveryConfig::default, DiscoveryConfig::pinned_to);
-    let mut receiver = if options.announce {
-        Receiver::bind_with_crypto(config, discovery, crypto).await?
-    } else {
-        Receiver::bind_silently(config, discovery, crypto).await?
-    }
-    .with_screen_enabled(options.profile.is_some());
+    let mut receiver = Receiver::bind(config, discovery, crypto, options.announce)
+        .await?
+        .with_screen_enabled(options.profile.is_some());
     if let Some(tap) = options.tap {
         receiver = receiver.with_mirror_tap(tap);
     }

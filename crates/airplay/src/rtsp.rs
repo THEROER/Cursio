@@ -270,19 +270,16 @@ impl Response {
     }
 }
 
-/// Route the discovery and first-probe endpoints.
+/// Route what the media session did not claim.
 ///
-/// Pairing, FairPlay, and media setup explicitly return 501. This is important:
-/// acknowledging those stages before their cryptographic state machines exist
-/// would leave the sender and receiver in inconsistent states.
-pub fn route(request: &Request, receiver: &ReceiverConfig) -> Result<Response, AirPlayError> {
-    route_with_crypto(request, receiver, None)
-}
-
-pub(crate) fn route_with_crypto(
+/// Pairing and FairPlay go to the crypto session; media stages whose state
+/// machine does not exist here return 501 explicitly. That matters:
+/// acknowledging such a stage would leave the sender and receiver in
+/// inconsistent states, each believing the other had set something up.
+pub(crate) fn route(
     request: &Request,
     receiver: &ReceiverConfig,
-    crypto: Option<&mut dyn CryptoSession>,
+    crypto: &mut dyn CryptoSession,
 ) -> Result<Response, AirPlayError> {
     let target = request.target.split('?').next().unwrap_or(&request.target);
     if request.method.eq_ignore_ascii_case("OPTIONS") {
@@ -304,7 +301,7 @@ pub(crate) fn route_with_crypto(
         "/fp-setup" => Some(CryptoEndpoint::FairPlaySetup),
         _ => None,
     };
-    if let (Some(endpoint), Some(crypto)) = (crypto_endpoint, crypto) {
+    if let Some(endpoint) = crypto_endpoint {
         let body = crypto.handle(endpoint, &request.body)?;
         return Ok(Response::new(200, "OK").with_body("application/octet-stream", body));
     }
@@ -320,13 +317,9 @@ pub(crate) fn route_with_crypto(
             | "GET_PARAMETER"
             | "SET_PARAMETER"
     );
-    if crypto_endpoint.is_some() || media_endpoint || media_method {
-        let stage = if crypto_endpoint.is_some() {
-            "airplay-crypto-pending"
-        } else {
-            "airplay-media-pending"
-        };
-        return Ok(Response::new(501, "Not Implemented").with_header("X-Cursio-Stage", stage));
+    if media_endpoint || media_method {
+        return Ok(Response::new(501, "Not Implemented")
+            .with_header("X-Cursio-Stage", "airplay-media-pending"));
     }
 
     Ok(Response::new(404, "Not Found"))
@@ -507,6 +500,7 @@ mod tests {
                 body: Vec::new(),
             },
             &config(),
+            &mut TestCrypto { called: None },
         )
         .unwrap();
         assert_eq!(response.status, 200);
@@ -542,19 +536,22 @@ mod tests {
             headers: vec![("cseq".to_string(), "42".to_string())],
             body: Vec::new(),
         };
-        let response = route(&request, &config()).unwrap();
+        let response = route(&request, &config(), &mut TestCrypto { called: None }).unwrap();
         let encoded = response.encode(request.version, request.header("CSeq"));
         let text = std::str::from_utf8(&encoded).unwrap();
         assert!(text.contains("\r\nCSeq: 42\r\n"));
         assert!(text.ends_with("Content-Length: 0\r\n\r\n"));
     }
 
+    /// A media stage this build has no state machine for must be refused, not
+    /// acknowledged: a sender told "fine" sets up its half and waits for a
+    /// receiver that never comes.
     #[test]
-    fn unsupported_crypto_and_media_fail_closed() {
-        for (method, target, stage) in [
-            ("POST", "/pair-setup", "airplay-crypto-pending"),
-            ("POST", "/fp-setup", "airplay-crypto-pending"),
-            ("SETUP", "/stream", "airplay-media-pending"),
+    fn unimplemented_media_stages_fail_closed() {
+        for (method, target) in [
+            ("SETUP", "/stream"),
+            ("RECORD", "/stream"),
+            ("POST", "/audioMode"),
         ] {
             let response = route(
                 &Request {
@@ -565,16 +562,45 @@ mod tests {
                     body: Vec::new(),
                 },
                 &config(),
+                &mut TestCrypto { called: None },
             )
             .unwrap();
-            assert_eq!(response.status, 501);
+            assert_eq!(response.status, 501, "{method} {target}");
             assert_eq!(
                 response
                     .headers
                     .iter()
                     .find(|(key, _)| key == "X-Cursio-Stage")
                     .map(|(_, value)| value.as_str()),
-                Some(stage)
+                Some("airplay-media-pending")
+            );
+        }
+    }
+
+    /// Pairing and FairPlay reach the crypto session rather than a 501. They
+    /// used to be able to miss it — the receiver could be built without a
+    /// provider at all — and the stale "crypto-pending" answer is what a sender
+    /// saw when they did.
+    #[test]
+    fn pairing_endpoints_reach_the_crypto_session() {
+        for target in ["/pair-setup", "/pair-verify", "/fp-setup"] {
+            let mut crypto = TestCrypto { called: None };
+            let response = route(
+                &Request {
+                    method: "POST".to_string(),
+                    target: target.to_string(),
+                    version: Version::Rtsp10,
+                    headers: Vec::new(),
+                    body: b"challenge".to_vec(),
+                },
+                &config(),
+                &mut crypto,
+            )
+            .unwrap();
+            assert_eq!(response.status, 200, "{target}");
+            assert!(
+                crypto.called.is_some(),
+                "{target} never reached the session"
             );
         }
     }
@@ -610,7 +636,7 @@ mod tests {
             body: b"challenge".to_vec(),
         };
         let mut crypto = TestCrypto { called: None };
-        let response = route_with_crypto(&request, &config(), Some(&mut crypto)).unwrap();
+        let response = route(&request, &config(), &mut crypto).unwrap();
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"reply:challenge");
@@ -628,6 +654,7 @@ mod tests {
                 body: Vec::new(),
             },
             &config(),
+            &mut TestCrypto { called: None },
         )
         .unwrap();
         assert_eq!(response.status, 404);

@@ -89,18 +89,12 @@ impl MediaSession {
         &mut self,
         request: &Request,
         context: Option<ConnectionContext>,
-        crypto: Option<&mut dyn CryptoSession>,
+        crypto: &mut dyn CryptoSession,
     ) -> Result<Option<Response>, AirPlayError> {
         let target = request.target.split('?').next().unwrap_or(&request.target);
         if request.method.eq_ignore_ascii_case("SETUP") {
             let Some(context) = context else {
                 return Ok(Some(Response::new(500, "Internal Server Error")));
-            };
-            let Some(crypto) = crypto else {
-                return Ok(Some(Response::new(501, "Not Implemented").with_header(
-                    "X-Cursio-Stage",
-                    "airplay-crypto-provider-required",
-                )));
             };
             return self
                 .handle_setup(&request.body, context, crypto)
@@ -821,7 +815,7 @@ mod tests {
         };
         let mut media = MediaSession::new(false, None, test_volume(), test_screen_size());
         let response = media
-            .handle_request(&request, Some(context), Some(&mut TestCrypto))
+            .handle_request(&request, Some(context), &mut TestCrypto)
             .await
             .unwrap()
             .unwrap();
@@ -863,7 +857,7 @@ mod tests {
         };
         let mut media = MediaSession::new(false, None, test_volume(), test_screen_size());
         let response = media
-            .handle_request(&request, Some(context), Some(&mut TestCrypto))
+            .handle_request(&request, Some(context), &mut TestCrypto)
             .await
             .unwrap()
             .unwrap();
@@ -894,7 +888,7 @@ mod tests {
         media.encrypted_key = Some(vec![7; 72]);
 
         let response = media
-            .handle_request(&request, None, None)
+            .handle_request(&request, None, &mut TestCrypto)
             .await
             .unwrap()
             .unwrap();
@@ -954,7 +948,7 @@ mod tests {
         media.encrypted_key = Some(vec![7; 72]);
 
         let response = media
-            .handle_request(&request, None, None)
+            .handle_request(&request, None, &mut TestCrypto)
             .await
             .unwrap()
             .unwrap();
@@ -979,7 +973,7 @@ mod tests {
         };
         assert_eq!(
             media
-                .handle_request(&set, None, None)
+                .handle_request(&set, None, &mut TestCrypto)
                 .await
                 .unwrap()
                 .unwrap()
@@ -999,7 +993,7 @@ mod tests {
             body: b"volume\r\n".to_vec(),
         };
         let response = reconnected
-            .handle_request(&get, None, None)
+            .handle_request(&get, None, &mut TestCrypto)
             .await
             .unwrap()
             .unwrap();
@@ -1028,7 +1022,7 @@ mod tests {
         let mut media = MediaSession::new(false, None, test_volume(), test_screen_size());
         media.encrypted_key = Some(vec![7; 72]);
         let response = media
-            .handle_request(&request, None, None)
+            .handle_request(&request, None, &mut TestCrypto)
             .await
             .unwrap()
             .unwrap();

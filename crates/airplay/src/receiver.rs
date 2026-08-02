@@ -28,7 +28,7 @@ pub struct Receiver {
     /// so the record has to be withdrawable, and re-publishable when that peer
     /// goes away. Empty means bound but deliberately invisible.
     announcement: Announcer,
-    crypto: Option<Arc<dyn CryptoProvider>>,
+    crypto: Arc<dyn CryptoProvider>,
     screen_enabled: bool,
     tap: Option<crate::MirrorTap>,
     /// Survives the control connections that come and go, so a volume the user
@@ -41,39 +41,16 @@ impl Receiver {
     ///
     /// Binding first means callers may use port zero without publishing an
     /// unusable service record.
+    ///
+    /// `announce` is false for a node that lost the mesh's AirPlay election: it
+    /// must not appear in a sender's list, but it stays bound and ready, so
+    /// pointing at it directly — or taking over when the announcing node goes
+    /// away — needs no restart. A parameter rather than a second constructor,
+    /// because the caller already holds the answer as a `bool`.
     pub async fn bind(
         config: ReceiverConfig,
         discovery: DiscoveryConfig,
-    ) -> Result<Self, AirPlayError> {
-        Self::bind_inner(config, discovery, None, true).await
-    }
-
-    pub async fn bind_with_crypto(
-        config: ReceiverConfig,
-        discovery: DiscoveryConfig,
         crypto: Arc<dyn CryptoProvider>,
-    ) -> Result<Self, AirPlayError> {
-        Self::bind_inner(config, discovery, Some(crypto), true).await
-    }
-
-    /// Bind without publishing an mDNS record.
-    ///
-    /// For a node that lost the mesh's AirPlay election: it must not appear in
-    /// a sender's list, but it stays ready to serve so that pointing at it
-    /// directly — or taking over when the announcing node goes away — needs no
-    /// restart.
-    pub async fn bind_silently(
-        config: ReceiverConfig,
-        discovery: DiscoveryConfig,
-        crypto: Arc<dyn CryptoProvider>,
-    ) -> Result<Self, AirPlayError> {
-        Self::bind_inner(config, discovery, Some(crypto), false).await
-    }
-
-    async fn bind_inner(
-        config: ReceiverConfig,
-        discovery: DiscoveryConfig,
-        crypto: Option<Arc<dyn CryptoProvider>>,
         announce: bool,
     ) -> Result<Self, AirPlayError> {
         let listener = TcpListener::bind(config.bind_addr).await?;
@@ -131,15 +108,9 @@ impl Receiver {
         tracing::info!(
             address = %self.listener.local_addr()?,
             name = %self.config.name,
-            crypto = if self.crypto.is_some() { "configured" } else { "unavailable" },
             screen = if self.screen_enabled { "enabled" } else { "disabled" },
             "cursio_airplay receiver started"
         );
-        if self.crypto.is_none() {
-            tracing::warn!(
-                "AirPlay pairing and FairPlay are unavailable; this receiver currently supports discovery and /info probes only"
-            );
-        }
         loop {
             // A transient accept failure (descriptor exhaustion, an aborted
             // connection) must not retire the receiver for the lifetime of the
@@ -162,10 +133,7 @@ impl Receiver {
             };
             tracing::debug!(%peer, %local_addr, "AirPlay control connection accepted");
             let config = self.config.clone();
-            let crypto = self
-                .crypto
-                .as_ref()
-                .map(|provider| provider.start_session());
+            let crypto = self.crypto.start_session();
             let screen_enabled = self.screen_enabled;
             let tap = self.tap.clone();
             let volume = self.volume.clone();
@@ -216,7 +184,7 @@ fn is_notable(request: &rtsp::Request, status: u16) -> bool {
 async fn serve_connection<T>(
     mut stream: T,
     config: Arc<ReceiverConfig>,
-    mut crypto: Option<Box<dyn CryptoSession>>,
+    mut crypto: Box<dyn CryptoSession>,
     context: Option<ConnectionContext>,
     screen_enabled: bool,
     tap: Option<crate::MirrorTap>,
@@ -308,24 +276,12 @@ where
                     }
                 }
             }
-            let response = if let Some(response) = media
-                .handle_request(
-                    &request,
-                    context,
-                    crypto
-                        .as_mut()
-                        .map(|session| session.as_mut() as &mut dyn CryptoSession),
-                )
+            let response = match media
+                .handle_request(&request, context, crypto.as_mut())
                 .await?
             {
-                response
-            } else {
-                match crypto.as_mut() {
-                    Some(session) => {
-                        rtsp::route_with_crypto(&request, &config, Some(session.as_mut()))?
-                    }
-                    None => rtsp::route(&request, &config)?,
-                }
+                Some(response) => response,
+                None => rtsp::route(&request, &config, crypto.as_mut())?,
             };
             let encoded = response.encode(request.version, request.header("CSeq"));
             if is_notable(&request, response.status) {
@@ -375,7 +331,7 @@ mod tests {
         let task = tokio::spawn(serve_connection(
             server,
             config(),
-            None,
+            crate::crypto::AppleCryptoProvider::new().start_session(),
             None,
             false,
             None,
@@ -409,7 +365,7 @@ mod tests {
         let task = tokio::spawn(serve_connection(
             server,
             config(),
-            None,
+            crate::crypto::AppleCryptoProvider::new().start_session(),
             None,
             false,
             None,
@@ -455,7 +411,7 @@ mod tests {
         let task = tokio::spawn(serve_connection(
             server,
             config(),
-            None,
+            crate::crypto::AppleCryptoProvider::new().start_session(),
             None,
             false,
             None,

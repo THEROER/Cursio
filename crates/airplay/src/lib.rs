@@ -20,7 +20,9 @@ pub mod rtsp;
 mod tap;
 pub mod video;
 
-pub use config::{ConfigError, DeviceId, ReceiverConfig, Resolution, VideoProfile};
+pub use config::{
+    ConfigError, DeviceId, ReceiverConfig, Resolution, VideoProfile, DEFAULT_CONTROL_PORT,
+};
 pub use receiver::{Announcer, Receiver};
 pub use tap::{MirrorReader, MirrorTap, MirrorUnit};
 

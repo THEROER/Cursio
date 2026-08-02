@@ -8,9 +8,9 @@ use crate::discovery::LEGACY_RECEIVER_PUBLIC_KEY;
 /// Default port used by Apple TV receivers for the AirPlay control connection.
 pub const DEFAULT_CONTROL_PORT: u16 = 7000;
 /// Compatibility model advertised during the initial AirPlay probe.
-pub const DEFAULT_MODEL: &str = "AppleTV2,1";
+const DEFAULT_MODEL: &str = "AppleTV2,1";
 /// AirTunes source version advertised to clients.
-pub const DEFAULT_SOURCE_VERSION: &str = "220.68";
+const DEFAULT_SOURCE_VERSION: &str = "220.68";
 
 /// Stable six-byte identity shared by the AirPlay and RAOP announcements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,7 +22,7 @@ impl DeviceId {
     /// It is not claimed to be a physical interface address. Using the node's
     /// persisted UUID keeps the advertised receiver identity stable across
     /// restarts without colliding with a real NIC.
-    pub fn from_uuid(id: Uuid) -> Self {
+    fn from_uuid(id: Uuid) -> Self {
         let mut bytes = [0; 6];
         bytes.copy_from_slice(&id.as_bytes()[..6]);
         bytes[0] = (bytes[0] | 0x02) & 0xfe;
@@ -125,19 +125,6 @@ impl ReceiverConfig {
         self.pairing_public_key = public_key;
         self
     }
-
-    pub fn with_default_port(
-        name: impl Into<String>,
-        identity: Uuid,
-        profile: VideoProfile,
-    ) -> Result<Self, ConfigError> {
-        Self::new(
-            name,
-            identity,
-            SocketAddr::from(([0, 0, 0, 0], DEFAULT_CONTROL_PORT)),
-            profile,
-        )
-    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -187,7 +174,13 @@ mod tests {
     #[test]
     fn receiver_name_must_not_be_blank() {
         let profile = VideoProfile::new(Resolution::FullHd, 60).unwrap();
-        let error = ReceiverConfig::with_default_port("  ", Uuid::nil(), profile).unwrap_err();
+        let error = ReceiverConfig::new(
+            "  ",
+            Uuid::nil(),
+            SocketAddr::from(([0, 0, 0, 0], DEFAULT_CONTROL_PORT)),
+            profile,
+        )
+        .unwrap_err();
         assert_eq!(error, ConfigError::EmptyName);
     }
 }
