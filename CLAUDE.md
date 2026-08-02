@@ -29,7 +29,7 @@ Running:
 
 ```sh
 cargo run -p cursio-core -- join            # once per new machine, prompts for the password
-cargo run -p cursio-core -- mesh --airplay-screen
+cargo run -p cursio-core -- mesh --airplay screen
 cargo run -p cursio-core -- peers
 RUST_LOG=cursio_airplay=debug,info cargo run -p cursio-core -- mesh
 ```
@@ -186,9 +186,9 @@ The AES-CTR keystream is continuous for the life of a mirror data connection. Ev
 
 **One receiver per mesh, not per machine.** An iPhone is picking "my desktop", so every node advertising `Cursio - <hostname>` made the user choose between two answers to a question they did not ask. The name is plain `Cursio` and exactly one node announces it: the lowest peer id wins, which every node computes identically from the trust store without exchanging a message. Losing only stands a node down if the winner actually answers a TCP probe at its last known address — otherwise the elected machine being switched off would mean no AirPlay at all. A stood-down node still binds and serves, so pointing a sender at it directly works.
 
-`--airplay-screen` (alias `--airplay`) gates video; without it the control receiver still runs and mirror `SETUP` answers 501. `--no-airplay` disables the listener. A busy port 7000 (macOS' own receiver) logs a warning and leaves the mesh running.
+One flag, `--airplay <MODE>`, because the three states are mutually exclusive and were three booleans. `control` is the default — the receiver answers an iPhone and takes part in the choice of host, but shows nothing and answers mirror `SETUP` with 501. `screen` decodes and shows it; a profile in its place (`1080p30`, `2k`) sets size and rate too. `off` steps out entirely: nothing is bound, and the service module answers a peer's `Request` with `RefuseAll`, so the mesh looks elsewhere rather than waiting on a machine that will not answer. Every node `off` means AirPlay does not run, which is what asking for it means. The name in the picker is not settable: one mesh, one `Cursio`. A busy port 7000 (macOS' own receiver) logs a warning and leaves the mesh running.
 
-**Reaching the rest of the mesh** is `tap.rs` plus `core/src/airplay_window.rs`. The phone never becomes a peer — it has no identity, runs no modules, and is absent from the registry. Instead the receiving host offers its screen through the ordinary window-transfer path: AirPlay produces H.264 and `TileCodec::LossyVideo` already carries H.264, so access units go out untouched and the viewer decodes them with the surrogate it already has. The tap retains the last SPS/PPS and replays them to each new subscriber, because a machine that joins mid-stream would otherwise have nothing to configure a decoder with. `--share-airplay` (requires `--airplay-screen`) turns it on.
+**Reaching the rest of the mesh** is `tap.rs` plus `core/src/airplay_window.rs`. The phone never becomes a peer — it has no identity, runs no modules, and is absent from the registry. Instead the receiving host offers its screen through the ordinary window-transfer path: AirPlay produces H.264 and `TileCodec::LossyVideo` already carries H.264, so access units go out untouched and the viewer decodes them with the surrogate it already has. The tap retains the last SPS/PPS and replays them to each new subscriber, because a machine that joins mid-stream would otherwise have nothing to configure a decoder with. `--share-airplay` turns it on, and needs a picture to share — it is refused without `--airplay screen`.
 
 ### Wire compatibility
 

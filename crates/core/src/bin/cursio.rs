@@ -22,7 +22,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
 use cursio_core::session::{self};
@@ -148,7 +148,7 @@ enum Command {
         ///
         /// The peer sees it as an ordinary transferred window: the H.264 from
         /// AirPlay is forwarded untouched, so nothing is re-encoded on the way.
-        #[arg(long, default_value_t = false, requires = "airplay_screen")]
+        #[arg(long, default_value_t = false)]
         share_airplay: bool,
         /// Accept a first-time pairing from another machine for the next ten
         /// minutes, using a password read from the terminal.
@@ -158,30 +158,23 @@ enum Command {
         /// is refused before pairing can run.
         #[arg(long, default_value_t = false)]
         pair: bool,
-        /// Decode iPhone mirroring video and show it in a native window.
+        /// What this machine does about AirPlay. Receiving is on by default.
         ///
-        /// Without this flag the AirPlay RTSP control receiver still runs, but
-        /// it does not create a video decoder or screen window.
-        #[arg(long, visible_alias = "airplay", default_value_t = false)]
-        airplay_screen: bool,
-        /// Disable the AirPlay RTSP receiver completely.
-        #[arg(long, default_value_t = false, conflicts_with = "airplay_screen")]
-        no_airplay: bool,
-        /// Override the name shown in the iPhone Screen Mirroring picker.
-        #[arg(long)]
-        airplay_name: Option<String>,
+        /// `control` — the default — answers an iPhone and takes part in the
+        /// mesh's choice of who holds the receiver, but shows no picture.
+        /// `screen` decodes the mirrored video and shows it, at 1080p60.
+        /// A profile in place of `screen` sets the size and rate: `1080p30`,
+        /// `1440p60`, `2k`. `off` steps out entirely — nothing is bound, and a
+        /// peer asking this machine to host is refused, so the mesh picks
+        /// another. With every machine `off`, AirPlay simply does not run.
+        #[arg(long, default_value = "control", value_name = "MODE")]
+        airplay: String,
         /// AirPlay control port.
         #[arg(long, default_value_t = 7000)]
         airplay_port: u16,
         /// Pin AirPlay mDNS to the LAN interface with this address.
         #[arg(long)]
         airplay_interface: Option<IpAddr>,
-        /// Target AirPlay output resolution.
-        #[arg(long, value_enum, default_value_t = AirPlayResolutionArg::FullHd)]
-        res: AirPlayResolutionArg,
-        /// Target AirPlay output frame rate.
-        #[arg(long, default_value_t = 60)]
-        fps: u16,
         /// Where a peer's modifier keys land on this machine (macOS only).
         ///
         /// `positional` — the default — puts every key where the hardware says
@@ -228,21 +221,103 @@ fn parse_position(value: &str) -> Result<cursio_protocol::Position, String> {
     ))
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum AirPlayResolutionArg {
-    #[value(name = "1080p")]
-    FullHd,
-    #[value(name = "2k")]
-    Qhd,
+/// What `--airplay` was set to.
+///
+/// One value rather than the three booleans this used to be (`--airplay-screen`,
+/// its `--airplay` alias, and `--no-airplay`, two of which had to be declared as
+/// conflicting). There are three states and they are mutually exclusive, which
+/// is exactly what one value expresses and three flags do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AirPlayMode {
+    /// Do not take part: nothing is bound, nothing announced, and a peer's
+    /// request to host is refused so it keeps looking.
+    Off,
+    /// Answer an iPhone, but show no picture. Mirror `SETUP` returns 501.
+    Control,
+    /// Decode the mirrored screen and show it, at this profile.
+    Screen(VideoProfile),
 }
 
-impl From<AirPlayResolutionArg> for Resolution {
-    fn from(resolution: AirPlayResolutionArg) -> Self {
-        match resolution {
-            AirPlayResolutionArg::FullHd => Self::FullHd,
-            AirPlayResolutionArg::Qhd => Self::Qhd,
+/// The profile `--airplay screen` means without one spelled out.
+const DEFAULT_AIRPLAY_FPS: u16 = 60;
+
+impl AirPlayMode {
+    /// Read `off`, `control`, `screen`, or a profile like `1080p30`.
+    fn parse(spec: &str) -> Result<Self, String> {
+        let cleaned: String = spec
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| !matches!(c, '-' | '_' | ' '))
+            .collect();
+        match cleaned.as_str() {
+            "off" | "no" | "none" => return Ok(Self::Off),
+            "control" | "on" => return Ok(Self::Control),
+            "screen" => {
+                return Ok(Self::Screen(
+                    VideoProfile::new(Resolution::FullHd, DEFAULT_AIRPLAY_FPS)
+                        .expect("the default profile is in range"),
+                ))
+            }
+            _ => {}
+        }
+        parse_video_profile(&cleaned).map(Self::Screen)
+    }
+
+    /// Whether the mirrored picture is shown here.
+    fn screen(self) -> Option<VideoProfile> {
+        match self {
+            Self::Screen(profile) => Some(profile),
+            _ => None,
         }
     }
+
+    /// Whether this machine takes part in AirPlay at all.
+    fn participates(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// Parse `1080p30`, `1440p`, `2k60` into a profile.
+///
+/// The rate may be separated by `:` or `@` or by nothing at all, because all
+/// three are how people write it and none is ambiguous. Omitted, it is
+/// [`DEFAULT_AIRPLAY_FPS`].
+fn parse_video_profile(spec: &str) -> Result<VideoProfile, String> {
+    // Longest name first, so `1080p60` is not read as `1080` followed by the
+    // nonsense `p60`.
+    const NAMES: &[(&str, Resolution)] = &[
+        ("1080p", Resolution::FullHd),
+        ("fullhd", Resolution::FullHd),
+        ("1080", Resolution::FullHd),
+        ("1440p", Resolution::Qhd),
+        ("1440", Resolution::Qhd),
+        ("qhd", Resolution::Qhd),
+        ("2k", Resolution::Qhd),
+    ];
+    for &(name, resolution) in NAMES {
+        let Some(rest) = spec.strip_prefix(name) else {
+            continue;
+        };
+        let rest = rest.trim_start_matches([':', '@']);
+        // Anything but digits after the size means this was not the name we
+        // took it for — `1080i` is a resolution nobody here supports, not a
+        // 1080p at a frame rate called `i`. Fall through and let the error at
+        // the end list what is actually accepted.
+        if !rest.is_empty() && !rest.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let fps = match rest.is_empty() {
+            true => DEFAULT_AIRPLAY_FPS,
+            false => rest
+                .parse::<u16>()
+                .map_err(|_| format!("`{rest}` is not a frame rate"))?,
+        };
+        return VideoProfile::new(resolution, fps).map_err(|e| e.to_string());
+    }
+    Err(format!(
+        "`{spec}` is not one of off, control, screen, or a profile such as 1080p60, 1080p30, 2k30"
+    ))
 }
 
 /// Read `--mac-modifiers` and hand it to the keymap, or refuse to start.
@@ -332,16 +407,24 @@ async fn main() -> anyhow::Result<()> {
             keep_window_visible,
             share_airplay,
             pair,
-            airplay_screen,
-            no_airplay,
-            airplay_name,
+            airplay,
             airplay_port,
             airplay_interface,
-            res,
-            fps,
             mac_modifiers,
         } => {
             apply_modifier_map(&mac_modifiers)?;
+            let airplay =
+                AirPlayMode::parse(&airplay).map_err(|e| anyhow::anyhow!("--airplay: {e}"))?;
+            // Checked here rather than with clap's `requires`, which cannot see
+            // inside a value: sharing the phone's screen with peers presupposes
+            // decoding it, and silently sharing nothing would be worse than
+            // refusing to start.
+            if share_airplay && airplay.screen().is_none() {
+                anyhow::bail!(
+                    "--share-airplay needs a picture to share; pass --airplay screen (or a \
+                     profile such as --airplay 1080p60)"
+                );
+            }
             // Read before anything binds a port, so a mistyped password costs
             // nothing and the prompt is not buried under startup logging.
             let pairing = if pair {
@@ -365,7 +448,10 @@ async fn main() -> anyhow::Result<()> {
             // One tap feeds both the local window and every peer that asks
             // for the phone's screen; without `--share-airplay` there is no
             // tap at all and the receiver keeps the stream to itself.
-            let (width, height) = Resolution::from(res).dimensions();
+            let profile = airplay.screen();
+            let (width, height) = profile
+                .map_or(Resolution::FullHd, |p| p.resolution)
+                .dimensions();
             let airplay_tap = share_airplay.then(cursio_airplay::MirrorTap::new);
 
             // The CLI's only job for modules is to build the registry; from here
@@ -391,38 +477,47 @@ async fn main() -> anyhow::Result<()> {
                     make_host: {
                         let claimed = airplay_claimed.clone();
                         let port = airplay_port;
-                        Box::new(move || {
-                            Box::new(AirPlayHost {
-                                port,
-                                claimed: claimed.clone(),
-                            })
-                        })
+                        // `off` refuses rather than declining to answer. A peer
+                        // that asked and heard nothing waits forever for a
+                        // receiver; one that hears "no" asks the next machine.
+                        match airplay.participates() {
+                            false => Box::new(|| {
+                                Box::new(cursio_core::service_session::RefuseAll)
+                                    as Box<dyn cursio_core::service_session::ServiceHost>
+                            }),
+                            true => Box::new(move || {
+                                Box::new(AirPlayHost {
+                                    port,
+                                    claimed: claimed.clone(),
+                                })
+                                    as Box<dyn cursio_core::service_session::ServiceHost>
+                            }),
+                        }
                     },
                 },
             );
             let mesh = run_mesh(identity.clone(), port, send_input, at, modules, pairing);
-            if no_airplay {
+            if !airplay.participates() {
+                // Nothing bound and nothing announced, and the service module
+                // is refusing on this machine's behalf, so a peer that asks
+                // learns to look elsewhere. With every machine here, AirPlay
+                // does not run at all — which is what asking for it means.
+                tracing::info!("AirPlay is off on this machine");
                 mesh.await
             } else {
                 // Two questions, in order of cost. Is another cursio on *this*
                 // machine already announcing — which no peer can answer, since
                 // both processes are the same peer — and then, is another
-                // machine doing it. An explicit `--airplay-name` overrides only
-                // the second: a name the user chose does not make a duplicate
-                // on one machine any less of a duplicate.
+                // machine doing it.
                 let airplay_lock = claim_local_airplay();
-                let announce = airplay_lock.is_some()
-                    && (airplay_name.is_some() || claims_airplay(&identity).await);
+                let announce = airplay_lock.is_some() && claims_airplay(&identity).await;
                 match bind_airplay(
                     &identity,
                     AirPlayOpts {
                         announce,
-                        name: airplay_name,
                         port: airplay_port,
                         interface: airplay_interface,
-                        resolution: res,
-                        fps,
-                        screen_enabled: airplay_screen,
+                        profile,
                         tap: airplay_tap,
                     },
                 )
@@ -587,19 +682,23 @@ struct AirPlayOpts {
     /// Whether to put this receiver in an iPhone's picker. False on every node
     /// but the one that won the election; see [`claims_airplay`].
     announce: bool,
-    name: Option<String>,
     port: u16,
     interface: Option<IpAddr>,
-    resolution: AirPlayResolutionArg,
-    fps: u16,
-    screen_enabled: bool,
+    /// The size and rate to show the mirrored screen at, or `None` for a
+    /// control-only receiver that answers an iPhone but shows nothing.
+    profile: Option<VideoProfile>,
     /// Set when peers should be able to watch the mirrored screen too.
     tap: Option<cursio_airplay::MirrorTap>,
 }
 
 async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::Result<Receiver> {
-    let profile = VideoProfile::new(options.resolution.into(), options.fps)?;
-    if options.screen_enabled {
+    // A control-only receiver still needs a profile to describe itself with in
+    // `/info`; it simply never decodes anything.
+    let profile = match options.profile {
+        Some(profile) => profile,
+        None => VideoProfile::new(Resolution::FullHd, DEFAULT_AIRPLAY_FPS)?,
+    };
+    if options.profile.is_some() {
         let hardware = cursio_airplay::hardware::HardwareInfo::detect();
         for gpu in &hardware.gpus {
             let vram = gpu
@@ -619,9 +718,7 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     }
     let crypto = Arc::new(AppleCryptoProvider::new());
     let config = ReceiverConfig::new(
-        options
-            .name
-            .unwrap_or_else(|| AIRPLAY_RECEIVER_NAME.to_string()),
+        AIRPLAY_RECEIVER_NAME,
         identity.peer_id,
         SocketAddr::from(([0, 0, 0, 0], options.port)),
         profile,
@@ -635,13 +732,13 @@ async fn bind_airplay(identity: &NodeIdentity, options: AirPlayOpts) -> anyhow::
     } else {
         Receiver::bind_silently(config, discovery, crypto).await?
     }
-    .with_screen_enabled(options.screen_enabled);
+    .with_screen_enabled(options.profile.is_some());
     if let Some(tap) = options.tap {
         receiver = receiver.with_mirror_tap(tap);
     }
     tracing::info!(
         address = %receiver.local_addr()?,
-        screen = options.screen_enabled,
+        screen = options.profile.is_some(),
         announced = options.announce,
         "mesh AirPlay RTSP receiver is available"
     );
@@ -2049,32 +2146,70 @@ mod tests {
         assert!(Cli::try_parse_from(["cursio", "mesh", "--at", "a,0"]).is_err());
     }
 
+    /// Receiving is on by default: a user who wants an iPhone to find this
+    /// machine should not have to know a flag exists.
     #[test]
-    fn airplay_screen_is_enabled_only_by_its_flag() {
-        let Command::Mesh { airplay_screen, .. } =
+    fn airplay_receives_without_being_asked_to() {
+        let Command::Mesh { airplay, .. } =
             Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
         else {
             unreachable!();
         };
-        assert!(!airplay_screen);
+        assert_eq!(AirPlayMode::parse(&airplay).unwrap(), AirPlayMode::Control);
+    }
 
-        let Command::Mesh { airplay_screen, .. } =
-            Cli::try_parse_from(["cursio", "mesh", "--airplay-screen"])
-                .unwrap()
-                .command
-        else {
-            unreachable!();
-        };
-        assert!(airplay_screen);
+    #[test]
+    fn the_mode_covers_off_control_and_screen() {
+        assert_eq!(AirPlayMode::parse("off").unwrap(), AirPlayMode::Off);
+        assert!(!AirPlayMode::parse("off").unwrap().participates());
+        assert_eq!(AirPlayMode::parse("control").unwrap(), AirPlayMode::Control);
+        assert!(AirPlayMode::parse("control").unwrap().screen().is_none());
+        assert_eq!(
+            AirPlayMode::parse("screen").unwrap().screen(),
+            Some(VideoProfile::new(Resolution::FullHd, 60).unwrap())
+        );
+    }
 
-        let Command::Mesh { airplay_screen, .. } =
-            Cli::try_parse_from(["cursio", "mesh", "--airplay"])
-                .unwrap()
-                .command
-        else {
-            unreachable!();
-        };
-        assert!(airplay_screen);
+    /// A profile in place of `screen` says both things at once, which is the
+    /// whole reason `--res` and `--fps` stopped being separate flags.
+    #[test]
+    fn a_profile_turns_the_screen_on_and_sets_it() {
+        let cases = [
+            ("1080p30", Resolution::FullHd, 30),
+            ("1080p", Resolution::FullHd, 60),
+            ("2k", Resolution::Qhd, 60),
+            ("1440p24", Resolution::Qhd, 24),
+        ];
+        for (spec, resolution, fps) in cases {
+            let profile = AirPlayMode::parse(spec)
+                .unwrap_or_else(|e| panic!("{spec}: {e}"))
+                .screen()
+                .unwrap_or_else(|| panic!("{spec} should show a picture"));
+            assert_eq!(
+                (profile.resolution, profile.fps),
+                (resolution, fps),
+                "{spec}"
+            );
+        }
+    }
+
+    /// Three ways of writing the same thing, because all three are how people
+    /// write it and none of them is ambiguous.
+    #[test]
+    fn the_rate_may_be_separated_or_not() {
+        for spec in ["1080p30", "1080p:30", "1080p@30", "1080P-30"] {
+            let profile = AirPlayMode::parse(spec).unwrap().screen().unwrap();
+            assert_eq!(profile.fps, 30, "{spec}");
+        }
+    }
+
+    #[test]
+    fn a_mode_that_is_not_a_mode_names_what_it_could_be() {
+        let error = AirPlayMode::parse("1080i").unwrap_err();
+        assert!(error.contains("1080p60"), "{error}");
+        assert!(error.contains("off"), "{error}");
+        // Out of range is the profile's own complaint, not this one.
+        assert!(AirPlayMode::parse("1080p999").is_err());
     }
 
     /// The phone is picking "my desktop", not a machine. A name carrying the
