@@ -1895,7 +1895,7 @@ async fn start_node(
 
     // Announce ourselves so other nodes can find us. Pin mDNS to the real LAN
     // interface so VPN/virtual interfaces don't break it.
-    let instance = sanitize_instance(&identity.display_name);
+    let instance = discovery::mdns_label(&identity.display_name, "cursio-node");
     let announcement = discovery::announce_with(
         identity.peer_id,
         &identity.display_name,
@@ -2022,25 +2022,6 @@ async fn list_peers(identity: NodeIdentity, timeout_secs: u64) -> anyhow::Result
     }
     tracing::info!("done; {found} peer(s) found");
     Ok(())
-}
-
-/// mDNS instance names must be simple; strip anything awkward from the hostname.
-fn sanitize_instance(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "cursio-node".into()
-    } else {
-        cleaned
-    }
 }
 
 #[cfg(test)]

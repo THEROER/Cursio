@@ -121,7 +121,10 @@ fn service_infos(
     pinned_addr: Option<IpAddr>,
 ) -> Result<[ServiceInfo; 2], AirPlayError> {
     let instance = receiver.name.trim();
-    let host = format!("{}.local.", host_label(instance));
+    let host = format!(
+        "{}.local.",
+        cursio_transport::discovery::mdns_label(instance, "cursio-airplay")
+    );
     let device_id = receiver.device_id.to_string();
     let identity = receiver.identity.to_string();
     let pairing_public_key = receiver
@@ -205,28 +208,6 @@ fn new_service(
     service.map_err(|error| AirPlayError::Mdns(error.to_string()))
 }
 
-fn host_label(name: &str) -> String {
-    let label: String = name
-        .chars()
-        .filter_map(|character| {
-            if character.is_ascii_alphanumeric() || character == '-' {
-                Some(character)
-            } else if character.is_whitespace() || character == '_' {
-                Some('-')
-            } else {
-                None
-            }
-        })
-        .take(48)
-        .collect();
-    let label = label.trim_matches('-');
-    if label.is_empty() {
-        "cursio-airplay".to_string()
-    } else {
-        label.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +277,11 @@ mod tests {
 
     #[test]
     fn host_label_is_safe_and_has_a_fallback() {
-        assert_eq!(host_label("Living Room_1"), "Living-Room-1");
-        assert_eq!(host_label("💻"), "cursio-airplay");
+        use cursio_transport::discovery::mdns_label;
+        assert_eq!(
+            mdns_label("Living Room_1", "cursio-airplay"),
+            "Living-Room-1"
+        );
+        assert_eq!(mdns_label("💻", "cursio-airplay"), "cursio-airplay");
     }
 }
