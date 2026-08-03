@@ -89,6 +89,14 @@ pub struct WindowEngine<C: WindowCapture, R: WindowRenderer> {
     /// own task while the engine is owned by the session loop; this hands the
     /// request over without sharing the engine behind a lock.
     requests: Option<tokio::sync::mpsc::UnboundedReceiver<TransferRequest>>,
+    /// Tells the drag trigger a transfer ended without being dragged back.
+    ///
+    /// The trigger latches "a window is over there" so that the next drag
+    /// across the edge is read as a return. Every other way a transfer can end
+    /// — the peer closing the surrogate, the real window going away — leaves
+    /// that latch set, and the next window dragged at the edge is then taken
+    /// for a return of something already home and silently dropped.
+    transfer_ended: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// A transfer asked for from outside the session loop.
@@ -116,6 +124,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             pending_close: None,
             peer_name,
             requests: None,
+            transfer_ended: None,
         }
     }
 
@@ -129,6 +138,19 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
     ) -> Self {
         self.requests = Some(requests);
         self
+    }
+
+    /// Report back to the drag trigger when a transfer ends by any other route.
+    pub fn with_transfer_ended(mut self, ended: tokio::sync::mpsc::UnboundedSender<()>) -> Self {
+        self.transfer_ended = Some(ended);
+        self
+    }
+
+    /// A transfer this machine was hosting is over, and no drag said so.
+    fn note_transfer_ended(&self) {
+        if let Some(tx) = &self.transfer_ended {
+            let _ = tx.send(());
+        }
     }
 
     /// Act on anything the drag trigger asked for since the last pump.
@@ -266,6 +288,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                         s.close(reason);
                     }
                     self.offer_sent = false;
+                    self.note_transfer_ended();
                 }
             }
         }
@@ -293,6 +316,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                     let id = session.meta().id;
                     self.hosted = None;
                     self.offer_sent = false;
+                    self.note_transfer_ended();
                     send_control(
                         tx,
                         WindowMsg::Close {
@@ -528,12 +552,14 @@ impl crate::module::ModuleFactory for WindowFactory {
             // On Linux the portal runs its own window picker, so there is no
             // title to match and no window of ours to hide — both options are
             // Windows-only and deliberately ignored here.
+            let (requests, ended) = spawn_drag_trigger(ctx.peer_edge);
             let engine = WindowEngine::new(
                 cursio_window::PortalWindowCapture,
                 cursio_window::GtkWindowRenderer,
                 ctx.peer_name().to_string(),
             )
-            .with_requests(spawn_drag_trigger(ctx.peer_edge));
+            .with_requests(requests)
+            .with_transfer_ended(ended);
             Ok(Box::new(engine))
         }
         #[cfg(target_os = "windows")]
@@ -552,6 +578,7 @@ impl crate::module::ModuleFactory for WindowFactory {
             // Hiding the source is what makes a transfer feel like the window
             // moved rather than been copied; the drag that started it is the
             // user saying they want it over there.
+            let (requests, ended) = spawn_drag_trigger(ctx.peer_edge);
             let engine = WindowEngine::new(
                 cursio_window::WgcWindowCapture {
                     title_hint: String::new(),
@@ -560,7 +587,8 @@ impl crate::module::ModuleFactory for WindowFactory {
                 cursio_window::Win32WindowRenderer,
                 ctx.peer_name().to_string(),
             )
-            .with_requests(spawn_drag_trigger(ctx.peer_edge));
+            .with_requests(requests)
+            .with_transfer_ended(ended);
             Ok(Box::new(engine))
         }
         #[cfg(target_os = "macos")]
@@ -576,12 +604,14 @@ impl crate::module::ModuleFactory for WindowFactory {
                     ctx,
                 )));
             }
+            let (requests, ended) = spawn_drag_trigger(ctx.peer_edge);
             let engine = WindowEngine::new(
                 cursio_window::MacWindowCapture::default(),
                 cursio_window::MacWindowRenderer,
                 ctx.peer_name().to_string(),
             )
-            .with_requests(spawn_drag_trigger(ctx.peer_edge));
+            .with_requests(requests)
+            .with_transfer_ended(ended);
             Ok(Box::new(engine))
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
@@ -607,10 +637,14 @@ pub const VERSION: u16 = 1;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn spawn_drag_trigger(
     peer_edge: Option<cursio_protocol::Edge>,
-) -> tokio::sync::mpsc::UnboundedReceiver<TransferRequest> {
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<TransferRequest>,
+    tokio::sync::mpsc::UnboundedSender<()>,
+) {
     use cursio_window::drag_trigger::{DragTrigger, TriggerAction};
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     tokio::spawn(async move {
         #[cfg(target_os = "linux")]
@@ -649,7 +683,39 @@ fn spawn_drag_trigger(
         );
 
         let mut trigger = DragTrigger::new(peer_edge, screen);
-        while let Some(event) = watcher.next().await {
+        loop {
+            let event = tokio::select! {
+                // Biased so a transfer that just ended is recorded before the
+                // drag that may already be under way is judged against it.
+                biased;
+                ended = ended_rx.recv() => {
+                    if ended.is_none() {
+                        break; // the session ended
+                    }
+                    trigger.transfer_ended();
+                    continue;
+                }
+                event = watcher.next() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
+
+            // Re-read the geometry as each drag begins. A monitor unplugged or
+            // a resolution changed mid-session moves the edge, and this is the
+            // one moment where asking costs nothing anybody can feel.
+            if matches!(event, cursio_window::drag::DragEvent::Started { .. }) {
+                #[cfg(target_os = "linux")]
+                let now = cursio_window::linux_drag::screen_size().await;
+                #[cfg(target_os = "windows")]
+                let now = cursio_window::windows_drag::screen_size();
+                #[cfg(target_os = "macos")]
+                let now = cursio_window::macos_drag::screen_size();
+                if let Some(now) = now {
+                    trigger.set_screen(now);
+                }
+            }
+
             let Some(action) = trigger.on_drag(&event) else {
                 continue;
             };
@@ -663,7 +729,7 @@ fn spawn_drag_trigger(
         }
     });
 
-    rx
+    (rx, ended_tx)
 }
 
 /// Build an engine that hosts the mirrored iPhone screen.
@@ -891,6 +957,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn the_peer_closing_the_window_tells_the_drag_trigger() {
+        // Otherwise the trigger still believes a window is over there, and
+        // reads the *next* window dragged at the edge as a return of one that
+        // is already home — dropping it silently.
+        let (_frames_tx, frames_rx) = frame_channel();
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (ended_tx, mut ended_rx) = mpsc::unbounded_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        )
+        .with_requests(req_rx)
+        .with_transfer_ended(ended_tx);
+
+        req_tx
+            .send(TransferRequest::Send {
+                title: "Editor".into(),
+            })
+            .unwrap();
+        let mut tx = RecordingTx::default();
+        eng.pump(&mut tx).await.unwrap();
+        assert!(ended_rx.try_recv().is_err(), "nothing has ended yet");
+
+        eng.handle_message(&control_frame(WindowMsg::Close {
+            id: 1,
+            reason: WindowCloseReason::ViewerClosed,
+        }));
+
+        assert!(ended_rx.try_recv().is_ok());
     }
 
     #[tokio::test]
