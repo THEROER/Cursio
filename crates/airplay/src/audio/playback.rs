@@ -53,10 +53,10 @@ mod backend {
             config: &[u8],
         ) -> Result<Self, AirPlayError> {
             gst::init().map_err(|error| {
-                AirPlayError::Video(format!("GStreamer could not start ({error})"))
+                AirPlayError::Audio(format!("GStreamer could not start ({error})"))
             })?;
             if gst::ElementFactory::find("avdec_aac").is_none() {
-                return Err(AirPlayError::Video(
+                return Err(AirPlayError::Audio(
                     "avdec_aac is required to decode AirPlay audio; install the GStreamer \
                      libav plugin (gst-libav)"
                         .into(),
@@ -78,15 +78,15 @@ mod backend {
                  max-size-time={MAX_AUDIO_LAG_NS} leaky=downstream ! \
                  autoaudiosink sync=false"
             ))
-            .map_err(|error| AirPlayError::Video(error.to_string()))?
+            .map_err(|error| AirPlayError::Audio(error.to_string()))?
             .downcast::<gst::Pipeline>()
-            .map_err(|_| AirPlayError::Video("GStreamer did not create a pipeline".into()))?;
+            .map_err(|_| AirPlayError::Audio("GStreamer did not create a pipeline".into()))?;
 
             let source = pipeline
                 .by_name("airplay-audio")
-                .ok_or_else(|| AirPlayError::Video("pipeline has no audio appsrc".into()))?
+                .ok_or_else(|| AirPlayError::Audio("pipeline has no audio appsrc".into()))?
                 .downcast::<gst_app::AppSrc>()
-                .map_err(|_| AirPlayError::Video("AirPlay audio source is not an appsrc".into()))?;
+                .map_err(|_| AirPlayError::Audio("AirPlay audio source is not an appsrc".into()))?;
 
             // The decoder cannot start without this: raw AAC-ELD carries no
             // header of its own, so the whole description lives in the caps.
@@ -102,7 +102,7 @@ mod backend {
             let volume = pipeline.by_name("airplay-volume");
             pipeline
                 .set_state(gst::State::Playing)
-                .map_err(|error| AirPlayError::Video(error.to_string()))?;
+                .map_err(|error| AirPlayError::Audio(error.to_string()))?;
             Ok(Self {
                 pipeline,
                 source,
@@ -125,20 +125,20 @@ mod backend {
             duration: std::time::Duration,
         ) -> Result<(), AirPlayError> {
             let mut buffer = gst::Buffer::with_size(frame.len())
-                .map_err(|error| AirPlayError::Video(error.to_string()))?;
+                .map_err(|error| AirPlayError::Audio(error.to_string()))?;
             {
                 let buffer = buffer.get_mut().ok_or_else(|| {
-                    AirPlayError::Video("new audio buffer is unexpectedly shared".into())
+                    AirPlayError::Audio("new audio buffer is unexpectedly shared".into())
                 })?;
                 buffer
                     .copy_from_slice(0, frame)
-                    .map_err(|error| AirPlayError::Video(error.to_string()))?;
+                    .map_err(|error| AirPlayError::Audio(error.to_string()))?;
                 buffer.set_pts(gst::ClockTime::from_nseconds(pts.as_nanos() as u64));
                 buffer.set_duration(gst::ClockTime::from_nseconds(duration.as_nanos() as u64));
             }
             self.source
                 .push_buffer(buffer)
-                .map_err(|error| AirPlayError::Video(error.to_string()))?;
+                .map_err(|error| AirPlayError::Audio(error.to_string()))?;
             Ok(())
         }
     }
@@ -195,7 +195,7 @@ mod backend {
 
     impl AudioPlayer {
         pub(super) fn new(_: u32, _: u8, _: &[u8]) -> Result<Self, AirPlayError> {
-            Err(AirPlayError::Video(
+            Err(AirPlayError::Audio(
                 "playing AirPlay audio is supported on Linux and Windows".into(),
             ))
         }

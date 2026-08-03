@@ -42,6 +42,13 @@ pub enum AirPlayError {
     Config(#[from] ConfigError),
     #[error("video pipeline error: {0}")]
     Video(String),
+    /// A failure on the audio that accompanies mirroring.
+    ///
+    /// Its own variant because the two pipelines fail independently and for
+    /// unrelated reasons: reporting a missing audio sink as a "video pipeline
+    /// error" sends whoever reads the log to the decoder.
+    #[error("audio pipeline error: {0}")]
+    Audio(String),
     /// The user closed the window the mirrored screen was appearing in.
     ///
     /// Separate from [`AirPlayError::Video`] because it is not a fault: it is
