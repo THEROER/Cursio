@@ -1,0 +1,23 @@
+# Line endings are normalised, because a commit made on Windows otherwise
+# rewrites whole files invisibly.
+#
+# This is not hypothetical here. `8c47ac4` landed from the Windows peer in
+# CRLF and changed 118 lines of `link.rs` and `cursio.rs` — but git saw every
+# one of their 1743 lines as modified, so merging the Apple branch reported
+# both files as conflicting in their entirety. The real overlap only became
+# visible with `-X ignore-cr-at-eol`. Text is stored LF and checked out LF on
+# every platform; the Rust, C and MSVC toolchains all read it either way.
+* text=auto eol=lf
+
+# Files Windows tooling insists on writing back as CRLF. Left alone rather
+# than fought with: normalising them means every save by Visual Studio shows
+# up as a diff.
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+*.vcxproj.filters text eol=crlf
+*.inf text eol=crlf
+*.rc text eol=crlf
+
+# Binary, so never touched: normalisation would corrupt them silently.
+*.png binary
+*.ico binary
