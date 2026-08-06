@@ -19,6 +19,7 @@ use super::attr::{attr_from, dir_attr, root_attr, to_errno, CACHE_TTL};
 use super::inode::{join, Entry, InodeTable, ROOT_INO};
 use crate::bridge::{mount_threads, PeerLink};
 use crate::server::{FALLBACK_FREE, FALLBACK_TOTAL};
+use crate::volume_dir_name;
 
 /// Generation number for every inode we hand out.
 ///
@@ -671,19 +672,6 @@ fn open_mode_from(flags: fuser::OpenFlags) -> OpenMode {
     }
 }
 
-/// Directory name for a volume.
-///
-/// A Windows volume id is `C:`, and a colon is legal in a Linux filename, so it
-/// is kept — the name matches what the user sees on the other machine. The
-/// Linux root `/` cannot be a filename, so it becomes `root`.
-fn volume_dir_name(id: &str) -> String {
-    if id == "/" {
-        "root".to_string()
-    } else {
-        id.to_string()
-    }
-}
-
 /// A live mount. Dropping it unmounts.
 pub struct MountHandle {
     /// Dropping this unmounts and joins the FUSE threads — which is the whole
@@ -896,16 +884,4 @@ mod tests {
         assert!(trunc.is_mutating());
     }
 
-    /// The Linux root has to become a legal directory name; a Windows drive
-    /// letter is already one and should be left recognisable.
-    #[test]
-    fn volume_names_are_legal_directory_names() {
-        assert_eq!(volume_dir_name("/"), "root");
-        assert_eq!(volume_dir_name("C:"), "C:");
-        assert_eq!(volume_dir_name("D:"), "D:");
-        assert!(
-            !volume_dir_name("/").contains('/'),
-            "a volume directory name must not contain a separator"
-        );
-    }
 }

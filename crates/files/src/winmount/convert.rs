@@ -99,15 +99,11 @@ pub fn split_path<'a>(
 
 /// Directory name for a volume, when a peer offers more than one.
 ///
-/// A Windows drive id is `C:`, and a colon cannot appear in a Windows filename,
-/// so it becomes `C` — recognisable without being illegal. A Linux root is
-/// `root`, as on the other side.
-pub fn dir_name_of(volume_id: &str) -> String {
-    match volume_id {
-        "/" => "root".to_string(),
-        other => other.trim_end_matches(':').to_string(),
-    }
-}
+/// The rule is shared with the Linux mount — see [`crate::volume_dir_name`].
+/// A colon cannot appear in a Windows filename at all, which is why this side
+/// has always dropped it; the other side now does the same, for tools rather
+/// than for the OS.
+pub use crate::volume_dir_name as dir_name_of;
 
 /// Map a wire error onto the NTSTATUS WinFsp expects.
 ///
