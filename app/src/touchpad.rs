@@ -144,7 +144,12 @@ async fn run_link(
             // We dialled, so we lead both handshakes.
             role: Role::Initiator,
             registry: &registry,
-            peer_edge: None,
+            // A touchpad has no screen for the cursor to enter, so it never
+            // becomes anyone's neighbour and its own coordinates are never
+            // consulted — the peer keeps the cursor for the life of the link.
+            position: cursio_protocol::Position::new(0, 0),
+            // Nothing this device could host: no decoder, no display.
+            service: cursio_protocol::ServiceOffer::none(),
             sends_input: true,
         },
     )
