@@ -1045,8 +1045,9 @@ pub fn mount(peer: PeerLink, peer_name: &str) -> anyhow::Result<MountHandle> {
         // request outright: it never reached `set_delete` or `cleanup` — the
         // trace showed the directory opened and enumerated (empty), and then no
         // delete call at all — and Windows reported `ERROR_INVALID_PARAMETER`,
-        // which cargo prints as "failed to remove temporary directory:
-        // Параметр задан неверно (os error 87)". Node deletes through the older
+        // which cargo prints as "failed to remove temporary directory: the
+        // parameter is incorrect (os error 87)" — localised, so it reads in
+        // whatever language Windows runs in. Node deletes through the older
         // disposition class, which is why it never hit this.
         .supports_posix_unlink_rename(true);
 

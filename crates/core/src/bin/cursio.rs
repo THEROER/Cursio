@@ -1697,7 +1697,7 @@ fn spawn_hotkey_filter(
         // anything, so Ctrl↑/Alt↑ never reach the peer. The peer's injector
         // reports it as `releasing held keys ... keys=2` only at session end;
         // meanwhile every click there is a Ctrl+click and the mouse looks
-        // broken. That was the "нажал и всё зависло" report.
+        // broken. That was the "pressed a key and everything froze" report.
         let mut swallow_until_release = false;
         while let Some(event) = upstream.recv().await {
             if !grab.mode().forwards_events() {

@@ -460,7 +460,8 @@ mod tests {
         assert_eq!(mdns_label("💻", "cursio-node"), "cursio-node");
         assert_eq!(mdns_label("", "cursio-node"), "cursio-node");
         // Non-ASCII letters are dropped, not transliterated: guessing at a
-        // romanisation would produce a name the user never chose.
+        // romanisation would produce a name the user never chose. Any
+        // non-Latin script would do here; this one is a real machine name.
         assert_eq!(mdns_label("Мак", "cursio-node"), "cursio-node");
     }
 

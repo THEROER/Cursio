@@ -665,9 +665,9 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             // resting in the 1px jump zone such an event looks exactly like a
             // fresh crossing: the position is in the zone and the step since the
             // last event is 0 (nothing moved), so it passes the flick filter and
-            // hands the machine back mid-click. Symptom: "нажал ЛКМ и потерял
-            // управление". Only a genuine move can mean the user pushed into the
-            // edge, so only WM_MOUSEMOVE is allowed to trigger a handoff.
+            // hands the machine back mid-click. Symptom: a left click loses
+            // control of the machine. Only a genuine move can mean the user
+            // pushed into the edge, so only WM_MOUSEMOVE triggers a handoff.
             MODE_ACTIVE if wparam as u32 == WM_MOUSEMOVE => check_jump_zone(info.pt),
             _ => {}
         }

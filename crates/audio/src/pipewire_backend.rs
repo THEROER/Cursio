@@ -1151,7 +1151,7 @@ fn run_capture_loop(
                 // the node was generic — the session manager happily linked it
                 // to whatever it liked, including our own mirrors. The result
                 // was a feedback path: mic → peer → mirror → the user's
-                // headphones ("микрофон ссыт мне в уши").
+                // headphones — the mic came back into the user's own ears.
                 props.insert(
                     *pipewire::keys::NODE_NAME,
                     format!("cursio-mic-{}", target.as_deref().unwrap_or("default")).as_str(),

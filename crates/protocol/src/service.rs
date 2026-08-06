@@ -325,6 +325,10 @@ mod tests {
 
     /// Reasons name real paths and device names, and slicing a multi-byte
     /// character in half panics.
+    ///
+    /// The character below is two bytes in UTF-8, chosen so that the cut lands
+    /// mid-character on a byte-counted limit — an ASCII string could never
+    /// catch this.
     #[test]
     fn shortening_never_splits_a_character() {
         let long = "я".repeat(MAX_REASON_LEN);

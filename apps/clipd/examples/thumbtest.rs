@@ -8,7 +8,7 @@ fn main() {
     let mut png = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
-    println!("исходник: {} байт", png.len());
+    println!("source: {} bytes", png.len());
 
     let content =
         clipboard_core::ClipboardContent::single(clipboard_core::ClipboardFormat::ImagePng, png);
@@ -18,13 +18,13 @@ fn main() {
     match item.thumbnail {
         Some(p) => {
             let len = std::fs::metadata(&p).unwrap().len();
-            println!("миниатюра id={id}: {len} байт -> {}", p.display());
+            println!("thumbnail id={id}: {len} bytes -> {}", p.display());
             if len < 100 {
-                println!("!!! ОБРЕЗАНА");
+                println!("!!! TRUNCATED");
             } else {
-                println!("ок");
+                println!("ok");
             }
         }
-        None => println!("!!! миниатюры нет"),
+        None => println!("!!! no thumbnail"),
     }
 }
