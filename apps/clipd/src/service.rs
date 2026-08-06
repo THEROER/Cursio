@@ -92,12 +92,10 @@ fn install_binary() -> Result<PathBuf> {
     // Replace rather than write in place: overwriting a running binary fails
     // with ETXTBSY, and an unlinked one keeps working for processes using it.
     if target.exists() {
-        std::fs::remove_file(&target)
-            .with_context(|| format!("replacing {}", target.display()))?;
+        std::fs::remove_file(&target).with_context(|| format!("replacing {}", target.display()))?;
     }
-    std::fs::copy(&current, &target).with_context(|| {
-        format!("copying {} to {}", current.display(), target.display())
-    })?;
+    std::fs::copy(&current, &target)
+        .with_context(|| format!("copying {} to {}", current.display(), target.display()))?;
 
     warn_if_not_on_path(target.parent().unwrap());
     Ok(target)

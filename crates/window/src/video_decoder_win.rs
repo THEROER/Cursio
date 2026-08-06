@@ -133,8 +133,7 @@ impl VideoDecoder {
             }];
             let mut status = 0u32;
 
-            let result =
-                unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
+            let result = unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
 
             match result {
                 Ok(()) => {
@@ -202,7 +201,8 @@ impl VideoDecoder {
 
             let need = stride * (height as usize) * 3 / 2;
             self.nv12.clear();
-            self.nv12.extend_from_slice(std::slice::from_raw_parts(data, need));
+            self.nv12
+                .extend_from_slice(std::slice::from_raw_parts(data, need));
 
             match &locked_2d {
                 Some(two_d) => {
@@ -260,7 +260,9 @@ unsafe fn find_h264_decoder() -> Result<IMFTransform, WindowError> {
     .map_err(|e| WindowError::Backend(format!("MFTEnumEx: {e}")))?;
 
     if activates.is_null() || count == 0 {
-        return Err(WindowError::Backend("no H.264 decoder MFT on this machine".into()));
+        return Err(WindowError::Backend(
+            "no H.264 decoder MFT on this machine".into(),
+        ));
     }
 
     // The array is CoTaskMem and each entry is an owned reference; take the
@@ -271,7 +273,9 @@ unsafe fn find_h264_decoder() -> Result<IMFTransform, WindowError> {
         if chosen.is_none() {
             match activate.ActivateObject::<IMFTransform>() {
                 Ok(t) => chosen = Some(t),
-                Err(e) => tracing::debug!(error = %e, "an H.264 MFT failed to activate; trying next"),
+                Err(e) => {
+                    tracing::debug!(error = %e, "an H.264 MFT failed to activate; trying next")
+                }
             }
         }
     }
@@ -287,7 +291,8 @@ unsafe fn find_h264_decoder() -> Result<IMFTransform, WindowError> {
 /// and taking the NV12 one, rather than constructing it — a decoder may
 /// require attributes we would not know to set.
 unsafe fn configure(transform: &IMFTransform) -> Result<(), WindowError> {
-    let input = MFCreateMediaType().map_err(|e| WindowError::Backend(format!("media type: {e}")))?;
+    let input =
+        MFCreateMediaType().map_err(|e| WindowError::Backend(format!("media type: {e}")))?;
     input
         .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
         .and_then(|_| input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264))
@@ -341,11 +346,10 @@ unsafe fn make_sample(packet: &[u8]) -> Result<IMFSample, WindowError> {
         .SetCurrentLength(packet.len() as u32)
         .map_err(|e| WindowError::Backend(format!("SetCurrentLength: {e}")))?;
 
-    let sample = MFCreateSample().map_err(|e| WindowError::Backend(format!("MFCreateSample: {e}")))?;
+    let sample =
+        MFCreateSample().map_err(|e| WindowError::Backend(format!("MFCreateSample: {e}")))?;
     sample
         .AddBuffer(&buffer)
         .map_err(|e| WindowError::Backend(format!("AddBuffer: {e}")))?;
     Ok(sample)
 }
-
-

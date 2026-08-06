@@ -68,7 +68,10 @@ impl OpusEncoder {
 
         let encoder =
             Encoder::new(config).map_err(|e| AudioError::Backend(format!("opus encoder: {e}")))?;
-        Ok(Self { encoder, pending: Vec::with_capacity(FRAME_INTERLEAVED * 2) })
+        Ok(Self {
+            encoder,
+            pending: Vec::with_capacity(FRAME_INTERLEAVED * 2),
+        })
     }
 
     /// Encode raw wire bytes, returning zero or more Opus packets.
@@ -187,7 +190,10 @@ mod tests {
     fn partial_frames_are_held_until_complete() {
         let mut enc = OpusEncoder::new().unwrap();
         let half = vec![0.1f32; FRAME_INTERLEAVED / 2];
-        assert!(enc.encode(&pcm(&half)).unwrap().is_empty(), "half a frame should emit nothing");
+        assert!(
+            enc.encode(&pcm(&half)).unwrap().is_empty(),
+            "half a frame should emit nothing"
+        );
         // The second half completes it.
         assert_eq!(enc.encode(&pcm(&half)).unwrap().len(), 1);
     }

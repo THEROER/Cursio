@@ -1,13 +1,32 @@
-//! Linux cursor hiding — X11 real hide, Wayland honest no-op.
+//! Linux cursor hiding — which no display server here allows from a daemon.
 //!
-//! Hiding the system cursor on Linux is display-server-specific:
-//! - **X11** can hide it globally (XFixes) — not yet implemented here; the
-//!   backend reports it and falls back to no-op until it's wired.
-//! - **Wayland** does **not** let a background daemon hide the system cursor at
-//!   all: the compositor only allows a focused client with its own surface to
-//!   touch the cursor. Real Wayland hiding waits until Cursio also runs as a
-//!   Wayland/libei client (see the cursor-hiding notes). Until then this is a
-//!   deliberate no-op that logs once.
+//! Every other platform gets the pointer out of the way while this machine
+//! drives a peer: Windows swaps the system cursors, macOS hides it and parks it
+//! in a corner. Linux can do neither, and the reasons are different enough per
+//! server to be worth stating rather than filed under "not implemented".
+//!
+//! **Wayland.** The compositor only lets a focused client with its own surface
+//! touch the cursor, and Cursio is a background process with no surface at all.
+//! Nor can the pointer be parked instead: there is no absolute warp, and the
+//! relative-motion trick the capture backend uses to nudge the cursor off an
+//! edge does not apply here — while this machine is dormant the InputCapture
+//! portal already holds the pointer pinned at the barrier, so injected motion
+//! goes to the peer rather than the local desktop.
+//!
+//! The supported way through is for Cursio to own a surface: a fullscreen GTK4
+//! window, transparent, with an empty input region so it never takes a click,
+//! and its cursor set to `none`. That is real work in `cursio-window` (GTK is
+//! thread-affine and each window already owns a thread) rather than a call to
+//! add here, so this stays an honest no-op until it exists.
+//!
+//! **X11.** XFixes can hide the pointer globally, which would work — but the
+//! evdev backend that serves X11 sessions cannot detect an edge crossing in the
+//! first place (see [`crate::capture`]), so a machine there hands the cursor
+//! over by hotkey alone and a frozen pointer is the least of it.
+//!
+//! What actually happens meanwhile: the pointer stops moving, because local
+//! input is grabbed, and stays visible where it stopped. That is stated once in
+//! the log rather than left for the user to wonder about.
 //!
 //! The backend is chosen at construction from the running session type, so the
 //! session code calls [`CursorControl`] the same way everywhere.
@@ -17,9 +36,9 @@ use crate::{CursorControl, InputError};
 /// Which display server we're running under, as far as cursor control cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Server {
-    /// Wayland: cannot hide from a daemon yet (no-op).
+    /// Wayland: needs a surface Cursio does not have.
     Wayland,
-    /// X11: hide is possible via XFixes (not yet implemented — no-op for now).
+    /// X11: XFixes could hide it, but this session cannot cross an edge anyway.
     X11,
     /// Neither detected: treat as unsupported.
     Unknown,
@@ -41,9 +60,8 @@ fn detect_server() -> Server {
     }
 }
 
-/// Linux cursor controller. Currently a no-op on every server (X11 XFixes hide
-/// is a TODO), but it detects and reports the server so wiring the real X11
-/// path later is a localized change.
+/// Linux cursor controller: a no-op that says so, once, with the reason for
+/// this particular session.
 pub struct LinuxCursor {
     server: Server,
     warned: bool,
@@ -60,7 +78,7 @@ impl LinuxCursor {
         })
     }
 
-    /// Log, once, that hiding isn't available on this server yet.
+    /// Log, once, what will happen to the pointer and why.
     fn warn_unsupported(&mut self) {
         if self.warned {
             return;
@@ -68,24 +86,29 @@ impl LinuxCursor {
         self.warned = true;
         match self.server {
             Server::Wayland => tracing::warn!(
-                "cursor hide unsupported on Wayland from an evdev daemon; \
-                 the cursor freezes but stays visible (needs the libei client)"
+                "this machine's pointer stays visible while it drives the peer: hiding it on \
+                 Wayland needs a surface of our own, which Cursio does not have yet. It stops \
+                 moving, since local input is grabbed"
             ),
-            Server::X11 => tracing::warn!("X11 cursor hide (XFixes) not implemented yet; no-op"),
-            Server::Unknown => tracing::warn!("no known display server; cursor hide is a no-op"),
+            Server::X11 => tracing::warn!(
+                "this machine's pointer stays visible while it drives the peer (X11 XFixes hiding \
+                 is not wired up)"
+            ),
+            Server::Unknown => tracing::warn!(
+                "no display server detected, so this machine's pointer cannot be hidden"
+            ),
         }
     }
 }
 
 impl CursorControl for LinuxCursor {
     fn hide(&mut self) -> Result<(), InputError> {
-        // TODO(x11): XFixesHideCursor when server == X11.
         self.warn_unsupported();
         Ok(())
     }
 
     fn show(&mut self) -> Result<(), InputError> {
-        // No-op: nothing was hidden. (X11 XFixesShowCursor lands with hide.)
+        // Nothing was hidden, so there is nothing to restore.
         Ok(())
     }
 

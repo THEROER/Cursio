@@ -78,7 +78,11 @@ impl WinCursor {
         // Worth logging: zero copies means `show()` falls back to the slower
         // registry reload, which is the difference between a crisp restore and a
         // racy one.
-        tracing::info!(copied, total = originals.len(), "snapshotted system cursors");
+        tracing::info!(
+            copied,
+            total = originals.len(),
+            "snapshotted system cursors"
+        );
         Ok(Self {
             hidden: false,
             originals,
@@ -104,7 +108,11 @@ impl CursorControl for WinCursor {
             // consumes it. `id` is a documented OCR_* system cursor id.
             let ok = unsafe { SetSystemCursor(cursor, id) };
             if ok == 0 {
-                tracing::warn!(id, err = last_error(), "SetSystemCursor failed while hiding");
+                tracing::warn!(
+                    id,
+                    err = last_error(),
+                    "SetSystemCursor failed while hiding"
+                );
             }
         }
         self.hidden = true;
@@ -154,7 +162,11 @@ impl CursorControl for WinCursor {
             // SAFETY: `dup` is a valid HCURSOR we own; SetSystemCursor consumes it.
             let ok = unsafe { SetSystemCursor(dup, id) };
             if ok == 0 {
-                tracing::warn!(id, err = last_error(), "SetSystemCursor failed while restoring");
+                tracing::warn!(
+                    id,
+                    err = last_error(),
+                    "SetSystemCursor failed while restoring"
+                );
             }
         }
         self.hidden = false;
@@ -208,7 +220,12 @@ fn copy_system_cursor(id: SYSTEM_CURSOR_ID, reg_name: &str) -> Option<HANDLE> {
         )
     };
     if handle.is_null() {
-        tracing::warn!(id, reg_name, err = last_error(), "loading cursor file failed");
+        tracing::warn!(
+            id,
+            reg_name,
+            err = last_error(),
+            "loading cursor file failed"
+        );
         return None;
     }
     Some(handle)
@@ -225,15 +242,7 @@ fn read_cursor_path(name: &str) -> Option<Vec<u16>> {
     let mut key: HKEY = ptr::null_mut();
     let subkey = wide("Control Panel\\Cursors");
     // SAFETY: standard registry open; `key` is written only on success.
-    let rc = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_READ,
-            &mut key,
-        )
-    };
+    let rc = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut key) };
     if rc != 0 {
         tracing::warn!(rc, "cannot open HKCU\\Control Panel\\Cursors");
         return None;
@@ -242,8 +251,8 @@ fn read_cursor_path(name: &str) -> Option<Vec<u16>> {
     let value = wide(name);
     let mut buf = [0u16; 512];
     let mut len = (buf.len() * 2) as u32; // bytes, per the API
-    // SAFETY: `buf`/`len` describe the same buffer; the API writes at most `len`
-    // bytes and updates `len` to what it wrote.
+                                          // SAFETY: `buf`/`len` describe the same buffer; the API writes at most `len`
+                                          // bytes and updates `len` to what it wrote.
     let rc = unsafe {
         RegQueryValueExW(
             key,
@@ -297,8 +306,8 @@ fn last_error() -> u32 {
 /// A monochrome cursor is defined by an AND mask and an XOR mask. `AND = 0xFF`
 /// (all ones) with `XOR = 0x00` (all zeros) yields a fully transparent pixel
 /// everywhere — the standard "invisible cursor" bitmasks.
-fn create_transparent_cursor() -> Result<windows_sys::Win32::UI::WindowsAndMessaging::HCURSOR, InputError>
-{
+fn create_transparent_cursor(
+) -> Result<windows_sys::Win32::UI::WindowsAndMessaging::HCURSOR, InputError> {
     // SAFETY: GetSystemMetrics has no preconditions.
     let (w, h) = unsafe {
         (

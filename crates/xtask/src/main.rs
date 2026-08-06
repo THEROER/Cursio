@@ -4,12 +4,12 @@
 //! triples remembered by hand:
 //! - `build`   — release build for this host (Linux/macOS/Windows).
 //! - `install` — build release, then copy binaries into `~/.local/bin` and
-//!               install `.desktop` launchers (Linux).
+//!   install `.desktop` launchers (Linux).
 //! - `windows` — cross-compile the `.exe`s from Linux (mingw), no Windows box.
 //! - `logs`    — print the log directory (and `tail -f` it with `--follow`).
 //!
-//! macOS and Android are declared but not wired up yet; they print what's
-//! missing instead of pretending to work.
+//! Android is declared but not wired up yet; it prints what's missing instead
+//! of pretending to work.
 //!
 //! Run `cargo xtask <cmd> --help` for flags.
 
@@ -140,7 +140,7 @@ enum Command_ {
         #[arg(long)]
         debug: bool,
     },
-    /// macOS build (not wired up yet — prints what's needed).
+    /// Build the supported macOS binaries.
     Macos,
     /// Android build (future — prints what's needed).
     Android,
@@ -185,7 +185,7 @@ fn main() -> Result<()> {
 /// Build the selected binaries. `release` picks the profile; `only` narrows to
 /// one binary; `target` cross-compiles when set (else host).
 fn build(release: bool, only: Option<BinArg>, target: Option<&str>) -> Result<()> {
-    let selected = select(only);
+    let selected = select_for_host(only)?;
     let profile = if release { "release" } else { "debug" };
     let where_ = target.unwrap_or("host");
     println!("→ building {} ({profile}, {where_})", names(&selected));
@@ -221,11 +221,10 @@ fn install(only: Option<BinArg>, no_build: bool) -> Result<()> {
     }
 
     let bin_dir = local_bin_dir()?;
-    std::fs::create_dir_all(&bin_dir)
-        .with_context(|| format!("creating {}", bin_dir.display()))?;
+    std::fs::create_dir_all(&bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
 
     let src_dir = out_dir(true, None);
-    let selected = select(only);
+    let selected = select_for_host(only)?;
     for b in &selected {
         let src = src_dir.join(exe_name(b.bin, None));
         if !src.exists() {
@@ -256,28 +255,33 @@ fn windows(release: bool) -> Result<()> {
     }
     ensure_rust_target(WINDOWS_TARGET)?;
 
-    if which("cargo-xwin").is_none() {
-        bail!(
+    let xwin = which("cargo-xwin").with_context(|| {
+        format!(
             "cargo-xwin not found. Install it with:\n  \
              cargo install cargo-xwin\n\
              (it downloads the MSVC CRT and Windows SDK so {WINDOWS_TARGET} \
              links without Visual Studio)"
-        );
-    }
+        )
+    })?;
     // libopus is built with cmake, which invokes ninja specifically.
     if which("ninja").is_none() {
         bail!(
             "ninja not found. Install it with:\n  \
-             sudo apt install ninja-build\n\
+             {}\n\
              (cmake builds libopus with it; without it the build fails with \
-             \"unable to find a build program corresponding to Ninja\")"
+             \"unable to find a build program corresponding to Ninja\")",
+            ninja_install_hint()
         );
     }
+    let gstreamer = windows_gstreamer_sysroot()?;
 
     // clipd is GTK/Linux-only — never cross-build it for Windows.
     let selected: Vec<&Binary> = BINARIES.iter().filter(|b| b.bin != "clipd").collect();
     let profile = if release { "release" } else { "debug" };
-    println!("→ cross-building {} for Windows ({profile})", names(&selected));
+    println!(
+        "→ cross-building {} for Windows ({profile})",
+        names(&selected)
+    );
 
     let mut cmd = cargo();
     cmd.arg("xwin");
@@ -292,28 +296,41 @@ fn windows(release: bool) -> Result<()> {
     // The prebuilt libopus for Windows; without this the crate tries to compile
     // it from source under the cross toolchain.
     cmd.env("OPUS_TARGET", OPUS_TARGET_WINDOWS);
-    // Ubuntu keeps lld-link out of PATH, and xwin links with it.
-    if let Some(dir) = llvm_bin_dir() {
-        let path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{path}", dir.display()));
+    // AirPlay video pulls in GStreamer, whose -sys crates resolve through
+    // pkg-config. Cross-compiling means pointing it at the Windows development
+    // files instead of the host's, which pkg-config refuses to do by default.
+    cmd.env("PKG_CONFIG_ALLOW_CROSS", "1");
+    cmd.env("PKG_CONFIG_SYSROOT_DIR", &gstreamer);
+    cmd.env("PKG_CONFIG_PATH", gstreamer.join("lib").join("pkgconfig"));
+    // Ubuntu keeps lld-link out of PATH, and xwin links with it. `cargo-xwin`
+    // itself may also live outside PATH, in `$CARGO_HOME/bin`.
+    let mut extra_dirs: Vec<PathBuf> = Vec::new();
+    extra_dirs.extend(llvm_bin_dir());
+    extra_dirs.extend(xwin.parent().map(Path::to_path_buf));
+    if !extra_dirs.is_empty() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let joined =
+            std::env::join_paths(extra_dirs.into_iter().chain(std::env::split_paths(&path)))
+                .context("building the cross-build PATH")?;
+        cmd.env("PATH", joined);
     }
     run(cmd).context("windows cross-build failed")?;
 
     let dir = out_dir(release, Some(WINDOWS_TARGET));
     for b in &selected {
-        println!("✓ {}", dir.join(exe_name(b.bin, Some(WINDOWS_TARGET))).display());
+        println!(
+            "✓ {}",
+            dir.join(exe_name(b.bin, Some(WINDOWS_TARGET))).display()
+        );
     }
     Ok(())
 }
 
 fn macos() -> Result<()> {
-    println!(
-        "macOS build isn't wired up yet.\n\
-         When it is, it'll build the aarch64-apple-darwin / x86_64-apple-darwin \n\
-         binaries here. For now, build on a Mac with:\n  \
-         cargo build --release -p cursio-core -p cursio-app"
-    );
-    Ok(())
+    if !cfg!(target_os = "macos") {
+        bail!("`cargo xtask macos` must run on macOS");
+    }
+    build(true, None, None)
 }
 
 fn android() -> Result<()> {
@@ -332,8 +349,8 @@ fn logs(follow: bool) -> Result<()> {
     if !follow {
         return Ok(());
     }
-    let newest = newest_file(&dir)?
-        .with_context(|| format!("no log files in {}", dir.display()))?;
+    let newest =
+        newest_file(&dir)?.with_context(|| format!("no log files in {}", dir.display()))?;
     println!("→ tailing {}", newest.display());
     let mut cmd = Command::new("tail");
     cmd.arg("-f").arg(&newest);
@@ -342,10 +359,24 @@ fn logs(follow: bool) -> Result<()> {
 
 // --- helpers ---------------------------------------------------------------
 
-fn select(only: Option<BinArg>) -> Vec<&'static Binary> {
+fn select_for_host(only: Option<BinArg>) -> Result<Vec<&'static Binary>> {
+    let supported = |binary: &&Binary| binary.bin != "clipd" || cfg!(target_os = "linux");
     match only {
-        Some(b) => BINARIES.iter().filter(|x| x.bin == b.as_str()).collect(),
-        None => BINARIES.iter().collect(),
+        Some(b) => {
+            let selected: Vec<_> = BINARIES
+                .iter()
+                .filter(|binary| binary.bin == b.as_str())
+                .filter(supported)
+                .collect();
+            if selected.is_empty() {
+                bail!(
+                    "{} is Linux-only and cannot be built on this host",
+                    b.as_str()
+                );
+            }
+            Ok(selected)
+        }
+        None => Ok(BINARIES.iter().filter(supported).collect()),
     }
 }
 
@@ -473,29 +504,118 @@ fn warn_if_not_on_path(bin_dir: &Path) {
     }
 }
 
-/// Ensure a rustup target is installed, installing it if missing.
+/// Ensure the *active* toolchain can compile for `target`, installing it with
+/// rustup when it can't.
+///
+/// Asking `rustup target list` is not enough: a host where `rustc` resolves to
+/// a distribution package (Homebrew, apt) while `rustup` is also installed will
+/// happily report the target as present and then fail the build much later with
+/// an opaque `can't find crate for core`. The standard library directory the
+/// active `rustc` would actually use is the thing worth checking.
 fn ensure_rust_target(target: &str) -> Result<()> {
-    let installed = Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output();
-    if let Ok(out) = installed {
-        let list = String::from_utf8_lossy(&out.stdout);
-        if list.lines().any(|l| l.trim() == target) {
-            return Ok(());
-        }
+    if has_target_libdir(target) {
+        return Ok(());
+    }
+    if which("rustup").is_none() {
+        bail!(
+            "the active rust toolchain cannot build for {target} and rustup is not installed.\n\
+             Install rustup, or build on a host whose toolchain ships {target}."
+        );
     }
     println!("→ installing rust target {target}");
     let mut cmd = Command::new("rustup");
     cmd.args(["target", "add", target]);
-    run(cmd)
+    run(cmd)?;
+    if has_target_libdir(target) {
+        return Ok(());
+    }
+    bail!(
+        "rustup installed {target} but the active `rustc` still cannot use it.\n\
+         `rustc` is most likely a distribution package rather than rustup's shim; \
+         check `which rustc` against `rustup which rustc`."
+    )
+}
+
+/// Env var pointing at the unpacked GStreamer *Windows* development files.
+const GSTREAMER_WINDOWS_SYSROOT_ENV: &str = "GSTREAMER_WINDOWS_SYSROOT";
+
+/// Locate the GStreamer development files the Windows build links against.
+///
+/// `cursio-airplay` renders mirrored iPhone frames through GStreamer, so
+/// `glib-sys` and the `gstreamer-*-sys` crates run pkg-config during the cross
+/// build. Without a Windows sysroot they fail roughly two hundred crates in,
+/// behind a wall of `cargo:rerun-if-env-changed` noise that says nothing about
+/// what to install — so the requirement is checked up front instead.
+fn windows_gstreamer_sysroot() -> Result<PathBuf> {
+    let sysroot = std::env::var_os(GSTREAMER_WINDOWS_SYSROOT_ENV)
+        .map(PathBuf::from)
+        .with_context(|| {
+            format!(
+                "{GSTREAMER_WINDOWS_SYSROOT_ENV} is not set.\n\
+                 The Windows build needs GStreamer's MSVC *development* files \
+                 (the `-devel` package from https://gstreamer.freedesktop.org/download/), \
+                 unpacked somewhere this host can read:\n  \
+                 export {GSTREAMER_WINDOWS_SYSROOT_ENV}=/path/to/gstreamer/1.0/msvc_x86_64\n\
+                 That directory must contain lib/pkgconfig/gstreamer-1.0.pc."
+            )
+        })?;
+    let pkgconfig = sysroot.join("lib").join("pkgconfig");
+    if !pkgconfig.join("gstreamer-1.0.pc").is_file() {
+        bail!(
+            "{} does not look like a GStreamer Windows sysroot: {} is missing.\n\
+             Point {GSTREAMER_WINDOWS_SYSROOT_ENV} at the prefix that contains \
+             lib/pkgconfig (for the MSVC devel package that is .../1.0/msvc_x86_64).",
+            sysroot.display(),
+            pkgconfig.join("gstreamer-1.0.pc").display()
+        );
+    }
+    Ok(sysroot)
+}
+
+/// Package-manager hint for the host running the cross-build. `windows` is
+/// documented as a Linux workflow but does run elsewhere, and an apt command on
+/// a Mac is worse than no hint at all.
+fn ninja_install_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "brew install ninja"
+    } else {
+        "sudo apt install ninja-build"
+    }
+}
+
+/// Whether the active `rustc` has a standard library for `target`.
+fn has_target_libdir(target: &str) -> bool {
+    let Ok(out) = Command::new("rustc")
+        .args(["--print", "target-libdir", "--target", target])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout);
+    Path::new(dir.trim()).is_dir()
 }
 
 /// Locate an executable on PATH (`which`-style), returning its path.
+///
+/// `$CARGO_HOME/bin` is searched too: that is where `cargo install` puts cargo
+/// subcommands, and it is missing from PATH whenever cargo itself came from a
+/// package manager rather than from rustup.
 fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
+        .chain(cargo_bin_dir())
         .map(|d| d.join(name))
         .find(|p| p.is_file())
+}
+
+fn cargo_bin_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))?;
+    Some(home.join("bin"))
 }
 
 /// Newest regular file in a directory by mtime, or None if the dir is empty.

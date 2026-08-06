@@ -1,0 +1,467 @@
+//! The audio that accompanies a mirrored iPhone screen.
+//!
+//! Video and sound are negotiated as separate AirPlay streams: the screen is
+//! stream type 110 over TCP, the sound is type 96 over UDP with an RTP header.
+//! Until this existed a `SETUP` asking only for audio found nothing it
+//! recognised and was answered `461 Unsupported Transport`, so iOS mirrored
+//! silently.
+//!
+//! ## How the payload is protected
+//!
+//! AES-128-CBC with the key from `ekey` (unwrapped by FairPlay) and the IV from
+//! `eiv`, **reset for every packet**, covering only whole 16-byte blocks — the
+//! trailing bytes travel in the clear.
+//!
+//! That shape was read off a real iPhone rather than assumed. Silent frames are
+//! four bytes and arrive byte-identical packet after packet (`00683400`); a
+//! stream cipher would have made each one different, so the tail cannot be
+//! encrypted, and a payload shorter than one block is therefore plaintext
+//! throughout. Frames carrying sound are 140-155 bytes: eight encrypted blocks
+//! plus a short clear tail.
+//!
+//! The plaintext underneath is raw AAC-ELD, decoded and played by
+//! [`playback`] — there is no header in the stream, so [`config`] builds the
+//! description a decoder needs from what `SETUP` said.
+
+mod config;
+mod playback;
+
+use std::net::{IpAddr, SocketAddr};
+
+use aes::Aes128;
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
+use plist::{Dictionary, Value};
+use tokio::net::UdpSocket;
+
+use crate::AirPlayError;
+
+type Aes128CbcDec = cbc::Decryptor<Aes128>;
+
+/// AES block size; only whole blocks of a payload are encrypted.
+const AES_BLOCK_BYTES: usize = 16;
+
+/// AirPlay's stream type for the audio that accompanies mirroring.
+pub(crate) const AUDIO_STREAM_TYPE: u64 = 96;
+
+/// Fixed part of an RTP header: version/flags, payload type, sequence,
+/// timestamp, SSRC.
+const RTP_HEADER_BYTES: usize = 12;
+
+/// Largest datagram worth accepting. AirPlay audio frames are far smaller;
+/// anything near this is not a frame we understand.
+const MAX_AUDIO_DATAGRAM: usize = 4 * 1024;
+
+/// What the sender asked for in a `SETUP` carrying an audio stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AudioStreamRequest {
+    /// Compression type. AirPlay mirroring uses AAC-ELD; other values exist for
+    /// the audio-only (RAOP) profile.
+    pub compression: Option<u64>,
+    /// Samples per frame — 480 for the low-delay profile mirroring uses.
+    pub samples_per_frame: Option<u64>,
+    /// Channels the sender will produce.
+    pub channels: Option<u64>,
+    /// Sample rate the sender will produce.
+    pub sample_rate: Option<u64>,
+    /// The sender's control port, when it offered one.
+    pub remote_control_port: Option<u16>,
+    /// Opaque id used to key this stream's cipher.
+    pub stream_connection_id: Option<u64>,
+}
+
+impl AudioStreamRequest {
+    /// Read one `streams` entry that describes audio.
+    pub(crate) fn parse(stream: &Dictionary) -> Self {
+        let integer = |key: &str| stream.get(key).and_then(crate::media::plist_u64_bits);
+        Self {
+            compression: integer("ct"),
+            samples_per_frame: integer("spf"),
+            channels: integer("ch"),
+            sample_rate: integer("sr"),
+            remote_control_port: integer("controlPort").and_then(|port| u16::try_from(port).ok()),
+            stream_connection_id: integer("streamConnectionID"),
+        }
+    }
+
+    /// A human-readable summary for the log, so an unfamiliar sender can be
+    /// identified without a packet capture.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "ct={:?} spf={:?} ch={:?} sr={:?} controlPort={:?}",
+            self.compression,
+            self.samples_per_frame,
+            self.channels,
+            self.sample_rate,
+            self.remote_control_port
+        )
+    }
+}
+
+/// The `streams` entry answering an audio `SETUP`.
+pub(crate) fn setup_response(data_port: u16, control_port: u16) -> Value {
+    let mut stream = Dictionary::new();
+    stream.insert("type".into(), AUDIO_STREAM_TYPE.into());
+    stream.insert("dataPort".into(), u64::from(data_port).into());
+    stream.insert("controlPort".into(), u64::from(control_port).into());
+    Value::Dictionary(stream)
+}
+
+/// One received audio datagram, split into its RTP header fields and payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AudioPacket {
+    pub payload_type: u8,
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub payload_bytes: usize,
+    /// The first bytes of the payload, hex-encoded.
+    ///
+    /// This is the one thing a log can say that settles what the payload
+    /// actually is: AAC-ELD framing has recognisable leading bits, while
+    /// ciphertext has none — so a glance decides whether the decode stage needs
+    /// a key first, without a packet capture or a guess.
+    pub prefix: String,
+}
+
+impl AudioPacket {
+    pub(crate) fn parse(datagram: &[u8]) -> Option<Self> {
+        if datagram.len() <= RTP_HEADER_BYTES || datagram.len() > MAX_AUDIO_DATAGRAM {
+            return None;
+        }
+        let payload = &datagram[RTP_HEADER_BYTES..];
+        Some(Self {
+            // The top bit is the marker flag, not part of the payload type.
+            payload_type: datagram[1] & 0x7f,
+            sequence: u16::from_be_bytes([datagram[2], datagram[3]]),
+            timestamp: u32::from_be_bytes([datagram[4], datagram[5], datagram[6], datagram[7]]),
+            payload_bytes: payload.len(),
+            prefix: payload
+                .iter()
+                .take(16)
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        })
+    }
+}
+
+/// Undoes the per-packet AES-128-CBC that AirPlay audio arrives under.
+///
+/// Holds no state between packets on purpose: the IV is reset for every one, so
+/// a lost datagram costs that datagram and nothing after it. This is the
+/// opposite of the mirroring video stream, whose CTR keystream is continuous
+/// and where a single skipped packet ruins everything that follows.
+#[derive(Clone)]
+pub(crate) struct AudioDecryptor {
+    key: [u8; 16],
+    iv: [u8; 16],
+}
+
+impl AudioDecryptor {
+    pub(crate) fn new(key: [u8; 16], iv: [u8; 16]) -> Self {
+        Self { key, iv }
+    }
+
+    /// Decrypt in place, leaving the sub-block tail untouched.
+    pub(crate) fn decrypt(&self, payload: &mut [u8]) {
+        let whole = payload.len() - payload.len() % AES_BLOCK_BYTES;
+        if whole == 0 {
+            return;
+        }
+        let cipher = Aes128CbcDec::new(&self.key.into(), &self.iv.into());
+        // The length is a block multiple by construction, so the only way this
+        // fails is a programming error rather than anything on the wire.
+        if cipher
+            .decrypt_padded_mut::<NoPadding>(&mut payload[..whole])
+            .is_err()
+        {
+            tracing::warn!(bytes = whole, "AirPlay audio block decrypt refused");
+        }
+    }
+}
+
+/// Tracks which RTP sequence numbers have already been played.
+///
+/// An iPhone sends each audio packet more than once — plain redundancy against
+/// UDP loss, and visible in any capture as the same sequence number arriving
+/// two or three times. Handing every copy to the decoder plays the same ten
+/// milliseconds repeatedly, which is heard as stuttering rather than as an
+/// echo, because the timeline stops matching the sound.
+#[derive(Default)]
+pub(crate) struct SequenceFilter {
+    newest: Option<u16>,
+}
+
+impl SequenceFilter {
+    /// Whether this packet is new. Late duplicates and re-orderings are refused.
+    pub(crate) fn accept(&mut self, sequence: u16) -> bool {
+        match self.newest {
+            // Half the sequence space ahead counts as newer, which is how the
+            // wrap from 65535 back to 0 stays a step forward rather than a
+            // jump backwards that silences the stream for a minute.
+            Some(newest) if sequence.wrapping_sub(newest) == 0 => false,
+            Some(newest) if sequence.wrapping_sub(newest) >= 0x8000 => false,
+            _ => {
+                self.newest = Some(sequence);
+                true
+            }
+        }
+    }
+}
+
+/// Bind the pair of UDP sockets an audio stream needs.
+pub(crate) async fn bind_ports(local_ip: IpAddr) -> Result<(UdpSocket, UdpSocket), AirPlayError> {
+    let data = UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?;
+    let control = UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?;
+    Ok((data, control))
+}
+
+/// Receive the audio stream and report what it carries.
+///
+/// Deliberately observational for now. Every field logged here is one that the
+/// decode stage needs to get right, and reading them off a real iPhone is the
+/// only way to know them.
+pub(crate) async fn observe(
+    socket: UdpSocket,
+    request: AudioStreamRequest,
+    decryptor: Option<AudioDecryptor>,
+    mut volume: tokio::sync::watch::Receiver<f32>,
+) {
+    // Playback needs the stream described up front. An iPhone leaves `ch` out,
+    // and mirroring is always stereo at 44100, so the gaps are filled with what
+    // it actually sends rather than treated as a reason to stay silent.
+    let sample_rate = request.sample_rate.unwrap_or(44100) as u32;
+    let channels = request.channels.unwrap_or(2) as u8;
+    let samples_per_frame = request.samples_per_frame.unwrap_or(480) as u32;
+    let mut playback = if decryptor.is_some() {
+        match playback::AudioPlayback::new(sample_rate, channels, samples_per_frame) {
+            Ok(playback) => Some(playback),
+            Err(error) => {
+                tracing::warn!(%error, "AirPlay audio will not be played");
+                None
+            }
+        }
+    } else {
+        // Undecrypted frames are noise; feeding them to a decoder would be
+        // worse than silence.
+        tracing::warn!("AirPlay audio arrived without a key; not playing it");
+        None
+    };
+
+    // The stored volume is applied straight away. Waiting for the next change
+    // would start every new stream at full volume, which is what made a phone
+    // set to a whisper come back loud after each reconnection.
+    if let Some(playback) = playback.as_ref() {
+        playback.set_volume(*volume.borrow_and_update());
+    }
+
+    let mut sequences = SequenceFilter::default();
+    let mut datagram = [0_u8; MAX_AUDIO_DATAGRAM];
+    let mut received = 0_u64;
+    let mut duplicates = 0_u64;
+    let mut malformed = 0_u64;
+    loop {
+        // The volume slider moves while sound is playing, so it is watched
+        // alongside the stream rather than read once at setup.
+        let count = tokio::select! {
+            datagram = socket.recv(&mut datagram) => match datagram {
+                Ok(count) => count,
+                Err(_) => {
+                    tracing::debug!(received, "AirPlay audio stream ended");
+                    return;
+                }
+            },
+            Ok(()) = volume.changed() => {
+                if let Some(playback) = playback.as_ref() {
+                    playback.set_volume(*volume.borrow_and_update());
+                }
+                continue;
+            }
+        };
+        if let Some(decryptor) = decryptor.as_ref() {
+            if count > RTP_HEADER_BYTES {
+                decryptor.decrypt(&mut datagram[RTP_HEADER_BYTES..count]);
+            }
+        }
+        match AudioPacket::parse(&datagram[..count]) {
+            Some(packet) => {
+                received += 1;
+                if !sequences.accept(packet.sequence) {
+                    duplicates += 1;
+                    if duplicates.is_power_of_two() {
+                        tracing::debug!(duplicates, "ignored a repeated AirPlay audio packet");
+                    }
+                    continue;
+                }
+                // Every frame, including the short quiet ones: a gap in sound is
+                // audible at once, and those decode to the silence that belongs
+                // between the loud parts.
+                if let Some(playback) = playback.as_mut() {
+                    playback.push(&datagram[RTP_HEADER_BYTES..count]);
+                }
+                // The first few describe the stream; after that this would be
+                // one line per 10 ms of sound.
+                if received <= 3 || received.is_power_of_two() {
+                    tracing::info!(
+                        received,
+                        payload_type = packet.payload_type,
+                        sequence = packet.sequence,
+                        timestamp = packet.timestamp,
+                        payload_bytes = packet.payload_bytes,
+                        prefix = %packet.prefix,
+                        setup = %request.describe(),
+                        "AirPlay audio packet"
+                    );
+                }
+            }
+            None => {
+                malformed += 1;
+                if malformed.is_power_of_two() {
+                    tracing::warn!(
+                        malformed,
+                        bytes = count,
+                        "unrecognised AirPlay audio packet"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rtp(payload_type: u8, sequence: u16, timestamp: u32, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x80, payload_type];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&timestamp.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 1]);
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn rtp_headers_are_split_from_the_payload() {
+        let packet = AudioPacket::parse(&rtp(96, 7, 1234, &[1, 2, 3, 4])).unwrap();
+        assert_eq!(packet.payload_type, 96);
+        assert_eq!(packet.sequence, 7);
+        assert_eq!(packet.timestamp, 1234);
+        assert_eq!(packet.payload_bytes, 4);
+        assert_eq!(packet.prefix, "01020304");
+    }
+
+    /// Long payloads are summarised, not dumped: the point is to identify the
+    /// format, and a log line per 10 ms of sound must stay readable.
+    #[test]
+    fn only_the_start_of_a_payload_is_logged() {
+        let packet = AudioPacket::parse(&rtp(96, 1, 0, &[0xab; 400])).unwrap();
+        assert_eq!(packet.payload_bytes, 400);
+        assert_eq!(packet.prefix.len(), 32);
+    }
+
+    /// The marker bit rides in the same byte as the payload type and must not
+    /// be read as part of it.
+    #[test]
+    fn the_marker_bit_is_not_part_of_the_payload_type() {
+        let packet = AudioPacket::parse(&rtp(96 | 0x80, 1, 0, &[1])).unwrap();
+        assert_eq!(packet.payload_type, 96);
+    }
+
+    #[test]
+    fn empty_and_oversized_datagrams_are_rejected() {
+        assert_eq!(AudioPacket::parse(&rtp(96, 1, 0, &[])), None);
+        assert_eq!(AudioPacket::parse(&[0; 4]), None);
+        assert_eq!(AudioPacket::parse(&vec![0; MAX_AUDIO_DATAGRAM + 1]), None);
+    }
+
+    /// The short packets a silent iPhone sends are below one AES block, so they
+    /// must come through untouched — that is what proved the tail is in the
+    /// clear in the first place.
+    #[test]
+    fn a_payload_shorter_than_a_block_is_left_alone() {
+        let decryptor = AudioDecryptor::new([0x11; 16], [0x22; 16]);
+        let mut payload = [0x00, 0x68, 0x34, 0x00];
+        decryptor.decrypt(&mut payload);
+        assert_eq!(payload, [0x00, 0x68, 0x34, 0x00]);
+    }
+
+    /// A real frame is whole blocks plus a short tail; only the blocks change.
+    #[test]
+    fn only_whole_blocks_are_decrypted() {
+        let decryptor = AudioDecryptor::new([0x11; 16], [0x22; 16]);
+        let mut payload = vec![0xab_u8; 141];
+        let tail = payload[128..].to_vec();
+        decryptor.decrypt(&mut payload);
+        assert_ne!(&payload[..128], &[0xab_u8; 128][..]);
+        assert_eq!(&payload[128..], &tail[..]);
+    }
+
+    /// Every packet starts from the same IV, so two identical frames decrypt
+    /// identically however far apart they arrived.
+    #[test]
+    fn packets_do_not_depend_on_the_ones_before_them() {
+        let decryptor = AudioDecryptor::new([0x5a; 16], [0x3c; 16]);
+        let mut first = vec![0x77_u8; 32];
+        let mut later = vec![0x77_u8; 32];
+        decryptor.decrypt(&mut first);
+        for _ in 0..10 {
+            decryptor.decrypt(&mut [0x01_u8; 48]);
+        }
+        decryptor.decrypt(&mut later);
+        assert_eq!(first, later);
+    }
+
+    /// The repeats an iPhone actually sends: 19344 arrives three times around
+    /// its neighbours, exactly as captured from a real device.
+    #[test]
+    fn repeated_packets_are_played_once() {
+        let mut filter = SequenceFilter::default();
+        assert!(filter.accept(19344));
+        assert!(!filter.accept(19344));
+        assert!(filter.accept(19345));
+        assert!(!filter.accept(19344));
+        assert!(filter.accept(19346));
+    }
+
+    /// The counter is 16 bits, so it wraps every eleven minutes of sound. That
+    /// must read as one step forward, not as a jump backwards that would mute
+    /// everything until the counter caught up again.
+    #[test]
+    fn the_sequence_counter_may_wrap() {
+        let mut filter = SequenceFilter::default();
+        assert!(filter.accept(65534));
+        assert!(filter.accept(65535));
+        assert!(filter.accept(0));
+        assert!(filter.accept(1));
+        assert!(!filter.accept(65535));
+    }
+
+    #[test]
+    fn an_audio_stream_setup_is_read_from_its_plist_entry() {
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), AUDIO_STREAM_TYPE.into());
+        stream.insert("ct".into(), 8_u64.into());
+        stream.insert("spf".into(), 480_u64.into());
+        stream.insert("ch".into(), 2_u64.into());
+        stream.insert("sr".into(), 44100_u64.into());
+        stream.insert("controlPort".into(), 6001_u64.into());
+
+        let request = AudioStreamRequest::parse(&stream);
+        assert_eq!(request.compression, Some(8));
+        assert_eq!(request.samples_per_frame, Some(480));
+        assert_eq!(request.channels, Some(2));
+        assert_eq!(request.sample_rate, Some(44100));
+        assert_eq!(request.remote_control_port, Some(6001));
+    }
+
+    #[test]
+    fn the_response_names_both_ports() {
+        let value = setup_response(7010, 7011);
+        let stream = value.as_dictionary().unwrap();
+        assert_eq!(
+            stream["type"].as_unsigned_integer(),
+            Some(AUDIO_STREAM_TYPE)
+        );
+        assert_eq!(stream["dataPort"].as_unsigned_integer(), Some(7010));
+        assert_eq!(stream["controlPort"].as_unsigned_integer(), Some(7011));
+    }
+}

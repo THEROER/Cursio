@@ -38,6 +38,8 @@ pub mod format;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -193,7 +195,11 @@ pub fn open() -> Result<Box<dyn Clipboard>, ClipboardError> {
     {
         windows::open()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::open()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(ClipboardError::Unsupported)
     }
@@ -209,7 +215,11 @@ pub fn watch(selection: Selection) -> Result<WatchHandle, ClipboardError> {
     {
         windows::watch(selection)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::watch(selection)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = selection;
         Err(ClipboardError::Unsupported)

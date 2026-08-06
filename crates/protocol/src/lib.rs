@@ -13,6 +13,7 @@ pub mod clipboard;
 pub mod files;
 pub mod frame;
 pub mod input;
+pub mod service;
 pub mod window;
 
 pub use capability::{
@@ -35,7 +36,8 @@ pub use files::{
     Chunk, FileError, FileHandle, FileKind, FileMeta, FileReqId, FilesMsg, OpenMode, Volume,
 };
 pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
-pub use input::{Edge, InputEvent, MouseButton};
+pub use input::{neighbour_across, Edge, InputEvent, MouseButton, Position};
+pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{
     Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
     WindowMeta, WindowMsg,
@@ -52,8 +54,10 @@ pub use window::{
 /// per-module, so an audio change no longer locks out a peer that only wanted
 /// clipboard. v12 introduced that split; v13 moved module traffic onto
 /// [`Message::Module`], which is what makes it real — a new module now adds no
-/// variant here at all.
-pub const PROTOCOL_VERSION: u16 = 13;
+/// variant here at all. v14 added [`Hello::position`], which every node must
+/// read to work out which of its edges faces which peer. v15 added
+/// [`Hello::service`] so placement and quality are agreed across the mesh.
+pub const PROTOCOL_VERSION: u16 = 15;
 
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
@@ -190,7 +194,6 @@ pub enum Message {
     /// else the audio module says — advertisements, gain, device and route state
     /// — is enveloped as [`audio::AudioMsg`].
     AudioChunk(audio::AudioChunk),
-
     // Clipboard traffic is no longer here: it moved to `Message::Module` with
     // `ModuleId::CLIPBOARD`, carrying `clipboard::ClipboardMsg`. It was migrated
     // first because it is pure bulk — no per-frame hot path to pay an extra
@@ -221,6 +224,15 @@ pub struct Hello {
     /// Subsystems this node has available on this link. A module runs only if
     /// both sides advertise it compatibly; see [`capability::negotiate`].
     pub modules: Vec<ModuleAdvert>,
+    /// Where this machine stands on the layout grid, so each side can work out
+    /// which of its own edges faces the other. See [`Position`].
+    pub position: Position,
+    /// What this node can carry for the mesh, and what it wants from it.
+    ///
+    /// In the greeting rather than asked for, because placing a duty has to be
+    /// settled the moment two machines meet: a round trip later is a window in
+    /// which both of them, or neither, are running it. See [`ServiceOffer`].
+    pub service: ServiceOffer,
 }
 
 impl Hello {
@@ -236,6 +248,8 @@ impl Hello {
             display_name: display_name.into(),
             device_kind: DeviceKind::Desktop,
             modules: Vec::new(),
+            position: Position::default(),
+            service: ServiceOffer::none(),
         }
     }
 }
@@ -334,7 +348,11 @@ impl Message {
         module: ModuleId,
     ) -> Result<Option<T>, ProtocolError> {
         match self {
-            Message::Module { module: id, payload, .. } if *id == module => {
+            Message::Module {
+                module: id,
+                payload,
+                ..
+            } if *id == module => {
                 let decoded = bincode::deserialize(payload)
                     .map_err(|e| ProtocolError::Decode(e.to_string()))?;
                 Ok(Some(decoded))
@@ -390,6 +408,12 @@ mod tests {
                 ModuleAdvert::symmetric(ModuleId::AUDIO, 1),
                 ModuleAdvert::new(ModuleId::INPUT, 1, ModuleRole::Source),
             ],
+            position: Position::new(1, 0),
+            service: ServiceOffer {
+                fitness: Fitness::Full,
+                wanted: Some(Quality::new(2560, 1440, 30)),
+                show_window: true,
+            },
         });
         let bytes = msg.to_bytes().unwrap();
         let back = Message::from_bytes(&bytes).unwrap();
@@ -428,11 +452,17 @@ mod tests {
     /// `Ok(None)` (not an error) is what lets a module claim-or-decline.
     #[test]
     fn a_module_does_not_decode_another_modules_frame() {
-        let msg = Message::module(ModuleId::AUDIO, Priority::Audio, &FakeModuleMsg::Ping(1)).unwrap();
+        let msg =
+            Message::module(ModuleId::AUDIO, Priority::Audio, &FakeModuleMsg::Ping(1)).unwrap();
 
-        let other = msg.decode_module::<FakeModuleMsg>(ModuleId::CLIPBOARD).unwrap();
+        let other = msg
+            .decode_module::<FakeModuleMsg>(ModuleId::CLIPBOARD)
+            .unwrap();
 
-        assert_eq!(other, None, "a frame addressed to audio was decoded by clipboard");
+        assert_eq!(
+            other, None,
+            "a frame addressed to audio was decoded by clipboard"
+        );
     }
 
     /// The scheduler ranks an envelope without decoding it, so the declared

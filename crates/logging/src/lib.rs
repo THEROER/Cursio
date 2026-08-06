@@ -76,6 +76,17 @@ pub fn log_dir() -> PathBuf {
 /// discovery still works over the pinned LAN interface. Set the env vars
 /// explicitly to override (e.g. `RUST_LOG=debug,mdns_sd=info`).
 pub fn init(app_name: &str) -> LogGuard {
+    init_with_verbosity(app_name, 0)
+}
+
+/// Initialise logging with a CLI verbosity count.
+///
+/// `0` keeps the normal `info` console / Cursio `debug` file defaults, `1`
+/// enables Cursio `debug` on the console, and `2` or more enables Cursio
+/// `trace`. Dependencies stay at `info` so runtime internals do not drown out
+/// application events. Explicit `RUST_LOG` and `CURSIO_LOG_FILE` directives
+/// still take precedence.
+pub fn init_with_verbosity(app_name: &str, verbosity: u8) -> LogGuard {
     // Before anything writes: make sure this console understands the colour
     // codes we're about to emit.
     enable_ansi_on_windows();
@@ -91,7 +102,7 @@ pub fn init(app_name: &str) -> LogGuard {
                 .with_ansi(false)
                 .with_target(true)
                 .with_writer(writer)
-                .with_filter(file_env_filter());
+                .with_filter(file_env_filter(verbosity));
             Some((layer, worker))
         }
         Err(e) => {
@@ -102,7 +113,7 @@ pub fn init(app_name: &str) -> LogGuard {
 
     let console_layer = fmt::layer()
         .with_writer(std::io::stderr)
-        .with_filter(console_env_filter());
+        .with_filter(console_env_filter(verbosity));
 
     // Split the Option so the registry always gets a (possibly no-op) file layer
     // slot; `Option<Layer>` implements Layer as a pass-through when `None`.
@@ -132,18 +143,35 @@ pub fn init(app_name: &str) -> LogGuard {
 }
 
 /// Console filter: `RUST_LOG` if set, else `info` with `mdns_sd` silenced.
-fn console_env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=off"))
+fn console_env_filter(verbosity: u8) -> EnvFilter {
+    EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_console_filter(verbosity)))
 }
 
 /// File filter: `CURSIO_LOG_FILE` if set, else `RUST_LOG` if set, else `debug`
 /// (with `mdns_sd` silenced). Lets the file stay verbose while the console
 /// stays quiet.
-fn file_env_filter() -> EnvFilter {
+fn file_env_filter(verbosity: u8) -> EnvFilter {
     if let Ok(f) = std::env::var("CURSIO_LOG_FILE") {
         return EnvFilter::new(f);
     }
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug,mdns_sd=off"))
+    EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_file_filter(verbosity)))
+}
+
+const fn default_console_filter(verbosity: u8) -> &'static str {
+    match verbosity {
+        0 => "info,mdns_sd=off",
+        1 => "info,cursio=debug,clipboard_core=debug,mdns_sd=off",
+        _ => "info,cursio=trace,clipboard_core=trace,mdns_sd=off",
+    }
+}
+
+const fn default_file_filter(verbosity: u8) -> &'static str {
+    match verbosity {
+        0 | 1 => "info,cursio=debug,clipboard_core=debug,mdns_sd=off",
+        _ => "info,cursio=trace,clipboard_core=trace,mdns_sd=off",
+    }
 }
 
 /// Turn on ANSI/VT escape handling for this process's console (Windows only).
@@ -182,3 +210,32 @@ fn enable_ansi_on_windows() {
 
 #[cfg(not(target_os = "windows"))]
 fn enable_ansi_on_windows() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbosity_selects_expected_default_filters() {
+        assert_eq!(default_console_filter(0), "info,mdns_sd=off");
+        assert_eq!(
+            default_console_filter(1),
+            "info,cursio=debug,clipboard_core=debug,mdns_sd=off"
+        );
+        assert_eq!(
+            default_console_filter(2),
+            "info,cursio=trace,clipboard_core=trace,mdns_sd=off"
+        );
+        assert_eq!(default_console_filter(u8::MAX), default_console_filter(2));
+
+        assert_eq!(
+            default_file_filter(0),
+            "info,cursio=debug,clipboard_core=debug,mdns_sd=off"
+        );
+        assert_eq!(default_file_filter(1), default_file_filter(0));
+        assert_eq!(
+            default_file_filter(2),
+            "info,cursio=trace,clipboard_core=trace,mdns_sd=off"
+        );
+    }
+}

@@ -36,6 +36,9 @@ pub mod frame_pipeline;
 pub mod framebuffer;
 pub mod window_test_support;
 
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+mod presentation_ack;
+
 /// The platform-independent half of the H.264 path (what a decoder returns,
 /// and where a stream may be entered), shared by the Linux and Windows
 /// decoders.
@@ -62,6 +65,13 @@ pub mod linux_drag;
 mod linux_capture;
 #[cfg(target_os = "linux")]
 pub use linux_capture::{PortalCaptureSession, PortalWindowCapture};
+
+#[cfg(target_os = "macos")]
+mod macos_capture;
+#[cfg(target_os = "macos")]
+pub mod macos_drag;
+#[cfg(target_os = "macos")]
+pub use macos_capture::{MacCaptureSession, MacWindowCapture, MacWindowRenderer};
 
 #[cfg(target_os = "windows")]
 pub mod video_decoder_win;
@@ -122,7 +132,7 @@ pub trait CaptureSession {
 
     /// The channel of pixel updates for this window. The first frame is a full
     /// window; subsequent frames carry only changed regions.
-    fn frames(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<WindowFrame>;
+    fn frames(&mut self) -> &mut tokio::sync::mpsc::Receiver<WindowFrame>;
 
     /// Apply one viewer input event (in the window's own coordinates) to the
     /// real window on this host.
@@ -141,6 +151,13 @@ pub trait CaptureSession {
     fn close(&mut self, reason: WindowCloseReason);
 }
 
+/// Maximum encoded packets waiting between a capture backend and the session.
+///
+/// The capture side never waits on this queue. When it fills, the backend drops
+/// the update and resets its differ/encoder so the next accepted update is
+/// independently decodable instead of extending latency with stale frames.
+pub const CAPTURE_FRAME_QUEUE_CAPACITY: usize = 8;
+
 /// Selects and starts capturing a local window (the **host** side).
 ///
 /// The entry point a backend provides. `begin` picks the window to transfer —
@@ -154,6 +171,18 @@ pub trait WindowCapture {
     /// Begin transferring the window the user is dragging out. Returns a running
     /// capture, or an error if no suitable window is available.
     fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError>;
+
+    /// Aim the next [`begin`](Self::begin) at the window whose title contains
+    /// this.
+    ///
+    /// The drag detector knows which window the user grabbed and the capture
+    /// does not, so it has to be told. Leaving it out worked on Windows by
+    /// accident — the window being dragged is the foreground one, which is what
+    /// an empty hint selects there — and could never work on macOS, where an
+    /// empty hint means the whole screen. Default is a no-op, for a backend
+    /// that picks its window some other way (the Wayland portal opens its own
+    /// chooser, and no title of ours would be honoured).
+    fn aim_at(&mut self, _title: &str) {}
 }
 
 /// A surrogate window shown on the **viewer** side.

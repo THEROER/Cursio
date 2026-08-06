@@ -418,10 +418,16 @@ mod tests {
     /// `MAX_CHUNK` bytes could never be delivered.
     #[test]
     fn a_full_chunk_fits_in_a_frame() {
-        assert!(
-            FilesMsg::MAX_CHUNK < crate::MAX_FRAME_LEN,
-            "a data chunk must leave room for its envelope"
-        );
+        // A `const` block, so the two constants are checked against each other
+        // when the crate is built rather than when someone runs the tests: a
+        // chunk larger than a frame is not a failing test, it is a build that
+        // should not have happened.
+        const {
+            assert!(
+                FilesMsg::MAX_CHUNK < crate::MAX_FRAME_LEN,
+                "a data chunk must leave room for its envelope"
+            )
+        };
         let msg = FilesMsg::Data {
             req: 1,
             offset: 0,
@@ -504,7 +510,10 @@ mod tests {
                 ..OpenMode::read_only()
             },
         ] {
-            assert!(m.is_mutating(), "{m:?} writes and must be refused read-only");
+            assert!(
+                m.is_mutating(),
+                "{m:?} writes and must be refused read-only"
+            );
         }
     }
 }

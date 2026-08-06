@@ -66,6 +66,9 @@ struct Queues {
     /// Set once the sender side is gone *and* all queues are empty, so the
     /// drainer knows to exit cleanly rather than park forever.
     closed: bool,
+    /// Fatal drainer error. Once set, the socket can never accept another
+    /// frame; producers must see an error instead of filling dead queues.
+    terminal_error: Option<String>,
 }
 
 impl Queues {
@@ -96,6 +99,15 @@ impl Queues {
     /// nothing left to write.
     fn pop_is_empty(&self) -> bool {
         self.classes.iter().all(VecDeque::is_empty)
+    }
+
+    fn fail(&mut self, error: String) {
+        for class in &mut self.classes {
+            class.clear();
+        }
+        self.queued_bytes.fill(0);
+        self.terminal_error = Some(error);
+        self.closed = true;
     }
 }
 
@@ -148,12 +160,16 @@ impl PrioritizedTx {
                             Ok(m) => m,
                             Err(e) => {
                                 tracing::warn!(error = %e, "sealing a queued frame failed");
-                                continue;
+                                drain_shared.queues.lock().unwrap().fail(e.to_string());
+                                drain_shared.drained.notify_waiters();
+                                break;
                             }
                         };
                         if let Err(e) = inner.send(&sealed).await {
                             // The link is gone; nothing more can be sent. Stop.
                             tracing::debug!(error = %e, "prioritized drainer: link closed");
+                            drain_shared.queues.lock().unwrap().fail(e.to_string());
+                            drain_shared.drained.notify_waiters();
                             break;
                         }
                         // Credited only now: a producer pacing itself against
@@ -172,6 +188,7 @@ impl PrioritizedTx {
                     }
                 }
             }
+            drain_shared.drained.notify_waiters();
         });
 
         PrioritizedTx { shared }
@@ -189,6 +206,9 @@ impl TransportTx for PrioritizedTx {
         let frames = chunk_plaintext(msg)?;
         {
             let mut q = self.shared.queues.lock().unwrap();
+            if let Some(error) = &q.terminal_error {
+                return Err(TransportError::Other(error.clone()));
+            }
             for f in frames {
                 q.push(idx, f);
             }
@@ -211,11 +231,11 @@ impl TransportTx for PrioritizedTx {
             // Register interest *before* checking, so a drain that completes
             // between the check and the await can't slip past us.
             let drained = self.shared.drained.notified();
-            let empty = {
+            let done = {
                 let q = self.shared.queues.lock().unwrap();
-                q.pop_is_empty()
+                q.pop_is_empty() || q.terminal_error.is_some()
             };
-            if empty {
+            if done {
                 return;
             }
             // Make sure the drainer is running, then wait for it to empty the
@@ -295,6 +315,19 @@ mod tests {
         assert_eq!(q.queued_bytes[class_index(Priority::Bulk)], 50);
     }
 
+    #[test]
+    fn terminal_failure_discards_every_backlog() {
+        let mut q = Queues::default();
+        q.push(class_index(Priority::Video), vec![0; 100]);
+        q.push(class_index(Priority::Bulk), vec![0; 200]);
+        q.fail("socket closed".into());
+
+        assert!(q.pop_is_empty());
+        assert_eq!(q.queued_bytes, [0; CLASS_COUNT]);
+        assert_eq!(q.terminal_error.as_deref(), Some("socket closed"));
+        assert!(q.closed);
+    }
+
     // --- End-to-end scheduling + flush over the real encrypted transport. ---
     //
     // NOTE on what is *not* unit-tested: the headline property — an input frame
@@ -342,7 +375,7 @@ mod tests {
 
         // Both arrive intact. (Order isn't asserted: without socket backpressure
         // the mock can't reproduce the interleave — see the note above.)
-        let mut got = vec![rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+        let mut got = [rx.recv().await.unwrap(), rx.recv().await.unwrap()];
         got.sort_by_key(|m| format!("{m:?}").len());
         assert!(got.contains(&input), "input must round-trip");
         assert!(got.contains(&bulk), "bulk must round-trip");
@@ -371,6 +404,36 @@ mod tests {
 
         // Receiver already has it available.
         assert_eq!(rx.recv().await.unwrap(), Message::Bye);
+    }
+
+    #[tokio::test]
+    async fn writer_failure_unblocks_flush_and_rejects_later_sends() {
+        let (a, b) = MemTransport::pair();
+        let init = tokio::spawn(async move {
+            EncryptedTransport::establish(a, b"k", Role::Initiator)
+                .await
+                .unwrap()
+        });
+        let resp = EncryptedTransport::establish(b, b"k", Role::Responder)
+            .await
+            .unwrap();
+        let init = init.await.unwrap();
+
+        let (mut tx, _rx) = Box::new(init).split_prioritized();
+        let (_peer_tx, peer_rx) = Box::new(resp).split();
+        drop(peer_rx);
+
+        let _ = tx.send(&Message::Bye).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), tx.flush())
+            .await
+            .expect("flush remained blocked after the writer failed");
+
+        assert!(tx.send(&Message::Bye).await.is_err());
+        assert_eq!(
+            tx.queue_depth(Priority::Control).queued_bytes,
+            0,
+            "dead queues must not retain unsendable frames"
+        );
     }
 
     /// A queued bulk payload must show up as a backlog, and be credited as sent
@@ -404,6 +467,9 @@ mod tests {
             "the payload must be credited to its own class, got {depth:?}"
         );
         // Another class stays at zero: a bulk transfer is not audio's backlog.
-        assert_eq!(tx.queue_depth(Priority::Audio), crate::QueueDepth::default());
+        assert_eq!(
+            tx.queue_depth(Priority::Audio),
+            crate::QueueDepth::default()
+        );
     }
 }

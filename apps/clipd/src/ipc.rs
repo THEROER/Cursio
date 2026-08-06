@@ -127,8 +127,8 @@ where
             .with_context(|| format!("removing stale socket {}", path.display()))?;
     }
 
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("listening on {}", path.display()))?;
+    let listener =
+        UnixListener::bind(&path).with_context(|| format!("listening on {}", path.display()))?;
     tracing::debug!(socket = %path.display(), "accepting commands");
 
     std::thread::spawn(move || {

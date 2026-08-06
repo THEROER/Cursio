@@ -10,6 +10,23 @@
 //!
 //! Pointer motion is captured as **relative** deltas (`REL_X`/`REL_Y`), matching
 //! the injection side and the "relative, not absolute" design requirement.
+//!
+//! ## No edge crossing, and not for want of trying
+//!
+//! Every other backend can say where the pointer is: the Wayland portal fires a
+//! barrier, the Windows hook reads the cursor, the macOS tap carries a point.
+//! evdev reports `REL_X` and `REL_Y` and nothing else — it is the *device*, not
+//! the desktop, so "the cursor reached the screen edge" is not a question this
+//! layer can answer. Summing deltas does not recover it either: the compositor
+//! applies acceleration and clamps at the edge, so the sum drifts from the real
+//! position within seconds and never comes back.
+//!
+//! Answering it needs the display server. On X11 that is `XQueryPointer` and a
+//! new dependency; deliberately not taken, because the sessions this backend
+//! actually serves are the ones with no compositor to ask. So the edges channel
+//! here is permanently empty and [`crate::spawn_capture`] says so when it picks
+//! this backend, rather than leaving the user with a cursor that stops dead at
+//! the screen edge and nothing in the log.
 
 use cursio_protocol::{InputEvent, MouseButton};
 use evdev::{Device, EventSummary, KeyCode, RelativeAxisCode};
@@ -72,13 +89,20 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     }
 
     if opened.is_empty() {
+        // Names the remedy, not just the group: every device was skipped or
+        // refused, and on a machine that has a mouse plugged in the reason is
+        // almost always that this user cannot read /dev/input/event*.
         return Err(InputError::Unavailable(
-            "no capturable input devices (check /dev/input permissions / `input` group)".into(),
+            "no capturable input devices — this user probably cannot read /dev/input/event*. \
+             Add them to the group that owns it with `sudo usermod -aG input $USER`, then log \
+             out and back in"
+                .into(),
         ));
     }
 
-    // No edge detection on evdev yet: hand back a receiver whose sender is
-    // dropped, so the channel is simply always empty.
+    // No edge detection on evdev, and none coming — see the module header. The
+    // sender is dropped here, so the channel is closed rather than merely
+    // quiet, and the forwarder reading it ends instead of parking forever.
     let (_edges_tx, edges_rx) = tokio::sync::mpsc::unbounded_channel();
 
     Ok(CaptureHandle {
@@ -137,6 +161,9 @@ fn start_reader(
                         }
                     };
                     if let Some(neutral) = translate(event) {
+                        if !grab_rx.borrow().forwards_events() {
+                            continue;
+                        }
                         // Receiver gone => nothing left to capture for; stop.
                         if tx.send(neutral).is_err() {
                             tracing::debug!("capture receiver gone; stopping reader");

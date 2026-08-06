@@ -145,12 +145,28 @@ pub enum TransportCandidate {
 impl TransportCandidate {
     /// Lower is better. Used by [`select_transport`] to order candidates.
     ///
-    /// TCP/Wi-Fi is our only (and preferred) channel today. Future channels
-    /// slot into this ranking rather than into caller code.
+    /// TCP/Wi-Fi is our only channel today, but not every address reaches a
+    /// peer the same way: a VPN address is routed off the machine, through a
+    /// relay and back, which costs tens of milliseconds that a shared cursor
+    /// and a 60 fps screen both feel. Discovery already refuses to *announce*
+    /// over such an interface; this is the other half, because an address can
+    /// also arrive from the trust store, where it was persisted by a session
+    /// that ran somewhere else.
+    ///
+    /// Ranked rather than rejected: away from the LAN a VPN is the only way
+    /// through, and a peer that is merely slow beats a peer that is
+    /// unreachable. Future channels slot into this ranking rather than into
+    /// caller code.
     fn preference_rank(&self) -> u8 {
         match self {
+            TransportCandidate::Tcp(addr) if discovery::is_virtual_addr(&addr.ip()) => 1,
             TransportCandidate::Tcp(_) => 0,
         }
+    }
+
+    /// Whether this candidate goes through a VPN or other virtual interface.
+    fn is_virtual(&self) -> bool {
+        self.preference_rank() > 0
     }
 }
 
@@ -167,6 +183,16 @@ pub async fn select_transport(
 
     let mut last_err: Option<TransportError> = None;
     for candidate in candidates {
+        // Said before connecting, not after: once it works nobody looks at the
+        // log, and "everything is oddly laggy today" is exactly the symptom
+        // this explains.
+        if candidate.is_virtual() {
+            tracing::warn!(
+                ?candidate,
+                "no LAN address for this peer; going through a VPN or virtual interface, which \
+                 adds latency to input and video"
+            );
+        }
         match connect_candidate(&candidate).await {
             Ok(t) => return Ok(t),
             Err(e) => {
@@ -186,6 +212,44 @@ async fn connect_candidate(
         TransportCandidate::Tcp(addr) => {
             let t = TcpTransport::connect(*addr).await?;
             Ok(Box::new(t))
+        }
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn tcp(addr: &str) -> TransportCandidate {
+        TransportCandidate::Tcp(addr.parse::<SocketAddr>().unwrap())
+    }
+
+    /// The whole point: with both addresses known, the LAN one is dialled and
+    /// the peer is not reached through a relay it does not need.
+    #[test]
+    fn a_lan_address_is_dialled_before_a_vpn_one() {
+        let mut candidates = [tcp("100.101.102.103:7777"), tcp("192.168.1.35:7777")];
+        candidates.sort_by_key(|c| c.preference_rank());
+        assert!(!candidates[0].is_virtual());
+        assert!(candidates[1].is_virtual());
+    }
+
+    /// Away from the LAN a VPN is the only way through, so it must still be
+    /// tried rather than filtered out.
+    #[test]
+    fn a_vpn_address_is_still_a_candidate_on_its_own() {
+        let candidate = tcp("100.101.102.103:7777");
+        assert!(candidate.is_virtual());
+        assert_eq!(candidate.preference_rank(), 1);
+    }
+
+    /// A home LAN commonly lives in 192.168/16 and 10/8; treating either as
+    /// virtual would demote the address we actually want.
+    #[test]
+    fn ordinary_home_ranges_are_not_treated_as_virtual() {
+        for addr in ["192.168.0.5:7777", "10.0.0.5:7777", "172.15.0.5:7777"] {
+            assert!(!tcp(addr).is_virtual(), "{addr} should rank as LAN");
         }
     }
 }

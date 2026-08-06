@@ -355,8 +355,9 @@ of the capture backend work.
      implements `IsScreencastSession`), so pixels out and input back cost the
      user **one dialog**, and `notify_pointer_motion_absolute` can address the
      cast's stream node directly — window coordinates need no translation.
-   - Trigger for now: `--share-window` on `serve`/`connect`/`mesh`. The picker
-     opens once at session start; the drag trigger is milestone 5.
+   - Trigger at the time: a `--share-window` flag, since the drag trigger was
+     still milestone 5. That flag is gone — the drag is the only way to start a
+     transfer now, so there is no second way to say the same thing.
    - Not included by design: no adaptive controller (fixed rate, acks are
      accepted and ignored), no lossy codec, dirty regions are a single bounding
      box rather than several tiles.
@@ -365,7 +366,8 @@ of the capture backend work.
 4. **Lossy codecs** — implement `LossyImage` then `LossyVideo` behind the
    existing `TileCodec` tags; host picks per-tile by region kind.
 5. **The edge-drag trigger — CODE COMPLETE, NOT YET RUN (2026-07-20)** — drag a
-   window past `--peer-edge` and it transfers; drag it back and it returns
+   window past the edge that borders the peer (derived from the two machines'
+   `--at` positions) and it transfers; drag it back and it returns
    (`WindowCloseReason::Returned`).
    - Detection is *not* shared with the cursor's edge crossing, and cannot be:
      that signal carries no window, and on Wayland it only fires while input
@@ -384,7 +386,8 @@ of the capture backend work.
      re-publishing Mutter's grab-op signals on D-Bus. Note this is a GNOME
      limitation, not a Wayland one — wlroots compositors do offer
      `ext_foreign_toplevel_list`.
-   - The extension is **optional**: without it dragging does nothing and
-     `--share-window-title` still works. Nothing in the daemon may depend on it.
+   - The extension is **optional**, and without it a GNOME machine cannot
+     *start* a transfer — it still receives one. Nothing in the daemon may
+     depend on it being present.
 6. **Windows backend** — Graphics.Capture host + Win32 surrogate; verify true
    cross-OS Windows↔Linux transfer.

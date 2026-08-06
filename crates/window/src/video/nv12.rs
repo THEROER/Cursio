@@ -174,7 +174,10 @@ mod tests {
         let nv12 = solid(2, 2, 2, 235, 128, 128);
         let bgra = to_bgra(&nv12, 2, 2, 2);
         for px in bgra.chunks(4) {
-            assert!(px[0] > 250 && px[1] > 250 && px[2] > 250, "expected white, got {px:?}");
+            assert!(
+                px[0] > 250 && px[1] > 250 && px[2] > 250,
+                "expected white, got {px:?}"
+            );
             assert_eq!(px[3], 0xFF);
         }
     }
@@ -198,7 +201,10 @@ mod tests {
         assert!(red[2] > red[0] && red[2] > red[1], "expected red-dominant");
 
         let blue = to_bgra(&solid(2, 2, 2, 128, 240, 128), 2, 2, 2);
-        assert!(blue[0] > blue[1] && blue[0] > blue[2], "expected blue-dominant");
+        assert!(
+            blue[0] > blue[1] && blue[0] > blue[2],
+            "expected blue-dominant"
+        );
     }
 
     /// Build a solid BGRA image.

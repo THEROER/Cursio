@@ -38,6 +38,13 @@ enum Job {
     },
     /// Put received content onto the local clipboard.
     Write(ClipboardContent),
+    /// Check whether the clipboard still contains a copy we wrote. Used to
+    /// distinguish the watch notification caused by that write from a real
+    /// local copy, so two peers do not echo the same payload forever.
+    Matches(
+        ClipboardContent,
+        std::sync::mpsc::Sender<Result<bool, ClipboardError>>,
+    ),
 }
 
 /// The worker's answer to a [`Job::Read`].
@@ -168,6 +175,18 @@ impl ClipboardWorker {
         let _ = self.jobs.send(Job::Write(content));
     }
 
+    /// Whether the current clipboard is the received copy we most recently
+    /// wrote. The write and this check use the same FIFO worker, so a change
+    /// notification cannot make the check overtake its corresponding write.
+    pub fn matches(&self, content: &ClipboardContent) -> Result<bool, ClipboardError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.jobs.send(Job::Matches(content.clone(), tx)).is_err() {
+            return Err(ClipboardError::Backend("clipboard worker gone".into()));
+        }
+        rx.recv()
+            .unwrap_or_else(|_| Err(ClipboardError::Backend("clipboard worker gone".into())))
+    }
+
     /// Stop the worker and watch threads.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -190,6 +209,15 @@ fn run_worker(
     // Opened lazily and cached: a headless host errors here, and we don't want
     // that to kill the session — jobs simply fail until (if ever) it works.
     let mut clipboard: Option<Box<dyn Clipboard>> = None;
+    // What the platform reported *after* the last write of a received copy.
+    //
+    // Not the same as what was written, and that difference is the whole point:
+    // write one `public.png` and macOS reports it back alongside the TIFF it
+    // synthesised, Windows alongside CF_DIB and CF_DIBV5. Comparing the echo
+    // check against what we handed over therefore never matched for an image,
+    // so a machine offered its own received picture straight back and the two
+    // peers traded it forever.
+    let mut after_write: Option<Vec<ClipboardFormat>> = None;
 
     let open = |cb: &mut Option<Box<dyn Clipboard>>| -> Result<(), ClipboardError> {
         if cb.is_none() {
@@ -207,20 +235,22 @@ fn run_worker(
         match job {
             Job::List(reply) => {
                 let result = match open(&mut clipboard) {
-                    Ok(()) => clipboard
-                        .as_mut()
-                        .unwrap()
-                        .read(Selection::Clipboard)
-                        .map(|content| {
-                            content
-                                .entries
-                                .iter()
-                                .map(|e| ClipboardFormatOffer {
-                                    format: e.format.clone(),
-                                    size: e.size,
-                                })
-                                .collect()
-                        }),
+                    Ok(()) => {
+                        clipboard
+                            .as_mut()
+                            .unwrap()
+                            .read(Selection::Clipboard)
+                            .map(|content| {
+                                content
+                                    .entries
+                                    .iter()
+                                    .map(|e| ClipboardFormatOffer {
+                                        format: e.format.clone(),
+                                        size: e.size,
+                                    })
+                                    .collect()
+                            })
+                    }
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(result);
@@ -232,10 +262,22 @@ fn run_worker(
                         .unwrap()
                         .load(Selection::Clipboard, &format)
                     {
-                        Ok(bytes) => ReadReply::Ok { generation, format, bytes },
-                        Err(error) => ReadReply::Failed { generation, format, error },
+                        Ok(bytes) => ReadReply::Ok {
+                            generation,
+                            format,
+                            bytes,
+                        },
+                        Err(error) => ReadReply::Failed {
+                            generation,
+                            format,
+                            error,
+                        },
                     },
-                    Err(error) => ReadReply::Failed { generation, format, error },
+                    Err(error) => ReadReply::Failed {
+                        generation,
+                        format,
+                        error,
+                    },
                 };
                 let _ = reads.send(reply);
             }
@@ -244,15 +286,188 @@ fn run_worker(
                     tracing::warn!(error = %e, "cannot open clipboard to write received content");
                     continue;
                 }
-                if let Err(e) = clipboard
-                    .as_mut()
-                    .unwrap()
-                    .write(Selection::Clipboard, &content)
-                {
+                let handle = clipboard.as_mut().unwrap();
+                if let Err(e) = handle.write(Selection::Clipboard, &content) {
                     tracing::warn!(error = %e, "writing received clipboard content failed");
+                    after_write = None;
+                    continue;
                 }
+                // Read straight back, while the FIFO guarantees nothing else has
+                // touched the clipboard, to learn what the platform made of the
+                // write. Formats only — the bytes are still the ones we sent,
+                // and materialising a pasted image twice would cost real time.
+                after_write = match handle.read(Selection::Clipboard) {
+                    Ok(current) => Some(current.entries.iter().map(|e| e.format.clone()).collect()),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "could not read back the write; echo checks fall back to a strict compare");
+                        None
+                    }
+                };
+            }
+            Job::Matches(content, reply) => {
+                let result = match open(&mut clipboard) {
+                    Ok(()) => clipboard_matches(
+                        clipboard.as_mut().unwrap().as_mut(),
+                        &content,
+                        after_write.as_deref(),
+                    ),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
         }
     }
     tracing::debug!("clipboard worker thread ended");
+}
+
+/// Compare a received, fully-loaded copy with the current platform clipboard.
+///
+/// Comparing only formats or sizes is insufficient: the ping-pong in question
+/// has the same one text format and the same size on every iteration. Requiring
+/// the same format set and bytes also means a genuine local copy wins even if
+/// it arrives while the remote write notification is still in flight.
+///
+/// `after_write` is the format set the platform reported once the copy was
+/// written, and it is what the current clipboard has to match. Using
+/// `expected`'s own set instead worked only for text: every platform expands an
+/// image into representations nobody wrote — a PNG becomes a PNG and a TIFF —
+/// so the sets never matched, the write looked like a fresh local copy, and it
+/// went straight back to the peer that sent it.
+fn clipboard_matches(
+    clipboard: &mut dyn Clipboard,
+    expected: &ClipboardContent,
+    after_write: Option<&[ClipboardFormat]>,
+) -> Result<bool, ClipboardError> {
+    if expected.is_empty() || expected.entries.iter().any(|entry| !entry.is_loaded()) {
+        return Ok(false);
+    }
+
+    let current = clipboard.read(Selection::Clipboard)?;
+    // Without a read-back, hold to the old rule: what is there must be exactly
+    // what was written. Weaker than the read-back and never wrong, only
+    // over-eager to call a local copy genuine.
+    let permitted: Vec<ClipboardFormat> = match after_write {
+        Some(formats) => formats.to_vec(),
+        None => expected.entries.iter().map(|e| e.format.clone()).collect(),
+    };
+    if current.entries.len() != permitted.len()
+        || current
+            .entries
+            .iter()
+            .any(|entry| !permitted.contains(&entry.format))
+    {
+        return Ok(false);
+    }
+
+    for entry in &expected.entries {
+        let expected_bytes = entry.bytes.as_deref().expect("loaded above");
+        let current_bytes = clipboard.load(Selection::Clipboard, &entry.format)?;
+        if current_bytes != expected_bytes {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clipboard_core::ClipboardEntry;
+
+    struct MemoryClipboard(ClipboardContent);
+
+    impl Clipboard for MemoryClipboard {
+        fn read(&mut self, _selection: Selection) -> Result<ClipboardContent, ClipboardError> {
+            Ok(self.0.clone())
+        }
+
+        fn load(
+            &mut self,
+            _selection: Selection,
+            format: &ClipboardFormat,
+        ) -> Result<Vec<u8>, ClipboardError> {
+            self.0
+                .bytes(format)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| ClipboardError::FormatUnavailable(format.mime().into()))
+        }
+
+        fn write(
+            &mut self,
+            _selection: Selection,
+            content: &ClipboardContent,
+        ) -> Result<(), ClipboardError> {
+            self.0 = content.clone();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn received_copy_matches_its_own_clipboard_write() {
+        let expected = ClipboardContent::text("same bytes");
+        let mut clipboard = MemoryClipboard(expected.clone());
+        assert!(clipboard_matches(&mut clipboard, &expected, None).unwrap());
+    }
+
+    #[test]
+    fn same_format_and_size_with_different_bytes_is_not_an_echo() {
+        let expected = ClipboardContent::text("first");
+        let mut clipboard = MemoryClipboard(ClipboardContent::text("other"));
+        assert!(!clipboard_matches(&mut clipboard, &expected, None).unwrap());
+    }
+
+    /// Every platform expands a pasted image: write one `public.png` and macOS
+    /// reports it back beside the TIFF it made, Windows beside CF_DIB. Judging
+    /// the echo by what was written therefore never matched, and the machine
+    /// offered the picture it had just received straight back — the two peers
+    /// traded one image forever.
+    #[test]
+    fn an_image_the_platform_expanded_is_still_our_own_write() {
+        let png = ClipboardFormat::Other("public.png".into());
+        let tiff = ClipboardFormat::Other("public.tiff".into());
+        let written = {
+            let mut content = ClipboardContent::default();
+            content.insert(ClipboardEntry::loaded(png.clone(), b"\x89PNG...".to_vec()));
+            content
+        };
+        // What the pasteboard actually holds afterwards.
+        let mut on_clipboard = written.clone();
+        on_clipboard.insert(ClipboardEntry::loaded(tiff.clone(), b"II*\0...".to_vec()));
+        let mut clipboard = MemoryClipboard(on_clipboard);
+
+        assert!(
+            !clipboard_matches(&mut clipboard, &written, None).unwrap(),
+            "without the read-back there is nothing to tell the extra format from a local copy"
+        );
+        assert!(
+            clipboard_matches(&mut clipboard, &written, Some(&[png, tiff])).unwrap(),
+            "the read-back says the platform made those formats, so this is our own write"
+        );
+    }
+
+    /// The read-back does not make the check blind: a genuine copy that happens
+    /// to carry the same formats still has to carry the same bytes.
+    #[test]
+    fn a_local_copy_wearing_the_same_formats_is_not_an_echo() {
+        let png = ClipboardFormat::Other("public.png".into());
+        let mut written = ClipboardContent::default();
+        written.insert(ClipboardEntry::loaded(png.clone(), b"first".to_vec()));
+        let mut other = ClipboardContent::default();
+        other.insert(ClipboardEntry::loaded(png.clone(), b"second".to_vec()));
+
+        let mut clipboard = MemoryClipboard(other);
+        assert!(!clipboard_matches(&mut clipboard, &written, Some(&[png])).unwrap());
+    }
+
+    #[test]
+    fn richer_local_copy_with_the_same_plain_text_is_not_an_echo() {
+        let expected = ClipboardContent::text("hello");
+        let mut local = expected.clone();
+        local.insert(ClipboardEntry::loaded(
+            ClipboardFormat::Html,
+            b"<b>hello</b>".to_vec(),
+        ));
+        let mut clipboard = MemoryClipboard(local);
+        assert!(!clipboard_matches(&mut clipboard, &expected, None).unwrap());
+    }
 }

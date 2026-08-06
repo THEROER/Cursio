@@ -116,7 +116,10 @@ fn main() -> Result<()> {
     };
 
     match cli.command {
-        Command::Daemon { max_items, max_bytes } => daemon(&dir, max_items, max_bytes),
+        Command::Daemon {
+            max_items,
+            max_bytes,
+        } => daemon(&dir, max_items, max_bytes),
         Command::List { limit, search } => list(&dir, limit, search.as_deref()),
         Command::Pick { with, limit } => pick(&dir, with.as_deref(), limit),
         Command::Ping => {

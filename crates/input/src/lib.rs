@@ -14,11 +14,17 @@ use cursio_protocol::InputEvent;
 #[cfg(target_os = "linux")]
 pub mod capture;
 #[cfg(target_os = "linux")]
-pub mod uinput;
-#[cfg(target_os = "linux")]
 pub mod lin_cursor;
+#[cfg(target_os = "macos")]
+pub mod mac;
+#[cfg(target_os = "macos")]
+pub mod mac_capture;
+#[cfg(target_os = "macos")]
+pub mod mac_cursor;
+#[cfg(target_os = "macos")]
+pub mod mac_keymap;
 #[cfg(target_os = "linux")]
-pub mod wl_capture;
+pub mod uinput;
 #[cfg(target_os = "windows")]
 pub mod win;
 #[cfg(target_os = "windows")]
@@ -27,9 +33,17 @@ pub mod win_capture;
 pub mod win_cursor;
 #[cfg(target_os = "windows")]
 mod win_keymap;
+#[cfg(target_os = "linux")]
+pub mod wl_capture;
 
 #[cfg(target_os = "linux")]
 pub use lin_cursor::LinuxCursor;
+#[cfg(target_os = "macos")]
+pub use mac::MacInjector;
+#[cfg(target_os = "macos")]
+pub use mac_cursor::MacCursor;
+#[cfg(target_os = "macos")]
+pub use mac_keymap::ModifierMap;
 #[cfg(target_os = "linux")]
 pub use uinput::UinputInjector;
 #[cfg(target_os = "windows")]
@@ -37,14 +51,19 @@ pub use win::WinInjector;
 #[cfg(target_os = "windows")]
 pub use win_cursor::WinCursor;
 
-/// Start Windows RawInput capture, wiring edge-crossing detection to
-/// `peer_edge`. Same signature as the Linux [`spawn_capture`] so callers are
-/// platform-agnostic. Unlike Linux (where the Wayland portal watches all edges
-/// and the caller filters), the Windows jump-zone watch lives in the mouse hook,
-/// so the edge is pushed down into the backend here.
+/// Start Windows RawInput capture. Same signature as the other platforms so
+/// callers stay platform-agnostic; the jump-zone watch lives in the mouse hook
+/// and is pointed at an edge by [`set_peer_edge`].
 #[cfg(target_os = "windows")]
-pub fn spawn_capture(peer_edge: Option<cursio_protocol::Edge>) -> Result<CaptureHandle, InputError> {
-    win_capture::spawn_capture_with_edge(peer_edge)
+pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
+    win_capture::spawn_capture_with_edge(peer_edge())
+}
+
+/// Start macOS capture through a `CGEventTap`. The tap reads the watched edge
+/// per event, so there is nothing to arm here.
+#[cfg(target_os = "macos")]
+pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
+    mac_capture::spawn_capture()
 }
 
 /// Start local input capture, picking the backend for this Linux session.
@@ -52,33 +71,86 @@ pub fn spawn_capture(peer_edge: Option<cursio_protocol::Edge>) -> Result<Capture
 /// On **Wayland** we can't grab `/dev/input` usefully, so we use the
 /// `InputCapture` portal + libei ([`wl_capture`]) — which also gives us edge
 /// crossing. On X11 / no display server we fall back to the evdev backend
-/// ([`capture`]). The caller gets the same [`CaptureHandle`] either way.
-///
-/// `peer_edge` (which of our edges borders the peer) is passed to the Wayland
-/// backend so it only arms a barrier on *that* edge — a barrier on any other
-/// edge would still grab input on activation (locking the user), even though the
-/// caller later filters the crossing out. With `None`, no barrier is armed, so
-/// edge-crossing is off (only the hotkey hands off). The evdev backend has no
-/// edge detection, so it ignores this.
+/// ([`capture`]), which cannot detect an edge at all. The caller gets the same
+/// [`CaptureHandle`] either way.
 #[cfg(target_os = "linux")]
-pub fn spawn_capture(peer_edge: Option<cursio_protocol::Edge>) -> Result<CaptureHandle, InputError> {
+pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland");
     if wayland {
         tracing::info!("using Wayland InputCapture portal for capture");
-        wl_capture::spawn_wayland_capture(peer_edge)
+        wl_capture::spawn_wayland_capture()
     } else {
+        // Stated rather than left to be discovered. evdev reports `REL_X`/
+        // `REL_Y` and nothing else, so "the cursor reached the edge" is not a
+        // question this backend can answer — and a mesh where the cursor simply
+        // stops dead at the screen edge, with nothing in the log, is
+        // indistinguishable from one where the peer is misplaced.
         tracing::info!("using evdev for capture");
+        tracing::warn!(
+            "this session is not Wayland: edge crossing is unavailable (evdev has no cursor \
+             position), so Ctrl+Alt+G is the only way to hand the cursor over"
+        );
         capture::spawn_capture()
+    }
+}
+
+/// Which of this machine's edges borders the peer the cursor would leave to.
+///
+/// Machine-wide rather than per session, and settable after capture has
+/// started, because those are the two facts that decide where it lives. There
+/// is one physical mouse, so there is one edge it can leave by; and the answer
+/// comes from the peer's position in the greeting, which arrives seconds
+/// *after* the barrier has to exist. Passing it at construction meant the user
+/// had to state on the command line something both machines already knew.
+///
+/// Encoded as a number so the capture backends — which read it from a signal
+/// handler, a Win32 hook and a `CFRunLoop` callback — can do so without a lock.
+static PEER_EDGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Tell capture which edge borders the peer. `None` turns edge crossing off.
+pub fn set_peer_edge(edge: Option<cursio_protocol::Edge>) {
+    let code = match edge {
+        None => 0,
+        Some(cursio_protocol::Edge::Left) => 1,
+        Some(cursio_protocol::Edge::Right) => 2,
+        Some(cursio_protocol::Edge::Top) => 3,
+        Some(cursio_protocol::Edge::Bottom) => 4,
+    };
+    if PEER_EDGE.swap(code, std::sync::atomic::Ordering::SeqCst) != code {
+        tracing::info!(?edge, "watching this edge for a crossing toward the peer");
+    }
+    // The Windows hook keeps its own copy, because it is read from inside a
+    // low-level hook where nothing may allocate or lock and the module's own
+    // static is what that code already reaches for.
+    #[cfg(target_os = "windows")]
+    win_capture::set_watched_edge(edge);
+    // Wayland does not read this value, it acts on it: a barrier is a D-Bus
+    // object placed on one edge, so moving the watch means taking capture down
+    // and putting a new list up. Harmless when the evdev backend is the one
+    // running — nobody is listening.
+    #[cfg(target_os = "linux")]
+    wl_capture::set_watched_edge(edge);
+}
+
+/// Which edge capture is watching, if any.
+pub fn peer_edge() -> Option<cursio_protocol::Edge> {
+    match PEER_EDGE.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => Some(cursio_protocol::Edge::Left),
+        2 => Some(cursio_protocol::Edge::Right),
+        3 => Some(cursio_protocol::Edge::Top),
+        4 => Some(cursio_protocol::Edge::Bottom),
+        _ => None,
     }
 }
 
 /// A screen-edge crossing detected by the capture backend: the shared cursor
 /// was shoved past `edge` at `pos_norm` along it (`0.0`..=`1.0`). The session
 /// turns this into an edge-crossing ownership handoff (if that edge borders the
-/// peer). Only the Wayland backend emits these today (via portal barriers);
-/// evdev/Windows will grow their own edge detection later.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// peer).
+///
+/// Emitted by the Wayland portal barriers, the Windows mouse hook and the macOS
+/// event tap. The evdev backend never emits one and cannot: see [`capture`].
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeCrossing {
     /// Which of this machine's edges the cursor left across.
@@ -91,7 +163,6 @@ pub struct EdgeCrossing {
 /// Handle to a running input capture: a channel of neutral events, the names of
 /// the devices being read, and a [`GrabControl`] to freeze/unfreeze local input.
 /// Both platform capture backends return this.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub struct CaptureHandle {
     /// Receives neutral input events from all captured devices.
     pub events: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
@@ -111,9 +182,8 @@ pub struct CaptureHandle {
 /// InputCapture portal has to be *armed* while we're active so a cursor shoved
 /// off the peer-facing edge is detected (see [`wl_capture`]) — arming does **not**
 /// grab input, only watches the edges. On evdev/Windows there are no edge
-/// barriers, so `Active` and `Idle` collapse to the same "don't grab" behaviour
-/// and only `Dormant` grabs.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// barriers, so `Active` and `Idle` are both ungrabbed; unlike `Active`, `Idle`
+/// discards physical events instead of retaining them for a future session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     /// This machine holds the shared cursor. Local input acts normally (not
@@ -139,13 +209,19 @@ pub enum InputMode {
     Shutdown,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl InputMode {
     /// Whether local input should be grabbed (frozen locally) in this mode.
     /// Only `Dormant` grabs; this is what evdev/Windows key off, ignoring the
     /// Wayland-only arm-while-`Active` distinction.
     pub fn grabbed(self) -> bool {
         matches!(self, InputMode::Dormant)
+    }
+
+    /// Whether physical events belong to an active session and should enter
+    /// its queue. Idle capture stays installed for fast reconnects, but it must
+    /// not retain hours of local input for the next peer.
+    pub fn forwards_events(self) -> bool {
+        matches!(self, InputMode::Active | InputMode::Dormant)
     }
 }
 
@@ -155,18 +231,18 @@ impl InputMode {
 /// While this machine drives the peer (`Dormant`) its own cursor/keyboard are
 /// grabbed so they don't double-act; while it holds the cursor (`Active`) input
 /// stays local but, on Wayland, edge barriers are armed to catch an off-edge
-/// crossing. Capture keeps running in every mode; the mode only changes routing.
+/// crossing. The backend may stay installed in every mode, but `Idle` events are
+/// discarded so reconnecting cannot replay stale input.
 /// Backed by a [`tokio::sync::watch`] the capture tasks observe (Linux evdev:
 /// `EVIOCGRAB`; Wayland: portal enable/disable; Windows: low-level hooks).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Clone)]
 pub struct GrabControl {
     tx: tokio::sync::watch::Sender<InputMode>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl GrabControl {
     /// Create a control paired with the receiver the capture tasks watch.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
     pub(crate) fn new() -> (Self, tokio::sync::watch::Receiver<InputMode>) {
         let (tx, rx) = tokio::sync::watch::channel(InputMode::Idle);
         (Self { tx }, rx)
@@ -179,6 +255,11 @@ impl GrabControl {
         let _ = self.tx.send(mode);
     }
 
+    /// Current capture mode.
+    pub fn mode(&self) -> InputMode {
+        *self.tx.borrow()
+    }
+
     /// Convenience for the two-state callers that only care about grab: `true`
     /// = [`Dormant`](InputMode::Dormant), `false` = [`Active`](InputMode::Active).
     pub fn set_grabbed(&self, grabbed: bool) {
@@ -187,6 +268,29 @@ impl GrabControl {
         } else {
             InputMode::Active
         });
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    #[test]
+    fn idle_and_shutdown_do_not_forward_events() {
+        assert!(!InputMode::Idle.forwards_events());
+        assert!(!InputMode::Shutdown.forwards_events());
+        assert!(InputMode::Active.forwards_events());
+        assert!(InputMode::Dormant.forwards_events());
+    }
+
+    #[test]
+    fn grab_control_reports_each_transition() {
+        let (control, _receiver) = GrabControl::new();
+        assert_eq!(control.mode(), InputMode::Idle);
+        control.set_mode(InputMode::Active);
+        assert_eq!(control.mode(), InputMode::Active);
+        control.set_mode(InputMode::Dormant);
+        assert_eq!(control.mode(), InputMode::Dormant);
     }
 }
 
@@ -223,6 +327,23 @@ pub trait CursorControl {
 
     /// Restore this machine's system cursor. Idempotent.
     fn show(&mut self) -> Result<(), InputError>;
+
+    /// Pull this machine's pointer clear of the edge that borders the peer.
+    ///
+    /// Called when the cursor leaves for the peer, and it is what stops the
+    /// crossing from happening again by itself. A crossing leaves the local
+    /// pointer pinned against the edge — `pos_norm` of exactly `0.0` or
+    /// `0.9989` in a log is that, not a coincidence — so the next small
+    /// movement is outward from the edge and reads as a fresh crossing. Two in
+    /// a row with no return between them is what makes a machine believe it is
+    /// driving the peer while the user is sitting at the other end, and from
+    /// there the cursor cannot be sent back.
+    ///
+    /// The Wayland backend has always done this from inside its capture loop
+    /// (`nudge_off_edge`, after Deskflow's `avoidJumpZone`); this is the same
+    /// idea for the platforms whose pointer is moved rather than barriered.
+    /// Default is a no-op, for a backend with no way to move the pointer.
+    fn nudge_off_peer_edge(&mut self) {}
 
     /// Short label for logs/UI, e.g. `"windows"`, `"x11"`, `"wayland-noop"`.
     fn backend(&self) -> &'static str;

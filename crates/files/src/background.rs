@@ -139,6 +139,21 @@ fn yield_to_everything_else() {
             libc::setpriority(libc::PRIO_PROCESS, tid, FILE_WORK_NICE);
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        // `PRIO_DARWIN_THREAD` addresses the calling thread and takes no id —
+        // the Linux trick of passing a tid to `PRIO_PROCESS` would nice the
+        // whole process here, cursor and all.
+        //
+        // Not `PRIO_DARWIN_BG`: that is Apple's full background band, which
+        // also throttles the thread's disk I/O, and a transfer on an otherwise
+        // idle Mac would crawl for no one's benefit. Same reasoning as the
+        // Windows arm above.
+        const FILE_WORK_NICE: libc::c_int = 5;
+        unsafe {
+            libc::setpriority(libc::PRIO_DARWIN_THREAD, 0, FILE_WORK_NICE);
+        }
+    }
 }
 
 #[cfg(test)]

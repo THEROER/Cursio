@@ -289,10 +289,16 @@ pub enum AudioMsg {
     /// mixer. `gain` is linear (1.0 = unity, 0.0 = mute).
     Gain { id: AudioStreamId, gain: f32 },
     /// Either side: end a stream (app stopped, device gone, consumer dropped it).
-    StreamClose { id: AudioStreamId, reason: AudioStreamCloseReason },
+    StreamClose {
+        id: AudioStreamId,
+        reason: AudioStreamCloseReason,
+    },
     /// Non-owner -> owner: *request* a change to a device's replicated state.
     /// The owner decides, applies, and broadcasts — invariant #3.
-    DeviceStateSet { device: String, field: DeviceStateField },
+    DeviceStateSet {
+        device: String,
+        field: DeviceStateField,
+    },
     /// Owner -> everyone: a device's current state, whole object and idempotent.
     DeviceState { device: String, state: DeviceState },
     /// Stream host -> receiver: (re)target one Remote Stream to a device.
@@ -301,7 +307,10 @@ pub enum AudioMsg {
     /// reconnect so routing survives without waiting for link events.
     RoutingState(RoutingState),
     /// Receiver -> stream host: a group operation on a whole Route.
-    RouteOp { target_device: (String, String), op: RouteOp },
+    RouteOp {
+        target_device: (String, String),
+        op: RouteOp,
+    },
     /// Stream host -> receiver: the current state of one Route, idempotent.
     RouteState(RouteState),
     /// Consumer -> owner: whether anything here is actually listening to a

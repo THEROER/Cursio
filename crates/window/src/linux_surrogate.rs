@@ -35,8 +35,8 @@ use gtk::{gdk, glib};
 use tokio::sync::mpsc;
 
 use crate::{
-    Surrogate, WindowError, WindowRenderer, codec::decode_tile, framebuffer::Framebuffer,
-    video_decoder::VideoDecoder,
+    codec::decode_tile, framebuffer::Framebuffer, presentation_ack::PresentationAcks,
+    video_decoder::VideoDecoder, Surrogate, WindowError, WindowRenderer,
 };
 /// Snapshot a framebuffer as a texture GTK can paint.
 ///
@@ -54,7 +54,7 @@ fn to_texture(fb: &Framebuffer) -> gdk::MemoryTexture {
 /// What the session hands the GTK thread.
 enum SurrogateCommand {
     /// A decoded tile to blit and present.
-    Frame { dirty: Rect, raw: Vec<u8> },
+    Frame { seq: u32, dirty: Rect, raw: Vec<u8> },
     /// A raw H.264 packet, to be decoded **on the GTK thread**.
     ///
     /// Every other codec is decoded on the session's thread, to keep expensive
@@ -64,7 +64,7 @@ enum SurrogateCommand {
     /// the packet crosses the channel instead of the pixels, and the decoder
     /// lives beside the framebuffer it feeds. That is also where the decoded
     /// frame is wanted, so it costs one less copy.
-    VideoPacket(Vec<u8>),
+    VideoPacket { seq: u32, packet: Vec<u8> },
     /// Window geometry changed; reallocate before the next blit.
     Resize { width: u32, height: u32 },
     /// Tear the window down.
@@ -80,33 +80,12 @@ pub struct GtkSurrogate {
     height: u32,
     commands: mpsc::UnboundedSender<SurrogateCommand>,
     input: mpsc::UnboundedReceiver<WindowInput>,
-    /// Highest seq presented but not yet acked; `None` when nothing is pending.
-    pending_ack: Option<u32>,
+    presented: mpsc::UnboundedReceiver<u32>,
+    acks: PresentationAcks,
     /// Whether a `LossyVideo` packet has been seen, so the log says once that
     /// the stream switched to video. The decoder itself lives on the GTK
     /// thread — see [`SurrogateCommand::VideoPacket`].
     video_started: bool,
-    /// When the last ack went out, so acks stay a few per second rather than
-    /// one per frame (see [`WindowFrameAck`]).
-    last_ack: std::time::Instant,
-}
-
-/// How often an ack may be emitted. Frames arrive at up to 60/s; acking each one
-/// would spend upstream bandwidth on pure feedback. A few per second is enough
-/// for the host's rate controller to see the sent-vs-acked gap move.
-const ACK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-
-impl GtkSurrogate {
-    /// Record that `seq` has been queued for paint, for the next due ack.
-    ///
-    /// Both codec paths end here so the rate-control loop sees every frame,
-    /// whether it arrived as a tile or as a video packet.
-    fn note_presented(&mut self, seq: u32) {
-        self.pending_ack = Some(match self.pending_ack {
-            Some(prev) => prev.max(seq),
-            None => seq,
-        });
-    }
 }
 
 impl Surrogate for GtkSurrogate {
@@ -136,9 +115,11 @@ impl Surrogate for GtkSurrogate {
             // The packet, not the pixels, crosses to the GTK thread — the
             // decoder cannot live here (see `SurrogateCommand::VideoPacket`).
             self.commands
-                .send(SurrogateCommand::VideoPacket(frame.data.clone()))
+                .send(SurrogateCommand::VideoPacket {
+                    seq: frame.seq,
+                    packet: frame.data.clone(),
+                })
                 .map_err(|_| WindowError::Backend("surrogate window is gone".into()))?;
-            self.note_presented(frame.seq);
             return Ok(());
         }
 
@@ -148,12 +129,12 @@ impl Surrogate for GtkSurrogate {
         let raw = decode_tile(frame.codec, &frame.data, expected)?;
         self.commands
             .send(SurrogateCommand::Frame {
+                seq: frame.seq,
                 dirty: frame.dirty,
                 raw,
             })
             .map_err(|_| WindowError::Backend("surrogate window is gone".into()))?;
 
-        self.note_presented(frame.seq);
         Ok(())
     }
 
@@ -162,16 +143,10 @@ impl Surrogate for GtkSurrogate {
     }
 
     fn take_ack(&mut self) -> Option<WindowFrameAck> {
-        let seq = self.pending_ack?;
-        if self.last_ack.elapsed() < ACK_INTERVAL {
-            return None;
+        while let Ok(seq) = self.presented.try_recv() {
+            self.acks.note_presented(seq);
         }
-        self.last_ack = std::time::Instant::now();
-        self.pending_ack = None;
-        Some(WindowFrameAck {
-            id: self.id,
-            acked_seq: seq,
-        })
+        self.acks.take()
     }
 
     fn close(&mut self, reason: WindowCloseReason) {
@@ -207,13 +182,14 @@ impl WindowRenderer for GtkWindowRenderer {
 fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let (presented_tx, presented_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let meta = meta.clone();
     let thread_meta = meta.clone();
     std::thread::Builder::new()
         .name(format!("cursio-surrogate-{}", meta.id))
-        .spawn(move || gtk_thread(thread_meta, cmd_rx, input_tx, ready_tx))
+        .spawn(move || gtk_thread(thread_meta, cmd_rx, input_tx, presented_tx, ready_tx))
         .map_err(|e| WindowError::Backend(format!("spawn surrogate thread: {e}")))?;
 
     match ready_rx.recv() {
@@ -223,9 +199,9 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
             height: meta.height,
             commands: cmd_tx,
             input: input_rx,
-            pending_ack: None,
+            presented: presented_rx,
+            acks: PresentationAcks::new(meta.id),
             video_started: false,
-            last_ack: std::time::Instant::now(),
         }),
         Ok(Err(e)) => Err(WindowError::Backend(e)),
         Err(_) => Err(WindowError::Backend(
@@ -239,6 +215,7 @@ fn gtk_thread(
     meta: WindowMeta,
     mut commands: mpsc::UnboundedReceiver<SurrogateCommand>,
     input_tx: mpsc::UnboundedSender<WindowInput>,
+    presented_tx: mpsc::UnboundedSender<u32>,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     if let Err(e) = gtk::init() {
@@ -250,9 +227,12 @@ fn gtk_thread(
     let fb = Rc::new(RefCell::new(Framebuffer::new(meta.width, meta.height)));
 
     let picture = gtk::Picture::builder()
-        // The surrogate must show the host's pixels 1:1; letting GTK scale to
-        // fit would blur text and desynchronise the input coordinates we send
-        // back, which are in the *host's* pixel space.
+        // `Fill` maps the texture onto the whole allocation, which keeps the
+        // widget↔host coordinate mapping a single ratio (see `to_host`) — the
+        // letterboxing of `Contain` would put the host's origin at an offset
+        // this code would then have to track. Sharpness comes from the window
+        // being resized to the source's resolution whenever that changes, so
+        // the ratio stays 1:1 and nothing is resampled.
         .content_fit(gtk::ContentFit::Fill)
         .build();
     picture.set_paintable(Some(&to_texture(&fb.borrow())));
@@ -287,18 +267,20 @@ fn gtk_thread(
         let tick_started = std::time::Instant::now();
 
         let mut painted = false;
+        let mut presented_seq: Option<u32> = None;
         // Bounded per tick: a burst of frames must not starve the paint that
         // makes them visible.
         for _ in 0..16 {
             match commands.try_recv() {
-                Ok(SurrogateCommand::Frame { dirty, raw }) => {
+                Ok(SurrogateCommand::Frame { seq, dirty, raw }) => {
                     if let Err(e) = fb_for_frames.borrow_mut().blit(dirty, &raw) {
                         tracing::warn!(error = %e, "dropping malformed tile");
                         continue;
                     }
                     painted = true;
+                    presented_seq = Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
                 }
-                Ok(SurrogateCommand::VideoPacket(packet)) => {
+                Ok(SurrogateCommand::VideoPacket { seq, packet }) => {
                     // Opened on first use: a window that never sends video
                     // never pays for a decoder.
                     if decoder.is_none() {
@@ -310,7 +292,9 @@ fn gtk_thread(
                             }
                         }
                     }
-                    let Some(dec) = decoder.as_mut() else { continue };
+                    let Some(dec) = decoder.as_mut() else {
+                        continue;
+                    };
                     match dec.decode(&packet) {
                         Ok(pictures) => {
                             for pic in pictures {
@@ -320,6 +304,15 @@ fn gtk_thread(
                                 // it disagrees, rather than refusing the blit.
                                 if fb.width != pic.width || fb.height != pic.height {
                                     fb.resize(pic.width, pic.height);
+                                    // The window follows too. `ContentFit::Fill`
+                                    // stretches the texture across whatever
+                                    // allocation it is given, so a stream that
+                                    // changes resolution — a quality change, or
+                                    // an encoder rounding up to whole macroblocks
+                                    // — would otherwise be scaled into the old
+                                    // window's size for the rest of the session.
+                                    main_loop_window
+                                        .set_default_size(pic.width as i32, pic.height as i32);
                                 }
                                 let full = Rect {
                                     x: 0,
@@ -332,6 +325,8 @@ fn gtk_thread(
                                     continue;
                                 }
                                 painted = true;
+                                presented_seq =
+                                    Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
                             }
                         }
                         Err(e) => {
@@ -374,6 +369,9 @@ fn gtk_thread(
         // visual update coalesce into a single present.
         if painted {
             picture_for_frames.set_paintable(Some(&to_texture(&fb_for_frames.borrow())));
+            if let Some(seq) = presented_seq {
+                let _ = presented_tx.send(seq);
+            }
         }
         let took = tick_started.elapsed();
         if took >= std::time::Duration::from_millis(100) {

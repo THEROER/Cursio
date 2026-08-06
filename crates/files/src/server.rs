@@ -202,7 +202,12 @@ impl FileServer {
     }
 
     /// Read from an open handle. Returns fewer bytes than asked at end of file.
-    pub fn read(&mut self, handle: FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, FileError> {
+    pub fn read(
+        &mut self,
+        handle: FileHandle,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, FileError> {
         let open = self.open.get_mut(&handle).ok_or(FileError::BadHandle)?;
         open.file
             .seek(SeekFrom::Start(offset))
@@ -225,7 +230,12 @@ impl FileServer {
     }
 
     /// Write to an open handle.
-    pub fn write(&mut self, handle: FileHandle, offset: u64, bytes: &[u8]) -> Result<u64, FileError> {
+    pub fn write(
+        &mut self,
+        handle: FileHandle,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<u64, FileError> {
         let open = self.open.get_mut(&handle).ok_or(FileError::BadHandle)?;
         if !open.writable {
             return Err(FileError::ReadOnly);
@@ -336,13 +346,16 @@ fn to_file_error(e: std::io::Error) -> FileError {
 /// free count makes others refuse to write, believing the disk full. A
 /// plausible figure is wrong in a way nothing crashes on; zero is wrong in a way
 /// that takes other programs down.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 pub(crate) const FALLBACK_TOTAL: u64 = 1 << 40; // 1 TiB
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 pub(crate) const FALLBACK_FREE: u64 = 1 << 39; // half of it
 
 /// Total and free bytes for the filesystem holding `path`.
 ///
 /// Falls back to [`FALLBACK_TOTAL`]/[`FALLBACK_FREE`] rather than zero when the
 /// query fails.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn capacity_of(path: &Path) -> (u64, u64) {
     match raw_capacity(path) {
         // A total of zero is as dangerous as a failed query, so treat it the
@@ -352,7 +365,10 @@ fn capacity_of(path: &Path) -> (u64, u64) {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// `statvfs` is POSIX, so one implementation covers both Unix hosts. The field
+/// widths differ (macOS counts blocks in 32 bits, Linux in 64), which the casts
+/// below absorb.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn raw_capacity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -401,12 +417,20 @@ fn raw_capacity(path: &Path) -> Option<(u64, u64)> {
     Some((total, free_to_caller))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(all(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    test
+))]
 fn raw_capacity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-#[cfg(target_os = "linux")]
+/// One volume rooted at `/` on either Unix.
+///
+/// macOS mounts removable disks under `/Volumes` and Linux under `/media` or
+/// `/mnt`, so both are already reachable by walking down from the root — the
+/// drive-letter enumeration Windows needs has no counterpart here.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn detect_volumes() -> Vec<SharedVolume> {
     let root = PathBuf::from("/");
     let (total_bytes, free_bytes) = capacity_of(&root);
@@ -449,7 +473,7 @@ fn detect_volumes() -> Vec<SharedVolume> {
     out
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn detect_volumes() -> Vec<SharedVolume> {
     Vec::new()
 }
@@ -489,7 +513,22 @@ mod tests {
         let (total, free) = capacity_of(Path::new("/nonexistent/path/for/this/test"));
         assert_eq!(total, FALLBACK_TOTAL);
         assert_eq!(free, FALLBACK_FREE);
-        assert!(total > 0 && free > 0, "the fallback itself must be non-zero");
+        assert!(
+            total > 0 && free > 0,
+            "the fallback itself must be non-zero"
+        );
+    }
+
+    /// A host with no volumes advertises the module and then answers every
+    /// listing with nothing, which reads as a broken link rather than an
+    /// unsupported platform — so each host this builds for must find at least
+    /// one.
+    #[test]
+    fn a_supported_host_finds_something_to_share() {
+        assert!(
+            !detect_volumes().is_empty(),
+            "this platform serves file requests but offers no volume"
+        );
     }
 
     /// Every detected volume carries a usable capacity, since that is what the
@@ -642,10 +681,15 @@ mod tests {
             Err(FileError::ReadOnly)
         ));
         assert!(matches!(srv.mkdir("R:", "new"), Err(FileError::ReadOnly)));
-        assert!(matches!(srv.remove("R:", "f.txt"), Err(FileError::ReadOnly)));
+        assert!(matches!(
+            srv.remove("R:", "f.txt"),
+            Err(FileError::ReadOnly)
+        ));
 
         // Reading still works — that is the point of a read-only share.
-        let (h, _) = srv.open("R:", "f.txt", OpenMode::read_only()).expect("opens");
+        let (h, _) = srv
+            .open("R:", "f.txt", OpenMode::read_only())
+            .expect("opens");
         assert_eq!(srv.read(h, 0, 4).expect("reads"), b"data");
     }
 
@@ -659,7 +703,10 @@ mod tests {
         let srv = server_on(tmp.path());
 
         let entries = srv.read_dir("T:", "").expect("lists");
-        let link = entries.iter().find(|e| e.name == "escape").expect("present");
+        let link = entries
+            .iter()
+            .find(|e| e.name == "escape")
+            .expect("present");
         assert_eq!(
             link.kind,
             FileKind::Symlink,

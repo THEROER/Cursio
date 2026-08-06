@@ -106,10 +106,14 @@ fn main() {
     ffmpeg_next::init().expect("ffmpeg init");
 
     println!();
-    println!("Lossless H.264 through cursio's own encoder — {W}x{H}, {FRAMES} frames @ {FPS:.0}fps");
-    println!("Raw BGRA for comparison: {:.1} KiB/frame, {:.0} Mbit/s",
+    println!(
+        "Lossless H.264 through cursio's own encoder — {W}x{H}, {FRAMES} frames @ {FPS:.0}fps"
+    );
+    println!(
+        "Raw BGRA for comparison: {:.1} KiB/frame, {:.0} Mbit/s",
         (W as f64 * H as f64 * 4.0) / 1024.0,
-        W as f64 * H as f64 * 4.0 * 8.0 * FPS / 1e6);
+        W as f64 * H as f64 * 4.0 * 8.0 * FPS / 1e6
+    );
     println!();
 
     bench("static", &static_frames());

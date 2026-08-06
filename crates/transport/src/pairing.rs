@@ -16,6 +16,7 @@
 //! milestone; this module establishes and persists the trust.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 use cursio_protocol::{Message, PeerId};
@@ -238,8 +239,16 @@ impl TrustStore {
     /// Load the store from disk, or return an empty one if none exists yet.
     pub fn load() -> Result<Self, PairingError> {
         let path = Self::path()?;
-        match std::fs::read(&path) {
+        Self::load_from(&path)
+    }
+
+    fn load_from(path: &std::path::Path) -> Result<Self, PairingError> {
+        match std::fs::read(path) {
             Ok(bytes) => {
+                if let Some(parent) = path.parent() {
+                    restrict_directory(parent)?;
+                }
+                restrict_file(path)?;
                 serde_json::from_slice(&bytes).map_err(|e| PairingError::Store(e.to_string()))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -291,12 +300,17 @@ impl TrustStore {
 
     fn save(&self) -> Result<(), PairingError> {
         let path = Self::path()?;
+        self.save_to(&path)
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> Result<(), PairingError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| PairingError::Store(e.to_string()))?;
+            restrict_directory(parent)?;
         }
         let json =
             serde_json::to_vec_pretty(self).map_err(|e| PairingError::Store(e.to_string()))?;
-        std::fs::write(&path, json).map_err(|e| PairingError::Store(e.to_string()))
+        write_private_file(path, &json)
     }
 
     /// Path to the trust-store file in the platform config directory.
@@ -305,6 +319,71 @@ impl TrustStore {
             .ok_or_else(|| PairingError::Store("cannot resolve config directory".into()))?;
         Ok(dirs.config_dir().join("trusted_peers.json"))
     }
+}
+
+/// Narrow the trust store's directory to this user.
+///
+/// Unix does it by mode. Windows has no `chmod`, and the store lives under
+/// `%APPDATA%`, whose default ACL already grants only this user and the
+/// administrators — so the protection is the profile's, not ours. That is worth
+/// saying out loud rather than leaving as an empty function: an administrator
+/// who moved the config directory somewhere world-readable would get no
+/// warning from us, and this is where the paired keys are.
+fn restrict_directory(path: &std::path::Path) -> Result<(), PairingError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| PairingError::Store(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        tracing::debug!(
+            path = %path.display(),
+            "no permission model here; the trust store inherits the profile directory's ACL"
+        );
+    }
+    Ok(())
+}
+
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), PairingError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(path)
+        .map_err(|e| PairingError::Store(e.to_string()))?;
+    restrict_file(path)?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| PairingError::Store(e.to_string()))
+}
+
+/// The same, for the file itself. See [`restrict_directory`] for why the
+/// non-Unix arm only reports.
+fn restrict_file(path: &std::path::Path) -> Result<(), PairingError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| PairingError::Store(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        tracing::debug!(
+            path = %path.display(),
+            "no permission model here; the trust store inherits the profile directory's ACL"
+        );
+    }
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -362,6 +441,36 @@ mod tests {
             last_addr: None,
         };
         assert_eq!(peer.shared_key().unwrap(), vec![0x0a, 0x0b, 0x0c]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_store_is_private_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("cursio-trust-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("trusted_peers.json");
+        let store = TrustStore::default();
+        store.save_to(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        TrustStore::load_from(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "loading must tighten permissions on an existing store"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

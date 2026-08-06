@@ -43,7 +43,10 @@ async fn main() {
             }
         }
     }
-    println!("captured {chunks} chunks / {bytes} bytes from {} alone", app.app_name);
+    println!(
+        "captured {chunks} chunks / {bytes} bytes from {} alone",
+        app.app_name
+    );
     if chunks == 0 {
         eprintln!("NO AUDIO captured (is that app actually making sound?)");
         std::process::exit(4);

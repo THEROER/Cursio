@@ -55,6 +55,13 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
 # against the system libav* (7.1 here); no vendored FFmpeg build.
 ffmpeg-next = "8.1"
 
+# macOS window capture. ScreenCaptureKit is Objective-C, and it is compiled
+# into this crate rather than spawned as a helper: Screen Recording permission
+# belongs to the responsible application, which a temporary unpacked binary is
+# not. `libc` is only for the pipe the capture writes frames into.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 # Windows window capture (Graphics Capture / Desktop Duplication by HWND) and
 # surrogate rendering land here as they're implemented. The behaviour of a
 # *hidden* window under Windows.Graphics.Capture is being settled first, by the
@@ -80,6 +87,10 @@ windows = { version = "0.61", features = [
     "Win32_System_WinRT_Graphics_Capture",
     # Finding the window, hiding it (layered alpha), and PostMessage replay.
     "Win32_UI_WindowsAndMessaging",
+    # Per-monitor DPI awareness for the surrogate. Without it the client area is
+    # reported in virtual pixels and DWM rescales the finished window, so the
+    # host's frames reach the screen resampled twice.
+    "Win32_UI_HiDpi",
     "Win32_Foundation",
     # H.264 decoding for the surrogate. Media Foundation is the answer to
     # `ffmpeg-next` needing system libav*, which Windows does not have: the
@@ -91,6 +102,12 @@ windows = { version = "0.61", features = [
     # `ICodecAPI` passes its encoder settings as VARIANTs.
     "Win32_System_Variant",
 ] }
+
+# Unconditional on purpose: a build script is compiled for the host whatever the
+# target is, so gating this behind `cfg(target_os = "macos")` left `build.rs`
+# referring to a crate that was not there when building on Windows or Linux.
+[build-dependencies]
+cc.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
@@ -104,3 +121,22 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # encode_bench calls ffmpeg_next::init() directly before benchmarking.
 ffmpeg-next = "8.1"
+
+# The probes drive Linux-only backends (portal capture, the GNOME drag
+# extension, the ffmpeg encoder), so they cannot compile anywhere else. Gating
+# them behind a feature keeps `cargo test -p cursio-window` working on macOS and
+# Windows, where the library itself builds fine.
+[features]
+linux-probes = []
+
+[[example]]
+name = "capture_probe"
+required-features = ["linux-probes"]
+
+[[example]]
+name = "drag_probe"
+required-features = ["linux-probes"]
+
+[[example]]
+name = "encode_bench"
+required-features = ["linux-probes"]

@@ -16,7 +16,9 @@ async fn main() {
     .expect("virtual sink");
     let _play = Playback::open(1, "Cursio: Dual Play".to_string()).expect("playback");
 
-    println!("both up. route audio to 'Cursio: Dual Test' (pactl set-default-sink cursio_dual_sink)");
+    println!(
+        "both up. route audio to 'Cursio: Dual Test' (pactl set-default-sink cursio_dual_sink)"
+    );
 
     let mut chunks = 0u64;
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));

@@ -135,6 +135,13 @@ pub struct ClipboardEngine {
     /// pump is enough.
     pending_failures: Vec<ClipboardFailed>,
 
+    /// The last copy pulled from the peer and written locally. Clipboard APIs
+    /// report our own write as a local change; retaining its bytes lets the
+    /// worker recognise and suppress that echo. It stays until a genuinely
+    /// different local copy appears, which also covers platforms that emit
+    /// more than one notification for a single write.
+    last_remote_copy: Option<ClipboardContent>,
+
     /// The peer's display name, for logs.
     peer_name: String,
 
@@ -179,6 +186,7 @@ impl ClipboardEngine {
             outbound: HashMap::new(),
             pending_request: None,
             pending_failures: Vec::new(),
+            last_remote_copy: None,
             peer_name,
             offered: 0,
             pulled: 0,
@@ -261,6 +269,23 @@ impl ClipboardEngine {
             return Ok(());
         }
 
+        if let Some(remote) = &self.last_remote_copy {
+            match self.worker.matches(remote) {
+                Ok(true) => {
+                    tracing::debug!("ignoring clipboard change caused by peer copy");
+                    return Ok(());
+                }
+                Ok(false) => self.last_remote_copy = None,
+                Err(error) => {
+                    // Do not let an optional echo check disable ordinary local
+                    // sharing. A normal list/read below will report any real
+                    // backend failure in its existing path.
+                    tracing::debug!(%error, "could not compare clipboard with peer copy");
+                    self.last_remote_copy = None;
+                }
+            }
+        }
+
         let formats = match self.worker.list_formats() {
             Ok(formats) => formats,
             Err(ClipboardError::Empty) => {
@@ -288,7 +313,10 @@ impl ClipboardEngine {
         }
 
         self.local_gen += 1;
-        let offer = ClipboardOffer { generation: self.local_gen, formats };
+        let offer = ClipboardOffer {
+            generation: self.local_gen,
+            formats,
+        };
         self.local_offer = Some(offer.clone());
         self.offered += 1;
         tracing::info!(
@@ -304,12 +332,19 @@ impl ClipboardEngine {
     async fn pump_read_replies(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
         while let Some(reply) = self.worker.next_read_reply() {
             match reply {
-                ReadReply::Ok { generation, format, bytes } => {
+                ReadReply::Ok {
+                    generation,
+                    format,
+                    bytes,
+                } => {
                     // The copy may have moved on while the worker read: if this
                     // generation is no longer the current local one, the bytes
                     // are stale — tell the requester rather than serving them.
                     if generation != self.local_gen {
-                        tracing::debug!(generation, "read finished for a superseded copy; dropping");
+                        tracing::debug!(
+                            generation,
+                            "read finished for a superseded copy; dropping"
+                        );
                         send(
                             tx,
                             ClipboardMsg::Failed(ClipboardFailed {
@@ -336,10 +371,20 @@ impl ClipboardEngine {
                     // Queue for chunked streaming from `pump_outbound`.
                     self.outbound.insert(
                         (generation, format.clone()),
-                        OutboundTransfer { generation, format, bytes, offset: 0, next_seq: 0 },
+                        OutboundTransfer {
+                            generation,
+                            format,
+                            bytes,
+                            offset: 0,
+                            next_seq: 0,
+                        },
                     );
                 }
-                ReadReply::Failed { generation, format, error } => {
+                ReadReply::Failed {
+                    generation,
+                    format,
+                    error,
+                } => {
                     let reason = match error {
                         ClipboardError::FormatUnavailable(_) => ClipboardFailReason::FormatGone,
                         ClipboardError::Empty | ClipboardError::OwnerGone => {
@@ -348,8 +393,15 @@ impl ClipboardEngine {
                         other => ClipboardFailReason::ReadFailed(other.to_string()),
                     };
                     tracing::debug!(generation, format = %format.mime(), ?reason, "serve failed");
-                    send(tx, ClipboardMsg::Failed(ClipboardFailed { generation, format, reason }))
-                        .await?;
+                    send(
+                        tx,
+                        ClipboardMsg::Failed(ClipboardFailed {
+                            generation,
+                            format,
+                            reason,
+                        }),
+                    )
+                    .await?;
                 }
             }
         }
@@ -373,7 +425,8 @@ impl ClipboardEngine {
         let mut budget = 4usize;
 
         // Collect keys first to avoid holding a borrow across the async send.
-        let keys: Vec<(ClipboardGeneration, ClipboardFormat)> = self.outbound.keys().cloned().collect();
+        let keys: Vec<(ClipboardGeneration, ClipboardFormat)> =
+            self.outbound.keys().cloned().collect();
         for key in keys {
             if budget == 0 {
                 break;
@@ -435,7 +488,11 @@ impl ClipboardEngine {
         // Ignore an offer older than one we've already seen (reordering).
         if let Some(seen) = self.peer_gen {
             if offer.generation <= seen {
-                tracing::trace!(generation = offer.generation, seen, "ignoring stale/rerun offer");
+                tracing::trace!(
+                    generation = offer.generation,
+                    seen,
+                    "ignoring stale/rerun offer"
+                );
                 return;
             }
         }
@@ -567,7 +624,12 @@ impl ClipboardEngine {
         transfer.next_seq += 1;
 
         if data.last {
-            let InboundTransfer { format, buf, generation, .. } = self.inbound.take().unwrap();
+            let InboundTransfer {
+                format,
+                buf,
+                generation,
+                ..
+            } = self.inbound.take().unwrap();
             tracing::info!(
                 generation,
                 format = %format.mime(),
@@ -577,6 +639,7 @@ impl ClipboardEngine {
             let content = ClipboardContent {
                 entries: vec![ClipboardEntry::loaded(format, buf)],
             };
+            self.last_remote_copy = Some(content.clone());
             self.worker.write(content);
             self.pulled += 1;
         }
@@ -619,10 +682,7 @@ impl crate::module::ModuleFactory for ClipboardFactory {
             .then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::CLIPBOARD, VERSION))
     }
 
-    fn build(
-        &self,
-        ctx: &crate::module::SessionCtx,
-    ) -> anyhow::Result<Box<dyn SessionModule>> {
+    fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         Ok(Box::new(ClipboardEngine::new(ctx.peer_name().to_string())))
     }
 }
@@ -651,12 +711,18 @@ mod tests {
         }
     }
 
-    fn offer(generation: ClipboardGeneration, formats: &[(ClipboardFormat, u64)]) -> ClipboardOffer {
+    fn offer(
+        generation: ClipboardGeneration,
+        formats: &[(ClipboardFormat, u64)],
+    ) -> ClipboardOffer {
         ClipboardOffer {
             generation,
             formats: formats
                 .iter()
-                .map(|(f, s)| ClipboardFormatOffer { format: f.clone(), size: *s })
+                .map(|(f, s)| ClipboardFormatOffer {
+                    format: f.clone(),
+                    size: *s,
+                })
                 .collect(),
         }
     }
@@ -670,9 +736,16 @@ mod tests {
             1,
             &[(ClipboardFormat::Text, 5), (ClipboardFormat::Html, 20)],
         ));
-        let req = eng.pending_request.take().expect("an offer should queue a pull");
+        let req = eng
+            .pending_request
+            .take()
+            .expect("an offer should queue a pull");
         assert_eq!(req.generation, 1);
-        assert_eq!(req.format, ClipboardFormat::Html, "richer html beats plain text");
+        assert_eq!(
+            req.format,
+            ClipboardFormat::Html,
+            "richer html beats plain text"
+        );
     }
 
     /// An offer with nothing we can paste must not request anything.
@@ -692,7 +765,10 @@ mod tests {
         eng.on_offer(&offer(5, &[(ClipboardFormat::Text, 3)]));
         eng.pending_request = None; // pretend we sent it
         eng.on_offer(&offer(4, &[(ClipboardFormat::Text, 3)]));
-        assert!(eng.pending_request.is_none(), "older offer must not re-trigger a pull");
+        assert!(
+            eng.pending_request.is_none(),
+            "older offer must not re-trigger a pull"
+        );
         assert_eq!(eng.peer_gen, Some(5));
     }
 
@@ -700,7 +776,10 @@ mod tests {
     #[tokio::test]
     async fn oversized_offer_is_not_pulled() {
         let mut eng = ClipboardEngine::new("peer".into());
-        eng.on_offer(&offer(1, &[(ClipboardFormat::ImagePng, MAX_PAYLOAD_BYTES + 1)]));
+        eng.on_offer(&offer(
+            1,
+            &[(ClipboardFormat::ImagePng, MAX_PAYLOAD_BYTES + 1)],
+        ));
         assert!(eng.pending_request.is_none());
     }
 
@@ -710,8 +789,14 @@ mod tests {
     async fn request_for_superseded_copy_fails_stale() {
         let mut eng = ClipboardEngine::new("peer".into());
         eng.local_gen = 7;
-        eng.on_request(&ClipboardRequest { generation: 3, format: ClipboardFormat::Text });
-        let f = eng.pending_failures.first().expect("a stale request must be answered");
+        eng.on_request(&ClipboardRequest {
+            generation: 3,
+            format: ClipboardFormat::Text,
+        });
+        let f = eng
+            .pending_failures
+            .first()
+            .expect("a stale request must be answered");
         assert_eq!(f.reason, ClipboardFailReason::StaleGeneration);
     }
 
@@ -721,8 +806,14 @@ mod tests {
         let mut eng = ClipboardEngine::new("peer".into());
         eng.local_gen = 2;
         eng.local_offer = Some(offer(2, &[(ClipboardFormat::Text, 4)]));
-        eng.on_request(&ClipboardRequest { generation: 2, format: ClipboardFormat::ImagePng });
-        let f = eng.pending_failures.first().expect("an unoffered format must be answered");
+        eng.on_request(&ClipboardRequest {
+            generation: 2,
+            format: ClipboardFormat::ImagePng,
+        });
+        let f = eng
+            .pending_failures
+            .first()
+            .expect("an unoffered format must be answered");
         assert_eq!(f.reason, ClipboardFailReason::FormatGone);
     }
 
@@ -840,7 +931,10 @@ mod tests {
         let chunks: Vec<ClipboardData> = tx
             .sent
             .iter()
-            .filter_map(|m| m.decode_module::<ClipboardMsg>(ModuleId::CLIPBOARD).unwrap())
+            .filter_map(|m| {
+                m.decode_module::<ClipboardMsg>(ModuleId::CLIPBOARD)
+                    .unwrap()
+            })
             .filter_map(|m| match m {
                 ClipboardMsg::Data(d) => Some(d),
                 _ => None,
@@ -877,6 +971,9 @@ mod tests {
         let mut tx = RecordingTx::default();
         eng.pump_outbound(&mut tx).await.unwrap();
         assert!(eng.outbound.is_empty());
-        assert!(tx.sent.is_empty(), "nothing should be sent for a superseded serve");
+        assert!(
+            tx.sent.is_empty(),
+            "nothing should be sent for a superseded serve"
+        );
     }
 }

@@ -32,12 +32,12 @@ pub mod codec;
 
 #[cfg(target_os = "linux")]
 pub mod pipewire_backend;
-#[cfg(target_os = "windows")]
-pub mod wasapi_backend;
 /// Drives the Cursio virtual audio driver, which is what gives Windows the
 /// same per-device parity Linux gets from PipeWire.
 #[cfg(target_os = "windows")]
 pub mod vad_client;
+#[cfg(target_os = "windows")]
+pub mod wasapi_backend;
 
 use cursio_protocol::{
     AudioChunk, AudioFrameAck, AudioStreamCloseReason, AudioStreamId, AudioStreamMeta,
@@ -209,6 +209,7 @@ pub fn list_app_streams() -> Result<Vec<AppStream>, AudioError> {
 
 /// Marker in a device name that identifies one of Cursio's own mirrors, so
 /// enumeration can skip them (see [`list_output_devices`]).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MIRROR_MARKER: &str = "cursio";
 
 // ---------------------------------------------------------------------------
@@ -402,16 +403,31 @@ impl Capture {
     }
 
     /// The stream advertisement to send before any chunk.
-    pub fn advertisements(
-        &mut self,
-    ) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta> {
-        self.inner.advertisements()
+    pub fn advertisements(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.advertisements()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            unreachable!("unsupported platforms cannot construct Capture")
+        }
     }
 
     /// Captured audio chunks.
     pub fn chunks(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioChunk> {
-        self.inner.chunks()
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.chunks()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            unreachable!("unsupported platforms cannot construct Capture")
+        }
     }
+
+    /// Stop this capture and release its platform stream immediately.
+    pub fn stop(self) {}
 }
 
 /// A running whole-device playback node, on whichever backend this platform has.
@@ -449,9 +465,7 @@ impl Playback {
         #[cfg(target_os = "windows")]
         {
             let inner = match device {
-                Some(name) => {
-                    wasapi_backend::WasapiSink::open_device(id, name, node_name.clone())?
-                }
+                Some(name) => wasapi_backend::WasapiSink::open_device(id, name, node_name.clone())?,
                 None => wasapi_backend::WasapiSink::open(id, node_name.clone())?,
             };
             Ok(Playback { inner })
@@ -494,7 +508,15 @@ impl Playback {
 
     /// Enqueue one inbound chunk for playback.
     pub fn play(&self, chunk: &AudioChunk) -> Result<(), AudioError> {
-        self.inner.play(chunk)
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            self.inner.play(chunk)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = chunk;
+            Err(AudioError::Unsupported)
+        }
     }
 
     /// Whether anything on this machine is actually consuming this node.

@@ -47,7 +47,7 @@ pub const INPUT_VERSION: u16 = 1;
 
 /// What a node needs to know to bring a link up.
 ///
-/// A struct rather than eight arguments: every caller sets most of these the
+/// A struct rather than a positional argument list: every caller sets most of these the
 /// same way, and the ones that differ are the interesting ones.
 pub struct Handshake<'a> {
     pub identity: &'a NodeIdentity,
@@ -57,8 +57,10 @@ pub struct Handshake<'a> {
     /// property of the connection — whoever dialled — not a hierarchy.
     pub role: Role,
     pub registry: &'a ModuleRegistry,
-    /// Which of our screen edges borders the peer, when that is configured.
-    pub peer_edge: Option<cursio_protocol::Edge>,
+    /// Where this machine stands in the user's layout.
+    pub position: cursio_protocol::Position,
+    /// What this machine can carry for the mesh, and what it wants from it.
+    pub service: cursio_protocol::ServiceOffer,
     /// Whether this machine has input to send the peer.
     ///
     /// Follow the *capture*, not a command-line flag: capture is one
@@ -81,6 +83,11 @@ pub struct Identified<T> {
     pub transport: T,
     pub peer: PeerHello,
     negotiated: cursio_protocol::Negotiated,
+    /// Which edge borders this peer, worked out from the two positions as soon
+    /// as it greeted us. Carried across the split rather than recomputed: the
+    /// second half no longer has the peer's position to hand, and deriving the
+    /// same answer twice is how the two halves start disagreeing.
+    peer_edge: Option<cursio_protocol::Edge>,
 }
 
 impl<T> Identified<T> {
@@ -98,6 +105,10 @@ pub struct Link {
     pub modules: Vec<Box<dyn SessionModule>>,
     /// Who holds the shared cursor, and whether the peer can hold it at all.
     pub cursor: CursorSetup,
+    /// Which of this machine's edges borders this peer, derived from the two
+    /// positions. The caller points capture at it: the answer is only knowable
+    /// once the peer has said hello, which is after capture exists.
+    pub peer_edge: Option<cursio_protocol::Edge>,
 }
 
 /// Say hello and work out which modules can run.
@@ -115,12 +126,20 @@ where
         plan.identity,
         session::local_device_kind(),
         &advertised,
+        plan.position,
+        plan.service,
     )
     .await?;
+    // Derived per link, not per process: four machines in a row each border a
+    // different neighbour, and a single machine-wide setting can only ever
+    // state one of those answers.
+    let peer_edge = plan.position.edge_toward(peer.position);
     tracing::info!(
         peer = %peer.display_name,
         id = %peer.peer_id,
         kind = ?peer.device_kind,
+        position = ?peer.position,
+        ?peer_edge,
         "handshake ok"
     );
 
@@ -138,6 +157,7 @@ where
         transport,
         peer,
         negotiated,
+        peer_edge,
     })
 }
 
@@ -154,6 +174,7 @@ where
         mut transport,
         peer,
         negotiated,
+        peer_edge,
     } = link;
 
     // Pairing runs over the plaintext transport, which is safe: SPAKE2 never
@@ -165,6 +186,12 @@ where
             trusted.shared_key()?
         }
         None => {
+            if plan.password.is_empty() {
+                anyhow::bail!(
+                    "peer {} is not trusted; run `cursio mesh --pair` on both machines",
+                    peer.peer_id
+                );
+            }
             tracing::info!("new peer; running pairing");
             let paired = pairing::run_pairing(
                 &mut transport,
@@ -189,7 +216,7 @@ where
     let ctx = SessionCtx {
         local: plan.identity,
         peer: &peer,
-        peer_edge: plan.peer_edge,
+        peer_edge,
     };
     let modules = plan.registry.build_agreed(&negotiated, &ctx);
 
@@ -201,6 +228,7 @@ where
     );
 
     Ok(Link {
+        peer_edge,
         transport: Box::new(secure),
         peer,
         modules,

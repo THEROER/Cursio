@@ -43,8 +43,21 @@ pub const EDGE_MARGIN: i32 = 2;
 
 /// The screen the drag is happening on, in the same coordinate space the drag
 /// events report.
+///
+/// Carries an origin, not just a size. Both multi-monitor platforms report the
+/// pointer in a desktop-wide space whose top-left is wherever the leftmost and
+/// topmost displays put it: Windows' virtual screen starts at
+/// `SM_XVIRTUALSCREEN`, macOS' display union at the minimum `CGDisplayBounds`
+/// corner. A monitor placed left of or above the main one makes that origin
+/// negative, and assuming `(0, 0)` then puts the left edge in the middle of the
+/// desktop and the right edge past every pixel the pointer can reach — so
+/// dragging a window at the edge fires either constantly or never.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenBounds {
+    /// Leftmost pointer coordinate on the desktop.
+    pub x: i32,
+    /// Topmost pointer coordinate on the desktop.
+    pub y: i32,
     pub width: i32,
     pub height: i32,
 }
@@ -144,10 +157,10 @@ impl DragTrigger {
 /// Whether a pointer position is at `edge` of a screen this size.
 fn at_edge(at: PointerPos, edge: Edge, screen: ScreenBounds) -> bool {
     match edge {
-        Edge::Left => at.x <= EDGE_MARGIN,
-        Edge::Right => at.x >= screen.width - 1 - EDGE_MARGIN,
-        Edge::Top => at.y <= EDGE_MARGIN,
-        Edge::Bottom => at.y >= screen.height - 1 - EDGE_MARGIN,
+        Edge::Left => at.x <= screen.x + EDGE_MARGIN,
+        Edge::Right => at.x >= screen.x + screen.width - 1 - EDGE_MARGIN,
+        Edge::Top => at.y <= screen.y + EDGE_MARGIN,
+        Edge::Bottom => at.y >= screen.y + screen.height - 1 - EDGE_MARGIN,
     }
 }
 
@@ -156,6 +169,8 @@ mod tests {
     use super::*;
 
     const SCREEN: ScreenBounds = ScreenBounds {
+        x: 0,
+        y: 0,
         width: 1920,
         height: 1080,
     };
@@ -190,6 +205,37 @@ mod tests {
         assert_eq!(t.on_drag(&moved(1500, 540)), None);
         assert_eq!(
             t.on_drag(&moved(1919, 540)),
+            Some(TriggerAction::SendToPeer {
+                title: "Editor".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_desktop_starting_left_of_zero_still_has_both_its_edges() {
+        // A second monitor to the left of the primary one: the pointer runs
+        // from -1920 to 1919, so neither edge is where a bare width/height
+        // would put it.
+        const OFFSET: ScreenBounds = ScreenBounds {
+            x: -1920,
+            y: 0,
+            width: 3840,
+            height: 1080,
+        };
+
+        let mut right = DragTrigger::new(Some(Edge::Right), OFFSET);
+        assert_eq!(right.on_drag(&start(0, 540)), None);
+        assert_eq!(
+            right.on_drag(&moved(1919, 540)),
+            Some(TriggerAction::SendToPeer {
+                title: "Editor".into()
+            })
+        );
+
+        let mut left = DragTrigger::new(Some(Edge::Left), OFFSET);
+        assert_eq!(left.on_drag(&start(0, 540)), None);
+        assert_eq!(
+            left.on_drag(&moved(-1920, 540)),
             Some(TriggerAction::SendToPeer {
                 title: "Editor".into()
             })

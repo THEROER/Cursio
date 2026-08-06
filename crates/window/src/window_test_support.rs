@@ -22,7 +22,7 @@ use crate::{CaptureSession, Surrogate, WindowCapture, WindowError, WindowRendere
 /// A capture whose frames a test supplies over a channel.
 pub struct FakeCaptureSession {
     meta: WindowMeta,
-    frames: mpsc::UnboundedReceiver<WindowFrame>,
+    frames: mpsc::Receiver<WindowFrame>,
     /// Input the host was asked to replay, for assertions.
     pub applied_input: Vec<WindowInput>,
     /// Acks fed back to the encoder, for assertions.
@@ -36,7 +36,7 @@ impl CaptureSession for FakeCaptureSession {
         &self.meta
     }
 
-    fn frames(&mut self) -> &mut mpsc::UnboundedReceiver<WindowFrame> {
+    fn frames(&mut self) -> &mut mpsc::Receiver<WindowFrame> {
         &mut self.frames
     }
 
@@ -56,14 +56,14 @@ impl CaptureSession for FakeCaptureSession {
 
 /// Hands out a [`FakeCaptureSession`] fed by a test-owned channel.
 pub struct FakeCapture {
-    frames: Option<mpsc::UnboundedReceiver<WindowFrame>>,
+    frames: Option<mpsc::Receiver<WindowFrame>>,
     width: u32,
     height: u32,
 }
 
 impl FakeCapture {
     /// Frames sent on `frames` appear as if captured, at the given geometry.
-    pub fn new(frames: mpsc::UnboundedReceiver<WindowFrame>, width: u32, height: u32) -> Self {
+    pub fn new(frames: mpsc::Receiver<WindowFrame>, width: u32, height: u32) -> Self {
         Self {
             frames: Some(frames),
             width,

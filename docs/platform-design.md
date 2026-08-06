@@ -37,7 +37,7 @@ The invariant that makes this work, and that must survive every new module:
 > own handshake, never holds the transport.
 
 This is not an aesthetic preference. Pairing is password-authenticated and
-explicit (`join --password`); a module with its own socket would be a second,
+explicit (`mesh --pair`, with a hidden terminal prompt); a module with its own socket would be a second,
 unauthenticated way into the machine. It is also why the priority scheduler
 works at all — it can only rank traffic it can see.
 

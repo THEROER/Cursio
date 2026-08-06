@@ -10,6 +10,7 @@ path = "src/bin/cursio.rs"
 [dependencies]
 cursio-protocol.workspace = true
 cursio-transport.workspace = true
+cursio-airplay.workspace = true
 cursio-input.workspace = true
 cursio-audio.workspace = true
 cursio-window.workspace = true
@@ -38,6 +39,8 @@ uuid.workspace = true
 clap.workspace = true
 hostname.workspace = true
 directories.workspace = true
+rpassword = "7"
+zeroize = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Self-elevation at startup: without admin rights, Windows' UIPI silently drops

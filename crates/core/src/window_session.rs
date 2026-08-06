@@ -17,12 +17,11 @@
 //! - **Viewer** — on an inbound offer, opens a [`Surrogate`]; blits inbound
 //!   frames into it, and pumps the surrogate's input and acks back to the host.
 //!
-//! Milestone 2 starts a capture only when explicitly asked (see
-//! [`WindowEngine::share_window`]); the drag-past-the-edge trigger that starts
-//! one automatically is milestone 5.
+//! Capture starts only after an explicit transfer request, normally a window
+//! crossing the peer-facing screen edge.
 
 use async_trait::async_trait;
-use cursio_protocol::{Message, ModuleId, WindowCloseReason, WindowId, WindowMsg};
+use cursio_protocol::{Message, ModuleId, Priority, WindowCloseReason, WindowId, WindowMsg};
 use cursio_transport::{TransportError, TransportTx};
 use cursio_window::{CaptureSession, Surrogate, WindowCapture, WindowRenderer};
 
@@ -46,6 +45,13 @@ async fn send_control(tx: &mut dyn TransportTx, msg: WindowMsg) -> Result<(), Tr
 /// 16 ms while `pump` runs far more often than that, so a small bound keeps
 /// latency low and still never monopolises the loop.
 const MAX_FRAMES_PER_PUMP: usize = 4;
+
+/// Stop pulling capture packets once this much video is waiting for the socket.
+///
+/// `PriorityTransport::send` only enqueues, so without this gate the session
+/// drains one queue into another and can still accumulate seconds of stale
+/// video. Backpressure now reaches the bounded capture channel instead.
+const VIDEO_QUEUE_HIGH_WATER_BYTES: usize = 2 * 1024 * 1024;
 
 /// Most input events to forward per pump, viewer→host.
 ///
@@ -83,6 +89,14 @@ pub struct WindowEngine<C: WindowCapture, R: WindowRenderer> {
     /// own task while the engine is owned by the session loop; this hands the
     /// request over without sharing the engine behind a lock.
     requests: Option<tokio::sync::mpsc::UnboundedReceiver<TransferRequest>>,
+    /// Tells the drag trigger a transfer ended without being dragged back.
+    ///
+    /// The trigger latches "a window is over there" so that the next drag
+    /// across the edge is read as a return. Every other way a transfer can end
+    /// — the peer closing the surrogate, the real window going away — leaves
+    /// that latch set, and the next window dragged at the edge is then taken
+    /// for a return of something already home and silently dropped.
+    transfer_ended: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// A transfer asked for from outside the session loop.
@@ -110,14 +124,14 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             pending_close: None,
             peer_name,
             requests: None,
+            transfer_ended: None,
         }
     }
 
     /// Accept transfer requests from the drag trigger.
     ///
-    /// Optional: without this the engine only shares when told to directly
-    /// (the `--share-window` path), which is what happens on a machine with no
-    /// drag detection.
+    /// Optional: without this the engine only shares when told directly by its
+    /// caller.
     pub fn with_requests(
         mut self,
         requests: tokio::sync::mpsc::UnboundedReceiver<TransferRequest>,
@@ -126,11 +140,23 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
         self
     }
 
+    /// Report back to the drag trigger when a transfer ends by any other route.
+    pub fn with_transfer_ended(mut self, ended: tokio::sync::mpsc::UnboundedSender<()>) -> Self {
+        self.transfer_ended = Some(ended);
+        self
+    }
+
+    /// A transfer this machine was hosting is over, and no drag said so.
+    fn note_transfer_ended(&self) {
+        if let Some(tx) = &self.transfer_ended {
+            let _ = tx.send(());
+        }
+    }
+
     /// Act on anything the drag trigger asked for since the last pump.
     ///
     /// Failures are logged, not propagated: a window that can't be captured
-    /// must not take the session down with it, exactly as on the `--share-window`
-    /// path.
+    /// must not take the session down with it.
     fn apply_requests(&mut self) {
         // Drain rather than take one: the trigger is latched per drag, so a
         // backlog here would mean stale requests acting on later drags.
@@ -150,6 +176,11 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                         continue;
                     }
                     tracing::info!(%title, "window dragged to the peer edge");
+                    // Told which window before being asked for one: the drag
+                    // detector is the only thing that knows, and a backend that
+                    // has to guess picks the foreground window — right on
+                    // Windows by coincidence, the whole screen on macOS.
+                    self.capture.aim_at(&title);
                     if let Err(e) = self.share_window() {
                         tracing::warn!(error = %e, "could not start the dragged transfer");
                     }
@@ -257,6 +288,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                         s.close(reason);
                     }
                     self.offer_sent = false;
+                    self.note_transfer_ended();
                 }
             }
         }
@@ -268,6 +300,9 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             return Ok(());
         };
         for _ in 0..MAX_FRAMES_PER_PUMP {
+            if tx.queue_depth(Priority::Video).queued_bytes >= VIDEO_QUEUE_HIGH_WATER_BYTES {
+                break;
+            }
             // `try_recv`, never `recv`: the capture channel going quiet is the
             // normal case (a static window emits nothing), and awaiting it here
             // would block the whole session loop on an idle window.
@@ -281,9 +316,13 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                     let id = session.meta().id;
                     self.hosted = None;
                     self.offer_sent = false;
+                    self.note_transfer_ended();
                     send_control(
                         tx,
-                        WindowMsg::Close { id, reason: WindowCloseReason::HostClosed },
+                        WindowMsg::Close {
+                            id,
+                            reason: WindowCloseReason::HostClosed,
+                        },
                     )
                     .await?;
                     break;
@@ -310,7 +349,10 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                     if let Some(id) = id {
                         send_control(
                             tx,
-                            WindowMsg::Close { id, reason: WindowCloseReason::ViewerClosed },
+                            WindowMsg::Close {
+                                id,
+                                reason: WindowCloseReason::ViewerClosed,
+                            },
                         )
                         .await?;
                     }
@@ -327,7 +369,6 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
         }
         Ok(())
     }
-
 }
 
 #[async_trait]
@@ -420,7 +461,10 @@ where
             session.close(WindowCloseReason::HostClosed);
             let _ = send_control(
                 tx,
-                WindowMsg::Close { id, reason: WindowCloseReason::HostClosed },
+                WindowMsg::Close {
+                    id,
+                    reason: WindowCloseReason::HostClosed,
+                },
             )
             .await;
         }
@@ -438,73 +482,139 @@ where
 /// question is answered once, here, and a machine with no backend simply
 /// advertises nothing.
 pub struct WindowFactory {
-    pub enabled: bool,
-    /// Windows only: share the window whose title contains this, immediately,
-    /// without waiting for a drag. Empty means "wait for a drag".
-    pub title_hint: String,
-    /// Windows only: keep the shared window visible locally instead of hiding
-    /// it. Hiding is what makes a transfer feel like the window *moved*.
-    pub keep_visible: bool,
+    /// When set, this node shares whatever an iPhone is mirroring to it instead
+    /// of one of its own windows. The two are alternatives rather than both at
+    /// once: an engine hosts a single window per session.
+    ///
+    /// The only option there is. A window of this machine's own transfers by
+    /// being dragged across the peer-facing edge — the drag is the request, and
+    /// a flag that meant the same thing was a second way to say it that had to
+    /// agree with the first.
+    pub airplay: Option<AirPlayShare>,
+}
+
+/// The receiver stream this node can offer through the window module.
+#[derive(Clone)]
+pub struct AirPlayShare {
+    pub tap: cursio_airplay::MirrorTap,
+    pub state: crate::service_session::ServiceState,
+    pub local: cursio_protocol::PeerId,
+    /// Preserve `--share-airplay`: offer to every peer, not only peers that
+    /// explicitly asked for a local AirPlay window.
+    pub force: bool,
 }
 
 /// Whether this build has a window-transfer backend at all.
-const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "windows"));
+///
+/// macOS counts even though it can only host: a Mac that shares its screen with
+/// a Windows peer is the whole point of the backend, and negotiation would skip
+/// the module entirely if this said otherwise. Its renderer refuses politely,
+/// so a peer offering *it* a window gets a clear error rather than silence.
+const SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "macos"
+));
 
 impl crate::module::ModuleFactory for WindowFactory {
     fn id(&self) -> ModuleId {
         ModuleId::WINDOW
     }
 
+    /// Advertised by any machine that *could* show a window, not only by one
+    /// that wants to send one.
+    ///
+    /// Negotiation is symmetric: a module runs only when both sides advertise
+    /// it. Receiving is passive and costs an idle engine; offering stays the
+    /// deliberate act of dragging a window across an edge.
     fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
-        if self.enabled && !SUPPORTED {
-            tracing::warn!("window transfer isn't supported on this platform; not advertising it");
-        }
-        (self.enabled && SUPPORTED)
-            .then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::WINDOW, VERSION))
+        SUPPORTED.then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::WINDOW, VERSION))
     }
 
     #[allow(unused_variables)]
-    fn build(
-        &self,
-        ctx: &crate::module::SessionCtx,
-    ) -> anyhow::Result<Box<dyn SessionModule>> {
+    fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
+        if let Some(share) = &self.airplay {
+            share.state.note_offer(ctx.peer.peer_id, ctx.peer.service);
+        }
         #[cfg(target_os = "linux")]
         {
+            if let Some(airplay) = self
+                .airplay
+                .clone()
+                .filter(|share| share.force || ctx.peer.service.show_window)
+            {
+                return Ok(Box::new(airplay_engine(
+                    airplay,
+                    cursio_window::GtkWindowRenderer,
+                    ctx,
+                )));
+            }
             // On Linux the portal runs its own window picker, so there is no
             // title to match and no window of ours to hide — both options are
             // Windows-only and deliberately ignored here.
+            let (requests, ended) = spawn_drag_trigger(ctx.peer_edge);
             let engine = WindowEngine::new(
                 cursio_window::PortalWindowCapture,
                 cursio_window::GtkWindowRenderer,
                 ctx.peer_name().to_string(),
             )
-            .with_requests(spawn_drag_trigger(ctx.peer_edge));
+            .with_requests(requests)
+            .with_transfer_ended(ended);
             Ok(Box::new(engine))
         }
         #[cfg(target_os = "windows")]
         {
-            let mut engine = WindowEngine::new(
+            if let Some(airplay) = self
+                .airplay
+                .clone()
+                .filter(|share| share.force || ctx.peer.service.show_window)
+            {
+                return Ok(Box::new(airplay_engine(
+                    airplay,
+                    cursio_window::Win32WindowRenderer,
+                    ctx,
+                )));
+            }
+            // Hiding the source is what makes a transfer feel like the window
+            // moved rather than been copied; the drag that started it is the
+            // user saying they want it over there.
+            let (requests, ended) = spawn_drag_trigger(ctx.peer_edge);
+            let engine = WindowEngine::new(
                 cursio_window::WgcWindowCapture {
-                    title_hint: self.title_hint.clone(),
-                    hide_source: !self.keep_visible,
+                    title_hint: String::new(),
+                    hide_source: true,
                 },
                 cursio_window::Win32WindowRenderer,
                 ctx.peer_name().to_string(),
             )
-            .with_requests(spawn_drag_trigger(ctx.peer_edge));
-
-            // An explicit title means "share this one now", without waiting for
-            // a drag. A failure shouldn't kill the module, let alone the
-            // session — the drag path may still work.
-            if !self.title_hint.is_empty() {
-                match engine.share_window() {
-                    Ok(id) => tracing::info!(id, "window transfer started"),
-                    Err(e) => tracing::error!(error = %e, "could not start window transfer"),
-                }
-            }
+            .with_requests(requests)
+            .with_transfer_ended(ended);
             Ok(Box::new(engine))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(airplay) = self
+                .airplay
+                .clone()
+                .filter(|share| share.force || ctx.peer.service.show_window)
+            {
+                return Ok(Box::new(airplay_engine(
+                    airplay,
+                    cursio_window::MacWindowRenderer,
+                    ctx,
+                )));
+            }
+            let (requests, ended) = spawn_drag_trigger(ctx.peer_edge);
+            let engine = WindowEngine::new(
+                cursio_window::MacWindowCapture::default(),
+                cursio_window::MacWindowRenderer,
+                ctx.peer_name().to_string(),
+            )
+            .with_requests(requests)
+            .with_transfer_ended(ended);
+            Ok(Box::new(engine))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {
             // Unreachable in practice: `advert` returns `None` here, so
             // negotiation never agrees on this module.
@@ -524,13 +634,17 @@ pub const VERSION: u16 = 1;
 /// transfer *is* on each platform — the same reason the capture backends do.
 /// Returns an empty-forever channel if the platform can't detect drags, which
 /// the engine handles as "no drag trigger attached".
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn spawn_drag_trigger(
     peer_edge: Option<cursio_protocol::Edge>,
-) -> tokio::sync::mpsc::UnboundedReceiver<TransferRequest> {
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<TransferRequest>,
+    tokio::sync::mpsc::UnboundedSender<()>,
+) {
     use cursio_window::drag_trigger::{DragTrigger, TriggerAction};
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     tokio::spawn(async move {
         #[cfg(target_os = "linux")]
@@ -543,6 +657,11 @@ fn spawn_drag_trigger(
             cursio_window::windows_drag::DragWatcher::spawn(),
             cursio_window::windows_drag::screen_size(),
         );
+        #[cfg(target_os = "macos")]
+        let (mut watcher, screen) = (
+            cursio_window::macos_drag::DragWatcher::spawn(),
+            cursio_window::macos_drag::screen_size(),
+        );
 
         // Without a screen size there is no edge to compare against. Bail
         // rather than guess: a wrong bound would fire mid-screen.
@@ -552,15 +671,51 @@ fn spawn_drag_trigger(
         };
         if peer_edge.is_none() {
             tracing::info!(
-                "no --peer-edge set, so dragging a window off an edge does nothing; \
-                 window transfer still works with --share-window"
+                "this peer borders no edge of this screen, so dragging a window off one does \
+                 nothing; configure distinct --at positions to enable window transfer"
             );
         }
-        tracing::info!(?peer_edge, width = screen.width, height = screen.height,
-            "watching for windows dragged toward the peer");
+        tracing::info!(
+            ?peer_edge,
+            width = screen.width,
+            height = screen.height,
+            "watching for windows dragged toward the peer"
+        );
 
         let mut trigger = DragTrigger::new(peer_edge, screen);
-        while let Some(event) = watcher.next().await {
+        loop {
+            let event = tokio::select! {
+                // Biased so a transfer that just ended is recorded before the
+                // drag that may already be under way is judged against it.
+                biased;
+                ended = ended_rx.recv() => {
+                    if ended.is_none() {
+                        break; // the session ended
+                    }
+                    trigger.transfer_ended();
+                    continue;
+                }
+                event = watcher.next() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
+
+            // Re-read the geometry as each drag begins. A monitor unplugged or
+            // a resolution changed mid-session moves the edge, and this is the
+            // one moment where asking costs nothing anybody can feel.
+            if matches!(event, cursio_window::drag::DragEvent::Started { .. }) {
+                #[cfg(target_os = "linux")]
+                let now = cursio_window::linux_drag::screen_size().await;
+                #[cfg(target_os = "windows")]
+                let now = cursio_window::windows_drag::screen_size();
+                #[cfg(target_os = "macos")]
+                let now = cursio_window::macos_drag::screen_size();
+                if let Some(now) = now {
+                    trigger.set_screen(now);
+                }
+            }
+
             let Some(action) = trigger.on_drag(&event) else {
                 continue;
             };
@@ -574,6 +729,62 @@ fn spawn_drag_trigger(
         }
     });
 
+    (rx, ended_tx)
+}
+
+/// Build an engine that hosts the mirrored iPhone screen.
+///
+/// Sharing follows mesh placement rather than a drag: only the selected host
+/// offers a surrogate, and a host or quality change closes and recreates it.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn airplay_engine<R: cursio_window::WindowRenderer>(
+    share: AirPlayShare,
+    renderer: R,
+    ctx: &crate::module::SessionCtx,
+) -> WindowEngine<crate::airplay_window::AirPlayWindowCapture, R> {
+    let requests = spawn_airplay_trigger(share.state.clone(), share.local);
+    WindowEngine::new(
+        crate::airplay_window::AirPlayWindowCapture::for_mesh(share.tap, share.state),
+        renderer,
+        ctx.peer_name().to_string(),
+    )
+    .with_requests(requests)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn spawn_airplay_trigger(
+    state: crate::service_session::ServiceState,
+    local: cursio_protocol::PeerId,
+) -> tokio::sync::mpsc::UnboundedReceiver<TransferRequest> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut last: Option<Option<cursio_protocol::Quality>> = None;
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            poll.tick().await;
+            let placement = state.placement();
+            let selected = placement.is_some_and(|placement| placement.host == local)
+                || (state.was_asked_to_host(cursio_protocol::ServiceId::AIRPLAY)
+                    && state.is_hosted_here(cursio_protocol::ServiceId::AIRPLAY));
+            let wanted = selected.then(|| placement.and_then(|placement| placement.quality));
+            if wanted == last {
+                continue;
+            }
+            if last.is_some() && tx.send(TransferRequest::BringBack).is_err() {
+                return;
+            }
+            if wanted.is_some()
+                && tx
+                    .send(TransferRequest::Send {
+                        title: "Cursio (iPhone)".into(),
+                    })
+                    .is_err()
+            {
+                return;
+            }
+            last = wanted;
+        }
+    });
     rx
 }
 
@@ -581,13 +792,56 @@ fn spawn_drag_trigger(
 mod tests {
     use super::*;
     use cursio_protocol::{Rect, TileCodec, WindowFrame, WindowInput, WindowMeta};
-    use cursio_window::{WindowError, window_test_support::*};
+    use cursio_transport::QueueDepth;
+    use cursio_window::{window_test_support::*, WindowError};
     use tokio::sync::mpsc;
+
+    fn airplay_offer(
+        fitness: cursio_protocol::Fitness,
+        wanted: Option<cursio_protocol::Quality>,
+    ) -> cursio_protocol::ServiceOffer {
+        cursio_protocol::ServiceOffer {
+            fitness,
+            wanted,
+            show_window: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn airplay_window_transfer_follows_host_and_quality_changes() {
+        let local = cursio_protocol::PeerId::from_u128(1);
+        let peer = cursio_protocol::PeerId::from_u128(2);
+        let state = crate::service_session::ServiceState::new();
+        state.note_offer(local, airplay_offer(cursio_protocol::Fitness::Full, None));
+        let mut requests = spawn_airplay_trigger(state.clone(), local);
+
+        assert!(matches!(
+            requests.recv().await,
+            Some(TransferRequest::Send { .. })
+        ));
+
+        state.note_offer(
+            peer,
+            airplay_offer(
+                cursio_protocol::Fitness::Full,
+                Some(cursio_protocol::Quality::new(2560, 1440, 30)),
+            ),
+        );
+        assert_eq!(requests.recv().await, Some(TransferRequest::BringBack));
+        assert!(matches!(
+            requests.recv().await,
+            Some(TransferRequest::Send { .. })
+        ));
+
+        state.note_offer(local, airplay_offer(cursio_protocol::Fitness::No, None));
+        assert_eq!(requests.recv().await, Some(TransferRequest::BringBack));
+    }
 
     /// Collects what the module sends, standing in for the transport.
     #[derive(Default)]
     struct RecordingTx {
         sent: Vec<Message>,
+        video_depth: QueueDepth,
     }
 
     #[async_trait]
@@ -595,6 +849,14 @@ mod tests {
         async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
             self.sent.push(msg.clone());
             Ok(())
+        }
+
+        fn queue_depth(&self, priority: Priority) -> QueueDepth {
+            if priority == Priority::Video {
+                self.video_depth
+            } else {
+                QueueDepth::default()
+            }
         }
     }
 
@@ -637,9 +899,13 @@ mod tests {
         }
     }
 
+    fn frame_channel() -> (mpsc::Sender<WindowFrame>, mpsc::Receiver<WindowFrame>) {
+        mpsc::channel(64)
+    }
+
     #[tokio::test]
     async fn a_drag_request_starts_the_transfer_on_the_next_pump() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
@@ -662,7 +928,7 @@ mod tests {
 
     #[tokio::test]
     async fn dragging_back_closes_the_transfer_as_returned() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
@@ -686,15 +952,50 @@ mod tests {
         // home rather than died, so its surrogate disappears quietly.
         assert!(matches!(
             tx.control().first(),
-            Some(WindowMsg::Close { reason: WindowCloseReason::Returned, .. })
+            Some(WindowMsg::Close {
+                reason: WindowCloseReason::Returned,
+                ..
+            })
         ));
+    }
+
+    #[tokio::test]
+    async fn the_peer_closing_the_window_tells_the_drag_trigger() {
+        // Otherwise the trigger still believes a window is over there, and
+        // reads the *next* window dragged at the edge as a return of one that
+        // is already home — dropping it silently.
+        let (_frames_tx, frames_rx) = frame_channel();
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (ended_tx, mut ended_rx) = mpsc::unbounded_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        )
+        .with_requests(req_rx)
+        .with_transfer_ended(ended_tx);
+
+        req_tx
+            .send(TransferRequest::Send {
+                title: "Editor".into(),
+            })
+            .unwrap();
+        let mut tx = RecordingTx::default();
+        eng.pump(&mut tx).await.unwrap();
+        assert!(ended_rx.try_recv().is_err(), "nothing has ended yet");
+
+        eng.handle_message(&control_frame(WindowMsg::Close {
+            id: 1,
+            reason: WindowCloseReason::ViewerClosed,
+        }));
+
+        assert!(ended_rx.try_recv().is_ok());
     }
 
     #[tokio::test]
     async fn a_second_send_while_hosting_is_ignored() {
         // The trigger latches per drag, but a repeat must not restart capture
         // or allocate a second id for the window already on the peer.
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
@@ -724,9 +1025,9 @@ mod tests {
 
     #[tokio::test]
     async fn requests_are_ignored_without_a_trigger_attached() {
-        // The plain `--share-window` path has no request channel; the engine
-        // must pump normally rather than assume one exists.
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        // An engine without an external trigger must pump normally rather than
+        // assume one exists.
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -739,13 +1040,13 @@ mod tests {
 
     #[tokio::test]
     async fn offer_precedes_the_first_frame() {
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
         );
         let id = eng.share_window().unwrap();
-        frames_tx.send(frame(id, 1)).unwrap();
+        frames_tx.try_send(frame(id, 1)).unwrap();
 
         let mut tx = RecordingTx::default();
         eng.pump(&mut tx).await.unwrap();
@@ -756,7 +1057,11 @@ mod tests {
         // is a first-class variant, and they must still be ordered relative to
         // each other on the wire.
         assert!(matches!(
-            tx.sent.first().unwrap().decode_module::<WindowMsg>(ModuleId::WINDOW).unwrap(),
+            tx.sent
+                .first()
+                .unwrap()
+                .decode_module::<WindowMsg>(ModuleId::WINDOW)
+                .unwrap(),
             Some(WindowMsg::Offer(_))
         ));
         assert!(matches!(tx.sent.get(1), Some(Message::WindowFrame(_))));
@@ -764,7 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn offer_is_sent_only_once() {
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -772,9 +1077,9 @@ mod tests {
         let id = eng.share_window().unwrap();
 
         let mut tx = RecordingTx::default();
-        frames_tx.send(frame(id, 1)).unwrap();
+        frames_tx.try_send(frame(id, 1)).unwrap();
         eng.pump(&mut tx).await.unwrap();
-        frames_tx.send(frame(id, 2)).unwrap();
+        frames_tx.try_send(frame(id, 2)).unwrap();
         eng.pump(&mut tx).await.unwrap();
 
         let offers = tx
@@ -788,7 +1093,7 @@ mod tests {
 
     #[tokio::test]
     async fn frames_are_bounded_per_pump() {
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -797,7 +1102,7 @@ mod tests {
         // Far more than one pump may take: draining them all would starve the
         // session's inbound branch.
         for seq in 0..50 {
-            frames_tx.send(frame(id, seq)).unwrap();
+            frames_tx.try_send(frame(id, seq)).unwrap();
         }
 
         let mut tx = RecordingTx::default();
@@ -811,9 +1116,40 @@ mod tests {
         assert_eq!(frames, MAX_FRAMES_PER_PUMP);
     }
 
+    #[tokio::test]
+    async fn backed_up_transport_leaves_capture_frame_queued() {
+        let (frames_tx, frames_rx) = frame_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        );
+        let id = eng.share_window().unwrap();
+        frames_tx.try_send(frame(id, 1)).unwrap();
+
+        let mut tx = RecordingTx {
+            sent: Vec::new(),
+            video_depth: QueueDepth {
+                queued_bytes: VIDEO_QUEUE_HIGH_WATER_BYTES,
+                sent_bytes: 0,
+            },
+        };
+        eng.pump(&mut tx).await.unwrap();
+        assert!(tx
+            .sent
+            .iter()
+            .all(|message| !matches!(message, Message::WindowFrame(_))));
+
+        tx.video_depth = QueueDepth::default();
+        eng.pump(&mut tx).await.unwrap();
+        assert!(tx
+            .sent
+            .iter()
+            .any(|message| matches!(message, Message::WindowFrame(_))));
+    }
+
     #[test]
     fn an_offer_opens_a_surrogate() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -830,7 +1166,7 @@ mod tests {
 
     #[test]
     fn a_failed_surrogate_tells_the_host_to_stop() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::failing(),
@@ -853,27 +1189,32 @@ mod tests {
 
     #[test]
     fn window_messages_are_claimed_and_others_are_not() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
         );
         assert!(eng.handle_message(&Message::WindowFrame(frame(1, 1))));
         assert!(eng.handle_message(&control_frame(WindowMsg::FrameAck(
-            cursio_protocol::WindowFrameAck { id: 1, acked_seq: 1 }
+            cursio_protocol::WindowFrameAck {
+                id: 1,
+                acked_seq: 1
+            }
         ))));
-        assert!(eng.handle_message(&Message::WindowInput(WindowInput::PointerMove {
-            id: 1,
-            x: 0,
-            y: 0
-        })));
+        assert!(
+            eng.handle_message(&Message::WindowInput(WindowInput::PointerMove {
+                id: 1,
+                x: 0,
+                y: 0
+            }))
+        );
         // Another module's message must fall through to it.
         assert!(!eng.handle_message(&Message::Heartbeat { nonce: 1 }));
     }
 
     #[tokio::test]
     async fn a_dead_capture_closes_the_transfer() {
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -888,14 +1229,17 @@ mod tests {
 
         assert!(tx.control().iter().any(|m| matches!(
             m,
-            WindowMsg::Close { reason: WindowCloseReason::HostClosed, .. }
+            WindowMsg::Close {
+                reason: WindowCloseReason::HostClosed,
+                ..
+            }
         )));
         assert!(eng.hosted.is_none());
     }
 
     #[test]
     fn peer_close_tears_down_our_surrogate() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
@@ -916,15 +1260,12 @@ mod tests {
 
     #[test]
     fn sharing_twice_is_refused() {
-        let (_frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
         );
         eng.share_window().unwrap();
-        assert!(matches!(
-            eng.share_window(),
-            Err(WindowError::Backend(_))
-        ));
+        assert!(matches!(eng.share_window(), Err(WindowError::Backend(_))));
     }
 }

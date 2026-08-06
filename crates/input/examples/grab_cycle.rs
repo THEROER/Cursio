@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("info,cursio_input=debug")
         .init();
 
-    let mut handle = spawn_capture(None)?;
+    let mut handle = spawn_capture()?;
     println!("capturing: {:?}", handle.devices);
 
     // Drain events in the background so we can observe them arriving.

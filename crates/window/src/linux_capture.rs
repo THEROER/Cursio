@@ -47,16 +47,16 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use ashpd::desktop::{
-    PersistMode,
     remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions},
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+    PersistMode,
 };
 use cursio_protocol::{
     TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
 };
 use tokio::sync::mpsc;
 
-use crate::frame_pipeline::{FrameDiffer, pick_codec, should_use_video};
+use crate::frame_pipeline::{pick_codec, should_use_video, FrameDiffer};
 use crate::{CaptureSession, WindowCapture, WindowError};
 
 /// Where the ScreenCast restore token is persisted, next to `identity.json` in
@@ -88,7 +88,9 @@ fn load_restore_token() -> Option<String> {
 /// Persist a fresh token, best-effort: failing to save only costs an extra
 /// dialog next run, so it must never break an otherwise working capture.
 fn save_restore_token(token: &str) {
-    let Ok(path) = restore_token_path() else { return };
+    let Ok(path) = restore_token_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -96,8 +98,12 @@ fn save_restore_token(token: &str) {
         token: token.to_owned(),
     };
     match serde_json::to_vec_pretty(&state).map(|b| std::fs::write(&path, b)) {
-        Ok(Ok(())) => tracing::info!(path = %path.display(), "saved ScreenCast restore token (portal won't prompt again)"),
-        Ok(Err(e)) => tracing::warn!(error = %e, "could not write restore token; portal will prompt next time"),
+        Ok(Ok(())) => {
+            tracing::info!(path = %path.display(), "saved ScreenCast restore token (portal won't prompt again)")
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "could not write restore token; portal will prompt next time")
+        }
         Err(e) => tracing::warn!(error = %e, "could not encode restore token"),
     }
 }
@@ -288,7 +294,7 @@ enum CaptureCommand {
 /// that isn't `Send` (portal session, PipeWire loop).
 pub struct PortalCaptureSession {
     meta: WindowMeta,
-    frames: mpsc::UnboundedReceiver<WindowFrame>,
+    frames: mpsc::Receiver<WindowFrame>,
     commands: mpsc::UnboundedSender<CaptureCommand>,
 }
 
@@ -297,7 +303,7 @@ impl CaptureSession for PortalCaptureSession {
         &self.meta
     }
 
-    fn frames(&mut self) -> &mut mpsc::UnboundedReceiver<WindowFrame> {
+    fn frames(&mut self) -> &mut mpsc::Receiver<WindowFrame> {
         &mut self.frames
     }
 
@@ -345,7 +351,7 @@ impl WindowCapture for PortalWindowCapture {
 /// must surface as an error from `begin()`, not as a stream that silently never
 /// produces frames. Mirrors `spawn_wayland_capture` in `cursio-input`.
 fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
-    let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+    let (frames_tx, frames_rx) = mpsc::channel(crate::CAPTURE_FRAME_QUEUE_CAPACITY);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     // Readiness carries the negotiated window geometry back, so the meta we
     // offer the peer matches what the stream will actually deliver.
@@ -376,7 +382,7 @@ fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
 /// whole function.
 fn capture_thread(
     id: WindowId,
-    frames_tx: mpsc::UnboundedSender<WindowFrame>,
+    frames_tx: mpsc::Sender<WindowFrame>,
     cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: std::sync::mpsc::Sender<Result<WindowMeta, String>>,
 ) {
@@ -445,11 +451,11 @@ struct StreamState {
 fn format_param_pod() -> Vec<u8> {
     use pipewire::spa::{
         param::{
-            ParamType,
             format::{FormatProperties, MediaSubtype, MediaType},
             video::VideoFormat,
+            ParamType,
         },
-        pod::{Value, object, property, serialize::PodSerializer},
+        pod::{object, property, serialize::PodSerializer, Value},
         utils::{Fraction, Rectangle, SpaTypes},
     };
 
@@ -491,10 +497,7 @@ fn format_param_pod() -> Vec<u8> {
             Fraction,
             Fraction { num: 60, denom: 1 },
             Fraction { num: 0, denom: 1 },
-            Fraction {
-                num: 144,
-                denom: 1
-            }
+            Fraction { num: 144, denom: 1 }
         ),
     );
 
@@ -508,7 +511,7 @@ fn format_param_pod() -> Vec<u8> {
 fn run_pipewire_loop(
     id: WindowId,
     cast: PortalCast,
-    frames_tx: mpsc::UnboundedSender<WindowFrame>,
+    frames_tx: mpsc::Sender<WindowFrame>,
     mut cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: &std::sync::mpsc::Sender<Result<WindowMeta, String>>,
     rt: &tokio::runtime::Runtime,
@@ -691,16 +694,25 @@ fn run_pipewire_loop(
                             // One visual update can yield several packets, and
                             // sometimes none — the encoder decides.
                             let full = enc.full_rect();
-                            for data in packets {
-                                st.seq = st.seq.wrapping_add(1);
-                                let seq = st.seq;
-                                let _ = frames_tx.send(WindowFrame {
-                                    id,
-                                    seq,
-                                    dirty: full,
-                                    codec: TileCodec::LossyVideo,
-                                    data,
-                                });
+                            let frames = packets
+                                .into_iter()
+                                .map(|data| {
+                                    st.seq = st.seq.wrapping_add(1);
+                                    WindowFrame {
+                                        id,
+                                        seq: st.seq,
+                                        dirty: full,
+                                        codec: TileCodec::LossyVideo,
+                                        data,
+                                    }
+                                })
+                                .collect();
+                            if crate::frame_pipeline::try_queue_frames(&frames_tx, frames).is_err() {
+                                // The viewer never saw this encoder/differ
+                                // state. Restart both so the next accepted
+                                // update is a full frame and fresh keyframe.
+                                st.differ.reset();
+                                st.video = None;
                             }
                             return;
                         }
@@ -726,15 +738,21 @@ fn run_pipewire_loop(
 
             st.seq = st.seq.wrapping_add(1);
             let seq = st.seq;
-            // Send is non-blocking: the channel absorbs bursts so a slow link
-            // never stalls this RT callback.
-            let _ = frames_tx.send(WindowFrame {
+            // Never block the PipeWire callback. If the bounded queue is full,
+            // discard this delta and force the next accepted frame to be full.
+            if frames_tx
+                .try_send(WindowFrame {
                 id,
                 seq,
                 dirty,
                 codec,
                 data: encoded,
-            });
+                })
+                .is_err()
+            {
+                st.differ.reset();
+                st.video = None;
+            }
         })
         .register()
         .map_err(|e| format!("register stream listener: {e}"))?;

@@ -62,7 +62,8 @@ impl HiddenWindow {
                 None
             };
 
-            if !was_layered && SetWindowLongW(hwnd, GWL_EXSTYLE, prev_ex_style | WS_EX_LAYERED.0 as i32) == 0
+            if !was_layered
+                && SetWindowLongW(hwnd, GWL_EXSTYLE, prev_ex_style | WS_EX_LAYERED.0 as i32) == 0
             {
                 // `SetWindowLongW` returning 0 can be either the previous value
                 // or a genuine failure; only the latter sets an error.

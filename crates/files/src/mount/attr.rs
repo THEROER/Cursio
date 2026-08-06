@@ -165,8 +165,14 @@ mod tests {
     fn blocks_round_up() {
         assert_eq!(attr_from(2, &meta(FileKind::File, 0, true), 0, 0).blocks, 0);
         assert_eq!(attr_from(2, &meta(FileKind::File, 1, true), 0, 0).blocks, 1);
-        assert_eq!(attr_from(2, &meta(FileKind::File, 512, true), 0, 0).blocks, 1);
-        assert_eq!(attr_from(2, &meta(FileKind::File, 513, true), 0, 0).blocks, 2);
+        assert_eq!(
+            attr_from(2, &meta(FileKind::File, 512, true), 0, 0).blocks,
+            1
+        );
+        assert_eq!(
+            attr_from(2, &meta(FileKind::File, 513, true), 0, 0).blocks,
+            2
+        );
     }
 
     /// A timestamp from before 1970 must survive rather than collapse to the

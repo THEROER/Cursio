@@ -30,6 +30,27 @@ const KEYBOARD_NAME: &str = "Cursio Virtual Keyboard";
 /// not the keyboard. Used to bound the keyboard's declared key set.
 const BTN_0: u16 = KeyCode::BTN_0.0;
 
+/// Turn a failure to open `/dev/uinput` into something the user can act on.
+///
+/// "Permission denied" is the overwhelmingly common case on a fresh machine and
+/// the least useful thing to print: the device exists, the daemon is running,
+/// and nothing on screen says that a peer's keyboard will simply do nothing.
+/// Every other error is passed through as it came — inventing a remedy for a
+/// cause we did not identify is how a user ends up adding a udev rule that was
+/// never the problem.
+fn open_uinput_error(e: std::io::Error) -> InputError {
+    if e.kind() != std::io::ErrorKind::PermissionDenied {
+        return InputError::Unavailable(format!("open uinput: {e}"));
+    }
+    InputError::Unavailable(format!(
+        "open uinput: {e} — this user cannot write /dev/uinput, so a peer's keyboard and mouse \
+         will not reach this machine. Grant it with a udev rule: \
+         echo 'KERNEL==\"uinput\", GROUP=\"input\", MODE=\"0660\"' | \
+         sudo tee /etc/udev/rules.d/99-cursio-uinput.rules, then \
+         sudo usermod -aG input $USER and log out and back in"
+    ))
+}
+
 /// A uinput-backed injector owning persistent virtual pointer and keyboard
 /// devices.
 pub struct UinputInjector {
@@ -65,7 +86,7 @@ impl UinputInjector {
         axes.insert(RelativeAxisCode::REL_HWHEEL);
 
         let pointer = VirtualDevice::builder()
-            .map_err(|e| InputError::Unavailable(format!("open uinput: {e}")))?
+            .map_err(open_uinput_error)?
             .name(POINTER_NAME)
             .with_keys(&keys)
             .map_err(|e| InputError::Unavailable(format!("declare pointer keys: {e}")))?
@@ -86,7 +107,7 @@ impl UinputInjector {
         }
 
         let keyboard = VirtualDevice::builder()
-            .map_err(|e| InputError::Unavailable(format!("open uinput: {e}")))?
+            .map_err(open_uinput_error)?
             .name(KEYBOARD_NAME)
             .with_keys(&keyboard_keys)
             .map_err(|e| InputError::Unavailable(format!("declare keyboard keys: {e}")))?
@@ -193,7 +214,10 @@ impl InputInjector for UinputInjector {
         // keys on the keyboard), ignoring `active` — we must clean up even if
         // we ended in the inactive state.
         let held: Vec<u16> = self.held.drain().collect();
-        tracing::info!(count = held.len(), "releasing held keys/buttons on session end");
+        tracing::info!(
+            count = held.len(),
+            "releasing held keys/buttons on session end"
+        );
         for code in held {
             let ev = KeyEvent::new(KeyCode::new(code), 0).into();
             let res = if code >= BTN_0 {

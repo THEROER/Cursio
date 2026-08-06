@@ -74,7 +74,7 @@ impl VideoEncoder {
     pub fn open(width: u32, height: u32) -> Result<Self, WindowError> {
         // 4:2:0 chroma is subsampled by two on both axes, so odd dimensions
         // have no valid chroma plane. Reject rather than silently skew.
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(WindowError::Backend(format!(
                 "video encoder needs even dimensions, got {width}x{height}"
             )));
@@ -377,12 +377,7 @@ unsafe fn set_output_type(
         .and_then(|_| ty.SetUINT64(&MF_MT_FRAME_SIZE, pack_ratio(width, height)))
         .and_then(|_| ty.SetUINT64(&MF_MT_FRAME_RATE, pack_ratio(FRAME_RATE, 1)))
         .and_then(|_| ty.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1)))
-        .and_then(|_| {
-            ty.SetUINT32(
-                &MF_MT_INTERLACE_MODE,
-                MFVideoInterlace_Progressive.0 as u32,
-            )
-        })
+        .and_then(|_| ty.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32))
         // Every H.264 encoder MFT requires a bitrate on its output type, even
         // in a quality-driven rate-control mode where it is only a ceiling.
         // Sized generously: the design measured 138 Mbit/s worst case, and a
@@ -408,12 +403,7 @@ unsafe fn set_input_type(
         .and_then(|_| ty.SetUINT64(&MF_MT_FRAME_SIZE, pack_ratio(width, height)))
         .and_then(|_| ty.SetUINT64(&MF_MT_FRAME_RATE, pack_ratio(FRAME_RATE, 1)))
         .and_then(|_| ty.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1)))
-        .and_then(|_| {
-            ty.SetUINT32(
-                &MF_MT_INTERLACE_MODE,
-                MFVideoInterlace_Progressive.0 as u32,
-            )
-        })
+        .and_then(|_| ty.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32))
         .map_err(|e| WindowError::Backend(format!("describe NV12 input: {e}")))?;
 
     transform

@@ -211,9 +211,7 @@ fn uses_layer_shell() -> bool {
 /// Whether `program` is on `PATH`.
 fn which(program: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
-        })
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
         .unwrap_or(false)
 }
 

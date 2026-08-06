@@ -21,6 +21,12 @@ zstd = "0.13"
 fuser = { version = "0.18", default-features = false }
 libc = "0.2"
 
+# `statvfs` for the capacity a served volume reports. No mount half here — macOS
+# FUSE is a kernel extension the user has to install and approve — so this is
+# the only native call the platform needs.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 # Windows mounting goes through WinFsp. Gated on the MSVC environment, not just
 # on Windows: `winfsp-sys` refuses any other triple outright (its build script
 # panics with "unsupported triple" on MinGW), so the MinGW cross-build that

@@ -108,7 +108,13 @@ impl WinInjector {
 fn send_input(input: &INPUT) -> Result<(), InputError> {
     // SAFETY: `input` is a fully-initialised INPUT; we pass a valid pointer and
     // the matching struct size, as SendInput requires.
-    let sent = unsafe { SendInput(1, input as *const INPUT, std::mem::size_of::<INPUT>() as i32) };
+    let sent = unsafe {
+        SendInput(
+            1,
+            input as *const INPUT,
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
     if sent == 1 {
         Ok(())
     } else {
@@ -138,7 +144,7 @@ impl InputInjector for WinInjector {
                 // then every 120th move, so both cases are distinguishable
                 // without drowning the log.
                 self.motion_seq = self.motion_seq.wrapping_add(1);
-                if result.is_err() || self.motion_seq % 120 == 0 {
+                if result.is_err() || self.motion_seq.is_multiple_of(120) {
                     tracing::debug!(
                         dx,
                         dy,

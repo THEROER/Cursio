@@ -8,7 +8,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use cursio_protocol::PeerId;
-use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{IfKind, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use crate::TransportError;
 
@@ -50,7 +50,7 @@ impl DiscoveryConfig {
     ///   just the pinned one, so VPN/virtual interfaces can't be used.
     /// - Otherwise, best-effort excludes interfaces whose address falls in
     ///   known-virtual ranges (see [`is_virtual_addr`]).
-    fn build_daemon(&self) -> Result<ServiceDaemon, TransportError> {
+    pub fn new_daemon(&self) -> Result<ServiceDaemon, TransportError> {
         let daemon = ServiceDaemon::new().map_err(|e| TransportError::Other(e.to_string()))?;
 
         // IPv4-only on the LAN; drop all the IPv6 link-local multicast noise.
@@ -174,6 +174,51 @@ fn local_interface_addrs() -> Vec<IpAddr> {
     }
 }
 
+/// Turn a machine's display name into a label mDNS will carry.
+///
+/// One function, because every service this process announces has to answer the
+/// same question and there is no reason for two of them to answer it
+/// differently. Cursio's own record and AirPlay's both go through here.
+///
+/// It is a *host* label, which is why the rules are strict: [`announce_with`]
+/// uses the same string for the service instance and for `<instance>.local.`,
+/// and the second of those is DNS, where a Cyrillic or accented name is not a
+/// label at all. Nothing readable is lost — the name a user sees travels in the
+/// TXT record, not here.
+///
+/// The rules are DNS', not a preference. A label is ASCII letters, digits and
+/// hyphens. Punctuation and spaces become hyphens rather than vanishing — a
+/// Mac calls itself `macbook.local`, and the dot is a label *separator*, so it
+/// cannot survive inside one while `macbook-local` still reads as the same
+/// machine. Non-ASCII is dropped instead, because the alternative is guessing
+/// at a romanisation the user never chose. Leading and trailing hyphens go too,
+/// since a label may not begin or end with one, and the 48-character cap leaves
+/// room for the service suffix inside DNS' 63-byte limit.
+///
+/// `fallback` is what a name made entirely of unusable characters becomes, so
+/// the record is still published rather than silently malformed.
+pub fn mdns_label(name: &str, fallback: &str) -> String {
+    let label: String = name
+        .chars()
+        .filter_map(|character| match character {
+            c if c.is_ascii_alphanumeric() || c == '-' => Some(c),
+            c if c.is_ascii() || c.is_whitespace() => Some('-'),
+            _ => None,
+        })
+        .take(MAX_LABEL_CHARS)
+        .collect();
+    match label.trim_matches('-') {
+        "" => fallback.to_string(),
+        trimmed => trimmed.to_string(),
+    }
+}
+
+/// How much of a name a label keeps.
+///
+/// DNS allows 63 bytes; the rest is headroom for the service type appended
+/// after it, and a name long enough to hit this is not one anybody reads.
+const MAX_LABEL_CHARS: usize = 48;
+
 /// A peer found on the LAN.
 #[derive(Debug, Clone)]
 pub struct DiscoveredPeer {
@@ -228,7 +273,7 @@ pub fn announce_with(
     port: u16,
     config: &DiscoveryConfig,
 ) -> Result<Announcement, TransportError> {
-    let daemon = config.build_daemon()?;
+    let daemon = config.new_daemon()?;
 
     let properties = [
         (TXT_PEER_ID, peer_id.to_string()),
@@ -293,7 +338,7 @@ pub fn browse_with<F>(
 where
     F: FnMut(DiscoveredPeer),
 {
-    let daemon = config.build_daemon()?;
+    let daemon = config.new_daemon()?;
     let receiver = daemon
         .browse(SERVICE_TYPE)
         .map_err(|e| TransportError::Other(e.to_string()))?;
@@ -310,7 +355,7 @@ where
 
 /// Build a [`DiscoveredPeer`] from a resolved service, or `None` if it's us,
 /// malformed, or has no reachable address.
-fn peer_from_info(info: &ServiceInfo, self_id: PeerId) -> Option<DiscoveredPeer> {
+fn peer_from_info(info: &ResolvedService, self_id: PeerId) -> Option<DiscoveredPeer> {
     let peer_id: PeerId = info
         .get_property_val_str(TXT_PEER_ID)
         .and_then(|s| s.parse().ok())?;
@@ -330,7 +375,7 @@ fn peer_from_info(info: &ServiceInfo, self_id: PeerId) -> Option<DiscoveredPeer>
         .iter()
         .find(|a| a.is_ipv4())
         .or_else(|| info.get_addresses().iter().next())
-        .copied()?;
+        .map(|address| address.to_ip_addr())?;
 
     Some(DiscoveredPeer {
         peer_id,
@@ -389,5 +434,41 @@ mod tests {
     fn pinned_config_records_the_address() {
         let cfg = DiscoveryConfig::pinned_to(v4(192, 168, 1, 21));
         assert_eq!(cfg.pin_interface_addr, Some(v4(192, 168, 1, 21)));
+    }
+
+    #[test]
+    fn a_label_keeps_what_dns_allows_and_bridges_the_rest() {
+        assert_eq!(mdns_label("Living Room_1", "fallback"), "Living-Room-1");
+        // The dot is a label separator, so it becomes a hyphen rather than
+        // being dropped: `macbooklocal` is not the machine anybody named.
+        assert_eq!(mdns_label("macbook.local", "fallback"), "macbook-local");
+        assert_eq!(mdns_label("DESKTOP-N3R13HQ", "fallback"), "DESKTOP-N3R13HQ");
+    }
+
+    /// A label may not begin or end with a hyphen, and a name whose edges are
+    /// punctuation is the ordinary way to get one.
+    #[test]
+    fn a_label_never_starts_or_ends_with_a_hyphen() {
+        assert_eq!(mdns_label("_lab_", "fallback"), "lab");
+        assert_eq!(mdns_label(" spaced ", "fallback"), "spaced");
+    }
+
+    /// A Mac's default computer name can be entirely emoji, and a record still
+    /// has to be published rather than silently malformed.
+    #[test]
+    fn a_name_with_nothing_usable_falls_back() {
+        assert_eq!(mdns_label("💻", "cursio-node"), "cursio-node");
+        assert_eq!(mdns_label("", "cursio-node"), "cursio-node");
+        // Non-ASCII letters are dropped, not transliterated: guessing at a
+        // romanisation would produce a name the user never chose.
+        assert_eq!(mdns_label("Мак", "cursio-node"), "cursio-node");
+    }
+
+    /// DNS caps a label at 63 bytes and the service type is appended after it.
+    #[test]
+    fn a_long_name_is_cut_to_something_dns_will_carry() {
+        let label = mdns_label(&"a".repeat(200), "fallback");
+        assert_eq!(label.len(), MAX_LABEL_CHARS);
+        assert!(label.len() < 63);
     }
 }

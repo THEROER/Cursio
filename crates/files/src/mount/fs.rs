@@ -16,9 +16,9 @@ use fuser::{
 };
 
 use super::attr::{attr_from, dir_attr, root_attr, to_errno, CACHE_TTL};
-use crate::server::{FALLBACK_FREE, FALLBACK_TOTAL};
-use crate::bridge::{mount_threads, PeerLink};
 use super::inode::{join, Entry, InodeTable, ROOT_INO};
+use crate::bridge::{mount_threads, PeerLink};
+use crate::server::{FALLBACK_FREE, FALLBACK_TOTAL};
 
 /// Generation number for every inode we hand out.
 ///
@@ -360,11 +360,12 @@ impl Filesystem for RemoteFs {
         // filesystem as far as `statfs` is concerned. The peer's own fallback
         // guarantees each is non-zero, so the total is too.
         let (total, free) = match self.volumes() {
-            Ok(volumes) if !volumes.is_empty() => volumes
-                .iter()
-                .fold((0u64, 0u64), |(t, f), v| {
-                    (t.saturating_add(v.total_bytes), f.saturating_add(v.free_bytes))
-                }),
+            Ok(volumes) if !volumes.is_empty() => volumes.iter().fold((0u64, 0u64), |(t, f), v| {
+                (
+                    t.saturating_add(v.total_bytes),
+                    f.saturating_add(v.free_bytes),
+                )
+            }),
             // The peer has not said yet, or cannot be reached. Answering an
             // error here would make `df` and every file manager show the mount
             // as broken while it is merely still waking up.

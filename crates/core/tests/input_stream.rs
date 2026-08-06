@@ -55,7 +55,10 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
         // client. No handoff needed.
         let res = session::run_session(
             server,
-            session::CursorSetup { start_active: true, peer_takes_cursor: true },
+            session::CursorSetup {
+                start_active: true,
+                peer_takes_cursor: true,
+            },
             None,
             |ev| received_in_task.lock().unwrap().push(ev),
             None,
@@ -67,9 +70,7 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
         // close both count as a clean end here.
         matches!(
             res,
-            Ok(())
-                | Err(SessionError::PeerLeft)
-                | Err(SessionError::Transport(_))
+            Ok(()) | Err(SessionError::PeerLeft) | Err(SessionError::Transport(_))
         )
     });
 
@@ -84,21 +85,39 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
     }
     drop(tx); // capture channel closes after draining
 
-    // Run the initiator/client session. It starts DORMANT, so it forwards its
-    // captured input straight to the active server — no hotkey needed.
+    // The client holds the cursor and hands it over before sending anything,
+    // which is the whole sequence a real handoff is: a machine forwards its
+    // input only once the user *at it* has sent the cursor across, so a second
+    // keyboard stays usable on its own machine rather than silently driving the
+    // first. Sending the cursor away is also something only its holder can do —
+    // an idle machine's pointer drifting into the edge is not a handoff, and
+    // treating it as one left a Mac driving a peer nobody was sitting at.
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    cmd_tx
+        .send(session::OwnershipCmd::HandoffToPeer {
+            edge: cursio_protocol::Edge::Right,
+            pos_norm: 0.5,
+        })
+        .expect("the session has not started yet, so the channel is open");
+    drop(cmd_tx);
+
     let client_task = tokio::spawn(async move {
         let client: Box<dyn Transport> = Box::new(client);
         // `run_session` borrows the capture channel now: it outlives a single
         // session in real use, so sessions read from it rather than own it.
         let mut rx = rx;
+        let mut cmd_rx = cmd_rx;
         let _ = tokio::time::timeout(
             Duration::from_secs(3),
             session::run_session(
                 client,
-                session::CursorSetup { start_active: false, peer_takes_cursor: true },
+                session::CursorSetup {
+                    start_active: true,
+                    peer_takes_cursor: true,
+                },
                 Some(&mut rx),
                 |_| {},
-                None,
+                Some(&mut cmd_rx),
                 |_| {},
                 Vec::new(),
             ),

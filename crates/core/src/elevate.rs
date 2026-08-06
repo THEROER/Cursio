@@ -76,7 +76,9 @@ pub fn ensure_elevated() -> Elevation {
 #[cfg(target_os = "windows")]
 fn is_elevated() -> bool {
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     // SAFETY: standard token query. The handle is closed on every path, and

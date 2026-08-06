@@ -29,9 +29,9 @@ use pipewire::{
         param::audio::{AudioFormat as SpaAudioFormat, AudioInfoRaw},
         pod::{serialize::PodSerializer, Object, Pod, Property, PropertyFlags, Value, ValueArray},
         sys::{
-            SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_MAX_CHANNELS,
             SPA_PARAM_EnumFormat, SPA_PARAM_Props, SPA_PROP_channelVolumes, SPA_PROP_mute,
-            SPA_TYPE_OBJECT_Format, SPA_TYPE_OBJECT_Props,
+            SPA_TYPE_OBJECT_Format, SPA_TYPE_OBJECT_Props, SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_MAX_CHANNELS,
         },
         utils::Direction,
     },
@@ -426,8 +426,7 @@ fn run_intent_sink_loop(
             // Current app nodes whose output is linked into our sink's input.
             let mut current: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (out_port, in_port) in links.borrow().values() {
-                let (Some(&out_node), Some(&in_node)) =
-                    (ports.get(out_port), ports.get(in_port))
+                let (Some(&out_node), Some(&in_node)) = (ports.get(out_port), ports.get(in_port))
                 else {
                     continue; // ports not registered yet; try again next tick
                 };
@@ -493,8 +492,12 @@ fn run_intent_sink_loop(
             }
             // Link: keep it raw (by its own object id) with the ports it joins.
             if let (Some(op), Some(ip)) = (
-                props.get("link.output.port").and_then(|v| v.parse::<u32>().ok()),
-                props.get("link.input.port").and_then(|v| v.parse::<u32>().ok()),
+                props
+                    .get("link.output.port")
+                    .and_then(|v| v.parse::<u32>().ok()),
+                props
+                    .get("link.input.port")
+                    .and_then(|v| v.parse::<u32>().ok()),
             ) {
                 links_g.borrow_mut().insert(obj.id, (op, ip));
                 changed = true;
@@ -611,7 +614,9 @@ impl PwDeviceMonitor {
 
     /// Apply a mute flag to the named device.
     pub fn set_mute(&self, node_name: String, mute: bool) {
-        let _ = self.commands.send(DeviceCommand::SetMute { node_name, mute });
+        let _ = self
+            .commands
+            .send(DeviceCommand::SetMute { node_name, mute });
     }
 }
 
@@ -941,10 +946,7 @@ fn list_devices_of_class(media_class: &str) -> Result<Vec<crate::OutputDevice>, 
             let Some(name) = props.get("node.name") else {
                 return;
             };
-            let description = props
-                .get("node.description")
-                .unwrap_or(name)
-                .to_string();
+            let description = props.get("node.description").unwrap_or(name).to_string();
             // Skip anything of ours, checking BOTH the node name and the
             // description. Our virtual microphones are named by their label
             // ("Cursio(peer): Mic"), so a name-only check can miss one — and
@@ -1152,11 +1154,7 @@ fn run_capture_loop(
                 // headphones ("микрофон ссыт мне в уши").
                 props.insert(
                     *pipewire::keys::NODE_NAME,
-                    format!(
-                        "cursio-mic-{}",
-                        target.as_deref().unwrap_or("default")
-                    )
-                    .as_str(),
+                    format!("cursio-mic-{}", target.as_deref().unwrap_or("default")).as_str(),
                 );
                 // Stay on the device we asked for. Without this the session
                 // manager is free to move the stream to another source when
@@ -1274,7 +1272,12 @@ fn run_capture_loop(
             }
             relink_app(&core, &loop_ref, app_id, &stream, &mut app_links, 20);
             if !app_links.is_empty() {
-                tracing::info!(app_id, count = app_links.len(), attempt, "linked app to capture");
+                tracing::info!(
+                    app_id,
+                    count = app_links.len(),
+                    attempt,
+                    "linked app to capture"
+                );
                 break;
             }
             if attempt == 39 {
@@ -1411,7 +1414,11 @@ fn relink_app(
     let before = links.len();
     links.retain(|out_port, _| live_outs.contains(out_port));
     if links.len() != before {
-        tracing::info!(app_id, dropped = before - links.len(), "dropped stale app links");
+        tracing::info!(
+            app_id,
+            dropped = before - links.len(),
+            "dropped stale app links"
+        );
     }
 
     if outs.is_empty() || ins.is_empty() {
@@ -1745,8 +1752,8 @@ fn run_playback_loop(
         }
 
         // The stream name is also surfaced by some tools; use the real label.
-        let stream = StreamRc::new(core, node_name.as_str(), props)
-            .map_err(|e| format!("stream: {e}"))?;
+        let stream =
+            StreamRc::new(core, node_name.as_str(), props).map_err(|e| format!("stream: {e}"))?;
         Ok((main_loop, stream))
     })();
 
@@ -1918,9 +1925,7 @@ fn run_playback_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pipewire::spa::{
-        pod::deserialize::PodDeserializer, sys::SPA_FORMAT_AUDIO_position,
-    };
+    use pipewire::spa::{pod::deserialize::PodDeserializer, sys::SPA_FORMAT_AUDIO_position};
 
     /// Our streams must declare FL/FR positions, not just "2 channels".
     ///
@@ -1932,7 +1937,9 @@ mod tests {
     #[test]
     fn format_pod_declares_channel_positions() {
         let pod = format_param_pod();
-        let parsed = PodDeserializer::deserialize_any_from(&pod).expect("pod parses").1;
+        let parsed = PodDeserializer::deserialize_any_from(&pod)
+            .expect("pod parses")
+            .1;
 
         let Value::Object(obj) = parsed else {
             panic!("format pod should be an object");
@@ -1944,7 +1951,10 @@ mod tests {
             .expect("format pod must carry a channel position array");
 
         let Value::ValueArray(ValueArray::Id(ref ids)) = position.value else {
-            panic!("position should be an array of ids, got {:?}", position.value);
+            panic!(
+                "position should be an array of ids, got {:?}",
+                position.value
+            );
         };
         assert_eq!(
             ids.iter().map(|id| id.0).collect::<Vec<_>>(),

@@ -72,11 +72,19 @@ mod tests {
         let mut fb = Framebuffer::new(4, 2);
         let tile = [0xFF, 0xFF, 0xFF, 0xFF];
         fb.blit(
-            Rect { x: 2, y: 1, width: 1, height: 1 },
+            Rect {
+                x: 2,
+                y: 1,
+                width: 1,
+                height: 1,
+            },
             &tile,
         )
         .unwrap();
-        let i = ((1 * 4 + 2) * 4) as usize;
+        // (y * width + x) * bytes-per-pixel, spelled out rather than written as
+        // 24: the point of the test is that the offset follows the formula.
+        let (x, y, width) = (2_usize, 1_usize, 4_usize);
+        let i = (y * width + x) * 4;
         assert_eq!(&fb.pixels[i..i + 4], &tile);
         assert!(fb.pixels[..i].iter().all(|&b| b == 0));
     }
@@ -85,7 +93,12 @@ mod tests {
     fn out_of_bounds_tile_is_rejected_not_clipped() {
         let mut fb = Framebuffer::new(4, 2);
         let err = fb.blit(
-            Rect { x: 3, y: 0, width: 2, height: 1 },
+            Rect {
+                x: 3,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
             &[0; 8],
         );
         assert!(matches!(err, Err(WindowError::Backend(_))));

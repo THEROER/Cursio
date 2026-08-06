@@ -51,8 +51,9 @@ pub fn decode_tile(
 ) -> Result<Vec<u8>, WindowError> {
     let raw = match codec {
         TileCodec::RawBgra8888 => data.to_vec(),
-        TileCodec::LosslessBgra8888 => zstd::decode_all(data)
-            .map_err(|e| WindowError::Backend(format!("zstd decode: {e}")))?,
+        TileCodec::LosslessBgra8888 => {
+            zstd::decode_all(data).map_err(|e| WindowError::Backend(format!("zstd decode: {e}")))?
+        }
         TileCodec::LossyImage | TileCodec::LossyVideo => return Err(WindowError::Unsupported),
     };
     if raw.len() != expected_len {

@@ -257,11 +257,7 @@ impl VideoEncoder {
             height,
             encoder,
             scaler,
-            yuv: ffmpeg_next::frame::Video::new(
-                ffmpeg_next::format::Pixel::YUV420P,
-                width,
-                height,
-            ),
+            yuv: ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height),
             pts: 0,
         })
     }
@@ -310,8 +306,11 @@ impl VideoEncoder {
         // `stride()`, which for BGRA is usually but *not always* `width * 4`,
         // so copy row by row rather than in one memcpy — the same padding trap
         // as PipeWire's `chunk.stride`.
-        let mut src =
-            ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, self.width, self.height);
+        let mut src = ffmpeg_next::frame::Video::new(
+            ffmpeg_next::format::Pixel::BGRA,
+            self.width,
+            self.height,
+        );
         let row_bytes = (self.width as usize) * 4;
         let stride = src.stride(0);
         let data = src.data_mut(0);
@@ -412,7 +411,10 @@ mod tests {
             let lossless = opts
                 .iter()
                 .any(|(k, v)| (*k == "qp" && *v == "0") || *v == "lossless");
-            assert!(lossless, "{kind:?} options don't express lossless: {opts:?}");
+            assert!(
+                lossless,
+                "{kind:?} options don't express lossless: {opts:?}"
+            );
         }
     }
 
@@ -466,9 +468,19 @@ mod tests {
         let frame = solid_bgra(w, h, 0x40);
         let mut total = 0usize;
         for _ in 0..30 {
-            total += enc.encode(&frame).expect("encode").iter().map(|p| p.len()).sum::<usize>();
+            total += enc
+                .encode(&frame)
+                .expect("encode")
+                .iter()
+                .map(|p| p.len())
+                .sum::<usize>();
         }
-        total += enc.finish().expect("flush").iter().map(|p| p.len()).sum::<usize>();
+        total += enc
+            .finish()
+            .expect("flush")
+            .iter()
+            .map(|p| p.len())
+            .sum::<usize>();
 
         // 30 unchanging frames vs one raw frame. This is the whole premise of
         // the codec: inter-frame prediction should make repeats nearly free, so

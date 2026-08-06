@@ -263,6 +263,11 @@ type Mount = cursio_files::mount::MountHandle;
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 type Mount = cursio_files::winmount::MountHandle;
 
+/// Uninhabited where no mount implementation exists, so `Option<Mount>` is
+/// always `None` and every path that reads it stays compiled and honest.
+#[cfg(not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))))]
+enum Mount {}
+
 /// Mount the peer's volumes with whatever this platform provides.
 ///
 /// The two implementations differ in everything the OS cares about — a
@@ -280,6 +285,19 @@ fn mount_peer(peer: PeerLink, peer_name: &str) -> anyhow::Result<Mount> {
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 fn mount_peer(peer: PeerLink, peer_name: &str) -> anyhow::Result<Mount> {
     cursio_files::winmount::mount(peer, peer_name)
+}
+
+/// Serving is portable; mounting is not.
+///
+/// macOS has no mount backend here (FUSE needs a kernel extension the user must
+/// install and approve), and a MinGW build has none either — `winfsp-sys`
+/// refuses that target. Failing only *this* half is what lets the module still
+/// run: the engine already treats an absent mount as "still sharing ours", so a
+/// Mac serves its volumes to a Linux peer that can mount them, and says plainly
+/// why the reverse direction is missing.
+#[cfg(not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))))]
+fn mount_peer(_peer: PeerLink, _peer_name: &str) -> anyhow::Result<Mount> {
+    anyhow::bail!("no mount backend on this platform; install FUSE (Linux) or WinFsp (Windows)")
 }
 
 /// One request we sent that has not been answered yet.
@@ -481,10 +499,7 @@ impl FilesEngine {
 }
 
 /// Execute one peer request. Returns the reply to send, if any.
-fn run_request(
-    server: &std::sync::Mutex<FileServer>,
-    msg: FilesMsg,
-) -> Option<FilesMsg> {
+fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<FilesMsg> {
     /// Turn a `Result` into either its success message or a `Failed`.
     fn answer<T>(
         req: FileReqId,
@@ -529,7 +544,11 @@ fn run_request(
                 .lock()
                 .expect("file server")
                 .open(&volume, &path, mode);
-            answer(req, r, |(handle, size)| FilesMsg::Opened { req, handle, size })
+            answer(req, r, |(handle, size)| FilesMsg::Opened {
+                req,
+                handle,
+                size,
+            })
         }
         FilesMsg::Read {
             req,
@@ -540,7 +559,10 @@ fn run_request(
             // Clamped to the wire chunk size: a caller asking for more than one
             // frame can hold gets what fits, and asks again.
             let len = len.min(FilesMsg::MAX_CHUNK as u32);
-            let r = server.lock().expect("file server").read(handle, offset, len);
+            let r = server
+                .lock()
+                .expect("file server")
+                .read(handle, offset, len);
             answer(req, r, |bytes| FilesMsg::Data {
                 req,
                 offset,
@@ -624,7 +646,9 @@ impl FilesEngine {
         let mut seen = 0;
         while allowance > 0 && seen < MAX_MESSAGES_PER_PUMP && Instant::now() < deadline {
             seen += 1;
-            let Ok(op) = self.ops_rx.try_recv() else { break };
+            let Ok(op) = self.ops_rx.try_recv() else {
+                break;
+            };
             let req = self.next_req();
             let (pending, msg) = match op {
                 Op::Volumes { reply } => {
@@ -1087,7 +1111,10 @@ mod tests {
 
         let mut tx = RecordingTx::default();
         let deadline = Instant::now() + Duration::from_secs(30);
-        engine.pump_requests(&mut tx, deadline).await.expect("pumps");
+        engine
+            .pump_requests(&mut tx, deadline)
+            .await
+            .expect("pumps");
 
         assert_eq!(
             tx.sent.len(),
@@ -1098,7 +1125,10 @@ mod tests {
 
         // Nothing further goes out until answers come back: the window counts
         // what is outstanding, not what was sent this pass.
-        engine.pump_requests(&mut tx, deadline).await.expect("pumps");
+        engine
+            .pump_requests(&mut tx, deadline)
+            .await
+            .expect("pumps");
         assert_eq!(tx.sent.len(), MIN_IN_FLIGHT, "the window is still full");
     }
 
@@ -1140,7 +1170,10 @@ mod tests {
 
         let mut tx = RecordingTx::default();
         let deadline = Instant::now() + Duration::from_secs(30);
-        engine.pump_requests(&mut tx, deadline).await.expect("pumps");
+        engine
+            .pump_requests(&mut tx, deadline)
+            .await
+            .expect("pumps");
 
         // The write left the loop without being sent: it is on a worker being
         // compressed, and is already counted as outstanding.
@@ -1344,11 +1377,16 @@ mod tests {
             matches!(packed, Chunk::Zstd { .. }),
             "repetitive text must compress"
         );
-        assert!(packed.wire_len() < text.len(), "and must actually be smaller");
+        assert!(
+            packed.wire_len() < text.len(),
+            "and must actually be smaller"
+        );
         assert_eq!(unpack(packed).expect("unpacks"), text);
 
         // Incompressible: kept raw rather than declared compressed for nothing.
-        let noise: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 16) as u8).collect();
+        let noise: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
+            .collect();
         let packed = pack(noise.clone());
         assert_eq!(unpack(packed).expect("unpacks"), noise);
     }
