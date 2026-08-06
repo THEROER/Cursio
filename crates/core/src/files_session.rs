@@ -291,6 +291,7 @@ enum Pending {
         acc: Vec<cursio_protocol::FileMeta>,
     },
     Stat(std::sync::mpsc::Sender<Result<cursio_protocol::FileMeta, FileError>>),
+    Link(std::sync::mpsc::Sender<Result<String, FileError>>),
     Open(std::sync::mpsc::Sender<Result<(cursio_protocol::FileHandle, u64), FileError>>),
     Read {
         reply: std::sync::mpsc::Sender<Result<Vec<u8>, FileError>>,
@@ -307,6 +308,7 @@ impl Pending {
             Pending::Volumes(tx) => drop(tx.send(Err(e))),
             Pending::Dir { reply, .. } => drop(reply.send(Err(e))),
             Pending::Stat(tx) => drop(tx.send(Err(e))),
+            Pending::Link(tx) => drop(tx.send(Err(e))),
             Pending::Open(tx) => drop(tx.send(Err(e))),
             Pending::Read { reply, .. } => drop(reply.send(Err(e))),
             Pending::Wrote(tx) => drop(tx.send(Err(e))),
@@ -510,6 +512,13 @@ fn run_request(
             let r = server.lock().expect("file server").stat(&volume, &path);
             answer(req, r, |meta| FilesMsg::StatResult { req, meta })
         }
+        FilesMsg::ReadLink { req, volume, path } => {
+            let r = server
+                .lock()
+                .expect("file server")
+                .read_link(&volume, &path);
+            answer(req, r, |target| FilesMsg::LinkTarget { req, target })
+        }
         FilesMsg::Open {
             req,
             volume,
@@ -645,6 +654,14 @@ impl FilesEngine {
                     path,
                     reply,
                 } => (Pending::Stat(reply), FilesMsg::Stat { req, volume, path }),
+                Op::ReadLink {
+                    volume,
+                    path,
+                    reply,
+                } => (
+                    Pending::Link(reply),
+                    FilesMsg::ReadLink { req, volume, path },
+                ),
                 Op::Open {
                     volume,
                     path,
@@ -808,6 +825,11 @@ impl FilesEngine {
                     let _ = tx.send(Ok(meta));
                 }
             }
+            FilesMsg::LinkTarget { req, target } => {
+                if let Some(Pending::Link(tx)) = self.pending.remove(&req) {
+                    let _ = tx.send(Ok(target));
+                }
+            }
             FilesMsg::Opened { req, handle, size } => {
                 if let Some(Pending::Open(tx)) = self.pending.remove(&req) {
                     let _ = tx.send(Ok((handle, size)));
@@ -965,7 +987,7 @@ impl crate::module::ModuleFactory for FilesFactory {
 
 /// Version of this module's wire vocabulary ([`FilesMsg`]). Bump when those
 /// types change shape; peers run the module only on an exact match.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Whether a message is something to act on, rather than an answer to something
 /// we asked.
@@ -974,6 +996,7 @@ fn is_request(msg: &FilesMsg) -> bool {
         msg,
         FilesMsg::ReadDir { .. }
             | FilesMsg::Stat { .. }
+            | FilesMsg::ReadLink { .. }
             | FilesMsg::Open { .. }
             | FilesMsg::Read { .. }
             | FilesMsg::Write { .. }

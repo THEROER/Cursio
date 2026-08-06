@@ -235,6 +235,50 @@ impl Filesystem for RemoteFs {
         }
     }
 
+    /// Read a symlink's target.
+    ///
+    /// The kernel asks this for anything a listing reported as a link, and the
+    /// peer answers with the target exactly as stored. Nothing is resolved on
+    /// either side: the string is interpreted against this mounted tree, so a
+    /// link pointing out of the volume dangles here rather than reaching into
+    /// the owner's disk.
+    ///
+    /// Answering matters beyond the one entry — while this was `ENOSYS`, every
+    /// link was an object that could be neither read nor traversed, and a
+    /// directory walk tripped over the same one again and again, each attempt a
+    /// wasted round trip.
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match self.entry_of(ino.0) {
+            // The root and the volume directories are ours, and neither is a
+            // link.
+            Some(Entry::Root) => reply.error(Errno::EINVAL),
+            Some(Entry::Path { path, .. }) if path.is_empty() => reply.error(Errno::EINVAL),
+            Some(Entry::Path { volume, path }) => match self.peer.read_link(&volume, &path) {
+                Ok(target) => reply.data(target.as_bytes()),
+                Err(e) => reply.error(to_errno(&e)),
+            },
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    /// Nothing to flush.
+    ///
+    /// Writes are not buffered here: each one is a `Write` request answered by
+    /// the peer before the caller returns, so by the time a `close()` reaches
+    /// this there is nothing left to push. Left unimplemented it answers
+    /// `ENOSYS` — which the kernel tolerates, but which logs a warning on every
+    /// single file close.
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
     fn readdir(
         &self,
         _req: &Request,
