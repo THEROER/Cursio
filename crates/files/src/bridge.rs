@@ -91,6 +91,11 @@ pub enum Op {
         path: String,
         reply: std_mpsc::Sender<Result<FileMeta, FileError>>,
     },
+    ReadLink {
+        volume: String,
+        path: String,
+        reply: std_mpsc::Sender<Result<String, FileError>>,
+    },
     Open {
         volume: String,
         path: String,
@@ -235,6 +240,14 @@ impl PeerLink {
 
     pub fn stat(&self, volume: &str, path: &str) -> Result<FileMeta, FileError> {
         self.call(|reply| Op::Stat {
+            volume: volume.to_string(),
+            path: path.to_string(),
+            reply,
+        })
+    }
+
+    pub fn read_link(&self, volume: &str, path: &str) -> Result<String, FileError> {
+        self.call(|reply| Op::ReadLink {
             volume: volume.to_string(),
             path: path.to_string(),
             reply,

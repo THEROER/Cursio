@@ -287,6 +287,27 @@ pub enum FilesMsg {
     /// Owner -> mount: the metadata.
     StatResult { req: FileReqId, meta: FileMeta },
 
+    /// Mount -> owner: what does this symlink point at?
+    ///
+    /// The counterpart to [`FileKind::Symlink`]: a listing reports a link as a
+    /// link without resolving it, which leaves the mount side holding something
+    /// the kernel will ask it to read. Without this the answer is `ENOSYS`, and
+    /// every symlink on the volume becomes an entry that can be neither read nor
+    /// traversed — a directory walk trips over the same one repeatedly, paying a
+    /// round trip each time.
+    ReadLink {
+        req: FileReqId,
+        volume: String,
+        path: String,
+    },
+    /// Owner -> mount: the link's target, exactly as stored.
+    ///
+    /// Unresolved and unvalidated, because only the mount side can judge it: a
+    /// target is meaningful relative to the mounted tree, and one pointing
+    /// outside the volume must arrive intact to be seen for what it is rather
+    /// than silently reinterpreted against the owner's disk.
+    LinkTarget { req: FileReqId, target: String },
+
     /// Mount -> owner: open a file, yielding a handle.
     Open {
         req: FileReqId,

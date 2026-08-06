@@ -138,6 +138,36 @@ impl FileServer {
         Ok(meta_from(name, &md, self.writable(volume)))
     }
 
+    /// Read a symlink's target, exactly as stored.
+    ///
+    /// Deliberately not resolved: following it here would let a link inside the
+    /// volume address anything on this disk, which is the whole reason a listing
+    /// reports links rather than what they point at. The target crosses the wire
+    /// as written and the mount side interprets it against the mounted tree,
+    /// where a link leading out of the volume simply dangles.
+    ///
+    /// Windows targets keep their backslashes. Rewriting them would be a guess
+    /// about a path this side never resolves, and a dangling link that reads
+    /// back what the owner stored is easier to explain than one silently
+    /// rewritten into a different dangling path.
+    pub fn read_link(&self, volume: &str, path: &str) -> Result<String, FileError> {
+        let target = self.resolve(volume, path)?;
+        // `symlink_metadata` first: `read_link` on a regular file reports
+        // `InvalidInput`, which `to_file_error` cannot tell from a malformed
+        // request. The caller asked about the wrong kind of thing, and
+        // `WrongKind` says so.
+        let md = target.symlink_metadata().map_err(to_file_error)?;
+        if !md.file_type().is_symlink() {
+            return Err(FileError::WrongKind);
+        }
+        let dest = std::fs::read_link(&target).map_err(to_file_error)?;
+        dest.to_str()
+            .map(str::to_owned)
+            // Wire paths are UTF-8. A target that is not says so plainly rather
+            // than arriving mangled by a lossy conversion.
+            .ok_or(FileError::Io("link target is not valid utf-8".into()))
+    }
+
     /// Open a file, returning a handle and its current size.
     pub fn open(
         &mut self,
@@ -635,5 +665,62 @@ mod tests {
             FileKind::Symlink,
             "a link must not be reported as its target"
         );
+    }
+
+    /// A link's target crosses the wire exactly as stored, including one that
+    /// leads out of the volume.
+    ///
+    /// Reporting a link without being able to answer for it is what made every
+    /// symlink on the volume unreadable and untraversable. Resolving it here
+    /// instead would be worse than useless: `/etc/shadow` is outside the shared
+    /// tree, and the mount side can only recognise that if it receives the
+    /// target unresolved.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_links_target_is_returned_unresolved() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink("/etc/shadow", tmp.path().join("escape")).expect("symlink");
+        std::os::unix::fs::symlink("inside.txt", tmp.path().join("relative")).expect("symlink");
+        let srv = server_on(tmp.path());
+
+        assert_eq!(srv.read_link("T:", "escape").expect("reads"), "/etc/shadow");
+        assert_eq!(
+            srv.read_link("T:", "relative").expect("reads"),
+            "inside.txt"
+        );
+    }
+
+    /// Reading a link on something that is not one says so, rather than
+    /// surfacing the `InvalidInput` the OS reports for it — which is
+    /// indistinguishable from a malformed request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reading_a_link_on_a_regular_file_reports_the_wrong_kind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("plain.txt"), b"data").expect("writes");
+        let srv = server_on(tmp.path());
+
+        assert!(matches!(
+            srv.read_link("T:", "plain.txt"),
+            Err(FileError::WrongKind)
+        ));
+        assert!(matches!(
+            srv.read_link("T:", "missing"),
+            Err(FileError::NotFound)
+        ));
+    }
+
+    /// A link cannot be used to read outside the volume, the same as any other
+    /// path: the escape is refused before the link is ever consulted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_link_request_cannot_escape_its_volume() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let srv = server_on(tmp.path());
+
+        assert!(matches!(
+            srv.read_link("T:", "../outside"),
+            Err(FileError::Denied)
+        ));
     }
 }
