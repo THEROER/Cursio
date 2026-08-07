@@ -52,6 +52,16 @@ mod backend {
             channels: u8,
             config: &[u8],
         ) -> Result<Self, AirPlayError> {
+            // See `video::gstreamer_present`: these symbols are delay-loaded on
+            // Windows, so calling into a GStreamer that is not installed raises
+            // a structured exception rather than failing.
+            if !crate::video::gstreamer_present() {
+                return Err(AirPlayError::Audio(
+                    "GStreamer is not installed; AirPlay audio needs its runtime DLLs on PATH or \
+                     beside the executable"
+                        .into(),
+                ));
+            }
             gst::init().map_err(|error| {
                 AirPlayError::Audio(format!("GStreamer could not start ({error})"))
             })?;

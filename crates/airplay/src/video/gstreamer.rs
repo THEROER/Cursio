@@ -6,6 +6,17 @@ use super::{PipelinePlan, VideoCodec};
 use crate::AirPlayError;
 
 pub(super) fn check_available(codec: VideoCodec) -> Result<(), AirPlayError> {
+    // Before the first call, not after: on Windows these symbols are
+    // delay-loaded, and calling into a library that is not installed raises a
+    // structured exception instead of failing — which ended the process here,
+    // during startup, with nothing written to the log.
+    if !super::gstreamer_present() {
+        return Err(AirPlayError::Video(
+            "GStreamer is not installed; AirPlay video needs its runtime DLLs on PATH or beside \
+             the executable"
+                .into(),
+        ));
+    }
     gst::init().map_err(|error| {
         AirPlayError::Video(format!(
             "GStreamer could not start ({error}); install GStreamer 1.x and its hardware video plugins"

@@ -22,6 +22,46 @@ pub fn prepare_window() -> Result<(), crate::AirPlayError> {
 
 use crate::AirPlayError;
 
+/// Whether GStreamer's own DLLs can be loaded at all.
+///
+/// On Windows they are delay-loaded, so the binary starts without them and a
+/// machine that never mirrors a phone needs nothing installed. The cost of that
+/// is unforgiving: an unresolved delay-load raises a structured exception at
+/// the first call rather than returning an error, and nothing here catches one
+/// — `gst::init()` took the whole process down without a line in the log.
+///
+/// `LoadLibraryW` asks the same question the delay-load stub would, and answers
+/// with a null handle instead of an exception. Every entry point into GStreamer
+/// goes through here first.
+///
+/// The handles are deliberately not freed: something is about to call into
+/// these libraries, and this is the process-wide load either way.
+#[cfg(target_os = "windows")]
+pub fn gstreamer_present() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::LoadLibraryW;
+
+    // Only the two that everything else depends on. A GStreamer missing just
+    // `gstvideo` is not an installation this code can rescue, and probing all
+    // five would report the same thing more slowly.
+    for name in ["glib-2.0-0.dll", "gstreamer-1.0-0.dll"] {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the
+        // call, which is all `LoadLibraryW` requires.
+        if unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())) }.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Everywhere else the libraries are ordinary shared objects: if the crate
+/// linked, they are present.
+#[cfg(not(target_os = "windows"))]
+pub fn gstreamer_present() -> bool {
+    true
+}
+
 /// How large the mirrored screen should appear locally.
 ///
 /// Carried from the configured [`VideoProfile`](crate::VideoProfile) rather
