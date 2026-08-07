@@ -1574,16 +1574,23 @@ async fn run_pairing_and_session(
                 tracing::warn!("panic recovery: input returned to this machine, barriers down");
                 return;
             }
-            // Three states, not two. Dormant grabs local input and streams it,
-            // and that is only true while we are actually driving the peer.
-            // Holding the cursor is Active; neither is Idle, where this
-            // machine's own keyboard and mouse simply act on it.
-            let dormant = ownership.driving;
+            // Two states, because there is one shared cursor and every machine
+            // can move it. Holding it is Active; not holding it is Dormant —
+            // local input is grabbed and streamed to whichever machine does.
+            //
+            // A third state sorted by `driving` was tried and is what made a
+            // mouse stop working: a machine that had handed the cursor back
+            // landed in Idle, where its pointer acts locally and moves nothing
+            // shared. The user then had one mouse that drove both screens and
+            // one that drove neither. Which side the user is sitting at is not
+            // knowable here and does not need to be — an unheld cursor is
+            // driven from wherever the hand is.
+            let dormant = !ownership.active;
             if let Some(g) = grab_ref.as_ref() {
-                g.set_mode(match (ownership.active, ownership.driving) {
-                    (true, _) => cursio_input::InputMode::Active,
-                    (false, true) => cursio_input::InputMode::Dormant,
-                    (false, false) => cursio_input::InputMode::Idle,
+                g.set_mode(if ownership.active {
+                    cursio_input::InputMode::Active
+                } else {
+                    cursio_input::InputMode::Dormant
                 });
             }
             // Cursor visibility before the injector, and both before the log
