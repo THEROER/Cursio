@@ -417,6 +417,37 @@ struct BarrierInfo {
 /// the portal rejects the ones that fall on an internal seam (harmless, logged),
 /// leaving the barrier on the true outer edge. Returns the id -> [`BarrierInfo`]
 /// map used to recover the edge + normalized position on activation.
+/// Whether `edge` of this region faces off the desktop rather than another
+/// monitor.
+///
+/// A barrier is a line the pointer cannot cross, so it belongs only where the
+/// desktop ends. Put one on the seam between two monitors and the portal
+/// refuses it — correctly, since stopping the pointer mid-desktop is not
+/// something a compositor will do.
+///
+/// "Another monitor is there" means one that starts exactly where this edge
+/// ends *and* overlaps it along the edge's own axis. Monitors of different
+/// heights make that overlap partial: a short screen beside a tall one leaves
+/// the tall one's edge exposed above and below it. Treating such an edge as
+/// outer keeps the barrier, which is the safe way to be wrong — the portal
+/// rejects a barrier it dislikes, while a missing one silently stops edge
+/// crossing from working at all.
+fn is_outer_edge(rect: Rect, edge: Edge, rects: &[Rect]) -> bool {
+    let (x, y, w, h) = rect;
+    rects.iter().all(|&(ox, oy, ow, oh)| {
+        if (ox, oy, ow, oh) == rect {
+            return true; // a region cannot enclose itself
+        }
+        // Does the neighbour sit flush against this edge, and cover it whole?
+        match edge {
+            Edge::Left => !(ox + ow == x && oy <= y && oy + oh >= y + h),
+            Edge::Right => !(ox == x + w && oy <= y && oy + oh >= y + h),
+            Edge::Top => !(oy + oh == y && ox <= x && ox + ow >= x + w),
+            Edge::Bottom => !(oy == y + h && ox <= x && ox + ow >= x + w),
+        }
+    })
+}
+
 fn outer_edge_barriers(
     rects: &[Rect],
     peer_edge: Option<Edge>,
@@ -429,6 +460,14 @@ fn outer_edge_barriers(
     let mut next_id = 1u32;
 
     for &(x, y, w, h) in rects {
+        // Outer edges only, as the name says. A barrier on the seam between two
+        // of this desktop's own monitors is one the portal rejects — it logged
+        // `some barriers were rejected` on every start of a two-monitor
+        // desktop, which is noise that hides a barrier genuinely refused.
+        if !is_outer_edge((x, y, w, h), peer_edge, rects) {
+            continue;
+        }
+
         // The barrier line + (origin, length) span for the chosen edge only.
         let (pos, origin, length) = match peer_edge {
             Edge::Left => (BarrierPosition::new(x, y, x, y + h - 1), y, h),
@@ -943,23 +982,49 @@ mod tests {
         assert!(info.is_empty());
     }
 
-    /// Two monitors side by side: the left one's right-hand barrier falls on
-    /// the seam between them and the portal rejects it, which is why one is
-    /// emitted per region rather than one for the desktop. The surviving
-    /// barrier is the one on the true outer edge.
+    /// Two monitors of equal height, side by side: only the outer edge gets a
+    /// barrier.
+    ///
+    /// The seam between them used to get one too, and the portal rejected it on
+    /// every start — `some barriers were rejected` in the log of any
+    /// two-monitor desktop, which is exactly the noise that hides a barrier
+    /// refused for a reason worth knowing.
     #[test]
-    fn a_two_monitor_row_offers_a_barrier_per_screen() {
-        let desktop = [(0, 0, 1920, 1080), (1920, 0, 2560, 1440)];
+    fn a_seam_between_two_monitors_gets_no_barrier() {
+        let desktop = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
         let (barriers, info) = outer_edge_barriers(&desktop, Some(Edge::Right));
-        assert_eq!(barriers.len(), 2);
-        assert_eq!(
-            info.len(),
-            2,
-            "each barrier must be attributable on its own"
-        );
+        assert_eq!(barriers.len(), 1, "the seam must not be offered");
+        assert_eq!(info.len(), 1);
+        let line = barriers[0].position().as_tuple().0;
+        assert_eq!(line, 3840, "the barrier belongs on the desktop's own edge");
+    }
+
+    /// A neighbour that does not cover the whole edge leaves it partly facing
+    /// off the desktop, so the barrier stays.
+    ///
+    /// A 1080-tall screen beside a 1440-tall one covers only part of the taller
+    /// one's edge; the rest is outer. Dropping the barrier there would leave
+    /// the pointer able to leave the desktop with nothing to notice it, which
+    /// is worse than offering one the portal might reject.
+    #[test]
+    fn a_partly_covered_edge_keeps_its_barrier() {
+        let desktop = [(0, 0, 2560, 1440), (2560, 0, 1920, 1080)];
+        let (barriers, _) = outer_edge_barriers(&desktop, Some(Edge::Right));
         let lines: Vec<i32> = barriers.iter().map(|b| b.position().as_tuple().0).collect();
-        assert!(lines.contains(&1920), "the seam, which the portal rejects");
-        assert!(lines.contains(&4480), "the outer edge, which it keeps");
+        assert!(
+            lines.contains(&2560),
+            "the taller screen's edge is exposed above the shorter one"
+        );
+        assert!(lines.contains(&4480), "and the outer edge is still there");
+    }
+
+    /// Stacked monitors, with the peer to the right: neither edge is a seam,
+    /// because the seam between them is horizontal.
+    #[test]
+    fn a_seam_on_another_axis_does_not_suppress_a_barrier() {
+        let desktop = [(0, 0, 1920, 1080), (0, 1080, 1920, 1080)];
+        let (barriers, _) = outer_edge_barriers(&desktop, Some(Edge::Right));
+        assert_eq!(barriers.len(), 2, "both right edges face off the desktop");
     }
 
     /// A horizontal edge varies along x, a vertical one along y. Getting this
