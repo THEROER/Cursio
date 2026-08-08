@@ -1,163 +1,181 @@
-Cursio is a LAN-first, cross-platform seamless workspace tool that allows you to move application windows between machines while the applications continue running on their original host.
+# Cursio
 
-The goal is simple:
+A LAN-only mesh of trusted personal devices sharing one encrypted channel.
 
-It should not matter where an application is launched.
+Input, audio, clipboard, window transfer and file sharing are **modules** on that
+channel — not separate products. Applications never migrate; only pixels,
+samples, events and file requests cross the link.
 
-What it does
+The goal is simple: **it should not matter which machine an application was
+launched on.**
 
-Stream individual application windows across machines on the same LAN
+## What it does
 
-Proxy mouse and keyboard input back to the source system
+- Share one mouse and keyboard across every machine, moving between them by
+  pushing the cursor off a screen edge
+- Stream an individual application window to another machine while the app keeps
+  running on its original host
+- Carry the clipboard across machines, with formatting and images intact
+- Route audio **per application**, so each remote app appears here as its own
+  named node
+- Mount a peer's disks locally, on demand
+- Receive iPhone/iPad screen mirroring as an AirPlay target for the whole mesh
 
-Treat remote windows as part of a single logical workspace
+## What it is not
 
-Integrate naturally with cursor boundaries and window movement
+- Not a remote desktop — a window is transferred, not a screen
+- Not application or process migration — the app never leaves its host
+- Not virtualization
+- Not built for the Internet or NAT traversal (LAN only in v0.x)
+- Not a replacement for your mixer — Cursio replaces the network hop, not
+  VoiceMeeter or Carla
 
-What it is not
+## Supported platforms (v0.1)
 
-Not full remote desktop
+| | Input | Clipboard | Window host | Window view | Audio | Files | AirPlay |
+|---|---|---|---|---|---|---|---|
+| **Linux** (Wayland) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Windows 11** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **macOS 13+** | ✅ | ✅ | ✅ | ❌ | ❌ | serve only | ✅ |
 
-Not application or process migration
+A Mac can host a window but cannot yet display a peer's; it serves its own
+volumes but cannot mount a peer's. Wayland support depends on compositor
+security policy and varies between compositors.
 
-Not virtualization
+## Core concepts
 
-Not designed for Internet/NAT traversal (LAN only in v0.x)
+**No server, no hub.** Every node listens for peers dialling in *and* dials the
+known peers that are down. A node dying doesn't make the others forget it — they
+mark it offline, carry on with each other, and reconnect when it returns.
 
-Supported platforms (v0.1)
+**Machines are placed on a grid**, not by naming a side. `--at 1,0` is one
+machine to the right of `0,0`; four in a row are `0,0 1,0 2,0 3,0`. Cells, not
+pixels — nothing needs to know how wide anybody's screen is. A side cannot
+express order, and a designated centre would make every machine depend on one
+being up, which is what the mesh exists to avoid.
 
-Windows 11
+**One encrypted channel, five priority classes.** Everything rides one Noise
+link, scheduled `Control` > `Input` > `Audio` > `Video` > `Bulk`, so an input
+event queued mid-file-transfer jumps ahead of that transfer's remaining chunks.
 
-Linux (Wayland)
+**Input is relative.** Mouse motion crosses the wire as `dx`/`dy`, never as an
+absolute position — absolute positioning teleports the cursor and breaks games
+reading raw input. System shortcuts such as Alt-Tab stay local.
 
-macOS 13+ — input, clipboard, AirPlay and window *hosting*. A Mac cannot yet
-display a peer's window, and has no audio or file-sharing backend.
+**A drag is the only way to start a window transfer.** There is no flag for it,
+so nothing is ever transferred by accident. Receiving stays passive: a peer's
+window always arrives.
 
-Wayland support depends on compositor security policies and may vary.
+## Quick start
 
-Core concepts
-
-Applications always run on the source machine
-
-Only the window surface and input are transferred
-
-When a window is moved:
-
-it is hidden on the source (Windows), so the transfer feels like a move
-
-and appears as a native window on the target
-
-Input model
-
-Mouse input is sent as relative motion (dx/dy)
-
-Keyboard events are proxied to the source
-
-System shortcuts (e.g. Alt-Tab) remain local
-
-Performance
-
-Hardware H.264 encoding where the platform provides it — ffmpeg on Linux, Media
-Foundation on Windows
-
-Focus on low latency and high visual quality
-
-LAN-only transport
-
-User interaction
-
-Move windows by dragging them across screen edges — the only way to offer one,
-so nothing is transferred by accident
-
-Take the cursor back with Ctrl+Alt+G (in the wire key namespace, so a Mac's own
-mapping is logged at startup)
-
-Device pairing with password authentication
-
-Limitations (v0.x)
-
-DRM/protected surfaces may not be capturable
-
-Fullscreen applications and games are experimental
-
-Wayland compositors impose restrictions on capture and window control
-
-Latency depends on network and hardware capabilities
-
-Roadmap
-
-Done: encrypted mesh, input proxy, drag-to-edge window movement, per-application
-audio, clipboard, file sharing, AirPlay receiver
-
-Next: displaying a peer's window on macOS, VideoToolbox encoding, adaptive
-bitrate, compositor integrations
-
-## Project layout
-
-Cursio is a Cargo workspace:
-
-- `crates/protocol` — wire messages and length-prefixed framing
-- `crates/transport` — the `Transport` trait + auto-selection, TCP transport,
-  mDNS discovery, and password pairing (SPAKE2 + key confirmation + trust store)
-- `crates/core` — node identity, session handshake/heartbeat, and the `cursio` CLI
-- `crates/logging` — `cursio-log`: console + rotating-file logging shared by every binary
-- `crates/xtask` — build/install/cross-compile automation (`cargo xtask`)
-- `apps/clipd` — clipboard history popup (GTK4/libadwaita)
-- `app` — the Tauri desktop UI (builds on `cursio-core`)
-
-## Building & running (networking milestone)
-
-The current milestone is discovery + pairing + a live heartbeat session. The
-`cursio` CLI drives it; no Tauri toolchain is needed for this part.
-
-Build the networking crates and CLI:
+Build the CLI:
 
 ```sh
 cargo build -p cursio-core
 ```
 
-Run tests:
+Pair two machines by running the *same* command on **both**, with the same
+password:
 
 ```sh
-cargo test -p cursio-protocol -p cursio-transport -p cursio-core
+cargo run -p cursio-core -- mesh --pair
 ```
 
-### AirPlay receiver
+Then run the mesh with the modules you want:
 
-`cursio mesh` participates in one AirPlay receiver for the whole mesh. Open
-Control Center → Screen Mirroring and select `Cursio`. The mesh chooses a host
-with a free control port and prefers one with hardware H.264 decoding.
+```sh
+cursio mesh --at 0,0 --send-input --clipboard
+```
 
-`--airplay 1440p:30fps` asks the mesh for that quality without implying a local
-window; a better request rebuilds the selected receiver. Add
-`--airplay-window` on the machine where the mirrored screen should appear, even
-when another machine hosts the receiver. `--airplay off` removes this machine
-from hosting, while `--airplay-port <port>` changes its control port.
+## Pairing
 
-Current AirPlay scope:
+Pairing prompts for the password without echoing it. There is no separate
+"listen" and "join" side: a mesh node already listens and dials at once, and the
+two ends sort out which one places the call. `--pair` only opens the ten-minute
+window in which a machine neither has met is allowed to be called at all.
 
-- iPhone/iPad screen mirroring into a native Cursio video window;
-- transient AirPlay pairing, FairPlay session setup, encrypted H.264 transport,
-  and hardware-backed presentation;
-- the audio that accompanies screen mirroring is planned but is not decoded
-  yet;
-- arbitrary file transfer is not an AirPlay feature. Cursio's own encrypted
-  mesh file channel is the intended path for sending files between computers.
+On first contact the two run SPAKE2 pairing in symmetric mode — the password
+never crosses the wire — confirm the derived key, remember each other, and hold a
+session. A wrong password yields two *different* keys rather than an error, so an
+explicit key-confirmation step follows; only after it is the peer stored. Later
+runs skip pairing (`peer already trusted`), so a plain `mesh` is enough.
 
-Platform video requirements:
+Identity and trusted peers are persisted under the platform config directory
+(`~/.config/cursio` on Linux, `%APPDATA%\cursio` on Windows, `~/Library/
+Application Support/cursio` on macOS).
 
-- macOS: the receiver includes its native AppKit/AVFoundation presentation
-  helper and uses Apple's hardware H.264 decoder; no GStreamer installation is
-  required;
-- Linux: GStreamer 1.x plus a hardware H.264 decoder (`nvh264dec`, `vah264dec`,
-  or `vaapih264dec`) and a compatible Wayland/GL sink;
-- Windows: GStreamer 1.x with `d3d11h264dec` and `d3d11videosink`.
+## CLI
 
-At startup the Rust CLI checks the platform video path and port availability.
-Those results and the requested quality travel in the mesh greeting, so every
-node computes the same placement and failover when a host disconnects.
+```
+cursio mesh      # run as a mesh node — this is how everything runs
+cursio peers     # list peers discovered on the LAN, then exit
+```
 
-### Build & install (`cargo xtask`)
+Modules are off by default; each flag opts this machine in.
+
+| Flag | Effect |
+|---|---|
+| `--at X,Y` | Where this machine stands on the grid. Defaults to `0,0`, where nothing borders anything and Ctrl+Alt+G is the only handoff. Negative cells are fine (`--at -1,0`). |
+| `--send-input` | Capture this machine's mouse/keyboard and share it with peers |
+| `--clipboard` | Share the clipboard (text, images, other formats) |
+| `--audio` | Share audio per application |
+| `--files` | Share disks both ways; a peer's volumes appear under `~/Cursio/<peer>/` |
+| `--pair` | Open the pairing window (run on both machines) |
+| `--pair-addr <HOST:PORT>` | Name the machine to pair with when mDNS will not; also means this side places the call |
+| `--port <n>` | Listening port. Defaults to **46073**, deliberately stable — peers cache the last address to reconnect when mDNS is slow, and a port that changed each restart left that cache pointing at a dead one. Pass `0` for an ephemeral port. |
+| `--mac-modifiers <SPEC>` | Where the modifiers land on a Mac (see below) |
+
+`--files` mounts read-write, so anything either machine can reach, the other can
+change. Linux mounts with FUSE, Windows with WinFsp.
+
+### Taking the cursor
+
+Push the cursor off the edge facing a peer to hand it over. To take it back from
+an idle machine, press **Ctrl+Alt+G**.
+
+The hotkey is defined in the **wire** key namespace (Linux evdev), so on a Mac it
+moves with `--mac-modifiers`: `positional` (the default) puts it on Control+
+Option+G, `swapped` on Command+Option+G. Startup logs which physical keys, since
+a hotkey that quietly relocated is one you cannot find.
+
+`--mac-modifiers` takes a preset (`positional`, `swapped`) or `from=to` pairs
+such as `rightalt=globe`. `swapped` makes a PC keyboard's Ctrl+C copy on a Mac.
+
+## AirPlay
+
+`cursio mesh` participates in **one AirPlay receiver for the whole mesh**, named
+plainly `Cursio`. Open Control Center → Screen Mirroring and select it. The mesh
+picks a host that has a free control port and prefers one with a hardware H.264
+decoder; if that host goes away, the rest recompute placement and one takes over.
+
+| Flag | Effect |
+|---|---|
+| `--airplay <MODE>` | `on`/`control` (default) takes part; a profile such as `1440p:30fps` raises the mesh's quality request; `off` steps out of hosting |
+| `--airplay-window` | Show the mirrored screen on *this* machine, even when another hosts the receiver |
+| `--airplay-port <port>` | Change the control port |
+| `--share-airplay` | When hosting, offer the mirrored screen to every peer rather than only those asking for a window |
+
+The picture appears wherever you started it: the hosting peer forwards the H.264
+untouched through the ordinary window path, so nothing is re-encoded on the way.
+
+Scope today: screen mirroring, transient AirPlay pairing, FairPlay session setup,
+encrypted H.264 transport and hardware-backed presentation. The audio that
+accompanies mirroring is not decoded yet. Arbitrary file transfer is not an
+AirPlay feature — Cursio's own encrypted file channel is the path for that.
+
+**Platform video requirements**
+
+- **macOS** — bundles its native AppKit/AVFoundation helper and Apple's hardware
+  decoder; no GStreamer needed
+- **Linux** — GStreamer 1.x with a hardware H.264 decoder (`vah264dec`,
+  `nvh264dec`, or `vaapih264dec`) and a compatible Wayland/GL sink
+- **Windows** — GStreamer 1.x with `d3d11h264dec` and `d3d11videosink`
+
+Software decoding is refused rather than silently used. At startup the CLI checks
+the video path and port availability; those results travel in the mesh greeting,
+so every node computes the same placement.
+
+## Building & installing
 
 Project automation lives in `cargo xtask`, which wraps the env vars and target
 triples each build needs:
@@ -165,75 +183,105 @@ triples each build needs:
 ```sh
 cargo xtask build              # release build of supported binaries for this host
 cargo xtask install            # build + copy cursio, clipd, cursio-app to ~/.local/bin
-                               # (+ .desktop launchers for the GUI apps on Linux)
-cargo xtask windows            # cross-compile the .exe(s) from Linux (mingw)
+cargo xtask windows            # cross-compile the .exe(s) from Linux (MSVC)
 cargo xtask logs --follow      # print the log dir and tail the current log
 ```
 
-`install` also installs `.desktop` files under `~/.local/share/applications`.
-Add `~/.local/bin` to your `PATH` if it isn't already. `clipd` is Linux-only,
-so macOS builds `cursio` and `cursio-app`. Android remains a placeholder.
+`install` also writes `.desktop` files under `~/.local/share/applications`; add
+`~/.local/bin` to your `PATH` if it isn't already. `clipd` is Linux-only, so
+macOS builds `cursio` and `cursio-app`.
 
-`windows` links AirPlay video against GStreamer, so it needs that project's
-MSVC *development* package unpacked on the build host and pointed at with
-`GSTREAMER_WINDOWS_SYSROOT` (the prefix holding `lib/pkgconfig`, typically
-`.../1.0/msvc_x86_64`). `xtask` checks for it before building and wires up
-`PKG_CONFIG_*` itself.
+> Scope cargo to a package — **`--workspace` fails on macOS**, because
+> `apps/clipd` needs GTK4/libadwaita and `gdk-pixbuf-sys` ships no macOS
+> pkg-config.
 
-> On this Ubuntu box `cargo xtask` sets `OPUS_TARGET=ubuntu-24.04_x86_64`
-> automatically for native builds (a plain `cargo build` still needs it set by
-> hand). Windows cross-builds compile libopus from source and don't need it.
+Native Linux builds need `OPUS_TARGET=ubuntu-24.04_x86_64`; `cargo xtask` sets it
+automatically, a plain `cargo build` does not. Windows cross-builds compile
+libopus from source and don't need it, but do need GStreamer's MSVC *development*
+package unpacked on the build host and pointed at with `GSTREAMER_WINDOWS_SYSROOT`
+(the prefix holding `lib/pkgconfig`, typically `.../1.0/msvc_x86_64`).
 
-### Logging
+Run the tests:
+
+```sh
+cargo test -p cursio-protocol -p cursio-transport -p cursio-core
+```
+
+Several crates ship `examples/` that probe real hardware (`capture_probe`,
+`wasapi_loopback_probe`, `grab_cycle`, `encode_bench`). They exist because the
+thing they test needs a compositor, a GPU or an iPhone:
+
+```sh
+cargo run -p <pkg> --example <name>
+```
+
+## Logging
 
 Every binary logs to **both** the console and a rotating file:
 
-- Console (stderr): coloured, `info` by default.
-- File: plain, `debug` by default, rotated daily, under the platform data dir
-  — `~/.local/share/cursio/logs/` on Linux, `%APPDATA%\cursio\cursio\data\logs`
-  on Windows. Each binary writes its own file (`cursio.log.<date>`, etc.).
+- **Console** (stderr): coloured, `info` by default
+- **File**: plain, `debug` by default, rotated daily, under the platform data
+  dir — `~/.local/share/cursio/logs/` on Linux,
+  `%APPDATA%\cursio\cursio\data\logs` on Windows
 
-Override the levels via env vars:
+Override the levels:
 
-- `RUST_LOG=debug` — raises **both** sinks (e.g. `RUST_LOG=trace`).
-- `CURSIO_LOG_FILE=trace` — raises only the **file**, leaving the console quiet.
-
-`cargo xtask logs` prints the directory; add `--follow` to `tail -f` the newest.
-
-### Pairing two machines on your LAN
-
-Run the *same* command on **both** machines, with the same password:
+- `RUST_LOG=debug` — raises **both** sinks
+- `CURSIO_LOG_FILE=trace` — raises only the **file**, leaving the console quiet
 
 ```sh
-cargo run -p cursio-core -- mesh --pair
+RUST_LOG=cursio_airplay=debug,info cargo run -p cursio-core -- mesh
+cargo xtask logs --follow
 ```
 
-It prompts for the password without echoing it. There is no separate "listen"
-and "join" side: a mesh node already listens and dials at once, and the two ends
-sort out which one places the call. `--pair` only opens the ten-minute window in
-which a machine neither has met is allowed to be called at all.
+## Project layout
 
-On first contact they run SPAKE2 pairing, confirm the derived key, remember each
-other, and hold a session. Later runs skip pairing (`peer already trusted`), so
-plain `mesh` is enough. A wrong password is rejected at key confirmation and no
-trust is stored.
+Cursio is a Cargo workspace, layered `protocol` → `transport` → `core` →
+platform crates → binaries:
 
-Useful flags:
+- `crates/protocol` — wire vocabulary and length-prefixed framing, no I/O
+- `crates/transport` — discovery, password pairing (SPAKE2 + key confirmation +
+  trust store), Noise, and priority scheduling
+- `crates/core` — identity, link bring-up, mesh supervision, the session loop,
+  the module implementations, and the `cursio` CLI
+- `crates/input` — capture and injection per platform
+- `crates/window` — window capture, encoding, and surrogate windows
+- `crates/audio` — PipeWire and WASAPI backends
+- `crates/files` — serving volumes and mounting a peer's
+- `crates/clipboard-core` — clipboard backends, shared with `clipd`
+- `crates/airplay` — the AirPlay receiver, deliberately outside the mesh
+- `crates/logging` — console + rotating-file logging shared by every binary
+- `crates/xtask` — build/install/cross-compile automation
+- `app` — the Tauri desktop UI
+- `apps/clipd` — standalone Linux clipboard history popup (GTK4/libadwaita)
+- `native/` — vendored FairPlay C, the Windows audio driver, and the GNOME
+  extension used for drag detection
 
-- `mesh --pair-addr <ip:port>` — name the machine to pair with when mDNS will
-  not; also means this side places the call.
-- `mesh --port <n>` — pin the listening port.
-- `peers` — list peers discovered on the LAN and exit.
-- `RUST_LOG=debug` — verbose logging (heartbeats etc.).
+Platform crates are **mechanism**; the matching `*_session.rs` in `core` is
+**policy**. A feature is added as a module, never by branching in the CLI.
 
-Identity and trusted peers are persisted under the platform config directory
-(`~/.config/cursio` on Linux; `%APPDATA%\cursio` on Windows; `~/Library/
-Application Support/cursio` on macOS).
+`docs/*.md` are the source of truth for their subsystems: [mesh](docs/mesh-design.md),
+[platform](docs/platform-design.md), [input](docs/input-design.md),
+[audio](docs/audio-design.md), [clipboard](docs/clipboard-design.md),
+[window transfer](docs/window-transfer-design.md).
 
-Session traffic runs over a Noise `NNpsk0` channel keyed by the paired secret —
-input, audio, clipboard, windows and file requests all share that one encrypted
-link.
+## Limitations (v0.x)
 
-License
+- DRM/protected surfaces may not be capturable
+- Fullscreen applications and games are experimental
+- Wayland compositors restrict capture and window control; drag detection on
+  GNOME needs the bundled Shell extension
+- Latency depends on network and hardware
 
-TBD.
+## Roadmap
+
+**Done** — encrypted mesh, input proxy, drag-to-edge window transfer,
+per-application audio, clipboard, file sharing, AirPlay receiver.
+
+**Next** — displaying a peer's window on macOS, VideoToolbox encoding, adaptive
+bitrate, compositor integrations.
+
+## License
+
+Not yet chosen (`license = "TBD"`). Until one is added, no usage rights are
+granted.
