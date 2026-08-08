@@ -1,10 +1,11 @@
 # Clipboard Design (history, and sharing between machines)
 
-Status: foundation + `clipd` implemented and verified on the dev box
-(2026-07-19). Cross-machine sharing **implemented** (2026-07-19) as a session
-module in `crates/core/src/clipboard_session.rs`; unit-tested, not yet
-LAN-verified end to end. Companion to `input-design.md`,
-`window-transfer-design.md`, and `audio-design.md`.
+Status: **implemented on all three platforms.** `clipboard-core` has Linux
+(`data-control`/X11 via arboard), Windows (Win32 clipboard on a message-only
+window) and macOS (`NSPasteboard`) backends; cross-machine sharing is a session
+module in `crates/core/src/clipboard_session.rs`, and `clipd` ships its own GTK4
+popup. Companion to `input-design.md`, `window-transfer-design.md`, and
+`audio-design.md`.
 
 ## Two products, one foundation
 
@@ -21,14 +22,22 @@ destination differs — a database, or a socket. So that job lives in
 
 ```
 crates/clipboard-core/     the platform layer (read/write/watch, formats)
-  ├── apps/clipd/          history + picker   (standalone)
-  └── crates/core/         Cursio sharing     (not yet built)
+  ├── apps/clipd/          history + GTK4 popup   (standalone, Linux)
+  └── crates/core/         Cursio sharing         (clipboard_session.rs)
 ```
 
 **They compose for free.** The meeting point is the *system* clipboard, so when
 both run, content Cursio receives from another machine lands on the local
 clipboard, which `clipd` observes as an ordinary copy and records. There is no
 integration code between them, and none is needed.
+
+What that costs is one guard on the sharing side: writing the peer's copy to the
+local clipboard is itself a local change, and every platform reports it as one.
+Left alone, each machine would re-offer what it just received and the two would
+trade a copy back and forth forever. `last_remote_copy` retains the bytes of the
+last copy pulled from the peer so the worker recognises its own write as an echo,
+and holds them until a genuinely different local copy appears — which also covers
+platforms that emit more than one notification for a single write.
 
 ## The clipboard is a set, not a string
 
@@ -94,13 +103,45 @@ Hyprland) and can be added behind the same trait without touching callers.
   a full bitmap several times a second. An image copy is detected by the text
   representation changing, after which a full read finds what is actually there.
 
+## The other two platforms
+
+Everything above is X11's bargain, and neither of the other backends shares it.
+Both implement the same trait; what differs is what the platform will admit to.
+
+**Windows** (`windows.rs`) — the clipboard is **owned by the OS**, not served by
+a live process: once `SetClipboardData` copies the data in, the writing process
+can exit and the content survives. So there is no serving thread here at all, and
+the X11 rule above ("whoever writes must keep serving") is simply false on this
+platform. Change detection is a real notification — `AddClipboardFormatListener`
+on a message-only window — not a poll. Formats are the `CF_*` table:
+`CF_UNICODETEXT` for text, a registered `"PNG"` format preferred for images with
+`CF_DIB` decoded to PNG as the interop fallback.
+
+**macOS** (`macos.rs`) — representations are named with **Uniform Type
+Identifiers**, so the table is `public.png` and `public.utf8-plain-text` rather
+than `image/png` and `text/plain`; anything unrecognised is carried through
+verbatim. Two quirks are load-bearing:
+
+- nothing on the platform *announces* a copy, so the watcher polls `changeCount`
+  every 200 ms — what every clipboard manager on macOS does;
+- `NSPasteboard` cannot report a representation's size without materialising it,
+  so `read` really does load each one to measure it. That breaks the laziness the
+  trait otherwise promises, and it is honest rather than lazy: the offer needs
+  sizes, and there is no way to learn them cheaply.
+
 ## `clipd`
 
 ```
-clipd daemon          # watch and record
+clipd daemon          # watch and record; also hosts the picker window
 clipd list            # print history
 clipd pick            # choose an entry and put it back
 clipd copy <id>       # restore a specific entry
+clipd pin <id>        # keep an entry past the history limits
+clipd unpin <id>      # release it back to the limits
+clipd remove <id>     # drop one entry
+clipd clear           # drop everything unpinned
+clipd status          # where history is stored and how big it is
+clipd ping            # is the daemon up
 clipd install-service # run the daemon at login (systemd user unit)
 clipd install-hotkey  # bind the picker under GNOME
 ```
@@ -155,12 +196,25 @@ explicit "keep this".
 
 ### Picker and hotkey
 
-`clipd pick` drives whichever dmenu-style picker is installed (`fuzzel`, `rofi`,
-`wofi`, `tofi`, `dmenu`). They already solve the genuinely hard parts on
-Wayland: an overlay that takes focus, fuzzy search, desktop-matching theming.
-The cost is no image thumbnails — an image shows as `[image, 2.1 MiB]`. A native
-GTK popup would do better and `picker.rs` is the seam where one slots in;
-everything above it only asks "which id?".
+The picker started as whichever dmenu-style program was installed (`fuzzel`,
+`rofi`, `wofi`, `tofi`, `dmenu`), because those already solve the genuinely hard
+parts on Wayland: an overlay that takes focus, fuzzy search, desktop-matching
+theming. The cost was no image thumbnails — an image showed as
+`[image, 2.1 MiB]`.
+
+**The native GTK4/libadwaita popup that `picker.rs` was the seam for now ships**
+(`ui.rs`), and it does show thumbnails: one is generated on insert and stored in
+the `thumb` column beside the blob, so the list renders them without decoding
+full images. It lives **inside the daemon** rather than being spawned per press —
+starting GTK on each keypress costs hundreds of milliseconds — so `clipd pick` is
+now a one-line client that sends `Show`/`Hide`/`Toggle` over a unix socket
+(`ipc.rs`). Rows are lazy (`ListView` + a factory), so a long history costs
+nothing to open.
+
+An external picker is still reachable with `clipd pick --with <name>`. When one
+is used, the choice is not unconditionally dmenu-style: under GNOME `picker.rs`
+prefers GTK dialogs (`zenity`, `yad`), because the Wayland dmenu pickers need
+`wlr-layer-shell`, which GNOME does not implement.
 
 Wayland gives applications no way to register a global shortcut — that is the
 compositor's business. GNOME's answer is custom keybindings in dconf, so
@@ -177,7 +231,7 @@ claim first, as an explicit and reversible choice.
 Implemented as a [`SessionModule`] — `ClipboardEngine` in
 `crates/core/src/clipboard_session.rs` — multiplexed onto the same encrypted
 channel as input and audio, exactly like window transfer and audio. Enabled with
-`--clipboard` on `serve` / `connect` / `mesh`. The blocking `clipboard-core`
+`mesh --clipboard`. The blocking `clipboard-core`
 backend runs on a dedicated worker thread (`clipboard_session/worker.rs`) so the
 async session loop never blocks. The wire protocol reuses the disciplines
 already proven in this workspace.
@@ -189,9 +243,14 @@ waste bandwidth and stall the shared-cursor input stream sharing that link. The
 native clipboards are lazy in exactly this way, so this matches the OS model.
 
 **Chunked transfer.** Payloads exceed `MAX_FRAME_LEN` (16 MiB), so a requested
-format streams as a sequence of chunks — the discipline `AudioChunk` and
-`WindowFrame` already use. It also keeps the link responsive: input events
-interleave between chunks instead of a large paste blocking the session.
+format streams as a sequence of chunks of `CHUNK_BYTES` (256 KiB) — the
+discipline `AudioChunk` and `WindowFrame` already use. It also keeps the link
+responsive: input events interleave between chunks instead of a large paste
+blocking the session. A representation larger than `MAX_PAYLOAD_BYTES` (64 MiB)
+is not offered at all — offering it only to answer `TooLarge` on request wastes a
+round-trip — while the other representations of the same copy still go. The
+ceiling is enforced on both ends, so `TooLarge` remains the answer when a request
+arrives for something past it anyway.
 
 **Generation ids.** Copying twice in quick succession means the peer may still be
 pulling generation *n* when *n+1* is offered. Every request, chunk and error
@@ -202,10 +261,14 @@ so stale bytes are never pasted as current content.
 gone, read failed, too large) is answered with an error rather than silence, so
 the requester can fall back to another format instead of hanging.
 
-This is carried by the `Message` variants `ClipboardOffer` / `ClipboardRequest` /
-`ClipboardData` / `ClipboardFailed` (in `crates/protocol/src/clipboard.rs`), with
-`PROTOCOL_VERSION` bumped to 8. The module claims those variants via
-`SessionModule::handle_message` and drives its outbound work from `pump`.
+This is carried by `ClipboardMsg::{Offer, Request, Data, Failed}` (in
+`crates/protocol/src/clipboard.rs`) at `Priority::Bulk`. Clipboard was the first
+module moved off flat `Message` variants onto the module envelope, so these ride
+inside `Message::Module { module: ModuleId::CLIPBOARD, .. }` and are versioned by
+the module's own `VERSION`, not by `PROTOCOL_VERSION`. (`lib.rs` keeps a
+tombstone comment where the four flat variants used to be.) The module claims
+them via `SessionModule::handle_message` and drives its outbound work from
+`pump`.
 
 **Receiver pulls eagerly, once.** The offer→request split saves the bytes of
 every copy that is never pasted on the peer — but this side has no "the user is

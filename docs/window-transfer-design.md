@@ -1,13 +1,15 @@
 # Cursio — Window Transfer Design (drag a window to the other machine)
 
-Status: 2026-07-20 — milestone 1 (protocol v4 + traits) and milestone 2 (the
-Linux→Linux vertical slice) are implemented, and **capture has now been run
-live** (see *First live capture* below). The capture half is proven; the
-surrogate/network half still has not shown a frame on a peer. This document is
-the source of truth for how window transfer should behave; code should match it
-or this doc should be updated. Companion to `input-design.md` (shared cursor &
-keyboard), which this reuses for the transport, pairing, and the "drag past the
-edge" trigger.
+Status: **implemented, both halves.** Capture ships for Linux (ScreenCast portal
+→ PipeWire), Windows (`Windows.Graphics.Capture`) and macOS (ScreenCaptureKit);
+surrogate windows ship for Linux (GTK4) and Windows (raw Win32). A Mac can host a
+window but cannot yet display a peer's — `MacWindowRenderer` says so rather than
+failing obscurely. The protocol version quoted throughout this document is the
+one each piece landed in, not the current one. This document is the source of
+truth for how window transfer should behave; code should match it or this doc
+should be updated. Companion to `input-design.md` (shared cursor & keyboard),
+which this reuses for the transport, pairing, and the "drag past the edge"
+trigger.
 
 ### First live capture (2026-07-20)
 

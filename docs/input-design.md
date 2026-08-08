@@ -1,8 +1,10 @@
 # Cursio — Input Design (mouse & keyboard sharing)
 
-Status: design agreed 2026-07-17. Implementation in progress (virtual mouse via
-uinput first). This document is the source of truth for how input sharing
-should behave; code should match it or this doc should be updated.
+Status: **implemented on all three platforms.** Capture and injection ship for
+Linux (evdev + the Wayland `InputCapture` portal), Windows (RawInput +
+`SendInput`) and macOS (`CGEventTap` + `CGEventPost`). This document is the
+source of truth for how input sharing should behave; code should match it or this
+doc should be updated.
 
 ## Model: Mouse Without Borders, but relative
 
@@ -44,7 +46,9 @@ OS to re-init the device, producing lag/flicker).
 
 `crates/protocol/src/input.rs`:
 - `InputEvent::PointerMotion { dx, dy }` — relative deltas (evdev REL_X/REL_Y sign convention: +x right, +y down).
-- `InputEvent::PointerButton { button, pressed }` — `MouseButton` = Left/Right/Middle for now.
+- `InputEvent::PointerButton { button, pressed }` — `MouseButton` =
+  Left/Right/Middle plus the two side buttons, `Back` (evdev `BTN_SIDE`, Windows
+  `XBUTTON1`) and `Forward` (`BTN_EXTRA` / `XBUTTON2`).
 - `InputEvent::PointerScroll { dx, dy }` — notches, +y = up (evdev REL_WHEEL).
 - `InputEvent::Key { key, pressed }` — **key is a Linux evdev keycode** (`KEY_*`
   from `input-event-codes.h`) used as the neutral cross-platform namespace; each
@@ -53,9 +57,13 @@ OS to re-init the device, producing lag/flicker).
 ## Injection backend
 
 Decision: **uinput first, behind a `trait InputInjector`** so libei/portal
-(Wayland "proper" path) and a Windows backend can be added later without
-touching callers. Platform-specific code lives in a dedicated `cursio-input`
-crate, kept out of the transport crate.
+(Wayland "proper" path) and a Windows backend could be added without touching
+callers. Platform-specific code lives in a dedicated `cursio-input` crate, kept
+out of the transport crate.
+
+All of them landed. Injection is two persistent uinput devices on Linux (pointer
+and keyboard kept separate so the compositor doesn't misclassify them),
+`SendInput` on Windows, and `CGEventPost` at the HID tap on macOS.
 
 ### Environment facts (dev laptop, Ubuntu GNOME 49 / Wayland, verified 2026-07-17)
 - `/dev/uinput` exists and is **writable now** (no sudo needed on this host).

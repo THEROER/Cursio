@@ -174,7 +174,8 @@ the peer edge. Node startup builds the registry once; each session asks the
 factories whose ids were negotiated to build.
 
 What it actually removed, measured: `run_pairing_and_session` went from 13
-arguments to 9 (the four dropped were all per-module flags), ~75 lines of
+arguments to 9 (the four dropped were all per-module flags; the service work has
+since added `offer`, taking it back to 10), ~75 lines of
 per-module `if` plus three `#[cfg]` blocks collapsed to one `build_agreed` call,
 and `spawn_drag_trigger` moved out of the binary into `window_session` — it was
 platform-specific window-transfer wiring living in `main` for no reason. The
@@ -321,8 +322,9 @@ destabilised.
    giving each module's control tier the same `Priority` as its hot path, and
    `offer_precedes_the_first_frame` now asserts across that boundary.
 3. ~~**`ModuleFactory` + `SessionCtx`**~~ — **done**. `run_pairing_and_session`
-   is down from 13 arguments to 9, module `#[cfg]` moved into each factory's
-   `advert`, and `main` names modules in exactly one place (`module_registry`).
+   is down from 13 arguments to 9 (10 today, since `offer` arrived with the
+   service module), module `#[cfg]` moved into each factory's `advert`, and
+   `main` names modules in exactly one place (`module_registry`).
    Steps 1–3 together mean a fourth module is now: write the engine, write a
    factory, add one line to `module_registry`.
 4. **Split modules into their own crates**, core stops depending on them.

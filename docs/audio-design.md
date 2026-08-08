@@ -1,10 +1,31 @@
 # Cursio — Audio Design (shared, per-application audio between machines)
 
-Status: design in progress 2026-07-19. No code yet. This document is the source
-of truth for how audio sharing should behave; code should match it or this doc
-should be updated. Companion to `input-design.md` (shared cursor/keyboard) and
-`window-transfer-design.md` (drag a window); audio reuses their transport,
-pairing, and adaptive-rate machinery.
+Status: **implemented on Linux (PipeWire); partial on Windows (WASAPI).** There
+is no macOS audio backend at all, so a Mac does not advertise the audio module.
+
+The Windows gap is **endpoint parity**. Linux publishes a node per remote
+application through PipeWire; Windows has no user-space way to publish an audio
+endpoint, so making a peer's devices appear as native Windows endpoints needs a
+kernel driver. `native/cursio-vad` — a fork of Microsoft's ACX AudioCodec sample
+— is that driver, and it is **written but not yet in service**:
+
+- both halves of the data path exist — `vad_client.rs` (IOCTL + ring) in user
+  mode, and `CursioRing`/`CursioBridge`/`CursioIoctl` in the driver, with the
+  stream hooks wired into `StreamEngine`, `RenderCircuit` and `CaptureCircuit`;
+- dynamic endpoints are implemented, not planned: `Cursio_CreateEndpoint` /
+  `Cursio_RemoveEndpoint` (`CursioEndpoint.cpp`) hang one render+capture child
+  PDO per remote device off the parent via `AcxDeviceAddCircuitDevice`;
+- what is missing is the last mile — no built and signed `.sys` ships, so none of
+  it has been loaded and exercised on a real Windows box.
+
+Until that lands, capture and render over WASAPI work, but a peer's device does
+not appear in Windows' own device list. (`native/cursio-vad/CURSIO-FORK.md` still
+describes these changes as planned; it predates the implementation.)
+
+This document is the source of truth for how audio sharing should behave; code
+should match it or this doc should be updated. Companion to `input-design.md`
+(shared cursor/keyboard) and `window-transfer-design.md` (drag a window); audio
+reuses their transport, pairing, and adaptive-rate machinery.
 
 ## What this replaces — and what it does NOT
 
@@ -72,14 +93,19 @@ Audio is less bandwidth-hungry than video but far less forgiving of timing:
 gaps/underruns are instantly audible, and drift between a stream's clock and the
 playback clock causes crackle or growing lag.
 
-- **Codec:** raw PCM only for LAN bring-up (48 kHz stereo s16 ≈ 1.5 Mbit/s per
-  stream — fine on LAN, wasteful over Wi-Fi and multiplied per app). Steady
-  streams use **Opus** (present on the dev box, 1.5.2), low-latency mode. The
-  wire format tags the codec per stream so PCM↔Opus needs no protocol change,
-  the same discipline as `TileCodec` for windows.
-- **Framing:** small fixed audio chunks (e.g. 10 ms) with a per-stream `seq`, so
-  the receiver can order, detect loss, and run a **jitter buffer** — a few ms of
-  slack traded for gap-free playback.
+- **Codec:** raw PCM only for LAN bring-up (48 kHz stereo ≈ 3 Mbit/s per stream
+  as f32 — fine on LAN, wasteful over Wi-Fi and multiplied per app). Steady
+  streams use **Opus**, low-latency mode. The wire format tags the codec per
+  stream so PCM↔Opus needs no protocol change, the same discipline as
+  `TileCodec` for windows.
+
+  The PCM on the wire is **f32, never s16**. PipeWire monitors are natively
+  float, and an earlier bug had the wire claim s16 while the buffers were
+  actually float32 — every backend now agrees on f32.
+- **Framing:** small fixed audio chunks with a per-stream `seq`, so the receiver
+  can order, detect loss, and run a **jitter buffer** — a few ms of slack traded
+  for gap-free playback. Opus runs at **5 ms** frames (`FRAME_SAMPLES = 240`,
+  `Application::LowDelay`), not the 10 ms this design first sketched.
 - **Adaptive:** like windows, a lightweight ack (`AudioFrameAck`) lets the
   sender track fill/RTT and adjust Opus bitrate under pressure. The rule is the
   same — **drop/degrade rather than buffer unboundedly** — but audio keeps a
@@ -88,14 +114,24 @@ playback clock causes crackle or growing lag.
   (details are a backend concern; the protocol carries timestamps/seq to make it
   possible).
 
-## Wire protocol (planned)
+## Wire protocol
 
-`crates/protocol/src/audio.rs` (adds to `Message`, bumps `PROTOCOL_VERSION`).
-OS-neutral, same discipline as `input.rs` / `window.rs`.
+`crates/protocol/src/audio.rs`. OS-neutral, same discipline as `input.rs` /
+`window.rs`.
+
+**The shape changed after this was written.** Audio moved onto the module
+envelope: everything below except the chunk itself is an `AudioMsg` variant
+carried inside `Message::Module { module: ModuleId::AUDIO, .. }`, not a flat
+`Message` variant. `Message::AudioChunk` stayed first-class because it is the hot
+path. So `Message::AudioStreamAdvertise` below is really
+`AudioMsg::StreamAdvertise`, and likewise for `FrameAck`, `Gain` and
+`StreamClose`. The module carries its own `VERSION` (`ModuleId::AUDIO = 2`);
+the `PROTOCOL_VERSION` bumps recorded further down are historical markers, not
+the current value.
 
 - `AudioStreamId` — session-scoped `u32`, one per logical stream (a device or an
   app node). Not any OS handle.
-- `AudioFormat` — `{ sample_rate, channels, sample_kind }` (e.g. 48000, 2, S16).
+- `AudioFormat` — `{ sample_rate, channels, sample_kind }` (48000, 2, f32).
 - `AudioCodec` — `RawPcm` (bring-up) / `Opus` (steady). Placeholder-extensible.
 - `Message::AudioStreamAdvertise(AudioStreamMeta)` — announces a stream the peer
   can consume: `{ id, role (Playback/Capture), app_name: Option<String>,
@@ -119,7 +155,13 @@ touching the session. Channels, not callbacks (a slow link never stalls capture)
   the virtual output). Windows = WASAPI loopback + process loopback for per-app.
 - **Playback / sink side:** create local nodes from advertisements, play inbound
   chunks through a jitter buffer, expose them so VM/Carla can route them. Linux =
-  PipeWire nodes; Windows = WASAPI render.
+  PipeWire nodes; Windows = WASAPI render, with the `native/cursio-vad` driver
+  (not WASAPI) responsible for making those nodes visible as real endpoints.
+
+  There is deliberately **no fallback** on Windows when that driver is absent.
+  The old one was actively harmful: every "mirror" captured the same full system
+  mix, so per-app routing silently became a copy of everything. It now returns
+  `Unsupported` with a warning instead.
 - **Gain:** apply `AudioGain` to the right node.
 
 Cross-OS works because the wire is neutral (PCM/Opus + neutral stream metadata);
@@ -158,10 +200,17 @@ ONE machine, not two linked ones.** helvum (Linux) / volume mixer (Windows) on
 either side shows the devices AND applications of both machines as native local
 objects.
 
-**Implementation status (2026-07-21): all seven phases below are ✅ DONE**, on
-both Linux (PipeWire) and Windows (WASAPI). The device-state monitor now has a
-Windows backend too (`IAudioEndpointVolume`, polled), so device volume/mute
-replicate cross-OS; everything protocol-, session-, and routing-side is in.
+**Implementation status: all seven phases below are ✅ DONE** protocol-, session-
+and routing-side, with one platform gap. The device-state monitor has a Windows
+backend (`IAudioEndpointVolume`, polled), so device volume/mute replicate
+cross-OS.
+
+The gap is the **Intent Sink itself (phases 2–3), which is Linux-only**:
+`IntentSink::create` is `#[cfg(target_os = "linux")]` and returns
+`AudioError::Unsupported` everywhere else, because it needs a routing observer
+the WASAPI backend does not have. Windows publishes a peer's devices through the
+`native/cursio-vad` kernel driver instead — see the status note at the top of this
+document for how far that has got.
 
 The defining insight: **separate routing from transport.** In AudioRelay/Deskflow
 a device is both the place you pick and the pipe the audio flows through. Here a
@@ -431,8 +480,9 @@ one graph.
 The model is written in terms of **node** and **owner**, not "the two machines".
 Nothing assumes exactly two peers: each device has a current owner, every other
 node mirrors it, and Remote Streams/Routes are per source→target. So it extends to
-N machines (desktop + laptop + Steam Deck + Mac mini) with no model change — Cursio
-becomes a distributed audio *network*, not a PC↔PC link.
+N machines (desktop + laptop + Steam Deck) with no model change — Cursio becomes a
+distributed audio *network*, not a PC↔PC link. A Mac is not in that list: with no
+backend, it never advertises the audio module and so is not a node here at all.
 
 ## Invariants
 
