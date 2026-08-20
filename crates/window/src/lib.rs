@@ -146,6 +146,17 @@ pub trait CaptureSession {
     /// here from the start so the adaptive loop needs no protocol change later.
     fn on_ack(&mut self, ack: WindowFrameAck);
 
+    /// Resize the real window, because the viewer resized its surrogate.
+    ///
+    /// Advisory in both directions: the host may clamp the request to what the
+    /// window will accept, and the viewer learns the outcome only from the
+    /// frames that follow, never from a reply. Default is a no-op for a backend
+    /// that cannot resize its source — the viewer then keeps scaling the
+    /// picture, which is the old behaviour rather than a new failure.
+    fn request_resize(&mut self, _width: u32, _height: u32) -> Result<(), WindowError> {
+        Ok(())
+    }
+
     /// Stop capturing and release the window. After this the session is done;
     /// callers should send a [`Message::WindowClose`](cursio_protocol::Message::WindowClose).
     fn close(&mut self, reason: WindowCloseReason);
@@ -204,6 +215,18 @@ pub trait Surrogate {
     /// when nothing new is worth reporting, so the caller sends acks sparingly
     /// (a few per second) rather than one per frame. See [`WindowFrameAck`].
     fn take_ack(&mut self) -> Option<WindowFrameAck>;
+
+    /// A size the user resized this surrogate to, to ask the host for, if one
+    /// is pending.
+    ///
+    /// Coalesced by the backend rather than reported per motion event: a drag
+    /// across the screen produces a continuous stream of sizes, and asking the
+    /// host for every one of them would put a resize storm on the same channel
+    /// the cursor rides. Default is `None` for a backend whose window the user
+    /// cannot resize.
+    fn take_resize_request(&mut self) -> Option<(u32, u32)> {
+        None
+    }
 
     /// Tear down the surrogate window (host closed, user dismissed, or returned).
     fn close(&mut self, reason: WindowCloseReason);

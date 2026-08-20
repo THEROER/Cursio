@@ -143,10 +143,11 @@ impl FrameDiffer {
     }
 }
 
-/// Above this fraction of the window's pixels, a change is sent through the
-/// video encoder instead of as a lossless tile.
+/// The threshold a link with room to spare uses.
 ///
-/// The two paths win in opposite regimes, per the 2026-07-20 measurements:
+/// Above some fraction of the window's pixels a change is sent through the video
+/// encoder instead of as a lossless tile, because the two paths win in opposite
+/// regimes (2026-07-20 measurements):
 ///
 /// - A *small* dirty rect (caret, a typed character, a hover highlight) is a few
 ///   hundred bytes of zstd and needs no encoder state — cheaper and simpler than
@@ -156,19 +157,123 @@ impl FrameDiffer {
 ///   same change for ~0.1–280 KiB because it codes the *difference* from the
 ///   previous frame.
 ///
-/// 15% is deliberately low. The video path's cost barely depends on the dirty
-/// area (it always encodes the full frame), so erring towards it is cheap, while
-/// erring the other way risks the 742 Mbit/s case the design rules out.
-pub const VIDEO_AREA_THRESHOLD: f64 = 0.15;
+/// Which fraction is not fixed, though — see [`next_threshold`]. This is the
+/// value used when the viewer is keeping up.
+///
+/// The video path is **not** free: it is lossy, and visibly so on the content
+/// windows actually contain. H.264 here codes NV12 — 4:2:0 chroma, one colour
+/// sample per four pixels — which is built for camera footage and is exactly
+/// wrong for text, thin lines and flat UI. At the old flat 15% a scrolled page
+/// or a switched tab dirtied enough to cross the line, so ordinary use spent
+/// most of its time lossy and the window read as softer than a local one even
+/// between two machines at the same resolution and scale.
+///
+/// At 45% a window whose whole surface repaints (video, a game) still goes to
+/// the encoder — the 742 Mbit/s case the design rules out — while partial
+/// repaints, which is most of them, stay pixel-exact.
+pub const VIDEO_AREA_THRESHOLD_MAX: f64 = 0.45;
+
+/// The threshold a congested link falls back to.
+///
+/// The original value, and for the original reason: when the link cannot carry
+/// lossless updates, sending them anyway does not preserve quality — it builds a
+/// backlog, and the picture arrives late instead of arriving soft. Degrading is
+/// the lesser harm.
+pub const VIDEO_AREA_THRESHOLD_MIN: f64 = 0.15;
+
+/// How far the threshold moves per adjustment.
+const THRESHOLD_STEP: f64 = 0.10;
+
+/// Frames the host may be ahead of the viewer before quality is stepped down.
+///
+/// Sent-minus-acked, in frames. Small because a window transfer is meant to feel
+/// like a second monitor: two frames of backlog at 60 fps is already 33 ms of
+/// staleness, and letting it grow trades the thing the feature exists for.
+const BACKLOG_HIGH: u32 = 3;
+
+/// Backlog under which the link is considered to have room again.
+///
+/// Below `BACKLOG_HIGH`, so a link hovering at the limit holds its current
+/// quality instead of oscillating between the two.
+const BACKLOG_LOW: u32 = 1;
+
+/// Decide the next lossless/lossy threshold from the current one and the
+/// sent-vs-acked backlog.
+///
+/// Hysteretic, the same shape as the audio path's `next_bitrate`: a backlog over
+/// [`BACKLOG_HIGH`] steps toward [`VIDEO_AREA_THRESHOLD_MIN`] (more of the window
+/// goes through the cheap lossy encoder), a link caught up under [`BACKLOG_LOW`]
+/// steps back toward [`VIDEO_AREA_THRESHOLD_MAX`], and in between it holds.
+///
+/// This is what makes quality follow the link rather than a constant: on a link
+/// with headroom even a game's full-window repaints can stay lossless, while a
+/// congested one gives up fidelity before it gives up latency.
+/// The current lossless/lossy threshold, shared between the session thread that
+/// receives acks and the capture thread that encodes frames.
+///
+/// An atomic rather than a channel or a lock: the capture thread reads it once
+/// per frame and must never block on it, and a missed update simply means one
+/// more frame at the previous quality. Stored as the numerator of a percentage
+/// so it fits an integer atomic.
+#[derive(Debug)]
+pub struct AdaptiveQuality {
+    threshold_pct: std::sync::atomic::AtomicU32,
+}
+
+impl Default for AdaptiveQuality {
+    fn default() -> Self {
+        // Start optimistic: a link with headroom should not have to earn its
+        // way up to full quality, and a congested one is corrected within a few
+        // acks.
+        Self {
+            threshold_pct: std::sync::atomic::AtomicU32::new(
+                (VIDEO_AREA_THRESHOLD_MAX * 100.0) as u32,
+            ),
+        }
+    }
+}
+
+impl AdaptiveQuality {
+    /// The threshold to judge this frame by.
+    pub fn threshold(&self) -> f64 {
+        self.threshold_pct.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
+    }
+
+    /// Fold in what the viewer has acked: `gap` frames still unpresented.
+    ///
+    /// Returns the new threshold when it moved, for the caller to log.
+    pub fn observe(&self, gap: u32) -> Option<f64> {
+        let current = self.threshold();
+        let next = next_threshold(current, gap);
+        if (next - current).abs() < f64::EPSILON {
+            return None;
+        }
+        self.threshold_pct.store(
+            (next * 100.0).round() as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Some(next)
+    }
+}
+
+pub fn next_threshold(current: f64, gap: u32) -> f64 {
+    if gap > BACKLOG_HIGH {
+        (current - THRESHOLD_STEP).max(VIDEO_AREA_THRESHOLD_MIN)
+    } else if gap < BACKLOG_LOW {
+        (current + THRESHOLD_STEP).min(VIDEO_AREA_THRESHOLD_MAX)
+    } else {
+        current
+    }
+}
 
 /// Whether a change covering `dirty` of a `width`x`height` window should go
 /// through the video encoder rather than as a lossless tile.
-pub fn should_use_video(dirty: Rect, width: u32, height: u32) -> bool {
+pub fn should_use_video(dirty: Rect, width: u32, height: u32, threshold: f64) -> bool {
     if width == 0 || height == 0 {
         return false;
     }
     let changed = (dirty.width as f64 * dirty.height as f64) / (width as f64 * height as f64);
-    changed >= VIDEO_AREA_THRESHOLD
+    changed >= threshold
 }
 
 /// Pick the codec for a tile.
@@ -358,7 +463,7 @@ mod differ_tests {
             width: 8,
             height: 20,
         };
-        assert!(!should_use_video(caret, 1920, 1080));
+        assert!(!should_use_video(caret, 1920, 1080, VIDEO_AREA_THRESHOLD_MAX));
     }
 
     #[test]
@@ -371,26 +476,116 @@ mod differ_tests {
             width: 1920,
             height: 900,
         };
-        assert!(should_use_video(most, 1920, 1080));
+        assert!(should_use_video(most, 1920, 1080, VIDEO_AREA_THRESHOLD_MAX));
+    }
+
+    /// A link that keeps up earns full quality; one that falls behind gives it
+    /// up before it gives up latency.
+    #[test]
+    fn quality_follows_what_the_link_is_carrying() {
+        let q = AdaptiveQuality::default();
+        // Starts optimistic, so a fast link pays nothing to get there.
+        assert_eq!(q.threshold(), VIDEO_AREA_THRESHOLD_MAX);
+
+        // A backlog steps quality down, once per observation rather than all at
+        // once — a single late ack should not collapse the picture.
+        let after_one = q.observe(BACKLOG_HIGH + 1).expect("a backlog moves it");
+        assert!(after_one < VIDEO_AREA_THRESHOLD_MAX);
+
+        // Sustained congestion bottoms out at the floor and stays there.
+        for _ in 0..20 {
+            q.observe(BACKLOG_HIGH + 1);
+        }
+        assert_eq!(q.threshold(), VIDEO_AREA_THRESHOLD_MIN);
+        assert!(
+            q.observe(BACKLOG_HIGH + 1).is_none(),
+            "already at the floor: nothing to report"
+        );
+
+        // Recovery climbs back to full quality without a restart.
+        for _ in 0..20 {
+            q.observe(0);
+        }
+        assert_eq!(q.threshold(), VIDEO_AREA_THRESHOLD_MAX);
+    }
+
+    /// Between the two marks the threshold holds, so a link hovering at the
+    /// limit does not oscillate between sharp and soft every few frames.
+    #[test]
+    fn a_link_at_the_limit_holds_its_quality() {
+        let steady = 0.35;
+        for gap in BACKLOG_LOW..=BACKLOG_HIGH {
+            assert_eq!(
+                next_threshold(steady, gap),
+                steady,
+                "gap {gap} is neither congested nor clear"
+            );
+        }
+    }
+
+    /// The point of adapting: on a link with headroom, even a full-window
+    /// repaint — a game, a video — can stay lossless, which a fixed threshold
+    /// could never allow.
+    #[test]
+    fn a_clear_link_keeps_even_large_repaints_lossless() {
+        let q = AdaptiveQuality::default();
+        let most_of_the_window = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 430, // ~40% of 1080
+        };
+        assert!(!should_use_video(
+            most_of_the_window,
+            1920,
+            1080,
+            q.threshold()
+        ));
+
+        // The same repaint on a congested link goes lossy instead, trading
+        // fidelity to keep the picture current.
+        for _ in 0..20 {
+            q.observe(BACKLOG_HIGH + 1);
+        }
+        assert!(should_use_video(
+            most_of_the_window,
+            1920,
+            1080,
+            q.threshold()
+        ));
     }
 
     #[test]
     fn video_threshold_is_where_it_claims_to_be() {
-        // Just under and just over 15% of a 1000x1000 window.
+        // Just under and just over 45% of a 1000x1000 window.
         let under = Rect {
             x: 0,
             y: 0,
             width: 1000,
-            height: 149,
+            height: 449,
         };
         let over = Rect {
             x: 0,
             y: 0,
             width: 1000,
-            height: 151,
+            height: 451,
         };
-        assert!(!should_use_video(under, 1000, 1000));
-        assert!(should_use_video(over, 1000, 1000));
+        assert!(!should_use_video(under, 1000, 1000, VIDEO_AREA_THRESHOLD_MAX));
+        assert!(should_use_video(over, 1000, 1000, VIDEO_AREA_THRESHOLD_MAX));
+
+        // The case the raised threshold exists for: a repaint big enough to be
+        // ordinary — a scrolled page, a switched tab — stays lossless, so text
+        // does not go through 4:2:0 chroma for a change of this size.
+        let scrolled = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 300,
+        };
+        assert!(
+            !should_use_video(scrolled, 1000, 1000, VIDEO_AREA_THRESHOLD_MAX),
+            "a third of the window repainting must not force the lossy path"
+        );
     }
 
     #[test]
@@ -430,7 +625,7 @@ mod differ_tests {
             width: 10,
             height: 10,
         };
-        assert!(!should_use_video(any, 0, 0));
+        assert!(!should_use_video(any, 0, 0, VIDEO_AREA_THRESHOLD_MAX));
     }
 
     #[test]

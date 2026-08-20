@@ -444,6 +444,25 @@ unsafe fn configure_quality(transform: &IMFTransform) {
         &CODECAPI_AVEncMPVGOPSize,
         FRAME_RATE * KEYFRAME_INTERVAL_SECS,
     );
+
+    // Latency, not compression, is what this stream is judged on.
+    //
+    // A window transfer is meant to feel like a second monitor, so a frame that
+    // arrives late is worse than a frame that costs more bytes. Two encoder
+    // defaults trade exactly the wrong way for that:
+    //
+    // * **B-frames** are predicted from a *later* picture, so the encoder must
+    //   hold a frame back until the one after it exists. That reordering delay
+    //   is paid on every frame, and it is why every low-latency preset in the
+    //   field (x264's `zerolatency` among them) sets B-frames to zero.
+    // * **Lookahead / quality buffering** is what `LowLatencyMode` turns off;
+    //   without it the encoder may sit on output waiting for more input to
+    //   decide with.
+    //
+    // Both are advisory — `set` logs and continues when an encoder declines,
+    // which the software fallback does for some of these.
+    set(&CODECAPI_AVEncCommonLowLatency, 1);
+    set(&CODECAPI_AVEncMPVDefaultBPictureCount, 0);
 }
 
 /// Media Foundation packs paired 32-bit values (size, frame rate, aspect
