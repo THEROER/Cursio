@@ -1,244 +1,262 @@
-# USB Design (a device on one machine, usable from any of them)
+# USB Design (one device, every machine in the mesh)
 
-Status: **designed, not built.** Companion to `files-design.md` (the other
-module that carries a kernel's requests over the link) and
+Status: **designed; vocabulary and ownership built, arbitration not.** Companion
+to `files-design.md`, whose FUSE layer is the model this follows, and
 `platform-design.md`'s rules for new modules.
 
 ## What this is for
 
-A phone is plugged into the laptop; `adb devices` on the desktop should list it.
-A programmer, a security key, a printer — whichever machine has the port, every
-machine has the device. The USB port stops being a property of one box and
-becomes a property of the mesh.
+A phone is plugged into the laptop; `adb devices` on the desktop lists it, and
+so does `adb devices` on every other machine. A programmer, a security key, a
+printer — whichever machine has the port, every machine has the device. The USB
+port stops being a property of one box and becomes a property of the mesh.
 
-This is deliberately *not* a per-device feature. There is no adb module, no
-printer module: the shared thing is the bus, and everything speaking USB rides
-it for free.
+Deliberately not a per-device feature. There is no adb module and no printer
+module: the shared thing is the bus, and everything speaking USB rides it.
 
-## What Cursio does not implement
+## The driver is an adapter, not a tunnel
 
-**The URB transport is USB/IP, and Cursio does not reimplement it.**
+This is the decision everything else follows from, and the first draft of this
+document got it wrong.
 
-Linux ships both halves of USB/IP in mainline: `usbip-host` detaches a local
-device and exports its transfers, `vhci-hcd` is a virtual host controller that
-makes a remote device appear as though it were plugged in locally. Both are
-kernel drivers, both are stable, and the protocol between them is fixed. On
-Windows the importing half is `usbipd-win`, which ships its own VHCI driver.
-
-Writing our own URB vocabulary would mean writing a kernel driver on both
-platforms to consume it — the `native/cursio-vad` road, taken again, to arrive
-where mainline already is. Audio needed that because Windows genuinely offers no
-way to publish an endpoint from user space. USB does not: the endpoint exists,
-it just has no authentication and no discovery.
-
-So the split is:
-
-| Concern | Owner |
-|---|---|
-| URB framing, device emulation, kernel plumbing | USB/IP (`usbip-host`, `vhci-hcd`, `usbipd-win`) |
-| Discovery, trust, encryption, ownership, reconnect | Cursio |
-
-Cursio carries the USB/IP byte stream inside the session it already has, and
-adds the parts USB/IP lacks.
-
-## Why carrying it is worth doing
-
-`usbipd` listens on TCP 3240 with **no authentication whatsoever**. Whoever
-reaches the port takes the device — it is a remote-attach primitive with the
-access control left as an exercise. The standing advice is to never expose it
-beyond a trusted link, which is precisely the thing this project already built:
-SPAKE2 pairing, a trust store, and a Noise channel between machines that have
-confirmed each other.
-
-Carrying USB/IP over the mesh channel means the daemon never binds a public
-port. It listens on loopback; the module dials loopback locally and the bytes
-cross the link inside Noise, authenticated as the peer they came from.
-
-Discovery comes free for the same reason. `usbip list -r <host>` needs a host;
-the mesh already knows every peer and survives their coming and going.
-
-## Ownership: a device lives on one machine at a time
-
-The hard truth this design cannot engineer around: **`usbip bind` takes the
-device away from its local kernel.** It rebinds the device from its class driver
-to `usbip-host`. While the phone is attached to the desktop, the laptop it is
-physically plugged into no longer has it — no MTP mount, no `adb`, nothing.
-
-"Available on every machine simultaneously" is not achievable at the bus layer,
-and no amount of protocol design changes it: USB has exactly one host per
-device. What is achievable, and what this module targets, is **available on any
-machine, one at a time, switched in a second**.
-
-That is the same shape as the shared cursor, and it reuses the same reasoning
-(`input-design.md`, and `CursorRole` in the code):
-
-- Exactly one **holder** at a time; every other node sees the device listed but
-  not attached.
-- **Only the holder may hand it away.** An idle machine claiming a device it
-  does not hold is the USB version of the stray-pointer bug that made a machine
-  start driving a peer nobody was at.
-- The **host** — the machine with the physical port — is the authority on
-  whether a device exists at all, and may always revoke.
-
-Rule 4 in `platform-design.md` ("one owner per piece of state") is what this is;
-the holder is the owner, and everyone else requests.
-
-## Vocabulary
-
-`ModuleId::USB = ModuleId(7)`, symmetric — every machine both offers its ports
-and attaches peers' devices. Two priority classes, deliberately split:
-
-- **Control** (`Priority::Control`) — the device list, claims, releases,
-  revocations. Small, rare, and must not queue behind a bulk transfer, or a
-  release would be delayed by the very transfer it is trying to end.
-- **Data** (`Priority::Bulk`) — the URB stream itself. This is the honest class
-  under rule 2: a file copy off a USB drive is bulk traffic and must yield to
-  the cursor, exactly as `files` does.
+The obvious way to carry USB is to take USB/IP whole — both its transport *and*
+its semantics — and move the bytes:
 
 ```
-UsbMsg::ListDevices                 → Devices(Vec<UsbDevice>)
-UsbMsg::Claim   { device, reason }  → Claimed  { device, stream }
-                                    | Refused  { device, UsbError }
-UsbMsg::Release { device }          → Detached { device, stream, error: None }
-                                      Detached { device, stream, error: Some }
-                                        (host → holder, unsolicited: an unplug)
-UsbMsg::Data    { stream, bytes }     (Bulk; the USB/IP byte stream)
+vhci-hcd ──[opaque bytes]── Cursio ──[opaque bytes]── usbip-host
 ```
 
-One `Detached` covers both an orderly release and a revocation, because the
-holder's kernel needs the detach either way and the only difference is whether
-`error` says why. A separate `Revoked` would be a second message the holder had
-to handle identically — and a second chance to handle it differently by mistake.
+Cursio is a pipe. Nothing can be answered, merged or arbitrated, because
+nothing is understood. From inside that shape "one holder at a time" looks like
+a law of USB. It is not: it is a consequence of choosing to be a pipe.
 
-`UsbDevice` carries what a user needs to recognise the thing — vendor and
-product ids, the strings when the device offers them, the class, the bus id on
-its host, and a `UsbDeviceId` stable for as long as it stays plugged in. Not the
-raw busid alone: `3-2` means nothing on another machine and changes when the
-device is replugged into another port.
+`crates/files` already rejects that shape. FUSE is not a tunnel to a remote
+filesystem; it is an **adapter** that turns kernel intent into requests Cursio
+understands:
 
-Errors are values, never silence — the `files` rule, for the same reason. A
-claim that goes unanswered hangs the user's `adb` with no way to tell whether
-the device is busy, refused, or gone. `UsbError` names it: `InUse(PeerId)`,
-`Gone`, `Denied`, `DriverMissing`, `NeedsPrivilege`, `Unplugged`, `Backend`.
+```rust
+fn read(&self, ino, fh, offset, size, reply) {
+    match self.peer.read(remote, offset, size) { ... }
+}
+```
 
-State replication follows rule 5: the host broadcasts the **whole** device list
-on change, so a reconnecting peer resyncs by receiving the current one rather
-than replaying a history of arrivals and departures.
+`read(handle, offset, len)` is an *operation*, not a byte stream, which is
+precisely why any number of programs read a mounted volume at once. The server
+decides how to satisfy each one.
 
-## Not every device survives the trip
+USB/IP affords the same treatment, because a URB is also an operation rather
+than raw material. The kernel's own protocol
+([USB/IP protocol](https://docs.kernel.org/usb/usbip_protocol.html)) puts the
+meaning in a fixed 48-byte header:
 
-Worth stating in the design because it sets expectations, and because the code
-must report it rather than let the user discover it as flakiness.
+| Offset | Field | What it says |
+|---|---|---|
+| 0x00 | `seqnum` | which request a reply belongs to |
+| 0x00 | `direction`, `ep` | in or out, and which endpoint |
+| 0x14 | `transfer_flags` | |
+| 0x18 | `transfer_buffer_length` | |
+| 0x28 | `setup` (8 bytes) | the control request itself, when `ep` is 0 |
 
-USB/IP carries transfers over TCP, and the transfer types differ sharply in how
-they tolerate that:
+So the shape this design takes is the third one — neither a pipe nor a
+service-specific proxy:
 
-- **Control and bulk** — phones and `adb`, mass storage, programmers and
-  debuggers, printers, serial adapters, security keys. These retry and have no
-  hard deadline. They work well over a LAN.
-- **Interrupt** — keyboards, mice, HID. Work, with latency added. Cursio already
-  shares input properly, so this is rarely the interesting path.
-- **Isochronous** — webcams, USB audio interfaces. These have a per-frame
-  deadline and no retransmission; the LAN misses it. These work poorly over
-  USB/IP as a matter of the transfer model, not of implementation quality.
+```
+desktop  vhci-hcd ─┐
+tablet   vhci-hcd ─┼→ Cursio (arbiter) → usbip-host → device
+laptop   vhci-hcd ─┘
+```
 
-The module therefore reports an isochronous-heavy device as
-`UsbTransport::Degraded` in its listing rather than pretending. The user may
-still attach it; they are told what to expect first.
+Three virtual host controllers, three kernels, each holding what it believes is
+its own device. Cursio reads the header of every URB and decides what happens to
+it. **Every machine in the mesh sees the device and can use it**; what varies is
+how a given transfer is satisfied.
 
-`adb` — the case that motivated this — is bulk, and lands in the good category.
+## What arbitration actually does
+
+Three classes of traffic, told apart by the header alone. No USB stack, no
+descriptor parsing beyond the eight setup bytes.
+
+### Descriptors: answered from cache, to everyone
+
+Enumeration is control transfers on endpoint 0 — `GET_DESCRIPTOR` and friends —
+and every host asks the same questions and must receive the same answers. They
+are pure reads of data that does not change while the device is plugged in.
+
+Cursio answers them itself, from a cache filled on first enumeration. The device
+is not involved at all, which means a machine attaching for the second, third
+and fourth time costs the device nothing and cannot disturb whoever is already
+using it. This is what makes "every machine sees it" cheap rather than a
+thundering herd.
+
+### Data transfers: serialised, and the reply goes to whoever asked
+
+Bulk and interrupt transfers are ordinary work. They queue, the device performs
+them one at a time as it always has, and `seqnum` routes each reply back to the
+host that submitted it.
+
+Nothing is lost by serialising: a USB device executes one transfer at a time in
+any case, and the queue Cursio keeps is the same queue the host controller
+would. Two machines reading a device see the latency of sharing, not a failure.
+
+### State-changing requests: intercepted
+
+`SET_CONFIGURATION`, `SET_INTERFACE`, `CLEAR_FEATURE` and device resets change
+what the device *is*, not what it is doing. Left alone, a second host's
+`SET_CONFIGURATION` would reset the device out from under the first mid-transfer
+— the real hazard behind USB's one-host rule.
+
+These are recognised in the setup bytes and answered by Cursio: success when the
+device is already in the requested state, refusal when honouring it would
+disturb another machine. Only when a request would genuinely change the device
+does exclusivity come into play — and that is a property of *those requests*,
+not of the device.
+
+The exclusivity USB really imposes therefore shrinks from "the whole device" to
+"a handful of control requests" — the same narrowing FUSE achieves, where
+readers are unlimited and only writes need ordering.
+
+## What still cannot be shared
+
+Stated plainly, because arbitration is not magic and the boundary is real.
+
+**State inside the device.** Mass storage is the case: a filesystem's structure
+lives on the medium, and two kernels independently caching FAT tables will
+corrupt it the moment one writes. No amount of URB arbitration helps, because
+the shared state is not in the transfers. `crates/files` answers this properly —
+mount the volume on the host and share it as a *filesystem*, where one server is
+the final authority.
+
+**Protocols that assume a single client.** `adbd` keeps one session over its
+bulk pair; two hosts interleaving on it get a desynchronised stream. The right
+layer there is the adb server, which
+[multiplexes clients by design](https://developer.android.com/tools/adb) — so
+the mesh reaches a phone by forwarding that, not by splitting its endpoints.
+
+**Isochronous endpoints.** Cameras and audio interfaces have a per-frame
+deadline and no retransmission; TCP guarantees delivery but not time. This is a
+property of the transfer type, not of the implementation, and is reported as
+`UsbTransport::Degraded` rather than discovered as stutter.
+
+So the mesh offers three levels, and a device uses the highest one that fits:
+
+| Level | Concurrency | For |
+|---|---|---|
+| Filesystem (`files`) | full | storage |
+| Service (adb, IPP) | full | phones, printers |
+| **Bus (this module)** | **full for reads, arbitrated for state** | everything else |
+
+## Ownership, restated
+
+The first draft made ownership the centre of the design: one holder, everyone
+else refused. Under arbitration that is far too strong — it refuses machines
+that only ever wanted to read a descriptor.
+
+What is owned is not the device but its **configuration**. So:
+
+- Any number of machines **attach**. Attaching is not a claim; it enumerates
+  from cache and costs the device nothing.
+- One machine at a time holds the **configuration lease**, and only while it
+  needs one. A lease is taken by issuing a state-changing request, not by
+  asking in advance, and is released when its transfers finish.
+- The **host** — the machine with the port — arbitrates, is the single writer
+  for lease state, and may always revoke. An unplug beats any protocol state.
+
+Rule 4 in `platform-design.md` ("one owner per piece of state") still holds; the
+piece of state is now the device's configuration rather than the device.
+
+`UsbMsg::Claim`/`Release` survive with this narrower meaning, which is why the
+vocabulary needed no reshaping — only `Refused` becomes rare, because the
+common case no longer competes.
+
+## Why the mesh is worth carrying it
+
+`usbipd` listens on TCP 3240 with **no authentication whatsoever**: whoever
+reaches the port takes the device. Carried inside the mesh it binds loopback
+only, and every attach is authenticated as a peer that has completed SPAKE2
+pairing. Discovery comes free — `usbip attach` needs a host, and the mesh
+already knows every peer and survives their coming and going.
 
 ## Platforms
 
 ### Linux
 
-Both halves are in mainline and need no install: `usbip-host` to export,
-`vhci-hcd` to import, driven by `usbip`/`usbipd` from `linux-tools`. Present but
-unloaded on the development machine (kernel 6.17: the four `usbip` modules ship
-with the kernel package, and `/usr/bin/usbip` comes from `linux-tools-common`).
+Both halves are in mainline: `usbip-host` to export, `vhci-hcd` to import,
+driven through sysfs. Present but unloaded on the development machine (kernel
+6.17; `/usr/bin/usbip` from `linux-tools-common`).
 
 Two facts shape the backend:
 
-- The modules are **not loaded by default** (`modprobe usbip-host vhci-hcd`),
-  and loading them plus binding a device needs root. Cursio already asks for
-  elevation on Windows for input (`elevate.rs`); on Linux this is a `polkit`
-  action, requested per bind rather than by running the daemon as root.
-- The kernel's own control surface is **sysfs**, not the CLI. `usbip` is a thin
-  wrapper over `/sys/bus/usb/drivers/usbip-host/` and
-  `/sys/devices/platform/vhci_hcd.0/`. The backend talks to sysfs directly —
-  shelling out to a CLI to parse its human-readable output is the kind of thing
-  that breaks on a distro's version bump.
+- The modules are **not loaded by default** (`modprobe usbip-host vhci-hcd`) and
+  binding needs root — a polkit action per bind, not a daemon running as root.
+- The kernel's control surface is **sysfs**, not the `usbip` CLI, whose output
+  is formatted for people and has changed between releases. `usbip` reads sysfs
+  itself; so does this.
 
 ### Windows
 
-The importing half is `usbipd-win`, which installs a VHCI driver. It is signed
-and open-source, so this is not the `cursio-vad` situation of maintaining a
-driver fork — but it *is* a separate install plus a reboot before anything
-works, the same shape as WinFsp for the files module.
+The importing half is `usbipd-win`, a signed open-source VHCI driver — not a
+fork to maintain, but an install plus a reboot, the same shape as WinFsp for
+files. Verified absent on the peer; `winget` is available to install it.
 
-Consequences that must be handled rather than discovered:
+Absence is a first-class state: `advert()` returns `None` when the driver is
+missing, so the module is not negotiated and the log says why.
 
-- Absence is a first-class state. `advert()` returns `None` when the driver is
-  not installed, so the module is simply not negotiated and the peer is told why
-  in the log — never a link that half-works.
-- Exporting from Windows (a device plugged into the desktop, used from the
-  laptop) is the weaker direction in `usbipd-win` and is gated behind its own
-  capability flag rather than assumed symmetric.
+### WSL
+
+Microsoft ships `usbip-core.ko`, `usbip-host.ko` and `vhci-hcd.ko` in the WSL2
+kernel (confirmed on the peer, 6.6.87.2-microsoft-standard-WSL2) because
+`usbipd attach --wsl` is the supported way to give WSL a USB device. Useful as a
+test bed. It is **not** a target: a device attached into WSL is invisible to
+Windows itself, which is the opposite of what this module is for.
 
 ### macOS
 
-Neither half exists, and the kernel gives no supported way to add one — a
-virtual host controller is a kext, and the modern system refuses that class of
-extension. A Mac therefore does not advertise the module. Per the platform rule,
-this is an explicit "no backend here", not a silent degradation.
+Neither half exists and the kernel offers no supported way to add one — a
+virtual host controller is a kext. A Mac does not advertise the module.
 
 ## Shape of the implementation
 
-`crates/usb` is mechanism, `crates/core/src/usb_session.rs` is policy — the
-split `files` already uses:
-
 ```
-crates/usb/            enumerate, bind/unbind, attach/detach, the local socket
-  ├── linux.rs         sysfs + polkit
-  ├── windows.rs       usbipd-win
-  └── lib.rs           traits, UsbDevice, UsbError
+crates/usb/                mechanism
+  ├── linux.rs             sysfs enumeration            (built)
+  ├── offer.rs             ports → ids peers can quote  (built)
+  ├── arbiter.rs           URB header parsing, cache, leases
+  └── lib.rs               traits, LocalDevice
 
 crates/core/src/usb_session.rs
-                       what may be claimed, by whom, and who holds it now
+                           policy: who attaches, who leases   (built)
 ```
 
-The CLI's only job stays constructing the registry: `--usb` decides
-participation, `cursio usb` lists what the mesh can see and who holds it. No
-branch in `main` names a device.
-
-`PROTOCOL_VERSION` does not move for this. `ModuleId(7)` is a new id in an open
-namespace and the module's own vocabulary is versioned by its `ModuleAdvert` —
-which is the whole point of the envelope work in `platform-design.md` step 2.
+`PROTOCOL_VERSION` does not move. `ModuleId(7)` is a new id in an open
+namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
 
 ## Milestones
 
-1. **Vocabulary and policy.** `protocol/src/usb.rs`, `usb_session.rs`, ownership
-   and the claim/release/revoke state machine, tested against `MemTransport`
-   with a fake backend. No kernel involvement, so this is where the ownership
-   races get settled.
-2. **Linux export + import.** sysfs backend, `modprobe`, polkit. End-to-end
-   Ubuntu↔Ubuntu with a phone and `adb`.
-3. **Windows import.** `usbipd-win` detection, the missing-driver path, attach
-   from the desktop to a device on the laptop. This is the milestone that
-   answers the original question.
-4. **Windows export**, if `usbipd-win`'s export direction proves solid enough to
-   depend on.
-5. **Degradation reporting** — isochronous detection in the listing, and the
-   revoke path when a device is physically unplugged while a peer holds it.
+1. ~~**Vocabulary**~~ — `protocol/src/usb.rs`, `ModuleId::USB`.
+2. ~~**Ownership policy**~~ — `usb_session.rs`, tested against a fake backend.
+   Written under the pipe model; the lease narrowing above is a change to what
+   `Claim` means, not to its shape.
+3. ~~**Linux enumeration**~~ — sysfs, verified against real hardware.
+4. **The arbiter** — parse the 48-byte header, cache descriptors, serialise data
+   transfers, intercept state changes. Testable entirely from recorded headers:
+   no kernel, no device.
+5. **Linux export** — `modprobe`, polkit, the local USB/IP socket.
+6. **Attaching half** — the client side, so a peer's device can be used here.
+7. **Windows import** — `usbipd-win` detection and the missing-driver path.
+8. **Degradation reporting** — isochronous flagged, revoke on unplug.
+
+Milestone 4 is where "every machine in the mesh" is won or lost, and it needs no
+hardware, so it comes before anything requiring root.
 
 ## Invariants
 
-1. **Cursio never speaks URB.** If a change requires understanding a USB
-   transfer's contents, it is in the wrong layer.
-2. **One holder, and only the holder releases.** A claim from a non-holder is
-   refused, not honoured.
-3. **The host may always revoke.** Physical unplug beats any protocol state.
-4. **No listening port.** The USB/IP daemon binds loopback only; the mesh
-   channel is the only way in.
-5. **Absence is advertised, not simulated.** No driver, no advert. Never a
+1. **Cursio reads headers, never payloads.** Enough to route and arbitrate;
+   never enough to interpret what a device means by its bytes.
+2. **Descriptors are answered from cache.** Enumeration must never reach the
+   device once it is known, or attaching would disturb whoever is using it.
+3. **One configuration lease at a time**, held only while transfers need it.
+4. **The host arbitrates and may always revoke.** Physical unplug wins.
+5. **No listening port.** USB/IP binds loopback; the mesh channel is the only
+   way in.
+6. **Absence is advertised, not simulated.** No driver, no advert — never a
    device that appears attachable and silently does nothing.
