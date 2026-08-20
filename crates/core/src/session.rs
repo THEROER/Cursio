@@ -1084,7 +1084,10 @@ mod cursor_role_tests {
             pair.push_across();
             assert!(pair.there.active(), "trip {trip}: cursor did not cross");
             assert!(pair.here.driving(), "trip {trip}: sender stopped streaming");
-            assert!(!pair.there.driving(), "trip {trip}: holder is streaming too");
+            assert!(
+                !pair.there.driving(),
+                "trip {trip}: holder is streaming too"
+            );
             pair.push_back();
             assert!(pair.here.active(), "trip {trip}: cursor did not come home");
             assert!(
@@ -1170,7 +1173,10 @@ mod cursor_role_tests {
         for _ in 0..5 {
             mac.hand_over();
         }
-        assert_eq!(mac, handed_back, "the edge must be inert without the cursor");
+        assert_eq!(
+            mac, handed_back,
+            "the edge must be inert without the cursor"
+        );
         assert!(
             windows.active(),
             "the cursor is still where the user left it"

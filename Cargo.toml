@@ -10,6 +10,7 @@ members = [
     "crates/window",
     "crates/audio",
     "crates/files",
+    "crates/usb",
     "crates/core",
     "app",
     "apps/clipd",
@@ -32,6 +33,7 @@ cursio-input = { path = "crates/input" }
 cursio-audio = { path = "crates/audio" }
 cursio-window = { path = "crates/window" }
 cursio-files = { path = "crates/files" }
+cursio-usb = { path = "crates/usb" }
 cursio-core = { path = "crates/core" }
 cursio-log = { path = "crates/logging" }
 clipboard-core = { path = "crates/clipboard-core" }

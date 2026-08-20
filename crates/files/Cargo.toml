@@ -54,6 +54,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     # Mapping the drive letter onto the UNC share, as `net use` does.
     "Win32_NetworkManagement_WNet",
+    # `DRIVE_REMOVABLE`, for telling a stick from a fixed disk.
+    "Win32_System_WindowsProgramming",
 ] }
 
 [dev-dependencies]

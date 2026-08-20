@@ -1227,6 +1227,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cursio-usb"
+version = "0.1.0"
+dependencies = [
+ "cursio-protocol",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "cursio-window"
 version = "0.1.0"
 dependencies = [

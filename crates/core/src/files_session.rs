@@ -236,6 +236,17 @@ impl Pacer {
 /// the wrong trade when the network is the bottleneck.
 const ZSTD_LEVEL: i32 = 1;
 
+/// How often the local volume set is re-read, so a medium plugged in after the
+/// session started is offered without waiting for a reconnect.
+///
+/// Polled rather than driven by udev or udisks: the volume set is a handful of
+/// lines from `/proc/self/mounts` plus one sysfs read per block device, which
+/// is cheaper than holding a D-Bus subscription that would have to be
+/// duplicated for Windows anyway. A second is far below what a person notices
+/// between plugging a stick in and looking for it, and udisks itself takes a
+/// noticeable fraction of that to mount the thing.
+const VOLUME_RESCAN: Duration = Duration::from_secs(1);
+
 /// Where a peer's volumes are mounted on Linux.
 ///
 /// Under the user's runtime directory rather than `/mnt`: no privileges needed,
@@ -368,6 +379,9 @@ pub struct FilesEngine {
     /// The peer's volumes as last announced, answered from here instead of over
     /// the link. See where it is filled for why this matters.
     peer_volumes: Vec<Volume>,
+    /// When the local volume set was last re-read, so a stick plugged in after
+    /// the session started is noticed. See [`VOLUME_RESCAN`].
+    last_rescan: Instant,
 }
 
 impl FilesEngine {
@@ -401,7 +415,36 @@ impl FilesEngine {
             mount,
             announce_volumes: true,
             peer_volumes: Vec::new(),
+            last_rescan: Instant::now(),
         })
+    }
+
+    /// Re-read the local volumes, and schedule an announcement if they changed.
+    ///
+    /// Compared as a whole rather than watched for arrivals: a medium going away
+    /// matters as much as one appearing, and the peer is sent the entire set in
+    /// either case, so there is nothing a delta would buy.
+    fn rescan_volumes(&mut self) {
+        if self.last_rescan.elapsed() < VOLUME_RESCAN {
+            return;
+        }
+        self.last_rescan = Instant::now();
+
+        let mut server = self.server.lock().expect("file server");
+        let before = server.volumes();
+        let after = FileServer::detect();
+        if after.volumes() == before {
+            return;
+        }
+        tracing::info!(
+            peer = %self.peer_name,
+            was = before.len(),
+            now = after.volumes().len(),
+            "local volumes changed"
+        );
+        *server = after;
+        drop(server);
+        self.announce_volumes = true;
     }
 
     fn next_req(&mut self) -> FileReqId {
@@ -930,6 +973,8 @@ impl SessionModule for FilesEngine {
     }
 
     async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
+        self.rescan_volumes();
+
         if self.announce_volumes {
             let volumes = self.server.lock().expect("file server").volumes();
             send(tx, FilesMsg::Volumes(volumes)).await?;
@@ -1081,6 +1126,7 @@ mod tests {
             mount: None,
             announce_volumes: false,
             peer_volumes: Vec::new(),
+            last_rescan: Instant::now(),
         };
         (engine, ops_tx)
     }

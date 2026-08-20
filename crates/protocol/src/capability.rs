@@ -59,6 +59,9 @@ impl ModuleId {
     /// Asking a peer to carry a duty this machine cannot; see
     /// [`service`](crate::service).
     pub const SERVICE: ModuleId = ModuleId(6);
+    /// USB device sharing: a device on one machine's port, attached from
+    /// another; see [`usb`](crate::usb).
+    pub const USB: ModuleId = ModuleId(7);
 
     /// Human-readable name, for logs and diagnostics. Unknown ids are rendered
     /// numerically rather than hidden — that is exactly the case worth seeing in
@@ -71,6 +74,7 @@ impl ModuleId {
             ModuleId::WINDOW => "window",
             ModuleId::FILES => "files",
             ModuleId::SERVICE => "service",
+            ModuleId::USB => "usb",
             _ => "unknown",
         }
     }

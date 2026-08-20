@@ -1479,7 +1479,6 @@ async fn run_pairing_and_session(
     // before anyone had spoken.
     cursio_input::set_peer_edge(link.peer_edge);
 
-
     let peer = link.peer;
     let mut secure = link.transport;
     let modules = link.modules;

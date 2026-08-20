@@ -31,6 +31,7 @@ pub mod module;
 pub mod registry;
 pub mod service_session;
 pub mod session;
+pub mod usb_session;
 pub mod window_session;
 
 pub use identity::NodeIdentity;

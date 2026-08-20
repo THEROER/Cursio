@@ -425,25 +425,193 @@ fn raw_capacity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// One volume rooted at `/` on either Unix.
+/// The root, plus every disk mounted below it.
 ///
-/// macOS mounts removable disks under `/Volumes` and Linux under `/media` or
-/// `/mnt`, so both are already reachable by walking down from the root — the
-/// drive-letter enumeration Windows needs has no counterpart here.
+/// The root alone reaches all of them — a second disk is mounted under `/mnt`
+/// and so already hangs off `/` — but reaching is not presenting. Offered as
+/// one volume, a machine's other disks arrive at the peer as unnamed folders
+/// several levels down, with no capacity of their own, no label the user gave
+/// them, and no entry in a file manager's sidebar. On this machine that hid
+/// 1.2 TB across four disks inside a single `/`, while the Windows half
+/// offered every drive letter separately — the same machine presented two
+/// different ways depending on which end you looked from.
+///
+/// Each disk therefore becomes its own volume, which is also what makes a USB
+/// stick appear as the disk the user plugged in. The medium stays mounted
+/// exactly once, by this machine, and peers reach it through file operations —
+/// so any number of them use it at once without the cache divergence two
+/// kernels mounting one stick would cause. See `docs/usb-design.md`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn detect_volumes() -> Vec<SharedVolume> {
     let root = PathBuf::from("/");
     let (total_bytes, free_bytes) = capacity_of(&root);
-    vec![SharedVolume {
+    let mut volumes = vec![SharedVolume {
         info: Volume {
             id: "/".to_string(),
             label: "Root".to_string(),
             writable: true,
             total_bytes,
             free_bytes,
+            removable: false,
         },
         root,
-    }]
+    }];
+    volumes.extend(detect_disks());
+    volumes
+}
+
+/// Every disk mounted right now, as a volume of its own.
+///
+/// ## What counts as a disk
+///
+/// The same question a file manager answers when it decides what to put in its
+/// sidebar, and answered the same way rather than by a rule of our own. udisks
+/// distinguishes a volume backed by real hardware from one that is not by
+/// whether the block device belongs to a *drive*: `/dev/sda1` reports a drive
+/// with a model and a serial, while `/dev/loop0` reports none, because behind
+/// it is a file. In sysfs that is exactly the difference between a device under
+/// `/sys/devices/pci…` and one under `/sys/devices/virtual/`.
+///
+/// Reading it from sysfs rather than asking udisks over D-Bus keeps this
+/// working on a machine with no desktop session and needs no second
+/// implementation for Windows, which has no udisks at all. It is the same
+/// answer from the same source udisks itself reads.
+///
+/// On this machine the test is decisive: 29 snap loop mounts and four real
+/// disks, and a file manager shows the four. A rule based on the mount path
+/// would have failed here — `/mnt` holds permanently mounted fixed disks, not
+/// the removable media the name suggests.
+#[cfg(target_os = "linux")]
+fn detect_disks() -> Vec<SharedVolume> {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(source), Some(target)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        // The root is already offered above, and a bind mount of it would
+        // otherwise arrive a second time under another name.
+        if target == "/" {
+            continue;
+        }
+        let Some(disk) = backing_disk(source) else {
+            continue;
+        };
+        // One volume per filesystem: a disk mounted twice (a bind mount, or the
+        // same device mounted at two points) is one disk, and offering it twice
+        // would show the peer two drives that are the same storage.
+        if !seen.insert(source.to_string()) {
+            continue;
+        }
+        // The mount table escapes spaces as an octal `\040`, so a stick
+        // labelled "MY DRIVE" arrives with an escape sequence in its path.
+        // Written raw: `"\040"` in Rust source is a NUL followed by "40",
+        // which would match nothing this file ever contains.
+        let target = target.replace(r"\040", " ");
+        let root = PathBuf::from(&target);
+        let (total_bytes, free_bytes) = capacity_of(&root);
+        out.push(SharedVolume {
+            info: Volume {
+                // The mount path is the id: stable while the filesystem is
+                // mounted, which is exactly as long as the volume is offered,
+                // and unique because two filesystems cannot share a mount point.
+                id: target.clone(),
+                label: disk_label(&root, &target, total_bytes),
+                writable: true,
+                total_bytes,
+                free_bytes,
+                removable: is_removable_disk(&disk),
+            },
+            root,
+        });
+    }
+    out
+}
+
+/// The sysfs directory of the whole disk behind a block device, or `None` when
+/// nothing physical is behind it.
+///
+/// A partition's sysfs entry is a child of its disk's, so the parent is taken
+/// when the device is not itself a whole disk. Anything under
+/// `/sys/devices/virtual` — loop, device-mapper, zram — has no drive behind it
+/// and is not offered, which is what keeps a machine's snap mounts out of the
+/// peer's file manager.
+#[cfg(target_os = "linux")]
+fn backing_disk(source: &str) -> Option<PathBuf> {
+    let name = source.strip_prefix("/dev/")?;
+    let path = std::fs::canonicalize(format!("/sys/class/block/{name}")).ok()?;
+    if path.starts_with("/sys/devices/virtual") {
+        return None;
+    }
+    // `removable` sits on the whole disk; its presence is also what marks this
+    // entry as the disk rather than one of its partitions.
+    match path.join("removable").exists() {
+        true => Some(path),
+        false => Some(path.parent()?.to_path_buf()),
+    }
+}
+
+/// Whether the kernel calls this disk removable.
+#[cfg(target_os = "linux")]
+fn is_removable_disk(disk: &Path) -> bool {
+    std::fs::read_to_string(disk.join("removable"))
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// A name for a volume, in the order a person would recognise it.
+///
+/// The mount point's last component first, because udisks names a mount after
+/// the filesystem label and that is the name the user gave the disk. A disk
+/// with no label is mounted at a path that says nothing either — so rather than
+/// offer the peer a volume called `sdd2`, it is named for its size, exactly as
+/// a file manager shows "239 GB Volume" for the same disk.
+#[cfg(target_os = "linux")]
+fn disk_label(root: &Path, target: &str, total_bytes: u64) -> String {
+    let named = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| target.to_string());
+    // A bare device name is not a label anybody chose.
+    match named.starts_with("sd") || named.starts_with("nvme") || named.is_empty() {
+        true => format!("{} Volume", human_size(total_bytes)),
+        false => named,
+    }
+}
+
+/// Round a capacity the way a file manager labels a disk: "239 GB", "1,0 TB".
+#[cfg(target_os = "linux")]
+fn human_size(bytes: u64) -> String {
+    // Decimal units, as every disk vendor and file manager uses: a 240 GB SSD
+    // labelled "223 GiB" reads as the wrong disk.
+    const UNITS: [(&str, u64); 3] = [
+        ("TB", 1_000_000_000_000),
+        ("GB", 1_000_000_000),
+        ("MB", 1_000_000),
+    ];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            let whole = bytes / scale;
+            return match whole >= 10 {
+                true => format!("{whole} {unit}"),
+                // One decimal below ten, so a 1.5 TB disk is not "1 TB".
+                false => format!("{:.1} {unit}", bytes as f64 / scale as f64),
+            };
+        }
+    }
+    format!("{bytes} B")
+}
+
+/// macOS mounts removable media under `/Volumes`, but reporting which are
+/// removable needs DiskArbitration — a framework this crate does not link for
+/// the one machine that cannot host a mount anyway.
+#[cfg(target_os = "macos")]
+fn detect_disks() -> Vec<SharedVolume> {
+    Vec::new()
 }
 
 #[cfg(target_os = "windows")]
@@ -466,11 +634,32 @@ fn detect_volumes() -> Vec<SharedVolume> {
                 writable: true,
                 total_bytes,
                 free_bytes,
+                removable: is_removable_drive(letter),
             },
             root,
         });
     }
     out
+}
+
+/// Whether a drive letter is a removable medium.
+///
+/// `GetDriveTypeW` answers directly, and is the whole of what Windows needs
+/// here — the drive-letter enumeration above already found the volume, so
+/// unlike Linux there is no mount table to walk or parent device to resolve.
+#[cfg(target_os = "windows")]
+fn is_removable_drive(letter: char) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    // `DRIVE_REMOVABLE` lives under `WindowsProgramming`, not beside the
+    // function that returns it.
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOVABLE;
+
+    let path: Vec<u16> = format!("{letter}:\\")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `path` is a NUL-terminated UTF-16 string that outlives the call.
+    unsafe { GetDriveTypeW(path.as_ptr()) == DRIVE_REMOVABLE }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -482,6 +671,71 @@ fn detect_volumes() -> Vec<SharedVolume> {
 mod tests {
     use super::*;
 
+    /// A file manager labels a disk in decimal units — a 240 GB SSD shown as
+    /// "223 GiB" reads as a different disk than the one on the box.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_capacity_reads_the_way_a_disk_is_sold() {
+        assert_eq!(human_size(238_927_478_784), "238 GB");
+        assert_eq!(human_size(1_000_200_994_816), "1.0 TB");
+        assert_eq!(human_size(500_105_217_024), "500 GB");
+    }
+
+    /// Below ten the whole number alone loses too much: a 1.5 TB disk must not
+    /// be labelled the same as a 1.0 TB one.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_small_multiple_keeps_one_decimal() {
+        assert_eq!(human_size(1_500_000_000_000), "1.5 TB");
+        assert_eq!(human_size(2_000_000_000), "2.0 GB");
+    }
+
+    /// udisks mounts a disk under its filesystem label, so the last path
+    /// component is the name the user gave it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_labelled_disk_keeps_its_name() {
+        let target = "/mnt/Programing";
+        assert_eq!(
+            disk_label(Path::new(target), target, 200_000_000_000),
+            "Programing"
+        );
+    }
+
+    /// A disk with no label is mounted at a path naming the device, and
+    /// `sdd2` is not a name anybody chose. Named for its size instead, exactly
+    /// as a file manager does.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_unlabelled_disk_is_named_for_its_size() {
+        let target = "/media/theroer/sdd2";
+        assert_eq!(
+            disk_label(Path::new(target), target, 238_927_478_784),
+            "238 GB Volume"
+        );
+    }
+
+    /// Nothing physical backs a loop device, which is why a file manager does
+    /// not show one — and why 29 snap mounts must not reach the peer.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_loop_device_has_no_backing_disk() {
+        // Skipped rather than failed where the machine has no loop devices:
+        // the assertion is about what sysfs reports, not about this file.
+        if std::path::Path::new("/sys/class/block/loop0").exists() {
+            assert!(backing_disk("/dev/loop0").is_none());
+        }
+    }
+
+    /// Anything that is not a block device at all — tmpfs, cgroup, proc — has
+    /// no disk behind it either.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_pseudo_filesystem_has_no_backing_disk() {
+        assert!(backing_disk("tmpfs").is_none());
+        assert!(backing_disk("proc").is_none());
+    }
+
     fn server_on(root: &Path) -> FileServer {
         FileServer::new(vec![SharedVolume {
             info: Volume {
@@ -490,6 +744,7 @@ mod tests {
                 writable: true,
                 total_bytes: FALLBACK_TOTAL,
                 free_bytes: FALLBACK_FREE,
+                removable: false,
             },
             root: root.to_path_buf(),
         }])
@@ -665,6 +920,7 @@ mod tests {
                 writable: false,
                 total_bytes: FALLBACK_TOTAL,
                 free_bytes: FALLBACK_FREE,
+                removable: false,
             },
             root: tmp.path().to_path_buf(),
         }]);
