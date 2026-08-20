@@ -425,25 +425,122 @@ fn raw_capacity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// One volume rooted at `/` on either Unix.
+/// The root, plus any removable medium mounted below it.
 ///
-/// macOS mounts removable disks under `/Volumes` and Linux under `/media` or
-/// `/mnt`, so both are already reachable by walking down from the root — the
-/// drive-letter enumeration Windows needs has no counterpart here.
+/// The root alone would be enough to *reach* a USB stick — it is mounted under
+/// `/media` or `/mnt` and so already hangs off `/`. It is not enough to
+/// *present* one: buried several levels inside the peer's root, a stick appears
+/// as a folder nobody would look for, with no label, no capacity of its own and
+/// no eject. Offering it as its own volume is what lets the mounting side dress
+/// it as the disk the user plugged in.
+///
+/// The medium stays mounted exactly once, by this machine, and peers reach it
+/// through file operations — which is why any number of them may use it at once
+/// without the cache divergence that two kernels mounting one stick would
+/// cause. See `docs/usb-design.md`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn detect_volumes() -> Vec<SharedVolume> {
     let root = PathBuf::from("/");
     let (total_bytes, free_bytes) = capacity_of(&root);
-    vec![SharedVolume {
+    let mut volumes = vec![SharedVolume {
         info: Volume {
             id: "/".to_string(),
             label: "Root".to_string(),
             writable: true,
             total_bytes,
             free_bytes,
+            removable: false,
         },
         root,
-    }]
+    }];
+    volumes.extend(detect_removable());
+    volumes
+}
+
+/// Removable media mounted right now, as volumes of their own.
+///
+/// Read from the kernel's mount table and its `removable` attribute rather than
+/// guessed from the mount path. A path heuristic looks tempting — `/media` is
+/// where udisks puts sticks — but `/mnt` holds permanently mounted fixed disks
+/// on plenty of machines (this one included), and calling those removable would
+/// offer the peer an eject button for a drive bolted into the case.
+#[cfg(target_os = "linux")]
+fn detect_removable() -> Vec<SharedVolume> {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(source), Some(target)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        // Only real block devices can be removable; skip tmpfs, cgroup and the
+        // rest before touching the filesystem.
+        if !source.starts_with("/dev/") || !is_removable_device(source) {
+            continue;
+        }
+        // The mount table escapes spaces as an octal `\040`, so a stick
+        // labelled "MY DRIVE" arrives with an escape sequence in its path.
+        // Written raw: `"\040"` in Rust source is a NUL followed by "40",
+        // which would match nothing this file ever contains.
+        let target = target.replace(r"\040", " ");
+        let root = PathBuf::from(&target);
+        let (total_bytes, free_bytes) = capacity_of(&root);
+        let label = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.clone());
+        out.push(SharedVolume {
+            info: Volume {
+                // The mount path is the id: stable while the medium is mounted,
+                // which is exactly as long as the volume is offered, and unique
+                // because two filesystems cannot share a mount point.
+                id: target,
+                label,
+                writable: true,
+                total_bytes,
+                free_bytes,
+                removable: true,
+            },
+            root,
+        });
+    }
+    out
+}
+
+/// Whether `/dev/sdb1` sits on a disk the kernel calls removable.
+///
+/// The flag lives on the whole disk (`sdb`), not the partition (`sdb1`), so the
+/// partition's sysfs entry is resolved to its parent first.
+#[cfg(target_os = "linux")]
+fn is_removable_device(source: &str) -> bool {
+    let Some(name) = source.strip_prefix("/dev/") else {
+        return false;
+    };
+    let Ok(path) = std::fs::canonicalize(format!("/sys/class/block/{name}")) else {
+        return false;
+    };
+    // A partition's sysfs directory is a child of its disk's; a whole device's
+    // is not, and `removable` is already there.
+    let disk = match path.join("removable").exists() {
+        true => path,
+        false => match path.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => return false,
+        },
+    };
+    std::fs::read_to_string(disk.join("removable"))
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// macOS mounts removable media under `/Volumes`, but reporting which are
+/// removable needs DiskArbitration — a framework this crate does not link for
+/// the one machine that cannot host a mount anyway.
+#[cfg(target_os = "macos")]
+fn detect_removable() -> Vec<SharedVolume> {
+    Vec::new()
 }
 
 #[cfg(target_os = "windows")]
@@ -466,11 +563,29 @@ fn detect_volumes() -> Vec<SharedVolume> {
                 writable: true,
                 total_bytes,
                 free_bytes,
+                removable: is_removable_drive(letter),
             },
             root,
         });
     }
     out
+}
+
+/// Whether a drive letter is a removable medium.
+///
+/// `GetDriveTypeW` answers directly, and is the whole of what Windows needs
+/// here — the drive-letter enumeration above already found the volume, so
+/// unlike Linux there is no mount table to walk or parent device to resolve.
+#[cfg(target_os = "windows")]
+fn is_removable_drive(letter: char) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, DRIVE_REMOVABLE};
+
+    let path: Vec<u16> = format!("{letter}:\\")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `path` is a NUL-terminated UTF-16 string that outlives the call.
+    unsafe { GetDriveTypeW(path.as_ptr()) == DRIVE_REMOVABLE }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -490,6 +605,7 @@ mod tests {
                 writable: true,
                 total_bytes: FALLBACK_TOTAL,
                 free_bytes: FALLBACK_FREE,
+                removable: false,
             },
             root: root.to_path_buf(),
         }])
@@ -665,6 +781,7 @@ mod tests {
                 writable: false,
                 total_bytes: FALLBACK_TOTAL,
                 free_bytes: FALLBACK_FREE,
+                removable: false,
             },
             root: tmp.path().to_path_buf(),
         }]);

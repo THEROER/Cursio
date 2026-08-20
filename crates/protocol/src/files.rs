@@ -91,6 +91,21 @@ pub struct Volume {
     /// reported as a plausible non-zero figure, never as nothing.
     pub total_bytes: u64,
     pub free_bytes: u64,
+    /// Whether this volume is a removable medium — a USB stick or card rather
+    /// than a fixed disk.
+    ///
+    /// Carried because the receiving side has no way to tell: a volume arrives
+    /// as a path and a label, and nothing about those says whether the user
+    /// would expect an eject button next to it. The mount uses this to present
+    /// a removable disk as one, which is the difference between "a folder that
+    /// happens to be a stick" and the stick appearing where the user looks for
+    /// it.
+    ///
+    /// Defaulted rather than added to every construction site: a peer built
+    /// before this field existed sends a `Volume` without it, and every fixed
+    /// disk — the overwhelming majority — wants exactly this value.
+    #[serde(default)]
+    pub removable: bool,
 }
 
 /// What a path is: the file kind plus the metadata a directory listing needs.
