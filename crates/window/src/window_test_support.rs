@@ -57,6 +57,12 @@ impl CaptureSession for FakeCaptureSession {
 /// Hands out a [`FakeCaptureSession`] fed by a test-owned channel.
 pub struct FakeCapture {
     frames: Option<mpsc::Receiver<WindowFrame>>,
+    /// Senders for the extra sessions, kept alive so their receivers stay open.
+    spare_senders: Vec<mpsc::Sender<WindowFrame>>,
+    /// The title `aim_at` last named, mirroring a real backend: the session
+    /// dedupes by title, so a fake that ignored the aim would report every
+    /// window as the same one.
+    aimed_title: Option<String>,
     width: u32,
     height: u32,
 }
@@ -66,6 +72,8 @@ impl FakeCapture {
     pub fn new(frames: mpsc::Receiver<WindowFrame>, width: u32, height: u32) -> Self {
         Self {
             frames: Some(frames),
+            spare_senders: Vec::new(),
+            aimed_title: None,
             width,
             height,
         }
@@ -75,15 +83,30 @@ impl FakeCapture {
 impl WindowCapture for FakeCapture {
     type Session = FakeCaptureSession;
 
+    fn aim_at(&mut self, title: &str) {
+        self.aimed_title = Some(title.to_string());
+    }
+
     fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError> {
-        let frames = self
-            .frames
-            .take()
-            .ok_or_else(|| WindowError::Backend("fake capture already consumed".into()))?;
+        // The first session gets the test's channel; later ones get a channel
+        // of their own that never yields. A host can have several windows open
+        // at once, and a fake that refused the second could only test the
+        // single-window case it was written for — but a test still drives
+        // frames through one known channel, so that one keeps it.
+        let frames = self.frames.take().unwrap_or_else(|| {
+            let (tx, rx) = mpsc::channel(1);
+            // Held so the receiver reads as open (empty) rather than closed,
+            // which the engine treats as the capture having ended.
+            self.spare_senders.push(tx);
+            rx
+        });
         Ok(FakeCaptureSession {
             meta: WindowMeta {
                 id,
-                title: "fake window".into(),
+                title: self
+                    .aimed_title
+                    .clone()
+                    .unwrap_or_else(|| "fake window".into()),
                 width: self.width,
                 height: self.height,
             },
