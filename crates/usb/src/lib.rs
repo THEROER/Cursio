@@ -18,6 +18,7 @@
 #[cfg(target_os = "linux")]
 mod linux;
 mod offer;
+pub mod urb;
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxUsb;
@@ -42,6 +43,11 @@ pub enum UsbBackendError {
     NoSuchDevice(String),
     #[error("usb enumeration failed: {0}")]
     Enumerate(String),
+    /// The USB/IP stream stopped making sense. Framing errors end a stream
+    /// rather than being skipped: once sync is lost every later message is
+    /// misread, so continuing would corrupt transfers rather than drop one.
+    #[error("malformed usb/ip stream: {0}")]
+    Framing(String),
 }
 
 /// A device as the local machine sees it, before it is offered to anyone.
