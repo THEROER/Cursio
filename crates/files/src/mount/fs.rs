@@ -766,14 +766,13 @@ fn mount_config(peer_name: &str) -> fuser::Config {
         // set-user-id bits or device nodes that arrived over a network.
         MountOption::NoSuid,
         MountOption::NoDev,
-        // Deliberately NOT `x-gvfs-show`, which is what would put this in a
-        // file manager's sidebar as a drive. `x-*` options are userspace ones,
-        // interpreted by libmount from an fstab entry; fuser passes CUSTOM
-        // straight to the kernel as a mount flag, which never reaches the
-        // gvfs monitor and at best is ignored. Presenting a peer's removable
-        // medium as a drive needs a gvfs mount rather than a flag here, so the
-        // volume is offered separately (see `SharedVolume`) and the sidebar
-        // question is left to whatever presents it.
+        // No `x-gvfs-show` here, and none is needed: gvfs already picks this
+        // up through its UDisks2 monitor as a `GProxyMount`, so the mount
+        // appears in a file manager's sidebar with an eject button of its own.
+        // The option would not have helped anyway — `x-*` options are userspace
+        // ones that libmount interprets from an fstab entry, while fuser passes
+        // CUSTOM straight to the kernel as a mount flag, where no gvfs monitor
+        // ever sees it.
         // Deliberately NOT AutoUnmount: fuser refuses it unless the session ACL
         // is widened to `allow_other` or `allow_root`, and either would expose
         // the peer's files — and through them the peer's whole disk — to every
