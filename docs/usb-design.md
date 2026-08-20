@@ -96,14 +96,19 @@ and attaches peers' devices. Two priority classes, deliberately split:
   the cursor, exactly as `files` does.
 
 ```
-UsbMsg::List                          → Devices { Vec<UsbDevice> }
-UsbMsg::Claim  { device, reason }     → Claimed { device, endpoint }
-                                      | Refused { device, UsbError }
-UsbMsg::Release{ device }             → Released { device }
-UsbMsg::Revoked{ device, UsbError }   (host → holder, unsolicited)
-UsbMsg::Attached { .. }               (holder → mesh, state replication)
-UsbMsg::Data   { stream, bytes }      (Bulk; the USB/IP byte stream)
+UsbMsg::ListDevices                 → Devices(Vec<UsbDevice>)
+UsbMsg::Claim   { device, reason }  → Claimed  { device, stream }
+                                    | Refused  { device, UsbError }
+UsbMsg::Release { device }          → Detached { device, stream, error: None }
+                                      Detached { device, stream, error: Some }
+                                        (host → holder, unsolicited: an unplug)
+UsbMsg::Data    { stream, bytes }     (Bulk; the USB/IP byte stream)
 ```
+
+One `Detached` covers both an orderly release and a revocation, because the
+holder's kernel needs the detach either way and the only difference is whether
+`error` says why. A separate `Revoked` would be a second message the holder had
+to handle identically — and a second chance to handle it differently by mistake.
 
 `UsbDevice` carries what a user needs to recognise the thing — vendor and
 product ids, the strings when the device offers them, the class, the bus id on
@@ -114,7 +119,7 @@ device is replugged into another port.
 Errors are values, never silence — the `files` rule, for the same reason. A
 claim that goes unanswered hangs the user's `adb` with no way to tell whether
 the device is busy, refused, or gone. `UsbError` names it: `InUse(PeerId)`,
-`Gone`, `Denied`, `DriverMissing`, `NeedsPrivilege`.
+`Gone`, `Denied`, `DriverMissing`, `NeedsPrivilege`, `Unplugged`, `Backend`.
 
 State replication follows rule 5: the host broadcasts the **whole** device list
 on change, so a reconnecting peer resyncs by receiving the current one rather
