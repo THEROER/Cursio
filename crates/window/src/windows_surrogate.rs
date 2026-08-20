@@ -53,6 +53,9 @@ pub(crate) enum SurrogateCommand {
     VideoPacket { seq: u32, packet: Vec<u8> },
     /// Window geometry changed; reallocate before the next blit.
     Resize { width: u32, height: u32 },
+    /// The window grew, learnt from a tile rather than a full frame. Keeps the
+    /// pixels already drawn — see [`Framebuffer::grow_to`].
+    Grow { width: u32, height: u32 },
     /// Tear the window down.
     Close(WindowCloseReason),
 }
@@ -87,6 +90,24 @@ impl Surrogate for Win32Surrogate {
                 width: self.width,
                 height: self.height,
             });
+        } else {
+            // A tile reaching past the edge says the same thing without an
+            // origin to recognise it by — a `dirty` rect names only what
+            // changed, never the window's full size, and dragging a corner
+            // produces exactly that. The blit rejects an out-of-bounds tile
+            // rather than clipping it, so without this the picture froze for
+            // the rest of the session. See the Linux surrogate for the whole
+            // reasoning.
+            let need_w = frame.dirty.x.saturating_add(frame.dirty.width);
+            let need_h = frame.dirty.y.saturating_add(frame.dirty.height);
+            if need_w > self.width || need_h > self.height {
+                self.width = self.width.max(need_w);
+                self.height = self.height.max(need_h);
+                let _ = self.commands.send(SurrogateCommand::Grow {
+                    width: self.width,
+                    height: self.height,
+                });
+            }
         }
 
         if frame.codec == TileCodec::LossyVideo {

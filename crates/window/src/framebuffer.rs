@@ -38,6 +38,31 @@ impl Framebuffer {
         self.height = height;
     }
 
+    /// Grow to at least `width`x`height`, keeping what is already drawn.
+    ///
+    /// Unlike [`Self::resize`], which is the answer to a full frame that is
+    /// about to overwrite everything anyway, this serves the case where only a
+    /// tile told us the window got bigger: the rest of the picture is still the
+    /// newest we have, and clearing it would flash the window black on every
+    /// step of a drag-resize.
+    pub fn grow_to(&mut self, width: u32, height: u32) {
+        let (w, h) = (self.width.max(width), self.height.max(height));
+        if w == self.width && h == self.height {
+            return;
+        }
+        let mut grown = vec![0u8; (w as usize) * (h as usize) * 4];
+        let old_row = (self.width as usize) * 4;
+        let new_row = (w as usize) * 4;
+        for y in 0..self.height as usize {
+            let src = y * old_row;
+            let dst = y * new_row;
+            grown[dst..dst + old_row].copy_from_slice(&self.pixels[src..src + old_row]);
+        }
+        self.pixels = grown;
+        self.width = w;
+        self.height = h;
+    }
+
     /// Blit one decoded raw-BGRA tile at `dirty`.
     ///
     /// Rejects a tile that would land outside the framebuffer rather than
@@ -87,6 +112,59 @@ mod tests {
         let i = (y * width + x) * 4;
         assert_eq!(&fb.pixels[i..i + 4], &tile);
         assert!(fb.pixels[..i].iter().all(|&b| b == 0));
+    }
+
+    /// Growing keeps the picture; only a full frame is allowed to clear it.
+    ///
+    /// A drag-resize is a stream of tiles that reach past the old edge, and the
+    /// pixels around them are still the newest the viewer has. Reallocating
+    /// blank would flash the window black on every step of the drag.
+    #[test]
+    fn growing_preserves_the_pixels_already_drawn() {
+        let mut fb = Framebuffer::new(2, 2);
+        let white = [0xFFu8; 4];
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            fb.blit(
+                Rect {
+                    x,
+                    y,
+                    width: 1,
+                    height: 1,
+                },
+                &white,
+            )
+            .unwrap();
+        }
+
+        fb.grow_to(4, 3);
+        assert_eq!((fb.width, fb.height), (4, 3));
+
+        // Every original pixel is still where it was, at its new stride.
+        for (x, y) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+            let i = (y * fb.width as usize + x) * 4;
+            assert_eq!(&fb.pixels[i..i + 4], &white, "lost the pixel at ({x},{y})");
+        }
+        // And the new area is blank rather than holding stale bytes.
+        let corner = (2 * fb.width as usize + 3) * 4;
+        assert_eq!(&fb.pixels[corner..corner + 4], &[0, 0, 0, 0]);
+    }
+
+    /// A tile that reaches past the edge is what a drag-resize looks like, so
+    /// growing to fit must make the very same blit succeed.
+    #[test]
+    fn a_tile_past_the_edge_fits_after_growing_to_it() {
+        let mut fb = Framebuffer::new(4, 2);
+        let dirty = Rect {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        };
+        let tile = vec![0xAAu8; (dirty.width * dirty.height) as usize * 4];
+        assert!(fb.blit(dirty, &tile).is_err(), "precondition: does not fit");
+
+        fb.grow_to(dirty.x + dirty.width, dirty.y + dirty.height);
+        fb.blit(dirty, &tile).expect("fits once the window grew");
     }
 
     #[test]
