@@ -123,16 +123,86 @@ The exclusivity USB really imposes therefore shrinks from "the whole device" to
 "a handful of control requests" — the same narrowing FUSE achieves, where
 readers are unlimited and only writes need ordering.
 
+## Storage takes the filesystem path, and still looks like a disk
+
+A removable disk is the one device class where carrying the bus is both
+unnecessary and unsafe, and where the obvious alternative appears to cost the
+user something. It does not have to.
+
+### Why the bus is the wrong layer for it
+
+A filesystem's structure lives on the medium, and each host that mounts it
+caches that structure in its own kernel. Two mounts of one medium means two
+caches with no way to learn of each other's writes — the condition storage
+people call *concurrent write sharing*, and the reason a single iSCSI target
+mounted by several initiators corrupts unless a cluster filesystem coordinates
+them. ext4, FAT and NTFS assume sole ownership; they have no such coordination
+and cannot acquire it.
+
+Arbitrating URBs does not help. Cursio can serialise two `WRITE(10)` commands
+perfectly and the medium still ends up inconsistent, because the stale data is
+in a *kernel*, not in the transfers. This is the one place where the adapter
+model reaches its limit — not for lack of understanding the traffic, but
+because the shared state is somewhere the traffic never goes.
+
+### The medium is mounted once, by the machine holding it
+
+So a removable disk is not exported as a bus device. Its host mounts it exactly
+as it always would — udisks does this automatically, before any peer is even
+aware of it — and offers the *filesystem* to the mesh:
+
+```
+laptop:   /dev/sdb → one filesystem → /media/user/MY_USB
+                                          ↓ files module
+desktop:  ~/Cursio/MY_USB     tablet:  ~/Cursio/MY_USB
+```
+
+One filesystem, one cache, one authority. Every machine reads and writes at
+once, and nothing can diverge because there is nothing to diverge from. The
+concurrency the bus could never give is free here.
+
+It also survives the host losing interest: unmounting in a file manager, or
+closing it, does not withdraw the volume. The host is *serving* the medium, not
+holding it, so a peer keeps working until the stick is physically pulled.
+
+### It must still look like a disk
+
+The reason this is not a compromise is that the mount is presented as what it
+is. A volume arriving over the link is a removable disk on the machine that
+receives it — sidebar entry, label, capacity, eject button — and applications
+open it by an ordinary path with no idea a network is involved. That is the same
+claim the window module makes about a peer's window, and the file module already
+makes about a peer's disks; storage simply has to carry the volume's identity
+across so the receiving side can dress it correctly.
+
+The wire type already carries what that needs: [`Volume`](../crates/protocol/src/files.rs)
+has `label`, `writable`, `total_bytes` and `free_bytes`, and `FilesMsg::Volumes`
+is documented as being re-sent "if the set changes (a USB disk appearing)".
+What is missing is the announcement when it does, a mount point of the volume's
+own rather than a folder deep inside the peer's root, and the mount options that
+make a file manager treat it as a drive — `x-gvfs-show` on Linux, a drive letter
+on Windows, which WinFsp gives for free.
+
+So the user's mental model — "I plugged a stick into the laptop and it appeared
+on the desktop" — is exactly what happens. The transport underneath is this
+project's own protocol rather than a bus, and that is invisible where it should
+be.
+
+### What the bus is still for
+
+Raw export remains for the cases where there is no filesystem to protect:
+imaging with `dd`, partitioning, flashing, a filesystem the host cannot mount,
+or a medium that must be booted from. Those need the device, not the files —
+and having no mounted filesystem, they have nothing to corrupt.
+
+The rule is therefore mechanical rather than a matter of judgement: **a mass
+storage device with a mounted filesystem is offered through `files`; one without
+is offered through the bus.** No heuristic about what the user meant, and no
+window in which both paths are live.
+
 ## What still cannot be shared
 
-Stated plainly, because arbitration is not magic and the boundary is real.
-
-**State inside the device.** Mass storage is the case: a filesystem's structure
-lives on the medium, and two kernels independently caching FAT tables will
-corrupt it the moment one writes. No amount of URB arbitration helps, because
-the shared state is not in the transfers. `crates/files` answers this properly —
-mount the volume on the host and share it as a *filesystem*, where one server is
-the final authority.
+Two more limits, stated plainly because arbitration is not magic.
 
 **Protocols that assume a single client.** `adbd` keeps one session over its
 bulk pair; two hosts interleaving on it get a desynchronised stream. The right
@@ -256,6 +326,12 @@ namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
 6. **Attaching half** — the client side, so a peer's device can be used here.
 7. **Windows import** — `usbipd-win` detection and the missing-driver path.
 8. **Degradation reporting** — isochronous flagged, revoke on unplug.
+
+Storage is not on this list: it belongs to `files`, which needs three additions
+of its own — announce a removable volume when udisks mounts one, give it a mount
+point rather than burying it in the peer's root, and mount it with the options
+that make a file manager show a drive. None of them need a driver, a kernel
+module or elevated privilege, which is why they land before any milestone here.
 
 Milestone 4 is where "every machine in the mesh" is won or lost, and it needs no
 hardware, so it comes before anything requiring root.
