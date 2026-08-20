@@ -11,7 +11,7 @@ use std::time::Duration;
 use cursio_protocol::{
     DeviceKind, Hello, Message, ModuleAdvert, Negotiated, PeerId, PROTOCOL_VERSION,
 };
-use cursio_transport::{Transport, TransportError};
+use cursio_transport::{Transport, TransportError, TransportTx};
 
 /// Identity and capabilities learned from the peer's [`Hello`].
 #[derive(Debug, Clone)]
@@ -64,6 +64,59 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// inbound traffic or the 5 s heartbeat, which turned continuous audio into
 /// one clump every five seconds.
 const MODULE_PUMP_INTERVAL: Duration = Duration::from_millis(5);
+
+/// The pace the loop falls back to once every module has been quiet for
+/// [`IDLE_PUMP_AFTER`] consecutive ticks.
+///
+/// The fast pace above exists for a *stream*: audio arriving every ~10 ms has
+/// to be picked up at least that often or it queues and lands as a burst. When
+/// nothing is streaming there is no such deadline, and 200 wakeups a second buy
+/// nothing — but they still cost, and not in CPU time. A tick that finds every
+/// module empty does almost no work, so it barely registers as usage; what it
+/// does is keep waking the core, which is what actually stops the package from
+/// reaching its deeper idle states. On an always-on mesh node that is a steady
+/// draw for no delivered work, and on a laptop it is measurably worse than the
+/// same load in fewer, longer wakeups.
+///
+/// 50 ms keeps the loop responsive to anything that does not announce itself
+/// through the transport (a module that starts producing between ticks waits at
+/// most one of these before its first pump), while cutting idle wakeups by an
+/// order of magnitude.
+const IDLE_PUMP_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How many consecutive silent pumps before dropping to [`IDLE_PUMP_INTERVAL`].
+///
+/// Deliberately several rather than one: audio chunks do not arrive on a perfect
+/// 10 ms grid, so a single empty tick is normal mid-stream and must not slow the
+/// loop under a live stream. At the fast pace this is 100 ms of complete silence
+/// across every module before the pace changes at all.
+const IDLE_PUMP_AFTER: u32 = 20;
+
+/// Bytes the transport has written for everything a module can produce.
+///
+/// Sums the classes rather than reading one, because any of them appearing is
+/// reason to stay fast: audio and input are the latency-critical pair, video
+/// and bulk mean a window or a file transfer is live. [`Priority::Control`] is
+/// left out — the heartbeat ticks every 5 s on its own timer, and counting it
+/// would make an idle session look like a busy one forever.
+///
+/// A sender that writes inside `send` reports zero for every class (see
+/// [`TransportTx::queue_depth`]), so on that transport the sum never changes
+/// and the loop settles at the idle pace. That is the correct outcome: such a
+/// sender has no queue, so there is nothing for a fast pace to keep drained,
+/// and inbound traffic still wakes the loop through the `select!`.
+fn module_sent_bytes(tx: &dyn TransportTx) -> u64 {
+    use cursio_protocol::Priority;
+    [
+        Priority::Audio,
+        Priority::Input,
+        Priority::Video,
+        Priority::Bulk,
+    ]
+    .iter()
+    .map(|p| tx.queue_depth(*p).sent_bytes)
+    .fold(0u64, u64::wrapping_add)
+}
 
 /// Warn when a single module pump takes at least this long.
 ///
@@ -456,13 +509,25 @@ where
     // buffer overflowing on every burst.
     //
     // A short tick keeps the loop turning at roughly the audio chunk rate, so
-    // pumping stays smooth. It costs nothing when idle: the modules simply have
-    // nothing to send.
+    // pumping stays smooth while anything is streaming. When nothing is, the
+    // pace drops to `IDLE_PUMP_INTERVAL` — see the constant for why idle ticks
+    // are worth avoiding even though they do no work.
     let mut pace = tokio::time::interval(MODULE_PUMP_INTERVAL);
     // If a tick is missed (a long pump, a slow send), fire once and carry on
     // rather than replaying the backlog as a burst — bursts are the very thing
     // this is here to prevent.
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Whether the loop is currently on the fast pace, and how many pumps in a
+    // row have sent nothing. Tracked rather than re-read from `pace` because
+    // `tokio::time::Interval` does not expose its period.
+    let mut pace_is_fast = true;
+    let mut silent_pumps: u32 = 0;
+    // Total bytes the transport had written when the last pump finished. The
+    // counter is monotonic, so any increase means some module actually sent
+    // something — which is the signal the pace follows. Summed across the
+    // classes a module can produce; `Control` is excluded on purpose, since the
+    // heartbeat ticks on its own schedule and would otherwise read as traffic.
+    let mut last_sent_bytes: u64 = 0;
 
     // Liveness: when did we last hear *anything* from the peer? Any inbound
     // message counts, not just heartbeats — real traffic proves the link just
@@ -516,6 +581,40 @@ where
         if let Some((name, e)) = pump_err {
             tracing::warn!(module = name, error = %e, "module pump failed");
             break Err(SessionError::from(e));
+        }
+
+        // Follow the traffic: stay fast while modules are producing, fall back
+        // to the idle pace once they have all been quiet for a while.
+        //
+        // Read from the transport rather than from `pump`'s return: `pump`
+        // reports failure, not whether it sent, and every module would have to
+        // change to say so. `sent_bytes` already answers it for all of them at
+        // once, and counts what reached the socket rather than what a module
+        // believes it queued.
+        let sent_now = module_sent_bytes(tx.as_ref());
+        if sent_now != last_sent_bytes {
+            last_sent_bytes = sent_now;
+            silent_pumps = 0;
+            if !pace_is_fast {
+                // Back to a stream: restore the fast pace immediately. The
+                // first chunk has already been pumped by the time we get here,
+                // so this only affects how soon the *next* one is picked up.
+                pace = tokio::time::interval(MODULE_PUMP_INTERVAL);
+                pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                pace_is_fast = true;
+                tracing::debug!("module traffic resumed; session loop back to fast pace");
+            }
+        } else if pace_is_fast {
+            silent_pumps = silent_pumps.saturating_add(1);
+            if silent_pumps >= IDLE_PUMP_AFTER {
+                pace = tokio::time::interval(IDLE_PUMP_INTERVAL);
+                pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                pace_is_fast = false;
+                tracing::debug!(
+                    idle_ms = IDLE_PUMP_INTERVAL.as_millis() as u64,
+                    "no module traffic; session loop dropping to idle pace"
+                );
+            }
         }
 
         // NOTE: deliberately *not* `biased!` here. The inbound branch is written
@@ -902,6 +1001,137 @@ mod tests {
         PeerId::from_bytes([byte; 16])
     }
 
+    /// A transport that reports whatever per-class totals it is told to.
+    ///
+    /// Only `queue_depth` matters here: the pace follows the bytes the classes
+    /// have written, so a stub that can move one class at a time is enough to
+    /// drive the decision without a real link.
+    #[derive(Default)]
+    struct CountingTx {
+        audio: u64,
+        input: u64,
+        video: u64,
+        bulk: u64,
+        control: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl TransportTx for CountingTx {
+        async fn send(&mut self, _msg: &Message) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn queue_depth(&self, priority: cursio_protocol::Priority) -> cursio_transport::QueueDepth {
+            use cursio_protocol::Priority;
+            let sent = match priority {
+                Priority::Audio => self.audio,
+                Priority::Input => self.input,
+                Priority::Video => self.video,
+                Priority::Bulk => self.bulk,
+                Priority::Control => self.control,
+            };
+            cursio_transport::QueueDepth {
+                queued_bytes: 0,
+                sent_bytes: sent,
+            }
+        }
+    }
+
+    /// Every class a module can produce keeps the loop awake.
+    ///
+    /// Audio and input are the obvious ones, but a window transfer (`Video`) and
+    /// a file copy (`Bulk`) are just as much live traffic: reading only the
+    /// latency-critical pair would drop the loop to the idle pace in the middle
+    /// of a transfer and pace it at 50 ms.
+    #[test]
+    fn traffic_in_any_module_class_counts_as_activity() {
+        let bumps = [
+            ("audio", (|t: &mut CountingTx| t.audio += 100) as fn(&mut _)),
+            ("input", |t: &mut CountingTx| t.input += 100),
+            ("video", |t: &mut CountingTx| t.video += 100),
+            ("bulk", |t: &mut CountingTx| t.bulk += 100),
+        ];
+        for (name, bump) in bumps {
+            let mut tx = CountingTx::default();
+            let before = module_sent_bytes(&tx);
+            bump(&mut tx);
+            assert_ne!(
+                module_sent_bytes(&tx),
+                before,
+                "{name} traffic must register as a module producing"
+            );
+        }
+    }
+
+    /// The heartbeat must not read as module traffic.
+    ///
+    /// It ticks every 5 s forever, so counting `Control` would mean an idle
+    /// session sees the total move on every heartbeat and never settles onto the
+    /// idle pace — the loop would stay at 200 wakeups a second for the life of
+    /// the link, which is the exact cost this pacing exists to avoid.
+    #[test]
+    fn the_heartbeat_alone_does_not_hold_the_loop_at_the_fast_pace() {
+        let mut tx = CountingTx::default();
+        let before = module_sent_bytes(&tx);
+        tx.control += 4096;
+        assert_eq!(
+            module_sent_bytes(&tx),
+            before,
+            "control traffic must not count as a module producing"
+        );
+    }
+
+    /// A sender with no queue reports zeros, and that must be stable.
+    ///
+    /// `TransportTx::queue_depth` defaults to zero for a transport that writes
+    /// inside `send`. The loop then settles at the idle pace, which is correct —
+    /// there is no queue for a fast pace to keep drained — but only as long as
+    /// the reading does not drift, or the pace would flap on a link that is
+    /// doing nothing.
+    #[test]
+    fn a_queueless_transport_reads_as_steady() {
+        struct NoQueueTx;
+
+        #[async_trait::async_trait]
+        impl TransportTx for NoQueueTx {
+            async fn send(&mut self, _msg: &Message) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let tx = NoQueueTx;
+        let first = module_sent_bytes(&tx);
+        assert_eq!(first, 0);
+        assert_eq!(
+            module_sent_bytes(&tx),
+            first,
+            "must not drift between reads"
+        );
+    }
+
+    /// The idle pace has to be slower than the fast one, and the switch has to
+    /// take long enough that a live stream never trips it.
+    ///
+    /// Both are silent when wrong: the loop keeps working either way, and the
+    /// only symptom is either audio pumped in clumps or a core that never gets
+    /// to idle.
+    #[test]
+    fn the_idle_pace_is_slower_and_slow_to_engage() {
+        assert!(
+            IDLE_PUMP_INTERVAL > MODULE_PUMP_INTERVAL,
+            "the idle pace must actually be slower"
+        );
+        let settle = MODULE_PUMP_INTERVAL * IDLE_PUMP_AFTER;
+        assert!(
+            settle >= Duration::from_millis(100),
+            "a stream with gaps must not be able to trip the idle pace"
+        );
+        assert!(
+            IDLE_PUMP_INTERVAL <= HEARTBEAT_INTERVAL,
+            "the idle pace must still turn the loop faster than the heartbeat"
+        );
+    }
+
     /// Two machines with screens: the lower id starts with the cursor, and each
     /// side reaches the opposite answer without asking the other.
     ///
@@ -1084,7 +1314,10 @@ mod cursor_role_tests {
             pair.push_across();
             assert!(pair.there.active(), "trip {trip}: cursor did not cross");
             assert!(pair.here.driving(), "trip {trip}: sender stopped streaming");
-            assert!(!pair.there.driving(), "trip {trip}: holder is streaming too");
+            assert!(
+                !pair.there.driving(),
+                "trip {trip}: holder is streaming too"
+            );
             pair.push_back();
             assert!(pair.here.active(), "trip {trip}: cursor did not come home");
             assert!(
@@ -1170,7 +1403,10 @@ mod cursor_role_tests {
         for _ in 0..5 {
             mac.hand_over();
         }
-        assert_eq!(mac, handed_back, "the edge must be inert without the cursor");
+        assert_eq!(
+            mac, handed_back,
+            "the edge must be inert without the cursor"
+        );
         assert!(
             windows.active(),
             "the cursor is still where the user left it"
