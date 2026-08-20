@@ -109,6 +109,72 @@ impl InodeTable {
         ino
     }
 
+    /// The inode for a path, allocating one if needed, **without** counting a
+    /// kernel reference.
+    ///
+    /// For replies that name an inode but hand out no reference: `readdir`, and
+    /// `readdirplus` while it assembles a listing it may not send in full.
+    ///
+    /// An entry left at zero references is one the kernel was never handed, so
+    /// it will never send a `forget` for it — the caller must therefore pair
+    /// this with either [`Self::reference`], once the kernel does receive the
+    /// entry, or [`Self::release_unreferenced`] once it is clear it will not.
+    /// Leaving it is a slow leak: a re-listed directory tree would add an entry
+    /// per file per pass, and nothing would ever take them out.
+    pub fn resolve(&mut self, volume: &str, path: &str) -> u64 {
+        let key = (volume.to_string(), path.to_string());
+        if let Some(&ino) = self.by_path.get(&key) {
+            return ino;
+        }
+        let ino = self.next;
+        self.next += 1;
+        self.entries.insert(
+            ino,
+            Tracked {
+                entry: Entry::Path {
+                    volume: key.0.clone(),
+                    path: key.1.clone(),
+                },
+                lookups: 0,
+            },
+        );
+        self.by_path.insert(key, ino);
+        ino
+    }
+
+    /// Drop an entry that was resolved but never handed to the kernel.
+    ///
+    /// A no-op if the inode is referenced — `readdir` names entries the kernel
+    /// may already hold from an earlier `lookup`, and those must survive.
+    pub fn release_unreferenced(&mut self, ino: u64) {
+        if ino == ROOT_INO {
+            return;
+        }
+        let Some(tracked) = self.entries.get(&ino) else {
+            return;
+        };
+        if tracked.lookups > 0 {
+            return;
+        }
+        if let Entry::Path { volume, path } = &tracked.entry {
+            self.by_path.remove(&(volume.clone(), path.clone()));
+        }
+        self.entries.remove(&ino);
+    }
+
+    /// Count one kernel reference against an inode already resolved.
+    ///
+    /// Paired with [`Self::resolve`] for `readdirplus`: the number is settled
+    /// while the listing is built, and the reference is taken only for the
+    /// entries that actually reach the kernel. Referencing at resolve time
+    /// would leak every entry that did not fit in the reply buffer, since the
+    /// kernel never learns of those and so never forgets them.
+    pub fn reference(&mut self, ino: u64) {
+        if let Some(t) = self.entries.get_mut(&ino) {
+            t.lookups += 1;
+        }
+    }
+
     /// Return `n` kernel references, dropping the entry once none remain.
     pub fn forget(&mut self, ino: u64, n: u64) {
         // The root is permanent: forgetting it would leave the mount unable to
@@ -221,6 +287,31 @@ mod tests {
         assert!(t.get(again).is_some());
     }
 
+    /// `readdirplus` counts a reference only for entries it actually sent, so
+    /// referencing an already-resolved inode must be its own step — a listing
+    /// whose tail did not fit must not leave those inodes referenced forever.
+    #[test]
+    fn a_reference_can_be_counted_without_resolving_a_path() {
+        let mut t = InodeTable::new();
+        let ino = t.resolve("C:", "a.txt"); // named in a listing, not yet sent
+        assert_eq!(t.resolve("C:", "a.txt"), ino, "resolving twice is stable");
+
+        t.reference(ino);
+        assert!(t.get(ino).is_some(), "the entry the kernel received is held");
+        t.forget(ino, 1);
+        assert!(t.get(ino).is_none());
+
+        // Referencing an inode we no longer track is a no-op, not a panic:
+        // the kernel may have forgotten it between resolve and send.
+        t.reference(4242);
+
+        // Releasing must spare an entry the kernel does hold — a listing names
+        // inodes that an earlier `lookup` already referenced.
+        let held = t.lookup("C:", "held.txt");
+        t.release_unreferenced(held);
+        assert!(t.get(held).is_some(), "a referenced entry survives release");
+    }
+
     /// Forgetting more references than were handed out must not underflow.
     #[test]
     fn over_forgetting_is_survivable() {
@@ -231,6 +322,39 @@ mod tests {
         // And forgetting an inode we no longer know is a no-op, not a panic.
         t.forget(ino, 1);
         t.forget(4242, 1);
+    }
+
+    /// The exact `readdirplus` sequence: a listing is resolved whole, but only
+    /// the prefix that fits the reply buffer is sent, and the kernel resumes
+    /// from there. Every entry must end up with exactly one reference per time
+    /// the kernel was actually handed it — no more, or the inode is never
+    /// freed; no fewer, and the number is reused while the kernel still holds
+    /// it, which is the silent-corruption case the module docs open with.
+    #[test]
+    fn an_unsent_readdirplus_entry_holds_no_reference() {
+        let mut t = InodeTable::new();
+        let names = ["a.txt", "b.txt", "c.txt"];
+
+        // Pass one: resolve all three, send only the first two.
+        let inos: Vec<u64> = names.iter().map(|n| t.resolve("C:", n)).collect();
+        for ino in &inos[..2] {
+            t.reference(*ino);
+        }
+        // The third was resolved but never sent, so it holds no reference and
+        // the kernel will never forget it — the listing drops it itself.
+        t.release_unreferenced(inos[2]);
+        assert!(t.get(inos[2]).is_none(), "the entry that did not fit is free");
+
+        // Pass two: the kernel asks again from the third, which is sent now.
+        let resumed = t.resolve("C:", names[2]);
+        t.reference(resumed);
+
+        // Each of the three is held exactly once: one forget frees it.
+        for (i, n) in names.iter().enumerate() {
+            let ino = if i == 2 { resumed } else { inos[i] };
+            t.forget(ino, 1);
+            assert!(t.get(ino).is_none(), "{n} was referenced more than once");
+        }
     }
 
     /// The root must outlive any amount of forgetting: losing it would leave

@@ -4,6 +4,23 @@
 //! — so all mutable state lives behind a mutex and every reply is sent from the
 //! thread that received the call. Nothing here touches the tokio runtime; see
 //! [`super::bridge`] for why.
+//!
+//! ## What is deliberately left to fuser's default
+//!
+//! Most unimplemented callbacks answer `ENOSYS` *and log a warning each time*,
+//! so the ones worth answering are answered — even where the answer is a
+//! refusal, since a refusal the kernel can cache beats a question it asks
+//! forever. Four are left alone on purpose:
+//!
+//! - `getlk`/`setlk`: `ENOSYS` is what makes the kernel handle locking itself,
+//!   locally. Answering here would advertise locks that coordinate across the
+//!   mesh, which nothing in the protocol delivers — two machines would each be
+//!   told they hold the same exclusive lock.
+//! - `bmap`: only meaningful for a block-backed filesystem, which this is not.
+//! - `ioctl`/`poll`: no device semantics to expose, and no readiness to report.
+//!
+//! These are asked for rarely enough that the warning is not the nuisance the
+//! per-`exec` and per-`close` ones were.
 
 use std::ffi::OsStr;
 use std::sync::Mutex;
@@ -11,8 +28,8 @@ use std::time::Duration;
 
 use cursio_protocol::{FileError, FileKind, OpenMode};
 use fuser::{
-    Errno, FileType, Filesystem, INodeNo, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, Request,
+    Errno, FileAttr, FileType, Filesystem, INodeNo, MountOption, ReplyAttr, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
 };
 
 use super::attr::{attr_from, dir_attr, root_attr, to_errno, CACHE_TTL};
@@ -46,6 +63,17 @@ struct State {
     /// Our inode-scoped file handles mapped to the peer's.
     handles: std::collections::HashMap<u64, cursio_protocol::FileHandle>,
     next_handle: u64,
+}
+
+/// One `readdirplus` entry, held while the listing is assembled.
+///
+/// `counts` marks the entries that take a kernel reference when sent — every
+/// real child, but not the `.` and `..` positions.
+struct Plus {
+    ino: u64,
+    attr: FileAttr,
+    name: String,
+    counts: bool,
 }
 
 /// How long the volume list is trusted before being refetched.
@@ -262,6 +290,39 @@ impl Filesystem for RemoteFs {
         }
     }
 
+    /// No extended attributes exist here, and that is an answer, not a gap.
+    ///
+    /// The peer's protocol carries none, so there is nothing to forward. Left
+    /// unimplemented this answers `ENOSYS`, which the kernel reads as "this
+    /// filesystem cannot do xattrs at all" — but it asks anyway, once per
+    /// executable it is about to run, for `security.capability`. `ENODATA`
+    /// ("this file has no such attribute") is both the truth and the answer the
+    /// kernel caches, so the warning stops repeating on every exec.
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        reply.error(Errno::NO_XATTR);
+    }
+
+    /// The empty attribute list, which `getxattr` above implies.
+    ///
+    /// A zero `size` asks how large the name list would be rather than for the
+    /// list itself; both answers are empty here. Reporting `ENOSYS` instead
+    /// makes `cp -a` and `rsync -X` treat the mount as broken rather than as
+    /// one that simply carries no attributes.
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: fuser::ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
     /// Nothing to flush.
     ///
     /// Writes are not buffered here: each one is a `Write` request answered by
@@ -311,8 +372,7 @@ impl Filesystem for RemoteFs {
                     // only lookup and readdirplus do — so the inode is resolved
                     // without counting one. Counting here would leak entries
                     // that are never forgotten.
-                    let child = state.inodes.lookup(&vol.id, "");
-                    state.inodes.forget(child, 1);
+                    let child = state.inodes.resolve(&vol.id, "");
                     listing.push((child, FileType::Directory, volume_dir_name(&vol.id)));
                 }
             }
@@ -324,8 +384,7 @@ impl Filesystem for RemoteFs {
                 let mut state = self.state.lock().expect("inode state");
                 for meta in entries {
                     let child_path = join(path, &meta.name);
-                    let child = state.inodes.lookup(volume, &child_path);
-                    state.inodes.forget(child, 1);
+                    let child = state.inodes.resolve(volume, &child_path);
                     let kind = match meta.kind {
                         FileKind::Dir => FileType::Directory,
                         FileKind::Symlink => FileType::Symlink,
@@ -340,11 +399,154 @@ impl Filesystem for RemoteFs {
         // entry it accepted, and it means "resume after this" — so each entry
         // carries the index of the NEXT one. Getting this off by one either
         // loops forever or silently drops a file.
-        for (i, (child_ino, kind, name)) in listing.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(INodeNo(child_ino), i as u64 + 1, kind, name) {
+        for (i, (child_ino, kind, name)) in listing.iter().enumerate().skip(offset as usize) {
+            if reply.add(INodeNo(*child_ino), i as u64 + 1, *kind, name) {
                 // Buffer full: stop here and let the kernel ask again from the
                 // offset of the last entry that fit.
                 break;
+            }
+        }
+
+        // A readdir hands out no references at all, so every inode resolved
+        // above is one the kernel will never forget. Those it already holds
+        // from an earlier lookup are spared; the rest would accumulate on every
+        // re-listing of the same directory.
+        {
+            let mut state = self.state.lock().expect("inode state");
+            for (child_ino, _, _) in &listing {
+                state.inodes.release_unreferenced(*child_ino);
+            }
+        }
+        reply.ok();
+    }
+
+    /// `readdir` that carries each entry's attributes with it.
+    ///
+    /// The kernel issues this instead of `readdir` when it intends to stat the
+    /// listing anyway — which `ls -l`, every file manager and every `find` do.
+    /// Answering `ENOSYS` does not break that, it just makes the kernel fall
+    /// back to `readdir` followed by one `lookup` per entry, and each of those
+    /// lookups is a `Stat` round trip to the peer. A directory of two hundred
+    /// files costs two hundred sequential round trips over the link.
+    ///
+    /// The peer's `ReadDir` already answers with a full `FileMeta` per entry, so
+    /// those attributes are in hand before the kernel asks: one round trip
+    /// serves the whole listing.
+    ///
+    /// Unlike `readdir`, an entry here **does** hand the kernel a reference, so
+    /// each one sent is counted — see [`InodeTable::lookup`]. The reference is
+    /// taken at the moment the entry goes into the buffer, never before: an
+    /// entry that does not fit is one the kernel never received, and counting
+    /// it would leak an inode that nothing will ever forget. `.` and `..` are
+    /// offset positions rather than entries the kernel references, so they are
+    /// emitted without being counted.
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
+        mut reply: fuser::ReplyDirectoryPlus,
+    ) {
+        let Some(entry) = self.entry_of(ino.0) else {
+            return reply.error(Errno::ENOENT);
+        };
+
+        // Gather the listing first, without touching reference counts: the
+        // peer's answer may fail, and a failed reply must leave the table
+        // exactly as it was.
+        let mut listing: Vec<Plus> = Vec::new();
+
+        // A directory of our own — the mount root or a volume's own directory —
+        // has no counterpart on the peer, so its attributes are synthesised the
+        // way `getattr` synthesises them.
+        let self_attr = match &entry {
+            Entry::Root => root_attr(self.uid, self.gid),
+            Entry::Path { .. } => dir_attr(ino.0, self.uid, self.gid),
+        };
+        listing.push(Plus {
+            ino: ino.0,
+            attr: self_attr,
+            name: ".".to_string(),
+            counts: false,
+        });
+        listing.push(Plus {
+            ino: ROOT_INO,
+            attr: root_attr(self.uid, self.gid),
+            name: "..".to_string(),
+            counts: false,
+        });
+
+        match &entry {
+            Entry::Root => {
+                let volumes = match self.volumes() {
+                    Ok(v) => v,
+                    Err(e) => return reply.error(to_errno(&e)),
+                };
+                let mut state = self.state.lock().expect("inode state");
+                for vol in &volumes {
+                    // Resolving the number is not the same as referencing it:
+                    // the count is taken below, only for entries actually sent.
+                    let child = state.inodes.resolve(&vol.id, "");
+                    listing.push(Plus {
+                        ino: child,
+                        attr: dir_attr(child, self.uid, self.gid),
+                        name: volume_dir_name(&vol.id),
+                        counts: true,
+                    });
+                }
+            }
+            Entry::Path { volume, path } => {
+                let entries = match self.peer.read_dir(volume, path) {
+                    Ok(e) => e,
+                    Err(e) => return reply.error(to_errno(&e)),
+                };
+                let mut state = self.state.lock().expect("inode state");
+                for meta in entries {
+                    let child_path = join(path, &meta.name);
+                    let child = state.inodes.resolve(volume, &child_path);
+                    listing.push(Plus {
+                        ino: child,
+                        attr: attr_from(child, &meta, self.uid, self.gid),
+                        name: meta.name,
+                        counts: true,
+                    });
+                }
+            }
+        }
+
+        // Offsets mean the same thing as in `readdir`: each entry carries the
+        // index of the next one, and the kernel resumes after the last it took.
+        let mut sent = offset as usize;
+        for (i, item) in listing.iter().enumerate().skip(offset as usize) {
+            if reply.add(
+                INodeNo(item.ino),
+                i as u64 + 1,
+                &item.name,
+                &CACHE_TTL,
+                &item.attr,
+                GENERATION,
+            ) {
+                // Buffer full. This entry was not accepted, so it gets no
+                // reference; the kernel asks again from here.
+                break;
+            }
+            sent = i + 1;
+        }
+
+        {
+            let mut state = self.state.lock().expect("inode state");
+            for (i, item) in listing.iter().enumerate() {
+                if !item.counts {
+                    continue;
+                }
+                if (offset as usize..sent).contains(&i) {
+                    state.inodes.reference(item.ino);
+                } else {
+                    // Resolved while building the listing but never sent —
+                    // either already behind the resume offset, or past what fit.
+                    state.inodes.release_unreferenced(item.ino);
+                }
             }
         }
         reply.ok();
@@ -394,6 +596,197 @@ impl Filesystem for RemoteFs {
             255,
             bsize,
         );
+    }
+
+    /// Nothing is buffered, so there is nothing to force to disk.
+    ///
+    /// Every `Write` is a request the peer answers before the caller returns,
+    /// so by the time an `fsync` arrives the bytes are as durable as this
+    /// filesystem can make them. Answering `ENOSYS` would be read by callers as
+    /// "the write may not have landed" — SQLite and any editor that fsyncs
+    /// before replacing a file treat that as data loss and refuse to proceed,
+    /// which is a good deal worse than the warning it also logs.
+    ///
+    /// What this cannot promise is the peer's own disk cache: `fsync` there is
+    /// not part of the protocol. The honest reading is "delivered and
+    /// acknowledged", which is the same guarantee a network filesystem gives.
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    /// Directories are never buffered either; see [`RemoteFs::fsync`].
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    /// Permission is the peer's to grant, so this only answers for the mount.
+    ///
+    /// The real decision happens when the peer serves an `Open` — it knows its
+    /// own ACLs, and a read-only volume refuses writes there. Repeating a guess
+    /// here would only be able to disagree with it. What the kernel needs from
+    /// this call is that the mount does not deny traversal outright: the
+    /// attributes returned by `getattr` already carry the modes, and the kernel
+    /// checks them itself when mounted with `default_permissions`.
+    ///
+    /// Left unimplemented this answers `ENOSYS`, which the kernel tolerates but
+    /// which logs a warning for every `access(2)` — one per path component that
+    /// anything on this machine examines.
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    /// Extended attributes are not stored, and that is a decision.
+    ///
+    /// The protocol carries no attribute set, so there is nowhere to put one:
+    /// accepting it would silently drop what the caller believes it saved.
+    /// `EOPNOTSUPP` is what a filesystem without xattr support answers, and
+    /// what `cp -a` and `rsync -X` are written to expect — unlike `ENOSYS`,
+    /// which they report as an error against the whole copy.
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::EOPNOTSUPP);
+    }
+
+    /// Nothing is stored, so there is never anything to remove.
+    ///
+    /// `ENODATA` rather than `EOPNOTSUPP`: the caller asked to remove one named
+    /// attribute, and the truthful answer is that this file does not have it.
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(Errno::NO_XATTR);
+    }
+
+    /// Device nodes, FIFOs and sockets do not cross the link.
+    ///
+    /// The protocol has no vocabulary for them, and a mount that could create
+    /// them would be a way to place a device node on another machine's disk —
+    /// which is why `nodev` and `nosuid` are set on the mount in the first
+    /// place. `EPERM` says the operation is refused rather than unrecognised.
+    fn mknod(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::EPERM);
+    }
+
+    /// Links are read but never created.
+    ///
+    /// `ReadLink` is the whole of the protocol's link support: a target can be
+    /// reported, but nothing asks the peer to make one. Creating a symlink here
+    /// would also mean writing a path that this machine interprets and the peer
+    /// stores — the two do not agree on what a path looks like when one of them
+    /// is Windows.
+    fn symlink(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _link_name: &OsStr,
+        _target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::EPERM);
+    }
+
+    /// Hard links have no representation on the wire.
+    ///
+    /// The inode table maps one number to one path; a second name for the same
+    /// file is a relationship it cannot express, and the peer is never told
+    /// about it either.
+    fn link(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::EPERM);
+    }
+
+    /// Preallocation is not something the peer can be asked for.
+    ///
+    /// `EOPNOTSUPP` is the documented answer, and callers that care fall back
+    /// to writing zeroes. `ENOSYS` would be read by `posix_fallocate` as a
+    /// reason to fail rather than to fall back.
+    fn fallocate(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _offset: u64,
+        _length: u64,
+        _mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::EOPNOTSUPP);
+    }
+
+    /// Server-side copy is not in the protocol.
+    ///
+    /// Refusing sends the caller down the ordinary read-then-write path, which
+    /// costs the bytes twice over the link but is the only route that exists.
+    /// Implementing this properly means a `CopyRange` the peer can serve
+    /// without the data ever leaving its disk — worth having, but it is a
+    /// protocol change, not a mount one.
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        _ino_in: INodeNo,
+        _fh_in: fuser::FileHandle,
+        _offset_in: u64,
+        _ino_out: INodeNo,
+        _fh_out: fuser::FileHandle,
+        _offset_out: u64,
+        _len: u64,
+        _flags: fuser::CopyFileRangeFlags,
+        reply: fuser::ReplyWrite,
+    ) {
+        reply.error(Errno::EOPNOTSUPP);
+    }
+
+    /// Holes are not reported, so seeking to one has no answer to give.
+    ///
+    /// `SEEK_HOLE`/`SEEK_DATA` ask where a sparse file's gaps are; the peer
+    /// sends sizes and bytes, never an extent map. `EOPNOTSUPP` makes the
+    /// caller treat the file as fully allocated, which is the safe reading —
+    /// guessing would have it skip data that is really there.
+    fn lseek(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _offset: i64,
+        _whence: i32,
+        reply: fuser::ReplyLseek,
+    ) {
+        reply.error(Errno::EOPNOTSUPP);
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
