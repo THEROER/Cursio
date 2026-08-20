@@ -57,6 +57,14 @@ meaning in a fixed 48-byte header:
 | 0x18 | `transfer_buffer_length` | |
 | 0x28 | `setup` (8 bytes) | the control request itself, when `ep` is 0 |
 
+The constants needed to read those fields are uapi, not folklore:
+`/usr/include/linux/usbip.h` defines the direction bit (`USBIP_URB_DIR_IN`
+`0x0200`, `USBIP_URB_DIR_OUT` `0`, `USBIP_URB_DIR_MASK`) inside
+`transfer_flags`, and `/usr/include/linux/usb/ch9.h` names the standard
+requests the arbiter has to tell apart — `USB_REQ_GET_DESCRIPTOR` `0x06`,
+`USB_REQ_SET_CONFIGURATION` `0x09`, `USB_REQ_SET_INTERFACE` `0x0B`. Both ship
+with the kernel headers, so nothing here is reconstructed from observation.
+
 So the shape this design takes is the third one — neither a pipe nor a
 service-specific proxy:
 
@@ -191,6 +199,10 @@ Two facts shape the backend:
 - The kernel's control surface is **sysfs**, not the `usbip` CLI, whose output
   is formatted for people and has changed between releases. `usbip` reads sysfs
   itself; so does this.
+- The kernel already tracks whether an exported device is in use and publishes
+  it (`SDEV_ST_AVAILABLE`, `SDEV_ST_USED`, `SDEV_ST_ERROR` in
+  `linux/usbip.h`). Lease state is read from there rather than mirrored in a
+  second place that can disagree with it.
 
 ### Windows
 
