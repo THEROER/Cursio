@@ -17,9 +17,12 @@
 
 #[cfg(target_os = "linux")]
 mod linux;
+mod offer;
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxUsb;
+
+pub use offer::DeviceOffers;
 
 use thiserror::Error;
 
