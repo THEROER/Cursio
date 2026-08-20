@@ -15,6 +15,7 @@
 //!
 //! See `docs/usb-design.md`.
 
+pub mod arbiter;
 #[cfg(target_os = "linux")]
 mod linux;
 mod offer;
