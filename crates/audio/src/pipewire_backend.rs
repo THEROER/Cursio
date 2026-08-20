@@ -1266,11 +1266,21 @@ fn run_capture_loop(
     if let CaptureMode::AppTap { .. } = &mode {
         // Do the first link promptly, retrying while the graph settles (our input
         // ports appear a beat after connect without AUTOCONNECT).
+        //
+        // The first attempt comes almost immediately, because everything the app
+        // plays before the link exists is lost: there is nowhere to put it. This
+        // used to pump a flat 100 ms before even looking, which came off the
+        // front of every stream — inaudible on a video, but Steam's Big Picture
+        // navigation sounds are themselves only a few hundred milliseconds, so
+        // their attack was cut off. The retry budget is unchanged.
         for attempt in 0..40 {
-            for _ in 0..4 {
-                loop_ref.iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(25)));
-            }
-            relink_app(&core, &loop_ref, app_id, &stream, &mut app_links, 20);
+            // `relink_app` pumps the loop itself, so the settle it is given is
+            // the real wait. Keep the first pass short: when the app's ports are
+            // already up — the common case for an app that was mid-playback when
+            // it was routed — this links on the first try and loses nothing off
+            // the front. Later passes settle longer, for a graph still forming.
+            let settle = if attempt == 0 { 1 } else { 20 };
+            relink_app(&core, &loop_ref, app_id, &stream, &mut app_links, settle);
             if !app_links.is_empty() {
                 tracing::info!(
                     app_id,

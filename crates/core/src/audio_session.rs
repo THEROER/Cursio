@@ -29,6 +29,27 @@ async fn send_control(tx: &mut dyn TransportTx, msg: AudioMsg) -> Result<(), Tra
     tx.send(&framed).await
 }
 
+/// A tap whose open is in flight, remembered so the node's departure can be
+/// handled even while its tap is still being built.
+struct PendingTap {
+    stream_id: u32,
+    app_name: String,
+    device: (String, String),
+    /// Whether this reuses a tunnel the peer already holds. A resumed stream
+    /// must not re-advertise: the peer would tear down and rebuild its playback
+    /// node, which is the churn this whole path exists to avoid.
+    resumed: bool,
+    /// Set when the node leaves before its tap is ready, so the finished tap is
+    /// dropped on arrival instead of being wired to a node that is gone.
+    abandoned: bool,
+}
+
+/// The result of opening a tap on a worker thread.
+struct OpenedTap {
+    app_node_id: u32,
+    result: Result<cursio_audio::Capture, String>,
+}
+
 /// Live audio state for one session: what we capture and stream out, and what
 /// we play from the peer.
 pub struct AudioEngine {
@@ -97,6 +118,22 @@ pub struct AudioEngine {
     /// Node id -> app name, so a `Left` event (which carries only the id) can
     /// find the route it belongs to.
     routed_app_names: HashMap<u32, String>,
+    /// When each routed node was first tapped, so a departure can be read as a
+    /// pause or as the app discarding a node it barely opened. See
+    /// [`NODE_SETTLED_AGE`].
+    routed_app_since: HashMap<u32, std::time::Instant>,
+    /// Taps being opened on a worker thread, and the channel they land on.
+    ///
+    /// Opening a tap connects to the PipeWire daemon and waits for the stream to
+    /// come up — tens of milliseconds, measured at up to 100. Done inline that
+    /// stalls the whole session loop, and since the cursor shares this channel
+    /// it is felt directly as the mouse jerking. Apps that churn their nodes
+    /// (browsers, Steam) open taps constantly, so this was the session's largest
+    /// source of stalls. The open happens on a worker; the finished tap is
+    /// collected by a later pump.
+    opening_taps: HashMap<u32, PendingTap>,
+    tap_ready_tx: tokio::sync::mpsc::UnboundedSender<OpenedTap>,
+    tap_ready_rx: tokio::sync::mpsc::UnboundedReceiver<OpenedTap>,
     /// Apps whose tunnel is open but whose node is currently absent, and since
     /// when. Cleared when the app comes back; see [`TUNNEL_IDLE_TIMEOUT`].
     tunnel_idle_since: HashMap<String, std::time::Instant>,
@@ -239,6 +276,7 @@ impl AudioEngine {
     /// ids we allocate.
     pub fn new(local_id: PeerId, render_device: Option<String>, peer_name: String) -> Self {
         let id_base = id_base_for(local_id);
+        let (tap_ready_tx, tap_ready_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             id_base,
             inbound_targets: HashMap::new(),
@@ -253,6 +291,10 @@ impl AudioEngine {
             routed_app_expiry: HashMap::new(),
             app_routes: HashMap::new(),
             routed_app_names: HashMap::new(),
+            routed_app_since: HashMap::new(),
+            opening_taps: HashMap::new(),
+            tap_ready_tx,
+            tap_ready_rx,
             tunnel_idle_since: HashMap::new(),
             playbacks: HashMap::new(),
             gains: HashMap::new(),
@@ -733,6 +775,37 @@ const ROUTED_APP_GRACE: std::time::Duration = std::time::Duration::from_millis(8
 /// of an app the user actually closed, rather than holding it for the session.
 const TUNNEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long a node must have lived before its departure counts as a pause
+/// rather than the app discarding a node it never really used.
+///
+/// An app holding several nodes at once made every departure look like a
+/// leftover, because *some* other node was always live — so the tunnel was
+/// closed immediately and [`AudioEngine::app_routes`] lost its entry. Measured
+/// over a day of real use, that path fired 72 times and the reuse it exists to
+/// enable ("app returned; re-pointed its tap") fired **zero** times: Chromium
+/// keeps a node per tab, so pausing a video always raced against a sibling.
+///
+/// Age separates the two cases the `still_live` test could not. A node the app
+/// opens and drops while starting up (Minecraft, browsers probing devices) is
+/// gone within a second or two; a node that actually played audio has lived far
+/// longer by the time the user pauses it. Below this, the tunnel is a leftover
+/// and closing it is right — that is what keeps a dead stream from answering
+/// the peer's demand in place of the live one. Above it, the app is pausing and
+/// the tunnel must survive.
+const NODE_SETTLED_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a departed node's tunnel is a startup leftover, to be closed at once,
+/// rather than an app pausing, whose tunnel must survive.
+///
+/// A leftover is silent but still advertised, and the peer picks by
+/// advertisement order — so leaving one up had it answer demand in place of the
+/// node actually producing sound. Being outlived by a sibling is not enough to
+/// call it one, though: an app with a node per tab always has a sibling, which
+/// made every pause look like a leftover. Age is the part that separates them.
+fn is_startup_leftover(still_live: bool, age: std::time::Duration) -> bool {
+    still_live && age < NODE_SETTLED_AGE
+}
+
 /// How often we return an [`AudioFrameAck`] per inbound stream.
 ///
 /// The design says acks are "sent sparsely (a few per second), not per chunk":
@@ -863,6 +936,12 @@ impl AudioEngine {
             if self.routed_apps.contains_key(&app_node_id) {
                 continue; // already streaming this app
             }
+            if let Some(pending) = self.opening_taps.get_mut(&app_node_id) {
+                // Its tap is still being built on a worker. The node coming back
+                // before it lands just cancels the abandonment.
+                pending.abandoned = false;
+                continue;
+            }
             // Reuse the stream this app already owns, if it has one. The tap is
             // bound to a node id so it must be rebuilt, but the tunnel it feeds —
             // stream id, encoder, the peer's advertisement — is keyed to the app
@@ -875,10 +954,17 @@ impl AudioEngine {
             // node pointed the tunnel at the newcomer and orphaned the tap that
             // was actually producing sound — heard as the browser going silent
             // until it happened to recreate its nodes in a luckier order.
+            // A tap still opening counts as live too: two nodes of one app can
+            // arrive in the same pump, and without this the second would reuse
+            // the id the first is already claiming.
             let already_live = self
                 .routed_app_names
                 .iter()
-                .any(|(node, name)| *name == app_name && *node != app_node_id);
+                .any(|(node, name)| *name == app_name && *node != app_node_id)
+                || self
+                    .opening_taps
+                    .iter()
+                    .any(|(node, p)| p.app_name == app_name && *node != app_node_id);
             let resumed = if already_live {
                 None
             } else {
@@ -892,62 +978,79 @@ impl AudioEngine {
                     id
                 }
             };
-            match cursio_audio::Capture::app_tap(id, app_node_id.to_string(), app_name.clone()) {
-                Ok(mut cap) => {
-                    // Advertise it as a per-app stream, but tag the peer DEVICE so
-                    // the peer renders it into that exact device rather than its
-                    // default output. Only for a NEW stream: re-advertising one
-                    // the peer already holds would make it tear down and rebuild
-                    // the playback end, which is the very churn this avoids.
-                    if resumed.is_some() {
-                        // Drain the advertisement the tap emits on open; the peer
-                        // already has this stream and needs no second copy.
-                        let _ = cap.advertisements().try_recv();
-                        tracing::info!(id, app = %app_name, device = %device.1, "app returned; re-pointed its tap, tunnel kept open");
-                    } else if let Ok(mut meta) = cap.advertisements().try_recv() {
-                        meta.device = Some(device.clone());
-                        tracing::info!(id, app = %app_name, device = %device.1, "app routed into Intent Sink; opening Remote Stream");
-                        send_control(tx, AudioMsg::StreamAdvertise(meta)).await?;
-                    }
-                    self.routed_apps.insert(app_node_id, (id, cap));
-                    self.routed_app_names.insert(app_node_id, app_name.clone());
-                    // The name -> stream mapping is what a returning node looks
-                    // itself up by, so it must keep pointing at the app's FIRST
-                    // stream. A second concurrent node gets its own id and must
-                    // not overwrite that, or the original tunnel becomes
-                    // unreachable and its audio stops being sent.
-                    self.app_routes
-                        .entry(app_name.clone())
-                        .or_insert_with(|| (id, device.clone()));
-                    // Back in the graph: it is not an idle tunnel any more, so
-                    // the reaper must not collect it.
-                    self.tunnel_idle_since.remove(&app_name);
-                    // Record the route for the replicated RoutingState snapshot, and
-                    // mark it dirty so `pump` re-broadcasts the whole map. This is
-                    // what lets routing survive a reconnect without waiting on
-                    // PipeWire to re-emit link events. Keyed by stream id, which
-                    // outlives the node the app happens to be using.
-                    self.routed_app_route.insert(
-                        id,
-                        cursio_protocol::RouteEntry {
-                            id,
-                            app_name: Some(app_name.clone()),
-                            device: Some(device.clone()),
-                        },
-                    );
-                    self.routing_dirty = true;
-                    // If this device's Route already has a non-default group
-                    // gain/mute, mark it dirty so the new member inherits it (the
-                    // fan-out in `pump_routes` re-applies to all members).
-                    if self.route_groups.contains_key(&device) {
-                        self.routes_dirty.insert(device.clone());
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(app = %app_name, error = %e, "cannot tap app routed into Intent Sink");
-                }
+            // Open the tap on a worker. This connects to the PipeWire daemon and
+            // waits for the stream to come up, which the session loop cannot
+            // afford to sit through — see [`AudioEngine::opening_taps`].
+            let ready = self.tap_ready_tx.clone();
+            let node_arg = app_node_id.to_string();
+            let app_arg = app_name.clone();
+            std::thread::Builder::new()
+                .name(format!("cursio-tap-open-{id}"))
+                .spawn(move || {
+                    let result = cursio_audio::Capture::app_tap(id, node_arg, app_arg)
+                        .map_err(|e| e.to_string());
+                    // The receiver only closes when the session is ending, in
+                    // which case the tap is moot.
+                    let _ = ready.send(OpenedTap {
+                        app_node_id,
+                        result,
+                    });
+                })
+                .map_err(|e| {
+                    TransportError::Io(std::io::Error::other(format!(
+                        "spawn tap opener: {e}"
+                    )))
+                })?;
+            self.opening_taps.insert(
+                app_node_id,
+                PendingTap {
+                    stream_id: id,
+                    app_name: app_name.clone(),
+                    device: device.clone(),
+                    resumed: resumed.is_some(),
+                    abandoned: false,
+                },
+            );
+            // Claim the app's state now rather than when the tap lands. The node
+            // is routed the moment it joins; leaving these until the open
+            // finished would let the same node be picked up again by the next
+            // pump, and a `Left` arriving meanwhile would find nothing to cancel.
+            self.routed_app_names.insert(app_node_id, app_name.clone());
+            self.routed_app_since
+                .insert(app_node_id, std::time::Instant::now());
+            // The name -> stream mapping is what a returning node looks itself up
+            // by, so it must keep pointing at the app's FIRST stream. A second
+            // concurrent node gets its own id and must not overwrite that, or the
+            // original tunnel becomes unreachable and its audio stops being sent.
+            self.app_routes
+                .entry(app_name.clone())
+                .or_insert_with(|| (id, device.clone()));
+            // Back in the graph: it is not an idle tunnel any more, so the reaper
+            // must not collect it.
+            self.tunnel_idle_since.remove(&app_name);
+            // Record the route for the replicated RoutingState snapshot, and mark
+            // it dirty so `pump` re-broadcasts the whole map. This is what lets
+            // routing survive a reconnect without waiting on PipeWire to re-emit
+            // link events. Keyed by stream id, which outlives the node the app
+            // happens to be using.
+            self.routed_app_route.insert(
+                id,
+                cursio_protocol::RouteEntry {
+                    id,
+                    app_name: Some(app_name.clone()),
+                    device: Some(device.clone()),
+                },
+            );
+            self.routing_dirty = true;
+            // If this device's Route already has a non-default group gain/mute,
+            // mark it dirty so the new member inherits it (the fan-out in
+            // `pump_routes` re-applies to all members).
+            if self.route_groups.contains_key(&device) {
+                self.routes_dirty.insert(device.clone());
             }
         }
+
+        self.collect_opened_taps(tx).await?;
 
         // Schedule teardown for apps that left (grace period below).
         for app_node_id in left {
@@ -980,38 +1083,45 @@ impl AudioEngine {
         let mut orphaned: Vec<(u32, Option<String>)> = Vec::new();
         for app_node_id in expired {
             self.routed_app_expiry.remove(&app_node_id);
+            // A node can leave while its tap is still being opened. The worker
+            // cannot be called back, so mark it: `collect_opened_taps` drops the
+            // tap when it lands. The tunnel is left alone — the app may well be
+            // pausing, exactly as below.
+            if let Some(pending) = self.opening_taps.get_mut(&app_node_id) {
+                pending.abandoned = true;
+            }
             if let Some((stream_id, cap)) = self.routed_apps.remove(&app_node_id) {
                 cap.stop(); // stops the capture thread; the tunnel stays up
                 let app = self.routed_app_names.remove(&app_node_id);
+                let age = self
+                    .routed_app_since
+                    .remove(&app_node_id)
+                    .map(|since| now.duration_since(since))
+                    .unwrap_or_default();
                 let still_live = app
                     .as_ref()
                     .is_some_and(|app| self.routed_app_names.values().any(|n| n == app));
+                let leftover = is_startup_leftover(still_live, age);
 
-                if still_live {
-                    // Another node of this app is still playing, so this tunnel
-                    // is a leftover from a node the app opened and dropped —
-                    // Minecraft and browsers both do this while starting up.
-                    //
-                    // Close it now rather than holding it: keeping a tunnel
-                    // across a pause only makes sense when it is the app's only
-                    // one. A second, silent tunnel competes for the peer's
-                    // attention, and the peer picks by advertisement order — so
-                    // it happily reported `listening=true` for this dead stream
-                    // while the live one carried the actual audio nowhere. That
-                    // is Minecraft going silent after a restart.
+                if leftover {
                     orphaned.push((stream_id, app.clone()));
                 } else if let Some(app) = &app {
-                    // The app's last node: start the clock that tells a pause
-                    // from a quit.
-                    self.tunnel_idle_since
-                        .insert(app.clone(), std::time::Instant::now());
+                    // The tunnel outlives this node. Start the clock that tells
+                    // a pause from a quit — but only while the app has no other
+                    // node, or a tab still playing would have the reaper
+                    // counting down against a tunnel that is in active use.
+                    if !still_live {
+                        self.tunnel_idle_since
+                            .insert(app.clone(), std::time::Instant::now());
+                    }
                 }
 
                 tracing::info!(
                     id = stream_id,
                     app_node_id,
                     app = app.as_deref().unwrap_or("?"),
-                    orphaned = still_live,
+                    age_ms = age.as_millis() as u64,
+                    orphaned = leftover,
                     "app's node went away; tap released"
                 );
             }
@@ -1034,6 +1144,73 @@ impl AudioEngine {
         }
 
         self.reap_idle_tunnels(tx).await?;
+        Ok(())
+    }
+
+    /// Take delivery of taps the workers finished opening.
+    ///
+    /// The advertisement is sent from here rather than at request time because
+    /// only a tap that actually came up should make the peer build a playback
+    /// node for it.
+    async fn collect_opened_taps(
+        &mut self,
+        tx: &mut dyn TransportTx,
+    ) -> Result<(), TransportError> {
+        while let Ok(opened) = self.tap_ready_rx.try_recv() {
+            let Some(pending) = self.opening_taps.remove(&opened.app_node_id) else {
+                continue;
+            };
+            let mut cap = match opened.result {
+                Ok(cap) => cap,
+                Err(e) => {
+                    tracing::warn!(
+                        app = %pending.app_name,
+                        error = %e,
+                        "cannot tap app routed into Intent Sink"
+                    );
+                    // Undo the state claimed when the open was requested, or the
+                    // node would look routed with nothing behind it.
+                    self.routed_app_names.remove(&opened.app_node_id);
+                    self.routed_app_since.remove(&opened.app_node_id);
+                    continue;
+                }
+            };
+            if pending.abandoned {
+                tracing::debug!(
+                    id = pending.stream_id,
+                    app = %pending.app_name,
+                    "app's node left before its tap was ready; dropping it"
+                );
+                continue;
+            }
+            // Advertise it as a per-app stream, but tag the peer DEVICE so the
+            // peer renders it into that exact device rather than its default
+            // output. Only for a NEW stream: re-advertising one the peer already
+            // holds would make it tear down and rebuild the playback end, which
+            // is the very churn this avoids.
+            if pending.resumed {
+                // Drain the advertisement the tap emits on open; the peer already
+                // has this stream and needs no second copy.
+                let _ = cap.advertisements().try_recv();
+                tracing::info!(
+                    id = pending.stream_id,
+                    app = %pending.app_name,
+                    device = %pending.device.1,
+                    "app returned; re-pointed its tap, tunnel kept open"
+                );
+            } else if let Ok(mut meta) = cap.advertisements().try_recv() {
+                meta.device = Some(pending.device.clone());
+                tracing::info!(
+                    id = pending.stream_id,
+                    app = %pending.app_name,
+                    device = %pending.device.1,
+                    "app routed into Intent Sink; opening Remote Stream"
+                );
+                send_control(tx, AudioMsg::StreamAdvertise(meta)).await?;
+            }
+            self.routed_apps
+                .insert(opened.app_node_id, (pending.stream_id, cap));
+        }
         Ok(())
     }
 
@@ -2396,6 +2573,39 @@ mod tests {
         // The last one leaves: now it may expire.
         e.routed_app_names.remove(&200);
         assert!(!e.routed_app_names.values().any(|n| n == "Firefox"));
+    }
+
+    /// A node that played for a while and then stopped is a pause, not an
+    /// orphan — even while another node of the same app is live.
+    ///
+    /// Chromium keeps a node per tab, so a paused video was always outlived by
+    /// a sibling. Judging by that alone, every pause was read as a startup
+    /// leftover: the tunnel closed, `app_routes` lost the app, and the sound did
+    /// not come back until something forced a brand new node (seeking did,
+    /// un-pausing did not). Over a day of real use the reuse path this exists to
+    /// enable never ran once.
+    #[test]
+    fn a_settled_node_pausing_is_not_treated_as_a_startup_leftover() {
+        let long_enough = NODE_SETTLED_AGE + std::time::Duration::from_secs(1);
+        assert!(
+            !is_startup_leftover(true, long_enough),
+            "a node that played for a while is pausing; its tunnel must survive"
+        );
+
+        // The case the age test must not give away: Minecraft opens two nodes at
+        // startup and drops one immediately. That one never settled, and leaving
+        // it advertised had the peer answer demand for a silent stream.
+        assert!(
+            is_startup_leftover(true, std::time::Duration::from_millis(900)),
+            "a node dropped seconds after opening is a leftover and must close"
+        );
+
+        // With no sibling the tunnel is the app's only one, so it is held for a
+        // return however briefly the node lived.
+        assert!(
+            !is_startup_leftover(false, std::time::Duration::from_millis(10)),
+            "an app's only tunnel is never an orphan"
+        );
     }
 
     /// A stream nobody plays is captured but not sent — and resumes the moment
