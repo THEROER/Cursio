@@ -578,7 +578,10 @@ fn detect_volumes() -> Vec<SharedVolume> {
 /// unlike Linux there is no mount table to walk or parent device to resolve.
 #[cfg(target_os = "windows")]
 fn is_removable_drive(letter: char) -> bool {
-    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, DRIVE_REMOVABLE};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    // `DRIVE_REMOVABLE` lives under `WindowsProgramming`, not beside the
+    // function that returns it.
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOVABLE;
 
     let path: Vec<u16> = format!("{letter}:\\")
         .encode_utf16()

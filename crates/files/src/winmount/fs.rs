@@ -422,16 +422,31 @@ impl FileSystemContext for RemoteFs {
     /// Explorer, cmd and .NET — none of which make that call — worked fine.
     /// The same refusal is what `fsutil` reported as "Incorrect function".
     ///
-    /// The peer does not send free-space figures, so rather than invent a
-    /// number the volume is reported as full: a fixed capacity with nothing
-    /// free. Windows only uses these to draw a bar and to decide whether a copy
-    /// can fit, and writes are proxied to the peer, which enforces its own
-    /// limits. Claiming free space we cannot vouch for would fail later and
-    /// less clearly.
+    /// The figures are the peer's own, summed across its volumes: the mount is
+    /// one drive letter as far as Windows is concerned, so it reports one
+    /// capacity. Reporting the drive as full instead — which this did while the
+    /// wire carried no capacity — draws a red bar over an empty disk and makes
+    /// Explorer refuse a copy before attempting it, on a volume with hundreds
+    /// of gigabytes free.
+    ///
+    /// The fallback is deliberately not zero. A volume answering zero total
+    /// makes "percent used" a division by zero in callers that compute it, and
+    /// zero free makes file managers refuse to write; see `FALLBACK_TOTAL` in
+    /// [`crate::server`], which the FUSE half answers with for the same reason.
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
-        const TOTAL_BYTES: u64 = 1 << 40;
-        out_volume_info.total_size = TOTAL_BYTES;
-        out_volume_info.free_size = 0;
+        let (total, free) = match self.volumes() {
+            Ok(volumes) if !volumes.is_empty() => volumes.iter().fold((0u64, 0u64), |(t, f), v| {
+                (
+                    t.saturating_add(v.total_bytes),
+                    f.saturating_add(v.free_bytes),
+                )
+            }),
+            // The peer has not answered yet, or cannot be reached. A plausible
+            // figure keeps Explorer usable while the link wakes up.
+            _ => (crate::server::FALLBACK_TOTAL, crate::server::FALLBACK_FREE),
+        };
+        out_volume_info.total_size = total;
+        out_volume_info.free_size = free;
         out_volume_info.set_volume_label(&self.label);
         Ok(())
     }
