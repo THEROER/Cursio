@@ -515,6 +515,12 @@ pub(crate) fn run(
                         fit_client(hwnd, width, height);
                         painted = true;
                     }
+                    Ok(SurrogateCommand::Grow { width, height }) => {
+                        let state = &*state_ptr;
+                        state.fb.borrow_mut().grow_to(width, height);
+                        fit_client(hwnd, width, height);
+                        painted = true;
+                    }
                     Ok(SurrogateCommand::Close(reason)) => {
                         tracing::info!(?reason, id = meta.id, "surrogate closing");
                         break 'outer;

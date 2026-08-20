@@ -50,6 +50,8 @@ pub use hide::HiddenWindow;
 enum CaptureCommand {
     /// Replay one viewer input event onto the real window.
     Input(WindowInput),
+    /// Resize the real window because the viewer resized its surrogate.
+    Resize { width: u32, height: u32 },
     /// Stop capturing and end the thread.
     Stop,
 }
@@ -57,6 +59,10 @@ enum CaptureCommand {
 /// A live capture of one window via Windows.Graphics.Capture.
 pub struct WgcCaptureSession {
     meta: WindowMeta,
+    /// Shared with the capture thread: quality is written here as acks arrive
+    /// and read there per frame; `last_seq` the other way round.
+    quality: Arc<crate::frame_pipeline::AdaptiveQuality>,
+    last_seq: Arc<std::sync::atomic::AtomicU32>,
     frames: mpsc::Receiver<WindowFrame>,
     commands: mpsc::UnboundedSender<CaptureCommand>,
     /// Set when the capture thread stops on its own (window closed), so
@@ -81,8 +87,27 @@ impl CaptureSession for WgcCaptureSession {
             .map_err(|_| WindowError::Backend("capture thread is gone".into()))
     }
 
-    fn on_ack(&mut self, _ack: WindowFrameAck) {
-        // Fixed rate for now; the adaptive controller is milestone 3.
+    fn request_resize(&mut self, width: u32, height: u32) -> Result<(), WindowError> {
+        // Same reasoning as `apply_input`: the HWND belongs to the capture
+        // thread, and resizing from here would race the frame it is producing.
+        self.commands
+            .send(CaptureCommand::Resize { width, height })
+            .map_err(|_| WindowError::Backend("capture thread is gone".into()))
+    }
+
+    fn on_ack(&mut self, ack: WindowFrameAck) {
+        // How far ahead of the viewer we are, in frames. `seq` is monotonic per
+        // window, so the difference is the backlog the link has not carried.
+        let sent = self.last_seq.load(Ordering::Relaxed);
+        let gap = sent.saturating_sub(ack.acked_seq);
+        if let Some(threshold) = self.quality.observe(gap) {
+            tracing::info!(
+                id = self.meta.id,
+                gap,
+                threshold,
+                "link changed; adjusting how much of the window stays lossless"
+            );
+        }
     }
 
     fn close(&mut self, reason: WindowCloseReason) {
@@ -134,10 +159,13 @@ impl WindowCapture for WgcWindowCapture {
     }
 }
 
-/// Start the capture thread and block until the first frame defines geometry.
+/// Start the capture thread and block until it reports the window's geometry.
 ///
 /// Blocking mirrors the Linux backend: a window that can't be captured must
-/// fail from `begin()`, not silently produce nothing.
+/// fail from `begin()`, not silently produce nothing. The wait is short by
+/// construction — the thread answers from `GetClientRect` before it builds the
+/// D3D pipeline, never from the first frame, which may be a long way off for a
+/// window that is not redrawing (see `capture_thread`).
 fn spawn_capture(
     id: WindowId,
     hwnd: HWND,
@@ -148,8 +176,12 @@ fn spawn_capture(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WindowMeta, String>>();
     let ended = Arc::new(AtomicBool::new(false));
+    let quality = Arc::new(crate::frame_pipeline::AdaptiveQuality::default());
+    let last_seq = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let thread_ended = ended.clone();
+    let thread_quality = quality.clone();
+    let thread_last_seq = last_seq.clone();
     // `HWND` is a raw pointer and so not `Send`; it is only ever used on the
     // capture thread, so move it as a plain integer.
     let hwnd_bits = hwnd.0 as isize;
@@ -157,7 +189,17 @@ fn spawn_capture(
         .name("cursio-wgc-capture".into())
         .spawn(move || {
             let hwnd = HWND(hwnd_bits as *mut core::ffi::c_void);
-            let result = capture_thread(id, hwnd, title, hide_source, frames_tx, cmd_rx, &ready_tx);
+            let result = capture_thread(
+                id,
+                hwnd,
+                title,
+                hide_source,
+                frames_tx,
+                cmd_rx,
+                &ready_tx,
+                thread_quality,
+                thread_last_seq,
+            );
             if let Err(e) = result {
                 tracing::error!(error = %e, "window capture ended with an error");
                 let _ = ready_tx.send(Err(e));
@@ -172,6 +214,8 @@ fn spawn_capture(
             frames: frames_rx,
             commands: cmd_tx,
             ended,
+            quality,
+            last_seq,
         }),
         Ok(Err(e)) => Err(WindowError::Backend(e)),
         Err(_) => Err(WindowError::Backend(
@@ -278,6 +322,8 @@ fn emit_frame(
     // per frame.
     video_failed_for: &mut Option<(u32, u32)>,
     frames_tx: &mpsc::Sender<WindowFrame>,
+    quality: &crate::frame_pipeline::AdaptiveQuality,
+    last_seq: &std::sync::atomic::AtomicU32,
 ) {
     let Some(dirty) = differ.diff(frame, width, height) else {
         return; // unchanged — a static window costs nothing
@@ -286,7 +332,7 @@ fn emit_frame(
     // Which path? A small change rides a lossless tile; a large one goes
     // through the video encoder, which codes the difference from the previous
     // frame rather than the pixels themselves.
-    if should_use_video(dirty, width, height) {
+    if should_use_video(dirty, width, height, quality.threshold()) {
         // Geometry changes invalidate the encoder: H.264 is fixed-size.
         if video.as_ref().is_some_and(|e| e.size() != (width, height)) {
             tracing::info!(width, height, "window resized; reopening video encoder");
@@ -358,6 +404,8 @@ fn emit_frame(
                         .into_iter()
                         .map(|data| {
                             *seq = seq.wrapping_add(1);
+            last_seq.store(*seq, Ordering::Relaxed);
+                            last_seq.store(*seq, Ordering::Relaxed);
                             WindowFrame {
                                 id,
                                 seq: *seq,
@@ -417,6 +465,8 @@ fn capture_thread(
     frames_tx: mpsc::Sender<WindowFrame>,
     mut cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: &std::sync::mpsc::Sender<Result<WindowMeta, String>>,
+    quality: Arc<crate::frame_pipeline::AdaptiveQuality>,
+    last_seq: Arc<std::sync::atomic::AtomicU32>,
 ) -> Result<(), String> {
     // Join the multi-threaded apartment BEFORE touching anything WinRT.
     //
@@ -469,6 +519,30 @@ fn capture_thread(
         }
     }
 
+    // Announce before building the capture pipeline, not after.
+    //
+    // Creating the D3D device and starting the WGC session take tens of
+    // milliseconds, and `begin()` — which the session loop calls, and which the
+    // shared cursor therefore waits on — blocks until this handshake lands. The
+    // geometry is already known, so the offer need not wait for any of it: the
+    // viewer's window opens while this thread is still setting up.
+    let mut announced = match client_size(hwnd) {
+        Ok((w, h)) => {
+            let _ = ready_tx.send(Ok(WindowMeta {
+                id,
+                title: title.clone(),
+                width: w,
+                height: h,
+            }));
+            true
+        }
+        // Fall back to announcing from the first frame, as this always did.
+        Err(e) => {
+            tracing::debug!(error = %e, "no client rect yet; announcing from the first frame");
+            false
+        }
+    };
+
     let (device, context) = d3d::create_device()?;
     let mut session = d3d::CaptureStream::start(&device, &context, hwnd)?;
 
@@ -498,13 +572,17 @@ fn capture_thread(
     // rather than guess, each step below says what it is about to do.
     tracing::info!("capture loop starting");
 
+    // Ask the window to paint. A hidden, idle window (a file manager sitting
+    // there) has nothing to redraw for, and WGC would hand out its first frame
+    // only when something else happened to dirty it.
+    force_repaint(hwnd);
+
     let mut differ = FrameDiffer::new();
     let mut seq = 0u32;
     // How many times the loop asked for a frame, and how many actually came —
     // used only to keep tracing bounded (see below).
     let mut polls: u64 = 0;
     let mut frames_seen: u32 = 0;
-    let mut announced = false;
     // H.264 encoder for large updates, opened lazily and dropped on resize
     // (H.264 cannot change frame size mid-stream).
     let mut video: Option<crate::video_encoder_win::VideoEncoder> = None;
@@ -513,6 +591,11 @@ fn capture_thread(
     loop {
         match cmd_rx.try_recv() {
             Ok(CaptureCommand::Stop) => break,
+            Ok(CaptureCommand::Resize { width, height }) => {
+                if let Err(e) = resize_source(hwnd, width, height) {
+                    tracing::debug!(error = %e, width, height, "could not resize the source window");
+                }
+            }
             Ok(CaptureCommand::Input(input)) => {
                 if let Err(e) = crate::windows_input::replay(hwnd, input) {
                     tracing::debug!(error = %e, "could not replay input");
@@ -558,6 +641,10 @@ fn capture_thread(
                         height: h,
                     }));
                 }
+                // The size the first frame actually carries may differ from the
+                // client rect the offer was built from (DPI rounding, a window
+                // that lays out late). The viewer follows a frame that does not
+                // fit its geometry, so this needs no message of its own.
 
                 if trace {
                     tracing::info!(seq, "encoding and sending the frame");
@@ -572,6 +659,8 @@ fn capture_thread(
                     &mut video,
                     &mut video_failed_for,
                     &frames_tx,
+                    &quality,
+                    &last_seq,
                 );
                 if trace {
                     tracing::info!(seq, "frame sent");
@@ -589,4 +678,115 @@ fn capture_thread(
 
     tracing::info!(id, "window capture stopped");
     Ok(())
+}
+
+/// Resize the captured window so its **client area** becomes `width`x`height`.
+///
+/// The viewer measures in client pixels — that is what the frames carry — while
+/// `SetWindowPos` takes the outer frame, so the difference (title bar, borders,
+/// and whatever the window's own styles add) has to be added back. Asking for
+/// the client size directly would shrink the picture by exactly the chrome on
+/// every resize, compounding each time.
+///
+/// Position and Z-order are left alone: the user is resizing a window on the
+/// other machine, not moving it or raising it over what they are working on
+/// there.
+fn resize_source(hwnd: HWND, width: u32, height: u32) -> Result<(), WindowError> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::UpdateWindow;
+    use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOZORDER, WINDOW_EX_STYLE, WINDOW_STYLE,
+    };
+
+    if width == 0 || height == 0 {
+        return Err(WindowError::Backend("refusing a zero-sized resize".into()));
+    }
+
+    // SAFETY: `hwnd` is the window this capture thread owns and has already
+    // used for capture; every call below only reads or sets its geometry.
+    unsafe {
+        let style = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
+        let ex_style = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        let dpi = GetDpiForWindow(hwnd);
+        if dpi == 0 {
+            return Err(WindowError::Backend("window reported no DPI".into()));
+        }
+        AdjustWindowRectExForDpi(&mut rect, style, false, ex_style, dpi)
+            .map_err(|e| WindowError::Backend(format!("sizing the frame: {e}")))?;
+
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .map_err(|e| WindowError::Backend(format!("resizing the window: {e}")))?;
+        // The window is deliberately hidden while captured, so it gets no paint
+        // from the compositor on its own; force one, or the capture keeps
+        // handing out frames at the old size until the app repaints for some
+        // other reason.
+        let _ = UpdateWindow(hwnd);
+    }
+    Ok(())
+}
+
+/// The window's client area, for announcing a transfer before any pixels.
+///
+/// The client rect, not the frame: it is what WGC hands out and therefore what
+/// the viewer's surrogate must be sized to.
+fn client_size(hwnd: HWND) -> Result<(u32, u32), WindowError> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+    let mut rect = RECT::default();
+    // SAFETY: reads geometry from a HWND this capture owns.
+    unsafe {
+        GetClientRect(hwnd, &mut rect)
+            .map_err(|e| WindowError::Backend(format!("client rect: {e}")))?;
+    }
+    let (w, h) = (
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    );
+    if w == 0 || h == 0 {
+        return Err(WindowError::Backend("window has no client area yet".into()));
+    }
+    Ok((w, h))
+}
+
+/// Nudge a window into painting, so capture has something to send at once.
+///
+/// WGC produces a frame when the window redraws, and a window nobody is
+/// touching — a file manager, a paused player — has no reason to. Invalidating
+/// it makes DWM composite it again, which is what capture is watching for.
+///
+/// Deliberately **without** `RDW_UPDATENOW`: that flag sends `WM_PAINT`
+/// synchronously and returns only once the app has handled it, and Windows
+/// pauses an application's UI thread for the duration of a window drag — which
+/// is exactly when this runs. Posting the invalidation instead lets the paint
+/// happen when the app is next able, and never blocks the capture thread on an
+/// application that cannot answer yet.
+fn force_repaint(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE};
+
+    // SAFETY: invalidates a HWND this capture owns; no state is read back.
+    unsafe {
+        let _ = RedrawWindow(
+            Some(hwnd),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+        );
+    }
 }

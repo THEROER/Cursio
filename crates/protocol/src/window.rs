@@ -195,6 +195,22 @@ pub enum WindowInput {
     },
 }
 
+impl WindowInput {
+    /// Which transferred window this event belongs to.
+    ///
+    /// Every variant carries the id, but they carry it separately — a host
+    /// showing more than one window needs it to know which one the user is
+    /// actually driving.
+    pub fn id(&self) -> WindowId {
+        match self {
+            Self::PointerMove { id, .. }
+            | Self::PointerButton { id, .. }
+            | Self::PointerScroll { id, .. }
+            | Self::Key { id, .. } => *id,
+        }
+    }
+}
+
 /// Why a window transfer ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowCloseReason {
@@ -227,6 +243,20 @@ pub enum WindowMsg {
     Offer(WindowMeta),
     /// Viewer -> host: newest frame presented, for adaptive rate control.
     FrameAck(WindowFrameAck),
+    /// Viewer -> host: the user resized the surrogate; resize the real window.
+    ///
+    /// A request, not a statement of fact. The viewer does not change its own
+    /// geometry on the strength of it: the host may clamp it to the window's
+    /// minimum size, or refuse outright (a fixed-size dialog), and the truth
+    /// arrives the ordinary way, as a full frame at the new size. Without this
+    /// the surrogate could only stretch its texture over the new allocation —
+    /// the picture grew, the pixels behind it did not, and the result was a
+    /// blurry scale-up of a window that never actually resized.
+    ResizeRequest {
+        id: WindowId,
+        width: u32,
+        height: u32,
+    },
     /// Either side: end a transfer. No frames or input for `id` are valid after.
     Close {
         id: WindowId,

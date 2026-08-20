@@ -146,9 +146,15 @@ struct PortalCast {
 /// mean two dialogs and a cast the input side can't address.
 ///
 /// Asks for `SourceType::Window` so the picker offers windows rather than whole
-/// monitors, and for `CursorMode::Embedded` so the pointer is baked into the
-/// pixels — the viewer sees the cursor where the app draws it without us having
-/// to composite a second cursor over the surrogate.
+/// monitors, and for `CursorMode::Hidden` so the pointer stays out of the pixels.
+///
+/// `Embedded` looked cheaper — the viewer would see a cursor without us
+/// compositing one — but the pointer it bakes in is the **host's**, and the host
+/// is a machine the user has usually just left. Having taken the cursor to the
+/// other side, they still saw the laptop's idle pointer sitting in the streamed
+/// window, and it slid across the picture whenever anything moved it over there.
+/// The viewer's own cursor is drawn by its compositor over the surrogate, which
+/// is the one that actually tracks the user's hand.
 async fn setup_portal() -> Result<PortalCast, String> {
     let remote = RemoteDesktop::new()
         .await
@@ -198,7 +204,7 @@ async fn setup_portal() -> Result<PortalCast, String> {
         .select_sources(
             &session,
             SelectSourcesOptions::default()
-                .set_cursor_mode(CursorMode::Embedded)
+                .set_cursor_mode(CursorMode::Hidden)
                 .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Window))
                 .set_multiple(false),
         )
@@ -293,6 +299,11 @@ enum CaptureCommand {
 /// Owns the channels to the capture thread; the thread itself owns everything
 /// that isn't `Send` (portal session, PipeWire loop).
 pub struct PortalCaptureSession {
+    /// Shared with the capture thread; moved as the viewer's acks arrive.
+    quality: std::sync::Arc<crate::frame_pipeline::AdaptiveQuality>,
+    /// Highest `seq` the capture thread has emitted, so an ack says how far
+    /// behind the viewer is. Written there, read here.
+    last_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
     meta: WindowMeta,
     frames: mpsc::Receiver<WindowFrame>,
     commands: mpsc::UnboundedSender<CaptureCommand>,
@@ -316,10 +327,19 @@ impl CaptureSession for PortalCaptureSession {
             .map_err(|_| WindowError::Backend("capture thread is gone".into()))
     }
 
-    fn on_ack(&mut self, _ack: WindowFrameAck) {
-        // Milestone 2 runs at a fixed rate with no adaptive controller, so acks
-        // are accepted and ignored. Milestone 3 turns this into the rate-control
-        // loop (sent-vs-acked + RTT → fps/quality).
+    fn on_ack(&mut self, ack: WindowFrameAck) {
+        // How far ahead of the viewer we are, in frames. `seq` is monotonic per
+        // window, so the difference is the backlog the link has not carried.
+        let sent = self.last_seq.load(std::sync::atomic::Ordering::Relaxed);
+        let gap = sent.saturating_sub(ack.acked_seq);
+        if let Some(threshold) = self.quality.observe(gap) {
+            tracing::info!(
+                id = self.meta.id,
+                gap,
+                threshold,
+                "link changed; adjusting how much of the window stays lossless"
+            );
+        }
     }
 
     fn close(&mut self, reason: WindowCloseReason) {
@@ -356,10 +376,25 @@ fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
     // Readiness carries the negotiated window geometry back, so the meta we
     // offer the peer matches what the stream will actually deliver.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WindowMeta, String>>();
+    // Shared with the capture thread: quality is written here as acks arrive
+    // and read there per frame; `last_seq` the other way round.
+    let quality = std::sync::Arc::new(crate::frame_pipeline::AdaptiveQuality::default());
+    let last_seq = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let thread_quality = quality.clone();
+    let thread_last_seq = last_seq.clone();
 
     std::thread::Builder::new()
         .name("cursio-window-capture".into())
-        .spawn(move || capture_thread(id, frames_tx, cmd_rx, ready_tx))
+        .spawn(move || {
+            capture_thread(
+                id,
+                frames_tx,
+                cmd_rx,
+                ready_tx,
+                thread_quality,
+                thread_last_seq,
+            )
+        })
         .map_err(|e| WindowError::Backend(format!("spawn capture thread: {e}")))?;
 
     match ready_rx.recv() {
@@ -367,6 +402,8 @@ fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
             meta,
             frames: frames_rx,
             commands: cmd_tx,
+            quality,
+            last_seq,
         }),
         Ok(Err(e)) => Err(WindowError::Backend(e)),
         Err(_) => Err(WindowError::Backend(
@@ -385,6 +422,8 @@ fn capture_thread(
     frames_tx: mpsc::Sender<WindowFrame>,
     cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: std::sync::mpsc::Sender<Result<WindowMeta, String>>,
+    quality: std::sync::Arc<crate::frame_pipeline::AdaptiveQuality>,
+    last_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     // Phase 1: the portal handshake is async (D-Bus), so it needs a runtime —
     // current-thread, because none of it may migrate.
@@ -408,7 +447,9 @@ fn capture_thread(
 
     // Phase 2: hand the thread to PipeWire. `cast` (and its portal session)
     // stays alive here for the duration.
-    if let Err(e) = run_pipewire_loop(id, cast, frames_tx, cmd_rx, &ready_tx, &rt) {
+    if let Err(e) = run_pipewire_loop(
+        id, cast, frames_tx, cmd_rx, &ready_tx, &rt, quality, last_seq,
+    ) {
         // If we never signalled readiness, this is the error the caller sees;
         // if we already did, the send is a no-op and the log is the record.
         tracing::error!(error = %e, "window capture loop ended with an error");
@@ -438,6 +479,11 @@ struct StreamState {
     /// change frame size mid-stream, so a new geometry means a new encoder (and
     /// a fresh keyframe).
     video: Option<crate::video_encoder::VideoEncoder>,
+    /// Shared with the session thread, which moves it as acks arrive. Read per
+    /// frame so a link that frees up restores quality without a restart.
+    quality: std::sync::Arc<crate::frame_pipeline::AdaptiveQuality>,
+    /// Mirrors `seq` for the session's ack maths; see `PortalCaptureSession`.
+    last_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Build the format Pod we offer PipeWire.
@@ -515,6 +561,8 @@ fn run_pipewire_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: &std::sync::mpsc::Sender<Result<WindowMeta, String>>,
     rt: &tokio::runtime::Runtime,
+    quality: std::sync::Arc<crate::frame_pipeline::AdaptiveQuality>,
+    last_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) -> Result<(), String> {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -561,6 +609,8 @@ fn run_pipewire_loop(
     .map_err(|e| format!("stream: {e}"))?;
 
     let state = Rc::new(RefCell::new(StreamState {
+        quality,
+        last_seq,
         format: None,
         seq: 0,
         differ: FrameDiffer::new(),
@@ -667,7 +717,7 @@ fn run_pipewire_loop(
             // Which path? A small change rides a lossless tile; a large one
             // goes through the video encoder, which codes the difference from
             // the previous frame rather than the pixels themselves.
-            if should_use_video(dirty, width, height) {
+            if should_use_video(dirty, width, height, st.quality.threshold()) {
                 // Geometry changes invalidate the encoder: H.264 is fixed-size.
                 if st
                     .video
@@ -698,6 +748,8 @@ fn run_pipewire_loop(
                                 .into_iter()
                                 .map(|data| {
                                     st.seq = st.seq.wrapping_add(1);
+                                    st.last_seq
+                                        .store(st.seq, std::sync::atomic::Ordering::Relaxed);
                                     WindowFrame {
                                         id,
                                         seq: st.seq,
@@ -737,6 +789,8 @@ fn run_pipewire_loop(
             };
 
             st.seq = st.seq.wrapping_add(1);
+            st.last_seq
+                .store(st.seq, std::sync::atomic::Ordering::Relaxed);
             let seq = st.seq;
             // Never block the PipeWire callback. If the bounded queue is full,
             // discard this delta and force the next accepted frame to be full.

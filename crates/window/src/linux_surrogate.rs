@@ -67,6 +67,9 @@ enum SurrogateCommand {
     VideoPacket { seq: u32, packet: Vec<u8> },
     /// Window geometry changed; reallocate before the next blit.
     Resize { width: u32, height: u32 },
+    /// The window grew, learnt from a tile rather than a full frame. Keeps the
+    /// pixels already drawn — see [`Framebuffer::grow_to`].
+    Grow { width: u32, height: u32 },
     /// Tear the window down.
     Close(WindowCloseReason),
 }
@@ -81,6 +84,12 @@ pub struct GtkSurrogate {
     commands: mpsc::UnboundedSender<SurrogateCommand>,
     input: mpsc::UnboundedReceiver<WindowInput>,
     presented: mpsc::UnboundedReceiver<u32>,
+    /// Sizes the user dragged this window to, newest wins. See
+    /// [`Surrogate::take_resize_request`].
+    resized: mpsc::UnboundedReceiver<(u32, u32)>,
+    /// The last size actually asked of the host, so a drag that returns to a
+    /// size already requested does not ask again.
+    requested_size: Option<(u32, u32)>,
     acks: PresentationAcks,
     /// Whether a `LossyVideo` packet has been seen, so the log says once that
     /// the stream switched to video. The decoder itself lives on the GTK
@@ -100,6 +109,27 @@ impl Surrogate for GtkSurrogate {
                 width: self.width,
                 height: self.height,
             });
+        } else {
+            // A tile reaching past the edge also means the host grew the window,
+            // but this one carries no origin to recognise it by: a `dirty` rect
+            // is only the region that changed, and the frame does not state the
+            // window's full size. Dragging a window's corner produces exactly
+            // that — tiles at a fixed offset whose extent creeps outwards — and
+            // rejecting them (the blit is deliberately strict, never clipping)
+            // froze the picture for the rest of the session, because every
+            // later tile was measured against the stale geometry too. Growing to
+            // fit keeps the stream alive; the host's next full frame settles the
+            // real size.
+            let need_w = frame.dirty.x.saturating_add(frame.dirty.width);
+            let need_h = frame.dirty.y.saturating_add(frame.dirty.height);
+            if need_w > self.width || need_h > self.height {
+                self.width = self.width.max(need_w);
+                self.height = self.height.max(need_h);
+                let _ = self.commands.send(SurrogateCommand::Grow {
+                    width: self.width,
+                    height: self.height,
+                });
+            }
         }
 
         // `LossyVideo` is the one codec whose packets are *not* self-contained:
@@ -149,6 +179,24 @@ impl Surrogate for GtkSurrogate {
         self.acks.take()
     }
 
+    fn take_resize_request(&mut self) -> Option<(u32, u32)> {
+        // Drain to the newest: a drag emits a size per frame, and only where the
+        // user let go matters.
+        let mut latest = None;
+        while let Ok(size) = self.resized.try_recv() {
+            latest = Some(size);
+        }
+        let size = latest?;
+        // The host answers a resize with a full frame, which sets `self.width`
+        // — so a size we already asked for, or one that matches what is being
+        // shown, would be an echo of our own request.
+        if Some(size) == self.requested_size || size == (self.width, self.height) {
+            return None;
+        }
+        self.requested_size = Some(size);
+        Some(size)
+    }
+
     fn close(&mut self, reason: WindowCloseReason) {
         tracing::info!(?reason, id = self.id, "closing surrogate window");
         let _ = self.commands.send(SurrogateCommand::Close(reason));
@@ -183,13 +231,23 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (presented_tx, presented_rx) = mpsc::unbounded_channel();
+    let (resized_tx, resized_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let meta = meta.clone();
     let thread_meta = meta.clone();
     std::thread::Builder::new()
         .name(format!("cursio-surrogate-{}", meta.id))
-        .spawn(move || gtk_thread(thread_meta, cmd_rx, input_tx, presented_tx, ready_tx))
+        .spawn(move || {
+            gtk_thread(
+                thread_meta,
+                cmd_rx,
+                input_tx,
+                presented_tx,
+                resized_tx,
+                ready_tx,
+            )
+        })
         .map_err(|e| WindowError::Backend(format!("spawn surrogate thread: {e}")))?;
 
     match ready_rx.recv() {
@@ -200,6 +258,8 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
             commands: cmd_tx,
             input: input_rx,
             presented: presented_rx,
+            resized: resized_rx,
+            requested_size: None,
             acks: PresentationAcks::new(meta.id),
             video_started: false,
         }),
@@ -216,6 +276,7 @@ fn gtk_thread(
     mut commands: mpsc::UnboundedReceiver<SurrogateCommand>,
     input_tx: mpsc::UnboundedSender<WindowInput>,
     presented_tx: mpsc::UnboundedSender<u32>,
+    resized_tx: mpsc::UnboundedSender<(u32, u32)>,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     if let Err(e) = gtk::init() {
@@ -245,6 +306,21 @@ fn gtk_thread(
         .build();
 
     attach_input_controllers(&window, &picture, id, input_tx, fb.clone());
+
+    // Report the size the user drags this window to, so the host can resize the
+    // real one. `default-width`/`default-height` rather than a size-allocate on
+    // the picture: the latter also fires for the resizes we perform ourselves
+    // when adopting the host's geometry, which would bounce a request straight
+    // back at the host for the size it just gave us.
+    for property in ["default-width", "default-height"] {
+        let (tx, win) = (resized_tx.clone(), window.clone());
+        window.connect_notify_local(Some(property), move |_, _| {
+            let (w, h) = (win.default_width(), win.default_height());
+            if w > 0 && h > 0 {
+                let _ = tx.send((w as u32, h as u32));
+            }
+        });
+    }
 
     // Drain the command channel on the GTK thread. `try_recv` in a timeout
     // source keeps this cooperative: GTK stays free to paint and dispatch input
@@ -336,6 +412,11 @@ fn gtk_thread(
                 }
                 Ok(SurrogateCommand::Resize { width, height }) => {
                     fb_for_frames.borrow_mut().resize(width, height);
+                    main_loop_window.set_default_size(width as i32, height as i32);
+                    painted = true;
+                }
+                Ok(SurrogateCommand::Grow { width, height }) => {
+                    fb_for_frames.borrow_mut().grow_to(width, height);
                     main_loop_window.set_default_size(width as i32, height as i32);
                     painted = true;
                 }

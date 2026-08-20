@@ -2,7 +2,8 @@
 //!
 //! Wraps the handful of commands that otherwise need env vars and target
 //! triples remembered by hand:
-//! - `build`   — release build for this host (Linux/macOS/Windows).
+//! - `build`   — release build; `build <host|windows|macos|all>` picks what for.
+//! - `run`     — build, then run it, restarting the binary when it crashes.
 //! - `install` — build release, then copy binaries into `~/.local/bin` and
 //!   install `.desktop` launchers (Linux).
 //! - `windows` — cross-compile the `.exe`s from Linux (mingw), no Windows box.
@@ -116,8 +117,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command_ {
-    /// Release build for this host.
+    /// Release build. Builds for this host unless another target is named.
     Build {
+        /// What to build: host, windows, macos, or all.
+        ///
+        /// `all` is every target this machine can produce — on Linux that is
+        /// the host binaries plus the cross-compiled Windows `.exe`s; elsewhere
+        /// only the host, since neither Linux nor macOS binaries cross-build
+        /// from the other.
+        #[arg(value_enum, default_value = "host")]
+        target: TargetArg,
         /// Build in debug profile instead of release.
         #[arg(long)]
         debug: bool,
@@ -134,13 +143,32 @@ enum Command_ {
         #[arg(long)]
         no_build: bool,
     },
-    /// Cross-compile the Windows .exe(s) from Linux (mingw).
+    /// Build, then run it. Restarts on crash; Ctrl-C stops for good.
+    Run {
+        /// Run the debug build instead of release.
+        #[arg(long)]
+        debug: bool,
+        /// Which binary to run.
+        #[arg(long, value_enum, default_value = "cursio")]
+        bin: BinArg,
+        /// Don't restart the binary when it exits non-zero.
+        #[arg(long)]
+        once: bool,
+        /// Arguments for the binary itself. Anything after `--`.
+        ///
+        /// For `cursio` these replace the default `mesh --send-input
+        /// --clipboard`; a bare subcommand is enough (`-- peers`), since what
+        /// follows is passed through untouched.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Cross-compile the Windows .exe(s) from Linux. Alias for `build windows`.
     Windows {
         /// Build in debug profile instead of release.
         #[arg(long)]
         debug: bool,
     },
-    /// Build the supported macOS binaries.
+    /// Build the supported macOS binaries. Alias for `build macos`.
     Macos,
     /// Android build (future — prints what's needed).
     Android,
@@ -150,6 +178,24 @@ enum Command_ {
         #[arg(long)]
         follow: bool,
     },
+}
+
+/// What `build` should produce.
+///
+/// A single command with a target, rather than one subcommand per platform:
+/// `build`, `windows` and `macos` were three spellings of "compile this
+/// workspace", differing only in where the output lands, and the pair that
+/// still exist are kept as aliases rather than as the way in.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TargetArg {
+    /// This machine.
+    Host,
+    /// The Windows `.exe`s, cross-compiled from Linux.
+    Windows,
+    /// The macOS binaries (only on macOS).
+    Macos,
+    /// Everything this machine can build.
+    All,
 }
 
 /// clap mirror of the installable binary names.
@@ -173,12 +219,46 @@ impl BinArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command_::Build { debug, bin } => build(!debug, bin, None),
+        Command_::Build { target, debug, bin } => build_target(target, !debug, bin),
         Command_::Install { bin, no_build } => install(bin, no_build),
+        Command_::Run {
+            debug,
+            bin,
+            once,
+            args,
+        } => run_task(!debug, bin, once, &args),
         Command_::Windows { debug } => windows(!debug),
         Command_::Macos => macos(),
         Command_::Android => android(),
         Command_::Logs { follow } => logs(follow),
+    }
+}
+
+/// Build one target, or every target this machine can produce.
+///
+/// `all` skips what the host cannot make rather than failing: on Linux the
+/// Windows cross-build is available and macOS is not, and a command that
+/// refused to build anything because one platform is out of reach would be
+/// useless exactly where it is most wanted.
+fn build_target(target: TargetArg, release: bool, only: Option<BinArg>) -> Result<()> {
+    match target {
+        TargetArg::Host => build(release, only, None),
+        TargetArg::Windows => windows(release),
+        TargetArg::Macos => macos(),
+        TargetArg::All => {
+            // Windows cross-builds from Linux via cargo-xwin; macOS binaries
+            // can only be produced on macOS, and Linux ones only on Linux.
+            let targets: &[TargetArg] = if cfg!(target_os = "linux") {
+                &[TargetArg::Host, TargetArg::Windows]
+            } else {
+                &[TargetArg::Host]
+            };
+            for (i, t) in targets.iter().enumerate() {
+                println!("=== building {}/{} ===", i + 1, targets.len());
+                build_target(*t, release, only)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -211,6 +291,133 @@ fn build(release: bool, only: Option<BinArg>, target: Option<&str>) -> Result<()
     run(cmd).context("cargo build failed")?;
     println!("✓ built into {}", out_dir(release, target).display());
     Ok(())
+}
+
+/// The arguments `cursio` gets when the user names none.
+///
+/// The daily set (see memory: cursio-default-runset), not a minimal one: a
+/// `run` that came up without input sharing would look broken in exactly the
+/// way the tool exists to avoid.
+const DEFAULT_CURSIO_ARGS: &[&str] = &["mesh", "--send-input", "--clipboard"];
+
+/// Build one binary and run it, restarting it if it dies.
+///
+/// The restart loop is what makes this usable for a daemon under development:
+/// `cursio` is killed by every rebuild and by its own crashes, and re-running
+/// the whole command by hand each time is the friction this removes. A clean
+/// exit (status 0) is taken as "it meant to stop" and ends the loop, as does
+/// Ctrl-C, which the shell delivers to the child and to us alike.
+fn run_task(release: bool, bin: BinArg, once: bool, args: &[String]) -> Result<()> {
+    let name = bin.as_str();
+    // Kill it before building, not after: cargo cannot overwrite a running
+    // executable ("Text file busy" on Linux, sharing violation on Windows), so
+    // a leftover from the last run fails the build rather than the launch.
+    stop_running(name);
+
+    let selected = select_for_host(Some(bin))?;
+    let Some(target) = selected.first() else {
+        bail!("{name} is not built on this platform");
+    };
+    let package = target.package;
+    build(release, Some(bin), None)?;
+
+    let exe = out_dir(release, None).join(exe_name(name, None));
+    if !exe.exists() {
+        bail!("{} not found after building {package}", exe.display());
+    }
+
+    // `trailing_var_arg` hands us the `--` separator itself, wherever the user
+    // put it, and passing it on makes the binary read what follows as
+    // positionals: `cursio mesh -- --send-input` fails with "unexpected
+    // argument '--send-input'". Both spellings people reach for —
+    // `run -- mesh --flags` and `run mesh -- --flags` — mean the same thing
+    // here, so every separator is dropped rather than only a leading one.
+    let passed: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != "--")
+        .collect();
+    let effective: Vec<&str> = if !passed.is_empty() {
+        passed
+    } else if name == "cursio" {
+        DEFAULT_CURSIO_ARGS.to_vec()
+    } else {
+        // Only `cursio` has a subcommand worth defaulting to; the GUIs take
+        // none and would reject one.
+        Vec::new()
+    };
+
+    loop {
+        println!("→ running {} {}", exe.display(), effective.join(" "));
+        let mut cmd = Command::new(&exe);
+        cmd.args(&effective);
+        let status = cmd
+            .status()
+            .with_context(|| format!("spawning {}", exe.display()))?;
+
+        if status.success() {
+            return Ok(());
+        }
+        // A signal (Ctrl-C, or a kill) is the user stopping it, not a crash to
+        // recover from — restarting there would make the process impossible to
+        // stop from the terminal that started it.
+        if once || terminated_by_signal(&status) {
+            bail!("{name} exited with {status}");
+        }
+        eprintln!("--- {name} exited with {status}; restarting (--once to disable) ---");
+    }
+}
+
+/// Whether a process was ended by a signal rather than by returning a status.
+#[cfg(unix)]
+fn terminated_by_signal(status: &std::process::ExitStatus) -> bool {
+    std::os::unix::process::ExitStatusExt::signal(status).is_some()
+}
+
+/// Windows has no signals; every exit carries a code.
+#[cfg(not(unix))]
+fn terminated_by_signal(_status: &std::process::ExitStatus) -> bool {
+    false
+}
+
+/// Ask any running copy of `bin` to quit, so the build can replace it.
+///
+/// Best-effort by design: no `pkill` on the box, nothing running, or a process
+/// belonging to another user are all ordinary, and none of them should stop a
+/// build that will fail loudly on its own if the executable really is locked.
+fn stop_running(bin: &str) {
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut c = Command::new("pkill");
+        // `-x` because a substring match would also hit `cursio-app` when asked
+        // for `cursio`; `-U` so this never reaches another account's processes.
+        c.args(["-x", "-U", &whoami(), bin]);
+        c
+    };
+    #[cfg(not(unix))]
+    let mut cmd = {
+        let mut c = Command::new("taskkill");
+        c.args(["/IM", &format!("{bin}.exe"), "/F"]);
+        c
+    };
+
+    let quiet = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if matches!(quiet, Ok(s) if s.success()) {
+        println!("→ stopped a running {bin}");
+    }
+}
+
+/// This user's name, for `pkill -U`.
+///
+/// Read from the environment rather than pulled in as a `libc` dependency for
+/// one call; `USER` is set by every login shell, and the fallback simply names
+/// the account `pkill` would refuse to match, which fails safe.
+#[cfg(unix)]
+fn whoami() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "\u{0}".to_string())
 }
 
 /// Build release binaries (unless `no_build`) and copy them into ~/.local/bin,

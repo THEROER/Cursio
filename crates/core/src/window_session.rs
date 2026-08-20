@@ -20,6 +20,8 @@
 //! Capture starts only after an explicit transfer request, normally a window
 //! crossing the peer-facing screen edge.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use cursio_protocol::{Message, ModuleId, Priority, WindowCloseReason, WindowId, WindowMsg};
 use cursio_transport::{TransportError, TransportTx};
@@ -59,28 +61,39 @@ const VIDEO_QUEUE_HIGH_WATER_BYTES: usize = 2 * 1024 * 1024;
 /// is worthless anyway.
 const MAX_INPUT_PER_PUMP: usize = 32;
 
+/// One window this machine is hosting, and whether the peer knows about it yet.
+struct HostedWindow<S> {
+    session: S,
+    /// Whether this window's offer has gone out. The offer must precede any of
+    /// its frames, but sending needs a transport, so `share_window` only starts
+    /// the capture and the next `pump` sends this.
+    offer_sent: bool,
+}
+
 /// Window transfer for one session, in whichever role(s) it ends up playing.
 pub struct WindowEngine<C: WindowCapture, R: WindowRenderer> {
     capture: C,
     renderer: R,
-    /// The window we are hosting, if any. `None` until [`share_window`] starts one.
-    hosted: Option<C::Session>,
-    /// The window we are viewing, if any — opened when an offer arrives.
-    viewed: Option<R::Surrogate>,
-    /// The id of the viewed window. Kept beside the surrogate because
-    /// [`Surrogate`] deliberately doesn't carry its meta — the id is session
-    /// bookkeeping, not something a renderer backend should have to store.
-    viewed_id: Option<WindowId>,
+    /// Windows we are hosting, keyed by the id we allocated for each.
+    ///
+    /// A map rather than one slot: the point of the feature is that the two
+    /// desktops read as one, and a second monitor does not hold a single
+    /// window. When this was an `Option`, dragging a second window across
+    /// silently replaced the first — its surrogate was dropped mid-stream and
+    /// the transfer looked like it had hung.
+    hosted: HashMap<WindowId, HostedWindow<C::Session>>,
+    /// Windows we are viewing, keyed by the id the host gave each.
+    ///
+    /// Keyed rather than paired with an id field, because every inbound frame,
+    /// close and ack names the window it belongs to and has to find it.
+    viewed: HashMap<WindowId, R::Surrogate>,
     /// Next [`WindowId`] to allocate as host. Ids only need to be unique within
     /// a session, and only the host allocates, so a counter suffices.
     next_id: WindowId,
-    /// Whether the offer for the currently hosted window has gone out. The
-    /// offer must precede any frame, but sending needs a transport, so
-    /// `share_window` only starts the capture and the first `pump` sends this.
-    offer_sent: bool,
-    /// Set by `handle_message` when a close arrives, acted on in `pump`
-    /// (`handle_message` is sync and cannot touch the transport).
-    pending_close: Option<(WindowId, WindowCloseReason)>,
+    /// Closes arriving from the peer, acted on in `pump` (`handle_message` is
+    /// sync and cannot touch the transport). A queue rather than one slot: two
+    /// windows can end in the same batch of messages.
+    pending_closes: Vec<(WindowId, WindowCloseReason)>,
     peer_name: String,
     /// Transfers requested from outside the session — by the drag trigger,
     /// which lives on the input side and cannot reach into this module.
@@ -116,12 +129,10 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
         Self {
             capture,
             renderer,
-            hosted: None,
-            viewed: None,
-            viewed_id: None,
+            hosted: HashMap::new(),
+            viewed: HashMap::new(),
             next_id: 1,
-            offer_sent: false,
-            pending_close: None,
+            pending_closes: Vec::new(),
             peer_name,
             requests: None,
             transfer_ended: None,
@@ -171,8 +182,16 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
         for request in pending {
             match request {
                 TransferRequest::Send { title } => {
-                    if self.hosted.is_some() {
-                        tracing::debug!("already sharing a window; ignoring drag request");
+                    // The trigger fires per drag, and a window shoved at the
+                    // edge twice is still the one window: without this a repeat
+                    // would open a second capture of the same thing and offer it
+                    // again, so the peer would show it twice.
+                    if self
+                        .hosted
+                        .values()
+                        .any(|h| h.session.meta().title == title)
+                    {
+                        tracing::debug!(%title, "already sharing this window; ignoring drag");
                         continue;
                     }
                     tracing::info!(%title, "window dragged to the peer edge");
@@ -186,7 +205,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                     }
                 }
                 TransferRequest::BringBack => {
-                    if self.hosted.is_none() {
+                    if self.hosted.is_empty() {
                         tracing::debug!("nothing is being shared; ignoring return request");
                         continue;
                     }
@@ -203,11 +222,6 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
     /// The offer itself goes out from the next `pump`, since sending needs the
     /// transport the session lends us. Returns the id assigned to the transfer.
     pub fn share_window(&mut self) -> Result<WindowId, cursio_window::WindowError> {
-        if self.hosted.is_some() {
-            return Err(cursio_window::WindowError::Backend(
-                "already sharing a window in this session".into(),
-            ));
-        }
         let id = self.next_id;
         self.next_id += 1;
         let session = self.capture.begin(id)?;
@@ -216,32 +230,50 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             peer = %self.peer_name,
             width = session.meta().width,
             height = session.meta().height,
+            hosted = self.hosted.len() + 1,
             "sharing a window with the peer"
         );
-        self.hosted = Some(session);
-        self.offer_sent = false;
+        self.hosted.insert(
+            id,
+            HostedWindow {
+                session,
+                offer_sent: false,
+            },
+        );
         Ok(id)
     }
 
-    /// Stop hosting the current window, if any.
+    /// Stop hosting the window most recently shared, if any.
+    ///
+    /// Dragging back is undirected — the gesture says "bring one home", not
+    /// which — so the newest is returned, which is the one the user just sent
+    /// and the only one they can still be thinking of as in flight.
     pub fn stop_sharing(&mut self, reason: WindowCloseReason) {
-        if let Some(mut session) = self.hosted.take() {
-            let id = session.meta().id;
-            session.close(reason);
-            self.offer_sent = false;
-            self.pending_close = Some((id, reason));
+        let Some(&id) = self.hosted.keys().max() else {
+            return;
+        };
+        self.stop_sharing_id(id, reason);
+    }
+
+    /// Stop hosting one specific window.
+    fn stop_sharing_id(&mut self, id: WindowId, reason: WindowCloseReason) {
+        if let Some(mut hosted) = self.hosted.remove(&id) {
+            hosted.session.close(reason);
+            self.pending_closes.push((id, reason));
         }
     }
 
-    /// The offer to send, if one is still owed. The offer must precede any
-    /// frame, so this is checked before frames are pumped.
-    fn take_unsent_offer(&mut self) -> Option<cursio_protocol::WindowMeta> {
-        let session = self.hosted.as_ref()?;
-        if self.offer_sent {
-            return None;
+    /// Offers still owed, one per newly shared window. Each must precede that
+    /// window's frames, so this is drained before frames are pumped.
+    fn take_unsent_offers(&mut self) -> Vec<cursio_protocol::WindowMeta> {
+        let mut offers = Vec::new();
+        for hosted in self.hosted.values_mut() {
+            if !hosted.offer_sent {
+                hosted.offer_sent = true;
+                offers.push(hosted.session.meta().clone());
+            }
         }
-        self.offer_sent = true;
-        Some(session.meta().clone())
+        offers
     }
 
     /// Apply one control message from the peer: start a transfer, take rate
@@ -260,34 +292,38 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                         height = meta.height,
                         "opened surrogate for the peer's window"
                     );
-                    self.viewed = Some(surrogate);
-                    self.viewed_id = Some(meta.id);
+                    self.viewed.insert(meta.id, surrogate);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, id = meta.id, "could not open surrogate window");
                     // Tell the host not to keep streaming into the void.
-                    self.pending_close = Some((meta.id, WindowCloseReason::ViewerClosed));
+                    self.pending_closes
+                        .push((meta.id, WindowCloseReason::ViewerClosed));
                 }
             },
+            WindowMsg::ResizeRequest { id, width, height } => {
+                if let Some(hosted) = self.hosted.get_mut(&id) {
+                    if let Err(e) = hosted.session.request_resize(width, height) {
+                        // The window refusing a size is ordinary (a fixed
+                        // dialog), and the viewer finds out from the frames
+                        // that follow, so this is not worth a warning.
+                        tracing::debug!(error = %e, id, width, height, "could not resize the hosted window");
+                    }
+                }
+            }
             WindowMsg::FrameAck(ack) => {
-                if let Some(session) = self.hosted.as_mut() {
-                    session.on_ack(ack);
+                if let Some(hosted) = self.hosted.get_mut(&ack.id) {
+                    hosted.session.on_ack(ack);
                 }
             }
             WindowMsg::Close { id, reason } => {
                 tracing::info!(id, ?reason, "peer ended a window transfer");
                 // Whichever side we were playing for this id, wind it down.
-                if self.viewed_id == Some(id) {
-                    if let Some(mut s) = self.viewed.take() {
-                        s.close(reason);
-                    }
-                    self.viewed_id = None;
+                if let Some(mut s) = self.viewed.remove(&id) {
+                    s.close(reason);
                 }
-                if self.hosted.as_ref().map(|s| s.meta().id) == Some(id) {
-                    if let Some(mut s) = self.hosted.take() {
-                        s.close(reason);
-                    }
-                    self.offer_sent = false;
+                if let Some(mut hosted) = self.hosted.remove(&id) {
+                    hosted.session.close(reason);
                     self.note_transfer_ended();
                 }
             }
@@ -296,76 +332,121 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
 
     /// Host → peer: forward captured frames, bounded per call.
     async fn pump_frames(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
-        let Some(session) = self.hosted.as_mut() else {
+        if self.hosted.is_empty() {
             return Ok(());
-        };
-        for _ in 0..MAX_FRAMES_PER_PUMP {
-            if tx.queue_depth(Priority::Video).queued_bytes >= VIDEO_QUEUE_HIGH_WATER_BYTES {
-                break;
-            }
-            // `try_recv`, never `recv`: the capture channel going quiet is the
-            // normal case (a static window emits nothing), and awaiting it here
-            // would block the whole session loop on an idle window.
-            match session.frames().try_recv() {
-                Ok(frame) => tx.send(&Message::WindowFrame(frame)).await?,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // The capture backend ended on its own (window closed,
-                    // portal revoked). Tell the peer so its surrogate goes away.
-                    tracing::info!("window capture ended; telling the peer");
-                    let id = session.meta().id;
-                    self.hosted = None;
-                    self.offer_sent = false;
-                    self.note_transfer_ended();
-                    send_control(
-                        tx,
-                        WindowMsg::Close {
-                            id,
-                            reason: WindowCloseReason::HostClosed,
-                        },
-                    )
-                    .await?;
+        }
+        // Round-robin, one bounded pass per window rather than draining each in
+        // turn: a busy window (a video playing) would otherwise spend the whole
+        // budget every pump and a second window would never be sent at all.
+        let ids: Vec<WindowId> = self.hosted.keys().copied().collect();
+        let per_window = (MAX_FRAMES_PER_PUMP / ids.len()).max(1);
+        let mut ended: Vec<WindowId> = Vec::new();
+
+        for id in ids {
+            let Some(hosted) = self.hosted.get_mut(&id) else {
+                continue;
+            };
+            for _ in 0..per_window {
+                if tx.queue_depth(Priority::Video).queued_bytes >= VIDEO_QUEUE_HIGH_WATER_BYTES {
                     break;
                 }
+                // `try_recv`, never `recv`: the capture channel going quiet is
+                // the normal case (a static window emits nothing), and awaiting
+                // it here would block the whole session loop on an idle window.
+                match hosted.session.frames().try_recv() {
+                    Ok(frame) => tx.send(&Message::WindowFrame(frame)).await?,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        // The capture backend ended on its own (window closed,
+                        // portal revoked). Tell the peer so its surrogate goes.
+                        ended.push(id);
+                        break;
+                    }
+                }
             }
+        }
+
+        for id in ended {
+            tracing::info!(id, "window capture ended; telling the peer");
+            self.hosted.remove(&id);
+            self.note_transfer_ended();
+            send_control(
+                tx,
+                WindowMsg::Close {
+                    id,
+                    reason: WindowCloseReason::HostClosed,
+                },
+            )
+            .await?;
         }
         Ok(())
     }
 
     /// Viewer → host: forward the surrogate's input, then an ack if one is due.
     async fn pump_viewer(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
-        let Some(surrogate) = self.viewed.as_mut() else {
+        if self.viewed.is_empty() {
             return Ok(());
-        };
-        for _ in 0..MAX_INPUT_PER_PUMP {
-            match surrogate.input().try_recv() {
-                Ok(input) => tx.send(&Message::WindowInput(input)).await?,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // The user closed the surrogate window.
-                    tracing::info!("surrogate window closed by the user");
-                    let id = self.viewed_id.take();
-                    self.viewed = None;
-                    if let Some(id) = id {
-                        send_control(
-                            tx,
-                            WindowMsg::Close {
-                                id,
-                                reason: WindowCloseReason::ViewerClosed,
-                            },
-                        )
-                        .await?;
+        }
+        let ids: Vec<WindowId> = self.viewed.keys().copied().collect();
+        // Input is what the user's hand is doing right now, so each window gets
+        // the full budget rather than a share of it: only the focused surrogate
+        // produces any, and starving it to reserve room for idle ones would be
+        // felt directly as lag.
+        let mut closed: Vec<WindowId> = Vec::new();
+        // Collected while iterating and sent after, so the borrow of `viewed`
+        // ends before anything is awaited.
+        let mut outbound: Vec<Message> = Vec::new();
+        let mut control: Vec<WindowMsg> = Vec::new();
+
+        for id in ids {
+            let Some(surrogate) = self.viewed.get_mut(&id) else {
+                continue;
+            };
+            let mut gone = false;
+            for _ in 0..MAX_INPUT_PER_PUMP {
+                match surrogate.input().try_recv() {
+                    Ok(input) => outbound.push(Message::WindowInput(input)),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        gone = true;
+                        break;
                     }
-                    return Ok(());
                 }
             }
-        }
-        // Rate-control feedback, self-limited by the surrogate to a few per
-        // second — see `Surrogate::take_ack`.
-        if let Some(surrogate) = self.viewed.as_mut() {
-            if let Some(ack) = surrogate.take_ack() {
-                send_control(tx, WindowMsg::FrameAck(ack)).await?;
+            if gone {
+                closed.push(id);
+                continue;
             }
+            // The user resized this surrogate: ask the host to resize the real
+            // window, so the picture is re-rendered at the new size rather than
+            // scaled up to it.
+            if let Some((width, height)) = surrogate.take_resize_request() {
+                control.push(WindowMsg::ResizeRequest { id, width, height });
+            }
+            // Rate-control feedback, self-limited by the surrogate to a few per
+            // second — see `Surrogate::take_ack`.
+            if let Some(ack) = surrogate.take_ack() {
+                control.push(WindowMsg::FrameAck(ack));
+            }
+        }
+
+        for msg in outbound {
+            tx.send(&msg).await?;
+        }
+        for msg in control {
+            send_control(tx, msg).await?;
+        }
+        for id in closed {
+            tracing::info!(id, "surrogate window closed by the user");
+            self.viewed.remove(&id);
+            send_control(
+                tx,
+                WindowMsg::Close {
+                    id,
+                    reason: WindowCloseReason::ViewerClosed,
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -401,11 +482,11 @@ where
 
         // A close deferred from `handle_message` goes first: the peer should
         // learn a transfer ended before it sees anything else.
-        if let Some((id, reason)) = self.pending_close.take() {
+        for (id, reason) in std::mem::take(&mut self.pending_closes) {
             send_control(tx, WindowMsg::Close { id, reason }).await?;
         }
-        // The offer must precede the first frame.
-        if let Some(meta) = self.take_unsent_offer() {
+        // Each offer must precede that window's first frame.
+        for meta in self.take_unsent_offers() {
             tracing::info!(id = meta.id, "offering window to the peer");
             send_control(tx, WindowMsg::Offer(meta)).await?;
         }
@@ -430,18 +511,22 @@ where
         }
         match msg {
             Message::WindowFrame(frame) => {
-                if let Some(surrogate) = self.viewed.as_mut() {
-                    if let Err(e) = surrogate.apply_frame(frame) {
-                        tracing::warn!(error = %e, seq = frame.seq, "dropping unusable frame");
+                match self.viewed.get_mut(&frame.id) {
+                    Some(surrogate) => {
+                        if let Err(e) = surrogate.apply_frame(frame) {
+                            tracing::warn!(error = %e, seq = frame.seq, "dropping unusable frame");
+                        }
                     }
-                } else {
-                    tracing::debug!(id = frame.id, "frame for a window we aren't showing");
+                    None => tracing::debug!(id = frame.id, "frame for a window we aren't showing"),
                 }
                 true
             }
             Message::WindowInput(input) => {
-                if let Some(session) = self.hosted.as_mut() {
-                    if let Err(e) = session.apply_input(*input) {
+                // Routed by the id the event carries: with several windows
+                // hosted, replaying onto whichever happened to be first would
+                // put the user's clicks in the wrong application.
+                if let Some(hosted) = self.hosted.get_mut(&input.id()) {
+                    if let Err(e) = hosted.session.apply_input(*input) {
                         // Expected until the RemoteDesktop portal is wired in;
                         // logged at debug so it doesn't drown the session.
                         tracing::debug!(error = %e, "could not replay viewer input");
@@ -456,9 +541,8 @@ where
     async fn shutdown(&mut self, tx: &mut dyn TransportTx) {
         // Best-effort: the link may already be dead, so a failed send is not
         // worth reporting — the peer tears its side down on disconnect anyway.
-        if let Some(mut session) = self.hosted.take() {
-            let id = session.meta().id;
-            session.close(WindowCloseReason::HostClosed);
+        for (id, mut hosted) in std::mem::take(&mut self.hosted) {
+            hosted.session.close(WindowCloseReason::HostClosed);
             let _ = send_control(
                 tx,
                 WindowMsg::Close {
@@ -468,7 +552,7 @@ where
             )
             .await;
         }
-        if let Some(mut surrogate) = self.viewed.take() {
+        for (_, mut surrogate) in std::mem::take(&mut self.viewed) {
             surrogate.close(WindowCloseReason::ViewerClosed);
         }
     }
@@ -625,7 +709,7 @@ impl crate::module::ModuleFactory for WindowFactory {
 
 /// Version of this module's wire vocabulary ([`WindowMsg`]). Bump when those
 /// types change shape; peers run the module only on an exact match.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Watch for windows dragged toward the peer's edge and turn that into
 /// [`TransferRequest`]s.
@@ -1161,7 +1245,7 @@ mod tests {
             height: 240,
         };
         assert!(eng.handle_message(&control_frame(WindowMsg::Offer(meta))));
-        assert_eq!(eng.viewed_id, Some(7));
+        assert!(eng.viewed.contains_key(&7));
     }
 
     #[test]
@@ -1180,10 +1264,10 @@ mod tests {
         eng.handle_message(&control_frame(WindowMsg::Offer(meta)));
         // No surrogate, and a close queued so the host stops streaming pixels
         // nobody is showing.
-        assert!(eng.viewed.is_none());
+        assert!(eng.viewed.is_empty());
         assert_eq!(
-            eng.pending_close,
-            Some((7, WindowCloseReason::ViewerClosed))
+            eng.pending_closes,
+            vec![(7, WindowCloseReason::ViewerClosed)]
         );
     }
 
@@ -1234,7 +1318,7 @@ mod tests {
                 ..
             }
         )));
-        assert!(eng.hosted.is_none());
+        assert!(eng.hosted.is_empty());
     }
 
     #[test]
@@ -1254,18 +1338,64 @@ mod tests {
             id: 7,
             reason: WindowCloseReason::HostClosed,
         }));
-        assert!(eng.viewed.is_none());
-        assert_eq!(eng.viewed_id, None);
+        assert!(eng.viewed.is_empty());
+        assert!(eng.viewed.is_empty());
     }
 
     #[test]
-    fn sharing_twice_is_refused() {
+    fn sharing_a_second_window_keeps_the_first() {
         let (_frames_tx, frames_rx) = frame_channel();
         let mut eng = engine(
             FakeCapture::new(frames_rx, 640, 480),
             FakeRenderer::default(),
         );
-        eng.share_window().unwrap();
-        assert!(matches!(eng.share_window(), Err(WindowError::Backend(_))));
+
+        let first = eng.share_window().unwrap();
+        let second = eng.share_window().unwrap();
+
+        assert_ne!(first, second, "each window gets its own id");
+        assert!(
+            eng.hosted.contains_key(&first) && eng.hosted.contains_key(&second),
+            "a second window must not evict the first"
+        );
+        // Both are owed an offer, and each is offered exactly once.
+        let offered: Vec<WindowId> = eng.take_unsent_offers().iter().map(|m| m.id).collect();
+        assert_eq!(offered.len(), 2);
+        assert!(eng.take_unsent_offers().is_empty());
+    }
+
+    /// Input names the window it belongs to, so it reaches that one.
+    ///
+    /// With a single hosted window the id was decoration; with several,
+    /// replaying onto whichever the map happened to yield first would deliver
+    /// the user's clicks to the wrong application.
+    #[test]
+    fn input_is_replayed_onto_the_window_it_names() {
+        let (_frames_tx, frames_rx) = frame_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        );
+        let first = eng.share_window().unwrap();
+        let second = eng.share_window().unwrap();
+
+        eng.handle_message(&Message::WindowInput(WindowInput::PointerMove {
+            id: second,
+            x: 3,
+            y: 4,
+        }));
+
+        assert!(
+            eng.hosted[&first].session.applied_input.is_empty(),
+            "the window that was not named must see nothing"
+        );
+        assert_eq!(
+            eng.hosted[&second].session.applied_input,
+            vec![WindowInput::PointerMove {
+                id: second,
+                x: 3,
+                y: 4
+            }]
+        );
     }
 }
