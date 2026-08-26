@@ -302,12 +302,22 @@ virtual host controller is a kext. A Mac does not advertise the module.
 crates/usb/                mechanism
   ├── linux.rs             sysfs enumeration            (built)
   ├── offer.rs             ports → ids peers can quote  (built)
-  ├── arbiter.rs           URB header parsing, cache, leases
+  ├── arbiter.rs           URB header parsing, cache, leases  (built)
+  ├── urb.rs               the 48-byte header           (built)
+  ├── export.rs            device → usbip-host          (built)
+  ├── import.rs            peer device → vhci-hcd       (built)
+  ├── pipe.rs              the socketpair both kernels drive  (built)
   └── lib.rs               traits, LocalDevice
 
 crates/core/src/usb_session.rs
                            policy: who attaches, who leases   (built)
+                           LinuxUsbBackend, UsbFactory        (built)
 ```
+
+The CLI flag is `--usb`, and the module is advertised only where the kernel can
+actually export: `UsbFactory::advert` returns `None` with a log line naming the
+`modprobe` when `usbip-host` is absent. Invariant 6, in the one place a user
+meets it.
 
 `PROTOCOL_VERSION` does not move. `ModuleId(7)` is a new id in an open
 namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
@@ -319,13 +329,20 @@ namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
    Written under the pipe model; the lease narrowing above is a change to what
    `Claim` means, not to its shape.
 3. ~~**Linux enumeration**~~ — sysfs, verified against real hardware.
-4. **The arbiter** — parse the 48-byte header, cache descriptors, serialise data
-   transfers, intercept state changes. Testable entirely from recorded headers:
-   no kernel, no device.
-5. **Linux export** — `modprobe`, polkit, the local USB/IP socket.
-6. **Attaching half** — the client side, so a peer's device can be used here.
-7. **Windows import** — `usbipd-win` detection and the missing-driver path.
-8. **Degradation reporting** — isochronous flagged, revoke on unplug.
+4. ~~**The arbiter**~~ — the 48-byte header, the descriptor cache, serialised
+   data transfers, intercepted state changes. `urb.rs` and `arbiter.rs`.
+5. ~~**Linux export**~~ — `export.rs`: unbind, `match_busid`, bind, in that
+   order, and undone on failure. Privilege is reported, never escalated.
+6. ~~**Attaching half**~~ — `import.rs`: a free `vhci-hcd` port and the
+   socketpair whose far end the kernel drives.
+7. ~~**Carrying URBs**~~ — `pipe.rs`: a socketpair whose far end goes to the
+   kernel (`usbip_sockfd` when exporting, `attach` when importing) and whose
+   near end is read on its own thread, since a cancelled read leaves the
+   USB/IP stream misaligned. `UsbBackend` gained `collect`/`ended` so the
+   session pump can send a transfer's last bytes *before* the detach that
+   follows them.
+8. **Windows import** — `usbipd-win` detection and the missing-driver path.
+9. **Degradation reporting** — isochronous flagged, revoke on unplug.
 
 Storage is not on this list: it belongs to `files`, which needs three additions
 of its own — announce a removable volume when udisks mounts one, give it a mount
@@ -333,8 +350,9 @@ point rather than burying it in the peer's root, and mount it with the options
 that make a file manager show a drive. None of them need a driver, a kernel
 module or elevated privilege, which is why they land before any milestone here.
 
-Milestone 4 is where "every machine in the mesh" is won or lost, and it needs no
-hardware, so it comes before anything requiring root.
+Milestone 8 is the last platform gap: a Windows peer can host devices for the
+mesh today only in the sense that nothing there imports them yet. Everything
+Linux-to-Linux is in place and untested against real hardware.
 
 ## Invariants
 

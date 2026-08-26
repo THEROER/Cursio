@@ -199,6 +199,35 @@ impl Exporter {
         }
     }
 
+    /// Hand `usbip-host` the socket it should serve this device over.
+    ///
+    /// The attribute appears on the *device*, not the driver, and only once the
+    /// bind has happened — which is why this is a second step rather than part
+    /// of [`export`](Self::export). Writing a descriptor number here is what
+    /// starts the kernel serving; until then the device is bound to
+    /// `usbip-host` and idle.
+    ///
+    /// The socket must stay open for as long as the device is served. The
+    /// kernel holds the same file description, so closing this end is what ends
+    /// the export — deliberately, since it means a dropped session cannot leave
+    /// a device attached to nobody.
+    pub fn serve(&self, busid: &str, fd: std::os::fd::RawFd) -> Result<(), UsbBackendError> {
+        write_sysfs(&self.sockfd_path(busid), &fd.to_string())
+    }
+
+    /// Stop serving, without unbinding.
+    ///
+    /// `-1` is the kernel's own "no socket" value. Used when an attachment ends
+    /// but the device should stay exported for the next claim, which saves the
+    /// unbind/rebind cycle a peer reconnecting would otherwise pay.
+    pub fn stop_serving(&self, busid: &str) -> Result<(), UsbBackendError> {
+        write_sysfs(&self.sockfd_path(busid), "-1")
+    }
+
+    fn sockfd_path(&self, busid: &str) -> PathBuf {
+        self.devices.join(busid).join("usbip_sockfd")
+    }
+
     /// Write one value to a driver's control file.
     ///
     /// The error distinguishes "needs root" from everything else, because they
@@ -408,6 +437,31 @@ mod tests {
             // is on the message, and there is none to check.
             other => assert!(nix_is_root(), "expected a privilege error, got {other:?}"),
         }
+    }
+
+    /// The attribute lives on the device and the kernel starts serving the
+    /// moment a descriptor is written to it — that write is what turns a bound
+    /// device into an exported one.
+    #[test]
+    fn serving_writes_the_descriptor_to_the_devices_own_attribute() {
+        let fixture = Fixture::new(&[USBIP_HOST], "1-5", Some(USBIP_HOST));
+        let sockfd = fixture.devices.join("1-5").join("usbip_sockfd");
+        std::fs::write(&sockfd, "").expect("sockfd");
+
+        fixture.exporter().serve("1-5", 42).expect("serve");
+        assert_eq!(std::fs::read_to_string(&sockfd).expect("read"), "42");
+    }
+
+    /// `-1` is the kernel's "no socket": it ends the attachment while leaving
+    /// the device bound, so a peer reconnecting skips the unbind/rebind cycle.
+    #[test]
+    fn stopping_writes_the_kernels_no_socket_value() {
+        let fixture = Fixture::new(&[USBIP_HOST], "1-5", Some(USBIP_HOST));
+        let sockfd = fixture.devices.join("1-5").join("usbip_sockfd");
+        std::fs::write(&sockfd, "").expect("sockfd");
+
+        fixture.exporter().stop_serving("1-5").expect("stop");
+        assert_eq!(std::fs::read_to_string(&sockfd).expect("read"), "-1");
     }
 
     /// Root can write a 0400 file, so the permission test above cannot assert

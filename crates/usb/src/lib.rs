@@ -23,6 +23,8 @@ pub mod import;
 #[cfg(target_os = "linux")]
 mod linux;
 mod offer;
+#[cfg(target_os = "linux")]
+pub mod pipe;
 pub mod urb;
 
 #[cfg(target_os = "linux")]
@@ -31,6 +33,8 @@ pub use export::Exporter;
 pub use import::{Importer, Speed};
 #[cfg(target_os = "linux")]
 pub use linux::LinuxUsb;
+#[cfg(target_os = "linux")]
+pub use pipe::{KernelPipe, PipeEnded};
 
 pub use offer::DeviceOffers;
 

@@ -62,6 +62,28 @@ pub trait UsbBackend: Send {
 
     /// Hand URB bytes from the peer to the local USB/IP layer.
     fn feed(&mut self, stream: UsbStreamId, bytes: &[u8]) -> Result<(), UsbError>;
+
+    /// Take whatever the local USB/IP layer has produced since the last call.
+    ///
+    /// Must not block: this runs inside the session pump, which the shared
+    /// cursor also rides. An idle device — the common case — answers with
+    /// nothing.
+    ///
+    /// A stream that has ended is reported by its absence from the result *and*
+    /// by [`ended`](Self::ended), because the two mean different things to the
+    /// engine: no bytes is an idle device, while an ended stream is an
+    /// attachment to tear down.
+    fn collect(&mut self, out: &mut Vec<(UsbStreamId, Vec<u8>)>);
+
+    /// Streams whose kernel side has closed since the last call.
+    ///
+    /// Separate from [`collect`](Self::collect) so the engine can send the last
+    /// bytes of a transfer before the detach that follows them — a close and
+    /// the data preceding it arrive together, and reversing them would drop the
+    /// end of every transfer.
+    fn ended(&mut self) -> Vec<UsbStreamId> {
+        Vec::new()
+    }
 }
 
 /// One attach in progress, from the host's point of view.
@@ -248,6 +270,36 @@ impl UsbEngine {
             );
         }
     }
+
+    /// The local kernel closed a stream, so the attachment behind it is over.
+    ///
+    /// Told to the peer as [`UsbMsg::Detached`] with a reason rather than
+    /// letting its transfers time out: the holder's kernel is waiting on URBs
+    /// that will never complete, and every program touching the device hangs
+    /// until something says so. The device is unexported here too — the peer's
+    /// release cannot arrive for a stream that no longer exists.
+    fn end_stream(&mut self, stream: UsbStreamId) {
+        let Some((&device, _)) = self
+            .attached
+            .iter()
+            .find(|(_, attached)| attached.stream == stream)
+        else {
+            return;
+        };
+        self.attached.remove(&device);
+        self.backend.unexport(device);
+        // The listing carries the holder, so it is stale the moment one lets go.
+        self.announced = false;
+        self.outbound.push(UsbMsg::Detached {
+            device,
+            stream,
+            error: Some(UsbError::Unplugged),
+        });
+        tracing::info!(
+            peer = %self.peer_name, %device, stream = stream.0,
+            "the local usb/ip stream ended; telling the holder"
+        );
+    }
 }
 
 #[async_trait]
@@ -265,6 +317,26 @@ impl SessionModule for UsbEngine {
             self.announced = true;
             let devices = self.listing();
             self.outbound.push(UsbMsg::Devices(devices));
+        }
+
+        // Bytes the local kernel produced, then the streams that ended — in
+        // that order, because a close and the data preceding it arrive
+        // together and reversing them drops the end of every transfer.
+        let mut produced = Vec::new();
+        self.backend.collect(&mut produced);
+        for (stream, bytes) in produced {
+            // Split at the protocol's cap rather than trusting the kernel to
+            // read small: one read can be a whole bulk transfer, and a frame
+            // over the limit is refused by the transport rather than sent.
+            for chunk in bytes.chunks(UsbMsg::MAX_CHUNK) {
+                self.outbound.push(UsbMsg::Data {
+                    stream,
+                    bytes: chunk.to_vec(),
+                });
+            }
+        }
+        for stream in self.backend.ended() {
+            self.end_stream(stream);
         }
 
         for msg in std::mem::take(&mut self.outbound) {
@@ -324,9 +396,20 @@ pub struct LinuxUsbBackend {
     exporter: cursio_usb::Exporter,
     /// Stable ids for devices, so a peer's claim survives a re-enumeration.
     offers: cursio_usb::DeviceOffers,
-    /// Streams handed out, so URBs can be routed back to a bus id.
-    streams: HashMap<UsbStreamId, String>,
+    /// Streams handed out, and the socket carrying each one's URBs.
+    streams: HashMap<UsbStreamId, ServedStream>,
     next_stream: u64,
+    /// Streams the kernel closed, reported after their last bytes.
+    ended: Vec<UsbStreamId>,
+}
+
+/// One device being served over a socket the kernel holds the far end of.
+#[cfg(all(feature = "usb", target_os = "linux"))]
+struct ServedStream {
+    busid: String,
+    /// Our end of the pair. Dropping it closes the kernel's end, which is what
+    /// ends the export — so this must live exactly as long as the attachment.
+    pipe: cursio_usb::KernelPipe,
 }
 
 #[cfg(all(feature = "usb", target_os = "linux"))]
@@ -345,6 +428,7 @@ impl LinuxUsbBackend {
             offers: cursio_usb::DeviceOffers::new(),
             streams: HashMap::new(),
             next_stream: 1,
+            ended: Vec::new(),
         }
     }
 
@@ -383,9 +467,30 @@ impl UsbBackend for LinuxUsbBackend {
             backend_error_to_wire(&e)
         })?;
 
+        // The socket the kernel serves this device over. Made after the bind
+        // because `usbip_sockfd` does not exist until then.
+        let (pipe, kernel_end) = cursio_usb::KernelPipe::new().map_err(|e| {
+            self.exporter.unexport(&busid);
+            backend_error_to_wire(&e)
+        })?;
+        if let Err(e) = self
+            .exporter
+            .serve(&busid, std::os::fd::AsRawFd::as_raw_fd(&kernel_end))
+        {
+            // Nothing is serving, so leaving the device bound would strand it:
+            // taken from its own driver and given to nobody.
+            self.exporter.unexport(&busid);
+            tracing::warn!(%device, busid, error = %e, "cannot hand the socket to the kernel");
+            return Err(backend_error_to_wire(&e));
+        }
+        // The kernel `dup`s the descriptor, so ours has done its job. Holding
+        // it would keep a second reference alive and make the close that ends
+        // the export do nothing.
+        drop(kernel_end);
+
         let stream = UsbStreamId(self.next_stream);
         self.next_stream += 1;
-        self.streams.insert(stream, busid);
+        self.streams.insert(stream, ServedStream { busid, pipe });
         Ok(stream)
     }
 
@@ -393,22 +498,44 @@ impl UsbBackend for LinuxUsbBackend {
         let Some(busid) = self.offers.busid(device).map(str::to_string) else {
             return;
         };
-        self.streams.retain(|_, held| held != &busid);
+        // Dropping the pipe closes the kernel's end, which is what stops the
+        // export; the explicit `-1` is for the case where the kernel is slower
+        // to notice than the unbind that follows.
+        self.streams.retain(|_, served| served.busid != busid);
+        let _ = self.exporter.stop_serving(&busid);
         self.exporter.unexport(&busid);
     }
 
-    fn feed(&mut self, stream: UsbStreamId, _bytes: &[u8]) -> Result<(), UsbError> {
-        // Milestone 6 in `docs/usb-design.md`. The device is exported and the
-        // kernel is willing; what is missing is the local USB/IP socket that
-        // carries URBs between it and this stream. Refusing names the gap
-        // rather than dropping transfers into silence, which would look like a
-        // device that attaches and then does nothing.
-        match self.streams.contains_key(&stream) {
-            true => Err(UsbError::Backend(
-                "carrying urbs is not implemented yet".into(),
-            )),
-            false => Err(UsbError::Gone),
+    fn feed(&mut self, stream: UsbStreamId, bytes: &[u8]) -> Result<(), UsbError> {
+        let Some(served) = self.streams.get_mut(&stream) else {
+            return Err(UsbError::Gone);
+        };
+        served.pipe.write(bytes).map_err(|e| {
+            tracing::warn!(stream = stream.0, error = %e, "cannot hand urbs to the kernel");
+            backend_error_to_wire(&e)
+        })
+    }
+
+    fn collect(&mut self, out: &mut Vec<(UsbStreamId, Vec<u8>)>) {
+        let mut chunks = Vec::new();
+        for (stream, served) in &mut self.streams {
+            chunks.clear();
+            match served.pipe.drain(&mut chunks) {
+                Ok(()) => {}
+                // Recorded rather than acted on here: the bytes drained above
+                // are the end of a transfer and must be sent before the detach.
+                Err(cursio_usb::PipeEnded) => self.ended.push(*stream),
+            }
+            out.extend(chunks.drain(..).map(|bytes| (*stream, bytes)));
         }
+    }
+
+    fn ended(&mut self) -> Vec<UsbStreamId> {
+        let ended = std::mem::take(&mut self.ended);
+        for stream in &ended {
+            self.streams.remove(stream);
+        }
+        ended
     }
 }
 
@@ -502,6 +629,10 @@ mod tests {
         feed_fails: Option<UsbError>,
         fed: Vec<(UsbStreamId, Vec<u8>)>,
         next_stream: u64,
+        /// What the local kernel has produced, for the next `collect`.
+        produced: Vec<(UsbStreamId, Vec<u8>)>,
+        /// Streams the kernel has closed, for the next `ended`.
+        closed: Vec<UsbStreamId>,
     }
 
     impl FakeBackend {
@@ -541,6 +672,14 @@ mod tests {
 
         fn unexport(&mut self, device: UsbDeviceId) {
             self.exported.retain(|d| *d != device);
+        }
+
+        fn collect(&mut self, out: &mut Vec<(UsbStreamId, Vec<u8>)>) {
+            out.append(&mut self.produced);
+        }
+
+        fn ended(&mut self) -> Vec<UsbStreamId> {
+            std::mem::take(&mut self.closed)
         }
 
         fn feed(&mut self, stream: UsbStreamId, bytes: &[u8]) -> Result<(), UsbError> {
@@ -770,5 +909,63 @@ mod tests {
         e.announced = true;
         e.on_claim(UsbDeviceId(1), "adb");
         assert!(!e.announced, "the listing is stale once a device is taken");
+    }
+
+    /// The kernel closing a stream is not something the holder can see: its own
+    /// kernel is left waiting on URBs that will never complete, and every
+    /// program touching the device hangs until it is told.
+    #[test]
+    fn a_stream_the_kernel_closed_detaches_the_holder() {
+        let mut e = engine(&[1]);
+        e.on_claim(UsbDeviceId(1), "adb");
+        let stream = match taken(&mut e).as_slice() {
+            [UsbMsg::Claimed { stream, .. }] => *stream,
+            other => panic!("expected a grant, got {other:?}"),
+        };
+
+        e.end_stream(stream);
+
+        assert!(matches!(
+            taken(&mut e).as_slice(),
+            [UsbMsg::Detached { device, error: Some(UsbError::Unplugged), .. }]
+                if *device == UsbDeviceId(1)
+        ));
+        assert!(
+            e.attached.is_empty(),
+            "the device must not stay recorded as held"
+        );
+    }
+
+    /// The listing carries the holder, so it is stale the moment a stream ends
+    /// — otherwise every other peer keeps showing the device as taken.
+    #[test]
+    fn a_closed_stream_schedules_a_fresh_listing() {
+        let mut e = engine(&[1]);
+        e.on_claim(UsbDeviceId(1), "adb");
+        let stream = match taken(&mut e).as_slice() {
+            [UsbMsg::Claimed { stream, .. }] => *stream,
+            other => panic!("expected a grant, got {other:?}"),
+        };
+        e.announced = true;
+
+        e.end_stream(stream);
+        assert!(!e.announced);
+    }
+
+    /// A stream that ended twice — a close racing a release — must not detach a
+    /// device somebody has since claimed again.
+    #[test]
+    fn ending_an_unknown_stream_changes_nothing() {
+        let mut e = engine(&[1]);
+        e.on_claim(UsbDeviceId(1), "adb");
+        let _ = taken(&mut e);
+
+        e.end_stream(UsbStreamId(9999));
+
+        assert!(
+            taken(&mut e).is_empty(),
+            "nothing to say about a dead stream"
+        );
+        assert_eq!(e.attached.len(), 1, "the live attach must survive");
     }
 }
