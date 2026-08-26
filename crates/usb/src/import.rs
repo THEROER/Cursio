@@ -212,7 +212,13 @@ impl Importer {
                         vhci: self.vhci.clone(),
                     });
                 }
-                // Another process claimed it between the listing and the write.
+                // Only a *busy* port is worth trying the next one for. Every
+                // other failure is a property of the machine, identical on all
+                // sixteen ports — retrying turned one refused attach into
+                // sixteen log lines saying the wrong thing ("port taken" for
+                // what was really "needs root").
+                Err(e @ UsbBackendError::NeedsPrivilege(_)) => return Err(e),
+                Err(e @ UsbBackendError::DriverMissing(_)) => return Err(e),
                 Err(e) => {
                     tracing::debug!(port, error = %e, "vhci port taken; trying the next");
                     last = Some(e);

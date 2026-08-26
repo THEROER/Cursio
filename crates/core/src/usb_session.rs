@@ -163,6 +163,14 @@ pub struct UsbEngine {
     offered: Vec<UsbDevice>,
     /// When the refused devices were last retried.
     last_retry: Option<std::time::Instant>,
+    /// Peer devices this machine could not present, and when it last tried.
+    ///
+    /// Without this, a failed attach loops: the release frees the device on the
+    /// peer, the peer re-announces because its listing changed, and the fresh
+    /// listing asks again — several times a second, forever. The failures worth
+    /// retrying at all (a missing module gets loaded, a permission granted) are
+    /// slow, so they wait for [`RETRY_INTERVAL`] like any other refusal.
+    failed: HashMap<UsbDeviceId, std::time::Instant>,
 }
 
 impl UsbEngine {
@@ -178,6 +186,7 @@ impl UsbEngine {
             asking: std::collections::HashSet::new(),
             offered: Vec::new(),
             last_retry: None,
+            failed: HashMap::new(),
         }
     }
 
@@ -392,8 +401,20 @@ impl UsbEngine {
         }
 
         self.offered = devices.to_vec();
+        let now = std::time::Instant::now();
         for device in devices {
-            if self.borrowed.contains_key(&device.id) || !self.asking.insert(device.id) {
+            if self.borrowed.contains_key(&device.id) {
+                continue;
+            }
+            // A device this machine already failed to present waits out the
+            // retry interval, whatever the listing says.
+            if let Some(failed_at) = self.failed.get(&device.id) {
+                if now.duration_since(*failed_at) < RETRY_INTERVAL {
+                    continue;
+                }
+                self.failed.remove(&device.id);
+            }
+            if !self.asking.insert(device.id) {
                 continue;
             }
             tracing::info!(
@@ -444,8 +465,11 @@ impl UsbEngine {
             }
             Err(e) => {
                 // Give it straight back rather than leaving the peer believing
-                // this machine holds a device it never managed to present.
+                // this machine holds a device it never managed to present —
+                // and remember the failure, or the release re-announces the
+                // listing and the next one asks again immediately.
                 tracing::warn!(peer = %self.peer_name, %device, %e, "cannot attach peer device");
+                self.failed.insert(device, std::time::Instant::now());
                 self.outbound.push(UsbMsg::Release { device });
             }
         }
@@ -1077,6 +1101,9 @@ mod tests {
         attaches: bool,
         /// Peer devices this backend was told to present locally.
         borrowed: Vec<(UsbDeviceId, UsbStreamId)>,
+        /// Whether presenting a peer device should fail, as it does on a
+        /// machine whose `vhci-hcd` refuses without root.
+        attach_fails: bool,
     }
 
     impl FakeBackend {
@@ -1127,6 +1154,9 @@ mod tests {
         }
 
         fn attach(&mut self, device: UsbDeviceId, stream: UsbStreamId) -> Result<(), UsbError> {
+            if self.attach_fails {
+                return Err(UsbError::NeedsPrivilege);
+            }
             self.borrowed.push((device, stream));
             Ok(())
         }
@@ -1544,6 +1574,64 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, UsbMsg::Claim { device, .. } if *device == UsbDeviceId(1))),
             "a refused device must eventually be asked for again"
+        );
+    }
+
+    /// The loop this cost a flood of log lines to find: a failed attach
+    /// releases the device, the release re-announces the peer's listing
+    /// because it changed, and the fresh listing asks again — several times a
+    /// second, forever. A failure must be remembered, not just reported.
+    #[test]
+    fn a_device_that_could_not_be_attached_is_not_asked_for_again_at_once() {
+        let backend = FakeBackend {
+            attaches: true,
+            attach_fails: true,
+            ..FakeBackend::with(&[])
+        };
+        let mut e = UsbEngine::new("laptop".into(), peer(1), Box::new(backend));
+
+        e.on_devices(&[offered(1)]);
+        let _ = taken(&mut e);
+        e.on_claimed(UsbDeviceId(1), UsbStreamId(7));
+        // The engine hands it back rather than pretending to hold it.
+        assert!(taken(&mut e)
+            .iter()
+            .any(|m| matches!(m, UsbMsg::Release { device } if *device == UsbDeviceId(1))));
+
+        // The peer re-announces because its listing changed. This must not
+        // start the cycle again.
+        e.on_devices(&[offered(1)]);
+        assert!(
+            taken(&mut e).is_empty(),
+            "asked again immediately after failing"
+        );
+    }
+
+    /// But the failure is not permanent: a module gets loaded, a permission
+    /// granted. After the interval the device is worth another try.
+    #[test]
+    fn a_failed_attach_is_retried_once_the_interval_passes() {
+        let backend = FakeBackend {
+            attaches: true,
+            attach_fails: true,
+            ..FakeBackend::with(&[])
+        };
+        let mut e = UsbEngine::new("laptop".into(), peer(1), Box::new(backend));
+        e.on_devices(&[offered(1)]);
+        let _ = taken(&mut e);
+        e.on_claimed(UsbDeviceId(1), UsbStreamId(7));
+        let _ = taken(&mut e);
+
+        e.failed.insert(
+            UsbDeviceId(1),
+            std::time::Instant::now() - RETRY_INTERVAL * 2,
+        );
+        e.on_devices(&[offered(1)]);
+        assert!(
+            taken(&mut e)
+                .iter()
+                .any(|m| matches!(m, UsbMsg::Claim { device, .. } if *device == UsbDeviceId(1))),
+            "a failure must not be permanent"
         );
     }
 
