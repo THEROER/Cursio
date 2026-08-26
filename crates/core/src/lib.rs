@@ -20,6 +20,7 @@ pub mod elevate;
 /// outright), so on a platform with neither the module runs one-way and logs
 /// why.
 pub mod files_session;
+pub mod firewall;
 pub mod identity;
 /// Bringing a link up to the point a session can start: handshake, pairing,
 /// encryption, module negotiation. Shared by the CLI and the app, desktop and
@@ -28,6 +29,7 @@ pub mod link;
 pub mod logging;
 pub mod mesh;
 pub mod module;
+pub mod node_status;
 pub mod registry;
 pub mod service_session;
 pub mod session;

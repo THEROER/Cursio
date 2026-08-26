@@ -28,6 +28,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
+use cursio_core::node_status::NodeStatusMonitor;
 use cursio_core::session::{self};
 use cursio_core::NodeIdentity;
 use cursio_protocol::{Fitness, PeerId, Quality, ServiceId, ServiceOffer};
@@ -1049,6 +1050,7 @@ async fn run_mesh(
         listener,
         _announcement,
         capture,
+        status,
     } = start_node(&identity, port, send_input).await?;
 
     // One registry for the whole process, shared by every session. Sessions are
@@ -1120,6 +1122,7 @@ async fn run_mesh(
                             registry.clone(),
                             pairing.clone(),
                             capture.clone(),
+                            status.clone(),
                             position,
                             modules.clone(),
                             offer,
@@ -1188,6 +1191,7 @@ async fn run_mesh(
                                     registry.clone(),
                                     pairing.clone(),
                                     capture.clone(),
+                                    status.clone(),
                                     position,
                                     modules.clone(),
                                     offer,
@@ -1226,6 +1230,7 @@ async fn run_mesh(
                                 registry.clone(),
                                 pairing.clone(),
                                 capture.clone(),
+                                status.clone(),
                                 position,
                                 modules.clone(),
                                 offer,
@@ -1332,6 +1337,9 @@ fn spawn_peer_session(
     // resource (one portal permission, one grab), so sessions take turns on it
     // rather than each building their own. See [`PersistentCapture`].
     capture: SharedCapture,
+    // Machine-wide too, and for the same reason: every link greets with the
+    // same reading, and every link should announce the same change.
+    status: SharedNodeStatus,
     // Where this machine stands, from which the edge to each peer is derived.
     position: cursio_protocol::Position,
     // Shared rather than cloned: the registry is built once per process and read
@@ -1395,6 +1403,7 @@ fn spawn_peer_session(
             role,
             false,
             capture_for_session,
+            &status,
             position,
             &modules,
             offer,
@@ -1442,6 +1451,9 @@ async fn run_pairing_and_session(
     // Capture is created ONCE by the caller and lent to each peer session — see
     // [`PersistentCapture`] for why it must not be rebuilt per connection.
     capture: Option<&mut PersistentCapture>,
+    // Machine-wide power/network state: greeted with, then polled by the
+    // session loop so a change reaches every peer.
+    status: &SharedNodeStatus,
     // Where this machine stands. The edge to *this* peer is derived from it and
     // the peer's own position during the handshake — both the cursor handoff
     // and the window-drag trigger read that answer back off the link.
@@ -1463,6 +1475,7 @@ async fn run_pairing_and_session(
         registry: modules,
         position,
         service: offer,
+        status: status.borrow().current(),
         sends_input: capture.is_some(),
     };
     let identified = cursio_core::link::identify(transport, &plan).await?;
@@ -1477,7 +1490,21 @@ async fn run_pairing_and_session(
     // between us. This is what replaced `--peer-edge`: both machines already
     // know, and the flag only existed because the barrier had to be armed
     // before anyone had spoken.
-    cursio_input::set_peer_edge(link.peer_edge);
+    //
+    // A peer that borders no edge is passed over rather than applied. The
+    // watched edge is machine-wide — one mouse, one way out — so writing
+    // `None` for one peer takes the barrier down for *every* peer, and the
+    // last machine to connect decided the answer for all of them. Live, a
+    // third node started with only `--files` and placed at the same grid
+    // position as this one arrived after the neighbour and unwatched its edge:
+    // the cursor stopped crossing to a machine that was still there, still
+    // bordering, and still expecting it.
+    //
+    // A node that has no edge to offer has nothing to say about where the
+    // cursor leaves by, and silence is the honest answer.
+    if link.peer_edge.is_some() {
+        cursio_input::set_peer_edge(link.peer_edge);
+    }
 
     let peer = link.peer;
     let mut secure = link.transport;
@@ -1535,6 +1562,11 @@ async fn run_pairing_and_session(
     let release_ref = injector.clone();
     let grab_ref = grab.clone();
     let cursor_ref = cursor.clone();
+    // Level with the reading the greeting carried, so this link announces only
+    // what changes from here — and shares the monitor with every other session,
+    // so a change reaches all of them.
+    let status_ref = status.clone();
+    let mut status_cursor = status_ref.borrow().cursor();
     let result = session::run_session(
         secure,
         cursor_setup,
@@ -1615,6 +1647,7 @@ async fn run_pairing_and_session(
             tracing::info!(active = ownership.active, "ownership changed");
         },
         modules,
+        move || status_ref.borrow_mut().poll(&mut status_cursor),
     )
     .await;
 
@@ -2009,7 +2042,17 @@ struct NodeBase {
     /// Kept alive purely for its `Drop`: dropping it withdraws the mDNS record.
     _announcement: discovery::Announcement,
     capture: SharedCapture,
+    status: SharedNodeStatus,
 }
+
+/// This machine's power/network state, shared between concurrent sessions.
+///
+/// One monitor per machine, not per link: the readings are machine-wide, and a
+/// node bringing up four links would otherwise probe sysfs four times to learn
+/// the same number — and could report four different answers if a poll landed
+/// mid-change. `Rc<RefCell<_>>` for the same reason as [`SharedCapture`]:
+/// sessions are `!Send` and never leave this thread.
+type SharedNodeStatus = std::rc::Rc<std::cell::RefCell<NodeStatusMonitor>>;
 
 /// Bind, announce on the LAN, and bring up input capture.
 async fn start_node(
@@ -2020,6 +2063,12 @@ async fn start_node(
     let listener = TcpListenerHandle::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
     let bound = listener.local_addr();
     tracing::info!(%bound, "listening for peers");
+
+    // Being reachable is not the same as being bound. On Windows the firewall
+    // decides, and its own prompt opens the wrong protocol here — see
+    // `cursio_core::firewall`. Done with the port that was actually bound, so a
+    // node started on a different one opens that.
+    cursio_core::firewall::allow_mesh_port(bound.port());
 
     // Announce ourselves so other nodes can find us. Pin mDNS to the real LAN
     // interface so VPN/virtual interfaces don't break it.
@@ -2044,10 +2093,18 @@ async fn start_node(
     let capture: SharedCapture =
         std::rc::Rc::new(std::cell::RefCell::new(make_persistent_capture(send_input)));
 
+    // Read once here rather than per link, for the same reason capture is
+    // built once: the answer is machine-wide. The first reading rides every
+    // greeting; changes are announced from the session loop.
+    let status: SharedNodeStatus =
+        std::rc::Rc::new(std::cell::RefCell::new(NodeStatusMonitor::new()));
+    tracing::info!(status = %status.borrow().current(), "local node status");
+
     Ok(NodeBase {
         listener,
         _announcement: announcement,
         capture,
+        status,
     })
 }
 

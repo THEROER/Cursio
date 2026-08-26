@@ -61,6 +61,10 @@ pub struct Handshake<'a> {
     pub position: cursio_protocol::Position,
     /// What this machine can carry for the mesh, and what it wants from it.
     pub service: cursio_protocol::ServiceOffer,
+    /// This machine's power and network state as the link comes up. Read once
+    /// here rather than per link: a node brings several links up at the same
+    /// moment, and re-probing sysfs for each would report the same answer.
+    pub status: cursio_protocol::NodeStatus,
     /// Whether this machine has input to send the peer.
     ///
     /// Follow the *capture*, not a command-line flag: capture is one
@@ -128,6 +132,7 @@ where
         &advertised,
         plan.position,
         plan.service,
+        plan.status,
     )
     .await?;
     // Derived per link, not per process: four machines in a row each border a
@@ -140,6 +145,9 @@ where
         kind = ?peer.device_kind,
         position = ?peer.position,
         ?peer_edge,
+        // Empty for a peer that reports nothing, which is what an older build
+        // and a platform with no backend both look like.
+        status = %peer.status,
         "handshake ok"
     );
 
@@ -259,6 +267,7 @@ impl Link {
     pub async fn run_as_input_source(
         self,
         input: &mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+        poll_status: impl FnMut() -> Option<cursio_protocol::NodeStatus>,
     ) -> Result<(), SessionError> {
         debug_assert!(
             !self.cursor.start_active,
@@ -273,6 +282,7 @@ impl Link {
             None,
             |_| {},
             self.modules,
+            poll_status,
         )
         .await
     }

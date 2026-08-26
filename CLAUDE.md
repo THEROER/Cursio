@@ -194,9 +194,15 @@ The AES-CTR keystream is continuous for the life of a mirror data connection. Ev
 
 **Reaching the rest of the mesh** is `tap.rs` plus `core/src/airplay_window.rs`. The phone never becomes a peer. The selected host offers its screen through ordinary window transfer; H.264 access units go out untouched and the viewer's surrogate decodes them. The tap retains SPS/PPS for late subscribers. A placement/quality change closes and recreates the surrogate with the newly agreed dimensions.
 
+### Node state is not a module
+
+`NodeStatus` (battery, power source, network kind, Wi-Fi signal) rides `Hello` and is re-sent as `Message::NodeStatus` when it changes. It is deliberately **not** a `SessionModule`: modules are optional and negotiable, but every node has an answer here, and the peer sharing least with us is exactly the one whose "about to vanish" is worth knowing. Every field is `Option` and `None` means *cannot say*, never zero — a missing battery rendered as 0% would show every desktop as flat. The wire is event-driven (sent on change); the *reading* is a 30 s poll, because no platform offers one event source covering power and network both. One monitor per machine with a generation per reading, one cursor per link: the machine changes, not the link, so every peer must hear it exactly once. See `docs/mesh-design.md`.
+
+This is the second class of thing on the channel — **state and events of a device**, as opposed to a stream of data between machines. Notifications and media control belong to it too. Adding to that class is fine; conflating it with the module story is not.
+
 ### Wire compatibility
 
-Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 15) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
+Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 17) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
 
 ### Native and tooling directories
 

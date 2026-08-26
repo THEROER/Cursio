@@ -57,6 +57,9 @@ windows = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_System_Registry",
     "Win32_UI_WindowsAndMessaging",
+    # GetSystemPowerStatus — battery level and mains state for `NodeStatus`,
+    # in one call that needs neither WMI nor a COM apartment.
+    "Win32_System_Power",
 ] }
 
 [dev-dependencies]

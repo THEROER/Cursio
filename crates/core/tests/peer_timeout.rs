@@ -51,6 +51,8 @@ async fn silent_peer_times_out_instead_of_hanging() {
         None,
         |_| {},
         Vec::new(),
+        // Liveness only: nothing here watches the machine's power or network.
+        || None,
     )
     .await;
 

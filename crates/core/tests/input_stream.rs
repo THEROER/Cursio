@@ -64,6 +64,7 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
             None,
             |_| {},
             Vec::new(),
+            || None,
         )
         .await;
         // The client ends by dropping the link, so PeerLeft or a transport
@@ -120,6 +121,7 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
                 Some(&mut cmd_rx),
                 |_| {},
                 Vec::new(),
+                || None,
             ),
         )
         .await;

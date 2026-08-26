@@ -13,6 +13,7 @@ pub mod clipboard;
 pub mod files;
 pub mod frame;
 pub mod input;
+pub mod node;
 pub mod service;
 pub mod usb;
 pub mod window;
@@ -38,6 +39,7 @@ pub use files::{
 };
 pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
 pub use input::{neighbour_across, Edge, InputEvent, MouseButton, Position};
+pub use node::{NetworkKind, NodeStatus, PowerSource};
 pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{
     Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
@@ -57,8 +59,11 @@ pub use window::{
 /// [`Message::Module`], which is what makes it real — a new module now adds no
 /// variant here at all. v14 added [`Hello::position`], which every node must
 /// read to work out which of its edges faces which peer. v15 added
-/// [`Hello::service`] so placement and quality are agreed across the mesh.
-pub const PROTOCOL_VERSION: u16 = 15;
+/// [`Hello::service`] so placement and quality are agreed across the mesh. v17
+/// added [`Hello::status`] and [`Message::NodeStatus`], which every node both
+/// reports and reads — it is not a module precisely so that it cannot be
+/// negotiated away.
+pub const PROTOCOL_VERSION: u16 = 17;
 
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
@@ -102,6 +107,19 @@ pub enum Message {
 
     /// Graceful shutdown notice. The sender is closing the session.
     Bye,
+
+    /// The sender's [`NodeStatus`] changed since the greeting.
+    ///
+    /// Sent on change rather than polled: battery level drifts slowly, but the
+    /// switch to discharging — or onto a metered link — is what a peer acts on,
+    /// and it happens between any two polls. [`NodeStatus`] itself decides what
+    /// counts as a change worth sending, so a level ticking down one point a
+    /// minute does not become a frame a minute.
+    ///
+    /// Not a [`Module`](Message::Module): every node has an answer here, and a
+    /// peer sharing only files is exactly the one whose battery is worth
+    /// knowing. Making it a module would mean it could be negotiated away.
+    NodeStatus(node::NodeStatus),
 
     /// An opaque byte payload the protocol layer doesn't interpret.
     ///
@@ -234,6 +252,15 @@ pub struct Hello {
     /// settled the moment two machines meet: a round trip later is a window in
     /// which both of them, or neither, are running it. See [`ServiceOffer`].
     pub service: ServiceOffer,
+    /// What this node is *doing* — battery, power source, network — as opposed
+    /// to what it can do.
+    ///
+    /// In the greeting so a peer knows the moment they meet, and re-sent as
+    /// [`Message::NodeStatus`] whenever it changes. Every field inside is
+    /// optional; an older peer's greeting decodes to
+    /// [`NodeStatus::unknown`], which reads as "no information" rather than as
+    /// a flat battery. See [`node`].
+    pub status: NodeStatus,
 }
 
 impl Hello {
@@ -251,6 +278,7 @@ impl Hello {
             modules: Vec::new(),
             position: Position::default(),
             service: ServiceOffer::none(),
+            status: NodeStatus::unknown(),
         }
     }
 }
@@ -289,7 +317,12 @@ impl Message {
             | Message::Heartbeat { .. }
             | Message::Bye
             | Message::Grab { .. }
-            | Message::CrossEdge { .. } => Priority::Control,
+            | Message::CrossEdge { .. }
+            // Rare and a few bytes, but the reason it exists is to arrive
+            // before the peer acts on stale state — a node announcing it just
+            // went critical while queued behind a file transfer has said
+            // nothing useful.
+            | Message::NodeStatus(_) => Priority::Control,
 
             // The pointer/keyboard. The one thing that must never feel laggy.
             Message::Input(_) | Message::WindowInput(_) => Priority::Input,
@@ -375,6 +408,21 @@ impl Message {
 pub enum Priority {
     /// Bulk, latency-tolerant: clipboard/file payloads. Drained last.
     Bulk,
+    /// Small requests something is blocked on: a `stat`, a directory listing,
+    /// an open.
+    ///
+    /// Above [`Priority::Bulk`] because the two are not the same kind of
+    /// traffic even when they belong to the same module. A file chunk is
+    /// 256 KiB and nothing waits on any particular one; a `stat` is tens of
+    /// bytes and a process is asleep in a filesystem call until it is answered.
+    /// Sharing one class meant that question waited out every chunk already
+    /// queued — an `ls` during a copy stalled for as long as the queue was
+    /// deep, which is what a mount reports to its caller as a hung drive.
+    ///
+    /// Below [`Priority::Video`] because it has no frame rate to keep, and the
+    /// volume is self-limiting: these messages are small, and each answers a
+    /// caller that cannot ask again until it has its answer.
+    Metadata,
     /// Streamed window pixels.
     Video,
     /// Audio streams.
@@ -414,6 +462,12 @@ mod tests {
                 fitness: Fitness::Full,
                 wanted: Some(Quality::new(2560, 1440, 30)),
                 show_window: true,
+            },
+            status: NodeStatus {
+                battery_percent: Some(67),
+                power: Some(node::PowerSource::Battery),
+                network: Some(NetworkKind::Wifi),
+                signal_dbm: Some(-48),
             },
         });
         let bytes = msg.to_bytes().unwrap();

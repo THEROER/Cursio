@@ -140,6 +140,57 @@ direction. Left unset, every machine sits at `0,0`, where nothing borders
 anything and the hotkey is the only handoff. The reasoning behind grid
 coordinates rather than "left"/"right" is in `input-design.md`.
 
+## What a machine *is doing*
+
+`ModuleAdvert` says a node has audio; `DeviceKind` says it is a laptop. Neither
+says the laptop is at 9% and about to disappear, or that the desktop everything
+routes through has moved onto a phone hotspot. That is **state**: it changes
+while a session is up, and nothing on the wire carried it.
+
+`NodeStatus` (`protocol/src/node.rs`) does — battery level, power source,
+network kind, Wi-Fi signal. It rides `Hello` and is re-sent as
+`Message::NodeStatus` on change.
+
+**It is not a module, deliberately.** Every other subsystem is one because it is
+optional: a machine with no clipboard backend simply does not advertise
+clipboard. But every node has *some* answer to "are you on battery" — even if
+that answer is "no battery, I am a desktop" — and the peers whose state is most
+worth knowing are the ones sharing least with us. A module could be negotiated
+away, and then a peer running only files could not be asked whether it is about
+to vanish.
+
+**Every field is `Option`, and absence is never zero.** A desktop has no
+battery; a kernel may not expose one; a container has no Wi-Fi to ask about.
+`None` means "this node cannot say". A peer rendering a missing battery as 0%
+would show every desktop in the mesh as flat, and the mesh would route work away
+from machines that were fine. The rule in the platform layer is the same:
+**never substitute a plausible default for a failed read.**
+
+**Sent on change, read by polling.** No interval is right for a poll on the
+wire: battery percentage moves once a minute, but the switch to *discharging* is
+the moment a peer cares and it falls between any two polls. Reading, on the
+other hand, is polled — neither Linux nor Windows offers one event source
+covering power *and* network, and four subscriptions (two needing a message loop
+or a COM apartment) to learn a handful of integers costs more than reading a few
+sysfs files every 30 s. `differs_meaningfully_from` decides what is worth
+saying, so a plugged-in desktop sends nothing for the life of a session:
+percentage is compared in 5% steps and Wi-Fi signal in bars, while a change of
+power source or network kind is never rate-limited away.
+
+**One monitor per machine, one cursor per link.** A node holds a link to every
+peer and each session polls the same monitor, so a plain "changed since last
+poll" flag would be consumed by whichever session polled first and no other peer
+would ever hear it — the machine changed, not the link. Each reading therefore
+carries a generation and each session remembers the last it sent, so a change
+reaches every peer exactly once and a link that comes up later just greets with
+the current reading.
+
+Nothing routes by this yet; it is logged. The point of carrying it now is that
+placement decisions already exist (`ServiceOffer`/`Fitness` rank nodes for
+AirPlay) and have been ranking machines without knowing which of them is running
+out of power. A laptop below 15% and discharging is `is_power_critical`; a peer
+on cellular `is_metered`. Those are the questions the mesh will ask.
+
 ## Where it lives
 
 All five parts shipped, and the code is laid out along the same seams:
@@ -151,6 +202,7 @@ All five parts shipped, and the code is laid out along the same seams:
 | Identity-derived roles | `CursorSetup::negotiate` — `session.rs` |
 | Peer registry | `PeerState`, `should_dial` — `registry.rs` |
 | N sessions | one task per peer, supervised by the registry |
+| Node state | `NodeStatus` — `protocol/src/node.rs`; reading it — `core/src/node_status.rs` |
 
 `PeerState` gained a third state the original design did not name: `Connecting`,
 so the supervisor does not start a second attempt for a peer that already has one
