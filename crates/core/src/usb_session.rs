@@ -963,7 +963,7 @@ impl UsbBackend for WindowsUsbBackend {
 
         // The device is shared; now open the connection that will carry its
         // transfers. Loopback only — see `cursio_usb::wintunnel`.
-        let tunnel = cursio_usb::WinTunnel::connect().map_err(|e| {
+        let tunnel = cursio_usb::WinTunnel::connect(&busid).map_err(|e| {
             self.usbipd.unbind(&busid);
             tracing::warn!(%device, busid, error = %e, "cannot reach the local usbipd server");
             backend_error_to_wire(&e)
