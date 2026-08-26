@@ -259,8 +259,13 @@ already knows every peer and survives their coming and going.
 ### Linux
 
 Both halves are in mainline: `usbip-host` to export, `vhci-hcd` to import,
-driven through sysfs. Present but unloaded on the development machine (kernel
-6.17; `/usr/bin/usbip` from `linux-tools-common`).
+driven through sysfs. Verified on the development machine (kernel 6.17): both
+modules load, `vhci-hcd` offers 16 ports, and the `status` format the port
+parser reads is the one documented below.
+
+The first field of a `status` line is the hub's speed class (`hs`), **not** the
+port number — reading it as the port makes every line unparseable and so every
+port busy, which surfaces as "no free port" rather than as a wrong answer.
 
 Two facts shape the backend:
 
