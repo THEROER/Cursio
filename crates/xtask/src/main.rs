@@ -9,8 +9,9 @@
 //! - `windows` — cross-compile the `.exe`s from Linux (mingw), no Windows box.
 //! - `logs`    — print the log directory (and `tail -f` it with `--follow`).
 //!
-//! Android is declared but not wired up yet; it prints what's missing instead
-//! of pretending to work.
+//! - `android` — cross-compile the mesh core for arm64 (needs the NDK and
+//!   cargo-ndk). The core only: the platform modules each need an Android
+//!   backend before they can be switched on.
 //!
 //! Run `cargo xtask <cmd> --help` for flags.
 
@@ -170,8 +171,12 @@ enum Command_ {
     },
     /// Build the supported macOS binaries. Alias for `build macos`.
     Macos,
-    /// Android build (future — prints what's needed).
-    Android,
+    /// Cross-compile the mesh core for Android (arm64). Needs the NDK.
+    Android {
+        /// Build without optimizations.
+        #[arg(long)]
+        debug: bool,
+    },
     /// Print the log directory; with --follow, tail the current log.
     Logs {
         /// `tail -f` the newest log file instead of just printing the path.
@@ -229,7 +234,7 @@ fn main() -> Result<()> {
         } => run_task(!debug, bin, once, &args),
         Command_::Windows { debug } => windows(!debug),
         Command_::Macos => macos(),
-        Command_::Android => android(),
+        Command_::Android { debug } => android(!debug),
         Command_::Logs { follow } => logs(follow),
     }
 }
@@ -540,11 +545,90 @@ fn macos() -> Result<()> {
     build(true, None, None)
 }
 
-fn android() -> Result<()> {
+/// Rust target for 64-bit Android, the only ABI worth shipping to a phone.
+const ANDROID_TARGET: &str = "aarch64-linux-android";
+
+/// The NDK's name for that ABI, which is what `cargo-ndk` and Gradle use.
+const ANDROID_ABI: &str = "arm64-v8a";
+
+/// Minimum Android API level this builds against.
+///
+/// 26 (Oreo) is where the notification channels and foreground-service model
+/// the mesh needs actually exist. Nothing here targets older, and raising it
+/// costs devices rather than buying anything.
+const ANDROID_API: &str = "26";
+
+/// Build the mesh core as a native library for a phone.
+///
+/// This is the *core only* — `cursio-core` with no default features. That is
+/// not a limitation of the build but a statement about the layering: identity,
+/// link, session, mesh, registry and node status depend on no platform crate,
+/// so they cross to Android untouched. The platform modules do not follow
+/// automatically; each needs an Android backend before its feature can be
+/// switched on here (PipeWire, FUSE and an AirPlay receiver do not exist on a
+/// phone, so their desktop implementations never will be).
+fn android(release: bool) -> Result<()> {
+    ensure_rust_target(ANDROID_TARGET)?;
+
+    which("cargo-ndk").with_context(|| {
+        "cargo-ndk not found. Install it with:\n  \
+         cargo install cargo-ndk\n\
+         (it points the NDK's clang, ar and sysroot at the right API level; \
+         without it cmake and cc guess a toolchain that does not exist)"
+            .to_string()
+    })?;
+
+    // The NDK ships its own clang and sysroot; nothing here can be built with
+    // the host's. Both spellings are in circulation — Android Studio sets the
+    // first, most CI images the second.
+    let ndk = ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"]
+        .iter()
+        .find_map(|k| std::env::var_os(k).map(PathBuf::from))
+        .with_context(|| {
+            "ANDROID_NDK_HOME is not set.\n\
+             Install the NDK through Android Studio (SDK Manager → SDK Tools → \
+             NDK) or from https://developer.android.com/ndk/downloads, then:\n  \
+             export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/<version>"
+                .to_string()
+        })?;
+    if !ndk.join("toolchains/llvm/prebuilt").is_dir() {
+        bail!(
+            "{} does not look like an NDK: it has no toolchains/llvm/prebuilt.\n\
+             Point ANDROID_NDK_HOME at a versioned NDK directory, not at the SDK.",
+            ndk.display()
+        );
+    }
+
+    let profile = if release { "release" } else { "debug" };
+    println!("→ building the mesh core for Android {ANDROID_ABI} ({profile})");
+
+    let mut cmd = cargo();
+    cmd.arg("ndk");
+    cmd.args(["-t", ANDROID_ABI]);
+    cmd.args(["--platform", ANDROID_API]);
+    cmd.arg("build");
+    if release {
+        cmd.arg("--release");
+    }
+    cmd.args(["-p", "cursio-core"]);
+    // The library only: `cursio` is a desktop CLI (it drives capture, mounts
+    // and an AirPlay receiver), and a phone has no terminal to run it from.
+    cmd.arg("--lib");
+    // Every platform module off. Turning one on here without an Android
+    // backend behind it does not fail at the feature — it fails deep inside
+    // PipeWire or FUSE, which is a much worse error to read.
+    cmd.arg("--no-default-features");
+    cmd.env("ANDROID_NDK_HOME", &ndk);
+    run(cmd)?;
+
+    let lib = PathBuf::from("target")
+        .join(ANDROID_TARGET)
+        .join(profile)
+        .join("libcursio_core.rlib");
+    println!("✓ {}", lib.display());
     println!(
-        "Android is a future target — no build yet.\n\
-         It'll need the NDK and cargo-ndk, and the input/audio/capture backends \n\
-         ported to Android APIs before there's anything to build."
+        "  Next: a JNI bridge (cdylib) and an Android app to load it. The core \
+         is what had to cross; the modules follow one backend at a time."
     );
     Ok(())
 }

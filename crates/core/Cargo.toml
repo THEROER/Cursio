@@ -6,15 +6,43 @@ edition.workspace = true
 [[bin]]
 name = "cursio"
 path = "src/bin/cursio.rs"
+# The CLI drives every platform module, so it exists only in a build that has
+# them. A phone links the library into an app; there is no terminal to run this
+# from and nothing on Android that `--send-input` could capture.
+required-features = ["desktop"]
+
+# What a build of this crate includes. The default is every desktop subsystem,
+# so a plain `cargo build -p cursio-core` is exactly what it always was.
+#
+# The split exists because the mesh core — identity, link, session, registry,
+# module dispatch, node status — depends on *none* of the platform crates.
+# Nothing in `link.rs`, `session.rs`, `mesh.rs` or `registry.rs` imports one;
+# only the four `*_session.rs` policy files do. Android proves that separation
+# was real rather than aspirational: a phone builds the mesh and the modules it
+# can actually implement, and pulls in neither PipeWire, nor a FUSE mount, nor
+# an AirPlay receiver — none of which exist there.
+#
+# Each feature gates one `*_session.rs` and the platform crate behind it, so a
+# module that is off costs nothing to compile and cannot be negotiated on.
+[features]
+default = ["desktop"]
+desktop = ["audio", "input", "window", "files", "airplay"]
+audio = ["dep:cursio-audio"]
+input = ["dep:cursio-input"]
+window = ["dep:cursio-window"]
+files = ["dep:cursio-files"]
+# AirPlay carries a window back to the mesh, so it cannot be built without the
+# window module to carry it through.
+airplay = ["dep:cursio-airplay", "window"]
 
 [dependencies]
 cursio-protocol.workspace = true
 cursio-transport.workspace = true
-cursio-airplay.workspace = true
-cursio-input.workspace = true
-cursio-audio.workspace = true
-cursio-window.workspace = true
-cursio-files.workspace = true
+cursio-airplay = { workspace = true, optional = true }
+cursio-input = { workspace = true, optional = true }
+cursio-audio = { workspace = true, optional = true }
+cursio-window = { workspace = true, optional = true }
+cursio-files = { workspace = true, optional = true }
 # Compresses file chunks when it pays; see files_session::pack.
 zstd = "0.13"
 # Clipboard sharing: the platform layer (read/write/watch) the session module

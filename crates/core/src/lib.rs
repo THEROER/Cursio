@@ -9,7 +9,18 @@
 //! now this is the layer that proves two machines can find, pair, and hold a
 //! live session.
 
+//! ## What is always here, and what is a feature
+//!
+//! The mesh core — [`identity`], [`link`], [`session`], [`mesh`], [`registry`],
+//! [`module`], [`node_status`] — depends on no platform crate at all. The
+//! `*_session.rs` files are the policy layer on top, and each is gated by the
+//! feature naming its subsystem (all on by default). A phone builds the core
+//! plus the modules it can implement and never compiles PipeWire, a FUSE mount
+//! or an AirPlay receiver, none of which exist there.
+
+#[cfg(feature = "airplay")]
 pub mod airplay_window;
+#[cfg(feature = "audio")]
 pub mod audio_session;
 pub mod clipboard_session;
 /// Windows self-elevation, so injected input isn't blocked by UIPI.
@@ -19,6 +30,7 @@ pub mod elevate;
 /// latter only under MSVC, because `winfsp-sys` rejects every other target
 /// outright), so on a platform with neither the module runs one-way and logs
 /// why.
+#[cfg(feature = "files")]
 pub mod files_session;
 pub mod firewall;
 pub mod identity;
@@ -34,6 +46,7 @@ pub mod registry;
 pub mod service_session;
 pub mod session;
 pub mod usb_session;
+#[cfg(feature = "window")]
 pub mod window_session;
 
 pub use identity::NodeIdentity;

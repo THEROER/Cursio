@@ -22,8 +22,10 @@ cargo fmt -p <pkg>
 Linux native builds need `OPUS_TARGET=ubuntu-24.04_x86_64` (`cargo xtask` sets it; a bare `cargo build` does not). Windows cross-builds need `GSTREAMER_WINDOWS_SYSROOT`.
 
 ```sh
-cargo xtask build | install | macos | windows | logs --follow
+cargo xtask build | install | macos | windows | android | logs --follow
 ```
+
+`cargo xtask android` cross-builds **the mesh core only** for arm64 (`cursio-core --lib --no-default-features`), needing `ANDROID_NDK_HOME` and `cargo install cargo-ndk`. See "Android" below for why that is the whole core and not a subset of it.
 
 Running:
 
@@ -193,6 +195,14 @@ The AES-CTR keystream is continuous for the life of a mirror data connection. Ev
 `--airplay <MODE>` controls participation and requested mesh quality. `on`/`control` is the default, a profile such as `1440p:30fps` raises the mesh request, and `off` steps out of hosting. Window placement is orthogonal: `--airplay-window` is carried to the selected host, which forwards untouched H.264 through the window module when the viewer is another node. `--share-airplay` preserves the explicit broadcast-to-every-peer mode. A selected receiver with no local window uses a discarding sink after decrypting/tapping the access units, so it accepts mirroring without creating a decoder window.
 
 **Reaching the rest of the mesh** is `tap.rs` plus `core/src/airplay_window.rs`. The phone never becomes a peer. The selected host offers its screen through ordinary window transfer; H.264 access units go out untouched and the viewer's surrogate decodes them. The tap retains SPS/PPS for late subscribers. A placement/quality change closes and recreates the surrogate with the newly agreed dimensions.
+
+### Android: the core crosses, the modules do not
+
+`cursio-core`'s platform dependencies are **optional features**, all on by default (`desktop = ["audio", "input", "window", "files", "airplay"]`), so a desktop build is unchanged. `--no-default-features` leaves the mesh core — identity, link, session, mesh, registry, module dispatch, node status — and that builds for `aarch64-linux-android` as-is. Nothing in `link.rs`, `session.rs`, `mesh.rs` or `registry.rs` imports a platform crate; only the four `*_session.rs` policy files do, and each is gated by its feature.
+
+The `cursio` binary is `required-features = ["desktop"]`: it drives capture, mounts and an AirPlay receiver, and a phone has no terminal to run it from.
+
+**Do not switch a module's feature on for Android to "see if it works".** It will not fail at the feature — it fails deep inside PipeWire, FUSE or libopus, which is a far worse error to read. Each module needs an Android backend first. `DeviceKind::Phone`, `ModuleRole::Source`/`Sink` and `session::local_device_kind()`'s `target_os = "android"` arm already exist for that.
 
 ### Node state is not a module
 
