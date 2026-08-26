@@ -48,6 +48,12 @@ impl NodeIdentity {
     }
 
     fn path() -> anyhow::Result<PathBuf> {
+        // An explicitly configured root wins: on Android it is the only answer,
+        // since the writable directory is chosen by the system per install and
+        // handed to the app at runtime. See `cursio_protocol::paths`.
+        if let Some(dir) = cursio_protocol::paths::config_dir() {
+            return Ok(dir.join("identity.json"));
+        }
         let dirs = directories::ProjectDirs::from("dev", "cursio", "cursio")
             .ok_or_else(|| anyhow::anyhow!("cannot resolve config directory"))?;
         Ok(dirs.config_dir().join("identity.json"))

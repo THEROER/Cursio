@@ -551,6 +551,9 @@ const ANDROID_TARGET: &str = "aarch64-linux-android";
 /// The NDK's name for that ABI, which is what `cargo-ndk` and Gradle use.
 const ANDROID_ABI: &str = "arm64-v8a";
 
+/// The shared library the JVM opens with `System.loadLibrary("cursio_android")`.
+const ANDROID_LIB: &str = "libcursio_android.so";
+
 /// Minimum Android API level this builds against.
 ///
 /// 26 (Oreo) is where the notification channels and foreground-service model
@@ -558,15 +561,19 @@ const ANDROID_ABI: &str = "arm64-v8a";
 /// costs devices rather than buying anything.
 const ANDROID_API: &str = "26";
 
-/// Build the mesh core as a native library for a phone.
+/// Build the JNI bridge as a shared library a phone can load.
 ///
-/// This is the *core only* — `cursio-core` with no default features. That is
-/// not a limitation of the build but a statement about the layering: identity,
-/// link, session, mesh, registry and node status depend on no platform crate,
-/// so they cross to Android untouched. The platform modules do not follow
-/// automatically; each needs an Android backend before its feature can be
-/// switched on here (PipeWire, FUSE and an AirPlay receiver do not exist on a
-/// phone, so their desktop implementations never will be).
+/// Produces `libcursio_android.so` and stages it where Gradle expects native
+/// libraries (`jniLibs/<abi>/`), so an Android project consumes the output
+/// directly rather than each build reinventing the copy.
+///
+/// What crosses is the *core only* — `cursio-core` with no default features.
+/// That is not a limitation of the build but a statement about the layering:
+/// identity, link, session, mesh, registry and node status depend on no
+/// platform crate, so they reach Android untouched. The platform modules do
+/// not follow automatically; each needs an Android backend before its feature
+/// means anything here (PipeWire, FUSE and an AirPlay receiver do not exist on
+/// a phone).
 fn android(release: bool) -> Result<()> {
     ensure_rust_target(ANDROID_TARGET)?;
 
@@ -610,25 +617,38 @@ fn android(release: bool) -> Result<()> {
     if release {
         cmd.arg("--release");
     }
-    cmd.args(["-p", "cursio-core"]);
-    // The library only: `cursio` is a desktop CLI (it drives capture, mounts
-    // and an AirPlay receiver), and a phone has no terminal to run it from.
-    cmd.arg("--lib");
-    // Every platform module off. Turning one on here without an Android
-    // backend behind it does not fail at the feature — it fails deep inside
-    // PipeWire or FUSE, which is a much worse error to read.
-    cmd.arg("--no-default-features");
+    // The bridge crate, which pulls in `cursio-core` with its platform
+    // features already off. Turning one on without an Android backend behind
+    // it does not fail at the feature — it fails deep inside PipeWire, FUSE or
+    // libopus, which is a much worse error to read.
+    cmd.args(["-p", "cursio-android"]);
     cmd.env("ANDROID_NDK_HOME", &ndk);
     run(cmd)?;
 
-    let lib = PathBuf::from("target")
+    let built = PathBuf::from("target")
         .join(ANDROID_TARGET)
         .join(profile)
-        .join("libcursio_core.rlib");
-    println!("✓ {}", lib.display());
+        .join(ANDROID_LIB);
+    if !built.is_file() {
+        bail!(
+            "the build reported success but {} is missing",
+            built.display()
+        );
+    }
+
+    // Staged under the ABI name Gradle looks for, so an Android project points
+    // `jniLibs.srcDirs` at one directory and gets whatever was last built.
+    let staged_dir = PathBuf::from("target/android/jniLibs").join(ANDROID_ABI);
+    std::fs::create_dir_all(&staged_dir)
+        .with_context(|| format!("creating {}", staged_dir.display()))?;
+    let staged = staged_dir.join(ANDROID_LIB);
+    std::fs::copy(&built, &staged)
+        .with_context(|| format!("copying {} to {}", built.display(), staged.display()))?;
+
+    println!("✓ {}", staged.display());
     println!(
-        "  Next: a JNI bridge (cdylib) and an Android app to load it. The core \
-         is what had to cross; the modules follow one backend at a time."
+        "  Gradle: jniLibs.srcDirs += \"{}\"; Kotlin sources in crates/android/java.",
+        staged_dir.parent().unwrap_or(&staged_dir).display()
     );
     Ok(())
 }

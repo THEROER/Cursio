@@ -57,9 +57,35 @@ impl LogGuard {
 /// Falls back to `./cursio-logs` if the platform dir can't be resolved, so
 /// logging never silently vanishes.
 pub fn log_dir() -> PathBuf {
+    if let Some(dir) = LOG_ROOT.get() {
+        return dir.clone();
+    }
     directories::ProjectDirs::from("dev", "cursio", "cursio")
         .map(|dirs| dirs.data_dir().join("logs"))
         .unwrap_or_else(|| PathBuf::from("cursio-logs"))
+}
+
+/// Where logs go when the platform cannot be asked.
+static LOG_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Write logs under `dir` instead of the platform's data directory.
+///
+/// Android has no data directory this process can derive: the writable path is
+/// chosen by the system per install and handed to the app at runtime, so the
+/// host passes it in. Without this the fallback would be a relative
+/// `cursio-logs` resolved against a working directory an Android app does not
+/// meaningfully have.
+///
+/// Deliberately duplicated rather than sharing `cursio_protocol::paths`: this
+/// crate is the logging primitive every other one initialises *first*, and
+/// giving it a dependency on the wire vocabulary to answer "where do files go"
+/// inverts that. The host sets both, from one place, at startup.
+///
+/// Call before [`init`]; afterwards the appender already holds a directory.
+/// Setting it twice keeps the first value, so a defensive second call is
+/// harmless.
+pub fn set_log_dir(dir: impl Into<PathBuf>) {
+    let _ = LOG_ROOT.set(dir.into());
 }
 
 /// Initialise console + file logging for a binary named `app_name`.

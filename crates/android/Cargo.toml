@@ -1,0 +1,39 @@
+[package]
+name = "cursio-android"
+version.workspace = true
+edition.workspace = true
+
+# A C-ABI shared library, because that is the only thing Android's
+# `System.loadLibrary` can open. Nothing links this from Rust; the consumer is
+# the JVM.
+[lib]
+name = "cursio_android"
+# `rlib` alongside so the crate's own tests link against it — a bare `cdylib`
+# cannot be test-compiled, and the node's behaviour is worth testing on the
+# host rather than only on a phone.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The mesh core with every platform module off: this crate exists to prove the
+# core runs on a phone, and each module needs an Android backend before its
+# feature means anything here.
+# By path rather than `workspace = true`: a workspace dependency carries its
+# own `default-features`, and a `default-features = false` next to it is
+# ignored — which silently pulled PipeWire, FUSE and an AirPlay receiver into a
+# phone build. Naming the path here is what actually turns them off.
+cursio-core = { path = "../core", default-features = false }
+cursio-protocol.workspace = true
+cursio-transport.workspace = true
+cursio-log.workspace = true
+
+jni = "0.21"
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+# Route `tracing` into logcat. Without it every log line goes to a file the
+# user cannot reach and `adb logcat` shows nothing, which during bring-up is
+# indistinguishable from the library never having started.
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = "0.2"
+tracing-subscriber.workspace = true

@@ -315,6 +315,11 @@ impl TrustStore {
 
     /// Path to the trust-store file in the platform config directory.
     fn path() -> Result<PathBuf, PairingError> {
+        // Same root as identity, so a node's id and the peers it trusts never
+        // end up in two different places. See `cursio_protocol::paths`.
+        if let Some(dir) = cursio_protocol::paths::config_dir() {
+            return Ok(dir.join("trusted_peers.json"));
+        }
         let dirs = directories::ProjectDirs::from("dev", "cursio", "cursio")
             .ok_or_else(|| PairingError::Store("cannot resolve config directory".into()))?;
         Ok(dirs.config_dir().join("trusted_peers.json"))

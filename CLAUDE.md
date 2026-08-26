@@ -196,6 +196,18 @@ The AES-CTR keystream is continuous for the life of a mirror data connection. Ev
 
 **Reaching the rest of the mesh** is `tap.rs` plus `core/src/airplay_window.rs`. The phone never becomes a peer. The selected host offers its screen through ordinary window transfer; H.264 access units go out untouched and the viewer's surrogate decodes them. The tap retains SPS/PPS for late subscribers. A placement/quality change closes and recreates the surrogate with the newly agreed dimensions.
 
+### Android: the JVM's way in
+
+`crates/android` is a `cdylib` the JVM opens with `System.loadLibrary`, and the only thing Kotlin ever calls. The **node lives in Rust** — its own thread, its own current-thread Tokio runtime, the same `cursio-core` every desktop peer runs; Kotlin starts it, stops it, and asks for a status line. Putting the session loop on the JVM would expose a handshake to GC pauses and mean reimplementing `mesh.rs`.
+
+Every `extern "system"` entry point catches its own unwinds: a panic crossing into JVM frames is undefined behaviour, not an exception — the process dies with nothing in logcat naming the cause. This is the one place in the codebase where catching a panic is correct.
+
+Kotlin lives in `crates/android/java` (`CursioNative` declaring the six natives, `MeshService`, the manifest). The service is `foregroundServiceType="connectedDevice"` — that is what survives Doze; a battery-optimisation exemption helps only against manufacturer killers and is **not** the mechanism. `dataSync` would carry a timeout that stops a mesh link mid-session.
+
+**Paths are handed in, not derived.** Android's writable directory is chosen by the system per install and reaches the app only through `Context.getFilesDir()`, so `nativeInit` must be called first and everything persistent resolves against `cursio_protocol::paths` (logs through `cursio_log::set_log_dir`, which stays independent so the logging primitive does not depend on the wire vocabulary).
+
+**Depend on `cursio-core` by path, not `workspace = true`.** A workspace dependency carries its own `default-features`, and a `default-features = false` beside it is ignored — which silently pulled PipeWire, FUSE and libopus into a phone build.
+
 ### Android: the core crosses, the modules do not
 
 `cursio-core`'s platform dependencies are **optional features**, all on by default (`desktop = ["audio", "input", "window", "files", "airplay"]`), so a desktop build is unchanged. `--no-default-features` leaves the mesh core — identity, link, session, mesh, registry, module dispatch, node status — and that builds for `aarch64-linux-android` as-is. Nothing in `link.rs`, `session.rs`, `mesh.rs` or `registry.rs` imports a platform crate; only the four `*_session.rs` policy files do, and each is gated by its feature.
