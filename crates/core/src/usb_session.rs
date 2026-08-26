@@ -44,6 +44,9 @@ use crate::module::SessionModule;
 /// change shape; peers run the module only on an exact match.
 pub const VERSION: u16 = 1;
 
+/// How often a peer is asked again for devices it would not lend.
+const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// What the local machine can actually do with its ports.
 ///
 /// A trait so the ownership rules can be tested without a kernel: every race
@@ -149,6 +152,17 @@ pub struct UsbEngine {
     /// Peer devices asked for but not yet answered, so a re-announced listing
     /// does not ask twice for the same device.
     asking: std::collections::HashSet<UsbDeviceId>,
+    /// The peer's last listing, kept so refused devices can be asked for again
+    /// without waiting for something on that machine to change.
+    ///
+    /// A refusal is rarely permanent — a prompt gets accepted, a holder lets
+    /// go, a driver is installed — but the *listing* only travels when the
+    /// peer's own device set changes, which a granted permission is not. Left
+    /// alone, a device refused once would never be asked for again this
+    /// session.
+    offered: Vec<UsbDevice>,
+    /// When the refused devices were last retried.
+    last_retry: Option<std::time::Instant>,
 }
 
 impl UsbEngine {
@@ -162,6 +176,8 @@ impl UsbEngine {
             announced: false,
             borrowed: HashMap::new(),
             asking: std::collections::HashSet::new(),
+            offered: Vec::new(),
+            last_retry: None,
         }
     }
 
@@ -375,6 +391,7 @@ impl UsbEngine {
             }
         }
 
+        self.offered = devices.to_vec();
         for device in devices {
             if self.borrowed.contains_key(&device.id) || !self.asking.insert(device.id) {
                 continue;
@@ -388,6 +405,27 @@ impl UsbEngine {
                 reason: "mesh attach".into(),
             });
         }
+    }
+
+    /// Ask again for the peer's devices this machine does not have.
+    ///
+    /// Slow on purpose. The common reason a device is refused is that another
+    /// machine holds it, and asking a peer every few seconds for something it
+    /// has already said no to is noise on a link the cursor shares. A minute
+    /// is short enough that accepting a prompt feels like it worked and long
+    /// enough to be free.
+    fn retry_refused(&mut self) {
+        if !self.backend.can_attach() || self.offered.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match self.last_retry {
+            Some(last) if now.duration_since(last) < RETRY_INTERVAL => return,
+            _ => self.last_retry = Some(now),
+        }
+
+        let offered = std::mem::take(&mut self.offered);
+        self.on_devices(&offered);
     }
 
     /// The peer agreed. Present its device on this machine.
@@ -460,6 +498,7 @@ impl SessionModule for UsbEngine {
             let devices = self.listing();
             self.outbound.push(UsbMsg::Devices(devices));
         }
+        self.retry_refused();
 
         // Bytes the local kernel produced, then the streams that ended — in
         // that order, because a close and the data preceding it arrive
@@ -526,6 +565,11 @@ impl SessionModule for UsbEngine {
             UsbMsg::Devices(devices) => self.on_devices(&devices),
             UsbMsg::Claimed { device, stream } => self.on_claimed(device, stream),
             UsbMsg::Refused { device, error } => {
+                // Cleared either way, so the device is asked for again on the
+                // next listing. A refusal is rarely permanent: the peer that
+                // held it lets go, the user accepts the prompt, the driver
+                // gets installed. Treating it as final would mean a device
+                // that never appears until Cursio is restarted.
                 self.asking.remove(&device);
                 tracing::info!(
                     peer = %self.peer_name, %device, %error,
@@ -1471,6 +1515,53 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, UsbMsg::Claim { device, .. } if *device == UsbDeviceId(1))),
             "a refused device must be asked for again later"
+        );
+    }
+
+    /// The reason retrying exists: a refusal is rarely permanent, and the
+    /// peer's listing only travels when its *device set* changes — which
+    /// accepting an elevation prompt is not. Without this a device refused
+    /// once would never be asked for again this session.
+    #[test]
+    fn a_refused_device_is_asked_for_again_later() {
+        let mut e = attaching_engine();
+        e.on_devices(&[offered(1)]);
+        let _ = taken(&mut e);
+        // What `handle_message` does for a refusal.
+        e.asking.remove(&UsbDeviceId(1));
+
+        // Too soon: the peer has just said no, and asking every tick is noise
+        // on a link the cursor shares.
+        e.last_retry = Some(std::time::Instant::now());
+        e.retry_refused();
+        assert!(taken(&mut e).is_empty(), "retried immediately");
+
+        // Once the interval has passed, ask again.
+        e.last_retry = Some(std::time::Instant::now() - RETRY_INTERVAL * 2);
+        e.retry_refused();
+        assert!(
+            taken(&mut e)
+                .iter()
+                .any(|m| matches!(m, UsbMsg::Claim { device, .. } if *device == UsbDeviceId(1))),
+            "a refused device must eventually be asked for again"
+        );
+    }
+
+    /// Retrying must not re-ask for what this machine already has: the peer
+    /// answers a duplicate claim with the same stream, but the traffic is
+    /// pointless and the log line misleading.
+    #[test]
+    fn retrying_skips_devices_already_attached() {
+        let mut e = attaching_engine();
+        e.on_devices(&[offered(1)]);
+        let _ = taken(&mut e);
+        e.on_claimed(UsbDeviceId(1), UsbStreamId(7));
+
+        e.last_retry = Some(std::time::Instant::now() - RETRY_INTERVAL * 2);
+        e.retry_refused();
+        assert!(
+            taken(&mut e).is_empty(),
+            "asked for a device it already has"
         );
     }
 

@@ -25,9 +25,15 @@
 //! ```
 //!
 //! That is the same split Linux has — enumeration is unprivileged, export is
-//! not — and it is reported rather than escalated, for the same reason: a
-//! daemon holding administrator rights to avoid asking is a much larger thing
-//! to have made than a prompt.
+//! not. Sharing therefore raises a **UAC prompt for `usbipd` alone**, once per
+//! device: `bind` writes a persistent registry entry, so every later run of
+//! Cursio finds the device already shared and prompts for nothing.
+//!
+//! What is deliberately *not* elevated is Cursio itself. A daemon holding
+//! administrator rights for the life of a session to avoid a handful of
+//! prompts is a much larger thing to have made — and on this codebase it would
+//! also break file sharing, since volumes WinFsp mounts as administrator are
+//! invisible to the user's own Explorer.
 //!
 //! ## Absence is a first-class state
 //!
@@ -89,12 +95,81 @@ impl WindowsUsb {
 
     /// Share a device so a peer can attach it.
     ///
-    /// Needs administrator. The error carries what `usbipd` said, because
-    /// "access denied" without the command that fixes it is a dead end for the
-    /// user — and the fix here is not a permission to grant but an elevated
-    /// prompt to accept.
+    /// Tries unprivileged first, because a device already registered needs no
+    /// prompt at all: `bind` writes a persistent registry entry, so the second
+    /// and every later run succeed outright. Only a genuinely new device
+    /// reaches [`bind_elevated`](Self::bind_elevated) and its single UAC
+    /// prompt.
+    ///
+    /// Asking the user to run `usbipd bind` by hand would be the one command
+    /// this whole module exists to remove — "whichever machine has the port,
+    /// every machine has the device" is not something anyone should have to
+    /// type per device.
     pub fn bind(&self, busid: &str) -> Result<(), UsbBackendError> {
-        self.run(&["bind", "--busid", busid]).map(|_| ())
+        match self.run(&["bind", "--busid", busid]) {
+            Ok(_) => Ok(()),
+            Err(UsbBackendError::NeedsPrivilege(_)) => self.bind_elevated(busid),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Bind through a UAC prompt, once per device.
+    ///
+    /// `runas` is the only way to raise privilege for a child process on
+    /// Windows, and it is deliberately a *prompt* rather than something this
+    /// process can grant itself. Cursio does not run elevated for this: holding
+    /// administrator rights for the life of a daemon to avoid four prompts a
+    /// year is a much larger thing to have made than the prompts.
+    ///
+    /// The prompt is shown by the shell, not by us, so there is nothing to
+    /// suppress and no window to hide — declining is an ordinary answer and
+    /// comes back as [`UsbBackendError::NeedsPrivilege`] naming the device.
+    #[cfg(target_os = "windows")]
+    fn bind_elevated(&self, busid: &str) -> Result<(), UsbBackendError> {
+        use std::os::windows::process::CommandExt;
+
+        tracing::info!(
+            busid,
+            "asking for administrator rights to share a usb device"
+        );
+        // Through PowerShell's `Start-Process -Verb RunAs`: it raises the same
+        // UAC prompt as `ShellExecuteExW` and waits for the child, which is
+        // what lets the exit code be read. Doing it with the Win32 call
+        // directly would mean a second copy of the elevation plumbing that
+        // `core::elevate` already owns.
+        let script = format!(
+            "$p = Start-Process -FilePath '{}' -ArgumentList 'bind','--busid','{}' \
+             -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
+            self.exe.display(),
+            busid
+        );
+        // CREATE_NO_WINDOW: the elevated child is what the user should see, not
+        // a console flashing up behind it.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| UsbBackendError::Enumerate(format!("cannot raise a uac prompt: {e}")))?;
+
+        if output.status.success() {
+            tracing::info!(busid, "device shared after an elevation prompt");
+            return Ok(());
+        }
+        // A declined prompt and a failed bind are both "not shared", and the
+        // peer is told the same thing either way — it can do nothing about
+        // either, and the difference is only in this machine's log.
+        Err(UsbBackendError::NeedsPrivilege(format!(
+            "sharing {busid} needs administrator rights, and the prompt was declined or failed"
+        )))
+    }
+
+    /// Off Windows this cannot happen: the caller is the Windows backend.
+    #[cfg(not(target_os = "windows"))]
+    fn bind_elevated(&self, busid: &str) -> Result<(), UsbBackendError> {
+        Err(UsbBackendError::NeedsPrivilege(format!(
+            "sharing {busid} needs administrator rights"
+        )))
     }
 
     /// Stop sharing.
