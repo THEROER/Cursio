@@ -289,7 +289,20 @@ Two facts shape the backend:
 
 The importing half is `usbipd-win`, a signed open-source VHCI driver — not a
 fork to maintain, but an install plus a reboot, the same shape as WinFsp for
-files. Verified absent on the peer; `winget` is available to install it.
+files. **Installed on the peer** (5.3.0, at
+`C:\Program Files\usbipd-win\usbipd.exe`), so the install and reboot are
+already behind us.
+
+Unlike Linux, this talks to the CLI rather than to the kernel: there is no
+sysfs, the driver's control surface is a private device interface, and `usbipd`
+ships a `state` subcommand emitting **JSON** for exactly this use. Parsing a
+documented JSON contract is a different bet from parsing a table meant for a
+terminal, which is why the Linux half avoids `usbip` and this half does not.
+
+The privilege split is the same as Linux, verified on the peer: `list`, `state`
+and `--version` succeed as an ordinary user, while `bind` answers "Access
+denied; this operation requires administrator privileges". Reported, never
+escalated.
 
 Absence is a first-class state: `advert()` returns `None` when the driver is
 missing, so the module is not negotiated and the log says why.
@@ -318,6 +331,7 @@ crates/usb/                mechanism
   ├── export.rs            device → usbip-host          (built)
   ├── import.rs            peer device → vhci-hcd       (built)
   ├── pipe.rs              the socketpair both kernels drive  (built)
+  ├── windows.rs           usbipd-win: state JSON, bind       (built)
   └── lib.rs               traits, LocalDevice
 
 crates/core/src/usb_session.rs
@@ -352,7 +366,9 @@ namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
    USB/IP stream misaligned. `UsbBackend` gained `collect`/`ended` so the
    session pump can send a transfer's last bytes *before* the detach that
    follows them.
-8. **Windows import** — `usbipd-win` detection and the missing-driver path.
+8. **Windows import** — `windows.rs` reads `usbipd state` and can bind;
+   detection and the missing-driver path are done. What remains is joining it
+   to the session the way the Linux backend is.
 9. **Degradation reporting** — isochronous flagged, revoke on unplug.
 
 Storage is not on this list: it belongs to `files`, which needs three additions

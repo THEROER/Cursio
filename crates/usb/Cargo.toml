@@ -11,6 +11,11 @@ thiserror.workspace = true
 # Enumeration is sysfs, which is ordinary file reads — no libusb, and no
 # privilege. Exporting a device needs the kernel's usbip driver instead, which
 # is why nothing here links a USB library.
+# `usbipd state` emits JSON precisely so it can be read by another program;
+# parsing that is a different bet from parsing a table meant for a terminal.
+[target.'cfg(target_os = "windows")'.dependencies]
+serde_json.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 
 [dev-dependencies]

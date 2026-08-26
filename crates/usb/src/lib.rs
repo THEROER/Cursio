@@ -26,6 +26,8 @@ mod offer;
 #[cfg(target_os = "linux")]
 pub mod pipe;
 pub mod urb;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 #[cfg(target_os = "linux")]
 pub use export::Exporter;
@@ -37,6 +39,8 @@ pub use linux::LinuxUsb;
 pub use pipe::{KernelPipe, PipeEnded};
 
 pub use offer::DeviceOffers;
+#[cfg(target_os = "windows")]
+pub use windows::WindowsUsb;
 
 use thiserror::Error;
 
