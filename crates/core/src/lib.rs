@@ -46,6 +46,8 @@ pub mod registry;
 pub mod service_session;
 pub mod session;
 #[cfg(feature = "usb")]
+pub mod usb_node;
+#[cfg(feature = "usb")]
 pub mod usb_session;
 #[cfg(feature = "window")]
 pub mod window_session;

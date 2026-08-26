@@ -1037,12 +1037,10 @@ fn module_registry(
         .with(Box::new(cursio_core::files_session::FilesFactory {
             enabled: files,
         }))
-        // Unlike files, this is one-way per machine: sharing a device means
-        // giving it up, so a machine offers its own ports and attaches a
-        // peer's, and the two are separate decisions.
-        .with(Box::new(cursio_core::usb_session::UsbFactory {
-            enabled: usb,
-        }))
+        // Like files, a machine both offers its own ports and attaches a
+        // peer's. The factory carries the node-level state every link shares,
+        // which is why it is constructed rather than built from fields.
+        .with(Box::new(cursio_core::usb_session::UsbFactory::new(usb)))
 }
 
 /// Run as a mesh node: listen and dial trusted peers simultaneously, forever.

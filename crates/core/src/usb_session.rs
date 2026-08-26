@@ -47,6 +47,14 @@ pub const VERSION: u16 = 1;
 /// How often a peer is asked again for devices it would not lend.
 const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often this machine's own ports are re-read.
+///
+/// Short enough that plugging a phone in feels immediate, long enough to be
+/// free: on Linux this is two directory reads, and on Windows a `usbipd state`
+/// that takes about a tenth of a second. The pump runs far more often than
+/// this, so the interval is what keeps the cost off the session loop.
+const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// What the local machine can actually do with its ports.
 ///
 /// A trait so the ownership rules can be tested without a kernel: every race
@@ -123,12 +131,6 @@ pub trait UsbBackend: Send {
     fn collect_attached(&mut self, _out: &mut Vec<(UsbStreamId, Vec<u8>)>) {}
 }
 
-/// One attach in progress, from the host's point of view.
-struct Attached {
-    holder: PeerId,
-    stream: UsbStreamId,
-}
-
 /// The ownership rules, independent of transport and of any kernel.
 pub struct UsbEngine {
     peer_name: String,
@@ -136,18 +138,21 @@ pub struct UsbEngine {
     /// this machine, so a claim never has to say who it is from — and cannot
     /// lie about it.
     peer_id: PeerId,
-    backend: Box<dyn UsbBackend>,
-    /// What this machine has exported, keyed by device. The host's own record,
-    /// and the only authority on who holds what.
-    attached: HashMap<UsbDeviceId, Attached>,
+    /// This machine's ports, shared with every other link.
+    ///
+    /// Not owned here: a device belongs to the machine, and a session belongs
+    /// to one peer. Held per link, the exports and the arbiter's cache would
+    /// each be a private copy of state two peers must agree on — see
+    /// [`usb_node`](crate::usb_node).
+    node: std::sync::Arc<std::sync::Mutex<crate::usb_node::UsbNode>>,
     /// Queued for the next pump, because `handle_message` is synchronous while
     /// sending is not.
     outbound: Vec<UsbMsg>,
     /// Whether the device list has gone out on this link yet.
     announced: bool,
     /// Devices of *this peer* that are now present on this machine, keyed by
-    /// the peer's device id. The mirror image of `attached`: that is what we
-    /// lent out, this is what we borrowed.
+    /// the peer's device id. The mirror image of the node's exports: those are
+    /// what we lent out, this is what we borrowed.
     borrowed: HashMap<UsbDeviceId, UsbStreamId>,
     /// Peer devices asked for but not yet answered, so a re-announced listing
     /// does not ask twice for the same device.
@@ -163,6 +168,10 @@ pub struct UsbEngine {
     offered: Vec<UsbDevice>,
     /// When the refused devices were last retried.
     last_retry: Option<std::time::Instant>,
+    /// The listing last sent, and when. A device plugged in after the session
+    /// started is invisible until this notices it.
+    sent: Vec<UsbDevice>,
+    last_scan: Option<std::time::Instant>,
     /// Peer devices this machine could not present, and when it last tried.
     ///
     /// Without this, a failed attach loops: the release frees the device on the
@@ -174,12 +183,15 @@ pub struct UsbEngine {
 }
 
 impl UsbEngine {
-    pub fn new(peer_name: String, peer_id: PeerId, backend: Box<dyn UsbBackend>) -> Self {
+    pub fn new(
+        peer_name: String,
+        peer_id: PeerId,
+        node: std::sync::Arc<std::sync::Mutex<crate::usb_node::UsbNode>>,
+    ) -> Self {
         Self {
             peer_name,
             peer_id,
-            backend,
-            attached: HashMap::new(),
+            node,
             outbound: Vec::new(),
             announced: false,
             borrowed: HashMap::new(),
@@ -187,7 +199,29 @@ impl UsbEngine {
             offered: Vec::new(),
             last_retry: None,
             failed: HashMap::new(),
+            sent: Vec::new(),
+            last_scan: None,
         }
+    }
+
+    /// How many devices this machine is serving, for tests that assert a
+    /// device was given back.
+    #[cfg(test)]
+    fn exported_count(&self) -> usize {
+        self.node().exported_count()
+    }
+
+    /// This machine's ports, locked for the length of one call.
+    ///
+    /// Every caller here is inside the session pump, and the node's own work is
+    /// a few map lookups plus whatever the backend does — so the lock is never
+    /// held across an await and cannot make one link wait on another's I/O.
+    ///
+    /// A poisoned lock is taken anyway: the state behind it is a record of what
+    /// the kernel has, and refusing to read it because some other link panicked
+    /// would strand every exported device on this machine.
+    fn node(&self) -> std::sync::MutexGuard<'_, crate::usb_node::UsbNode> {
+        self.node.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The device list as this peer should see it: every device, each carrying
@@ -196,63 +230,33 @@ impl UsbEngine {
     /// Built from the backend's view each time rather than cached, so a device
     /// unplugged between announcements simply is not in the next one.
     fn listing(&mut self) -> Vec<UsbDevice> {
-        let attached: HashMap<UsbDeviceId, PeerId> = self
-            .attached
-            .iter()
-            .map(|(id, a)| (*id, a.holder))
-            .collect();
-        let mut devices = self.backend.devices();
-        for device in &mut devices {
-            device.holder = attached.get(&device.id).copied();
-        }
-        devices
+        self.node().listing()
     }
 
     /// Answer a peer asking for a device.
     ///
-    /// Refusing costs nothing and tells the user why; granting silently to a
-    /// device someone else holds would detach it from under them.
+    /// **Granted to any number of peers at once.** A second machine asking is
+    /// not a competitor: enumeration is answered from the arbiter's descriptor
+    /// cache, so it costs the device nothing and disturbs nobody already using
+    /// it. What machines contend for is the device's *configuration*, and that
+    /// is arbitrated per request rather than by refusing the attach —
+    /// `docs/usb-design.md`, "Ownership, restated".
+    ///
+    /// So `Refused` is now rare: a device that is gone, or a kernel that
+    /// cannot export. Neither is somebody else's turn.
     fn on_claim(&mut self, device: UsbDeviceId, reason: &str) {
-        if let Some(existing) = self.attached.get(&device) {
-            // Already ours to give away? Then the peer asking is the one who
-            // has it, and re-claiming is a no-op rather than an error: a
-            // reconnecting peer re-asks for what it believes it still holds.
-            let error = match existing.holder == self.peer_id {
-                true => {
-                    let stream = existing.stream;
-                    self.outbound.push(UsbMsg::Claimed { device, stream });
-                    return;
-                }
-                false => UsbError::InUse(existing.holder),
-            };
-            self.outbound.push(UsbMsg::Refused { device, error });
-            return;
-        }
-
-        if !self.backend.devices().iter().any(|d| d.id == device) {
-            self.outbound.push(UsbMsg::Refused {
-                device,
-                error: UsbError::Gone,
-            });
-            return;
-        }
-
-        match self.backend.export(device) {
+        let attached = self
+            .node()
+            .attach_peer(device, self.peer_id, &self.peer_name);
+        match attached {
             Ok(stream) => {
                 tracing::info!(
                     peer = %self.peer_name, %device, %reason,
                     "handing a device to a peer"
                 );
-                self.attached.insert(
-                    device,
-                    Attached {
-                        holder: self.peer_id,
-                        stream,
-                    },
-                );
                 self.outbound.push(UsbMsg::Claimed { device, stream });
-                // The listing changed: whoever else is watching needs to see it
-                // is taken, and this peer needs its own view corrected too.
+                // The listing carries who is using the device, so it is stale
+                // the moment somebody starts.
                 self.announced = false;
             }
             Err(error) => {
@@ -262,25 +266,16 @@ impl UsbEngine {
         }
     }
 
-    /// Let go of a device, if this peer is the one holding it.
+    /// Let go of this peer's use of a device.
     ///
-    /// A release from anyone else is ignored, not honoured. There is nothing
-    /// useful to say back — the sender does not hold it, so nothing changed for
-    /// them — and obeying would detach a bus from whoever actually is using it.
+    /// Only ever ends *this* peer's attachment: the device stays exported while
+    /// anyone else is still using it, including this machine itself. A release
+    /// from a peer that was not using it removes nothing and is silently
+    /// nothing — there is no state to correct and nothing useful to say back.
     fn on_release(&mut self, device: UsbDeviceId) {
-        let Some(existing) = self.attached.get(&device) else {
+        let Some(stream) = self.node().detach_peer(device, self.peer_id) else {
             return;
         };
-        if existing.holder != self.peer_id {
-            tracing::warn!(
-                peer = %self.peer_name, %device,
-                "ignoring a release from a peer that does not hold the device"
-            );
-            return;
-        }
-        let stream = existing.stream;
-        self.attached.remove(&device);
-        self.backend.unexport(device);
         tracing::info!(peer = %self.peer_name, %device, "a peer released a device");
         self.outbound.push(UsbMsg::Detached {
             device,
@@ -301,7 +296,7 @@ impl UsbEngine {
         // the real device. Told apart by which map the stream is in, because a
         // machine can be doing both at once with the same peer.
         if self.borrowed.values().any(|held| *held == stream) {
-            if let Err(error) = self.backend.feed_attached(stream, bytes) {
+            if let Err(error) = self.node().backend().feed_attached(stream, bytes) {
                 tracing::warn!(
                     peer = %self.peer_name, stream = stream.0, %error,
                     "cannot hand a peer device's urbs to the local controller"
@@ -310,18 +305,14 @@ impl UsbEngine {
             return;
         }
 
-        let owned = self
-            .attached
-            .iter()
-            .find(|(_, a)| a.stream == stream && a.holder == self.peer_id)
-            .map(|(id, _)| *id);
-        let Some(device) = owned else {
+        let mut node = self.node();
+        let Some(device) = node.device_of_stream(stream) else {
             return;
         };
-        if let Err(error) = self.backend.feed(stream, bytes) {
+        if let Err(error) = node.backend().feed(stream, bytes) {
+            drop(node);
             tracing::warn!(peer = %self.peer_name, %device, %error, "urb stream failed");
-            self.attached.remove(&device);
-            self.backend.unexport(device);
+            self.node().detach_peer(device, self.peer_id);
             self.outbound.push(UsbMsg::Detached {
                 device,
                 stream,
@@ -337,20 +328,7 @@ impl UsbEngine {
     /// and nobody will release: its holder is unreachable, so the release that
     /// would free it can never arrive.
     fn release_all(&mut self) {
-        let ours: Vec<UsbDeviceId> = self
-            .attached
-            .iter()
-            .filter(|(_, a)| a.holder == self.peer_id)
-            .map(|(id, _)| *id)
-            .collect();
-        for device in ours {
-            self.attached.remove(&device);
-            self.backend.unexport(device);
-            tracing::info!(
-                peer = %self.peer_name, %device,
-                "reclaiming a device whose holder went away"
-            );
-        }
+        self.node().peer_gone(self.peer_id);
     }
 
     /// A peer told us what it has. Take everything we do not already have.
@@ -367,7 +345,7 @@ impl UsbEngine {
     /// issuing a state-changing request and arbitrated by the host. Attaching
     /// is not claiming.
     fn on_devices(&mut self, devices: &[UsbDevice]) {
-        if !self.backend.can_attach() {
+        if !self.node().backend().can_attach() {
             // Said once per listing rather than per device: a machine without
             // `vhci-hcd` would otherwise repeat itself for every port the peer
             // has.
@@ -392,7 +370,7 @@ impl UsbEngine {
             .collect();
         for device in stale {
             if let Some(stream) = self.borrowed.remove(&device) {
-                self.backend.detach(stream);
+                self.node().backend().detach(stream);
                 tracing::info!(
                     peer = %self.peer_name, %device,
                     "a peer device is no longer offered; detaching"
@@ -418,6 +396,11 @@ impl UsbEngine {
             // its Bluetooth radio, its keyboard, its sound card. Taking one is
             // not sharing, it is breaking that machine — and the symptom shows
             // up nowhere near the cause, as headphones cutting out.
+            //
+            // A guard against the export *taking the device away from its
+            // host*, not against sharing it: once the host attaches its own
+            // device back to itself, sharing a radio costs its owner nothing
+            // and this narrows to the classes that genuinely cannot be shared.
             if !device.is_safe_to_take() {
                 continue;
             }
@@ -435,6 +418,39 @@ impl UsbEngine {
         }
     }
 
+    /// Notice devices plugged in or unplugged since the last listing.
+    ///
+    /// Nothing tells a process that a USB device appeared: udev does on Linux
+    /// and WM_DEVICECHANGE does on Windows, but both need a event loop of
+    /// their own, and neither exists on the other platform. Re-reading the
+    /// device list is two file reads on Linux and one short-lived process on
+    /// Windows — cheap enough that a poll costs less than the machinery to
+    /// avoid it, and the poll is what makes plugging a phone in mid-session
+    /// work at all.
+    ///
+    /// Only a *changed* listing is sent. A machine whose ports do not change —
+    /// the common case — puts nothing on the wire however often this runs.
+    fn rescan(&mut self) {
+        let now = std::time::Instant::now();
+        match self.last_scan {
+            Some(last) if now.duration_since(last) < SCAN_INTERVAL => return,
+            _ => self.last_scan = Some(now),
+        }
+
+        let devices = self.listing();
+        if devices == self.sent {
+            return;
+        }
+        tracing::info!(
+            peer = %self.peer_name,
+            before = self.sent.len(),
+            after = devices.len(),
+            "this machine's usb devices changed; telling the peer"
+        );
+        self.sent = devices.clone();
+        self.outbound.push(UsbMsg::Devices(devices));
+    }
+
     /// Ask again for the peer's devices this machine does not have.
     ///
     /// Slow on purpose. The common reason a device is refused is that another
@@ -443,7 +459,7 @@ impl UsbEngine {
     /// is short enough that accepting a prompt feels like it worked and long
     /// enough to be free.
     fn retry_refused(&mut self) {
-        if !self.backend.can_attach() || self.offered.is_empty() {
+        if !self.node().backend().can_attach() || self.offered.is_empty() {
             return;
         }
         let now = std::time::Instant::now();
@@ -462,7 +478,8 @@ impl UsbEngine {
         if self.borrowed.contains_key(&device) {
             return;
         }
-        match self.backend.attach(device, stream) {
+        let presented = self.node().backend().attach(device, stream);
+        match presented {
             Ok(()) => {
                 self.borrowed.insert(device, stream);
                 tracing::info!(
@@ -490,15 +507,10 @@ impl UsbEngine {
     /// until something says so. The device is unexported here too — the peer's
     /// release cannot arrive for a stream that no longer exists.
     fn end_stream(&mut self, stream: UsbStreamId) {
-        let Some((&device, _)) = self
-            .attached
-            .iter()
-            .find(|(_, attached)| attached.stream == stream)
-        else {
+        let Some(device) = self.node().device_of_stream(stream) else {
             return;
         };
-        self.attached.remove(&device);
-        self.backend.unexport(device);
+        self.node().detach_peer(device, self.peer_id);
         // The listing carries the holder, so it is stale the moment one lets go.
         self.announced = false;
         self.outbound.push(UsbMsg::Detached {
@@ -527,15 +539,17 @@ impl SessionModule for UsbEngine {
         if !self.announced {
             self.announced = true;
             let devices = self.listing();
+            self.sent = devices.clone();
             self.outbound.push(UsbMsg::Devices(devices));
         }
         self.retry_refused();
+        self.rescan();
 
         // Bytes the local kernel produced, then the streams that ended — in
         // that order, because a close and the data preceding it arrive
         // together and reversing them drops the end of every transfer.
         let mut produced = Vec::new();
-        self.backend.collect(&mut produced);
+        self.node().backend().collect(&mut produced);
         for (stream, bytes) in produced {
             // Split at the protocol's cap rather than trusting the kernel to
             // read small: one read can be a whole bulk transfer, and a frame
@@ -547,14 +561,15 @@ impl SessionModule for UsbEngine {
                 });
             }
         }
-        for stream in self.backend.ended() {
+        let ended = self.node().backend().ended();
+        for stream in ended {
             self.end_stream(stream);
         }
 
         // And the same in the other direction: what this machine's virtual
         // controller wants to send to a device on the peer's port.
         let mut wanted = Vec::new();
-        self.backend.collect_attached(&mut wanted);
+        self.node().backend().collect_attached(&mut wanted);
         for (stream, bytes) in wanted {
             for chunk in bytes.chunks(UsbMsg::MAX_CHUNK) {
                 self.outbound.push(UsbMsg::Data {
@@ -614,7 +629,7 @@ impl SessionModule for UsbEngine {
             } => {
                 self.asking.remove(&device);
                 if self.borrowed.remove(&device).is_some() {
-                    self.backend.detach(stream);
+                    self.node().backend().detach(stream);
                     tracing::info!(
                         peer = %self.peer_name, %device, ?error,
                         "a peer device went away"
@@ -1035,10 +1050,42 @@ fn backend_error_to_wire(error: &cursio_usb::UsbBackendError) -> UsbError {
     }
 }
 
-/// Builds the USB module for a link.
+/// Builds the USB module for a link, and holds what every link shares.
+///
+/// The factory outlives each session — a node builds one registry at startup —
+/// which is what makes it the right place for [`UsbNode`]. Built on the first
+/// link rather than in the constructor, so a machine that never negotiates the
+/// module never touches its kernel.
+///
+/// [`UsbNode`]: crate::usb_node::UsbNode
 #[cfg(feature = "usb")]
 pub struct UsbFactory {
     pub enabled: bool,
+    /// This machine's ports. One per node, shared by every session.
+    node: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<crate::usb_node::UsbNode>>>>,
+}
+
+#[cfg(feature = "usb")]
+impl UsbFactory {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            node: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The node, created on first use.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn node(
+        &self,
+        make: impl FnOnce() -> Box<dyn UsbBackend>,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::usb_node::UsbNode>> {
+        let mut slot = self.node.lock().unwrap_or_else(|e| e.into_inner());
+        slot.get_or_insert_with(|| {
+            std::sync::Arc::new(std::sync::Mutex::new(crate::usb_node::UsbNode::new(make())))
+        })
+        .clone()
+    }
 }
 
 #[cfg(feature = "usb")]
@@ -1113,7 +1160,7 @@ impl crate::module::ModuleFactory for UsbFactory {
         Ok(Box::new(UsbEngine::new(
             ctx.peer_name().to_string(),
             ctx.peer.peer_id,
-            Box::new(LinuxUsbBackend::new()),
+            self.node(|| Box::new(LinuxUsbBackend::new())),
         )))
     }
 
@@ -1122,7 +1169,7 @@ impl crate::module::ModuleFactory for UsbFactory {
         Ok(Box::new(UsbEngine::new(
             ctx.peer_name().to_string(),
             ctx.peer.peer_id,
-            Box::new(WindowsUsbBackend::new()),
+            self.node(|| Box::new(WindowsUsbBackend::new())),
         )))
     }
 
@@ -1137,6 +1184,15 @@ mod tests {
     use super::*;
     use cursio_protocol::usb::UsbTransport;
 
+    /// A fake backend wrapped in the node every session shares.
+    fn node_of(
+        backend: impl UsbBackend + 'static,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::usb_node::UsbNode>> {
+        std::sync::Arc::new(std::sync::Mutex::new(crate::usb_node::UsbNode::new(
+            Box::new(backend),
+        )))
+    }
+
     /// A backend with no kernel behind it: every ownership race is decided in
     /// the engine, so none of them need a real device.
     #[derive(Default)]
@@ -1146,7 +1202,11 @@ mod tests {
         /// What `export` should fail with, when the test wants a refusal.
         refuse: Option<UsbError>,
         /// What `feed` should fail with, to exercise a mid-stream failure.
-        feed_fails: Option<UsbError>,
+        ///
+        /// Shared so a test can break the backend *after* an attach exists:
+        /// replacing the whole backend would throw away the export the node is
+        /// holding, which is the state the test is about.
+        feed_fails: std::sync::Arc<std::sync::Mutex<Option<UsbError>>>,
         fed: Vec<(UsbStreamId, Vec<u8>)>,
         next_stream: u64,
         /// What the local kernel has produced, for the next `collect`.
@@ -1226,7 +1286,12 @@ mod tests {
         }
 
         fn feed(&mut self, stream: UsbStreamId, bytes: &[u8]) -> Result<(), UsbError> {
-            if let Some(error) = self.feed_fails.clone() {
+            if let Some(error) = self
+                .feed_fails
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
                 return Err(error);
             }
             self.fed.push((stream, bytes.to_vec()));
@@ -1242,7 +1307,7 @@ mod tests {
         UsbEngine::new(
             "desktop".into(),
             peer(1),
-            Box::new(FakeBackend::with(devices)),
+            node_of(FakeBackend::with(devices)),
         )
     }
 
@@ -1261,24 +1326,53 @@ mod tests {
         ));
     }
 
-    /// The race the host exists to settle: two peers ask for one device, and
-    /// exactly one gets it. The second is told who has it, not merely "no".
+    /// The point of arbitration: two machines use one device at once. The
+    /// second to ask is granted its own stream rather than told somebody else
+    /// got there first — enumeration is answered from the arbiter's cache, so
+    /// joining costs the device nothing.
+    ///
+    /// This asserted the opposite until the session was brought in line with
+    /// `docs/usb-design.md`: "one holder, everyone else refused" refuses
+    /// machines that only ever wanted to read a descriptor.
     #[test]
-    fn a_second_peer_is_refused_and_told_who_holds_it() {
+    fn a_second_peer_gets_its_own_stream_onto_the_same_device() {
         let mut e = engine(&[1]);
         e.on_claim(UsbDeviceId(1), "adb");
-        taken(&mut e);
+        let first = match taken(&mut e).as_slice() {
+            [UsbMsg::Claimed { stream, .. }] => *stream,
+            other => panic!("expected a grant, got {other:?}"),
+        };
 
         // The same engine, but the claim now arrives from a different session.
         e.peer_id = peer(2);
         e.on_claim(UsbDeviceId(1), "also adb");
 
         match taken(&mut e).as_slice() {
-            [UsbMsg::Refused { error, .. }] => {
-                assert_eq!(*error, UsbError::InUse(peer(1)), "must name the holder");
+            [UsbMsg::Claimed { stream, .. }] => {
+                assert_ne!(*stream, first, "each holder needs a stream of its own");
             }
-            other => panic!("expected a refusal, got {other:?}"),
+            other => panic!("expected a second grant, got {other:?}"),
         }
+    }
+
+    /// And one peer letting go does not detach the bus from under the other.
+    #[test]
+    fn releasing_one_holder_leaves_the_device_exported_for_the_rest() {
+        let mut e = engine(&[1]);
+        e.on_claim(UsbDeviceId(1), "adb");
+        e.peer_id = peer(2);
+        e.on_claim(UsbDeviceId(1), "also adb");
+        taken(&mut e);
+
+        e.on_release(UsbDeviceId(1));
+        assert!(
+            e.node().is_exported(UsbDeviceId(1)),
+            "the first peer is still using it"
+        );
+
+        e.peer_id = peer(1);
+        e.on_release(UsbDeviceId(1));
+        assert_eq!(e.exported_count(), 0, "now nobody is, so it goes back");
     }
 
     /// A peer that reconnects re-asks for what it believes it still holds. That
@@ -1312,7 +1406,7 @@ mod tests {
 
         assert!(taken(&mut e).is_empty(), "nothing to say to a non-holder");
         assert!(
-            e.attached.contains_key(&UsbDeviceId(1)),
+            e.node().is_exported(UsbDeviceId(1)),
             "the real holder must keep the device"
         );
     }
@@ -1329,7 +1423,7 @@ mod tests {
             taken(&mut e).as_slice(),
             [UsbMsg::Detached { error: None, .. }]
         ));
-        assert!(e.attached.is_empty(), "the device is free again");
+        assert!(e.exported_count() == 0, "the device is free again");
     }
 
     /// A device that is not there is refused as gone, rather than exported and
@@ -1354,7 +1448,7 @@ mod tests {
         let mut e = UsbEngine::new(
             "desktop".into(),
             peer(1),
-            Box::new(FakeBackend {
+            node_of(FakeBackend {
                 refuse: Some(UsbError::NeedsPrivilege),
                 ..FakeBackend::with(&[1])
             }),
@@ -1382,7 +1476,7 @@ mod tests {
 
         // The backend is behind a box; ask the engine's own record instead.
         assert!(
-            e.attached.contains_key(&UsbDeviceId(1)),
+            e.node().is_exported(UsbDeviceId(1)),
             "the attach is untouched"
         );
         assert!(taken(&mut e).is_empty(), "and nothing is said about it");
@@ -1392,18 +1486,23 @@ mod tests {
     /// than leaving the holder's kernel waiting on transfers that never come.
     #[test]
     fn a_failing_stream_detaches_with_a_reason() {
-        let mut e = UsbEngine::new("desktop".into(), peer(1), Box::new(FakeBackend::with(&[1])));
+        let breaks = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut e = UsbEngine::new(
+            "desktop".into(),
+            peer(1),
+            node_of(FakeBackend {
+                feed_fails: breaks.clone(),
+                ..FakeBackend::with(&[1])
+            }),
+        );
         e.on_claim(UsbDeviceId(1), "adb");
         let stream = match taken(&mut e).as_slice() {
             [UsbMsg::Claimed { stream, .. }] => *stream,
             other => panic!("expected a grant, got {other:?}"),
         };
 
-        // Break the backend now that the attach exists.
-        e.backend = Box::new(FakeBackend {
-            feed_fails: Some(UsbError::Unplugged),
-            ..FakeBackend::with(&[1])
-        });
+        // Break the device now that the attach exists.
+        *breaks.lock().expect("test lock") = Some(UsbError::Unplugged);
         e.on_data(stream, b"urb");
 
         assert!(matches!(
@@ -1413,7 +1512,7 @@ mod tests {
                 ..
             }]
         ));
-        assert!(e.attached.is_empty(), "a broken attach does not linger");
+        assert!(e.exported_count() == 0, "a broken attach does not linger");
     }
 
     /// A holder that goes away can never send the release that would free its
@@ -1426,7 +1525,7 @@ mod tests {
 
         e.release_all();
 
-        assert!(e.attached.is_empty(), "the device came back");
+        assert!(e.exported_count() == 0, "the device came back");
     }
 
     /// The listing is the resync path, so it must say who holds what — a peer
@@ -1474,7 +1573,7 @@ mod tests {
                 if *device == UsbDeviceId(1)
         ));
         assert!(
-            e.attached.is_empty(),
+            e.exported_count() == 0,
             "the device must not stay recorded as held"
         );
     }
@@ -1501,7 +1600,7 @@ mod tests {
             attaches: true,
             ..FakeBackend::with(&[])
         };
-        UsbEngine::new("laptop".into(), peer(1), Box::new(backend))
+        UsbEngine::new("laptop".into(), peer(1), node_of(backend))
     }
 
     /// One offered device, as a peer would announce it.
@@ -1644,7 +1743,7 @@ mod tests {
             attach_fails: true,
             ..FakeBackend::with(&[])
         };
-        let mut e = UsbEngine::new("laptop".into(), peer(1), Box::new(backend));
+        let mut e = UsbEngine::new("laptop".into(), peer(1), node_of(backend));
 
         e.on_devices(&[offered(1)]);
         let _ = taken(&mut e);
@@ -1672,7 +1771,7 @@ mod tests {
             attach_fails: true,
             ..FakeBackend::with(&[])
         };
-        let mut e = UsbEngine::new("laptop".into(), peer(1), Box::new(backend));
+        let mut e = UsbEngine::new("laptop".into(), peer(1), node_of(backend));
         e.on_devices(&[offered(1)]);
         let _ = taken(&mut e);
         e.on_claimed(UsbDeviceId(1), UsbStreamId(7));
@@ -1723,6 +1822,6 @@ mod tests {
             taken(&mut e).is_empty(),
             "nothing to say about a dead stream"
         );
-        assert_eq!(e.attached.len(), 1, "the live attach must survive");
+        assert_eq!(e.exported_count(), 1, "the live attach must survive");
     }
 }

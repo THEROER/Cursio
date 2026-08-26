@@ -336,6 +336,9 @@ crates/usb/                mechanism
   ├── setup.rs             one privileged run per machine     (built)
   └── lib.rs               traits, LocalDevice
 
+crates/core/src/usb_node.rs
+                           one per machine: the backend, the exports,
+                           the arbiter                        (built)
 crates/core/src/usb_session.rs
                            policy: who attaches, who leases   (built)
                            LinuxUsbBackend, UsbFactory        (built)
@@ -353,8 +356,14 @@ namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
 
 1. ~~**Vocabulary**~~ — `protocol/src/usb.rs`, `ModuleId::USB`.
 2. ~~**Ownership policy**~~ — `usb_session.rs`, tested against a fake backend.
-   Written under the pipe model; the lease narrowing above is a change to what
-   `Claim` means, not to its shape.
+   Brought in line with "Ownership, restated" after shipping under the older
+   one-holder rule: a second peer asking for a device now gets its own stream
+   instead of `InUse`, and a release ends one holder's use rather than the
+   export. What made that possible is `usb_node.rs` — a device belongs to the
+   machine, while a `SessionModule` belongs to one link, so the exports and the
+   arbiter had to move up a level. Held per link they were a private copy of
+   state two peers must agree on, and the backend was being constructed once
+   per session over one physical port.
 3. ~~**Linux enumeration**~~ — sysfs, verified against real hardware.
 4. ~~**The arbiter**~~ — the 48-byte header, the descriptor cache, serialised
    data transfers, intercepted state changes. `urb.rs` and `arbiter.rs`.
