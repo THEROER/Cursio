@@ -556,6 +556,115 @@ fn backend_error_to_wire(error: &cursio_usb::UsbBackendError) -> UsbError {
     }
 }
 
+/// The Windows backend: `usbipd-win` for both enumeration and sharing.
+///
+/// Shares [`DeviceOffers`](cursio_usb::DeviceOffers) and the whole policy layer
+/// with Linux; what differs is only where the device list comes from and what
+/// "export" means. The URB path does not exist here yet — see
+/// [`feed`](UsbBackend::feed) — so this machine can *offer* devices and a peer
+/// can see them, which is the half that has to work before carrying bytes is
+/// worth writing.
+#[cfg(all(feature = "usb", target_os = "windows"))]
+pub struct WindowsUsbBackend {
+    usbipd: cursio_usb::WindowsUsb,
+    offers: cursio_usb::DeviceOffers,
+    /// Bus ids handed out, so a release names the same device the claim did.
+    streams: HashMap<UsbStreamId, String>,
+    next_stream: u64,
+}
+
+#[cfg(all(feature = "usb", target_os = "windows"))]
+impl Default for WindowsUsbBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(feature = "usb", target_os = "windows"))]
+impl WindowsUsbBackend {
+    pub fn new() -> Self {
+        Self {
+            usbipd: cursio_usb::WindowsUsb::new(),
+            offers: cursio_usb::DeviceOffers::new(),
+            streams: HashMap::new(),
+            next_stream: 1,
+        }
+    }
+
+    /// Whether `usbipd-win` is installed.
+    pub fn is_available(&self) -> bool {
+        self.usbipd.is_available()
+    }
+}
+
+#[cfg(all(feature = "usb", target_os = "windows"))]
+impl UsbBackend for WindowsUsbBackend {
+    fn devices(&mut self) -> Vec<UsbDevice> {
+        match self.usbipd.devices() {
+            Ok(local) => self.offers.offer(&local),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot enumerate usb devices");
+                Vec::new()
+            }
+        }
+    }
+
+    fn export(&mut self, device: UsbDeviceId) -> Result<UsbStreamId, UsbError> {
+        let Some(busid) = self.offers.busid(device).map(str::to_string) else {
+            return Err(UsbError::Gone);
+        };
+        // Needs administrator, and says so rather than escalating: the fix is a
+        // prompt the user accepts, not a right this process should hold.
+        self.usbipd.bind(&busid).map_err(|e| {
+            tracing::warn!(%device, busid, error = %e, "cannot share device");
+            backend_error_to_wire(&e)
+        })?;
+
+        let stream = UsbStreamId(self.next_stream);
+        self.next_stream += 1;
+        self.streams.insert(stream, busid);
+        Ok(stream)
+    }
+
+    fn unexport(&mut self, device: UsbDeviceId) {
+        let Some(busid) = self.offers.busid(device).map(str::to_string) else {
+            return;
+        };
+        self.streams.retain(|_, held| held != &busid);
+        self.usbipd.unbind(&busid);
+    }
+
+    fn feed(&mut self, stream: UsbStreamId, _bytes: &[u8]) -> Result<(), UsbError> {
+        // `usbipd-win` owns its own socket to the driver and offers no way to
+        // hand it one of ours — the substitution `pipe.rs` performs on Linux
+        // has no equivalent here. Refusing names the gap; dropping the bytes
+        // would look like a device that attaches and then does nothing.
+        match self.streams.contains_key(&stream) {
+            true => Err(UsbError::Backend(
+                "windows cannot carry urbs over the mesh channel yet".into(),
+            )),
+            false => Err(UsbError::Gone),
+        }
+    }
+
+    fn collect(&mut self, _out: &mut Vec<(UsbStreamId, Vec<u8>)>) {}
+}
+
+/// Turn a local failure into what a peer is told.
+///
+/// Shared with the Linux backend deliberately: the peer's vocabulary is the
+/// same whichever kernel refused, and a second mapping would drift.
+#[cfg(all(feature = "usb", target_os = "windows"))]
+fn backend_error_to_wire(error: &cursio_usb::UsbBackendError) -> UsbError {
+    use cursio_usb::UsbBackendError;
+    match error {
+        UsbBackendError::NoSuchDevice(_) => UsbError::Gone,
+        UsbBackendError::DriverMissing(what) => UsbError::DriverMissing(what.clone()),
+        UsbBackendError::NeedsPrivilege(_) => UsbError::NeedsPrivilege,
+        other => UsbError::Backend(other.to_string()),
+    }
+}
+
 /// Builds the USB module for a link.
 #[cfg(feature = "usb")]
 pub struct UsbFactory {
@@ -590,7 +699,23 @@ impl crate::module::ModuleFactory for UsbFactory {
                 VERSION,
             ))
         }
-        #[cfg(not(target_os = "linux"))]
+        // Windows shares through `usbipd-win`, which is an install rather than
+        // a module to load — so the absent case names the installer instead.
+        #[cfg(target_os = "windows")]
+        {
+            if !WindowsUsbBackend::new().is_available() {
+                tracing::warn!(
+                    "usb sharing is off: usbipd-win is not installed \
+                     (winget install usbipd)"
+                );
+                return None;
+            }
+            Some(cursio_protocol::ModuleAdvert::symmetric(
+                ModuleId::USB,
+                VERSION,
+            ))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             tracing::warn!("usb sharing is not implemented on this platform yet");
             None
@@ -606,7 +731,16 @@ impl crate::module::ModuleFactory for UsbFactory {
         )))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
+        Ok(Box::new(UsbEngine::new(
+            ctx.peer_name().to_string(),
+            ctx.peer.peer_id,
+            Box::new(WindowsUsbBackend::new()),
+        )))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     fn build(&self, _ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         anyhow::bail!("usb sharing is not implemented on this platform")
     }

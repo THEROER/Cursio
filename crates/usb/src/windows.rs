@@ -303,6 +303,24 @@ mod tests {
         }
     }
 
+    /// A phone is the device this module exists for, and its instance id
+    /// carries a long alphanumeric serial rather than the zeroes the other
+    /// entries have — captured from a POCO X7 Pro plugged into the peer.
+    #[test]
+    fn a_phone_with_a_serial_in_its_instance_id_is_read() {
+        let json = r#"{"Devices":[{
+            "BusId": "1-1",
+            "Description": "POCO X7 Pro",
+            "InstanceId": "USB\\VID_2717&PID_FF08\\49FMUCWG7HM7Z5HI"
+        }]}"#;
+        let devices = parse_state(json).expect("parses");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].busid, "1-1");
+        assert_eq!(devices[0].vendor, 0x2717);
+        assert_eq!(devices[0].product, 0xFF08);
+        assert_eq!(devices[0].product_name.as_deref(), Some("POCO X7 Pro"));
+    }
+
     #[test]
     fn instance_ids_are_read_as_hex() {
         assert_eq!(

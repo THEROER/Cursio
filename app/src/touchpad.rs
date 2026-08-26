@@ -150,6 +150,11 @@ async fn run_link(
             position: cursio_protocol::Position::new(0, 0),
             // Nothing this device could host: no decoder, no display.
             service: cursio_protocol::ServiceOffer::none(),
+            // A touchpad is a phone or tablet, so its power state is exactly
+            // the kind a peer wants to know — but this build reads nothing
+            // about the device it runs on, and inventing a value would have
+            // the peer treat an unknown battery as a full one.
+            status: cursio_protocol::NodeStatus::unknown(),
             sends_input: true,
         },
     )
@@ -168,7 +173,9 @@ async fn run_link(
     report(Status::Connected {
         peer: link.peer.display_name.clone(),
     });
-    match Link::run_as_input_source(link, &mut events).await {
+    // Nothing here watches the battery or the network, so this link never
+    // reports a change after its greeting.
+    match Link::run_as_input_source(link, &mut events, || None).await {
         // The peer hanging up is how a session normally ends.
         Ok(()) | Err(SessionError::PeerLeft) => Ok(()),
         Err(e) => Err(e.into()),
