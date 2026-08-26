@@ -30,6 +30,8 @@ pub mod setup;
 pub mod urb;
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "windows")]
+pub mod wintunnel;
 
 #[cfg(target_os = "linux")]
 pub use export::Exporter;
@@ -43,6 +45,8 @@ pub use pipe::{KernelPipe, PipeEnded};
 pub use offer::DeviceOffers;
 #[cfg(target_os = "windows")]
 pub use windows::WindowsUsb;
+#[cfg(target_os = "windows")]
+pub use wintunnel::{TunnelEnded, WinTunnel};
 
 use thiserror::Error;
 

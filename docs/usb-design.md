@@ -332,6 +332,8 @@ crates/usb/                mechanism
   ├── import.rs            peer device → vhci-hcd       (built)
   ├── pipe.rs              the socketpair both kernels drive  (built)
   ├── windows.rs           usbipd-win: state JSON, bind       (built)
+  ├── wintunnel.rs         urbs over usbipd's loopback port   (built)
+  ├── setup.rs             one privileged run per machine     (built)
   └── lib.rs               traits, LocalDevice
 
 crates/core/src/usb_session.rs
@@ -366,9 +368,15 @@ namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
    USB/IP stream misaligned. `UsbBackend` gained `collect`/`ended` so the
    session pump can send a transfer's last bytes *before* the detach that
    follows them.
-8. **Windows import** — `windows.rs` reads `usbipd state` and can bind;
-   detection and the missing-driver path are done. What remains is joining it
-   to the session the way the Linux backend is.
+8. ~~**Windows export**~~ — `windows.rs` reads `usbipd state`, binds behind a
+   single UAC prompt for the whole machine, and `wintunnel.rs` carries the
+   URBs. `usbipd-win` will not take a socket the way the Linux kernel does,
+   but it serves USB/IP on loopback 3240, so Cursio connects to it as a client
+   and the mesh carries what crosses. Loopback is the invariant: `usbipd`
+   authenticates nobody, which is exactly what the mesh replaces.
+
+   Windows *importing* a peer's device is still open — it needs the vhci side
+   of `usbipd-win`, which has no unprivileged control surface yet.
 9. **Degradation reporting** — isochronous flagged, revoke on unplug.
 
 Storage is not on this list: it belongs to `files`, which needs three additions

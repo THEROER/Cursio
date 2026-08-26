@@ -898,9 +898,20 @@ fn backend_error_to_wire(error: &cursio_usb::UsbBackendError) -> UsbError {
 pub struct WindowsUsbBackend {
     usbipd: cursio_usb::WindowsUsb,
     offers: cursio_usb::DeviceOffers,
-    /// Bus ids handed out, so a release names the same device the claim did.
-    streams: HashMap<UsbStreamId, String>,
+    /// Bus ids handed out, and the connection carrying each one's URBs.
+    streams: HashMap<UsbStreamId, WindowsStream>,
     next_stream: u64,
+}
+
+/// One device shared over a connection to the local USB/IP server.
+///
+/// `usbipd-win` will not take a socket from us the way the Linux kernel does,
+/// but it does serve one on loopback — so this is a client connection rather
+/// than a socketpair, and the mesh carries what crosses it.
+#[cfg(all(feature = "usb", target_os = "windows"))]
+struct WindowsStream {
+    busid: String,
+    tunnel: cursio_usb::WinTunnel,
 }
 
 #[cfg(all(feature = "usb", target_os = "windows"))]
@@ -950,9 +961,17 @@ impl UsbBackend for WindowsUsbBackend {
             backend_error_to_wire(&e)
         })?;
 
+        // The device is shared; now open the connection that will carry its
+        // transfers. Loopback only — see `cursio_usb::wintunnel`.
+        let tunnel = cursio_usb::WinTunnel::connect().map_err(|e| {
+            self.usbipd.unbind(&busid);
+            tracing::warn!(%device, busid, error = %e, "cannot reach the local usbipd server");
+            backend_error_to_wire(&e)
+        })?;
+
         let stream = UsbStreamId(self.next_stream);
         self.next_stream += 1;
-        self.streams.insert(stream, busid);
+        self.streams.insert(stream, WindowsStream { busid, tunnel });
         Ok(stream)
     }
 
@@ -960,24 +979,38 @@ impl UsbBackend for WindowsUsbBackend {
         let Some(busid) = self.offers.busid(device).map(str::to_string) else {
             return;
         };
-        self.streams.retain(|_, held| held != &busid);
+        // Dropping the stream closes the connection, which is how usbipd
+        // learns the attachment is over.
+        self.streams.retain(|_, held| held.busid != busid);
         self.usbipd.unbind(&busid);
     }
 
-    fn feed(&mut self, stream: UsbStreamId, _bytes: &[u8]) -> Result<(), UsbError> {
-        // `usbipd-win` owns its own socket to the driver and offers no way to
-        // hand it one of ours — the substitution `pipe.rs` performs on Linux
-        // has no equivalent here. Refusing names the gap; dropping the bytes
-        // would look like a device that attaches and then does nothing.
-        match self.streams.contains_key(&stream) {
-            true => Err(UsbError::Backend(
-                "windows cannot carry urbs over the mesh channel yet".into(),
-            )),
-            false => Err(UsbError::Gone),
-        }
+    fn feed(&mut self, stream: UsbStreamId, bytes: &[u8]) -> Result<(), UsbError> {
+        let Some(served) = self.streams.get_mut(&stream) else {
+            return Err(UsbError::Gone);
+        };
+        served.tunnel.write(bytes).map_err(|e| {
+            tracing::warn!(stream = stream.0, error = %e, "cannot hand urbs to usbipd");
+            backend_error_to_wire(&e)
+        })
     }
 
-    fn collect(&mut self, _out: &mut Vec<(UsbStreamId, Vec<u8>)>) {}
+    fn collect(&mut self, out: &mut Vec<(UsbStreamId, Vec<u8>)>) {
+        let mut chunks = Vec::new();
+        let mut closed = Vec::new();
+        for (stream, served) in &mut self.streams {
+            chunks.clear();
+            if served.tunnel.drain(&mut chunks).is_err() {
+                closed.push(*stream);
+            }
+            out.extend(chunks.drain(..).map(|bytes| (*stream, bytes)));
+        }
+        // After draining, so a transfer's last bytes reach the peer before the
+        // stream they belong to disappears.
+        for stream in closed {
+            self.streams.remove(&stream);
+        }
+    }
 }
 
 /// Turn a local failure into what a peer is told.
