@@ -25,6 +25,8 @@ mod linux;
 mod offer;
 #[cfg(target_os = "linux")]
 pub mod pipe;
+#[cfg(target_os = "linux")]
+pub mod setup;
 pub mod urb;
 #[cfg(target_os = "windows")]
 pub mod windows;

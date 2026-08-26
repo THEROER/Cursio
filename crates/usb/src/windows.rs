@@ -108,43 +108,62 @@ impl WindowsUsb {
     pub fn bind(&self, busid: &str) -> Result<(), UsbBackendError> {
         match self.run(&["bind", "--busid", busid]) {
             Ok(_) => Ok(()),
-            Err(UsbBackendError::NeedsPrivilege(_)) => self.bind_elevated(busid),
+            // One prompt, every device — not one prompt per device. Four
+            // devices meant four dialogs, and a retry after a refusal meant
+            // four more; privilege is a property of the machine, so it is
+            // asked for once and spent on everything at hand.
+            Err(UsbBackendError::NeedsPrivilege(_)) => {
+                self.bind_all_elevated()?;
+                // Answer for the device actually asked about: the batch may
+                // have bound it, or the user may have declined.
+                match self.run(&["bind", "--busid", busid]) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
             Err(e) => Err(e),
         }
     }
 
-    /// Bind through a UAC prompt, once per device.
+    /// Share every device this machine has, in one elevated run.
     ///
-    /// `runas` is the only way to raise privilege for a child process on
-    /// Windows, and it is deliberately a *prompt* rather than something this
-    /// process can grant itself. Cursio does not run elevated for this: holding
-    /// administrator rights for the life of a daemon to avoid four prompts a
-    /// year is a much larger thing to have made than the prompts.
-    ///
-    /// The prompt is shown by the shell, not by us, so there is nothing to
-    /// suppress and no window to hide — declining is an ordinary answer and
-    /// comes back as [`UsbBackendError::NeedsPrivilege`] naming the device.
+    /// `bind` writes a persistent registry entry, so this is genuinely once per
+    /// machine rather than once per session: the next start finds everything
+    /// already shared and prompts for nothing. A device plugged in later is the
+    /// only thing that brings the dialog back, and then only for itself.
     #[cfg(target_os = "windows")]
-    fn bind_elevated(&self, busid: &str) -> Result<(), UsbBackendError> {
+    fn bind_all_elevated(&self) -> Result<(), UsbBackendError> {
         use std::os::windows::process::CommandExt;
 
+        let devices = self.devices()?;
+        if devices.is_empty() {
+            return Ok(());
+        }
+        let busids: Vec<String> = devices.iter().map(|d| d.busid.clone()).collect();
         tracing::info!(
-            busid,
-            "asking for administrator rights to share a usb device"
+            count = busids.len(),
+            "asking for administrator rights once to share this machine's usb devices"
         );
-        // Through PowerShell's `Start-Process -Verb RunAs`: it raises the same
-        // UAC prompt as `ShellExecuteExW` and waits for the child, which is
-        // what lets the exit code be read. Doing it with the Win32 call
-        // directly would mean a second copy of the elevation plumbing that
-        // `core::elevate` already owns.
+
+        // One `Start-Process -Verb RunAs` is one UAC dialog, and the loop runs
+        // inside the elevated shell rather than around it. `-ErrorAction
+        // Continue` so a device that refuses to bind does not abandon the rest.
+        let binds = busids
+            .iter()
+            .map(|b| format!("& '{}' bind --busid {b}", self.exe.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        // The inner command is base64'd rather than quoted: it carries paths,
+        // semicolons and quotes of its own, and every layer of PowerShell
+        // quoting between here and the elevated shell is a way to get it
+        // wrong. `-EncodedCommand` has no quoting rules at all.
+        let encoded = encode_command(&binds);
         let script = format!(
-            "$p = Start-Process -FilePath '{}' -ArgumentList 'bind','--busid','{}' \
-             -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
-            self.exe.display(),
-            busid
+            "$p = Start-Process -FilePath 'powershell.exe' \
+             -ArgumentList '-NoProfile','-EncodedCommand','{encoded}' \
+             -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode"
         );
-        // CREATE_NO_WINDOW: the elevated child is what the user should see, not
-        // a console flashing up behind it.
+
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let output = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -152,24 +171,25 @@ impl WindowsUsb {
             .output()
             .map_err(|e| UsbBackendError::Enumerate(format!("cannot raise a uac prompt: {e}")))?;
 
-        if output.status.success() {
-            tracing::info!(busid, "device shared after an elevation prompt");
-            return Ok(());
+        match output.status.success() {
+            true => {
+                tracing::info!("usb devices shared; windows will not ask again for them");
+                Ok(())
+            }
+            // Declining is an ordinary answer: sharing stays off until the user
+            // is willing, and nothing here retries on its own.
+            false => Err(UsbBackendError::NeedsPrivilege(
+                "sharing this machine's usb devices needs administrator rights,                  and the prompt was declined"
+                    .into(),
+            )),
         }
-        // A declined prompt and a failed bind are both "not shared", and the
-        // peer is told the same thing either way — it can do nothing about
-        // either, and the difference is only in this machine's log.
-        Err(UsbBackendError::NeedsPrivilege(format!(
-            "sharing {busid} needs administrator rights, and the prompt was declined or failed"
-        )))
     }
 
-    /// Off Windows this cannot happen: the caller is the Windows backend.
     #[cfg(not(target_os = "windows"))]
-    fn bind_elevated(&self, busid: &str) -> Result<(), UsbBackendError> {
-        Err(UsbBackendError::NeedsPrivilege(format!(
-            "sharing {busid} needs administrator rights"
-        )))
+    fn bind_all_elevated(&self) -> Result<(), UsbBackendError> {
+        Err(UsbBackendError::NeedsPrivilege(
+            "sharing usb devices needs administrator rights".into(),
+        ))
     }
 
     /// Stop sharing.
@@ -273,6 +293,41 @@ fn field_after(text: &str, marker: &str) -> Option<u16> {
         .take(4)
         .collect();
     u16::from_str_radix(&digits, 16).ok()
+}
+
+/// Encode a PowerShell command the way `-EncodedCommand` expects.
+///
+/// UTF-16LE, then base64 — the encoding PowerShell documents for exactly this
+/// case. Hand-rolled because pulling in a base64 crate to spell one fixed
+/// alphabet would be the larger dependency.
+#[cfg(target_os = "windows")]
+fn encode_command(command: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let utf16: Vec<u8> = command
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+
+    let mut out = String::with_capacity(utf16.len().div_ceil(3) * 4);
+    for chunk in utf16.chunks(3) {
+        let bytes = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(match chunk.len() > 1 {
+            true => ALPHABET[((n >> 6) & 0x3F) as usize] as char,
+            false => '=',
+        });
+        out.push(match chunk.len() > 2 {
+            true => ALPHABET[(n & 0x3F) as usize] as char,
+            false => '=',
+        });
+    }
+    out
 }
 
 /// Where `usbipd-win` would be, for a message that names it.
@@ -394,6 +449,32 @@ mod tests {
         assert_eq!(devices[0].vendor, 0x2717);
         assert_eq!(devices[0].product, 0xFF08);
         assert_eq!(devices[0].product_name.as_deref(), Some("POCO X7 Pro"));
+    }
+
+    /// The elevated command reaches PowerShell only through this encoding, so
+    /// a mistake here is a UAC prompt that runs nothing. Checked against what
+    /// PowerShell itself produces: UTF-16LE, then base64.
+    #[test]
+    fn a_command_is_encoded_as_utf16le_base64() {
+        // "hi" → 68 00 69 00 → aABpAA==
+        assert_eq!(encode_command("hi"), "aABpAA==");
+        // Padding for every remainder, since the byte count is always even.
+        assert_eq!(encode_command("a"), "YQA=");
+        assert_eq!(encode_command("abc"), "YQBiAGMA");
+        assert_eq!(encode_command(""), "");
+    }
+
+    /// Device paths carry spaces and quotes, which is the whole reason this is
+    /// encoded rather than quoted.
+    #[test]
+    fn a_command_with_quotes_and_spaces_survives_encoding() {
+        let command = "& 'C:\\Program Files\\usbipd-win\\usbipd.exe' bind --busid 1-1";
+        let encoded = encode_command(command);
+        assert!(!encoded.contains(' '), "encoding must not leave spaces");
+        assert!(!encoded.contains('\''), "encoding must not leave quotes");
+        assert!(encoded
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
     }
 
     #[test]

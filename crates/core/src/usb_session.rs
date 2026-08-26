@@ -1017,11 +1017,27 @@ impl crate::module::ModuleFactory for UsbFactory {
         // `modprobe` the user can run.
         #[cfg(target_os = "linux")]
         {
+            // One prompt for the machine, not one per device: loading the
+            // modules and making the control files group-writable is a
+            // property of this host, and everything after it runs
+            // unprivileged. Does nothing when the machine is already set up,
+            // so this is free on every start but the first.
+            match cursio_usb::setup::ensure_ready() {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        "usb sharing is off: setting this machine up needs privilege \
+                         and the prompt was declined"
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "usb sharing is off");
+                    return None;
+                }
+            }
             if !LinuxUsbBackend::new().is_available() {
-                tracing::warn!(
-                    "usb sharing is off: the usbip-host module is not loaded \
-                     (sudo modprobe usbip-host)"
-                );
+                tracing::warn!("usb sharing is off: the usbip-host module did not load");
                 return None;
             }
             Some(cursio_protocol::ModuleAdvert::symmetric(
