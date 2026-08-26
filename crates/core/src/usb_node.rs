@@ -53,6 +53,20 @@ struct Exported {
     /// The stream each holder's URBs ride, keyed by peer. A stream is per link,
     /// because that is what carries it.
     holders: HashMap<PeerId, UsbStreamId>,
+    /// What decides each transfer's fate. One per device, because a descriptor
+    /// cache and a configuration lease describe the device rather than a link:
+    /// one per link would be one cache per link, which is the desynchronisation
+    /// it exists to prevent.
+    #[cfg(feature = "usb")]
+    arbiter: cursio_usb::arbiter::Arbiter,
+    /// The request each in-flight transfer carried, keyed by the submitter and
+    /// its sequence number.
+    ///
+    /// A reply header carries no setup bytes of its own, so the association has
+    /// to be held across the round trip — that is what lets a descriptor be
+    /// cached when it comes back.
+    #[cfg(feature = "usb")]
+    in_flight: HashMap<(PeerId, u32), cursio_usb::urb::Setup>,
     /// Whether the host has attached the device to itself as well.
     ///
     /// Separate from `holders` because the host is not a peer: its stream is
@@ -83,14 +97,23 @@ pub struct UsbNode {
     /// Stream ids, minted here rather than per link so two peers can never be
     /// handed the same number for different work.
     next_stream: u64,
+    /// Replies the arbiter produced without the device, waiting for the link
+    /// that owes them.
+    answers: Vec<(PeerId, UsbStreamId, Vec<u8>)>,
+    /// This machine's own id, so its loop is arbitrated as one more holder
+    /// rather than as a special case. The arbiter keys a lease by peer, and the
+    /// host contends for it like everybody else.
+    host: PeerId,
 }
 
 impl UsbNode {
-    pub fn new(backend: Box<dyn UsbBackend>) -> Self {
+    pub fn new(backend: Box<dyn UsbBackend>, host: PeerId) -> Self {
         Self {
             backend,
             exported: HashMap::new(),
             next_stream: 1,
+            answers: Vec::new(),
+            host,
         }
     }
 
@@ -155,6 +178,10 @@ impl UsbNode {
                 device,
                 Exported {
                     holders: HashMap::new(),
+                    #[cfg(feature = "usb")]
+                    arbiter: cursio_usb::arbiter::Arbiter::new(),
+                    #[cfg(feature = "usb")]
+                    in_flight: HashMap::new(),
                     local: false,
                     local_stream: None,
                 },
@@ -320,6 +347,119 @@ impl UsbNode {
         out
     }
 
+    /// Carry one holder's URBs to the device, deciding each transfer's fate.
+    ///
+    /// The arbiter's whole point, and the reason a URB is an operation rather
+    /// than raw material: a descriptor read is answered here, a request for a
+    /// state already in force is acknowledged without touching the device, and
+    /// one that would reconfigure it under another machine is stalled. Only
+    /// ordinary work reaches the device.
+    ///
+    /// Bytes that are not a parseable submission are passed through untouched.
+    /// A stream carries payloads as well as headers, and a partial read is the
+    /// ordinary case rather than an error — refusing what cannot be parsed
+    /// would break every transfer larger than one read.
+    #[cfg(feature = "usb")]
+    pub fn feed_from(
+        &mut self,
+        device: UsbDeviceId,
+        peer: PeerId,
+        stream: UsbStreamId,
+        bytes: &[u8],
+    ) -> Result<(), UsbError> {
+        use cursio_usb::arbiter::Verdict;
+        use cursio_usb::urb::{Command, Header, STATUS_STALL};
+
+        let Some(entry) = self.exported.get_mut(&device) else {
+            return Err(UsbError::Gone);
+        };
+        let Ok(header) = Header::parse(bytes) else {
+            return self.backend.feed(stream, bytes);
+        };
+
+        // A reply travelling the other way is not something to arbitrate; it is
+        // what the arbiter is waiting for, so the cache can learn from it.
+        if header.command == Command::SubmitReply {
+            let setup = entry.in_flight.remove(&(peer, header.seqnum));
+            let payload = bytes.get(cursio_usb::urb::HEADER_LEN..).unwrap_or(&[]);
+            entry.arbiter.completed(peer, setup, payload);
+            return self.backend.feed(stream, bytes);
+        }
+
+        match entry.arbiter.submit(peer, &header) {
+            Verdict::Forward => {
+                if header.is_control() {
+                    entry.in_flight.insert((peer, header.seqnum), header.setup);
+                }
+                self.backend.feed(stream, bytes)
+            }
+            // Answered without the device being involved at all. This is what
+            // makes the second, third and fourth machine to enumerate cost the
+            // device nothing and disturb nobody already using it.
+            Verdict::FromCache(payload) => {
+                let reply = Header::reply(header.seqnum, header.devid, 0, &payload);
+                self.answer(peer, stream, device, &reply)
+            }
+            Verdict::AlreadyInEffect => {
+                let reply = Header::reply(header.seqnum, header.devid, 0, &[]);
+                self.answer(peer, stream, device, &reply)
+            }
+            // Honouring it would reconfigure the device under the machine
+            // holding the lease. Stalling says so in the vocabulary USB already
+            // has, rather than leaving the asker waiting on a reply.
+            Verdict::Refused(holder) => {
+                tracing::debug!(
+                    %device, %holder,
+                    "refused a request that would change the device under its lease holder"
+                );
+                let reply = Header::reply(header.seqnum, header.devid, STATUS_STALL, &[]);
+                self.answer(peer, stream, device, &reply)
+            }
+        }
+    }
+
+    /// Send a locally-produced reply back to whoever submitted the transfer.
+    ///
+    /// The host's own loop is fed straight into its controller; a peer's has to
+    /// travel its link, so it is queued for that session to send.
+    #[cfg(feature = "usb")]
+    fn answer(
+        &mut self,
+        peer: PeerId,
+        stream: UsbStreamId,
+        device: UsbDeviceId,
+        reply: &[u8],
+    ) -> Result<(), UsbError> {
+        let is_local = self
+            .exported
+            .get(&device)
+            .is_some_and(|e| e.local_stream == Some(stream));
+        match is_local {
+            true => {
+                let _ = self.backend.feed_attached(stream, reply);
+            }
+            false => self.answers.push((peer, stream, reply.to_vec())),
+        }
+        Ok(())
+    }
+
+    /// Replies produced locally, for the sessions to send.
+    ///
+    /// Taken rather than borrowed: each is owed to exactly one link, and a
+    /// session sends only the ones addressed to its peer.
+    pub fn take_answers(&mut self, peer: PeerId) -> Vec<(UsbStreamId, Vec<u8>)> {
+        let mut mine = Vec::new();
+        self.answers
+            .retain(|(owed, stream, bytes)| match *owed == peer {
+                true => {
+                    mine.push((*stream, bytes.clone()));
+                    false
+                }
+                false => true,
+            });
+        mine
+    }
+
     /// Send the host's own URBs to the device it shares.
     fn feed_device(&mut self, device: UsbDeviceId, bytes: &[u8]) {
         // The export is one stream per holder, but they all lead to the same
@@ -332,7 +472,13 @@ impl UsbNode {
         else {
             return;
         };
-        if let Err(error) = self.backend.feed(stream, bytes) {
+        // Through the arbiter like anyone else's: the host is one more holder,
+        // and its transfers must not race a peer's either.
+        #[cfg(feature = "usb")]
+        let fed = self.feed_from(device, self.host, stream, bytes);
+        #[cfg(not(feature = "usb"))]
+        let fed = self.backend.feed(stream, bytes);
+        if let Err(error) = fed {
             tracing::warn!(%device, %error, "the host's own urbs did not reach the device");
         }
     }

@@ -325,7 +325,11 @@ impl UsbEngine {
         let Some(device) = node.device_of_stream(stream) else {
             return;
         };
-        if let Err(error) = node.backend().feed(stream, bytes) {
+        // Through the arbiter, not straight at the kernel: a descriptor read is
+        // answered from cache, a request for a state already in force is
+        // acknowledged, and one that would reconfigure the device under another
+        // machine is stalled.
+        if let Err(error) = node.feed_from(device, self.peer_id, stream, bytes) {
             drop(node);
             tracing::warn!(peer = %self.peer_name, %device, %error, "urb stream failed");
             self.node().detach_peer(device, self.peer_id);
@@ -590,6 +594,19 @@ impl SessionModule for UsbEngine {
         for stream in drained.ended {
             if self.owns_stream(stream) {
                 self.end_stream(stream);
+            }
+        }
+
+        // Replies the arbiter produced without the device — a cached
+        // descriptor, an acknowledgement, a stall. The submitter is waiting on
+        // each one exactly as it would wait for the device's own answer.
+        let answers = self.node().take_answers(self.peer_id);
+        for (stream, bytes) in answers {
+            for chunk in bytes.chunks(UsbMsg::MAX_CHUNK) {
+                self.outbound.push(UsbMsg::Data {
+                    stream,
+                    bytes: chunk.to_vec(),
+                });
             }
         }
 
@@ -1092,11 +1109,15 @@ impl UsbFactory {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn node(
         &self,
+        host: PeerId,
         make: impl FnOnce() -> Box<dyn UsbBackend>,
     ) -> std::sync::Arc<std::sync::Mutex<crate::usb_node::UsbNode>> {
         let mut slot = self.node.lock().unwrap_or_else(|e| e.into_inner());
         slot.get_or_insert_with(|| {
-            std::sync::Arc::new(std::sync::Mutex::new(crate::usb_node::UsbNode::new(make())))
+            std::sync::Arc::new(std::sync::Mutex::new(crate::usb_node::UsbNode::new(
+                make(),
+                host,
+            )))
         })
         .clone()
     }
@@ -1174,7 +1195,7 @@ impl crate::module::ModuleFactory for UsbFactory {
         Ok(Box::new(UsbEngine::new(
             ctx.peer_name().to_string(),
             ctx.peer.peer_id,
-            self.node(|| Box::new(LinuxUsbBackend::new())),
+            self.node(ctx.local.peer_id, || Box::new(LinuxUsbBackend::new())),
         )))
     }
 
@@ -1183,7 +1204,7 @@ impl crate::module::ModuleFactory for UsbFactory {
         Ok(Box::new(UsbEngine::new(
             ctx.peer_name().to_string(),
             ctx.peer.peer_id,
-            self.node(|| Box::new(WindowsUsbBackend::new())),
+            self.node(ctx.local.peer_id, || Box::new(WindowsUsbBackend::new())),
         )))
     }
 
@@ -1208,6 +1229,7 @@ mod tests {
     ) -> std::sync::Arc<std::sync::Mutex<crate::usb_node::UsbNode>> {
         std::sync::Arc::new(std::sync::Mutex::new(crate::usb_node::UsbNode::new(
             Box::new(backend),
+            peer(200),
         )))
     }
 
@@ -1225,7 +1247,9 @@ mod tests {
         /// replacing the whole backend would throw away the export the node is
         /// holding, which is the state the test is about.
         feed_fails: std::sync::Arc<std::sync::Mutex<Option<UsbError>>>,
-        fed: Vec<(UsbStreamId, Vec<u8>)>,
+        /// What actually reached the device. Shared so a test can prove a
+        /// transfer was answered without the device hearing about it.
+        fed: Shared,
         next_stream: u64,
         /// What the local kernel has produced, for the next `collect`.
         ///
@@ -1334,7 +1358,10 @@ mod tests {
             {
                 return Err(error);
             }
-            self.fed.push((stream, bytes.to_vec()));
+            self.fed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((stream, bytes.to_vec()));
             Ok(())
         }
     }
@@ -1364,6 +1391,91 @@ mod tests {
             taken(&mut e).as_slice(),
             [UsbMsg::Claimed { device, .. }] if *device == UsbDeviceId(1)
         ));
+    }
+
+    /// How many *requests* actually reached the device. Replies travelling the
+    /// other way go through the same call, and counting those would score the
+    /// device's own answer as a second question.
+    fn submissions(fed: &Shared) -> usize {
+        fed.lock()
+            .expect("test lock")
+            .iter()
+            .filter(|(_, bytes)| {
+                cursio_usb::urb::Header::parse(bytes)
+                    .is_ok_and(|h| h.command == cursio_usb::urb::Command::Submit)
+            })
+            .count()
+    }
+
+    /// A USB/IP submission, as a host puts one on the wire.
+    fn submission(seqnum: u32, setup: [u8; 8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; cursio_usb::urb::HEADER_LEN];
+        bytes[0x00..0x04].copy_from_slice(&1u32.to_be_bytes());
+        bytes[0x04..0x08].copy_from_slice(&seqnum.to_be_bytes());
+        bytes[0x0c..0x10].copy_from_slice(&1u32.to_be_bytes());
+        bytes[0x28..0x30].copy_from_slice(&setup);
+        bytes
+    }
+
+    /// `GET_DESCRIPTOR` for the device descriptor — the first thing every host
+    /// asks, and the request the cache exists to answer.
+    fn get_descriptor() -> [u8; 8] {
+        [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]
+    }
+
+    /// What makes "every machine sees it" cheap rather than a thundering herd:
+    /// the second machine to enumerate is answered from the cache and the
+    /// device never hears about it.
+    #[test]
+    fn a_second_machine_enumerates_without_touching_the_device() {
+        let device = UsbDeviceId(1);
+        let fed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut e = UsbEngine::new(
+            "desktop".into(),
+            peer(1),
+            node_of(FakeBackend {
+                fed: fed.clone(),
+                ..FakeBackend::with(&[1])
+            }),
+        );
+
+        // The first machine asks, and the device answers.
+        e.on_claim(device, "adb");
+        let first = match taken(&mut e).as_slice() {
+            [UsbMsg::Claimed { stream, .. }] => *stream,
+            other => panic!("expected a grant, got {other:?}"),
+        };
+        e.on_data(first, &submission(1, get_descriptor()));
+        assert_eq!(
+            submissions(&fed),
+            1,
+            "the first enumeration must reach the device"
+        );
+        // The device answers, which is what fills the cache.
+        let reply = cursio_usb::urb::Header::reply(1, 0, 0, b"the descriptor");
+        e.node().feed_from(device, peer(1), first, &reply).ok();
+
+        // A second machine asks the identical question.
+        e.peer_id = peer(2);
+        e.on_claim(device, "also adb");
+        let second = match taken(&mut e).as_slice() {
+            [UsbMsg::Claimed { stream, .. }] => *stream,
+            other => panic!("expected a second grant, got {other:?}"),
+        };
+        e.on_data(second, &submission(1, get_descriptor()));
+
+        assert_eq!(
+            submissions(&fed),
+            1,
+            "the device must not be asked twice for what cannot have changed"
+        );
+        let answered = e.node().take_answers(peer(2));
+        assert!(
+            answered
+                .iter()
+                .any(|(s, b)| *s == second && b.ends_with(b"the descriptor")),
+            "the second machine is answered from the cache instead"
+        );
     }
 
     /// The symptom this exists to fix: a phone plugged into the laptop showed

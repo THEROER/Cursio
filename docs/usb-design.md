@@ -374,6 +374,12 @@ namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
 3. ~~**Linux enumeration**~~ — sysfs, verified against real hardware.
 4. ~~**The arbiter**~~ — the 48-byte header, the descriptor cache, serialised
    data transfers, intercepted state changes. `urb.rs` and `arbiter.rs`.
+   Written to this document but reached by nothing for as long as the session
+   refused a second machine before its first URB could arrive; `usb_node.rs`
+   now puts it on the path every transfer takes. Answering a verdict needs a
+   reply the submitting kernel accepts — a host waits on `RET_SUBMIT` for its
+   seqnum and waits forever without one — so `Header::reply` builds one, and a
+   refusal is reported as the stall (`-EPIPE`) the device itself would give.
 5. ~~**Linux export**~~ — `export.rs`: unbind, `match_busid`, bind, in that
    order, and undone on failure. Privilege is reported, never escalated.
 6. ~~**Attaching half**~~ — `import.rs`: a free `vhci-hcd` port and the

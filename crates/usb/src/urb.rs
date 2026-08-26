@@ -216,7 +216,50 @@ impl Header {
     pub fn write_seqnum(bytes: &mut [u8], seqnum: u32) {
         bytes[0x04..0x08].copy_from_slice(&seqnum.to_be_bytes());
     }
+
+    /// Build the reply this transfer would have got from the device.
+    ///
+    /// What turns an arbiter verdict into something a kernel accepts. A host
+    /// that submitted a transfer is waiting on `RET_SUBMIT` for that seqnum and
+    /// will wait forever without one — so answering from cache, reporting a
+    /// state already in effect, and refusing all have to produce a real reply
+    /// rather than silence.
+    ///
+    /// `status` is a kernel errno, negated, exactly as `usbip` carries it: `0`
+    /// succeeded, and `-EPIPE` (`-32`) is how USB says a request was refused —
+    /// the same stall a device answers with, so a host needs no special case
+    /// for a transfer Cursio declined.
+    ///
+    /// Isochronous descriptors are never appended: this only answers control
+    /// transfers, which have none.
+    pub fn reply(seqnum: u32, devid: u32, status: i32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; HEADER_LEN];
+        bytes[0x00..0x04].copy_from_slice(&RET_SUBMIT.to_be_bytes());
+        bytes[0x04..0x08].copy_from_slice(&seqnum.to_be_bytes());
+        bytes[0x08..0x0c].copy_from_slice(&devid.to_be_bytes());
+        // Direction and endpoint are the submitter's business, and the kernel
+        // ignores them on a reply: it matches on seqnum alone.
+        bytes[0x14..0x18].copy_from_slice(&status.to_be_bytes());
+        // `actual_length` shares the offset `transfer_buffer_length` has on a
+        // submission — a reply says how much came back, not how much was asked
+        // for, and a host that reads more than this gets somebody else's bytes.
+        bytes[0x18..0x1c].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        // `number_of_packets` is -1 on a reply to a non-isochronous transfer.
+        bytes[0x20..0x24].copy_from_slice(&(-1i32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
 }
+
+/// A reply to a submission, as the wire numbers it.
+const RET_SUBMIT: u32 = 0x0000_0003;
+
+/// What USB calls a stalled endpoint, which is how a refusal is reported.
+///
+/// A host asked for something another machine's lease forbids. `-EPIPE` is what
+/// the device itself would answer if it declined, so nothing on the host needs
+/// to know Cursio was involved.
+pub const STATUS_STALL: i32 = -32;
 
 #[cfg(test)]
 mod tests {
@@ -233,6 +276,51 @@ mod tests {
         bytes[0x18..0x1c].copy_from_slice(&64u32.to_be_bytes());
         bytes[SETUP_OFFSET..SETUP_OFFSET + 8].copy_from_slice(&setup);
         bytes
+    }
+
+    /// A host waits on `RET_SUBMIT` for the seqnum it submitted, so a verdict
+    /// answered locally has to look exactly like one the device produced.
+    #[test]
+    fn a_local_reply_carries_the_seqnum_and_length_a_host_waits_for() {
+        let reply = Header::reply(7, 0x0001_0002, 0, b"descriptor");
+
+        assert_eq!(&reply[0x00..0x04], &3u32.to_be_bytes(), "RET_SUBMIT");
+        assert_eq!(&reply[0x04..0x08], &7u32.to_be_bytes(), "the host's seqnum");
+        assert_eq!(&reply[0x14..0x18], &0i32.to_be_bytes(), "succeeded");
+        assert_eq!(
+            &reply[0x18..0x1c],
+            &10u32.to_be_bytes(),
+            "actual_length, not what was asked for"
+        );
+        assert_eq!(
+            &reply[0x20..0x24],
+            &(-1i32).to_be_bytes(),
+            "not an isochronous transfer"
+        );
+        assert_eq!(&reply[HEADER_LEN..], b"descriptor");
+    }
+
+    /// A refusal is a stall, which is what the device itself would answer —
+    /// so a host needs no special case for a transfer Cursio declined.
+    #[test]
+    fn a_refusal_is_reported_as_a_stall_with_no_payload() {
+        let reply = Header::reply(9, 0, STATUS_STALL, &[]);
+
+        assert_eq!(&reply[0x14..0x18], &(-32i32).to_be_bytes());
+        assert_eq!(&reply[0x18..0x1c], &0u32.to_be_bytes());
+        assert_eq!(reply.len(), HEADER_LEN, "a stall carries nothing back");
+    }
+
+    /// And what it builds is what it can read back: the reply is a header like
+    /// any other, so a parser on the far end has to accept it.
+    #[test]
+    fn a_built_reply_parses_as_the_reply_it_claims_to_be() {
+        let reply = Header::reply(7, 0x0001_0002, 0, b"abc");
+        let parsed = Header::parse(&reply).expect("a reply must parse");
+
+        assert_eq!(parsed.command, Command::SubmitReply);
+        assert_eq!(parsed.seqnum, 7);
+        assert_eq!(parsed.devid, 0x0001_0002);
     }
 
     /// `GET_DESCRIPTOR` for the device descriptor: the first thing every host
