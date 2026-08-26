@@ -267,6 +267,12 @@ The first field of a `status` line is the hub's speed class (`hs`), **not** the
 port number — reading it as the port makes every line unparseable and so every
 port busy, which surfaces as "no free port" rather than as a wrong answer.
 
+A full export cycle was run against real hardware (an ASUS AURA controller on
+`1-6`): `usb` → `usbip-host` → socket handed over → back to `usb`, with the
+device returned to its own driver. `usbip_sockfd` is write-only
+(`DEVICE_ATTR_WO`), so a successful write is the only confirmation the kernel
+offers — nothing can read back which descriptor it holds.
+
 Two facts shape the backend:
 
 - The modules are **not loaded by default** (`modprobe usbip-host vhci-hcd`) and

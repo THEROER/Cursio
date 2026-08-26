@@ -211,6 +211,12 @@ impl Exporter {
     /// kernel holds the same file description, so closing this end is what ends
     /// the export — deliberately, since it means a dropped session cannot leave
     /// a device attached to nobody.
+    ///
+    /// The attribute is **write-only** (`DEVICE_ATTR_WO` in the kernel's
+    /// `stub_dev.c`), so there is no reading back what was handed over: a
+    /// successful write is the only confirmation available, and code that
+    /// verified by reading would find an empty value and conclude the export
+    /// had failed.
     pub fn serve(&self, busid: &str, fd: std::os::fd::RawFd) -> Result<(), UsbBackendError> {
         write_sysfs(&self.sockfd_path(busid), &fd.to_string())
     }
