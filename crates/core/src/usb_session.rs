@@ -84,6 +84,40 @@ pub trait UsbBackend: Send {
     fn ended(&mut self) -> Vec<UsbStreamId> {
         Vec::new()
     }
+
+    /// Whether this machine can take a peer's device at all.
+    ///
+    /// The importing half is a separate kernel module from the exporting one
+    /// (`vhci-hcd`, not `usbip-host`) and is loaded independently, so a machine
+    /// can perfectly well share its own ports while being unable to accept
+    /// anyone else's. Asked before attaching rather than discovered as a
+    /// failure per device.
+    fn can_attach(&self) -> bool {
+        false
+    }
+
+    /// Make a peer's device appear on this machine.
+    ///
+    /// Returns the socket the peer's URBs should be written into, as far as
+    /// this side is concerned: the engine feeds it with [`feed_attached`] and
+    /// drains it with [`collect_attached`].
+    ///
+    /// [`feed_attached`]: Self::feed_attached
+    /// [`collect_attached`]: Self::collect_attached
+    fn attach(&mut self, _device: UsbDeviceId, _stream: UsbStreamId) -> Result<(), UsbError> {
+        Err(UsbError::Backend("attaching is not supported here".into()))
+    }
+
+    /// Stop presenting a peer's device locally.
+    fn detach(&mut self, _stream: UsbStreamId) {}
+
+    /// Hand bytes from the peer's device to the local virtual controller.
+    fn feed_attached(&mut self, _stream: UsbStreamId, _bytes: &[u8]) -> Result<(), UsbError> {
+        Err(UsbError::Gone)
+    }
+
+    /// Take what the local virtual controller wants to send the peer's device.
+    fn collect_attached(&mut self, _out: &mut Vec<(UsbStreamId, Vec<u8>)>) {}
 }
 
 /// One attach in progress, from the host's point of view.
@@ -108,6 +142,13 @@ pub struct UsbEngine {
     outbound: Vec<UsbMsg>,
     /// Whether the device list has gone out on this link yet.
     announced: bool,
+    /// Devices of *this peer* that are now present on this machine, keyed by
+    /// the peer's device id. The mirror image of `attached`: that is what we
+    /// lent out, this is what we borrowed.
+    borrowed: HashMap<UsbDeviceId, UsbStreamId>,
+    /// Peer devices asked for but not yet answered, so a re-announced listing
+    /// does not ask twice for the same device.
+    asking: std::collections::HashSet<UsbDeviceId>,
 }
 
 impl UsbEngine {
@@ -119,6 +160,8 @@ impl UsbEngine {
             attached: HashMap::new(),
             outbound: Vec::new(),
             announced: false,
+            borrowed: HashMap::new(),
+            asking: std::collections::HashSet::new(),
         }
     }
 
@@ -228,6 +271,20 @@ impl UsbEngine {
     /// a peer that does not hold the device are not addressed to any attach
     /// this machine granted.
     fn on_data(&mut self, stream: UsbStreamId, bytes: &[u8]) {
+        // Two directions share one message. Bytes for a device *we borrowed*
+        // go to the local virtual controller; bytes for one *we lent out* go to
+        // the real device. Told apart by which map the stream is in, because a
+        // machine can be doing both at once with the same peer.
+        if self.borrowed.values().any(|held| *held == stream) {
+            if let Err(error) = self.backend.feed_attached(stream, bytes) {
+                tracing::warn!(
+                    peer = %self.peer_name, stream = stream.0, %error,
+                    "cannot hand a peer device's urbs to the local controller"
+                );
+            }
+            return;
+        }
+
         let owned = self
             .attached
             .iter()
@@ -268,6 +325,91 @@ impl UsbEngine {
                 peer = %self.peer_name, %device,
                 "reclaiming a device whose holder went away"
             );
+        }
+    }
+
+    /// A peer told us what it has. Take everything we do not already have.
+    ///
+    /// **Automatic, and that is the whole feature.** "Whichever machine has the
+    /// port, every machine has the device" is not something a user should have
+    /// to ask for per device — a phone plugged into the laptop must appear in
+    /// `adb devices` here without anybody running a command. Attaching is also
+    /// cheap by design: enumeration is answered from the host's cache, so a
+    /// second machine attaching costs the device nothing and disturbs nobody
+    /// already using it (`docs/usb-design.md`, "Ownership, restated").
+    ///
+    /// What is *not* automatic is the configuration lease, which is taken by
+    /// issuing a state-changing request and arbitrated by the host. Attaching
+    /// is not claiming.
+    fn on_devices(&mut self, devices: &[UsbDevice]) {
+        if !self.backend.can_attach() {
+            // Said once per listing rather than per device: a machine without
+            // `vhci-hcd` would otherwise repeat itself for every port the peer
+            // has.
+            if !devices.is_empty() && self.borrowed.is_empty() && self.asking.is_empty() {
+                tracing::info!(
+                    peer = %self.peer_name, count = devices.len(),
+                    "peer offers usb devices but this machine cannot attach them"
+                );
+            }
+            return;
+        }
+
+        // A device that vanished from the listing is gone from the peer's port,
+        // so it must go from here too — the peer may not get to say so.
+        let present: std::collections::HashSet<UsbDeviceId> =
+            devices.iter().map(|d| d.id).collect();
+        let stale: Vec<UsbDeviceId> = self
+            .borrowed
+            .keys()
+            .copied()
+            .filter(|id| !present.contains(id))
+            .collect();
+        for device in stale {
+            if let Some(stream) = self.borrowed.remove(&device) {
+                self.backend.detach(stream);
+                tracing::info!(
+                    peer = %self.peer_name, %device,
+                    "a peer device is no longer offered; detaching"
+                );
+            }
+        }
+
+        for device in devices {
+            if self.borrowed.contains_key(&device.id) || !self.asking.insert(device.id) {
+                continue;
+            }
+            tracing::info!(
+                peer = %self.peer_name, device = %device.id, name = %device.label(),
+                "asking for a peer device"
+            );
+            self.outbound.push(UsbMsg::Claim {
+                device: device.id,
+                reason: "mesh attach".into(),
+            });
+        }
+    }
+
+    /// The peer agreed. Present its device on this machine.
+    fn on_claimed(&mut self, device: UsbDeviceId, stream: UsbStreamId) {
+        self.asking.remove(&device);
+        if self.borrowed.contains_key(&device) {
+            return;
+        }
+        match self.backend.attach(device, stream) {
+            Ok(()) => {
+                self.borrowed.insert(device, stream);
+                tracing::info!(
+                    peer = %self.peer_name, %device,
+                    "a peer device is now on this machine"
+                );
+            }
+            Err(e) => {
+                // Give it straight back rather than leaving the peer believing
+                // this machine holds a device it never managed to present.
+                tracing::warn!(peer = %self.peer_name, %device, %e, "cannot attach peer device");
+                self.outbound.push(UsbMsg::Release { device });
+            }
         }
     }
 
@@ -339,6 +481,19 @@ impl SessionModule for UsbEngine {
             self.end_stream(stream);
         }
 
+        // And the same in the other direction: what this machine's virtual
+        // controller wants to send to a device on the peer's port.
+        let mut wanted = Vec::new();
+        self.backend.collect_attached(&mut wanted);
+        for (stream, bytes) in wanted {
+            for chunk in bytes.chunks(UsbMsg::MAX_CHUNK) {
+                self.outbound.push(UsbMsg::Data {
+                    stream,
+                    bytes: chunk.to_vec(),
+                });
+            }
+        }
+
         for msg in std::mem::take(&mut self.outbound) {
             // Each message states its own class: the device list and the
             // claim/release handshake are control traffic, while the URB stream
@@ -368,13 +523,29 @@ impl SessionModule for UsbEngine {
             UsbMsg::Claim { device, reason } => self.on_claim(device, &reason),
             UsbMsg::Release { device } => self.on_release(device),
             UsbMsg::Data { stream, bytes } => self.on_data(stream, &bytes),
-            // Replies belong to the attaching half, which is not built yet.
-            // Claimed/Refused/Detached/Devices arriving here means this machine
-            // asked for something, and nothing in this engine asks.
-            UsbMsg::Devices(_)
-            | UsbMsg::Claimed { .. }
-            | UsbMsg::Refused { .. }
-            | UsbMsg::Detached { .. } => {}
+            UsbMsg::Devices(devices) => self.on_devices(&devices),
+            UsbMsg::Claimed { device, stream } => self.on_claimed(device, stream),
+            UsbMsg::Refused { device, error } => {
+                self.asking.remove(&device);
+                tracing::info!(
+                    peer = %self.peer_name, %device, %error,
+                    "peer would not lend a device"
+                );
+            }
+            UsbMsg::Detached {
+                device,
+                stream,
+                error,
+            } => {
+                self.asking.remove(&device);
+                if self.borrowed.remove(&device).is_some() {
+                    self.backend.detach(stream);
+                    tracing::info!(
+                        peer = %self.peer_name, %device, ?error,
+                        "a peer device went away"
+                    );
+                }
+            }
         }
         true
     }
@@ -401,6 +572,22 @@ pub struct LinuxUsbBackend {
     next_stream: u64,
     /// Streams the kernel closed, reported after their last bytes.
     ended: Vec<UsbStreamId>,
+    /// The importing half: `vhci-hcd`, which is loaded separately from
+    /// `usbip-host` and may well be absent while exporting works.
+    importer: cursio_usb::Importer,
+    /// Peer devices presented on this machine, keyed by the peer's stream id.
+    borrowed: HashMap<UsbStreamId, BorrowedStream>,
+}
+
+/// One device borrowed from a peer and presented locally.
+///
+/// The pipe carries URBs between this machine's virtual controller and the
+/// mesh; the attachment holds the vhci port and releases it on drop, so a lost
+/// session cannot leave a port bound to a socket nobody reads.
+#[cfg(all(feature = "usb", target_os = "linux"))]
+struct BorrowedStream {
+    pipe: cursio_usb::KernelPipe,
+    _attachment: cursio_usb::import::Attachment,
 }
 
 /// One device being served over a socket the kernel holds the far end of.
@@ -429,6 +616,8 @@ impl LinuxUsbBackend {
             streams: HashMap::new(),
             next_stream: 1,
             ended: Vec::new(),
+            importer: cursio_usb::Importer::new(),
+            borrowed: HashMap::new(),
         }
     }
 
@@ -536,6 +725,79 @@ impl UsbBackend for LinuxUsbBackend {
             self.streams.remove(stream);
         }
         ended
+    }
+
+    fn can_attach(&self) -> bool {
+        self.importer.is_available()
+    }
+
+    fn attach(&mut self, device: UsbDeviceId, stream: UsbStreamId) -> Result<(), UsbError> {
+        let (pipe, kernel_end) = cursio_usb::KernelPipe::new().map_err(|e| {
+            tracing::warn!(%device, error = %e, "cannot make a socket for a peer device");
+            backend_error_to_wire(&e)
+        })?;
+
+        // `devid` is the *remote* machine's bus and device number, which this
+        // side does not know: the peer's ids are opaque here by design. The
+        // kernel only echoes it back in messages, so a placeholder costs a
+        // less useful log line there and nothing else.
+        //
+        // Speed is High for the same reason — the listing carries no speed, and
+        // a device that enumerates at the wrong rate is a device with a problem
+        // while one refused for an unknown speed never appears at all.
+        let attachment = self
+            .importer
+            .attach(&kernel_end, 0, cursio_usb::Speed::High)
+            .map_err(|e| {
+                tracing::warn!(%device, error = %e, "cannot attach a peer device");
+                backend_error_to_wire(&e)
+            })?;
+        // The kernel `dup`s the descriptor; holding ours would keep a second
+        // reference alive and make the close that ends the attach do nothing.
+        drop(kernel_end);
+
+        tracing::info!(%device, port = attachment.port(), "peer device attached locally");
+        self.borrowed.insert(
+            stream,
+            BorrowedStream {
+                pipe,
+                _attachment: attachment,
+            },
+        );
+        Ok(())
+    }
+
+    fn detach(&mut self, stream: UsbStreamId) {
+        // Dropping both closes the socket and frees the vhci port, in that
+        // order — the port cannot be reused while a socket still references it.
+        self.borrowed.remove(&stream);
+    }
+
+    fn feed_attached(&mut self, stream: UsbStreamId, bytes: &[u8]) -> Result<(), UsbError> {
+        let Some(borrowed) = self.borrowed.get_mut(&stream) else {
+            return Err(UsbError::Gone);
+        };
+        borrowed.pipe.write(bytes).map_err(|e| {
+            tracing::warn!(stream = stream.0, error = %e, "cannot write to the virtual controller");
+            backend_error_to_wire(&e)
+        })
+    }
+
+    fn collect_attached(&mut self, out: &mut Vec<(UsbStreamId, Vec<u8>)>) {
+        let mut chunks = Vec::new();
+        let mut closed = Vec::new();
+        for (stream, borrowed) in &mut self.borrowed {
+            chunks.clear();
+            if borrowed.pipe.drain(&mut chunks).is_err() {
+                closed.push(*stream);
+            }
+            out.extend(chunks.drain(..).map(|bytes| (*stream, bytes)));
+        }
+        // After draining, so a transfer's last bytes reach the peer before the
+        // attachment they belong to disappears.
+        for stream in closed {
+            self.borrowed.remove(&stream);
+        }
     }
 }
 
@@ -767,6 +1029,10 @@ mod tests {
         produced: Vec<(UsbStreamId, Vec<u8>)>,
         /// Streams the kernel has closed, for the next `ended`.
         closed: Vec<UsbStreamId>,
+        /// Whether this machine pretends to have a virtual controller.
+        attaches: bool,
+        /// Peer devices this backend was told to present locally.
+        borrowed: Vec<(UsbDeviceId, UsbStreamId)>,
     }
 
     impl FakeBackend {
@@ -810,6 +1076,19 @@ mod tests {
 
         fn collect(&mut self, out: &mut Vec<(UsbStreamId, Vec<u8>)>) {
             out.append(&mut self.produced);
+        }
+
+        fn can_attach(&self) -> bool {
+            self.attaches
+        }
+
+        fn attach(&mut self, device: UsbDeviceId, stream: UsbStreamId) -> Result<(), UsbError> {
+            self.borrowed.push((device, stream));
+            Ok(())
+        }
+
+        fn detach(&mut self, stream: UsbStreamId) {
+            self.borrowed.retain(|(_, held)| *held != stream);
         }
 
         fn ended(&mut self) -> Vec<UsbStreamId> {
@@ -1084,6 +1363,115 @@ mod tests {
 
         e.end_stream(stream);
         assert!(!e.announced);
+    }
+
+    /// Build an engine whose machine can also take a peer's devices.
+    fn attaching_engine() -> UsbEngine {
+        let backend = FakeBackend {
+            attaches: true,
+            ..FakeBackend::with(&[])
+        };
+        UsbEngine::new("laptop".into(), peer(1), Box::new(backend))
+    }
+
+    /// One offered device, as a peer would announce it.
+    fn offered(id: u64) -> UsbDevice {
+        UsbDevice {
+            id: UsbDeviceId(id),
+            vendor: 0x2717,
+            product: 0xFF08,
+            manufacturer: None,
+            description: Some("POCO X7 Pro".into()),
+            class: 0,
+            transport: UsbTransport::Fine,
+            holder: None,
+        }
+    }
+
+    /// The whole feature: "whichever machine has the port, every machine has
+    /// the device". Seeing a peer's listing must ask for its devices without
+    /// anybody running a command.
+    #[test]
+    fn a_peers_devices_are_asked_for_the_moment_they_are_announced() {
+        let mut e = attaching_engine();
+        e.on_devices(&[offered(1), offered(2)]);
+
+        let asked: Vec<UsbDeviceId> = taken(&mut e)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                UsbMsg::Claim { device, .. } => Some(device),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, vec![UsbDeviceId(1), UsbDeviceId(2)]);
+    }
+
+    /// The listing is re-announced whenever anything changes, and asking again
+    /// for a device already being fetched would flood the link.
+    #[test]
+    fn a_re_announced_listing_does_not_ask_twice() {
+        let mut e = attaching_engine();
+        e.on_devices(&[offered(1)]);
+        let _ = taken(&mut e);
+
+        e.on_devices(&[offered(1)]);
+        assert!(taken(&mut e).is_empty(), "asked for the same device twice");
+    }
+
+    /// A machine without `vhci-hcd` can still share its own ports, and must not
+    /// ask for devices it has nowhere to put.
+    #[test]
+    fn a_machine_that_cannot_attach_asks_for_nothing() {
+        let mut e = engine(&[]);
+        e.on_devices(&[offered(1)]);
+        assert!(taken(&mut e).is_empty());
+    }
+
+    /// The grant is what makes the device appear locally.
+    #[test]
+    fn a_granted_device_is_presented_on_this_machine() {
+        let mut e = attaching_engine();
+        e.on_devices(&[offered(1)]);
+        let _ = taken(&mut e);
+
+        e.on_claimed(UsbDeviceId(1), UsbStreamId(7));
+        assert_eq!(e.borrowed.get(&UsbDeviceId(1)), Some(&UsbStreamId(7)));
+    }
+
+    /// A device unplugged from the peer's port simply stops being listed — the
+    /// peer may never get to say so — and must go from here too.
+    #[test]
+    fn a_device_dropped_from_the_listing_is_detached() {
+        let mut e = attaching_engine();
+        e.on_devices(&[offered(1)]);
+        let _ = taken(&mut e);
+        e.on_claimed(UsbDeviceId(1), UsbStreamId(7));
+
+        e.on_devices(&[]);
+        assert!(
+            e.borrowed.is_empty(),
+            "a device that is gone must not linger"
+        );
+    }
+
+    /// A refusal must clear the pending ask, or the device is never retried
+    /// when the peer that held it lets go.
+    #[test]
+    fn a_refusal_lets_the_device_be_asked_for_again() {
+        let mut e = attaching_engine();
+        e.on_devices(&[offered(1)]);
+        let _ = taken(&mut e);
+
+        // What `handle_message` does for a refusal: clear the pending ask.
+        e.asking.remove(&UsbDeviceId(1));
+        e.on_devices(&[offered(1)]);
+
+        assert!(
+            taken(&mut e)
+                .iter()
+                .any(|m| matches!(m, UsbMsg::Claim { device, .. } if *device == UsbDeviceId(1))),
+            "a refused device must be asked for again later"
+        );
     }
 
     /// A stream that ended twice — a close racing a release — must not detach a
