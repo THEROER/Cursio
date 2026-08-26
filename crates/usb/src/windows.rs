@@ -42,6 +42,7 @@
 //! never offered devices that would fail on claim (invariant 6 in
 //! `docs/usb-design.md`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -56,6 +57,20 @@ const DEFAULT_PATH: &str = r"C:\Program Files\usbipd-win\usbipd.exe";
 #[derive(Debug, Clone)]
 pub struct WindowsUsb {
     exe: PathBuf,
+    /// USB classes by vendor and product, and the device set they were read
+    /// for.
+    ///
+    /// `Get-PnpDevice` costs about **2.8 seconds** — nine times what `usbipd
+    /// state` costs — and the listing is re-read every few seconds so a device
+    /// plugged in mid-session appears. Paying that on every listing blocked the
+    /// session loop the shared cursor rides (`took_ms=50..112` in the logs) and
+    /// made the whole enumeration miss its window, so a claim arriving mid-scan
+    /// was answered `Gone` for a device that was plugged in the whole time.
+    ///
+    /// A class cannot change while a device stays plugged in, so the answer is
+    /// only re-read when the *set* of devices changes — which is exactly when a
+    /// class this does not know about could appear.
+    classes: std::cell::RefCell<Option<(Vec<(u16, u16)>, HashMap<(u16, u16), u8>)>>,
 }
 
 impl Default for WindowsUsb {
@@ -68,12 +83,16 @@ impl WindowsUsb {
     pub fn new() -> Self {
         Self {
             exe: PathBuf::from(DEFAULT_PATH),
+            classes: std::cell::RefCell::new(None),
         }
     }
 
     /// Point at a different binary — a non-default install, or a test double.
     pub fn at(exe: impl Into<PathBuf>) -> Self {
-        Self { exe: exe.into() }
+        Self {
+            exe: exe.into(),
+            classes: std::cell::RefCell::new(None),
+        }
     }
 
     /// Whether `usbipd-win` is installed at all.
@@ -95,8 +114,16 @@ impl WindowsUsb {
         // whether a device may be taken automatically — a Bluetooth radio
         // taken from a laptop cuts out the user's headphones. Windows knows it
         // through PnP, so it is asked separately and matched by vendor and
-        // product.
-        let classes = pnp_classes();
+        // product, and cached: see `classes`.
+        let present: Vec<(u16, u16)> = devices.iter().map(|d| (d.vendor, d.product)).collect();
+        let mut slot = self.classes.borrow_mut();
+        let classes = match slot.as_ref() {
+            Some((read_for, classes)) if !needs_reread(read_for, &present) => classes,
+            _ => {
+                let fresh = pnp_classes();
+                &slot.insert((present, fresh)).1
+            }
+        };
         for device in &mut devices {
             if let Some(class) = classes.get(&(device.vendor, device.product)) {
                 device.class = *class;
@@ -342,6 +369,16 @@ fn encode_command(command: &str) -> String {
     out
 }
 
+/// Whether the cached classes have to be read again.
+///
+/// Only a device that was not there before can carry a class the cache does not
+/// know: one that has gone away leaves an entry nobody asks about, and a device
+/// cannot change class while it stays plugged in. So a *smaller* set is free,
+/// and re-reading it would pay seconds to forget something harmless.
+fn needs_reread(read_for: &[(u16, u16)], present: &[(u16, u16)]) -> bool {
+    present.iter().any(|device| !read_for.contains(device))
+}
+
 /// USB classes, keyed by vendor and product, as Windows' PnP database has them.
 ///
 /// Windows names device *setup classes* ("Bluetooth", "HIDClass") rather than
@@ -543,6 +580,32 @@ mod tests {
         assert!(encoded
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+    }
+
+    /// `Get-PnpDevice` costs about 2.8 seconds — nine times `usbipd state` —
+    /// and the listing is re-read every few seconds. Paying it each time
+    /// blocked the session loop the shared cursor rides.
+    #[test]
+    fn classes_are_only_re_read_when_a_new_device_appears() {
+        let phone = (0x2717, 0xFF08);
+        let radio = (0x0489, 0xE0CD);
+
+        assert!(
+            !needs_reread(&[phone, radio], &[phone, radio]),
+            "the same devices must not cost another pnp query"
+        );
+        assert!(
+            !needs_reread(&[phone, radio], &[phone]),
+            "a device going away teaches nothing new"
+        );
+        assert!(
+            needs_reread(&[phone], &[phone, radio]),
+            "a device that was not there before may have an unknown class"
+        );
+        assert!(
+            !needs_reread(&[phone, radio], &[radio, phone]),
+            "order is not a change"
+        );
     }
 
     #[test]

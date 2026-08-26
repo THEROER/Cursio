@@ -1304,6 +1304,13 @@ mod tests {
             if let Some(error) = self.refuse.clone() {
                 return Err(error);
             }
+            // A device that is not here is `Gone`, exactly as both real
+            // backends answer when the id resolves to no port: they look it up
+            // in the table the last listing built, and a device unplugged since
+            // then is no longer in it.
+            if !self.present.contains(&device) {
+                return Err(UsbError::Gone);
+            }
             self.next_stream += 1;
             self.exported.push(device);
             Ok(UsbStreamId(self.next_stream))

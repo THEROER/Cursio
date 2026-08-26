@@ -170,9 +170,12 @@ impl UsbNode {
         }
 
         if !self.exported.contains_key(&device) {
-            if !self.backend.devices().iter().any(|d| d.id == device) {
-                return Err(UsbError::Gone);
-            }
+            // Straight to the export rather than checking the listing first: it
+            // resolves the same id against the same table and answers `Gone`
+            // itself when the device has been unplugged. Enumerating again to
+            // ask a question the next call answers anyway cost a second listing
+            // per claim — on Windows a `Get-PnpDevice`, which is seconds, not
+            // milliseconds.
             self.backend.export(device)?;
             self.exported.insert(
                 device,

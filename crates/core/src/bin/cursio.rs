@@ -112,13 +112,14 @@ enum Command {
         /// serves its own volumes but cannot yet mount the peer's.
         #[arg(long, default_value_t = false)]
         files: bool,
-        /// Offer this machine's USB devices to peers, so one of them can attach
-        /// a device plugged in here.
+        /// Share this machine's USB devices with the mesh, and use the devices
+        /// its peers are sharing. A device stays usable here while it is
+        /// shared.
         ///
-        /// Linux only, and only with the kernel's exporting half loaded
-        /// (`sudo modprobe usbip-host`). Without it the module is not
-        /// advertised and the log says why, rather than offering devices that
-        /// would fail on claim.
+        /// Needs the exporting half in place: `sudo modprobe usbip-host` on
+        /// Linux, `usbipd-win` installed on Windows. Without it the module is
+        /// not advertised and the log says why, rather than offering devices
+        /// that would fail on claim.
         #[arg(long, default_value_t = false)]
         usb: bool,
         /// When this machine is the selected AirPlay host, offer the mirrored
