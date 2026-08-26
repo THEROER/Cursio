@@ -26,11 +26,12 @@ required-features = ["desktop"]
 # module that is off costs nothing to compile and cannot be negotiated on.
 [features]
 default = ["desktop"]
-desktop = ["audio", "input", "window", "files", "airplay"]
+desktop = ["audio", "input", "window", "files", "airplay", "usb"]
 audio = ["dep:cursio-audio"]
 input = ["dep:cursio-input"]
 window = ["dep:cursio-window"]
 files = ["dep:cursio-files"]
+usb = ["dep:cursio-usb"]
 # AirPlay carries a window back to the mesh, so it cannot be built without the
 # window module to carry it through.
 airplay = ["dep:cursio-airplay", "window"]
@@ -43,6 +44,7 @@ cursio-input = { workspace = true, optional = true }
 cursio-audio = { workspace = true, optional = true }
 cursio-window = { workspace = true, optional = true }
 cursio-files = { workspace = true, optional = true }
+cursio-usb = { workspace = true, optional = true }
 # Compresses file chunks when it pays; see files_session::pack.
 zstd = "0.13"
 # Clipboard sharing: the platform layer (read/write/watch) the session module

@@ -112,6 +112,15 @@ enum Command {
         /// serves its own volumes but cannot yet mount the peer's.
         #[arg(long, default_value_t = false)]
         files: bool,
+        /// Offer this machine's USB devices to peers, so one of them can attach
+        /// a device plugged in here.
+        ///
+        /// Linux only, and only with the kernel's exporting half loaded
+        /// (`sudo modprobe usbip-host`). Without it the module is not
+        /// advertised and the log says why, rather than offering devices that
+        /// would fail on claim.
+        #[arg(long, default_value_t = false)]
+        usb: bool,
         /// When this machine is the selected AirPlay host, offer the mirrored
         /// screen to every peer instead of only peers using --airplay-window.
         ///
@@ -444,6 +453,7 @@ async fn main() -> anyhow::Result<()> {
             audio_render_device,
             clipboard,
             files,
+            usb,
             share_airplay,
             pair,
             pair_addr,
@@ -515,6 +525,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 clipboard,
                 files,
+                usb,
                 WindowOpts {
                     airplay: airplay_tap.clone().map(|tap| {
                         cursio_core::window_session::AirPlayShare {
@@ -988,6 +999,7 @@ fn module_registry(
     audio: &AudioOpts,
     clipboard: bool,
     files: bool,
+    usb: bool,
     window: WindowOpts,
     services: ServiceSetup,
 ) -> cursio_core::module::ModuleRegistry {
@@ -1024,6 +1036,12 @@ fn module_registry(
         // nothing.
         .with(Box::new(cursio_core::files_session::FilesFactory {
             enabled: files,
+        }))
+        // Unlike files, this is one-way per machine: sharing a device means
+        // giving it up, so a machine offers its own ports and attaches a
+        // peer's, and the two are separate decisions.
+        .with(Box::new(cursio_core::usb_session::UsbFactory {
+            enabled: usb,
         }))
 }
 

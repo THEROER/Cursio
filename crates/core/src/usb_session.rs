@@ -312,6 +312,179 @@ impl SessionModule for UsbEngine {
     }
 }
 
+/// The Linux backend: sysfs enumeration plus `usbip-host`.
+///
+/// Lives here rather than in `cursio-usb` because [`UsbBackend`] is policy's
+/// vocabulary and the dependency runs this way — `core` knows about `usb`, not
+/// the reverse. The crate below stays free of any opinion about who may attach
+/// what, which is what lets its tests run without a session.
+#[cfg(all(feature = "usb", target_os = "linux"))]
+pub struct LinuxUsbBackend {
+    enumerator: cursio_usb::LinuxUsb,
+    exporter: cursio_usb::Exporter,
+    /// Stable ids for devices, so a peer's claim survives a re-enumeration.
+    offers: cursio_usb::DeviceOffers,
+    /// Streams handed out, so URBs can be routed back to a bus id.
+    streams: HashMap<UsbStreamId, String>,
+    next_stream: u64,
+}
+
+#[cfg(all(feature = "usb", target_os = "linux"))]
+impl Default for LinuxUsbBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(feature = "usb", target_os = "linux"))]
+impl LinuxUsbBackend {
+    pub fn new() -> Self {
+        Self {
+            enumerator: cursio_usb::LinuxUsb::new(),
+            exporter: cursio_usb::Exporter::new(),
+            offers: cursio_usb::DeviceOffers::new(),
+            streams: HashMap::new(),
+            next_stream: 1,
+        }
+    }
+
+    /// Whether this machine can hand a device over at all.
+    ///
+    /// The `usbip-host` module is not loaded by default on any distribution, so
+    /// this is the ordinary answer on a fresh machine. Checked before
+    /// advertising rather than on the first claim: invariant 6 in
+    /// `docs/usb-design.md` — absence is advertised, never simulated.
+    pub fn is_available(&self) -> bool {
+        self.exporter.is_available()
+    }
+}
+
+#[cfg(all(feature = "usb", target_os = "linux"))]
+impl UsbBackend for LinuxUsbBackend {
+    fn devices(&mut self) -> Vec<UsbDevice> {
+        match self.enumerator.devices() {
+            Ok(local) => self.offers.offer(&local),
+            Err(e) => {
+                // An empty list rather than a stale one: a peer shown devices
+                // that can no longer be enumerated would claim one and get a
+                // refusal it cannot act on.
+                tracing::warn!(error = %e, "cannot enumerate usb devices");
+                Vec::new()
+            }
+        }
+    }
+
+    fn export(&mut self, device: UsbDeviceId) -> Result<UsbStreamId, UsbError> {
+        let Some(busid) = self.offers.busid(device).map(str::to_string) else {
+            return Err(UsbError::Gone);
+        };
+        self.exporter.export(&busid).map_err(|e| {
+            tracing::warn!(%device, busid, error = %e, "cannot export device");
+            backend_error_to_wire(&e)
+        })?;
+
+        let stream = UsbStreamId(self.next_stream);
+        self.next_stream += 1;
+        self.streams.insert(stream, busid);
+        Ok(stream)
+    }
+
+    fn unexport(&mut self, device: UsbDeviceId) {
+        let Some(busid) = self.offers.busid(device).map(str::to_string) else {
+            return;
+        };
+        self.streams.retain(|_, held| held != &busid);
+        self.exporter.unexport(&busid);
+    }
+
+    fn feed(&mut self, stream: UsbStreamId, _bytes: &[u8]) -> Result<(), UsbError> {
+        // Milestone 6 in `docs/usb-design.md`. The device is exported and the
+        // kernel is willing; what is missing is the local USB/IP socket that
+        // carries URBs between it and this stream. Refusing names the gap
+        // rather than dropping transfers into silence, which would look like a
+        // device that attaches and then does nothing.
+        match self.streams.contains_key(&stream) {
+            true => Err(UsbError::Backend(
+                "carrying urbs is not implemented yet".into(),
+            )),
+            false => Err(UsbError::Gone),
+        }
+    }
+}
+
+/// Turn a local failure into what a peer is told.
+///
+/// The mapping is deliberately not "everything becomes a string": the peer
+/// shows the user a different thing for each of these. A missing module is the
+/// host's to fix and is worth naming; a privilege failure is a prompt on the
+/// host, not a retry here; a device that is gone means stop asking.
+#[cfg(all(feature = "usb", target_os = "linux"))]
+fn backend_error_to_wire(error: &cursio_usb::UsbBackendError) -> UsbError {
+    use cursio_usb::UsbBackendError;
+    match error {
+        UsbBackendError::NoSuchDevice(_) => UsbError::Gone,
+        UsbBackendError::DriverMissing(what) => UsbError::DriverMissing(what.clone()),
+        UsbBackendError::NeedsPrivilege(_) => UsbError::NeedsPrivilege,
+        other => UsbError::Backend(other.to_string()),
+    }
+}
+
+/// Builds the USB module for a link.
+#[cfg(feature = "usb")]
+pub struct UsbFactory {
+    pub enabled: bool,
+}
+
+#[cfg(feature = "usb")]
+impl crate::module::ModuleFactory for UsbFactory {
+    fn id(&self) -> ModuleId {
+        ModuleId::USB
+    }
+
+    fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
+        if !self.enabled {
+            return None;
+        }
+        // Absence is advertised, not simulated: a machine whose kernel cannot
+        // export says nothing, so a peer is never offered a device that would
+        // fail on claim. The log line is what turns "nothing happened" into a
+        // `modprobe` the user can run.
+        #[cfg(target_os = "linux")]
+        {
+            if !LinuxUsbBackend::new().is_available() {
+                tracing::warn!(
+                    "usb sharing is off: the usbip-host module is not loaded \
+                     (sudo modprobe usbip-host)"
+                );
+                return None;
+            }
+            Some(cursio_protocol::ModuleAdvert::symmetric(
+                ModuleId::USB,
+                VERSION,
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            tracing::warn!("usb sharing is not implemented on this platform yet");
+            None
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
+        Ok(Box::new(UsbEngine::new(
+            ctx.peer_name().to_string(),
+            ctx.peer.peer_id,
+            Box::new(LinuxUsbBackend::new()),
+        )))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn build(&self, _ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
+        anyhow::bail!("usb sharing is not implemented on this platform")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

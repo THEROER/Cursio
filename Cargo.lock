@@ -1153,6 +1153,7 @@ dependencies = [
  "cursio-log",
  "cursio-protocol",
  "cursio-transport",
+ "cursio-usb",
  "cursio-window",
  "directories",
  "hostname",

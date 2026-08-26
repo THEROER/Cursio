@@ -17,10 +17,14 @@
 
 pub mod arbiter;
 #[cfg(target_os = "linux")]
+pub mod export;
+#[cfg(target_os = "linux")]
 mod linux;
 mod offer;
 pub mod urb;
 
+#[cfg(target_os = "linux")]
+pub use export::Exporter;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxUsb;
 
