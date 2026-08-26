@@ -115,7 +115,56 @@ pub struct UsbDevice {
     pub holder: Option<PeerId>,
 }
 
+/// USB class codes this module reasons about.
+///
+/// Only the ones that decide behaviour: everything else is carried through as
+/// a number nobody here interprets.
+mod class {
+    /// Audio. Taking a peer's sound card silences that machine.
+    pub const AUDIO: u8 = 0x01;
+    /// Keyboards and mice. Taking one leaves the peer's user with no input.
+    pub const HID: u8 = 0x03;
+    /// Webcams and their microphones.
+    pub const VIDEO: u8 = 0x0E;
+    /// Bluetooth lives here (subclass 0x01, protocol 0x01), along with every
+    /// other radio a machine talks to its own peripherals through.
+    pub const WIRELESS: u8 = 0xE0;
+    /// Hubs. Taking one takes everything behind it.
+    pub const HUB: u8 = 0x09;
+}
+
 impl UsbDevice {
+    /// Whether a machine may take this device from its host automatically.
+    ///
+    /// Attaching is automatic by design — "whichever machine has the port,
+    /// every machine has the device" is not something anyone should have to
+    /// ask for. But *some* devices are what the host machine is using to be
+    /// usable at all, and taking one is not sharing: it is breaking that
+    /// machine.
+    ///
+    /// Learned the hard way, from a laptop whose Bluetooth adapter this module
+    /// took 2879 times in one session — the user's headphones cut out every
+    /// six seconds and the cause was three machines away from the symptom.
+    ///
+    /// The rule is about *classes of harm*, not a blocklist of models:
+    ///
+    /// - **Wireless** (Bluetooth): the host's keyboard, mouse and headphones
+    ///   are on the other end of it.
+    /// - **HID**: a laptop's own keyboard and trackpad enumerate as USB.
+    /// - **Audio**: taking a sound card silences the machine it is in.
+    /// - **Video**: a built-in webcam belongs to whoever is sitting there.
+    /// - **Hubs**: taking one takes everything plugged into it.
+    ///
+    /// A device in one of these classes is still *offered* — the listing shows
+    /// it, and a deliberate claim can still take it. What changes is that
+    /// nothing takes it on its own.
+    pub fn is_safe_to_take(&self) -> bool {
+        !matches!(
+            self.class,
+            class::AUDIO | class::HID | class::VIDEO | class::WIRELESS | class::HUB
+        )
+    }
+
     /// A name for logs and for the device list, in the order a user would
     /// recognise it: what it calls itself, else what it is numbered.
     pub fn label(&self) -> String {
@@ -369,6 +418,58 @@ mod tests {
 
     /// Every refusal names its cause: a claim that fails without one leaves the
     /// user unable to tell a busy device from a missing driver.
+    fn sample_device() -> UsbDevice {
+        UsbDevice {
+            id: UsbDeviceId(1),
+            vendor: 0x2717,
+            product: 0xFF08,
+            manufacturer: None,
+            description: Some("POCO X7 Pro".into()),
+            class: 0,
+            transport: UsbTransport::Fine,
+            holder: None,
+        }
+    }
+
+    /// The bug this exists to prevent: a laptop's Bluetooth adapter was taken
+    /// 2879 times in one session, and the user's headphones cut out every six
+    /// seconds. Taking a machine's own radio is not sharing a device.
+    #[test]
+    fn a_machines_own_peripherals_are_never_taken_automatically() {
+        for (class, what) in [
+            (0xE0u8, "bluetooth"),
+            (0x03, "keyboard or mouse"),
+            (0x01, "sound card"),
+            (0x0E, "webcam"),
+            (0x09, "hub"),
+        ] {
+            let device = UsbDevice {
+                class,
+                ..sample_device()
+            };
+            assert!(
+                !device.is_safe_to_take(),
+                "{what} (class {class:#04x}) must not be taken automatically"
+            );
+        }
+    }
+
+    /// And the devices this module exists for stay automatic: a phone, a
+    /// programmer, a security key. Refusing those would make it pointless.
+    #[test]
+    fn the_devices_worth_sharing_are_still_taken() {
+        for class in [0x00u8, 0x08, 0xFF] {
+            let device = UsbDevice {
+                class,
+                ..sample_device()
+            };
+            assert!(
+                device.is_safe_to_take(),
+                "class {class:#04x} should be shareable"
+            );
+        }
+    }
+
     #[test]
     fn refusals_carry_a_readable_cause() {
         let peer = PeerId::from_bytes([7u8; 16]);

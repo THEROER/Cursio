@@ -414,6 +414,13 @@ impl UsbEngine {
                 }
                 self.failed.remove(&device.id);
             }
+            // Some devices are what the peer is using to be a usable machine:
+            // its Bluetooth radio, its keyboard, its sound card. Taking one is
+            // not sharing, it is breaking that machine — and the symptom shows
+            // up nowhere near the cause, as headphones cutting out.
+            if !device.is_safe_to_take() {
+                continue;
+            }
             if !self.asking.insert(device.id) {
                 continue;
             }

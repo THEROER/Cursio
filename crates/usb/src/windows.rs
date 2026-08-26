@@ -90,7 +90,19 @@ impl WindowsUsb {
     /// Unprivileged, so this is safe to call on every listing.
     pub fn devices(&self) -> Result<Vec<LocalDevice>, UsbBackendError> {
         let json = self.run(&["state"])?;
-        parse_state(&json)
+        let mut devices = parse_state(&json)?;
+        // `usbipd state` carries no class, and the class is what decides
+        // whether a device may be taken automatically — a Bluetooth radio
+        // taken from a laptop cuts out the user's headphones. Windows knows it
+        // through PnP, so it is asked separately and matched by vendor and
+        // product.
+        let classes = pnp_classes();
+        for device in &mut devices {
+            if let Some(class) = classes.get(&(device.vendor, device.product)) {
+                device.class = *class;
+            }
+        }
+        Ok(devices)
     }
 
     /// Share a device so a peer can attach it.
@@ -328,6 +340,62 @@ fn encode_command(command: &str) -> String {
         });
     }
     out
+}
+
+/// USB classes, keyed by vendor and product, as Windows' PnP database has them.
+///
+/// Windows names device *setup classes* ("Bluetooth", "HIDClass") rather than
+/// USB class codes, so the answer is translated back into the numbers the
+/// protocol speaks. Only the classes that decide whether a device is safe to
+/// take are recognised; everything else stays 0, which reads as "no opinion"
+/// and is treated as takeable.
+///
+/// Best-effort: a machine where the query fails simply reports no classes, and
+/// the caller sees devices it will not automatically take rather than devices
+/// it wrongly will.
+#[cfg(target_os = "windows")]
+fn pnp_classes() -> std::collections::HashMap<(u16, u16), u8> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let script = "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |                   Where-Object InstanceId -like 'USB\\VID_*' |                   ForEach-Object { $_.Class + '|' + $_.InstanceId }";
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(output) = output else {
+        tracing::debug!("cannot read pnp device classes; nothing will be auto-attached");
+        return std::collections::HashMap::new();
+    };
+
+    parse_pnp(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Turn `Class|InstanceId` lines into USB class codes by vendor and product.
+fn parse_pnp(text: &str) -> std::collections::HashMap<(u16, u16), u8> {
+    let mut classes = std::collections::HashMap::new();
+    for line in text.lines() {
+        let Some((setup_class, instance)) = line.trim().split_once('|') else {
+            continue;
+        };
+        let Some(ids) = instance_ids(instance) else {
+            continue;
+        };
+        // Windows' setup classes, mapped to the USB class codes
+        // `UsbDevice::is_safe_to_take` reasons about. A device appears once per
+        // interface, so the *first* class that means "do not take" wins:
+        // a composite device with any dangerous interface is dangerous whole.
+        let code = match setup_class {
+            "Bluetooth" => 0xE0,
+            "HIDClass" | "Keyboard" | "Mouse" => 0x03,
+            "MEDIA" | "AudioEndpoint" => 0x01,
+            "Camera" | "Image" => 0x0E,
+            "USB" if instance.contains("ROOT_HUB") => 0x09,
+            _ => continue,
+        };
+        classes.entry(ids).or_insert(code);
+    }
+    classes
 }
 
 /// Where `usbipd-win` would be, for a message that names it.
