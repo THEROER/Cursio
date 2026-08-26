@@ -204,6 +204,22 @@ impl UsbEngine {
         }
     }
 
+    /// Whether a stream belongs to this link — either lent to this peer or
+    /// borrowed from it.
+    ///
+    /// Streams are numbered per machine and carried per link, so this is what
+    /// keeps one session from sending another's traffic.
+    fn owns_stream(&self, stream: UsbStreamId) -> bool {
+        if self.borrowed.values().any(|held| *held == stream) {
+            return true;
+        }
+        // One lock for both questions: `Mutex` is not reentrant, so taking it
+        // twice in one expression would deadlock this session against itself.
+        let node = self.node();
+        node.device_of_stream(stream)
+            .is_some_and(|device| node.holds(device, self.peer_id, stream))
+    }
+
     /// How many devices this machine is serving, for tests that assert a
     /// device was given back.
     #[cfg(test)]
@@ -545,12 +561,22 @@ impl SessionModule for UsbEngine {
         self.retry_refused();
         self.rescan();
 
-        // Bytes the local kernel produced, then the streams that ended — in
-        // that order, because a close and the data preceding it arrive
-        // together and reversing them drops the end of every transfer.
-        let mut produced = Vec::new();
-        self.node().backend().collect(&mut produced);
-        for (stream, bytes) in produced {
+        // One drain for the whole machine, then the streams that ended — in
+        // that order, because a close and the data preceding it arrive together
+        // and reversing them drops the end of every transfer.
+        //
+        // The node drains because the backend is one per machine: a session
+        // collecting for itself would take the bytes belonging to every other
+        // link. What comes back is already routed, and the host's own loop has
+        // been closed inside it.
+        let drained = self.node().drain();
+        for (stream, bytes) in drained.to_peers {
+            // Only this link's traffic. A stream belongs to one peer, and
+            // sending another's down this link would hand it URBs for an
+            // attachment it never made.
+            if !self.owns_stream(stream) {
+                continue;
+            }
             // Split at the protocol's cap rather than trusting the kernel to
             // read small: one read can be a whole bulk transfer, and a frame
             // over the limit is refused by the transport rather than sent.
@@ -561,21 +587,9 @@ impl SessionModule for UsbEngine {
                 });
             }
         }
-        let ended = self.node().backend().ended();
-        for stream in ended {
-            self.end_stream(stream);
-        }
-
-        // And the same in the other direction: what this machine's virtual
-        // controller wants to send to a device on the peer's port.
-        let mut wanted = Vec::new();
-        self.node().backend().collect_attached(&mut wanted);
-        for (stream, bytes) in wanted {
-            for chunk in bytes.chunks(UsbMsg::MAX_CHUNK) {
-                self.outbound.push(UsbMsg::Data {
-                    stream,
-                    bytes: chunk.to_vec(),
-                });
+        for stream in drained.ended {
+            if self.owns_stream(stream) {
+                self.end_stream(stream);
             }
         }
 
@@ -1184,6 +1198,10 @@ mod tests {
     use super::*;
     use cursio_protocol::usb::UsbTransport;
 
+    /// A buffer the test and the fake backend both hold: the node owns the
+    /// backend, so a test reaches its recordings through one of these.
+    type Shared = std::sync::Arc<std::sync::Mutex<Vec<(UsbStreamId, Vec<u8>)>>>;
+
     /// A fake backend wrapped in the node every session shares.
     fn node_of(
         backend: impl UsbBackend + 'static,
@@ -1210,11 +1228,21 @@ mod tests {
         fed: Vec<(UsbStreamId, Vec<u8>)>,
         next_stream: u64,
         /// What the local kernel has produced, for the next `collect`.
-        produced: Vec<(UsbStreamId, Vec<u8>)>,
+        ///
+        /// Shared so a test can make the device answer after an attach exists.
+        produced: Shared,
         /// Streams the kernel has closed, for the next `ended`.
         closed: Vec<UsbStreamId>,
         /// Whether this machine pretends to have a virtual controller.
         attaches: bool,
+        /// Bytes handed to a local virtual controller, keyed by stream. What
+        /// the host's own loop delivers shows up here.
+        ///
+        /// Shared so a test can read it while the node owns the backend.
+        to_controller: Shared,
+        /// What a local virtual controller wants to submit, for the next
+        /// `collect_attached`.
+        submitted: Vec<(UsbStreamId, Vec<u8>)>,
         /// Peer devices this backend was told to present locally.
         borrowed: Vec<(UsbDeviceId, UsbStreamId)>,
         /// Whether presenting a peer device should fail, as it does on a
@@ -1262,7 +1290,7 @@ mod tests {
         }
 
         fn collect(&mut self, out: &mut Vec<(UsbStreamId, Vec<u8>)>) {
-            out.append(&mut self.produced);
+            out.append(&mut self.produced.lock().unwrap_or_else(|e| e.into_inner()));
         }
 
         fn can_attach(&self) -> bool {
@@ -1279,6 +1307,18 @@ mod tests {
 
         fn detach(&mut self, stream: UsbStreamId) {
             self.borrowed.retain(|(_, held)| *held != stream);
+        }
+
+        fn feed_attached(&mut self, stream: UsbStreamId, bytes: &[u8]) -> Result<(), UsbError> {
+            self.to_controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((stream, bytes.to_vec()));
+            Ok(())
+        }
+
+        fn collect_attached(&mut self, out: &mut Vec<(UsbStreamId, Vec<u8>)>) {
+            out.append(&mut self.submitted);
         }
 
         fn ended(&mut self) -> Vec<UsbStreamId> {
@@ -1324,6 +1364,90 @@ mod tests {
             taken(&mut e).as_slice(),
             [UsbMsg::Claimed { device, .. }] if *device == UsbDeviceId(1)
         ));
+    }
+
+    /// The symptom this exists to fix: a phone plugged into the laptop showed
+    /// up in `adb devices` on every machine *except* the laptop. Exporting
+    /// binds the device away from its own driver, so sharing it meant losing
+    /// it — available to everyone but its owner.
+    #[test]
+    fn a_machine_keeps_its_own_device_while_sharing_it() {
+        let mut e = UsbEngine::new(
+            "desktop".into(),
+            peer(1),
+            node_of(FakeBackend {
+                attaches: true,
+                ..FakeBackend::with(&[1])
+            }),
+        );
+        e.on_claim(UsbDeviceId(1), "adb");
+
+        assert!(
+            e.node().is_local(UsbDeviceId(1)),
+            "the host must attach its own device back to itself"
+        );
+    }
+
+    /// And the device's answers reach the host's own controller, not only the
+    /// peer that asked. Two machines attached means two are owed the reply.
+    #[test]
+    fn the_device_answers_the_host_as_well_as_the_peer() {
+        let device = UsbDeviceId(1);
+        let produced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let to_controller = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut e = UsbEngine::new(
+            "desktop".into(),
+            peer(1),
+            node_of(FakeBackend {
+                attaches: true,
+                produced: produced.clone(),
+                to_controller: to_controller.clone(),
+                ..FakeBackend::with(&[1])
+            }),
+        );
+        e.on_claim(device, "adb");
+        let peer_stream = match taken(&mut e).as_slice() {
+            [UsbMsg::Claimed { stream, .. }] => *stream,
+            other => panic!("expected a grant, got {other:?}"),
+        };
+
+        // The device produces a reply on the stream the peer is reading.
+        produced
+            .lock()
+            .expect("test lock")
+            .push((peer_stream, b"reply".to_vec()));
+        let drained = e.node().drain();
+
+        assert!(
+            drained
+                .to_peers
+                .iter()
+                .any(|(s, b)| *s == peer_stream && b == b"reply"),
+            "the peer that asked still gets its answer"
+        );
+        assert!(
+            to_controller
+                .lock()
+                .expect("test lock")
+                .iter()
+                .any(|(_, b)| b == b"reply"),
+            "and so does the machine the device is plugged into"
+        );
+    }
+
+    /// A machine with no virtual controller of its own still shares what it
+    /// has. It simply does not get the device back — which is what happened
+    /// everywhere before the loop existed.
+    #[test]
+    fn a_machine_that_cannot_attach_still_shares_its_ports() {
+        let mut e = engine(&[1]);
+        e.on_claim(UsbDeviceId(1), "adb");
+
+        assert!(matches!(taken(&mut e).as_slice(), [UsbMsg::Claimed { .. }]));
+        assert!(
+            !e.node().is_local(UsbDeviceId(1)),
+            "nothing to attach it to, and that is not an error"
+        );
     }
 
     /// The point of arbitration: two machines use one device at once. The

@@ -233,6 +233,13 @@ What is owned is not the device but its **configuration**. So:
 
 - Any number of machines **attach**. Attaching is not a claim; it enumerates
   from cache and costs the device nothing.
+- **The host is one of them.** Exporting binds a device away from its own
+  driver, so the machine with the port loses it the moment it shares — a phone
+  plugged into the laptop appeared in `adb devices` on every machine *except*
+  the laptop. So the host attaches its own device back to itself through the
+  same virtual controller a peer uses, and reaches it the way a peer does. Not
+  a special case in the data path: one more holder, which is what keeps the
+  host's own transfers from racing a peer's.
 - One machine at a time holds the **configuration lease**, and only while it
   needs one. A lease is taken by issuing a state-changing request, not by
   asking in advance, and is released when its transfers finish.
@@ -387,6 +394,12 @@ namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
    Windows *importing* a peer's device is still open — it needs the vhci side
    of `usbipd-win`, which has no unprivileged control surface yet.
 9. **Degradation reporting** — isochronous flagged, revoke on unplug.
+
+Milestone 2's rework brought two more things with it, both consequences of the
+backend having been per-session: the machine with the port now keeps its own
+device (above), and draining happens once per machine rather than once per
+link — a session collecting for itself took the bytes belonging to every other
+one, so the first pump won and the rest saw an idle device.
 
 Storage is not on this list: it belongs to `files`, which needs three additions
 of its own — announce a removable volume when udisks mounts one, give it a mount
