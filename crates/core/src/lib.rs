@@ -44,6 +44,7 @@ pub mod identity;
 pub mod link;
 pub mod logging;
 pub mod mesh;
+pub mod metrics;
 pub mod module;
 /// Running each session module on a thread of its own, off the loop the
 /// shared cursor rides.
