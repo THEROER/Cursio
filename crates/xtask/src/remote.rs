@@ -43,6 +43,11 @@ impl Peer {
         format!("{}/Cursio", self.win_home)
     }
 
+    /// Cursio's log directory on the peer (`%APPDATA%\cursio\cursio\data\logs`).
+    pub fn log_dir(&self) -> String {
+        format!("{}/AppData/Roaming/cursio/cursio/data/logs", self.win_home)
+    }
+
     fn ssh_command(&self) -> Command {
         let mut cmd = Command::new("ssh");
         cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])

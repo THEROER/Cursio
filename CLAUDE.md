@@ -23,7 +23,11 @@ Linux native builds need `OPUS_TARGET=ubuntu-24.04_x86_64` (`cargo xtask` sets i
 
 ```sh
 cargo xtask build | install | macos | windows | android | logs --follow
+cargo xtask deploy [--windows-only|--linux-only] [--no-restart]   # ship to Lightmoon, restart there
+cargo xtask live-test [--seconds N] [--yes]                       # PASS/FAIL over both real machines
 ```
+
+`deploy` and `live-test` are described in `docs/live-test.md`. `deploy` never deletes a Windows `.exe` it did not name itself, and never stops the Linux daemon (it tells you to restart your `cargo xtask run`). `live-test` injects pointer motion only with `--yes`, and touches the peer mount only by exact path from a child process with a deadline.
 
 `cargo xtask android` cross-builds **the mesh core only** for arm64 (`cursio-core --lib --no-default-features`), needing `ANDROID_NDK_HOME` and `cargo install cargo-ndk`. See "Android" below for why that is the whole core and not a subset of it.
 

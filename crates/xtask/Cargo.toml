@@ -10,3 +10,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+
+# Synthetic pointer motion for `live-test` goes through /dev/uinput.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

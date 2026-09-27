@@ -10,6 +10,8 @@
 //! - `logs`    — print the log directory (and `tail -f` it with `--follow`).
 //! - `deploy`  — build both halves, ship the `.exe` to the Windows peer under
 //!   a versioned name and restart it in the user's session.
+//! - `live-test` — measure both real machines over a window; PASS/FAIL table.
+//!   Both are described in `docs/live-test.md`.
 //!
 //! - `android` — cross-compile the mesh core for arm64 (needs the NDK and
 //!   cargo-ndk). The core only: the platform modules each need an Android
@@ -18,7 +20,11 @@
 //! Run `cargo xtask <cmd> --help` for flags.
 
 mod deploy;
+mod livetest;
+mod logscan;
 mod remote;
+#[cfg(target_os = "linux")]
+mod uinput;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -190,6 +196,17 @@ enum Command_ {
     },
     /// Build both halves, ship the .exe to the Windows peer and restart it there.
     Deploy(deploy::DeployArgs),
+    /// Measure the two real machines over a window and print PASS/FAIL.
+    LiveTest(livetest::LiveTestArgs),
+    /// live-test's child that touches the peer mount under a deadline.
+    #[command(hide = true)]
+    FileProbe {
+        path: PathBuf,
+        #[arg(long)]
+        seed: u64,
+        #[arg(long)]
+        remove: bool,
+    },
 }
 
 /// What `build` should produce.
@@ -244,6 +261,8 @@ fn main() -> Result<()> {
         Command_::Android { debug } => android(!debug),
         Command_::Logs { follow } => logs(follow),
         Command_::Deploy(args) => deploy::deploy(args),
+        Command_::LiveTest(args) => livetest::live_test(args),
+        Command_::FileProbe { path, seed, remove } => livetest::file_probe(&path, seed, remove),
     }
 }
 
