@@ -23,6 +23,10 @@
 //! ```
 //! It finds a matching top-level window, captures it in each state, and reports
 //! frames per second observed in each.
+//!
+//! `wgc_probe.exe --selftest` asks the remote-screen question instead — which
+//! states of a window the user never sees still land in Discord's and OBS's
+//! pickers and still record a picture; see `selftest.rs`.
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
@@ -31,7 +35,13 @@ fn main() {
 }
 
 #[cfg(target_os = "windows")]
+mod selftest;
+
+#[cfg(target_os = "windows")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--selftest") {
+        return selftest::run();
+    }
     windows_probe::run()
 }
 
