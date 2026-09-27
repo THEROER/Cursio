@@ -12,8 +12,9 @@
 //! A `pump` that takes longer than ~50 ms is logged as having blocked the
 //! session, and the shared cursor rides the same channel — so a file read must
 //! never happen inline. Disk work, and the compression that goes with it, is
-//! handed to a low-priority worker pool ([`cursio_files::Workers`]) and
-//! collected on a later pump. Each pass is bounded by a time slice rather than
+//! handed to low-priority worker pools ([`cursio_files::Workers`]) — one
+//! serving the peer, one for our own compression, so neither side's traffic
+//! queues behind the other's — and collected on a later pump. Each pass is bounded by a time slice rather than
 //! a message count, so a pump stays short whatever the size of the transfer.
 //!
 //! ## Nothing else slows down either
@@ -627,6 +628,13 @@ impl Pacer {
     }
 }
 
+/// Threads for compressing our writes and unpacking our reads.
+///
+/// Two, because one zstd thread at [`ZSTD_LEVEL`] already outruns the link by
+/// an order of magnitude; the second keeps a large chunk from holding up the
+/// small ones queued behind it.
+const CODEC_THREADS: usize = 2;
+
 /// Compression level for file chunks.
 ///
 /// Level 1 measured ~284 MB/s on compressible data here — an order of magnitude
@@ -895,9 +903,20 @@ pub struct FilesEngine {
     ///
     /// Retried each pump by [`FilesEngine::flush_deferred_closes`].
     deferred_closes: Vec<FileHandle>,
-    /// Threads that do the compressing and the disk work, kept below the
+    /// Threads that do the disk work the peer asks of us, kept below the
     /// priority of everything the user is actually looking at.
     workers: Workers,
+    /// Threads that compress our own writes and unpack our own reads.
+    ///
+    /// Apart from `workers` because the two answer to different people. That
+    /// pool serves the peer, and a peer walking a directory tree keeps it busy
+    /// with hundreds of `readdir` and `stat` a second — each of which, on a
+    /// Windows disk, can take milliseconds apiece. Sharing one queue put every
+    /// chunk of a local download behind that walk: seen live as Steam writing
+    /// to the peer's disk at 0 B/s while the peer's crawl was being served.
+    /// Compression is pure CPU and needs no disk, so a small pool of its own
+    /// keeps our transfer moving whatever the peer is asking.
+    codec: Workers,
     /// Sizes the in-flight window from what the link is measured to be doing.
     pace: Pacer,
     /// Requests we have sent and not yet had answered.
@@ -1007,6 +1026,7 @@ impl FilesEngine {
             compressing: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             deferred_closes: Vec::new(),
             workers: Workers::new("cursio-files"),
+            codec: Workers::with_threads("cursio-files-codec", CODEC_THREADS),
             pace: Pacer::new(),
             pending: PendingMap::default(),
             next_req: 1,
@@ -1827,7 +1847,7 @@ impl FilesEngine {
                         .expect("files compressing")
                         .entry(handle)
                         .or_insert(0) += 1;
-                    self.workers.spawn(move || {
+                    self.codec.spawn(move || {
                         let packed = pack(bytes);
                         let _ = outbox.send(FilesMsg::Write {
                             req,
@@ -2016,7 +2036,7 @@ impl FilesEngine {
                 // times a second while a file is being read: not a stall, but a
                 // steady tax on input latency for the length of every copy.
                 if last && acc.is_empty() {
-                    self.workers.spawn(move || {
+                    self.codec.spawn(move || {
                         let _ = reply.send(unpack(bytes));
                     });
                     return;
@@ -2388,6 +2408,7 @@ mod tests {
             compressing: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             deferred_closes: Vec::new(),
             workers: Workers::with_threads("test-files", 2),
+            codec: Workers::with_threads("test-files-codec", 1),
             pace: Pacer::new(),
             pending: PendingMap::default(),
             next_req: 1,
@@ -2455,6 +2476,40 @@ mod tests {
             .await
             .expect("pumps");
         assert_eq!(tx.sent.len(), MIN_IN_FLIGHT, "the window is still full");
+    }
+
+    /// Our own writes must not queue behind the work the peer asks of us.
+    ///
+    /// Sharing one pool put every chunk of a local download behind a peer's
+    /// directory walk, and Steam's download sat at 0 B/s while it was served.
+    #[tokio::test]
+    async fn our_writes_are_prepared_while_the_peers_work_occupies_its_pool() {
+        let (mut engine, ops) = engine();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        engine.workers = Workers::with_threads("test-files-busy", 1);
+        engine.workers.spawn(move || {
+            let _ = gate.recv();
+        });
+
+        let (reply, _rx) = std::sync::mpsc::channel();
+        ops.send(Op::Write {
+            handle: 7,
+            offset: 0,
+            bytes: vec![1u8; 4096],
+            reply,
+        })
+        .expect("queued");
+        let mut tx = RecordingTx::default();
+        engine
+            .pump_requests(&mut tx, Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("pumps");
+
+        let prepared = tokio::time::timeout(Duration::from_secs(10), engine.outbox_rx.recv())
+            .await
+            .expect("the write is compressed while the serving pool is stuck");
+        assert!(matches!(prepared, Some(FilesMsg::Write { handle: 7, .. })));
+        drop(release);
     }
 
     /// Requests the peer never answers must not keep the window shut.
@@ -2581,8 +2636,8 @@ mod tests {
         // cannot finish compressing first and make the deferral moot — which
         // is a timing the test would otherwise lose now and then.
         let (release, gate) = std::sync::mpsc::channel::<()>();
-        engine.workers = Workers::with_threads("test-files-gated", 1);
-        engine.workers.spawn(move || {
+        engine.codec = Workers::with_threads("test-files-gated", 1);
+        engine.codec.spawn(move || {
             let _ = gate.recv();
         });
         let (reply, _rx) = std::sync::mpsc::channel();
