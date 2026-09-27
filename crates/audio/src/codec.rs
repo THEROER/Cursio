@@ -10,7 +10,7 @@
 //! Cursio aims at minimal latency, so this deliberately does *not* use Opus's
 //! default music mode:
 //!
-//! - [`Application::LowDelay`] (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`) drops
+//! - `OPUS_APPLICATION_RESTRICTED_LOWDELAY` drops
 //!   the codec's look-ahead. Ordinary Opus adds ~6.5 ms of algorithmic delay;
 //!   restricted low-delay cuts that to ~2.5 ms.
 //! - A **5 ms frame** (240 samples at 48 kHz) rather than the usual 20 ms.
@@ -21,9 +21,71 @@
 //! on headers. That is the right trade here — bandwidth is what we have plenty
 //! of on a LAN, latency is what the user notices.
 
-use shiguredo_opus::{Application, Decoder, DecoderConfig, Encoder, EncoderConfig};
+//!
+//! ## Why the encoder talks to libopus directly
+//!
+//! Rate control changes a stream's bitrate mid-stream, and the only way to do
+//! that without a discontinuity is `OPUS_SET_BITRATE` on the encoder already
+//! running. `shiguredo_opus` sets the bitrate once, at construction, and keeps
+//! the encoder pointer private, so the only change it allows is a new encoder.
+//! That is not a harmless swap: the peer's decoder still holds the old
+//! encoder's state — band energies, MDCT overlap, pitch pre-filter — and the
+//! first packets from a fresh encoder decode against it as an audible burst.
+//! Rate control stepped several times a second when it misjudged the link, so
+//! the burst was heard in ordinary use.
+//!
+//! So the encoder is created and driven through libopus's C API here, against
+//! the library `shiguredo_opus` already builds and links. That crate renames
+//! every libopus symbol with a `shiguredo_opus_` prefix, which is why the
+//! declarations below carry `link_name`s; a rename upstream fails the link
+//! rather than misbehaving. The decoder has no such need and stays on the
+//! crate's safe wrapper.
+
+use std::os::raw::{c_int, c_uchar};
+
+use shiguredo_opus::{Decoder, DecoderConfig};
 
 use crate::AudioError;
+
+mod ffi {
+    use std::os::raw::{c_int, c_uchar};
+
+    /// Opaque libopus encoder state.
+    #[repr(C)]
+    pub struct OpusEncoder {
+        _private: [u8; 0],
+    }
+
+    pub const OPUS_OK: c_int = 0;
+    pub const OPUS_APPLICATION_RESTRICTED_LOWDELAY: c_int = 2051;
+    pub const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
+    pub const OPUS_GET_BITRATE_REQUEST: c_int = 4003;
+
+    extern "C" {
+        #[link_name = "shiguredo_opus_encoder_create"]
+        pub fn opus_encoder_create(
+            fs: i32,
+            channels: c_int,
+            application: c_int,
+            error: *mut c_int,
+        ) -> *mut OpusEncoder;
+        #[link_name = "shiguredo_opus_encoder_ctl"]
+        pub fn opus_encoder_ctl(st: *mut OpusEncoder, request: c_int, ...) -> c_int;
+        #[link_name = "shiguredo_opus_encode_float"]
+        pub fn opus_encode_float(
+            st: *mut OpusEncoder,
+            pcm: *const f32,
+            frame_size: c_int,
+            data: *mut c_uchar,
+            max_data_bytes: i32,
+        ) -> i32;
+        #[link_name = "shiguredo_opus_encoder_destroy"]
+        pub fn opus_encoder_destroy(st: *mut OpusEncoder);
+    }
+}
+
+/// Largest packet libopus is asked to produce; RFC 6716's recommended maximum.
+const MAX_PACKET_BYTES: usize = 4000;
 
 /// Samples per channel in one Opus frame: 5 ms at 48 kHz.
 ///
@@ -46,10 +108,18 @@ pub const DEFAULT_BITRATE: u32 = 96_000;
 /// but Opus insists on exact frame sizes — so this buffers across calls and
 /// emits only whole frames.
 pub struct OpusEncoder {
-    encoder: Encoder,
+    /// Owned libopus state: created in `with_bitrate`, destroyed in `drop`,
+    /// never null in between.
+    encoder: *mut ffi::OpusEncoder,
     /// Leftover interleaved samples that didn't fill a frame last time.
     pending: Vec<f32>,
+    packet: Vec<u8>,
 }
+
+// SAFETY: libopus encoder state has no thread affinity, and every use of the
+// pointer goes through `&mut self`, so it is never touched from two threads at
+// once.
+unsafe impl Send for OpusEncoder {}
 
 impl OpusEncoder {
     pub fn new() -> Result<Self, AudioError> {
@@ -57,21 +127,73 @@ impl OpusEncoder {
     }
 
     /// Build an encoder at a specific target bitrate (bits per second).
+    ///
+    /// Latency-first (see the module docs): restricted low-delay removes the
+    /// codec's look-ahead, and `encode` feeds it 5 ms frames, a much lower
+    /// latency floor than the 20 ms default.
     pub fn with_bitrate(bits_per_second: u32) -> Result<Self, AudioError> {
-        let mut config = EncoderConfig::new(48_000, 2);
-        // Latency-first (see the module docs): restricted low-delay removes the
-        // codec's look-ahead, and a 5 ms frame sets a much lower latency floor
-        // than the 20 ms default.
-        config.application = Some(Application::LowDelay);
-        config.frame_duration = Some(shiguredo_opus::FrameDuration::Ms5);
-        config.bitrate = Some(bits_per_second);
-
-        let encoder =
-            Encoder::new(config).map_err(|e| AudioError::Backend(format!("opus encoder: {e}")))?;
-        Ok(Self {
+        let mut error: c_int = ffi::OPUS_OK;
+        // SAFETY: plain constructor call; the result is checked before use.
+        let encoder = unsafe {
+            ffi::opus_encoder_create(
+                48_000,
+                2,
+                ffi::OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+                &mut error,
+            )
+        };
+        if error != ffi::OPUS_OK || encoder.is_null() {
+            return Err(AudioError::Backend(format!(
+                "opus encoder: opus_encoder_create failed with code {error}"
+            )));
+        }
+        let mut this = Self {
             encoder,
             pending: Vec::with_capacity(FRAME_INTERLEAVED * 2),
-        })
+            packet: vec![0; MAX_PACKET_BYTES],
+        };
+        this.set_bitrate(bits_per_second)?;
+        Ok(this)
+    }
+
+    /// Change the target bitrate of the running encoder.
+    ///
+    /// Takes effect from the next frame and keeps everything else: the codec
+    /// state the peer's decoder is tracking, and any partial frame held in
+    /// `pending`.
+    pub fn set_bitrate(&mut self, bits_per_second: u32) -> Result<(), AudioError> {
+        let value = c_int::try_from(bits_per_second).map_err(|_| {
+            AudioError::Backend(format!("opus bitrate {bits_per_second} out of range"))
+        })?;
+        // SAFETY: `self.encoder` is live (see the field); the request takes one
+        // `opus_int32`, which is `c_int` on every supported platform.
+        let code =
+            unsafe { ffi::opus_encoder_ctl(self.encoder, ffi::OPUS_SET_BITRATE_REQUEST, value) };
+        if code != ffi::OPUS_OK {
+            return Err(AudioError::Backend(format!(
+                "opus encoder: OPUS_SET_BITRATE({bits_per_second}) failed with code {code}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The bitrate libopus is currently targeting, in bits per second.
+    pub fn bitrate(&self) -> Result<u32, AudioError> {
+        let mut value: c_int = 0;
+        // SAFETY: `self.encoder` is live; the request writes one `opus_int32`.
+        let code = unsafe {
+            ffi::opus_encoder_ctl(
+                self.encoder,
+                ffi::OPUS_GET_BITRATE_REQUEST,
+                &mut value as *mut c_int,
+            )
+        };
+        if code != ffi::OPUS_OK {
+            return Err(AudioError::Backend(format!(
+                "opus encoder: OPUS_GET_BITRATE failed with code {code}"
+            )));
+        }
+        Ok(value as u32)
     }
 
     /// Encode raw wire bytes, returning zero or more Opus packets.
@@ -88,13 +210,31 @@ impl OpusEncoder {
         let mut packets = Vec::new();
         while self.pending.len() >= FRAME_INTERLEAVED {
             let frame: Vec<f32> = self.pending.drain(..FRAME_INTERLEAVED).collect();
-            let packet = self
-                .encoder
-                .encode_f32(&frame)
-                .map_err(|e| AudioError::Backend(format!("opus encode: {e}")))?;
-            packets.push(packet);
+            // SAFETY: `self.encoder` is live; `frame` holds exactly
+            // FRAME_SAMPLES stereo samples and `self.packet` is writable for
+            // the length passed.
+            let size = unsafe {
+                ffi::opus_encode_float(
+                    self.encoder,
+                    frame.as_ptr(),
+                    FRAME_SAMPLES as c_int,
+                    self.packet.as_mut_ptr() as *mut c_uchar,
+                    self.packet.len() as i32,
+                )
+            };
+            let size = usize::try_from(size).map_err(|_| {
+                AudioError::Backend(format!("opus encode: failed with code {size}"))
+            })?;
+            packets.push(self.packet[..size.min(self.packet.len())].to_vec());
         }
         Ok(packets)
+    }
+}
+
+impl Drop for OpusEncoder {
+    fn drop(&mut self) {
+        // SAFETY: created by `opus_encoder_create` and destroyed only here.
+        unsafe { ffi::opus_encoder_destroy(self.encoder) }
     }
 }
 
@@ -182,6 +322,59 @@ mod tests {
             "expected >8x compression, got {} -> {}",
             raw.len(),
             compressed
+        );
+    }
+
+    /// A bitrate change applies to the running encoder: the rate moves, and
+    /// the encoder keeps both its codec state and a half-received frame.
+    ///
+    /// Replacing the encoder instead is what this exists to avoid — the peer's
+    /// decoder keeps the old encoder's state, and the new one's first packets
+    /// decode against it as an audible burst.
+    #[test]
+    fn bitrate_changes_on_the_live_encoder_without_losing_a_partial_frame() {
+        let mut enc = OpusEncoder::with_bitrate(96_000).unwrap();
+        let tone = |frames: usize, offset: usize| -> Vec<f32> {
+            (0..FRAME_SAMPLES * frames)
+                .flat_map(|i| {
+                    let t = (i + offset) as f32 / 48_000.0;
+                    let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.3
+                        + (t * 3_000.0 * std::f32::consts::TAU).sin() * 0.2;
+                    [v, v * 0.8]
+                })
+                .collect()
+        };
+        let high: usize = enc
+            .encode(&pcm(&tone(20, 0)))
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+
+        let half = tone(1, FRAME_SAMPLES * 20);
+        assert!(enc
+            .encode(&pcm(&half[..FRAME_INTERLEAVED / 2]))
+            .unwrap()
+            .is_empty());
+        enc.set_bitrate(24_000).unwrap();
+        assert_eq!(enc.bitrate().unwrap(), 24_000);
+        assert_eq!(
+            enc.encode(&pcm(&half[FRAME_INTERLEAVED / 2..]))
+                .unwrap()
+                .len(),
+            1,
+            "the half frame held before the change must complete after it"
+        );
+
+        let low: usize = enc
+            .encode(&pcm(&tone(20, FRAME_SAMPLES * 21)))
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        assert!(
+            low * 2 < high,
+            "a quarter of the bitrate must produce far smaller packets: {high} -> {low} bytes"
         );
     }
 

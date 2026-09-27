@@ -378,9 +378,11 @@ To add:
    Stream/Route gain of the three-object model, never the device's replicated
    volume. `AudioFrameAck`: the receiver returns a sparse ack (~4/s) with the
    newest seq it has played; the sender tracks the sent-vs-acked gap and adapts
-   the stream's Opus bitrate with hysteresis (degrade-not-buffer) — Opus has no
-   live bitrate setter, so a change drops and rebuilds the encoder at the new
-   rate. `AudioStreamClose` already tore down playback; it now also clears the
+   the stream's Opus bitrate with hysteresis (degrade-not-buffer). A change is
+   applied to the running encoder (`OPUS_SET_BITRATE`), never by rebuilding it:
+   the receiver's decoder keeps the old encoder's state, and a fresh encoder's
+   first packets decode against it as a loud burst (see `codec.rs`).
+   `AudioStreamClose` already tore down playback; it now also clears the
    per-stream gain/rate-control state so a reused id starts clean.
 5. ✅ DONE 2026-07-21: **Device state replication with per-device owner**
    (volume/mute): RPC to owner, broadcast back. Protocol gained `DeviceState`

@@ -679,11 +679,10 @@ impl SessionModule for AudioEngine {
                 let encoder = match self.encoders.entry(*id) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        // Built at the stream's *current* target bitrate: rate
-                        // control lowers it by dropping the encoder (see
-                        // `adapt_bitrate`), and it is rebuilt here at the reduced
-                        // rate. Opus has no live bitrate setter, so rebuild is how
-                        // the rate actually changes.
+                        // Built at the stream's *current* target bitrate, so a
+                        // stream that restarts resumes at the rate the link was
+                        // last judged able to carry. Later changes are applied to
+                        // this encoder in place (see `adapt_bitrate`).
                         match cursio_audio::codec::OpusEncoder::with_bitrate(bitrate) {
                             Ok(enc) => e.insert(enc),
                             Err(err) => {
@@ -2013,10 +2012,11 @@ impl AudioEngine {
     /// The design's rule is **degrade rather than buffer unboundedly**: a
     /// sustained backlog (`sent - acked` over [`BACKLOG_HIGH`]) steps the bitrate
     /// down; a caught-up link (under [`BACKLOG_LOW`]) steps it back up toward the
-    /// default. Opus has no live bitrate setter, so a change drops the stream's
-    /// encoder — `pump` rebuilds it at the new target on the next chunk. Runs at
-    /// most once per [`ADAPT_INTERVAL`] per stream, with hysteresis, so it tracks
-    /// trends instead of oscillating on jitter.
+    /// default. A change is applied to the running encoder, never by replacing
+    /// it: the peer's decoder carries the old encoder's state, and a fresh
+    /// encoder's first packets decode against that state as a loud burst. Runs
+    /// at most once per [`ADAPT_INTERVAL`] per stream, with hysteresis, so it
+    /// tracks trends instead of oscillating on jitter.
     fn adapt_bitrate(&mut self) {
         let now = std::time::Instant::now();
         // Only streams we're actively sending have a last_sent_seq entry.
@@ -2047,6 +2047,15 @@ impl AudioEngine {
             let target = next_bitrate(current, gap);
 
             if target != current {
+                // No encoder yet means nothing to change: `pump` builds the
+                // first one at whatever `stream_bitrate` holds.
+                if let Some(encoder) = self.encoders.get_mut(&id) {
+                    if let Err(e) = encoder.set_bitrate(target) {
+                        tracing::warn!(error = %e, id, from = current, to = target,
+                            "cannot change the audio bitrate; keeping the current one");
+                        continue;
+                    }
+                }
                 tracing::info!(
                     id,
                     gap,
@@ -2055,8 +2064,6 @@ impl AudioEngine {
                     "adapting audio bitrate"
                 );
                 self.stream_bitrate.insert(id, target);
-                // Drop the encoder so `pump` rebuilds it at `target`.
-                self.encoders.remove(&id);
             }
         }
     }
