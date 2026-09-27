@@ -393,3 +393,131 @@ of the capture backend work.
      depend on it being present.
 6. **Windows backend** — Graphics.Capture host + Win32 surrogate; verify true
    cross-OS Windows↔Linux transfer.
+7. **Remote-screen views — CODE COMPLETE, NOT YET RUN (2026-09-27)** — see
+   below. State machine unit-tested with fakes; Windows cross-build checked;
+   no live Discord share yet.
+
+## Remote-screen views: a peer's app or monitor, for screen-sharing software
+
+The need: run Discord (or OBS, or a browser call) on one machine and share, from
+its ordinary picker, an app or a whole monitor of the **other** machine — in
+both directions (Discord on Nocturne sharing Lightmoon, and the reverse).
+
+A screen-sharing application can only offer what exists on its own machine, and
+the one thing every such application lists on every OS is a **window**. So each
+machine, when started with `cursio mesh --remote-screen`, opens one ordinary,
+visible top-level window per connected peer, titled `Cursio — <peer>`. Its
+content is one source on that peer — any of its top-level windows, or one of its
+monitors — and the user picks it inside the view. Discord lists the view under
+its windows/applications like anything else.
+
+### Why a kept window, and not a transfer surrogate
+
+It *is* the transfer surrogate (GTK4 on Linux, raw Win32 on Windows, the shared
+`Framebuffer` and decoders), opened through
+`WindowRenderer::open_screen_view`, but with three differences:
+
+- **It survives every source switch.** A screen share captures a window;
+  recreate the window and the share ends. So the host swaps the capture under
+  one reserved stream id (`SCREEN_STREAM_ID`) and sends `SourceShown` ahead of
+  the new source's first frame. The view restarts its decoder and clears its
+  picture on that marker (`Surrogate::restart_stream`) and keeps its window.
+  The old capture keeps streaming until the new one is up — on GNOME "up" can
+  mean a picker waiting on the host.
+- **It letterboxes.** A transfer's surrogate resizes itself to its source; a
+  view cannot, since the window is what is being captured. It scales the
+  picture to fit (`framebuffer::letterbox`) and paints bars around it.
+- **It is view-only.** The shared cursor already drives the peer directly, and
+  a monitor has no window to replay a click into. Mouse and keys in the view
+  drive the selector instead.
+
+On Windows the view must be a normal window: the layered `alpha=0` trick a
+transfer's *host* uses would be recorded by Discord as nothing.
+
+### Pulled by the viewer — why that is acceptable
+
+A transfer is pushed: the drag is the host's user choosing to show a window.
+A view is pulled by the viewer. In a mesh of strangers that would be a spyware
+primitive; in Cursio's it grants nothing new. Every peer is one of the user's
+own machines, admitted by a password typed on both, and each can already drive
+the other's keyboard and mouse and read its disks — watching its screen is
+strictly less. Hosting still stays a choice: `--no-screen-host` makes a node
+answer every request with `SourcesRefused` and a reason. The module keeps
+negotiating either way, because refusal with a reason beats silence (the same
+rule as the service module). Viewing stays passive in the other sense: nothing
+opens without `--remote-screen`.
+
+### Protocol (window module v3, `WindowMsg`)
+
+| Message | Direction | Class | Meaning |
+|---|---|---|---|
+| `ListSources` | viewer → host | Control | subscribe: send the list now and on every change |
+| `Sources(Vec<ScreenSource>)` | host → viewer | Control | `{ id, kind: Window/Monitor, title, width, height, picked_on_host }` |
+| `SourcesRefused { reason }` | host → viewer | Control | this host does not serve views |
+| `ShowSource { source }` | viewer → host | Control | start **or** switch |
+| `StopSource` | viewer → host | Control | stop streaming; the view stays |
+| `SourceShown { source, title, width, height }` | host → viewer | Video | the frames that follow are a new source |
+| `SourceEnded { reason }` | host → viewer | Video | stream ended (closed, failed, picker cancelled) |
+
+Frames are ordinary `WindowFrame`s under `SCREEN_STREAM_ID`, acks ordinary
+`FrameAck`s. Requests and the list are `Control` so a switch asked for during a
+full-rate monitor stream does not queue behind its frames; `SourceShown` and
+`SourceEnded` stay `Video` because they are ordered *against* frames — the
+decoder must restart exactly between the old source's last packet and the new
+one's first. The reserved id works even with views running in both directions
+on one link: frames only flow host → viewer, so a frame bearing it is always
+ours to show, and an ack bearing it always for the stream we host. The host
+re-reads its list every 2 s while subscribed and resends only on change.
+`PROTOCOL_VERSION` is unchanged: this is the window module's own vocabulary,
+versioned through its `ModuleAdvert` (2 → 3).
+
+### What each host can offer
+
+- **Windows** enumerates directly: every monitor (primary first,
+  `CreateForMonitor`) and every visible, titled, unowned, non-tool,
+  non-cloaked window (`CreateForWindow`, never hidden — the person at that
+  machine is still using it). Views of this machine are left out of its own
+  list. A new view shows the first monitor without being asked.
+- **GNOME** cannot enumerate: `Shell.Introspect.GetWindows` is `AccessDenied`,
+  and the portal is the only sanctioned way to name a source. So a Linux host
+  offers two `picked_on_host` entries, "Choose a window…" and "Choose a
+  screen…", and choosing one opens the ScreenCast picker **on the host**. That
+  session is ScreenCast-only (no RemoteDesktop, so the dialog does not ask for
+  keyboard control a view never uses), embeds the host's cursor (the audience
+  watches that machine), and takes no restore token — the viewer asked to
+  pick, and restoring the last source silently would make both entries show
+  the same thing. No source is auto-selected from a Linux host, and ←/→ skip
+  picker entries, so a dialog never pops up on the other machine unasked.
+- **macOS** refuses with a reason for now.
+
+### The selector, and why it is where it is
+
+The choice must not end up in the pixels Discord sends. A control inside the
+view (a GTK header button or popover *embedded in the content*) would be
+captured, since window capture records the whole surface. So:
+
+- **Right-click → context menu** listing screens, then windows, then "Show
+  nothing". On Windows it is `TrackPopupMenu`, a separate `#32768` window that
+  window capture does not record. On GNOME it is a `GtkPopoverMenu`, an
+  `xdg_popup` surface of its own; a window screencast records the toplevel's
+  surface, so it is not expected in the stream — **not yet verified live**.
+- **← / → (Page Up / Page Down)** step between the host's direct sources.
+  Draws nothing at all, which is why it exists beside the menu.
+- An idle view shows one line of hint text; it disappears with the first frame.
+
+Rejected: a CLI subcommand (`cursio share-source`) — the daemon has no IPC and
+adding one for this alone is a larger surface than a menu; the Tauri app has no
+channel to the daemon either.
+
+Closing the view stops the host's capture and keeps the view closed for the
+rest of that link (a list refresh must not pop it back up). A link ending
+closes the view and stops the capture.
+
+### Later: appearing under "Screens"
+
+Some applications — and Discord's own UI — separate windows from screens. A
+view can only ever be a window. To appear as a *screen*, the viewer would need
+a virtual monitor: an IddCx indirect display driver on Windows, or Mutter's
+`RecordVirtual` (a virtual monitor the compositor itself composites) on GNOME.
+Both are deliberately out of scope here; the view path stays the same, only
+its sink would change.

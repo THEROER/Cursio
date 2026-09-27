@@ -18,7 +18,9 @@
 //!   frames into it, and pumps the surrogate's input and acks back to the host.
 //!
 //! Capture starts only after an explicit transfer request, normally a window
-//! crossing the peer-facing screen edge.
+//! crossing the peer-facing screen edge — or, for a remote-screen view, after
+//! the viewing peer picks a source; that half lives in
+//! [`crate::remote_screen`], and this engine only routes its messages.
 
 use std::collections::HashMap;
 
@@ -614,10 +616,12 @@ pub struct WindowFactory {
     /// of one of its own windows. The two are alternatives rather than both at
     /// once: an engine hosts a single window per session.
     ///
-    /// The only option there is. A window of this machine's own transfers by
-    /// being dragged across the peer-facing edge — the drag is the request, and
-    /// a flag that meant the same thing was a second way to say it that had to
-    /// agree with the first.
+    /// No option starts a *transfer*. A window of this machine's own transfers
+    /// by being dragged across the peer-facing edge — the drag is the request,
+    /// and a flag that meant the same thing was a second way to say it that had
+    /// to agree with the first. The remote-screen options below are not that:
+    /// a view is a different thing (see `remote_screen`), not a second way to
+    /// start a transfer.
     pub airplay: Option<AirPlayShare>,
     /// Open a remote-screen view of every peer that serves one
     /// (`--remote-screen`). Off by default: the view is a window that appears
