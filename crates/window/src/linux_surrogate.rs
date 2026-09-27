@@ -43,7 +43,8 @@ use crate::{
     codec::decode_tile,
     framebuffer::{geometry_of, Framebuffer, Geometry},
     presentation_ack::PresentationAcks,
-    video_decoder::VideoDecoder, Surrogate, WindowError, WindowRenderer,
+    video_decoder::VideoDecoder,
+    Surrogate, WindowError, WindowRenderer,
 };
 /// Snapshot a framebuffer as a texture GTK can paint.
 ///
@@ -112,7 +113,9 @@ impl Surrogate for GtkSurrogate {
             Geometry::Unchanged => {}
             Geometry::Resize { width, height } => {
                 (self.width, self.height) = (width, height);
-                let _ = self.commands.send(SurrogateCommand::Resize { width, height });
+                let _ = self
+                    .commands
+                    .send(SurrogateCommand::Resize { width, height });
             }
             Geometry::Grow { width, height } => {
                 (self.width, self.height) = (width, height);

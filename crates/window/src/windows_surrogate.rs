@@ -102,7 +102,9 @@ impl Surrogate for Win32Surrogate {
             Geometry::Unchanged => {}
             Geometry::Resize { width, height } => {
                 (self.width, self.height) = (width, height);
-                let _ = self.commands.send(SurrogateCommand::Resize { width, height });
+                let _ = self
+                    .commands
+                    .send(SurrogateCommand::Resize { width, height });
             }
             Geometry::Grow { width, height } => {
                 (self.width, self.height) = (width, height);
