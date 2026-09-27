@@ -187,11 +187,15 @@ impl WindowsUsb {
         // One `Start-Process -Verb RunAs` is one UAC dialog, and the loop runs
         // inside the elevated shell rather than around it. `-ErrorAction
         // Continue` so a device that refuses to bind does not abandon the rest.
-        let binds = busids
+        let mut steps: Vec<String> = busids
             .iter()
             .map(|b| format!("& '{}' bind --busid {b}", self.exe.display()))
-            .collect::<Vec<_>>()
-            .join("; ");
+            .collect();
+        // The same prompt closes usbipd's port to the network: this is the
+        // one moment Cursio holds administrator rights, and asking again for
+        // it alone would be a second dialog. See `LOOPBACK_GUARD`.
+        steps.push(guard_script());
+        let binds = steps.join("; ");
         // The inner command is base64'd rather than quoted: it carries paths,
         // semicolons and quotes of its own, and every layer of PowerShell
         // quoting between here and the elevated shell is a way to get it
@@ -231,6 +235,28 @@ impl WindowsUsb {
         ))
     }
 
+    /// Whether usbipd's port is closed to everything but this machine.
+    ///
+    /// Reading a firewall rule needs no elevation, so this is asked at
+    /// startup and a machine still exposed is told so — the rule itself is
+    /// only added by the next elevated setup.
+    #[cfg(target_os = "windows")]
+    pub fn is_guarded(&self) -> bool {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                &format!("name={LOOPBACK_GUARD}"),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
     /// Stop sharing.
     pub fn unbind(&self, busid: &str) {
         if let Err(e) = self.run(&["unbind", "--busid", busid]) {
@@ -262,6 +288,41 @@ impl WindowsUsb {
         }
         Err(UsbBackendError::Enumerate(message))
     }
+}
+
+/// The firewall rule that keeps usbipd's port on this machine.
+///
+/// `usbipd-win` listens on `0.0.0.0:3240` and authenticates nobody: whoever
+/// reaches the port can attach any bound device, which on a café's Wi-Fi is
+/// anyone. Cursio reaches it only over loopback (`crate::wintunnel`) and
+/// carries the device through the paired, encrypted mesh, so the port has no
+/// business answering the network at all.
+pub const LOOPBACK_GUARD: &str = "Cursio - usbipd from this machine only";
+
+/// Every address except loopback, as `netsh` takes a remote-address list.
+///
+/// Spelled out rather than `any` and trusting the firewall's loopback
+/// exemption, so the rule says what it means on its own: `127.0.0.0/8` and
+/// `::1` are the gaps, and nothing else reaches 3240. `::` is unroutable and
+/// left out with `::1`.
+const NOT_LOOPBACK: &str = "0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255,\
+                            ::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
+
+/// The PowerShell step that adds [`LOOPBACK_GUARD`] unless it is there.
+///
+/// Idempotent by checking first rather than deleting and re-adding, so a run
+/// that fails halfway never leaves the port open where it was closed.
+///
+/// Each `key=value` is one single-quoted PowerShell string: unquoted, the
+/// commas in the address list would make PowerShell pass an array, split into
+/// separate arguments `netsh` would reject.
+fn guard_script() -> String {
+    format!(
+        "netsh advfirewall firewall show rule 'name={LOOPBACK_GUARD}' | Out-Null; \
+         if ($LASTEXITCODE -ne 0) {{ netsh advfirewall firewall add rule \
+         'name={LOOPBACK_GUARD}' dir=in action=block protocol=TCP localport=3240 \
+         'remoteip={NOT_LOOPBACK}' | Out-Null }}"
+    )
 }
 
 /// Read the device list out of `usbipd state`'s JSON.
@@ -606,6 +667,22 @@ mod tests {
             !needs_reread(&[phone, radio], &[radio, phone]),
             "order is not a change"
         );
+    }
+
+    /// The rule is added inside an elevated shell nobody watches, so what it
+    /// says is asserted here: a block on 3240 from everything but loopback,
+    /// added only when absent.
+    #[test]
+    fn the_guard_blocks_usbipd_from_everything_but_loopback_and_only_once() {
+        let script = guard_script();
+        assert!(script.contains("action=block protocol=TCP localport=3240"));
+        assert!(
+            script.find("show rule") < script.find("add rule"),
+            "checks before adding, so a rerun adds nothing"
+        );
+        assert!(NOT_LOOPBACK.contains("0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255"));
+        assert!(NOT_LOOPBACK.contains("::2-"), "::1 must stay reachable");
+        assert!(!NOT_LOOPBACK.contains(' '), "one argument, no spaces");
     }
 
     #[test]

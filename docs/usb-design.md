@@ -314,6 +314,24 @@ escalated.
 Absence is a first-class state: `advert()` returns `None` when the driver is
 missing, so the module is not negotiated and the log says why.
 
+### usbipd's port is closed to the network
+
+`usbipd-win` listens on `0.0.0.0:3240` and authenticates nobody: whoever reaches
+the port can attach any bound device. Cursio reaches it only on loopback
+(`wintunnel.rs`) and carries the device through the paired, encrypted mesh, so
+the port has no business answering the network. The one elevated run that binds
+devices (one UAC prompt for all of them) also adds the inbound firewall rule
+`Cursio - usbipd from this machine only`: block TCP 3240 from every address but
+`127.0.0.0/8` and `::1`, spelled out rather than relying on the firewall's
+loopback exemption. It is added only when absent, so reruns change nothing and a
+half-finished run never reopens the port. Reading a rule needs no elevation, so
+at startup a machine still without it — one whose devices were all bound before
+this existed — raises `usb.usbipd-exposed` with the command to close it now.
+
+This also blocks `usbipd attach --wsl` over WSL's NAT'ed virtual adapter. WSL
+is a test bed, not a target (below), and a user who needs it can delete the rule
+by name.
+
 ### When a local program holds the device
 
 Exporting takes a device away from this machine's driver, and the OS refuses

@@ -21,8 +21,10 @@
 //! machine to itself means the only route in is still the Noise channel, with
 //! every peer authenticated by SPAKE2 pairing.
 //!
-//! A user whose firewall exposes 3240 to the LAN has that hole with or without
-//! Cursio; nothing here opens it, and nothing here needs it open.
+//! usbipd itself still listens on every interface, so the port would be that
+//! hole regardless of Cursio. Nothing here needs it open beyond loopback, and
+//! the elevated setup that binds devices closes it to the network
+//! ([`crate::windows::LOOPBACK_GUARD`]).
 //!
 //! ## Blocking reads on their own thread
 //!

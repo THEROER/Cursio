@@ -1093,6 +1093,34 @@ fn held_problem_id(busid: &str) -> String {
     format!("usb.held.{busid}")
 }
 
+/// Say so when usbipd still answers the network.
+///
+/// The rule closing it is added by the elevated setup that binds devices, so a
+/// machine whose devices were all bound before that existed stays exposed
+/// until the next prompt; this is what makes that visible rather than silent.
+#[cfg(all(feature = "usb", target_os = "windows"))]
+fn report_usbipd_exposure() {
+    const ID: &str = "usb.usbipd-exposed";
+    if cursio_usb::WindowsUsb::new().is_guarded() {
+        crate::diagnostics::clear(ID);
+        return;
+    }
+    crate::diagnostics::raise(crate::diagnostics::Problem {
+        id: ID.into(),
+        severity: crate::diagnostics::Severity::Warning,
+        summary: "usbipd accepts connections from the network on port 3240, and anyone who \
+                  reaches it can take a shared device"
+            .into(),
+        hint: Some(format!(
+            "the next usb setup prompt closes it; to do it now, in an administrator shell: \
+             netsh advfirewall firewall add rule name=\"{}\" dir=in action=block \
+             protocol=TCP localport=3240 remoteip=0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255",
+            cursio_usb::windows::LOOPBACK_GUARD
+        )),
+        since: std::time::SystemTime::now(),
+    });
+}
+
 /// Builds the USB module for a link, and holds what every link shares.
 ///
 /// The factory outlives each session — a node builds one registry at startup —
@@ -1216,7 +1244,10 @@ impl crate::module::ModuleFactory for UsbFactory {
         Ok(Box::new(UsbEngine::new(
             ctx.peer_name().to_string(),
             ctx.peer.peer_id,
-            self.node(ctx.local.peer_id, || Box::new(WindowsUsbBackend::new())),
+            self.node(ctx.local.peer_id, || {
+                report_usbipd_exposure();
+                Box::new(WindowsUsbBackend::new())
+            }),
         )))
     }
 
