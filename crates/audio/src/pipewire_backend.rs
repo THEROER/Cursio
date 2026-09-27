@@ -1274,6 +1274,23 @@ fn run_capture_loop(
         // navigation sounds are themselves only a few hundred milliseconds, so
         // their attack was cut off. The retry budget is unchanged.
         for attempt in 0..40 {
+            // Give up the moment the capture is dropped.
+            //
+            // `PwSource::drop` signals here and then joins this thread, so every
+            // pass of this loop is time the dropper spends blocked. It runs on
+            // the session loop — a tap is released there when the app's node
+            // goes away — and an app that vanishes *while* its tap is still
+            // trying to link is exactly when both happen at once. Measured on a
+            // Firefox tab that closed mid-open: the retries held the session
+            // loop for 16.4 s ("module pump blocked the session loop
+            // module=audio took_ms=16397"), long past the peer's 15 s liveness
+            // deadline, so the link was torn down and rebuilt for no reason but
+            // this wait. The budget is nominally 40 × 20 ms; a graph still
+            // forming makes each `relink_app` pump far longer than its settle.
+            if stop_rx.try_recv().is_ok() {
+                tracing::debug!(app_id, attempt, "capture dropped while linking; giving up");
+                return;
+            }
             // `relink_app` pumps the loop itself, so the settle it is given is
             // the real wait. Keep the first pass short: when the app's ports are
             // already up — the common case for an app that was mid-playback when
