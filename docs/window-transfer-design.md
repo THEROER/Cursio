@@ -449,9 +449,15 @@ of the capture backend work.
      depend on it being present.
 6. **Windows backend** — Graphics.Capture host + Win32 surrogate; verify true
    cross-OS Windows↔Linux transfer.
-7. **Remote-screen views — CODE COMPLETE, NOT YET RUN (2026-09-27)** — see
-   below. State machine unit-tested with fakes; Windows cross-build checked;
-   no live Discord share yet.
+7. **Remote-screen views — windowless (2026-09-27)** — see below. Verified
+   live: the Windows unseen view is listed by Chromium's and OBS's filters and
+   recorded by WGC on the Windows peer (`screen_view_probe` +
+   `wgc-probe --inspect`); the Linux chain capture-app → real
+   `xdg-desktop-portal` 1.20.3 → Cursio backend → peer node → PipeWire remote
+   delivered frames (`portal_probe` on a private bus). Not yet run: a real
+   Discord/OBS share between the two machines, and the installed backend on
+   the live GNOME session (RemoteDesktop forwarding is argued from
+   `screen-cast.c`, not observed).
 
 ## Remote-screen views: a peer's app or monitor, for screen-sharing software
 
@@ -459,36 +465,110 @@ The need: run Discord (or OBS, or a browser call) on one machine and share, from
 its ordinary picker, an app or a whole monitor of the **other** machine — in
 both directions (Discord on Nocturne sharing Lightmoon, and the reverse).
 
-A screen-sharing application can only offer what exists on its own machine, and
-the one thing every such application lists on every OS is a **window**. So each
-machine, when started with `cursio mesh --remote-screen`, opens one ordinary,
-visible top-level window per connected peer, titled `Cursio — <peer>`. Its
-content is one source on that peer — any of its top-level windows, or one of its
-monitors — and the user picks it inside the view. Discord lists the view under
-its windows/applications like anything else.
+…and **without drawing it on this desktop**. The first version opened a
+visible `Cursio — <peer>` window per peer purely so it could be captured —
+rendering for nobody. A screen-sharing application can only offer what its own
+machine has, and what "has" means differs per OS, so the view does too.
 
-### Why a kept window, and not a transfer surrogate
+### Windows: a window nobody sees
 
-It *is* the transfer surrogate (GTK4 on Linux, raw Win32 on Windows, the shared
-`Framebuffer` and decoders), opened through
-`WindowRenderer::open_screen_view`, but with three differences:
+Discord, OBS and browsers list top-level windows, so the view stays one, one
+per peer, kept for the life of the link — but never on screen. Measured on the
+Windows peer (`tools/wgc-probe --selftest`, a window painting a known colour):
 
-- **It survives every source switch.** A screen share captures a window;
-  recreate the window and the share ends. So the host swaps the capture under
-  one reserved stream id (`SCREEN_STREAM_ID`) and sends `SourceShown` ahead of
-  the new source's first frame. The view restarts its decoder and clears its
-  picture on that marker (`Surrogate::restart_stream`) and keeps its window.
-  The old capture keeps streaming until the new one is up — on GNOME "up" can
-  mean a picker waiting on the host.
-- **It letterboxes.** A transfer's surrogate resizes itself to its source; a
-  view cannot, since the window is what is being captured. It scales the
-  picture to fit (`framebuffer::letterbox`) and paints bars around it.
-- **It is view-only.** The shared cursor already drives the peer directly, and
-  a monitor has no window to replay a click into. Mouse and keys in the view
-  drive the selector instead.
+| state | Chromium list | OBS list | WGC frames/2 s | picture |
+|---|---|---|---|---|
+| on screen | yes | yes | 43 | yes |
+| off the virtual desktop | yes | yes | **1** | stale |
+| layered alpha 0 | yes | yes | 43 | yes |
+| **layered alpha 0 + off desktop + `WS_EX_NOACTIVATE`** | yes | yes | 44 | yes |
+| `WS_EX_TOOLWINDOW` | **no** | **no** | 43 | yes |
 
-On Windows the view must be a normal window: the layered `alpha=0` trick a
-transfer's *host* uses would be recorded by Discord as nothing.
+The filters are re-stated from Chromium's `window_capture_utils.cc` (visible,
+not minimised, unowned or `APPWINDOW`, titled, not cloaked, `TOOLWINDOW`
+excluded for WGC) and OBS' `window-helpers.c` (visible, not minimised or
+cloaked, not `TOOLWINDOW`/`WS_CHILD`, non-empty client). Off the desktop alone
+stops DWM refreshing the window; layered alpha 0 keeps it composed with its
+picture intact in the capture; `NOACTIVATE` keeps it off the taskbar and
+Alt+Tab. `PrintWindow` returns nothing for it, so a GDI-only capturer (OBS'
+"BitBlt" method) would record black — every capturer measured here uses WGC.
+Discord's own native capture engine is not open source; that it lists the
+view is inferred from it listing the same windows Chromium does.
+
+The view keeps the old rules: it **survives every source switch** (the host
+swaps captures under one reserved `SCREEN_STREAM_ID` and sends `SourceShown`
+ahead of the new source's first frame; the view restarts its decoder in
+place), it follows the source's size (nobody sees it, so 1:1 is best for the
+capture), and its selector — which cannot be a right-click on a window that is
+nowhere — is a **notification-area icon** per peer with the same menu. A new
+view shows the peer's first monitor unasked. Painting fills only the letterbox
+bars, never the whole client first: DWM composes a redirected window whenever
+it likes, and a capture taken between a full black fill and the blit recorded
+a black frame (measured: every other capture black).
+
+### Linux (GNOME): the peer's source in the app's own share dialog
+
+Discord, OBS and browsers on GNOME get pixels only from the ScreenCast
+portal, so the view is not a window at all: it is a PipeWire `Video/Source`
+node (`PipeWireScreenSource`), and it is offered through a **ScreenCast portal
+backend of Cursio's own** (`linux_portal.rs`). Installed per user with
+`cursio portal install`, it becomes `org.freedesktop.impl.portal.ScreenCast`:
+
+1. A capture app asks to share. The backend shows its chooser —
+   "This computer…", then each peer's screens and windows of the kinds the app
+   asked for. With no peer offering anything it shows nothing and goes
+   straight to GNOME's dialog.
+2. "This computer" forwards `Start` to `xdg-desktop-portal-gnome` unchanged
+   (GNOME's own picker, restore tokens and all). A peer source goes through
+   `ScreenHub` to that peer's link: `ShowSource`, then on `SourceShown` the
+   node is created at the source's size and its id is `Start`'s answer.
+3. The app closing the session stops the host's capture; the host ending the
+   source (or the link dropping) emits `Closed` on the portal session.
+
+`CreateSession` and `SelectSources` are always forwarded to GNOME too, so
+GNOME has a twin session at the same path whatever the user picks. And every
+call for a session Cursio did not create is forwarded verbatim — which is what
+keeps **Cursio's own window transfer working**: `xdg-desktop-portal` routes
+`ScreenCast.SelectSources` on a *RemoteDesktop* session to the ScreenCast
+backend (one `impl` proxy, `screen-cast.c` 1.20.3), while `RemoteDesktop.Start`
+goes to GNOME, which starts only what GNOME was told. `InputCapture` never
+comes here.
+
+Details that are load-bearing:
+
+- **One configuration file.** `xdg-desktop-portal` reads the first
+  `(<desktop>-)portals.conf` it finds, user config first, and ignores the rest,
+  so `install` copies the one in effect and adds the ScreenCast line; writing
+  only that line would drop every other portal's choice.
+- **Not running is not broken.** D-Bus starts `cursio portal relay` (forward
+  everything) when no daemon holds the name; the daemon takes the name over
+  (`ReplaceExisting`), the relay allowed that and exits.
+- **The chooser is a child process** (this executable, hidden argument): GTK
+  initialises once per process, the daemon may already have spent it on a
+  transfer surrogate, and a crashed chooser is a cancelled share, not a dead
+  daemon.
+- **The node's size is fixed** at creation; a source that changes size later
+  is letterboxed into it (`framebuffer::scale_into`) rather than
+  renegotiated, which not every consumer follows.
+- **One stream per peer.** A second capture app asking the same peer takes
+  the stream; the first is told its session ended.
+- The portal reads its configuration only at start: the change applies after
+  `systemctl --user restart xdg-desktop-portal` or a new login, which ends
+  open portal sessions (Cursio's input capture included), so `install` does
+  not restart it.
+
+Rejected: a PipeWire node alone (neither Discord nor OBS can pick a node the
+portal did not hand out); a v4l2loopback or PipeWire *camera* (appears as a
+camera, not a screen, and v4l2loopback needs a kernel module).
+
+### Why not a camera or a virtual monitor on Windows
+
+- `MFCreateVirtualCamera` (Windows 11, user mode) would appear in Discord and
+  OBS as a **camera**, not a screen — a fallback at best, and the window path
+  already works.
+- An **IddCx** indirect display (a real extra monitor, listed under Screens)
+  needs a signed user-mode driver package installed with admin rights; out of
+  scope, as on GNOME is Mutter's `RecordVirtual`.
 
 ### Pulled by the viewer — why that is acceptable
 
@@ -503,7 +583,7 @@ negotiating either way, because refusal with a reason beats silence (the same
 rule as the service module). Viewing stays passive in the other sense: nothing
 opens without `--remote-screen`.
 
-### Protocol (window module v3, `WindowMsg`)
+### Protocol (window module v4, `WindowMsg`)
 
 | Message | Direction | Class | Meaning |
 |---|---|---|---|
@@ -525,7 +605,7 @@ on one link: frames only flow host → viewer, so a frame bearing it is always
 ours to show, and an ack bearing it always for the stream we host. The host
 re-reads its list every 2 s while subscribed and resends only on change.
 `PROTOCOL_VERSION` is unchanged: this is the window module's own vocabulary,
-versioned through its `ModuleAdvert` (2 → 3).
+versioned through its `ModuleAdvert` (2 → 3 for these, 3 → 4 for `VideoCaps`).
 
 ### What each host can offer
 
@@ -533,7 +613,8 @@ versioned through its `ModuleAdvert` (2 → 3).
   `CreateForMonitor`) and every visible, titled, unowned, non-tool,
   non-cloaked window (`CreateForWindow`, never hidden — the person at that
   machine is still using it). Views of this machine are left out of its own
-  list. A new view shows the first monitor without being asked.
+  list. A new Windows view shows the first monitor without being asked; a
+  Linux viewer never streams until a capture app asks.
 - **GNOME** cannot enumerate: `Shell.Introspect.GetWindows` is `AccessDenied`,
   and the portal is the only sanctioned way to name a source. So a Linux host
   offers two `picked_on_host` entries, "Choose a window…" and "Choose a
@@ -548,32 +629,24 @@ versioned through its `ModuleAdvert` (2 → 3).
 
 ### The selector, and why it is where it is
 
-The choice must not end up in the pixels Discord sends. A control inside the
-view (a GTK header button or popover *embedded in the content*) would be
-captured, since window capture records the whole surface. So:
-
-- **Right-click → context menu** listing screens, then windows, then "Show
-  nothing". On Windows it is `TrackPopupMenu`, a separate `#32768` window that
-  window capture does not record. On GNOME it is a `GtkPopoverMenu`, an
-  `xdg_popup` surface of its own; a window screencast records the toplevel's
-  surface, so it is not expected in the stream — **not yet verified live**.
-- **← / → (Page Up / Page Down)** step between the host's direct sources.
-  Draws nothing at all, which is why it exists beside the menu.
-- An idle view shows one line of hint text; it disappears with the first frame.
+On Linux there is no selector of Cursio's beyond the portal chooser: each pick
+in the capture app is a new request. On Windows the menu (screens, windows,
+"Show nothing") hangs off the view's notification-area icon; it is
+`TrackPopupMenu`, a window of its own, so it never reaches the pixels even if
+the view were visible. An idle view paints one line of hint naming the icon —
+seen only in the capture app's preview, which is exactly where someone wonders
+why it is empty.
 
 Rejected: a CLI subcommand (`cursio share-source`) — the daemon has no IPC and
 adding one for this alone is a larger surface than a menu; the Tauri app has no
 channel to the daemon either.
 
-Closing the view stops the host's capture and keeps the view closed for the
-rest of that link (a list refresh must not pop it back up). A link ending
-closes the view and stops the capture.
+A link ending closes the view (or node) and stops the capture.
 
 ### Later: appearing under "Screens"
 
-Some applications — and Discord's own UI — separate windows from screens. A
-view can only ever be a window. To appear as a *screen*, the viewer would need
-a virtual monitor: an IddCx indirect display driver on Windows, or Mutter's
-`RecordVirtual` (a virtual monitor the compositor itself composites) on GNOME.
-Both are deliberately out of scope here; the view path stays the same, only
-its sink would change.
+Some applications — Discord's own UI among them — separate windows from
+screens. The Windows view can only be a window, and the Linux node is offered
+as a monitor or window by the kind of its source. To appear as a real
+*screen* on Windows the viewer would need a virtual monitor (IddCx, a signed
+driver); out of scope, see above.
