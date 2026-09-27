@@ -44,8 +44,8 @@ fn main() {
     while started.elapsed().as_secs() < seconds {
         // Magenta with a white bar sweeping across the top.
         let mut pixels = vec![0u8; (w * h * 4) as usize];
-        for px in pixels.chunks_exact_mut(4) {
-            px.copy_from_slice(&[0xFF, 0x00, 0xFF, 0xFF]);
+        for px in pixels.as_chunks_mut::<4>().0 {
+            *px = [0xFF, 0x00, 0xFF, 0xFF];
         }
         let x0 = (seq * 8) % (w - 40);
         for y in 0..40 {
