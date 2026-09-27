@@ -31,7 +31,9 @@ zstd = "0.13"
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
 # The PipeWire video stream carrying the captured window's BGRA frames. Same
 # crate/version the audio backend already drives (0.10).
-pipewire = "0.10"
+# `v0_3_34` for `pw_stream_trigger_process`: a remote-screen node is a driver
+# and pushes a buffer when its picture changes (libpipewire here is 1.4).
+pipewire = { version = "0.10", features = ["v0_3_34"] }
 futures-util = "0.3"
 # Listening for the GNOME Shell extension's window-drag signals. Not a new
 # dependency in practice: `ashpd` above already builds on this exact zbus, so
@@ -146,4 +148,8 @@ required-features = ["linux-probes"]
 
 [[example]]
 name = "encode_bench"
+required-features = ["linux-probes"]
+
+[[example]]
+name = "screen_node_probe"
 required-features = ["linux-probes"]

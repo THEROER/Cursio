@@ -109,6 +109,19 @@ mod linux_surrogate;
 #[cfg(target_os = "linux")]
 pub use linux_surrogate::{GtkSurrogate, GtkWindowRenderer};
 
+/// A peer's screen source published as a PipeWire node instead of a window.
+#[cfg(target_os = "linux")]
+mod linux_screen_source;
+#[cfg(target_os = "linux")]
+pub use linux_screen_source::PipeWireScreenSource;
+
+/// The dialog shown when a capture app asks the portal for a screen.
+#[cfg(target_os = "linux")]
+pub mod linux_chooser;
+/// Cursio's own ScreenCast portal backend, which adds the peers' sources.
+#[cfg(target_os = "linux")]
+pub mod linux_portal;
+
 /// Errors from a window-transfer backend (capture or render).
 #[derive(Debug, thiserror::Error)]
 pub enum WindowError {

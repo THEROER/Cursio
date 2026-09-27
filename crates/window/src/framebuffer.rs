@@ -110,9 +110,70 @@ pub fn letterbox(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32, u
     ((dst_w - w) / 2, (dst_h - h) / 2, w, h)
 }
 
+/// Draw `src` into the tightly packed `dst_w` × `dst_h` BGRA buffer `dst`,
+/// letterboxed, with black bars.
+///
+/// For a destination whose size cannot follow the source — a published video
+/// node keeps the size it was negotiated at. Nearest-neighbour: this runs per
+/// frame on the node's thread, and the common case (sizes equal) is a copy.
+pub fn scale_into(src: &Framebuffer, dst: &mut [u8], dst_w: u32, dst_h: u32) {
+    let need = (dst_w as usize) * (dst_h as usize) * 4;
+    if dst.len() < need {
+        return;
+    }
+    if (src.width, src.height) == (dst_w, dst_h) {
+        dst[..need].copy_from_slice(&src.pixels[..need]);
+        return;
+    }
+    dst[..need].fill(0);
+    let (x0, y0, w, h) = letterbox(src.width, src.height, dst_w, dst_h);
+    if src.width == 0 || src.height == 0 {
+        return;
+    }
+    for y in 0..h {
+        let sy = (y as u64 * src.height as u64 / h as u64) as usize;
+        let src_row = sy * src.width as usize * 4;
+        let dst_row = ((y0 + y) as usize * dst_w as usize + x0 as usize) * 4;
+        for x in 0..w as usize {
+            let sx = x * src.width as usize / w as usize;
+            let s = src_row + sx * 4;
+            dst[dst_row + x * 4..dst_row + x * 4 + 4].copy_from_slice(&src.pixels[s..s + 4]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaling_to_the_same_size_is_a_copy() {
+        let mut fb = Framebuffer::new(2, 1);
+        fb.pixels.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut out = vec![9u8; 8];
+        scale_into(&fb, &mut out, 2, 1);
+        assert_eq!(out, fb.pixels);
+    }
+
+    #[test]
+    fn a_narrower_source_is_centred_between_black_bars() {
+        let mut fb = Framebuffer::new(1, 1);
+        fb.pixels.copy_from_slice(&[0xFF; 4]);
+        let mut out = vec![7u8; 3 * 4];
+        scale_into(&fb, &mut out, 3, 1);
+        assert_eq!(out, [0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_larger_source_is_sampled_down_to_fit() {
+        let mut fb = Framebuffer::new(4, 2);
+        for (i, px) in fb.pixels.chunks_mut(4).enumerate() {
+            px.fill(i as u8);
+        }
+        let mut out = vec![0u8; 2 * 4];
+        scale_into(&fb, &mut out, 2, 1);
+        assert_eq!(out, [0, 0, 0, 0, 2, 2, 2, 2]);
+    }
 
     #[test]
     fn a_wide_source_gets_bars_above_and_below() {
