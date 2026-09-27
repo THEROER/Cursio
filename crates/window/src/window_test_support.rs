@@ -11,13 +11,20 @@
 //! assert on what went out. Shipped in the crate (not behind `#[cfg(test)]`)
 //! because the tests that need them live in `cursio-core`, a different crate.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
 use tokio::sync::mpsc;
 
 use cursio_protocol::{
-    WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
+    ScreenSource, SourceId, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
+    WindowMeta,
 };
 
-use crate::{CaptureSession, Surrogate, WindowCapture, WindowError, WindowRenderer};
+use crate::{
+    CaptureSession, ScreenSources, SourcePick, Surrogate, WindowCapture, WindowError,
+    WindowRenderer,
+};
 
 /// A capture whose frames a test supplies over a channel.
 pub struct FakeCaptureSession {
@@ -125,12 +132,37 @@ pub struct FakeSurrogate {
     input: mpsc::UnboundedReceiver<WindowInput>,
     /// Kept alive so `input()` reports `Empty` rather than `Disconnected` —
     /// a dropped sender would look to the session like the user closed the
-    /// window.
-    _input_tx: mpsc::UnboundedSender<WindowInput>,
+    /// window. [`user_closes`](Self::user_closes) drops it on purpose.
+    input_tx: Option<mpsc::UnboundedSender<WindowInput>>,
     pub closed: Option<WindowCloseReason>,
+    /// Titles passed to `restart_stream`, in order.
+    pub restarts: Vec<String>,
+    /// The source list last handed to the selector.
+    pub sources: Vec<ScreenSource>,
+    /// Picks the test makes on the user's behalf, taken front first.
+    pub picks: VecDeque<SourcePick>,
+}
+
+impl FakeSurrogate {
+    /// Behave as if the user closed the window.
+    pub fn user_closes(&mut self) {
+        self.input_tx = None;
+    }
 }
 
 impl Surrogate for FakeSurrogate {
+    fn restart_stream(&mut self, title: &str) {
+        self.restarts.push(title.to_string());
+    }
+
+    fn set_sources(&mut self, sources: &[ScreenSource]) {
+        self.sources = sources.to_vec();
+    }
+
+    fn take_source_pick(&mut self) -> Option<SourcePick> {
+        self.picks.pop_front()
+    }
+
     fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
         self.applied.push(frame.clone());
         Ok(())
@@ -153,12 +185,18 @@ impl Surrogate for FakeSurrogate {
 #[derive(Default)]
 pub struct FakeRenderer {
     fail: bool,
+    /// Titles of every remote-screen view opened, so a test can tell a view
+    /// that was kept from one that was recreated.
+    pub views_opened: Vec<String>,
 }
 
 impl FakeRenderer {
     /// A renderer that refuses to open, as a real one would with no display.
     pub fn failing() -> Self {
-        Self { fail: true }
+        Self {
+            fail: true,
+            views_opened: Vec::new(),
+        }
     }
 }
 
@@ -173,8 +211,103 @@ impl WindowRenderer for FakeRenderer {
         Ok(FakeSurrogate {
             applied: Vec::new(),
             input: rx,
-            _input_tx: tx,
+            input_tx: Some(tx),
             closed: None,
+            restarts: Vec::new(),
+            sources: Vec::new(),
+            picks: VecDeque::new(),
         })
+    }
+
+    fn open_screen_view(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
+        let view = self.open(meta)?;
+        self.views_opened.push(meta.title.clone());
+        Ok(view)
+    }
+}
+
+#[derive(Default)]
+struct FakeSourcesState {
+    sources: Vec<ScreenSource>,
+    /// The frame sender behind each source opened, newest open wins.
+    senders: HashMap<SourceId, mpsc::Sender<WindowFrame>>,
+    /// Every `open`, in order.
+    opened: Vec<SourceId>,
+    /// When set, the next `open` fails with this reason.
+    fail_next: Option<String>,
+}
+
+/// A host's source list and captures, driven by a test.
+///
+/// Shared behind a lock because the engine opens sources on a thread of its
+/// own, exactly as it does with a real backend.
+#[derive(Clone, Default)]
+pub struct FakeScreenSources {
+    state: Arc<Mutex<FakeSourcesState>>,
+}
+
+impl FakeScreenSources {
+    pub fn new(sources: Vec<ScreenSource>) -> Self {
+        let fake = Self::default();
+        fake.set_sources(sources);
+        fake
+    }
+
+    /// Replace what `list` reports, as windows opening and closing would.
+    pub fn set_sources(&self, sources: Vec<ScreenSource>) {
+        self.lock().sources = sources;
+    }
+
+    /// The channel that feeds frames into the capture of `source`, once opened.
+    pub fn frames_for(&self, source: SourceId) -> Option<mpsc::Sender<WindowFrame>> {
+        self.lock().senders.get(&source).cloned()
+    }
+
+    /// Every source opened so far, in order.
+    pub fn opened(&self) -> Vec<SourceId> {
+        self.lock().opened.clone()
+    }
+
+    /// Make the next `open` fail, as a declined picker would.
+    pub fn fail_next(&self, reason: &str) {
+        self.lock().fail_next = Some(reason.to_string());
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FakeSourcesState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl ScreenSources for FakeScreenSources {
+    fn list(&self) -> Result<Vec<ScreenSource>, WindowError> {
+        Ok(self.lock().sources.clone())
+    }
+
+    fn open(
+        &self,
+        id: WindowId,
+        source: &ScreenSource,
+    ) -> Result<Box<dyn CaptureSession + Send>, WindowError> {
+        let mut state = self.lock();
+        state.opened.push(source.id);
+        if let Some(reason) = state.fail_next.take() {
+            return Err(WindowError::Backend(reason));
+        }
+        let (tx, rx) = mpsc::channel(64);
+        state.senders.insert(source.id, tx);
+        Ok(Box::new(FakeCaptureSession {
+            meta: WindowMeta {
+                id,
+                title: source.title.clone(),
+                width: source.width,
+                height: source.height,
+            },
+            frames: rx,
+            applied_input: Vec::new(),
+            acks: Vec::new(),
+            closed: None,
+        }))
     }
 }

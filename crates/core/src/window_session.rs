@@ -28,6 +28,8 @@ use cursio_transport::{TransportError, TransportTx};
 use cursio_window::{CaptureSession, Surrogate, WindowCapture, WindowRenderer};
 
 use crate::module::SessionModule;
+use crate::remote_screen::{ScreenHost, ScreenViewer};
+use cursio_protocol::SCREEN_STREAM_ID;
 
 /// Put one window *control* message on the wire, enveloped for this module.
 ///
@@ -35,7 +37,7 @@ use crate::module::SessionModule;
 /// first-class `Message` variants and are sent directly — see
 /// [`WindowMsg`](cursio_protocol::WindowMsg) for why that split exists.
 async fn send_control(tx: &mut dyn TransportTx, msg: WindowMsg) -> Result<(), TransportError> {
-    let framed = Message::module(ModuleId::WINDOW, WindowMsg::PRIORITY, &msg)?;
+    let framed = Message::module(ModuleId::WINDOW, msg.priority(), &msg)?;
     tx.send(&framed).await
 }
 
@@ -110,6 +112,10 @@ pub struct WindowEngine<C: WindowCapture, R: WindowRenderer> {
     /// that latch set, and the next window dragged at the edge is then taken
     /// for a return of something already home and silently dropped.
     transfer_ended: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// Serving the peer's remote-screen view of this machine.
+    screen_host: ScreenHost,
+    /// Our remote-screen view of the peer, when the user asked for views.
+    screen_view: Option<ScreenViewer<R::Surrogate>>,
 }
 
 /// A transfer asked for from outside the session loop.
@@ -136,7 +142,22 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             peer_name,
             requests: None,
             transfer_ended: None,
+            screen_host: ScreenHost::refusing("this machine has no remote-screen capture backend"),
+            screen_view: None,
         }
+    }
+
+    /// Serve the peer's remote-screen view with `host` — which may itself be a
+    /// refusal, for a node that opted out.
+    pub fn with_screen_host(mut self, host: ScreenHost) -> Self {
+        self.screen_host = host;
+        self
+    }
+
+    /// Open a remote-screen view of the peer once it publishes its sources.
+    pub fn with_screen_view(mut self) -> Self {
+        self.screen_view = Some(ScreenViewer::new(self.peer_name.clone()));
+        self
     }
 
     /// Accept transfer requests from the drag trigger.
@@ -283,6 +304,14 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
     /// while frames and input do not — keeping the two decode paths separate is
     /// clearer than one match over both.
     fn handle_control(&mut self, msg: WindowMsg) {
+        if self.screen_host.handle(&msg) {
+            return;
+        }
+        if let Some(viewer) = self.screen_view.as_mut() {
+            if viewer.handle(&msg, &mut self.renderer) {
+                return;
+            }
+        }
         match msg {
             WindowMsg::Offer(meta) => match self.renderer.open(&meta) {
                 Ok(surrogate) => {
@@ -493,6 +522,10 @@ where
         }
         self.pump_frames(tx).await?;
         self.pump_viewer(tx).await?;
+        self.screen_host.pump(tx).await?;
+        if let Some(viewer) = self.screen_view.as_mut() {
+            viewer.pump(tx).await?;
+        }
         Ok(())
     }
 
@@ -511,6 +544,12 @@ where
             }
         }
         match msg {
+            Message::WindowFrame(frame) if frame.id == SCREEN_STREAM_ID => {
+                if let Some(viewer) = self.screen_view.as_mut() {
+                    viewer.apply_frame(frame);
+                }
+                true
+            }
             Message::WindowFrame(frame) => {
                 match self.viewed.get_mut(&frame.id) {
                     Some(surrogate) => {
@@ -552,6 +591,10 @@ where
                 },
             )
             .await;
+        }
+        self.screen_host.shutdown();
+        if let Some(viewer) = self.screen_view.as_mut() {
+            viewer.shutdown();
         }
         for (_, mut surrogate) in std::mem::take(&mut self.viewed) {
             surrogate.close(WindowCloseReason::ViewerClosed);

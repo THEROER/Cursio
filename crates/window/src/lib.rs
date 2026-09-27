@@ -26,7 +26,8 @@
 //! latency budget, and the milestones.
 
 use cursio_protocol::{
-    WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
+    ScreenSource, SourceId, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
+    WindowMeta,
 };
 
 pub mod codec;
@@ -228,8 +229,90 @@ pub trait Surrogate {
         None
     }
 
+    /// The stream behind this surrogate is about to start over with a
+    /// different source; `title` names it.
+    ///
+    /// Only a remote-screen view is ever told this. Its window must survive a
+    /// source switch — a screen-sharing application capturing it would lose
+    /// the stream if it were recreated — so the decoder and the picture are
+    /// reset in place instead. Default is a no-op for a surrogate that is only
+    /// ever one window's.
+    fn restart_stream(&mut self, _title: &str) {}
+
+    /// The host's current shareable sources, for the view's selector.
+    fn set_sources(&mut self, _sources: &[ScreenSource]) {}
+
+    /// A source the user picked in the view's selector, if one is pending.
+    fn take_source_pick(&mut self) -> Option<SourcePick> {
+        None
+    }
+
     /// Tear down the surrogate window (host closed, user dismissed, or returned).
     fn close(&mut self, reason: WindowCloseReason);
+}
+
+/// What the user asked for in a remote-screen view's selector.
+///
+/// `Next`/`Previous` stay relative here rather than being resolved by the
+/// window, because the window thread holds a copy of the list that may be a
+/// refresh behind; the session resolves them against the list it last
+/// received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePick {
+    Source(SourceId),
+    Next,
+    Previous,
+    Stop,
+}
+
+/// The sources a host can stream into a peer's remote-screen view.
+///
+/// Separate from [`WindowCapture`] because it answers a different question.
+/// A drag names its window, so `begin` can be told which one; a remote-screen
+/// request names a source out of a list this host published, and the capture
+/// it starts may block for as long as a portal picker stays open on the host.
+/// `open` therefore runs on a thread of its own, which is why this trait is
+/// `Send + Sync` and hands back a boxed session rather than borrowing `&mut`
+/// state the session loop owns.
+pub trait ScreenSources: Send + Sync {
+    /// What can be shown right now. Called every couple of seconds while a
+    /// viewer is subscribed, so it must be cheap.
+    fn list(&self) -> Result<Vec<ScreenSource>, WindowError>;
+
+    /// Start capturing `source`, stamping `id` into its meta and frames.
+    ///
+    /// May block (a picker on the host); never called on the session loop.
+    fn open(
+        &self,
+        id: WindowId,
+        source: &ScreenSource,
+    ) -> Result<Box<dyn CaptureSession + Send>, WindowError>;
+}
+
+impl CaptureSession for Box<dyn CaptureSession + Send> {
+    fn meta(&self) -> &WindowMeta {
+        (**self).meta()
+    }
+
+    fn frames(&mut self) -> &mut tokio::sync::mpsc::Receiver<WindowFrame> {
+        (**self).frames()
+    }
+
+    fn apply_input(&mut self, input: WindowInput) -> Result<(), WindowError> {
+        (**self).apply_input(input)
+    }
+
+    fn on_ack(&mut self, ack: WindowFrameAck) {
+        (**self).on_ack(ack)
+    }
+
+    fn request_resize(&mut self, width: u32, height: u32) -> Result<(), WindowError> {
+        (**self).request_resize(width, height)
+    }
+
+    fn close(&mut self, reason: WindowCloseReason) {
+        (**self).close(reason)
+    }
 }
 
 /// Opens surrogate windows from host offers (the **viewer** side).
@@ -242,4 +325,19 @@ pub trait WindowRenderer {
 
     /// Open a surrogate window for a newly offered transfer.
     fn open(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError>;
+
+    /// Open a remote-screen view: a window that shows whichever of the peer's
+    /// sources the user picks, and keeps existing across every switch.
+    ///
+    /// It differs from a transfer's surrogate in three ways. It is view-only —
+    /// the shared cursor already drives the peer directly, and a monitor has
+    /// no window to replay a click into. It letterboxes the picture instead of
+    /// resizing itself to each source, since a screen-sharing application
+    /// capturing it must see one stable window. And its selector (a context
+    /// menu and keys) lives outside the picture, so choosing a source never
+    /// shows up in the captured pixels. Default refuses, for a platform with
+    /// no viewer at all.
+    fn open_screen_view(&mut self, _meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
+        Err(WindowError::Unsupported)
+    }
 }

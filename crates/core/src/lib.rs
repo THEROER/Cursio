@@ -43,6 +43,9 @@ pub mod mesh;
 pub mod module;
 pub mod node_status;
 pub mod registry;
+/// Remote-screen views: an app or monitor of a peer, shown in a window here
+/// that screen-sharing software can capture.
+pub mod remote_screen;
 pub mod service_session;
 pub mod session;
 #[cfg(feature = "usb")]
