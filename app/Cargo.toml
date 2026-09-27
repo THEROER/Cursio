@@ -11,10 +11,15 @@ path = "src/main.rs"
 tauri-build = { version = "2.0.0-beta.18" }
 
 [dependencies]
-cursio-core.workspace = true
+# The mesh core and the control client, none of the platform modules: the app
+# never runs the node, and the node's window module links GTK4, which cannot
+# share a process with the webview's GTK3. By path, not `workspace = true`,
+# which would ignore `default-features = false`.
+cursio-core = { path = "../crates/core", default-features = false }
 cursio-protocol.workspace = true
 cursio-transport.workspace = true
-tauri = { version = "2.0.0-beta.20", features = [] }
+# `tray-icon`: the notification-area icon is the app on a desktop.
+tauri = { version = "2.0.0-beta.20", features = ["tray-icon"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

@@ -1,7 +1,134 @@
 {
   "app": {
     "title": "Cursio",
-    "subtitle": "Use this device as a touchpad for your computer"
+    "subtitle": "Use this device as a touchpad for your computer",
+    "desktopSubtitle": "Your machines, one mesh"
+  },
+  "nav": {
+    "status": "Status",
+    "placement": "Arrange",
+    "pair": "Pair",
+    "settings": "Settings"
+  },
+  "node": {
+    "running": "Node running",
+    "stopped": "Node not running",
+    "connecting": "Connecting",
+    "notRunningTitle": "The Cursio node is not running on this machine",
+    "notRunningBody": "Nothing is shared until it runs. Start it here, or run `cursio mesh` in a terminal.",
+    "start": "Start node",
+    "starting": "Starting…"
+  },
+  "stats": {
+    "peers": "Peers online",
+    "latency": "Input latency p50 / p99",
+    "latencyHint": "Last 30 s of pointer and key events",
+    "noLatency": "No input measured yet",
+    "problems": "Problems"
+  },
+  "problems": {
+    "title": "Problems"
+  },
+  "modules": {
+    "title": "What this machine shares",
+    "description": "A module runs on a link only when both machines have it on.",
+    "input": "Keyboard and mouse",
+    "inputHint": "Capture this machine's input and move the cursor across screen edges",
+    "clipboard": "Clipboard",
+    "clipboardHint": "Copy here, paste there — text, images and formatting",
+    "audio": "Audio",
+    "audioHint": "Each app's sound reaches peers as its own stream",
+    "files": "Disks",
+    "filesHint": "Peers' disks appear under ~/Cursio, and theirs see yours",
+    "usb": "USB devices",
+    "usbHint": "Lend this machine's USB devices to peers",
+    "remoteScreen": "Peers' screens for screen sharing",
+    "remoteScreenHint": "Offer peers' windows to Discord, OBS and browser calls here",
+    "screenHost": "Let peers view this screen",
+    "screenHostHint": "Answer peers asking for this machine's windows",
+    "flag": "set by a flag",
+    "pinned": "Saved, but a command-line flag overrides it until the node is started without that flag.",
+    "restartNote": "Changes are written to {path} and the node restarts to apply them."
+  },
+  "peers": {
+    "title": "Peers",
+    "none": "No machines paired yet",
+    "noneHint": "Pair one from the Pair tab."
+  },
+  "presence": {
+    "online": "Online",
+    "connecting": "Connecting",
+    "offline": "Offline"
+  },
+  "kind": {
+    "Desktop": "Desktop",
+    "Laptop": "Laptop",
+    "Phone": "Phone",
+    "Tablet": "Tablet",
+    "Headless": "Headless"
+  },
+  "peer": {
+    "position": "Position",
+    "kind": "Device",
+    "battery": "Battery",
+    "network": "Network",
+    "charging": "charging",
+    "plugged": "plugged in",
+    "wired": "Wired",
+    "wifi": "Wi-Fi",
+    "cellular": "Cellular",
+    "unknownNetwork": "Unrecognised link",
+    "cannotSay": "Cannot say",
+    "skipped": "{module} off on this link: {why}",
+    "noLink": "Not connected in this session, so its position and status are unknown."
+  },
+  "placement": {
+    "title": "Arrange machines",
+    "description": "Drag this machine to the cell it sits in. The cursor crosses to whichever machine is next in that direction.",
+    "left": "Move left",
+    "up": "Move up",
+    "down": "Move down",
+    "right": "Move right",
+    "here": "This machine: {x}, {y}",
+    "reset": "Reset",
+    "apply": "Apply",
+    "applied": "Saved; the node restarts with the new position.",
+    "pinned": "Saved, but --at on the command line overrides it until the node is started without it.",
+    "sameCell": "Same cell as {names}: machines in one cell border nothing, so the cursor will not cross between them.",
+    "unplaced": "Not shown until they connect: {names}"
+  },
+  "pair": {
+    "title": "Pair a machine",
+    "description": "Show a code on one machine and enter it on the other. The code is used once and never leaves the two machines.",
+    "showTitle": "Show a code here",
+    "showHint": "Then enter it on the other machine in the Cursio app, or run `cursio pair CODE` there.",
+    "show": "Show a code",
+    "enterTitle": "Enter a code from the other machine",
+    "enterHint": "The eight characters shown there, with or without the dash.",
+    "enter": "Pair",
+    "showThis": "Enter this on the other machine",
+    "waiting": "Code accepted. Waiting for the other machine…",
+    "expiresIn": "Valid for {time}",
+    "failedAttempts": "Wrong code tried {n} time(s); three closes the window.",
+    "cancel": "Cancel",
+    "paired": "Paired with {peer}.",
+    "expired": "The code expired before it was used. Show a new one.",
+    "tooMany": "Too many wrong codes, so pairing was closed. Show a new code.",
+    "cancelled": "Pairing cancelled.",
+    "cli": "From a terminal: `cursio pair` shows a code, `cursio pair ABCD-EFGH` enters one."
+  },
+  "settings": {
+    "autostartTitle": "Start at login",
+    "autostartDescription": "Off unless you turn it on.",
+    "autostartNode": "Start the node",
+    "autostartNodeHint": "Linux: a systemd user service. Windows: the Run key; the node asks for administrator rights as it does from a terminal.",
+    "autostartTray": "Show the tray icon",
+    "autostartTrayHint": "Starts this app hidden, in the notification area.",
+    "nodeTitle": "Node",
+    "configAt": "Config file: {path}",
+    "pinned": "Fixed by command-line flags: {fields}",
+    "restart": "Restart node",
+    "restarting": "Restarting; peers reconnect in a few seconds."
   },
   "connection": {
     "password": "Pairing password",
