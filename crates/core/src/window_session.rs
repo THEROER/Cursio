@@ -327,6 +327,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                     self.note_transfer_ended();
                 }
             }
+            other => tracing::debug!(?other, "remote-screen message this node does not serve"),
         }
     }
 
@@ -709,7 +710,7 @@ impl crate::module::ModuleFactory for WindowFactory {
 
 /// Version of this module's wire vocabulary ([`WindowMsg`]). Bump when those
 /// types change shape; peers run the module only on an exact match.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// Watch for windows dragged toward the peer's edge and turn that into
 /// [`TransferRequest`]s.

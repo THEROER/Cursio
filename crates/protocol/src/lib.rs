@@ -43,8 +43,8 @@ pub use input::{neighbour_across, Edge, InputEvent, MouseButton, Position};
 pub use node::{NetworkKind, NodeStatus, PowerSource};
 pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{
-    Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
-    WindowMeta, WindowMsg,
+    Rect, ScreenSource, SourceId, SourceKind, TileCodec, WindowCloseReason, WindowFrame,
+    WindowFrameAck, WindowId, WindowInput, WindowMeta, WindowMsg, SCREEN_STREAM_ID,
 };
 
 /// Protocol version of the **session layer**: the greeting, pairing, liveness

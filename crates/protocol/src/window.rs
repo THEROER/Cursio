@@ -222,6 +222,51 @@ pub enum WindowCloseReason {
     Returned,
 }
 
+/// The [`WindowId`] every remote-screen stream travels under.
+///
+/// Reserved rather than allocated because a remote-screen stream is not a
+/// transfer: there is at most one per direction per link, it outlives every
+/// source it shows, and both machines may run one towards the other at once.
+/// Frames only ever flow host → viewer, so a frame bearing this id always
+/// belongs to *our* view of the peer's screen, and an ack bearing it always to
+/// the stream *we* host — the direction disambiguates what a shared id cannot.
+/// Drag transfers allocate upwards from 1 and never reach it.
+pub const SCREEN_STREAM_ID: WindowId = u32::MAX;
+
+/// Identifies one shareable source in a host's [`ScreenSource`] list.
+///
+/// Chosen by the host and stable only for as long as the source exists; the
+/// viewer echoes it back verbatim and never interprets it.
+pub type SourceId = u32;
+
+/// Whether a [`ScreenSource`] is one application window or a whole monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceKind {
+    Window,
+    Monitor,
+}
+
+/// One thing a host can stream into a peer's remote-screen view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenSource {
+    pub id: SourceId,
+    pub kind: SourceKind,
+    /// Display text for the viewer's selector.
+    pub title: String,
+    /// Size in pixels as the host last saw it; `0` when unknown until capture
+    /// starts (a portal-chosen source).
+    pub width: u32,
+    pub height: u32,
+    /// Choosing this opens a picker **on the host**, rather than naming a
+    /// concrete source.
+    ///
+    /// GNOME refuses to tell a client which windows exist
+    /// (`Shell.Introspect.GetWindows` is `AccessDenied`), so a Linux host can
+    /// only offer "let the portal ask". Flagged so the viewer can say where the
+    /// dialog will appear instead of the stream seeming to hang.
+    pub picked_on_host: bool,
+}
+
 /// The window module's **control** vocabulary, carried inside
 /// [`Message::Module`](crate::Message::Module).
 ///
@@ -262,10 +307,41 @@ pub enum WindowMsg {
         id: WindowId,
         reason: WindowCloseReason,
     },
+    /// Viewer -> host: send the list of shareable sources now, and again
+    /// whenever it changes, for as long as this link lives.
+    ///
+    /// A subscription rather than a one-shot query because the list is what a
+    /// right-click menu shows, and windows open and close while the viewer is
+    /// up; polling from the viewer would cost a round trip per menu.
+    ListSources,
+    /// Host -> viewer: the current shareable sources.
+    Sources(Vec<ScreenSource>),
+    /// Host -> viewer: this host does not serve remote-screen views.
+    ///
+    /// Carries a reason because silence would be indistinguishable from a
+    /// request that never arrived — the same rule as a service refusal.
+    SourcesRefused { reason: String },
+    /// Viewer -> host: stream this source into the view, replacing whatever it
+    /// showed. Starting and switching are the same request.
+    ShowSource { source: SourceId },
+    /// Viewer -> host: stop streaming into the view; the view stays open.
+    StopSource,
+    /// Host -> viewer: the frames that follow under [`SCREEN_STREAM_ID`] are a
+    /// new source. The viewer restarts its decoder and picture here and keeps
+    /// its window.
+    SourceShown {
+        source: SourceId,
+        title: String,
+        width: u32,
+        height: u32,
+    },
+    /// Host -> viewer: the view's stream ended (source closed, capture failed,
+    /// picker cancelled). The window stays; it simply shows nothing.
+    SourceEnded { reason: String },
 }
 
 impl WindowMsg {
-    /// Scheduling class for window control traffic.
+    /// Scheduling class for transfer control traffic.
     ///
     /// `Video`, matching the pixels it governs: an offer that outran its own
     /// frames, or a close that arrived before the last frame, would have the
@@ -273,6 +349,25 @@ impl WindowMsg {
     /// control in the same class as the frames keeps them ordered relative to
     /// each other.
     pub const PRIORITY: crate::Priority = crate::Priority::Video;
+
+    /// Scheduling class for this particular message.
+    ///
+    /// The remote-screen requests and the source list are `Control`: none of
+    /// them is ordered against pixels, and a source switch asked for while a
+    /// monitor streams at full rate must not wait behind that monitor's
+    /// frames. `SourceShown` and `SourceEnded` stay with the frames because
+    /// they *are* ordered against them — the viewer must restart its decoder
+    /// exactly between the old source's last packet and the new one's first.
+    pub fn priority(&self) -> crate::Priority {
+        match self {
+            Self::ListSources
+            | Self::Sources(_)
+            | Self::SourcesRefused { .. }
+            | Self::ShowSource { .. }
+            | Self::StopSource => crate::Priority::Control,
+            _ => Self::PRIORITY,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -285,5 +380,49 @@ mod tests {
         assert!(TileCodec::LosslessBgra8888.is_lossless());
         assert!(!TileCodec::LossyImage.is_lossless());
         assert!(!TileCodec::LossyVideo.is_lossless());
+    }
+
+    #[test]
+    fn source_requests_jump_the_video_queue_but_a_switch_stays_with_its_frames() {
+        use crate::Priority;
+        assert_eq!(
+            WindowMsg::ShowSource { source: 1 }.priority(),
+            Priority::Control
+        );
+        assert_eq!(WindowMsg::ListSources.priority(), Priority::Control);
+        assert_eq!(WindowMsg::Sources(Vec::new()).priority(), Priority::Control);
+        let shown = WindowMsg::SourceShown {
+            source: 1,
+            title: String::new(),
+            width: 0,
+            height: 0,
+        };
+        assert_eq!(shown.priority(), Priority::Video);
+        assert_eq!(
+            WindowMsg::SourceEnded {
+                reason: String::new()
+            }
+            .priority(),
+            Priority::Video
+        );
+    }
+
+    #[test]
+    fn a_source_list_survives_the_wire() {
+        let msg = WindowMsg::Sources(vec![ScreenSource {
+            id: 0x8000_0000,
+            kind: SourceKind::Monitor,
+            title: "Screen 1".into(),
+            width: 1920,
+            height: 1080,
+            picked_on_host: false,
+        }]);
+        let framed = crate::Message::module(crate::ModuleId::WINDOW, msg.priority(), &msg).unwrap();
+        assert_eq!(
+            framed
+                .decode_module::<WindowMsg>(crate::ModuleId::WINDOW)
+                .unwrap(),
+            Some(msg)
+        );
     }
 }
