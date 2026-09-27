@@ -209,8 +209,18 @@ fn import_device(socket: &mut TcpStream, busid: &str) -> Result<(), UsbBackendEr
         )));
     }
     if status != 0 {
-        // The usual cause is a device that was never `bind`-ed, which the
-        // caller can act on; anything else is the server's own business.
+        // The status says only "refused". A program here holding the device
+        // open is the cause seen live — a phone plugged in the whole time,
+        // reported as missing — and usbipd records that only in its event
+        // log, so the log is read before settling for the bare refusal.
+        if let Some(holder) = crate::holder::windows_hold() {
+            return Err(UsbBackendError::HeldLocally {
+                busid: busid.to_string(),
+                holder,
+            });
+        }
+        // Otherwise the usual cause is a device that was never `bind`-ed,
+        // which the caller can act on.
         return Err(UsbBackendError::NoSuchDevice(format!(
             "usbipd refused to export {busid} (status {status})"
         )));

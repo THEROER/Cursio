@@ -33,6 +33,7 @@ use crate::LocalDevice;
 #[derive(Default)]
 pub struct DeviceOffers {
     by_id: HashMap<UsbDeviceId, String>,
+    labels: HashMap<UsbDeviceId, String>,
 }
 
 impl DeviceOffers {
@@ -47,13 +48,14 @@ impl DeviceOffers {
     /// picker.
     pub fn offer(&mut self, local: &[LocalDevice]) -> Vec<UsbDevice> {
         self.by_id.clear();
+        self.labels.clear();
         local
             .iter()
             .filter(|d| d.is_shareable())
             .map(|d| {
                 let id = device_id(d);
                 self.by_id.insert(id, d.busid.clone());
-                UsbDevice {
+                let device = UsbDevice {
                     id,
                     vendor: d.vendor,
                     product: d.product,
@@ -67,9 +69,16 @@ impl DeviceOffers {
                     // Filled in by the session, which is what knows who holds
                     // what. A backend has no idea a mesh exists.
                     holder: None,
-                }
+                };
+                self.labels.insert(id, device.label());
+                device
             })
             .collect()
+    }
+
+    /// What the device calls itself, for a sentence about it.
+    pub fn label(&self, id: UsbDeviceId) -> Option<&str> {
+        self.labels.get(&id).map(String::as_str)
     }
 
     /// Which port a peer's id refers to, if it still refers to anything.

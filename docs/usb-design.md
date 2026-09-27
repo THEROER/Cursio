@@ -314,6 +314,27 @@ escalated.
 Absence is a first-class state: `advert()` returns `None` when the driver is
 missing, so the module is not negotiated and the log says why.
 
+### When a local program holds the device
+
+Exporting takes a device away from this machine's driver, and the OS refuses
+while something here has it open. Seen live on Windows: `adb` held a POCO X7
+Pro, `usbipd` answered the import with a bare non-zero status, and the peer was
+told `no such device` about a phone that was plugged in. The reason is only in
+usbipd's event log — `CR_REMOVE_VETOED: PNP_VetoOutstandingOpen`.
+
+`cursio-usb::holder` reads that log after a refusal (never on the listing path;
+it costs a PowerShell start) and, on an outstanding-open veto, reports
+`HeldLocally` with the likeliest holder among running processes — `adb`,
+`scrcpy`, `fastboot`, Phone Link, in that order of blame. Windows will not name
+a device handle's owner to an unprivileged process, so the sentence says "most
+likely". Linux can: an `EBUSY` from the bind or unbind is answered by reading
+`/proc/<pid>/fd` links for the device's `/dev/bus/usb` node.
+
+The session sends the peer `UsbError::Backend` with the full sentence and fix
+("POCO X7 Pro is held open on this machine, most likely by adb.exe (PID 7312);
+on that machine, run `adb kill-server`"), and raises `usb.held.<busid>` in the
+host's diagnostics until an export of that device succeeds.
+
 ### WSL
 
 Microsoft ships `usbip-core.ko`, `usbip-host.ko` and `vhci-hcd.ko` in the WSL2

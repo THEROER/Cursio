@@ -18,6 +18,7 @@
 pub mod arbiter;
 #[cfg(target_os = "linux")]
 pub mod export;
+pub mod holder;
 #[cfg(target_os = "linux")]
 pub mod import;
 #[cfg(target_os = "linux")]
@@ -64,6 +65,15 @@ pub enum UsbBackendError {
     NeedsPrivilege(String),
     #[error("no such device: {0}")]
     NoSuchDevice(String),
+    /// A program on this machine has the device open, so it cannot be taken
+    /// from its driver. Distinct from [`NoSuchDevice`](Self::NoSuchDevice):
+    /// the device is right there, and the fix is closing a program, not
+    /// plugging anything in.
+    #[error("{}", holder::held_sentence(.busid, .holder.as_ref()))]
+    HeldLocally {
+        busid: String,
+        holder: Option<holder::Holder>,
+    },
     #[error("usb enumeration failed: {0}")]
     Enumerate(String),
     /// The USB/IP stream stopped making sense. Framing errors end a stream

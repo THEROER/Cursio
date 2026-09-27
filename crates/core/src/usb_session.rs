@@ -755,8 +755,9 @@ impl UsbBackend for LinuxUsbBackend {
         };
         self.exporter.export(&busid).map_err(|e| {
             tracing::warn!(%device, busid, error = %e, "cannot export device");
-            backend_error_to_wire(&e)
+            refusal(&e, &busid, self.offers.label(device))
         })?;
+        crate::diagnostics::clear(&held_problem_id(&busid));
 
         // The socket the kernel serves this device over. Made after the bind
         // because `usbip_sockfd` does not exist until then.
@@ -1000,8 +1001,9 @@ impl UsbBackend for WindowsUsbBackend {
         let tunnel = cursio_usb::WinTunnel::connect(&busid).map_err(|e| {
             self.usbipd.unbind(&busid);
             tracing::warn!(%device, busid, error = %e, "cannot reach the local usbipd server");
-            backend_error_to_wire(&e)
+            refusal(&e, &busid, self.offers.label(device))
         })?;
+        crate::diagnostics::clear(&held_problem_id(&busid));
 
         let stream = UsbStreamId(self.next_stream);
         self.next_stream += 1;
@@ -1060,6 +1062,35 @@ fn backend_error_to_wire(error: &cursio_usb::UsbBackendError) -> UsbError {
         UsbBackendError::NeedsPrivilege(_) => UsbError::NeedsPrivilege,
         other => UsbError::Backend(other.to_string()),
     }
+}
+
+/// What the peer is told when an export is refused, and what this machine
+/// reports about it.
+///
+/// A hold by a local program is the one refusal the *host's* user has to act
+/// on — the peer can only wait — so it becomes a problem here as well as the
+/// reason the peer reads. Both carry the same sentence: the peer used to be
+/// told `no such device` about a phone plugged in the whole time.
+#[cfg(all(feature = "usb", any(target_os = "linux", target_os = "windows")))]
+fn refusal(error: &cursio_usb::UsbBackendError, busid: &str, label: Option<&str>) -> UsbError {
+    let cursio_usb::UsbBackendError::HeldLocally { holder, .. } = error else {
+        return backend_error_to_wire(error);
+    };
+    let summary = cursio_usb::holder::held_sentence(label.unwrap_or(busid), holder.as_ref());
+    let hint = cursio_usb::holder::held_hint(holder.as_ref());
+    crate::diagnostics::raise(crate::diagnostics::Problem {
+        id: held_problem_id(busid),
+        severity: crate::diagnostics::Severity::Error,
+        summary: format!("{summary}, so a peer could not attach it"),
+        hint: Some(hint.clone()),
+        since: std::time::SystemTime::now(),
+    });
+    UsbError::Backend(format!("{summary}; on that machine, {hint}"))
+}
+
+#[cfg(all(feature = "usb", any(target_os = "linux", target_os = "windows")))]
+fn held_problem_id(busid: &str) -> String {
+    format!("usb.held.{busid}")
 }
 
 /// Builds the USB module for a link, and holds what every link shares.
@@ -2084,5 +2115,46 @@ mod tests {
             "nothing to say about a dead stream"
         );
         assert_eq!(e.exported_count(), 1, "the live attach must survive");
+    }
+
+    /// Seen live: `adb` held a phone on the host and the peer was told `no
+    /// such device`. The peer must now read who holds it and the fix, and the
+    /// host must list it as its own problem.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn a_device_held_by_a_local_program_is_named_to_the_peer_and_raised_here() {
+        let error = cursio_usb::UsbBackendError::HeldLocally {
+            busid: "t-held-9-9".into(),
+            holder: Some(cursio_usb::holder::Holder {
+                process: "adb".into(),
+                pid: 7312,
+                certain: true,
+            }),
+        };
+        let told = refusal(&error, "t-held-9-9", Some("POCO X7 Pro"));
+        let UsbError::Backend(text) = told else {
+            panic!("expected a reason in words, got {told:?}");
+        };
+        assert!(
+            text.contains("POCO X7 Pro is held open by adb (PID 7312)"),
+            "{text}"
+        );
+        assert!(text.contains("adb kill-server"), "{text}");
+
+        let raised = crate::diagnostics::snapshot()
+            .into_iter()
+            .find(|p| p.id == "usb.held.t-held-9-9")
+            .expect("raised on the host");
+        assert_eq!(raised.severity, crate::diagnostics::Severity::Error);
+        crate::diagnostics::clear("usb.held.t-held-9-9");
+    }
+
+    /// Any other refusal keeps its old mapping: a missing device is still
+    /// `Gone`, which tells the peer to stop asking.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn a_refusal_that_is_not_a_hold_keeps_its_wire_meaning() {
+        let error = cursio_usb::UsbBackendError::NoSuchDevice("1-1".into());
+        assert_eq!(refusal(&error, "1-1", None), UsbError::Gone);
     }
 }

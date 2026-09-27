@@ -137,7 +137,8 @@ impl Exporter {
         // free before either. `usbip-host` binds nothing it has not been told
         // about, which is what makes loading the module harmless.
         if let Some(driver) = &previous {
-            self.write_driver(driver, "unbind", busid)?;
+            self.write_driver(driver, "unbind", busid)
+                .map_err(|e| self.name_holder(busid, e))?;
         }
         if let Err(e) = self.write_driver(USBIP_HOST, "match_busid", &format!("add {busid}")) {
             self.restore(busid, previous.as_deref());
@@ -149,7 +150,7 @@ impl Exporter {
             // success.
             let _ = self.write_driver(USBIP_HOST, "match_busid", &format!("del {busid}"));
             self.restore(busid, previous.as_deref());
-            return Err(e);
+            return Err(self.name_holder(busid, e));
         }
 
         tracing::info!(busid, previous = ?previous, "exported to usbip-host");
@@ -182,6 +183,41 @@ impl Exporter {
             tracing::debug!(busid, error = %e, "device not re-bound; it may need a replug");
         }
         tracing::info!(busid, "returned to this machine");
+    }
+
+    /// Turn a busy refusal into one naming who holds the device.
+    ///
+    /// `write_sysfs` sees only a file, so it reports the hold without a device
+    /// or a holder; this is where the bus id is known and `/proc` can be asked
+    /// which process has the device node open.
+    fn name_holder(&self, busid: &str, error: UsbBackendError) -> UsbBackendError {
+        match error {
+            UsbBackendError::HeldLocally { .. } => UsbBackendError::HeldLocally {
+                busid: busid.to_string(),
+                holder: self.device_node(busid).and_then(|node| {
+                    crate::holder::holders_of(Path::new("/proc"), &node)
+                        .into_iter()
+                        .next()
+                }),
+            },
+            other => other,
+        }
+    }
+
+    /// The `/dev/bus/usb` node a process opens to talk to this device.
+    fn device_node(&self, busid: &str) -> Option<PathBuf> {
+        let read = |name: &str| -> Option<u32> {
+            std::fs::read_to_string(self.devices.join(busid).join(name))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        Some(PathBuf::from(format!(
+            "/dev/bus/usb/{:03}/{:03}",
+            read("busnum")?,
+            read("devnum")?
+        )))
     }
 
     /// Put a device back after a failed export, as far as that is possible.
@@ -258,6 +294,15 @@ fn write_sysfs(path: &Path, value: &str) -> Result<(), UsbBackendError> {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(
             UsbBackendError::NeedsPrivilege(format!("cannot write {}: {e}", path.display())),
         ),
+        // The kernel answers `EBUSY` when something still has the device and
+        // will not let the driver go. Reported as a hold rather than as a
+        // generic failure, so the caller can go and find out whose.
+        Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => {
+            Err(UsbBackendError::HeldLocally {
+                busid: path.display().to_string(),
+                holder: None,
+            })
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(UsbBackendError::NoSuchDevice(
             format!("{} does not exist: {e}", path.display()),
         )),
@@ -468,6 +513,31 @@ mod tests {
 
         fixture.exporter().stop_serving("1-5").expect("stop");
         assert_eq!(std::fs::read_to_string(&sockfd).expect("read"), "-1");
+    }
+
+    /// A busy refusal reaches the caller naming the device, not the sysfs file
+    /// `write_sysfs` was writing when the kernel said no.
+    #[test]
+    fn a_busy_refusal_names_the_device_rather_than_the_control_file() {
+        let fixture = Fixture::new(&["usb"], "1-5", Some("usb"));
+        std::fs::write(fixture.devices.join("1-5").join("busnum"), "1\n").expect("busnum");
+        std::fs::write(fixture.devices.join("1-5").join("devnum"), "5\n").expect("devnum");
+        let exporter = fixture.exporter();
+        assert_eq!(
+            exporter.device_node("1-5"),
+            Some(PathBuf::from("/dev/bus/usb/001/005"))
+        );
+
+        let busy = UsbBackendError::HeldLocally {
+            busid: "/sys/bus/usb/drivers/usb/unbind".into(),
+            holder: None,
+        };
+        match exporter.name_holder("1-5", busy) {
+            UsbBackendError::HeldLocally { busid, .. } => assert_eq!(busid, "1-5"),
+            other => panic!("expected a hold, got {other:?}"),
+        }
+        let other = exporter.name_holder("1-5", UsbBackendError::NoSuchDevice("1-5".into()));
+        assert!(matches!(other, UsbBackendError::NoSuchDevice(_)));
     }
 
     /// Root can write a 0400 file, so the permission test above cannot assert
