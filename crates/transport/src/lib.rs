@@ -124,6 +124,15 @@ pub trait TransportTx: Send {
     /// leaves before the session drops the tx. Best-effort: the link may already
     /// be gone.
     async fn flush(&mut self) {}
+
+    /// Another handle onto this sender's queue, for a sender that has one.
+    ///
+    /// Session modules run on their own threads and send without going
+    /// through the session. `None` — the default, for a sender that writes
+    /// inside `send` — means the caller must share this one handle instead.
+    fn clone_sender(&self) -> Option<Box<dyn TransportTx>> {
+        None
+    }
 }
 
 /// The receive half of a split [`Transport`].

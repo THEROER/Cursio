@@ -194,11 +194,18 @@ struct Shared {
 
 /// A [`TransportTx`] that queues by priority instead of writing synchronously.
 ///
-/// Cloneable is not needed — the session holds exactly one — but it is cheap to
-/// hand out: all real work lives in the drainer task spawned by [`Self::spawn`].
+/// Cloneable, because each session module sends from its own thread: a clone
+/// is another handle onto the same queues, and all real work lives in the
+/// drainer task spawned by [`Self::spawn`]. The queue closes when the *last*
+/// handle goes, so a module finishing early cannot cut off the session's `Bye`.
+#[derive(Clone)]
 pub struct PrioritizedTx {
     shared: Arc<Shared>,
+    _open: Arc<OpenHandle>,
 }
+
+/// Closes the queues when dropped, which happens once, with the last clone.
+struct OpenHandle(Arc<Shared>);
 
 impl PrioritizedTx {
     /// Wrap a raw inner tx + Noise state in a prioritized sender, spawning the
@@ -263,7 +270,10 @@ impl PrioritizedTx {
             drain_shared.drained.notify_waiters();
         });
 
-        PrioritizedTx { shared }
+        PrioritizedTx {
+            _open: Arc::new(OpenHandle(shared.clone())),
+            shared,
+        }
     }
 }
 
@@ -298,6 +308,10 @@ impl TransportTx for PrioritizedTx {
         }
     }
 
+    fn clone_sender(&self) -> Option<Box<dyn TransportTx>> {
+        Some(Box::new(self.clone()))
+    }
+
     async fn flush(&mut self) {
         loop {
             // Register interest *before* checking, so a drain that completes
@@ -318,14 +332,14 @@ impl TransportTx for PrioritizedTx {
     }
 }
 
-impl Drop for PrioritizedTx {
+impl Drop for OpenHandle {
     fn drop(&mut self) {
         // Mark closed so the drainer exits once it has flushed what's queued,
         // then wake it in case it's parked.
-        if let Ok(mut q) = self.shared.queues.lock() {
+        if let Ok(mut q) = self.0.queues.lock() {
             q.closed = true;
         }
-        self.shared.wake.notify_one();
+        self.0.wake.notify_one();
     }
 }
 
@@ -698,6 +712,39 @@ mod tests {
         assert_eq!(
             tx.queue_depth(Priority::Audio),
             crate::QueueDepth::default()
+        );
+    }
+
+    /// A module's clone keeps the link open after the session's own handle is
+    /// gone, and what it sends still arrives; the queue closes with the last.
+    #[tokio::test]
+    async fn a_cloned_sender_shares_the_queue_until_the_last_handle_drops() {
+        let (a, b) = MemTransport::pair();
+        let init = tokio::spawn(async move {
+            EncryptedTransport::establish(a, b"k", Role::Initiator)
+                .await
+                .unwrap()
+        });
+        let resp = EncryptedTransport::establish(b, b"k", Role::Responder)
+            .await
+            .unwrap();
+        let init = init.await.unwrap();
+
+        let (tx, _u) = Box::new(init).split_prioritized();
+        let (_u2, mut rx) = Box::new(resp).split();
+
+        let mut clone = tx.clone_sender().expect("a prioritized sender clones");
+        drop(tx);
+        clone.send(&Message::Heartbeat { nonce: 7 }).await.unwrap();
+        clone.flush().await;
+        assert_eq!(rx.recv().await.unwrap(), Message::Heartbeat { nonce: 7 });
+
+        drop(clone);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("the link must close once the last handle is gone")
+                .is_err()
         );
     }
 }
