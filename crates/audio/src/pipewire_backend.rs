@@ -1254,192 +1254,276 @@ fn run_capture_loop(
     // unconnected (ports exist, nothing flows), so we wire it up ourselves —
     // the same thing `pw-link` does. See docs/audio-design.md.
     //
-    // Crucially this is **not one-shot**: browsers (Chromium, Firefox) tear down
-    // an app's output ports on pause/seek and create fresh ones on resume — often
-    // on the SAME node id, so no Joined/Left fires and the Remote Stream is never
-    // rebuilt. Our original links then point at ports that no longer exist and
-    // audio is silent forever (until a page *reload*, which does make a new node).
-    // So we keep a live map of app-out-port -> link and re-link on a short
-    // interval: drop links whose app port vanished, add links for new app ports.
-    let mut app_links: AppLinks = std::collections::HashMap::new();
+    // Crucially this is **not one-shot**: browsers (Chromium, Firefox) can tear
+    // down an app's output ports and create fresh ones — often on the SAME node
+    // id, so no Joined/Left fires and the Remote Stream is never rebuilt. Links to
+    // the old ports are then dead and audio is silent until we relink.
+    //
+    // The ports are followed through ONE registry listener that lives as long as
+    // the tap (see [`PortWatch`]). Each pass used to bind a fresh registry and
+    // pump the loop for ~100 ms hoping the full dump had arrived. On a busy graph
+    // it often had not, so ports that were perfectly alive were missing from the
+    // pass, their links were judged stale and dropped, and the next pass ~450 ms
+    // later linked them again: Firefox, with ports unchanged for hours, was cut
+    // out of the capture that way dozens of times an hour, heard as a pop and a
+    // gap on the peer. A port now leaves the table only when PipeWire says it was
+    // removed, and a relink runs the moment the table changes.
     let app_id: u32 = if let CaptureMode::AppTap { node_id, .. } = &mode {
         node_id.parse().unwrap_or(u32::MAX)
     } else {
         u32::MAX
     };
-    if let CaptureMode::AppTap { .. } = &mode {
-        // Do the first link promptly, retrying while the graph settles (our input
-        // ports appear a beat after connect without AUTOCONNECT).
-        //
-        // The first attempt comes almost immediately, because everything the app
-        // plays before the link exists is lost: there is nowhere to put it. This
-        // used to pump a flat 100 ms before even looking, which came off the
-        // front of every stream — inaudible on a video, but Steam's Big Picture
-        // navigation sounds are themselves only a few hundred milliseconds, so
-        // their attack was cut off. The retry budget is unchanged.
-        for attempt in 0..40 {
-            // Give up the moment the capture is dropped: a tap whose app has
-            // vanished has nothing left to link, and the budget is nominally
-            // 40 × 20 ms, but a graph still forming makes each `relink_app` pump
-            // far longer than its settle — seconds of PipeWire work for a stream
-            // nobody will read.
-            if stop_rx.try_recv().is_ok() {
-                tracing::debug!(app_id, attempt, "capture dropped while linking; giving up");
-                return;
-            }
-            // `relink_app` pumps the loop itself, so the settle it is given is
-            // the real wait. Keep the first pass short: when the app's ports are
-            // already up — the common case for an app that was mid-playback when
-            // it was routed — this links on the first try and loses nothing off
-            // the front. Later passes settle longer, for a graph still forming.
-            let settle = if attempt == 0 { 1 } else { 20 };
-            relink_app(&core, loop_ref, app_id, &stream, &mut app_links, settle);
-            if !app_links.is_empty() {
-                tracing::info!(
-                    app_id,
-                    count = app_links.len(),
-                    attempt,
-                    "linked app to capture"
-                );
-                break;
-            }
-            if attempt == 39 {
-                tracing::error!(app_id, "failed to link app to capture after retries");
+    let watch = if app_id != u32::MAX {
+        match PortWatch::new(&core, app_id) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::error!(app_id, error = %e, "cannot watch app ports; tap stays unlinked");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
+    let mut app_links: AppLinks = std::collections::HashMap::new();
+    let tap_started = std::time::Instant::now();
+    let mut first_link_logged = false;
+    let mut link_failure_logged = false;
 
     // Drive the loop, polling the stop channel between iterations. PipeWire's
     // loop has no cross-thread "run until signalled", so we iterate with a short
-    // timeout and re-check. For an app tap, re-link periodically so a pause/seek
-    // that recreates the app's ports doesn't silence the stream permanently.
+    // timeout and re-check. `iterate` returns as soon as it has dispatched
+    // anything, so an app port appearing is linked within the same wakeup —
+    // everything the app plays before its link exists is lost, which used to cut
+    // the attack off short event sounds.
     let mut last_relink = std::time::Instant::now();
     loop {
         if stop_rx.try_recv().is_ok() {
             break;
         }
         loop_ref.iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(50)));
-        if app_id != u32::MAX && last_relink.elapsed() >= APP_RELINK_INTERVAL {
+        let Some(watch) = &watch else { continue };
+        watch.our_node.set(stream.node_id());
+        // The periodic pass is only a backstop for a change that arrived while
+        // our own node id was still unknown; with the table held in memory it
+        // costs nothing.
+        if watch.dirty.replace(false) || last_relink.elapsed() >= APP_RELINK_INTERVAL {
             last_relink = std::time::Instant::now();
-            // Short settle on the periodic pass: the registry is already cached,
-            // and a long pump here would stall the capture loop (same thread).
-            relink_app(&core, loop_ref, app_id, &stream, &mut app_links, 4);
+            relink_app(&core, app_id, stream.node_id(), watch, &mut app_links);
+        }
+        if !first_link_logged && !app_links.is_empty() {
+            first_link_logged = true;
+            tracing::info!(
+                app_id,
+                count = app_links.len(),
+                after_ms = tap_started.elapsed().as_millis() as u64,
+                "linked app to capture"
+            );
+        }
+        if !first_link_logged && !link_failure_logged && tap_started.elapsed() >= APP_LINK_PATIENCE
+        {
+            link_failure_logged = true;
+            tracing::error!(
+                app_id,
+                "app tap is still unlinked; no app output port reached our input"
+            );
         }
     }
 }
 
-/// How often an app tap re-checks its links to the application's output ports.
-///
-/// A pause/seek that recreates the app's ports must heal quickly (the audio is
-/// gone until it does), but re-walking the registry costs a little, so this is a
-/// balance — fast enough that a resume is near-instant, slow enough to be cheap.
+/// How often an app tap re-plans its links even without a registry change.
 const APP_RELINK_INTERVAL: Duration = Duration::from_millis(400);
+
+/// How long an app tap may stay unlinked before that is reported as an error.
+const APP_LINK_PATIENCE: Duration = Duration::from_secs(10);
+
+/// The registry's view of the ports and links an app tap cares about, kept
+/// current by one listener for the tap's whole life.
+///
+/// The listener has to outlive every relink pass: a registry bound per pass
+/// delivers its initial dump over many loop wakeups, so any pass that stops
+/// pumping early sees only part of the graph — and a port absent from a
+/// partial dump is indistinguishable from one that was removed.
+struct PortWatch {
+    table: std::rc::Rc<std::cell::RefCell<PortTable>>,
+    /// Set by the listener when a port of the app or of our node comes or goes,
+    /// or a link on one of them is removed.
+    dirty: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Our capture node's id, `SPA_ID_INVALID` until the stream is bound.
+    our_node: std::rc::Rc<std::cell::Cell<u32>>,
+    _registry: pipewire::registry::RegistryRc,
+    _listener: pipewire::registry::Listener,
+}
+
+impl PortWatch {
+    fn new(core: &pipewire::core::CoreRc, app_id: u32) -> Result<Self, String> {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let registry = core
+            .get_registry_rc()
+            .map_err(|e| format!("registry: {e}"))?;
+        let table = Rc::new(RefCell::new(PortTable::default()));
+        let dirty = Rc::new(Cell::new(false));
+        let our_node = Rc::new(Cell::new(u32::MAX));
+
+        let relevant = {
+            let our_node = our_node.clone();
+            move |node: u32| node == app_id || node == our_node.get()
+        };
+        let (table_g, dirty_g, relevant_g) = (table.clone(), dirty.clone(), relevant.clone());
+        let (table_r, dirty_r) = (table.clone(), dirty.clone());
+        let listener = registry
+            .add_listener_local()
+            .global(move |obj| {
+                let Some(props) = obj.props else { return };
+                let mut table = table_g.borrow_mut();
+                if props.get("factory.type.name") == Some("PipeWire:Interface:Link") {
+                    if let Some(name) = props.get("factory.name") {
+                        table.factory = Some(name.to_string());
+                    }
+                    return;
+                }
+                if let (Some(out), Some(input)) = (
+                    props
+                        .get("link.output.port")
+                        .and_then(|v| v.parse::<u32>().ok()),
+                    props
+                        .get("link.input.port")
+                        .and_then(|v| v.parse::<u32>().ok()),
+                ) {
+                    table.links.insert(obj.id, (out, input));
+                    return;
+                }
+                let Some(node) = props.get("node.id").and_then(|v| v.parse::<u32>().ok()) else {
+                    return;
+                };
+                let Some(dir) = props.get("port.direction") else {
+                    return;
+                };
+                // Absent only before PipeWire 0.3.50; 0 then compares equal
+                // every pass, which degrades to matching by id alone.
+                let serial = props
+                    .get("object.serial")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let port = LinkPort {
+                    id: obj.id,
+                    serial,
+                    channel: props.get("audio.channel").unwrap_or("").to_string(),
+                };
+                table.add_port(node, dir == "out", port);
+                if relevant_g(node) {
+                    dirty_g.set(true);
+                }
+            })
+            .global_remove(move |id| {
+                let mut table = table_r.borrow_mut();
+                let Some((node, link)) = table.remove(id) else {
+                    return;
+                };
+                if relevant(node) {
+                    // A session manager may destroy one of our links while
+                    // both ports live on; the proxy we hold would otherwise go
+                    // on claiming an input nothing feeds any more.
+                    table.removed_links.extend(link);
+                    dirty_r.set(true);
+                }
+            })
+            .register();
+
+        Ok(Self {
+            table,
+            dirty,
+            our_node,
+            _registry: registry,
+            _listener: listener,
+        })
+    }
+}
+
+/// Ports and links as the registry has announced them and not yet removed.
+#[derive(Debug, Default)]
+struct PortTable {
+    /// Port id → (owning node, is an output, the port).
+    ports: std::collections::HashMap<u32, (u32, bool, LinkPort)>,
+    /// Link id → (output port, input port).
+    links: std::collections::HashMap<u32, (u32, u32)>,
+    /// Name of the factory that creates links, once announced.
+    factory: Option<String>,
+    /// Links removed since the last pass whose output belonged to a node we
+    /// watch.
+    removed_links: Vec<RemovedLink>,
+}
+
+/// `((output port, input port), that output port's serial)`.
+type RemovedLink = ((u32, u32), u64);
+
+impl PortTable {
+    fn add_port(&mut self, node: u32, output: bool, port: LinkPort) {
+        self.ports.insert(port.id, (node, output, port));
+    }
+
+    /// Forget a removed object. Returns the node it concerned, if it was a
+    /// port, or a link whose output port we know — together with that link.
+    ///
+    /// The serial travels with a removed link because the port id alone may
+    /// already belong to a recreated port that we have just linked afresh; a
+    /// late removal of the old link must not take the new one with it.
+    fn remove(&mut self, id: u32) -> Option<(u32, Option<RemovedLink>)> {
+        if let Some((node, _, _)) = self.ports.remove(&id) {
+            return Some((node, None));
+        }
+        let (out, input) = self.links.remove(&id)?;
+        let (node, _, port) = self.ports.get(&out)?;
+        Some((*node, Some(((out, input), port.serial))))
+    }
+
+    fn side(&self, node: u32, output: bool) -> Vec<LinkPort> {
+        self.ports
+            .values()
+            .filter(|(n, o, _)| *n == node && *o == output)
+            .map(|(_, _, p)| p.clone())
+            .collect()
+    }
+}
 
 /// Wire an application's output ports to our capture node's input ports.
 ///
-/// Walks the registry for both nodes' current ports, then:
-/// - drops any link whose app output port has disappeared (a pause/seek tore it
-///   down; the dead proxy is removed so the map reflects reality), and
-/// - creates a link for any app output port not yet linked (a resume made new
-///   ports), pairing by channel (FL→FL, FR→FR).
+/// Reads both nodes' ports from the [`PortWatch`] table, then drops any link
+/// whose app output port is gone and creates a link for any app output port
+/// not yet linked, pairing by channel (FL→FL, FR→FR). Both happen in the same
+/// pass without yielding to the loop, so an app that recreates its ports loses
+/// only what it lost itself.
 ///
 /// `links` is the [`AppLinks`] map; its proxies must be **kept alive** —
 /// dropping one tears its link down, which is exactly how a stale link is
-/// removed. Idempotent and safe to call on a timer: with no changes it walks the
-/// registry and does nothing. The decisions themselves are [`plan_app_links`].
-///
-/// This heals the pause/seek silence: browsers recreate an app's output ports on
-/// resume (often on the same node id, so no Joined/Left fires), and without
-/// re-linking our tap would stay wired to ports that no longer exist.
+/// removed. Idempotent: with no changes it does nothing. The decisions
+/// themselves are [`plan_app_links`].
 fn relink_app(
     core: &pipewire::core::CoreRc,
-    loop_ref: &pipewire::loop_::Loop,
     app_id: u32,
-    stream: &StreamRc,
+    our_node_id: u32,
+    watch: &PortWatch,
     links: &mut AppLinks,
-    // How long to pump the loop so the registry dump arrives. The first link
-    // needs a generous settle; a periodic re-check does not (objects are already
-    // cached and re-listed fast), and a long pump here would block the capture
-    // loop — which runs on this same thread — starving audio for ~half a second.
-    settle_iters: u32,
 ) {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    let our_node_id = stream.node_id();
-    let Ok(registry) = core.get_registry_rc() else {
-        return;
-    };
-
-    // Collect the ports of the two nodes we care about, plus the name of a link
-    // factory.
-    type Port = (u32, String, LinkPort); // node, direction, port
-    let ports: Rc<RefCell<Vec<Port>>> = Rc::new(RefCell::new(Vec::new()));
-    let factory: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let ports_cb = ports.clone();
-    let factory_cb = factory.clone();
-
-    let _listener = registry
-        .add_listener_local()
-        .global(move |obj| {
-            let Some(props) = obj.props else { return };
-            if props.get("factory.type.name") == Some("PipeWire:Interface:Link") {
-                if let Some(name) = props.get("factory.name") {
-                    *factory_cb.borrow_mut() = Some(name.to_string());
-                }
-                return;
-            }
-            let Some(node) = props.get("node.id").and_then(|v| v.parse::<u32>().ok()) else {
-                return;
-            };
-            if node != app_id && node != our_node_id {
-                return;
-            }
-            let Some(dir) = props.get("port.direction") else {
-                return;
-            };
-            let channel = props.get("audio.channel").unwrap_or("").to_string();
-            // Absent only before PipeWire 0.3.50; 0 then compares equal every
-            // pass, which degrades to matching by id alone.
-            let serial = props
-                .get("object.serial")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            ports_cb.borrow_mut().push((
-                node,
-                dir.to_string(),
-                LinkPort {
-                    id: obj.id,
-                    serial,
-                    channel,
-                },
-            ));
-        })
-        .register();
-
-    // Pump so the registry dump arrives (see `settle_iters`).
-    for _ in 0..settle_iters {
-        loop_ref.iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(25)));
+    // Borrowed only between loop wakeups: `create_object` below queues a
+    // request and dispatches nothing, so the listener cannot re-enter here.
+    let mut table = watch.table.borrow_mut();
+    for (pair, serial) in std::mem::take(&mut table.removed_links) {
+        if links.get(&pair).is_some_and(|(s, _)| *s == serial) {
+            tracing::info!(
+                app_id,
+                out = pair.0,
+                input = pair.1,
+                "app link was removed; relinking"
+            );
+            links.remove(&pair);
+        }
     }
-
-    // Snapshot everything the callback filled *now*, then drop the listener, so
-    // no further registry event can fire into the `RefCell` while we hold a
-    // borrow. The link-creation pump below (`loop_ref.iterate`) triggers globals
-    // for the new Link objects; if the listener were still live and `ports` still
-    // borrowed, its `borrow_mut()` would panic ("RefCell already borrowed").
-    let ports: Vec<Port> = ports.borrow().clone();
-    let factory = factory.borrow().clone();
-    drop(_listener);
-
-    let side = |node: u32, dir: &str| -> Vec<LinkPort> {
-        ports
-            .iter()
-            .filter(|(n, d, _)| *n == node && d == dir)
-            .map(|(_, _, p)| p.clone())
-            .collect()
-    };
-    let outs = side(app_id, "out");
-    let ins = side(our_node_id, "in");
+    let outs = table.side(app_id, true);
+    let ins = table.side(our_node_id, false);
+    let factory = table.factory.clone();
+    drop(table);
 
     let linked: std::collections::HashMap<(u32, u32), u64> = links
         .iter()
@@ -1487,10 +1571,6 @@ fn relink_app(
     }
     if created > 0 {
         tracing::info!(app_id, created, "re-linked app output ports to capture");
-        // Roundtrip so the server actually creates them.
-        for _ in 0..10 {
-            loop_ref.iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(25)));
-        }
     }
 }
 
@@ -2176,6 +2256,50 @@ mod tests {
 
         assert!(plan.stale.is_empty(), "the live FL link must be kept");
         assert_eq!(plan.create, vec![(port(30, 300, "MONO"), 51)]);
+    }
+
+    /// A live app port stays linked however the rest of the graph churns.
+    ///
+    /// Firefox kept ports 149/130 for hours while its tap was dropped and
+    /// relinked every few minutes: each pass read a registry dump that had not
+    /// fully arrived, so its ports were missing and looked removed. The table
+    /// is only ever shrunk by an explicit removal.
+    #[test]
+    fn a_stable_app_port_is_never_judged_stale_by_unrelated_graph_changes() {
+        let mut table = PortTable::default();
+        table.add_port(290, true, port(149, 101_576, "FL"));
+        table.add_port(290, true, port(130, 101_577, "FR"));
+        for input in our_inputs() {
+            table.add_port(303, false, input);
+        }
+        let linked = std::collections::HashMap::from([((149, 50), 101_576), ((130, 51), 101_577)]);
+
+        table.add_port(410, false, port(152, 101_427, "FL"));
+        table.links.insert(424, (149, 152));
+        assert_eq!(table.remove(424), Some((290, Some(((149, 152), 101_576)))));
+        assert_eq!(table.remove(9999), None, "an unknown id concerns nothing");
+
+        let plan = plan_app_links(&table.side(290, true), &table.side(303, false), &linked);
+        assert_eq!(plan, AppLinkPlan::default());
+    }
+
+    /// A recreated port is replaced and linked in the same pass that retires
+    /// the old one, so the only gap is the one the app made itself.
+    #[test]
+    fn a_recreated_app_port_is_relinked_in_the_same_pass_it_is_retired() {
+        let mut table = PortTable::default();
+        table.add_port(290, true, port(149, 100, "FL"));
+        for input in our_inputs() {
+            table.add_port(303, false, input);
+        }
+        let linked = std::collections::HashMap::from([((149, 50), 100)]);
+
+        assert_eq!(table.remove(149), Some((290, None)));
+        table.add_port(290, true, port(149, 105, "FL"));
+
+        let plan = plan_app_links(&table.side(290, true), &table.side(303, false), &linked);
+        assert_eq!(plan.stale, vec![(149, 50)]);
+        assert_eq!(plan.create, vec![(port(149, 105, "FL"), 50)]);
     }
 
     /// Our streams must declare FL/FR positions, not just "2 channels".

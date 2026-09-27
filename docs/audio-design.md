@@ -153,6 +153,14 @@ touching the session. Channels, not callbacks (a slow link never stalls capture)
 - **Capture / source side:** enumerate & advertise streams, grab each app/device
   stream, emit `AudioChunk`s. Linux = PipeWire (per-node capture, null-sink for
   the virtual output). Windows = WASAPI loopback + process loopback for per-app.
+
+  A Linux app tap is linked to the app's output ports by hand, and those links
+  are followed by **one registry listener for the tap's life**, not re-read per
+  pass. A per-pass registry sees a partial dump on a busy graph; a live port
+  missing from it looked removed, so its link was dropped and remade ~450 ms
+  later — an audible gap each time, dozens of times an hour on Firefox. A port
+  now counts as gone only when PipeWire removes it, and a recreated port is
+  relinked in the same loop wakeup that retires the old link.
 - **Playback / sink side:** create local nodes from advertisements, play inbound
   chunks through a jitter buffer, expose them so VM/Carla can route them. Linux =
   PipeWire nodes; Windows = WASAPI render, with the `native/cursio-vad` driver
