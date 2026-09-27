@@ -305,6 +305,12 @@ stream. The next video frame is a P-frame off the decoder's lossy reference, so
 motion is lossy again until it settles again; that is the trade the lossy
 stream already made.
 
+**Corrupted PipeWire buffers are skipped.** A buffer whose chunk carries
+`SPA_CHUNK_FLAG_CORRUPTED` holds no new picture — its memory is whatever an
+earlier frame left in that pool slot — and was diffed as current, sending the
+viewer an old picture. The capture never negotiated `SPA_META_VideoDamage`, so
+every other buffer is a whole frame and skipping one loses nothing.
+
 ## Wire protocol
 
 `crates/protocol/src/window.rs` (added in `PROTOCOL_VERSION = 4`). All types are

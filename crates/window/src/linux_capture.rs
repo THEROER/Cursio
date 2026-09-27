@@ -811,6 +811,17 @@ fn run_pipewire_loop(
             if size == 0 || stride == 0 {
                 return;
             }
+            // Mutter queues a buffer marked corrupted when it had no new
+            // picture to record into it (a cursor-only update, a failed
+            // blit). Its memory is whatever an earlier frame left in that pool
+            // slot, and diffing it as if it were current sends the viewer a
+            // picture from several frames ago.
+            if chunk
+                .flags()
+                .contains(pipewire::spa::buffer::ChunkFlags::CORRUPTED)
+            {
+                return;
+            }
             let Some(bytes) = data.data() else { return };
 
             let mut st = state_proc.borrow_mut();
