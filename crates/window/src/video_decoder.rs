@@ -64,6 +64,12 @@ impl VideoDecoder {
         })
     }
 
+    /// Whether a keyframe has arrived. Until one does every packet is
+    /// dropped, and the viewer should ask the host for one.
+    pub fn synced(&self) -> bool {
+        self.synced
+    }
+
     /// Feed one packet; return whatever complete BGRA frames it produced.
     ///
     /// Each returned frame is a full window image, tightly packed

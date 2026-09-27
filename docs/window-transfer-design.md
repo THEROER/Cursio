@@ -272,6 +272,25 @@ frame, which a fresh decoder cannot enter on); Media Foundation takes
 `CODECAPI_AVEncVideoForceKeyFrame` before the sample. A rate change still costs
 no keyframe on x264 and Media Foundation.
 
+**Resync on request, from the last frame.** The clock still needs a change to
+encode. So a viewer whose decoder is waiting for a keyframe — its first, or a
+fresh one after a decode error, which now drops the decoder rather than
+building on broken references — raises a flag its surrogate reports through
+`Surrogate::take_keyframe_request`, and the session sends
+`WindowMsg::KeyframeRequest { id }` (window module v5), at most once a second
+per stream (`KeyframeRequests`). A remote-screen view also asks on every
+`SourceShown`. The host's `CaptureSession::request_keyframe` reaches the
+capture thread, where the shared `frame_pipeline::CapturePipeline` (both
+backends now feed it; each only supplies an `EncoderSource`) marks the stream
+for *resync* and answers from the last captured frame between captures — on
+Linux after each PipeWire loop iteration, on Windows whenever WGC has nothing
+new — as an IDR, or as the whole picture in four lossless bands when no
+encoder opens. The encoder stays on the PipeWire thread; nothing is shared
+across threads. An update the capture queue could not take marks a resync too,
+instead of only resetting the differ: the old reset made the *next* change a
+full frame, but on a screen that then stood still there was no next change,
+and the viewer kept the gap.
+
 ## Wire protocol
 
 `crates/protocol/src/window.rs` (added in `PROTOCOL_VERSION = 4`). All types are
@@ -622,7 +641,7 @@ negotiating either way, because refusal with a reason beats silence (the same
 rule as the service module). Viewing stays passive in the other sense: nothing
 opens without `--remote-screen`.
 
-### Protocol (window module v4, `WindowMsg`)
+### Protocol (window module v5, `WindowMsg`)
 
 | Message | Direction | Class | Meaning |
 |---|---|---|---|
@@ -633,6 +652,7 @@ opens without `--remote-screen`.
 | `StopSource` | viewer → host | Control | stop streaming; the view stays |
 | `SourceShown { source, title, width, height }` | host → viewer | Video | the frames that follow are a new source |
 | `SourceEnded { reason }` | host → viewer | Video | stream ended (closed, failed, picker cancelled) |
+| `KeyframeRequest { id }` | viewer → host | Control | send the whole current picture now (also used by transfers) |
 
 Frames are ordinary `WindowFrame`s under `SCREEN_STREAM_ID`, acks ordinary
 `FrameAck`s. Requests and the list are `Control` so a switch asked for during a
@@ -644,7 +664,7 @@ on one link: frames only flow host → viewer, so a frame bearing it is always
 ours to show, and an ack bearing it always for the stream we host. The host
 re-reads its list every 2 s while subscribed and resends only on change.
 `PROTOCOL_VERSION` is unchanged: this is the window module's own vocabulary,
-versioned through its `ModuleAdvert` (2 → 3 for these, 3 → 4 for `VideoCaps`).
+versioned through its `ModuleAdvert` (2 → 3 for these, 3 → 4 for `VideoCaps`, 4 → 5 for `KeyframeRequest`).
 
 ### What each host can offer
 

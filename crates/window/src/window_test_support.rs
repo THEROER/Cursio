@@ -12,6 +12,7 @@
 //! because the tests that need them live in `cursio-core`, a different crate.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -38,6 +39,9 @@ pub struct FakeCaptureSession {
     pub closed: Option<WindowCloseReason>,
     /// What the engine last said the viewer's decoder takes.
     pub peer_video: Option<VideoCaps>,
+    /// How many times the viewer asked for a whole picture, shared with the
+    /// backend that opened this session.
+    pub keyframe_requests: Arc<AtomicU32>,
 }
 
 impl CaptureSession for FakeCaptureSession {
@@ -60,6 +64,10 @@ impl CaptureSession for FakeCaptureSession {
 
     fn on_ack(&mut self, ack: WindowFrameAck) {
         self.acks.push(ack);
+    }
+
+    fn request_keyframe(&mut self) {
+        self.keyframe_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     fn close(&mut self, reason: WindowCloseReason) {
@@ -128,6 +136,7 @@ impl WindowCapture for FakeCapture {
             acks: Vec::new(),
             closed: None,
             peer_video: None,
+            keyframe_requests: Arc::default(),
         })
     }
 }
@@ -151,6 +160,8 @@ pub struct FakeSurrogate {
     /// Set on a remote-screen view, standing in for a published node: the
     /// number of views opened before it, plus 100.
     pub node: Option<u32>,
+    /// Set by a test to stand in for a decoder waiting for a keyframe.
+    pub wants_keyframe: bool,
 }
 
 impl FakeSurrogate {
@@ -161,6 +172,10 @@ impl FakeSurrogate {
 }
 
 impl Surrogate for FakeSurrogate {
+    fn take_keyframe_request(&mut self) -> bool {
+        std::mem::take(&mut self.wants_keyframe)
+    }
+
     fn restart_stream(&mut self, title: &str) {
         self.restarts.push(title.to_string());
     }
@@ -231,6 +246,7 @@ impl WindowRenderer for FakeRenderer {
             sources: Vec::new(),
             picks: VecDeque::new(),
             node: None,
+            wants_keyframe: false,
         })
     }
 
@@ -251,6 +267,7 @@ struct FakeSourcesState {
     opened: Vec<SourceId>,
     /// When set, the next `open` fails with this reason.
     fail_next: Option<String>,
+    keyframe_requests: Arc<AtomicU32>,
 }
 
 /// A host's source list and captures, driven by a test.
@@ -282,6 +299,12 @@ impl FakeScreenSources {
     /// Every source opened so far, in order.
     pub fn opened(&self) -> Vec<SourceId> {
         self.lock().opened.clone()
+    }
+
+    /// How many times a viewer asked any capture opened here for a whole
+    /// picture.
+    pub fn keyframe_requests(&self) -> u32 {
+        self.lock().keyframe_requests.load(Ordering::Relaxed)
     }
 
     /// Make the next `open` fail, as a declined picker would.
@@ -325,6 +348,7 @@ impl ScreenSources for FakeScreenSources {
             acks: Vec::new(),
             closed: None,
             peer_video: None,
+            keyframe_requests: state.keyframe_requests.clone(),
         }))
     }
 }

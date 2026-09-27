@@ -52,11 +52,11 @@ use ashpd::desktop::{
     PersistMode,
 };
 use cursio_protocol::{
-    TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
+    WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
 };
 use tokio::sync::mpsc;
 
-use crate::frame_pipeline::{pick_codec, should_use_video, FrameDiffer};
+use crate::frame_pipeline::CapturePipeline;
 use crate::{CaptureSession, WindowCapture, WindowError};
 
 /// Where the ScreenCast restore token is persisted, next to `identity.json` in
@@ -342,6 +342,9 @@ enum CaptureCommand {
     /// may drive them is the capture thread's (the portal session is `!Send`).
     /// So the event is queued here and replayed there.
     Input(WindowInput),
+    /// Send the viewer the whole current picture; see
+    /// [`CaptureSession::request_keyframe`].
+    Keyframe,
     /// Stop the PipeWire loop and end the thread.
     Stop,
 }
@@ -396,6 +399,10 @@ impl CaptureSession for PortalCaptureSession {
 
     fn set_peer_video(&mut self, caps: cursio_protocol::VideoCaps) {
         self.quality.set_peer_video(caps);
+    }
+
+    fn request_keyframe(&mut self) {
+        let _ = self.commands.send(CaptureCommand::Keyframe);
     }
 
     fn close(&mut self, reason: WindowCloseReason) {
@@ -598,25 +605,13 @@ fn capture_thread(
 struct StreamState {
     /// Negotiated video format; `None` until the first `param_changed`.
     format: Option<pipewire::spa::param::video::VideoInfoRaw>,
-    /// Monotonic per-window frame counter for [`WindowFrame::seq`].
-    seq: u32,
-    differ: FrameDiffer,
     /// Set once we've reported readiness, so it only happens on the first
     /// format.
     announced: bool,
-    /// H.264 encoder for large updates, opened lazily.
-    ///
-    /// Lazy because a window that only ever changes a little never needs one,
-    /// and opening it costs a GPU session. Cleared on resize: H.264 cannot
-    /// change frame size mid-stream, so a new geometry means a new encoder (and
-    /// a fresh keyframe).
-    video: Option<crate::video_encoder::VideoEncoder>,
-    keyframes: crate::frame_pipeline::KeyframeClock,
-    /// Shared with the session thread, which moves it as acks arrive. Read per
-    /// frame so a link that frees up restores quality without a restart.
-    quality: std::sync::Arc<crate::frame_pipeline::AdaptiveQuality>,
-    /// Mirrors `seq` for the session's ack maths; see `PortalCaptureSession`.
-    last_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Lives here, on the PipeWire thread, rather than behind a lock: the
+    /// encoder is driven from `process` and, between buffers, from the loop
+    /// that iterates PipeWire — both this thread.
+    pipeline: CapturePipeline<crate::video_encoder::FfmpegEncoders>,
 }
 
 /// Build the format Pod we offer PipeWire.
@@ -744,14 +739,9 @@ fn run_pipewire_loop(
     .map_err(|e| format!("stream: {e}"))?;
 
     let state = Rc::new(RefCell::new(StreamState {
-        quality,
-        last_seq,
         format: None,
-        seq: 0,
-        differ: FrameDiffer::new(),
         announced: false,
-        video: None,
-        keyframes: Default::default(),
+        pipeline: CapturePipeline::new(id, Default::default(), quality, last_seq, frames_tx),
     }));
 
     let ready = ready_tx.clone();
@@ -808,7 +798,9 @@ fn run_pipewire_loop(
                 return;
             };
             let datas = buffer.datas_mut();
-            let Some(data) = datas.first_mut() else { return };
+            let Some(data) = datas.first_mut() else {
+                return;
+            };
 
             let chunk = data.chunk();
             let (offset, size, stride) = (
@@ -843,130 +835,8 @@ fn run_pipewire_loop(
                 frame.extend_from_slice(&bytes[start..end]);
             }
 
-            let Some(dirty) = st.differ.diff(&frame, width, height) else {
-                return; // nothing changed — the static-window case costs nothing
-            };
-
-            // Which path? A small change rides a lossless tile; a large one
-            // goes through the video encoder, which codes the difference from
-            // the previous frame rather than the pixels themselves.
-            if should_use_video(dirty, width, height, st.quality.threshold()) {
-                use crate::video_encoder::Fidelity;
-                let fidelity = if st.quality.lossless() {
-                    Fidelity::Lossless
-                } else {
-                    Fidelity::Lossy {
-                        bitrate: st.quality.bitrate(width, height),
-                    }
-                };
-                // Geometry changes invalidate the encoder: H.264 is fixed-size.
-                if st
-                    .video
-                    .as_ref()
-                    .is_some_and(|e| e.size() != (width, height))
-                {
-                    tracing::info!(width, height, "window resized; reopening video encoder");
-                    st.video = None;
-                }
-                if st
-                    .video
-                    .as_ref()
-                    .is_some_and(|e| !e.fidelity().same_stream(fidelity))
-                {
-                    tracing::info!(?fidelity, "the viewer's decoder changed what to encode");
-                    st.video = None;
-                }
-                if st.video.is_none() {
-                    match crate::video_encoder::VideoEncoder::open(width, height, fidelity) {
-                        Ok(enc) => st.video = Some(enc),
-                        Err(e) => {
-                            // Not fatal: fall through to the lossless path,
-                            // which always works — just more expensively.
-                            tracing::warn!(error = %e, "no video encoder; using lossless tiles");
-                        }
-                    }
-                }
-
-                let now = std::time::Instant::now();
-                let key = st.keyframes.due(now);
-                if let Some(enc) = st.video.as_mut() {
-                    if let Fidelity::Lossy { bitrate } = fidelity {
-                        enc.set_bitrate(bitrate);
-                    }
-                    if key {
-                        enc.force_keyframe();
-                    }
-                    match enc.encode(&frame) {
-                        Ok(packets) => {
-                            // One visual update can yield several packets, and
-                            // sometimes none — the encoder decides.
-                            let full = enc.full_rect();
-                            st.keyframes.note_sent(&packets, now);
-                            let frames = packets
-                                .into_iter()
-                                .map(|data| {
-                                    st.seq = st.seq.wrapping_add(1);
-                                    st.last_seq
-                                        .store(st.seq, std::sync::atomic::Ordering::Relaxed);
-                                    WindowFrame {
-                                        id,
-                                        seq: st.seq,
-                                        dirty: full,
-                                        codec: TileCodec::LossyVideo,
-                                        data,
-                                    }
-                                })
-                                .collect();
-                            if crate::frame_pipeline::try_queue_frames(&frames_tx, frames).is_err() {
-                                // The viewer never saw this encoder/differ
-                                // state. Restart both so the next accepted
-                                // update is a full frame and fresh keyframe.
-                                st.differ.reset();
-                                st.video = None;
-                            } else {
-                                st.quality.note_video_sent();
-                            }
-                            return;
-                        }
-                        Err(e) => {
-                            // Drop the encoder so the next frame retries
-                            // cleanly rather than repeating a broken session.
-                            tracing::warn!(error = %e, "video encode failed; falling back to tiles");
-                            st.video = None;
-                        }
-                    }
-                }
-            }
-
-            let tile = FrameDiffer::extract(&frame, width, dirty);
-            let codec = pick_codec(tile.len());
-            let encoded = match crate::codec::encode_tile(codec, &tile) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(error = %e, "tile encode failed; dropping frame");
-                    return;
-                }
-            };
-
-            st.seq = st.seq.wrapping_add(1);
-            st.last_seq
-                .store(st.seq, std::sync::atomic::Ordering::Relaxed);
-            let seq = st.seq;
-            // Never block the PipeWire callback. If the bounded queue is full,
-            // discard this delta and force the next accepted frame to be full.
-            if frames_tx
-                .try_send(WindowFrame {
-                id,
-                seq,
-                dirty,
-                codec,
-                data: encoded,
-                })
-                .is_err()
-            {
-                st.differ.reset();
-                st.video = None;
-            }
+            st.pipeline
+                .frame(&frame, width, height, std::time::Instant::now());
         })
         .register()
         .map_err(|e| format!("register stream listener: {e}"))?;
@@ -1014,6 +884,7 @@ fn run_pipewire_loop(
                         tracing::debug!(error = %e, "could not replay input onto the window");
                     }
                 }
+                Ok(CaptureCommand::Keyframe) => state.borrow_mut().pipeline.request_resync(),
                 Ok(CaptureCommand::Stop) => break 'outer,
                 Err(mpsc::error::TryRecvError::Disconnected) => break 'outer,
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -1022,6 +893,9 @@ fn run_pipewire_loop(
         main_loop
             .loop_()
             .iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(16)));
+        // Between buffers, on this same thread: a still screen delivers none,
+        // and what the viewer is owed must not wait for one.
+        state.borrow_mut().pipeline.idle(std::time::Instant::now());
     }
 
     tracing::info!("window capture stream stopped");

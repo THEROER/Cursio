@@ -341,6 +341,11 @@ pub enum WindowMsg {
     /// Either direction, once per link: what this machine's video decoder can
     /// take, so the peer encodes a stream that will actually show here.
     VideoCaps(VideoCaps),
+    /// Viewer -> host: the viewer has no picture to build on for `id` — its
+    /// decoder is waiting for a keyframe, or the view just started — so send
+    /// the whole current picture now rather than when the source next changes,
+    /// which on a still screen is never.
+    KeyframeRequest { id: WindowId },
 }
 
 /// What a viewer's H.264 decoder accepts, beyond the High profile every
@@ -383,7 +388,8 @@ impl WindowMsg {
             | Self::SourcesRefused { .. }
             | Self::ShowSource { .. }
             | Self::StopSource
-            | Self::VideoCaps(_) => crate::Priority::Control,
+            | Self::VideoCaps(_)
+            | Self::KeyframeRequest { .. } => crate::Priority::Control,
             _ => Self::PRIORITY,
         }
     }
@@ -423,6 +429,14 @@ mod tests {
             }
             .priority(),
             Priority::Video
+        );
+    }
+
+    #[test]
+    fn a_keyframe_request_does_not_wait_behind_the_frames_it_asks_about() {
+        assert_eq!(
+            WindowMsg::KeyframeRequest { id: 3 }.priority(),
+            crate::Priority::Control
         );
     }
 

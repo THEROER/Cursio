@@ -65,6 +65,7 @@ use cursio_window::{
 use tokio::sync::oneshot;
 
 use crate::screen_hub::{HubRequest, ScreenHub, Shown};
+use crate::window_session::KeyframeRequests;
 
 /// How often a subscribed host re-reads its source list.
 ///
@@ -172,6 +173,11 @@ impl ScreenHost {
                 }
             }
             WindowMsg::FrameAck(ack) if ack.id == SCREEN_STREAM_ID => self.on_ack(*ack),
+            WindowMsg::KeyframeRequest { id } if *id == SCREEN_STREAM_ID => {
+                if let Some((_, session)) = self.current.as_mut() {
+                    session.request_keyframe();
+                }
+            }
             _ => return false,
         }
         true
@@ -377,6 +383,7 @@ pub struct ScreenViewer<S: Surrogate> {
     pending: Option<PendingShow>,
     /// The showing a capture app holds now.
     active: Option<ActiveShow>,
+    keyframe_asks: KeyframeRequests,
 }
 
 struct PendingShow {
@@ -405,6 +412,7 @@ impl<S: Surrogate> ScreenViewer<S> {
             demand: None,
             pending: None,
             active: None,
+            keyframe_asks: KeyframeRequests::default(),
         }
     }
 
@@ -562,6 +570,7 @@ impl<S: Surrogate> ScreenViewer<S> {
             }
             WindowMsg::SourceShown { source, title, .. } => {
                 self.showing = Some(*source);
+                self.ask_for_keyframe();
                 if let Some(view) = self.view.as_mut() {
                     view.restart_stream(title);
                 }
@@ -601,6 +610,7 @@ impl<S: Surrogate> ScreenViewer<S> {
                 height,
             } => {
                 self.showing = Some(*source);
+                self.ask_for_keyframe();
                 self.fulfil(*source, title, *width, *height, renderer);
             }
             WindowMsg::SourceEnded { reason } => {
@@ -650,6 +660,15 @@ impl<S: Surrogate> ScreenViewer<S> {
                 tracing::warn!(error = %e, peer = %self.peer_name, "could not open a remote-screen view");
             }
         }
+    }
+
+    /// A new stream starts here: ask for its whole picture at once, rather
+    /// than trusting that its first frame is one and arrives whole.
+    fn ask_for_keyframe(&mut self) {
+        self.keyframe_asks.note_sent(Instant::now());
+        self.outbox.push(WindowMsg::KeyframeRequest {
+            id: SCREEN_STREAM_ID,
+        });
     }
 
     fn request(&mut self, source: SourceId) {
@@ -713,6 +732,14 @@ impl<S: Surrogate> ScreenViewer<S> {
                 picks.push(pick);
             }
             ack = view.take_ack();
+            if self
+                .keyframe_asks
+                .poll(std::time::Instant::now(), || view.take_keyframe_request())
+            {
+                self.outbox.push(WindowMsg::KeyframeRequest {
+                    id: SCREEN_STREAM_ID,
+                });
+            }
         }
         for pick in picks {
             match pick {
@@ -1281,5 +1308,44 @@ mod tests {
 
         assert!(frames.is_closed());
         assert!(pair.viewer.view().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_shown_source_asks_its_capture_for_a_whole_picture() {
+        let sources = lightmoon();
+        let mut pair = Pair::new(&sources);
+        pair.settle().await;
+        pair.exchange().await;
+        // Asked on `SourceShown`, before any frame could say whether the first
+        // one arrived whole.
+        assert_eq!(sources.keyframe_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_view_stuck_without_a_keyframe_asks_at_most_once_a_second() {
+        let sources = lightmoon();
+        let mut pair = Pair::new(&sources);
+        pair.settle().await;
+        pair.exchange().await;
+        let before = sources.keyframe_requests();
+
+        // The decoder raises its want for every packet it drops.
+        for _ in 0..20 {
+            pair.viewer.view_mut().unwrap().wants_keyframe = true;
+            pair.exchange().await;
+        }
+        assert_eq!(
+            sources.keyframe_requests(),
+            before,
+            "the ask on SourceShown was just now; the next waits its second"
+        );
+        assert!(
+            pair.viewer.view_mut().unwrap().wants_keyframe,
+            "a want raised while waiting is kept for when a request may go"
+        );
+
+        pair.viewer.keyframe_asks = KeyframeRequests::default();
+        pair.exchange().await;
+        assert_eq!(sources.keyframe_requests(), before + 1);
     }
 }

@@ -512,6 +512,69 @@ impl VideoEncoder {
     }
 }
 
+impl crate::frame_pipeline::StreamEncoder for VideoEncoder {
+    fn encode(&mut self, bgra: &[u8]) -> Result<Vec<Vec<u8>>, WindowError> {
+        VideoEncoder::encode(self, bgra)
+    }
+
+    fn force_keyframe(&mut self) {
+        VideoEncoder::force_keyframe(self)
+    }
+}
+
+/// Opens FFmpeg encoders for the capture pipeline, following what the viewer
+/// decodes and what the link carries.
+#[derive(Default)]
+pub struct FfmpegEncoders;
+
+impl crate::frame_pipeline::EncoderSource for FfmpegEncoders {
+    type Encoder = VideoEncoder;
+
+    fn prepare(
+        &mut self,
+        slot: &mut Option<VideoEncoder>,
+        width: u32,
+        height: u32,
+        quality: &crate::frame_pipeline::AdaptiveQuality,
+    ) -> Option<(u32, u32)> {
+        let fidelity = if quality.lossless() {
+            Fidelity::Lossless
+        } else {
+            Fidelity::Lossy {
+                bitrate: quality.bitrate(width, height),
+            }
+        };
+        // Geometry changes invalidate the encoder: H.264 is fixed-size.
+        if slot.as_ref().is_some_and(|e| e.size() != (width, height)) {
+            tracing::info!(width, height, "window resized; reopening video encoder");
+            *slot = None;
+        }
+        if slot
+            .as_ref()
+            .is_some_and(|e| !e.fidelity().same_stream(fidelity))
+        {
+            tracing::info!(?fidelity, "the viewer's decoder changed what to encode");
+            *slot = None;
+        }
+        if slot.is_none() {
+            match VideoEncoder::open(width, height, fidelity) {
+                Ok(enc) => *slot = Some(enc),
+                Err(e) => {
+                    // Not fatal: the lossless path always works, just more
+                    // expensively.
+                    tracing::warn!(error = %e, "no video encoder; using lossless tiles");
+                    return None;
+                }
+            }
+        }
+        let enc = slot.as_mut()?;
+        if let Fidelity::Lossy { bitrate } = fidelity {
+            enc.set_bitrate(bitrate);
+        }
+        Some((width, height))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

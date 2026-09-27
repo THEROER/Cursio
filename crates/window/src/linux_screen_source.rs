@@ -71,6 +71,8 @@ pub struct PipeWireScreenSource {
     input: mpsc::UnboundedReceiver<WindowInput>,
     _input_tx: mpsc::UnboundedSender<WindowInput>,
     ended: Arc<AtomicBool>,
+    /// Raised by the node thread while its decoder waits for a keyframe.
+    wants_keyframe: Arc<AtomicBool>,
 }
 
 impl PipeWireScreenSource {
@@ -86,12 +88,20 @@ impl PipeWireScreenSource {
         let (presented_tx, presented_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std_mpsc::channel();
         let ended = Arc::new(AtomicBool::new(false));
+        let wants_keyframe = Arc::new(AtomicBool::new(false));
+        let thread_wants_keyframe = wants_keyframe.clone();
         let thread_meta = meta.clone();
         let thread_ended = ended.clone();
         std::thread::Builder::new()
             .name("cursio-screen-node".into())
             .spawn(move || {
-                if let Err(e) = run(thread_meta, cmd_rx, presented_tx, &ready_tx) {
+                if let Err(e) = run(
+                    thread_meta,
+                    cmd_rx,
+                    presented_tx,
+                    &ready_tx,
+                    &thread_wants_keyframe,
+                ) {
                     tracing::warn!(error = %e, "remote-screen node ended");
                     let _ = ready_tx.send(Err(e));
                 }
@@ -122,6 +132,7 @@ impl PipeWireScreenSource {
             input: input_rx,
             _input_tx: input_tx,
             ended,
+            wants_keyframe,
         })
     }
 
@@ -181,6 +192,10 @@ impl Surrogate for PipeWireScreenSource {
 
     fn node_id(&self) -> Option<u32> {
         Some(self.node_id)
+    }
+
+    fn take_keyframe_request(&mut self) -> bool {
+        self.wants_keyframe.swap(false, Ordering::Relaxed)
     }
 
     fn restart_stream(&mut self, _title: &str) {
@@ -296,6 +311,7 @@ fn run(
     commands: std_mpsc::Receiver<Command>,
     presented: mpsc::UnboundedSender<u32>,
     ready: &std_mpsc::Sender<Result<u32, String>>,
+    wants_keyframe: &AtomicBool,
 ) -> Result<(), String> {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -445,7 +461,13 @@ fn run(
                                 }
                             }
                         }
-                        Err(e) => tracing::warn!(error = %e, "video decode failed"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "video decode failed; restarting the decoder");
+                            decoder = None;
+                        }
+                    }
+                    if !decoder.as_ref().is_some_and(VideoDecoder::synced) {
+                        wants_keyframe.store(true, Ordering::Relaxed);
                     }
                 }
             }

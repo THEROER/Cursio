@@ -68,6 +68,42 @@ const VIDEO_QUEUE_HIGH_WATER_BYTES: usize = 2 * 1024 * 1024;
 /// is worthless anyway.
 const MAX_INPUT_PER_PUMP: usize = 32;
 
+/// How often a viewer may ask the host for a whole picture.
+///
+/// A decoder waiting for a keyframe drops every packet and raises its request
+/// again for each; the answer is an IDR or a full picture, the most expensive
+/// thing on the link, so one second between asks bounds that cost while still
+/// recovering a stuck view within a second of the host hearing it.
+const KEYFRAME_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Rate-limits one stream's keyframe requests to [`KEYFRAME_REQUEST_INTERVAL`].
+#[derive(Debug, Default)]
+pub(crate) struct KeyframeRequests {
+    last: Option<std::time::Instant>,
+}
+
+impl KeyframeRequests {
+    /// Whether to send a request now, taking the surrogate's want only when
+    /// one may go — so a want raised during the quiet interval is kept, not
+    /// lost.
+    pub(crate) fn poll(&mut self, now: std::time::Instant, wants: impl FnOnce() -> bool) -> bool {
+        let ready = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= KEYFRAME_REQUEST_INTERVAL);
+        if !ready || !wants() {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+
+    /// A request went out for another reason (a new stream); the next one
+    /// waits its turn from here.
+    pub(crate) fn note_sent(&mut self, now: std::time::Instant) {
+        self.last = Some(now);
+    }
+}
+
 /// One window this machine is hosting, and whether the peer knows about it yet.
 struct HostedWindow<S> {
     session: S,
@@ -94,6 +130,8 @@ pub struct WindowEngine<C: WindowCapture, R: WindowRenderer> {
     /// Keyed rather than paired with an id field, because every inbound frame,
     /// close and ack names the window it belongs to and has to find it.
     viewed: HashMap<WindowId, R::Surrogate>,
+    /// Keyframe requests per viewed window.
+    keyframe_asks: HashMap<WindowId, KeyframeRequests>,
     /// Next [`WindowId`] to allocate as host. Ids only need to be unique within
     /// a session, and only the host allocates, so a counter suffices.
     next_id: WindowId,
@@ -145,6 +183,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             renderer,
             hosted: HashMap::new(),
             viewed: HashMap::new(),
+            keyframe_asks: HashMap::new(),
             next_id: 1,
             pending_closes: Vec::new(),
             peer_name,
@@ -370,9 +409,15 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                     hosted.session.on_ack(ack);
                 }
             }
+            WindowMsg::KeyframeRequest { id } => {
+                if let Some(hosted) = self.hosted.get_mut(&id) {
+                    hosted.session.request_keyframe();
+                }
+            }
             WindowMsg::Close { id, reason } => {
                 tracing::info!(id, ?reason, "peer ended a window transfer");
                 // Whichever side we were playing for this id, wind it down.
+                self.keyframe_asks.remove(&id);
                 if let Some(mut s) = self.viewed.remove(&id) {
                     s.close(reason);
                 }
@@ -452,6 +497,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
         // ends before anything is awaited.
         let mut outbound: Vec<Message> = Vec::new();
         let mut control: Vec<WindowMsg> = Vec::new();
+        let now = std::time::Instant::now();
 
         for id in ids {
             let Some(surrogate) = self.viewed.get_mut(&id) else {
@@ -483,6 +529,10 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             if let Some(ack) = surrogate.take_ack() {
                 control.push(WindowMsg::FrameAck(ack));
             }
+            let asks = self.keyframe_asks.entry(id).or_default();
+            if asks.poll(now, || surrogate.take_keyframe_request()) {
+                control.push(WindowMsg::KeyframeRequest { id });
+            }
         }
 
         for msg in outbound {
@@ -494,6 +544,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
         for id in closed {
             tracing::info!(id, "surrogate window closed by the user");
             self.viewed.remove(&id);
+            self.keyframe_asks.remove(&id);
             send_control(
                 tx,
                 WindowMsg::Close {
@@ -843,7 +894,7 @@ impl crate::module::ModuleFactory for WindowFactory {
 
 /// Version of this module's wire vocabulary ([`WindowMsg`]). Bump when those
 /// types change shape; peers run the module only on an exact match.
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 /// Watch for windows dragged toward the peer's edge and turn that into
 /// [`TransferRequest`]s.
@@ -1568,5 +1619,61 @@ mod tests {
                 y: 4
             }]
         );
+    }
+
+    #[test]
+    fn a_keyframe_request_reaches_the_capture_of_that_window() {
+        let (_frames_tx, frames_rx) = frame_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        );
+        let id = eng.share_window().unwrap();
+        eng.handle_message(&control_frame(WindowMsg::KeyframeRequest { id }));
+        eng.handle_message(&control_frame(WindowMsg::KeyframeRequest { id: id + 1 }));
+        let asked = &eng.hosted[&id].session.keyframe_requests;
+        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_surrogate_waiting_for_a_keyframe_asks_the_host() {
+        let (_frames_tx, frames_rx) = frame_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        );
+        eng.handle_message(&control_frame(WindowMsg::Offer(
+            cursio_protocol::WindowMeta {
+                id: 9,
+                title: "peer window".into(),
+                width: 640,
+                height: 480,
+            },
+        )));
+        eng.viewed.get_mut(&9).unwrap().wants_keyframe = true;
+
+        let mut tx = RecordingTx::default();
+        eng.pump(&mut tx).await.unwrap();
+        assert!(tx.control().contains(&WindowMsg::KeyframeRequest { id: 9 }));
+    }
+
+    #[test]
+    fn keyframe_requests_go_at_most_once_a_second_and_a_held_want_is_kept() {
+        let mut asks = KeyframeRequests::default();
+        let start = std::time::Instant::now();
+        assert!(asks.poll(start, || true));
+        let mut taken = false;
+        assert!(
+            !asks.poll(start + std::time::Duration::from_millis(500), || {
+                taken = true;
+                true
+            })
+        );
+        assert!(
+            !taken,
+            "a want must not be consumed while no request may go"
+        );
+        assert!(asks.poll(start + KEYFRAME_REQUEST_INTERVAL, || true));
+        assert!(!asks.poll(start + 3 * KEYFRAME_REQUEST_INTERVAL, || false));
     }
 }

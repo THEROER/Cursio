@@ -87,6 +87,8 @@ pub struct Win32Surrogate {
     video_started: bool,
     /// Set by the window thread when the user closes the window, so the session
     /// learns about it even before the channels drop.
+    /// Raised by the window thread while its decoder waits for a keyframe.
+    wants_keyframe: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     /// Set for a remote-screen view: what the user picked in its selector.
     picks: Option<mpsc::UnboundedReceiver<SourcePick>>,
@@ -152,6 +154,10 @@ impl Surrogate for Win32Surrogate {
         self.acks.take()
     }
 
+    fn take_keyframe_request(&mut self) -> bool {
+        self.wants_keyframe.swap(false, Ordering::Relaxed)
+    }
+
     fn restart_stream(&mut self, title: &str) {
         self.video_started = false;
         self.acks = PresentationAcks::new(self.id);
@@ -209,6 +215,8 @@ fn open_surrogate(meta: &WindowMeta, view: bool) -> Result<Win32Surrogate, Windo
     let (presented_tx, presented_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let closed = Arc::new(AtomicBool::new(false));
+    let wants_keyframe = Arc::new(AtomicBool::new(false));
+    let thread_wants_keyframe = wants_keyframe.clone();
 
     let meta = meta.clone();
     let thread_meta = meta.clone();
@@ -224,6 +232,7 @@ fn open_surrogate(meta: &WindowMeta, view: bool) -> Result<Win32Surrogate, Windo
                 presented_tx,
                 ready_tx,
                 thread_closed,
+                thread_wants_keyframe,
             );
         })
         .map_err(|e| WindowError::Backend(format!("spawn surrogate thread: {e}")))?;
@@ -241,6 +250,7 @@ fn open_surrogate(meta: &WindowMeta, view: bool) -> Result<Win32Surrogate, Windo
             acks: PresentationAcks::new(meta.id),
             video_started: false,
             closed,
+            wants_keyframe,
             picks: view.then_some(picks_rx),
         }),
         Ok(Err(e)) => Err(WindowError::Backend(e)),

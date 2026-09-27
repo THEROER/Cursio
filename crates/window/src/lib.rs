@@ -184,6 +184,12 @@ pub trait CaptureSession {
     /// profile. Default is a no-op for a backend with one kind of stream.
     fn set_peer_video(&mut self, _caps: VideoCaps) {}
 
+    /// The viewer has no picture it can build on — its decoder is waiting for
+    /// a keyframe, or it just started — so send the whole current picture now,
+    /// even if the source is not changing. Default is a no-op for a backend
+    /// whose every frame is already whole.
+    fn request_keyframe(&mut self) {}
+
     /// Stop capturing and release the window. After this the session is done;
     /// callers should send a [`Message::WindowClose`](cursio_protocol::Message::WindowClose).
     fn close(&mut self, reason: WindowCloseReason);
@@ -253,6 +259,15 @@ pub trait Surrogate {
     /// cannot resize.
     fn take_resize_request(&mut self) -> Option<(u32, u32)> {
         None
+    }
+
+    /// Whether this surrogate's decoder is stuck without a keyframe — waiting
+    /// for its first, or restarted after a failure — and the host should be
+    /// asked for the whole picture. Taking it clears it; the decoder sets it
+    /// again for every packet it still has to drop, so the caller decides how
+    /// often to ask. Default is `false` for a surrogate with no decoder.
+    fn take_keyframe_request(&mut self) -> bool {
+        false
     }
 
     /// The stream behind this surrogate is about to start over with a
@@ -344,6 +359,10 @@ impl CaptureSession for Box<dyn CaptureSession + Send> {
 
     fn set_peer_video(&mut self, caps: VideoCaps) {
         (**self).set_peer_video(caps)
+    }
+
+    fn request_keyframe(&mut self) {
+        (**self).request_keyframe()
     }
 
     fn close(&mut self, reason: WindowCloseReason) {

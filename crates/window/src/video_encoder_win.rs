@@ -709,3 +709,74 @@ unsafe fn configure_rate(codec_api: Option<&ICodecAPI>, bitrate: u32) {
 fn pack_ratio(a: u32, b: u32) -> u64 {
     ((a as u64) << 32) | (b as u64)
 }
+
+impl crate::frame_pipeline::StreamEncoder for VideoEncoder {
+    fn encode(&mut self, bgra: &[u8]) -> Result<Vec<Vec<u8>>, WindowError> {
+        VideoEncoder::encode(self, bgra)
+    }
+
+    fn force_keyframe(&mut self) {
+        VideoEncoder::force_keyframe(self)
+    }
+}
+
+/// Opens Media Foundation encoders for the capture pipeline.
+#[derive(Default)]
+pub struct MfEncoders {
+    /// Geometry whose encoder already failed to open.
+    ///
+    /// A failure is permanent for that size (an unsupported dimension, a
+    /// missing MFT), and retrying on every frame once produced 594 "opening
+    /// the video encoder" lines plus 777 warnings in one session — a 1.4 GB
+    /// log. Remembering the size keeps the fallback silent and cheap.
+    failed_for: Option<(u32, u32)>,
+}
+
+impl crate::frame_pipeline::EncoderSource for MfEncoders {
+    type Encoder = VideoEncoder;
+
+    fn prepare(
+        &mut self,
+        slot: &mut Option<VideoEncoder>,
+        width: u32,
+        height: u32,
+        quality: &crate::frame_pipeline::AdaptiveQuality,
+    ) -> Option<(u32, u32)> {
+        // 4:2:0 has no chroma plane for an odd row or column, so the encoder
+        // takes even dimensions only. Rounding down and cropping loses one
+        // edge pixel, which is invisible; refusing sent every frame down the
+        // far more expensive lossless path.
+        let (vw, vh) = (width & !1, height & !1);
+        if vw == 0 || vh == 0 {
+            return None;
+        }
+        if slot.as_ref().is_some_and(|e| e.size() != (vw, vh)) {
+            tracing::info!(
+                width = vw,
+                height = vh,
+                "window resized; reopening video encoder"
+            );
+            *slot = None;
+        }
+        if slot.is_none() {
+            if self.failed_for == Some((vw, vh)) {
+                return None;
+            }
+            tracing::info!(width = vw, height = vh, "opening the video encoder");
+            match VideoEncoder::open(vw, vh, quality.bitrate(vw, vh)) {
+                Ok(enc) => {
+                    *slot = Some(enc);
+                    self.failed_for = None;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, width = vw, height = vh,
+                        "no video encoder for this size; using lossless tiles");
+                    self.failed_for = Some((vw, vh));
+                    return None;
+                }
+            }
+        }
+        slot.as_mut()?.set_bitrate(quality.bitrate(vw, vh));
+        Some((vw, vh))
+    }
+}

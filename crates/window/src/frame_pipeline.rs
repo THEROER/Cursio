@@ -130,6 +130,11 @@ impl FrameDiffer {
         })
     }
 
+    /// The last frame seen, with its size, or `None` before the first.
+    pub fn last(&self) -> Option<(&[u8], u32, u32)> {
+        (!self.prev.is_empty()).then_some((self.prev.as_slice(), self.width, self.height))
+    }
+
     /// Copy `dirty` out of a tightly packed BGRA `frame` into its own tile.
     pub fn extract(frame: &[u8], frame_width: u32, dirty: Rect) -> Vec<u8> {
         let row_bytes = (frame_width as usize) * 4;
@@ -525,6 +530,307 @@ pub fn try_queue_frames(
         permit.send(frame);
     }
     Ok(())
+}
+
+/// What a capture backend's H.264 encoder offers the shared pipeline.
+pub trait StreamEncoder {
+    /// Encode one tightly packed BGRA frame at the encoder's size.
+    fn encode(&mut self, bgra: &[u8]) -> Result<Vec<Vec<u8>>, crate::WindowError>;
+    /// Make the next encoded frame an IDR.
+    fn force_keyframe(&mut self);
+}
+
+/// Opens and tunes a backend's encoders; what differs between platforms.
+pub trait EncoderSource {
+    type Encoder: StreamEncoder;
+
+    /// Leave `slot` holding an encoder fit for a `width`x`height` frame at the
+    /// quality the link allows now — reopening, retuning or leaving it as it
+    /// is — and return the size it encodes, which may crop an odd edge.
+    /// `None` when video cannot be used for this frame.
+    fn prepare(
+        &mut self,
+        slot: &mut Option<Self::Encoder>,
+        width: u32,
+        height: u32,
+        quality: &AdaptiveQuality,
+    ) -> Option<(u32, u32)>;
+}
+
+/// What became of an update offered to the video path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoSend {
+    Sent,
+    /// The queue could not take it; the viewer is owed a resync.
+    Dropped,
+    /// No encoder for it; the caller falls back to tiles.
+    Unavailable,
+}
+
+/// Most packets one full-picture resend may take, so it always fits the
+/// capture queue ([`crate::CAPTURE_FRAME_QUEUE_CAPACITY`]) with room to spare,
+/// and each band of a 4K picture stays under the transport's frame limit even
+/// uncompressed.
+const FULL_PICTURE_BANDS: u32 = 4;
+
+/// Everything a capture backend does with a captured frame, and between them.
+///
+/// Both backends feed it full BGRA frames; it diffs them, routes each change to
+/// a lossless tile or the video stream, and keeps what the viewer is owed when
+/// no frame comes — which is the case that matters on a still screen. A viewer
+/// that lost its place (a keyframe it never got, an update the queue could not
+/// take) asks, or is marked, for a *resync*; [`idle`](Self::idle) answers it
+/// from the last captured frame without waiting for the compositor to deliver
+/// a new one, because on an unchanging desktop it never will.
+pub struct CapturePipeline<S: EncoderSource> {
+    id: cursio_protocol::WindowId,
+    source: S,
+    differ: FrameDiffer,
+    video: Option<S::Encoder>,
+    keyframes: KeyframeClock,
+    /// The viewer lacks a picture to build on: it asked, or an update it needed
+    /// was dropped.
+    resync: bool,
+    seq: u32,
+    quality: std::sync::Arc<AdaptiveQuality>,
+    last_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    frames: mpsc::Sender<WindowFrame>,
+}
+
+impl<S: EncoderSource> CapturePipeline<S> {
+    pub fn new(
+        id: cursio_protocol::WindowId,
+        source: S,
+        quality: std::sync::Arc<AdaptiveQuality>,
+        last_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        frames: mpsc::Sender<WindowFrame>,
+    ) -> Self {
+        Self {
+            id,
+            source,
+            differ: FrameDiffer::new(),
+            video: None,
+            keyframes: KeyframeClock::default(),
+            resync: false,
+            seq: 0,
+            quality,
+            last_seq,
+            frames,
+        }
+    }
+
+    /// The viewer asked for a picture it can start from.
+    pub fn request_resync(&mut self) {
+        self.resync = true;
+    }
+
+    /// One captured frame, tightly packed BGRA.
+    pub fn frame(&mut self, frame: &[u8], width: u32, height: u32, now: std::time::Instant) {
+        let dirty = self.differ.diff(frame, width, height);
+        if self.resync {
+            self.send_resync(frame, width, height, now);
+            return;
+        }
+        let Some(dirty) = dirty else {
+            return; // unchanged — a static window costs nothing
+        };
+        // A small change rides a lossless tile; a large one goes through the
+        // video encoder, which codes the difference from the previous frame.
+        if should_use_video(dirty, width, height, self.quality.threshold())
+            && self.send_video(frame, width, height, false, now) != VideoSend::Unavailable
+        {
+            return;
+        }
+        self.send_tile(frame, width, dirty);
+    }
+
+    /// Between frames: answer what the viewer is owed from the last frame.
+    pub fn idle(&mut self, now: std::time::Instant) {
+        if !self.resync {
+            return;
+        }
+        let Some((frame, width, height)) = self.differ.last() else {
+            // Nothing captured yet; the first frame is a full one anyway.
+            return;
+        };
+        let frame = frame.to_vec();
+        self.send_resync(&frame, width, height, now);
+    }
+
+    /// The whole picture, as an IDR where an encoder opens and as lossless
+    /// tiles where none does.
+    fn send_resync(&mut self, frame: &[u8], width: u32, height: u32, now: std::time::Instant) {
+        match self.send_video(frame, width, height, true, now) {
+            VideoSend::Sent => self.resync = false,
+            VideoSend::Dropped => {}
+            VideoSend::Unavailable => {
+                if self.send_full_picture(frame, width, height) {
+                    self.resync = false;
+                }
+            }
+        }
+    }
+
+    fn next_seq(&mut self) -> u32 {
+        self.seq = self.seq.wrapping_add(1);
+        self.last_seq
+            .store(self.seq, std::sync::atomic::Ordering::Relaxed);
+        self.seq
+    }
+
+    fn send_video(
+        &mut self,
+        frame: &[u8],
+        width: u32,
+        height: u32,
+        keyframe: bool,
+        now: std::time::Instant,
+    ) -> VideoSend {
+        let Some((vw, vh)) = self
+            .source
+            .prepare(&mut self.video, width, height, &self.quality)
+        else {
+            return VideoSend::Unavailable;
+        };
+        let Some(enc) = self.video.as_mut() else {
+            return VideoSend::Unavailable;
+        };
+        if keyframe || self.keyframes.due(now) {
+            enc.force_keyframe();
+        }
+        let cropped;
+        let input = if (vw, vh) == (width, height) {
+            frame
+        } else {
+            cropped = crop_frame(frame, width, vw, vh);
+            &cropped
+        };
+        let packets = match enc.encode(input) {
+            Ok(packets) => packets,
+            Err(e) => {
+                // Dropped so the next frame retries cleanly rather than
+                // repeating a broken session.
+                tracing::warn!(error = %e, "video encode failed; falling back to tiles");
+                self.video = None;
+                return VideoSend::Unavailable;
+            }
+        };
+        self.keyframes.note_sent(&packets, now);
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: vw,
+            height: vh,
+        };
+        let frames = packets
+            .into_iter()
+            .map(|data| WindowFrame {
+                id: self.id,
+                seq: self.next_seq(),
+                dirty: full,
+                codec: TileCodec::LossyVideo,
+                data,
+            })
+            .collect();
+        match try_queue_frames(&self.frames, frames) {
+            Ok(()) => {
+                self.quality.note_video_sent();
+                VideoSend::Sent
+            }
+            Err(_) => {
+                // The viewer never saw this encoder state; the next encoder
+                // opens on a keyframe, and the resync makes it the whole
+                // picture even if the screen stops changing here.
+                self.video = None;
+                self.resync = true;
+                VideoSend::Dropped
+            }
+        }
+    }
+
+    fn send_tile(&mut self, frame: &[u8], width: u32, dirty: Rect) {
+        let tile = FrameDiffer::extract(frame, width, dirty);
+        let codec = pick_codec(tile.len());
+        let data = match crate::codec::encode_tile(codec, &tile) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(error = %e, "tile encode failed; dropping frame");
+                self.resync = true;
+                return;
+            }
+        };
+        let seq = self.next_seq();
+        // Never block the capture thread: a full queue loses this delta, and
+        // the resync replaces it with the whole picture.
+        if self
+            .frames
+            .try_send(WindowFrame {
+                id: self.id,
+                seq,
+                dirty,
+                codec,
+                data,
+            })
+            .is_err()
+        {
+            self.resync = true;
+        }
+    }
+
+    /// The whole picture as lossless tiles, in horizontal bands; whether it
+    /// was queued.
+    fn send_full_picture(&mut self, frame: &[u8], width: u32, height: u32) -> bool {
+        if height == 0 || width == 0 {
+            return false;
+        }
+        let band = height.div_ceil(FULL_PICTURE_BANDS);
+        let rows: Vec<(u32, u32)> = (0..height)
+            .step_by(band as usize)
+            .map(|y| (y, band.min(height - y)))
+            .collect();
+        // Checked before compressing: a busy queue would refuse the result,
+        // and zstd on a whole picture is not work to throw away.
+        if self.frames.capacity() < rows.len() {
+            return false;
+        }
+        let seq = self.next_seq();
+        let mut frames = Vec::with_capacity(rows.len());
+        for (y, h) in rows {
+            let dirty = Rect {
+                x: 0,
+                y,
+                width,
+                height: h,
+            };
+            let tile = FrameDiffer::extract(frame, width, dirty);
+            let codec = pick_codec(tile.len());
+            match crate::codec::encode_tile(codec, &tile) {
+                Ok(data) => frames.push(WindowFrame {
+                    id: self.id,
+                    seq,
+                    dirty,
+                    codec,
+                    data,
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not encode the whole picture");
+                    return false;
+                }
+            }
+        }
+        try_queue_frames(&self.frames, frames).is_ok()
+    }
+}
+
+/// The top-left `vw`x`vh` of a tightly packed BGRA frame `width` pixels wide.
+fn crop_frame(frame: &[u8], width: u32, vw: u32, vh: u32) -> Vec<u8> {
+    let (src_stride, dst_stride) = (width as usize * 4, vw as usize * 4);
+    let mut out = Vec::with_capacity(dst_stride * vh as usize);
+    for row in 0..vh as usize {
+        let start = row * src_stride;
+        out.extend_from_slice(&frame[start..start + dst_stride]);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -960,5 +1266,164 @@ mod differ_tests {
         for _ in 0..20 {
             assert_eq!(ladder.observe(2, true, now), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Emits an IDR-shaped packet when forced or first, a P-shaped one else.
+    struct FakeEncoder {
+        forced: bool,
+        started: bool,
+    }
+
+    impl StreamEncoder for FakeEncoder {
+        fn encode(&mut self, _bgra: &[u8]) -> Result<Vec<Vec<u8>>, crate::WindowError> {
+            let key = std::mem::take(&mut self.forced) || !self.started;
+            self.started = true;
+            Ok(vec![if key {
+                vec![0, 0, 0, 1, 0x65]
+            } else {
+                vec![0, 0, 0, 1, 0x41]
+            }])
+        }
+
+        fn force_keyframe(&mut self) {
+            self.forced = true;
+        }
+    }
+
+    /// Opens a [`FakeEncoder`], or refuses to when `available` is false.
+    struct FakeSource {
+        available: bool,
+    }
+
+    impl EncoderSource for FakeSource {
+        type Encoder = FakeEncoder;
+
+        fn prepare(
+            &mut self,
+            slot: &mut Option<FakeEncoder>,
+            width: u32,
+            height: u32,
+            _quality: &AdaptiveQuality,
+        ) -> Option<(u32, u32)> {
+            if !self.available {
+                return None;
+            }
+            slot.get_or_insert(FakeEncoder {
+                forced: false,
+                started: false,
+            });
+            Some((width, height))
+        }
+    }
+
+    const W: u32 = 16;
+    const H: u32 = 8;
+
+    fn pipeline(
+        available: bool,
+        capacity: usize,
+    ) -> (CapturePipeline<FakeSource>, mpsc::Receiver<WindowFrame>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let p = CapturePipeline::new(
+            7,
+            FakeSource { available },
+            Default::default(),
+            Default::default(),
+            tx,
+        );
+        (p, rx)
+    }
+
+    fn solid(c: u8) -> Vec<u8> {
+        vec![c; (W * H * 4) as usize]
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<WindowFrame>) -> Vec<WindowFrame> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn is_idr(frame: &WindowFrame) -> bool {
+        frame.codec == TileCodec::LossyVideo && crate::video::contains_keyframe(&frame.data)
+    }
+
+    #[test]
+    fn a_still_screen_owes_nothing_however_long_it_idles() {
+        let (mut p, mut rx) = pipeline(true, 8);
+        let now = Instant::now();
+        p.frame(&solid(1), W, H, now);
+        drain(&mut rx);
+        for i in 1..100 {
+            p.idle(now + Duration::from_millis(16 * i));
+        }
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_keyframe_request_on_a_still_screen_reencodes_the_last_frame_at_once() {
+        let (mut p, mut rx) = pipeline(true, 8);
+        let now = Instant::now();
+        p.frame(&solid(1), W, H, now);
+        p.frame(&solid(2), W, H, now + Duration::from_millis(10));
+        drain(&mut rx);
+
+        p.request_resync();
+        p.idle(now + Duration::from_millis(20));
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 1);
+        assert!(
+            is_idr(&sent[0]),
+            "a resync must be a picture a decoder can enter on"
+        );
+        // Answered once, not on every tick after.
+        p.idle(now + Duration::from_millis(40));
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn with_no_encoder_a_request_is_answered_with_the_whole_picture_as_tiles() {
+        let (mut p, mut rx) = pipeline(false, 8);
+        let now = Instant::now();
+        p.frame(&solid(1), W, H, now);
+        drain(&mut rx);
+        p.request_resync();
+        p.idle(now);
+        let sent = drain(&mut rx);
+        assert!(!sent.is_empty());
+        assert!(sent.iter().all(|f| f.codec.is_lossless()));
+        let rows: u32 = sent.iter().map(|f| f.dirty.height).sum();
+        assert_eq!(rows, H, "the bands must cover the whole picture");
+    }
+
+    #[test]
+    fn an_update_the_queue_could_not_take_is_made_good_once_there_is_room() {
+        let (mut p, mut rx) = pipeline(true, 1);
+        let now = Instant::now();
+        p.frame(&solid(1), W, H, now);
+        // The queue is full: this change is lost.
+        p.frame(&solid(2), W, H, now + Duration::from_millis(10));
+        assert_eq!(drain(&mut rx).len(), 1);
+
+        // The screen then stays still; the idle tick still delivers it.
+        p.idle(now + Duration::from_millis(20));
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 1);
+        assert!(is_idr(&sent[0]));
+    }
+
+    #[test]
+    fn a_video_frame_after_the_interval_is_forced_to_a_keyframe() {
+        let (mut p, mut rx) = pipeline(true, 8);
+        let start = Instant::now();
+        p.frame(&solid(1), W, H, start);
+        p.frame(&solid(2), W, H, start + Duration::from_millis(500));
+        p.frame(&solid(3), W, H, start + KEYFRAME_INTERVAL);
+        let keys: Vec<bool> = drain(&mut rx).iter().map(is_idr).collect();
+        assert_eq!(keys, vec![true, false, true]);
     }
 }

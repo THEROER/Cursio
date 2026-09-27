@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use cursio_protocol::{
-    TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
+    WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
 };
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HWND;
@@ -41,7 +41,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 
-use crate::frame_pipeline::{pick_codec, should_use_video, FrameDiffer};
+use crate::frame_pipeline::CapturePipeline;
+use crate::video_encoder_win::MfEncoders;
 use crate::{CaptureSession, WindowCapture, WindowError};
 
 mod d3d;
@@ -57,6 +58,9 @@ enum CaptureCommand {
     Input(WindowInput),
     /// Resize the real window because the viewer resized its surrogate.
     Resize { width: u32, height: u32 },
+    /// Send the viewer the whole current picture; see
+    /// [`CaptureSession::request_keyframe`].
+    Keyframe,
     /// Stop capturing and end the thread.
     Stop,
 }
@@ -113,6 +117,10 @@ impl CaptureSession for WgcCaptureSession {
                 "link changed; adjusting how much of the window stays lossless"
             );
         }
+    }
+
+    fn request_keyframe(&mut self) {
+        let _ = self.commands.send(CaptureCommand::Keyframe);
     }
 
     fn close(&mut self, reason: WindowCloseReason) {
@@ -341,175 +349,6 @@ pub(crate) fn texture_to_bgra(
     }
 }
 
-/// Turn one captured frame into `WindowFrame`s and send them.
-///
-/// Shares the diff and codec choice with the Linux path via
-/// [`frame_pipeline`](crate::frame_pipeline).
-///
-/// Large updates ride the Media Foundation H.264 encoder
-/// ([`video_encoder_win`](crate::video_encoder_win)); small ones stay on
-/// lossless zstd tiles. Same routing as the Linux path, and the same reason: a
-/// moving window costs 742 Mbit/s as lossless tiles, which fits nowhere.
-///
-/// The arguments are the capture loop's own state, borrowed for one frame.
-/// Bundling them into a struct would only move the same fields somewhere the
-/// loop then has to keep in step.
-#[allow(clippy::too_many_arguments)]
-fn emit_frame(
-    id: WindowId,
-    frame: &[u8],
-    width: u32,
-    height: u32,
-    differ: &mut FrameDiffer,
-    seq: &mut u32,
-    video: &mut Option<crate::video_encoder_win::VideoEncoder>,
-    // Geometry whose encoder already failed to open, so we don't retry it once
-    // per frame.
-    video_failed_for: &mut Option<(u32, u32)>,
-    keyframes: &mut crate::frame_pipeline::KeyframeClock,
-    frames_tx: &mpsc::Sender<WindowFrame>,
-    quality: &crate::frame_pipeline::AdaptiveQuality,
-    last_seq: &std::sync::atomic::AtomicU32,
-) {
-    let Some(dirty) = differ.diff(frame, width, height) else {
-        return; // unchanged — a static window costs nothing
-    };
-
-    // Which path? A small change rides a lossless tile; a large one goes
-    // through the video encoder, which codes the difference from the previous
-    // frame rather than the pixels themselves.
-    if should_use_video(dirty, width, height, quality.threshold()) {
-        // Geometry changes invalidate the encoder: H.264 is fixed-size.
-        if video.as_ref().is_some_and(|e| e.size() != (width, height)) {
-            tracing::info!(width, height, "window resized; reopening video encoder");
-            *video = None;
-        }
-        // Try to open the encoder once per geometry, not once per frame.
-        //
-        // A failure is permanent for that size (an unsupported dimension, a
-        // missing MFT), but this used to retry on every single frame — 594
-        // "opening the video encoder" lines plus 777 warnings in one session,
-        // and a **1.4 GB** log file. Remembering the failed size keeps the
-        // fallback silent and cheap.
-        // H.264 4:2:0 has no chroma plane for an odd row/column, so the encoder
-        // only accepts even dimensions. Round DOWN and crop the frame rather
-        // than refusing: losing one edge pixel is invisible, while refusing sent
-        // every frame down the far more expensive lossless path.
-        let (vw, vh) = (width & !1, height & !1);
-        let failed_here = *video_failed_for == Some((vw, vh));
-        if vw == 0 || vh == 0 {
-            // Too small to encode at all; the tile path below handles it.
-        } else if video.is_none() && !failed_here {
-            tracing::info!(width = vw, height = vh, "opening the video encoder");
-            match crate::video_encoder_win::VideoEncoder::open(vw, vh, quality.bitrate(vw, vh)) {
-                Ok(enc) => {
-                    tracing::info!("video encoder opened");
-                    *video = Some(enc);
-                    *video_failed_for = None;
-                }
-                Err(e) => {
-                    // Not fatal: fall through to the lossless path, which
-                    // always works — just more expensively. Said once.
-                    tracing::warn!(error = %e, width = vw, height = vh,
-                        "no video encoder for this size; using lossless tiles");
-                    *video_failed_for = Some((vw, vh));
-                }
-            }
-        }
-
-        if let Some(enc) = video.as_mut() {
-            enc.set_bitrate(quality.bitrate(vw, vh));
-            let first = *seq < 3;
-            if first {
-                tracing::info!(seq = *seq, "encoding frame");
-            }
-            // Crop to the encoder's even geometry when the window is odd-sized.
-            // Row-by-row, since dropping a column changes the stride.
-            let cropped;
-            let to_encode = if (vw, vh) == (width, height) {
-                frame
-            } else {
-                let src_stride = width as usize * 4;
-                let dst_stride = vw as usize * 4;
-                let mut buf = Vec::with_capacity(dst_stride * vh as usize);
-                for row in 0..vh as usize {
-                    let start = row * src_stride;
-                    buf.extend_from_slice(&frame[start..start + dst_stride]);
-                }
-                cropped = buf;
-                &cropped
-            };
-            let now = std::time::Instant::now();
-            if keyframes.due(now) {
-                enc.force_keyframe();
-            }
-            match enc.encode(to_encode) {
-                Ok(packets) => {
-                    keyframes.note_sent(&packets, now);
-                    if first {
-                        tracing::info!(packets = packets.len(), "frame encoded");
-                    }
-                    // One visual update can yield several packets, and
-                    // sometimes none — the encoder decides.
-                    let full = enc.full_rect();
-                    let frames = packets
-                        .into_iter()
-                        .map(|data| {
-                            *seq = seq.wrapping_add(1);
-                            last_seq.store(*seq, Ordering::Relaxed);
-                            WindowFrame {
-                                id,
-                                seq: *seq,
-                                dirty: full,
-                                codec: TileCodec::LossyVideo,
-                                data,
-                            }
-                        })
-                        .collect();
-                    if crate::frame_pipeline::try_queue_frames(frames_tx, frames).is_err() {
-                        differ.reset();
-                        *video = None;
-                    } else {
-                        quality.note_video_sent();
-                    }
-                    return;
-                }
-                Err(e) => {
-                    // Drop the encoder so the next frame retries cleanly
-                    // rather than repeating a broken session.
-                    tracing::warn!(error = %e, "video encode failed; falling back to tiles");
-                    *video = None;
-                }
-            }
-        }
-    }
-
-    let tile = FrameDiffer::extract(frame, width, dirty);
-    let codec = pick_codec(tile.len());
-    match crate::codec::encode_tile(codec, &tile) {
-        Ok(data) => {
-            *seq = seq.wrapping_add(1);
-            // Tiles count towards the backlog too: an ack is compared with
-            // the newest seq sent, whichever path carried it.
-            last_seq.store(*seq, Ordering::Relaxed);
-            if frames_tx
-                .try_send(WindowFrame {
-                    id,
-                    seq: *seq,
-                    dirty,
-                    codec,
-                    data,
-                })
-                .is_err()
-            {
-                differ.reset();
-                *video = None;
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "tile encode failed; dropping frame"),
-    }
-}
-
 /// The capture thread: owns the WGC session, the D3D device, and the HWND.
 ///
 /// All of it stays here because none of it is `Send`; only channels cross out.
@@ -655,21 +494,17 @@ fn capture_thread(
     // only when something else happened to dirty it.
     force_repaint(hwnd);
 
-    let mut differ = FrameDiffer::new();
-    let mut seq = 0u32;
     // How many times the loop asked for a frame, and how many actually came —
     // used only to keep tracing bounded (see below).
     let mut polls: u64 = 0;
     let mut frames_seen: u32 = 0;
-    // H.264 encoder for large updates, opened lazily and dropped on resize
-    // (H.264 cannot change frame size mid-stream).
-    let mut video: Option<crate::video_encoder_win::VideoEncoder> = None;
-    let mut video_failed_for: Option<(u32, u32)> = None;
-    let mut keyframes = crate::frame_pipeline::KeyframeClock::default();
+    let mut pipeline =
+        CapturePipeline::new(id, MfEncoders::default(), quality, last_seq, frames_tx);
 
     loop {
         match cmd_rx.try_recv() {
             Ok(CaptureCommand::Stop) => break,
+            Ok(CaptureCommand::Keyframe) => pipeline.request_resync(),
             Ok(CaptureCommand::Resize { width, height }) => {
                 if let Err(e) = resize_source(hwnd, width, height) {
                     tracing::debug!(error = %e, width, height, "could not resize the source window");
@@ -708,7 +543,7 @@ fn capture_thread(
             })) => {
                 frames_seen += 1;
                 if trace || frames_seen <= 3 {
-                    tracing::info!(seq, w, h, frames_seen, "frame received");
+                    tracing::info!(w, h, frames_seen, "frame received");
                 }
 
                 if !announced {
@@ -726,28 +561,18 @@ fn capture_thread(
                 // fit its geometry, so this needs no message of its own.
 
                 if trace {
-                    tracing::info!(seq, "encoding and sending the frame");
+                    tracing::info!(frames_seen, "encoding and sending the frame");
                 }
-                emit_frame(
-                    id,
-                    &frame,
-                    w,
-                    h,
-                    &mut differ,
-                    &mut seq,
-                    &mut video,
-                    &mut video_failed_for,
-                    &mut keyframes,
-                    &frames_tx,
-                    &quality,
-                    &last_seq,
-                );
+                pipeline.frame(&frame, w, h, std::time::Instant::now());
                 if trace {
-                    tracing::info!(seq, "frame sent");
+                    tracing::info!(frames_seen, "frame sent");
                 }
             }
             // No frame ready yet: normal for a window that isn't redrawing.
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(4)),
+            Ok(None) => {
+                pipeline.idle(std::time::Instant::now());
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }
             Err(e) => {
                 // The window closed, or the session died. Either way, done.
                 tracing::info!(error = %e, "capture session ended");
@@ -791,14 +616,12 @@ fn monitor_capture_loop(
         height,
     }));
 
-    let mut differ = FrameDiffer::new();
-    let mut seq = 0u32;
-    let mut video: Option<crate::video_encoder_win::VideoEncoder> = None;
-    let mut video_failed_for: Option<(u32, u32)> = None;
-    let mut keyframes = crate::frame_pipeline::KeyframeClock::default();
+    let mut pipeline =
+        CapturePipeline::new(id, MfEncoders::default(), quality, last_seq, frames_tx);
     loop {
         match cmd_rx.try_recv() {
             Ok(CaptureCommand::Stop) | Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Ok(CaptureCommand::Keyframe) => pipeline.request_resync(),
             // A view is view-only, and a monitor cannot be resized from here.
             Ok(CaptureCommand::Input(_)) | Ok(CaptureCommand::Resize { .. }) => {}
             Err(mpsc::error::TryRecvError::Empty) => {}
@@ -808,21 +631,13 @@ fn monitor_capture_loop(
                 pixels,
                 width: w,
                 height: h,
-            })) => emit_frame(
-                id,
-                &pixels,
-                w,
-                h,
-                &mut differ,
-                &mut seq,
-                &mut video,
-                &mut video_failed_for,
-                &mut keyframes,
-                &frames_tx,
-                &quality,
-                &last_seq,
-            ),
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(4)),
+            })) => pipeline.frame(&pixels, w, h, std::time::Instant::now()),
+            Ok(None) => {
+                // WGC delivers nothing while the screen is still, and what
+                // the viewer is owed must not wait for it.
+                pipeline.idle(std::time::Instant::now());
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }
             Err(e) => {
                 tracing::info!(error = %e, "monitor capture ended");
                 break;

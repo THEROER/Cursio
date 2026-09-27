@@ -103,6 +103,8 @@ pub struct GtkSurrogate {
     /// the stream switched to video. The decoder itself lives on the GTK
     /// thread — see [`SurrogateCommand::VideoPacket`].
     video_started: bool,
+    /// Raised by the GTK thread while its decoder waits for a keyframe.
+    wants_keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Surrogate for GtkSurrogate {
@@ -168,6 +170,11 @@ impl Surrogate for GtkSurrogate {
             self.acks.note_presented(seq);
         }
         self.acks.take()
+    }
+
+    fn take_keyframe_request(&mut self) -> bool {
+        self.wants_keyframe
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn take_resize_request(&mut self) -> Option<(u32, u32)> {
@@ -255,6 +262,10 @@ impl Surrogate for LinuxSurrogate {
         self.inner().take_resize_request()
     }
 
+    fn take_keyframe_request(&mut self) -> bool {
+        self.inner().take_keyframe_request()
+    }
+
     fn restart_stream(&mut self, title: &str) {
         self.inner().restart_stream(title)
     }
@@ -281,6 +292,8 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (presented_tx, presented_rx) = mpsc::unbounded_channel();
     let (resized_tx, resized_rx) = mpsc::unbounded_channel();
+    let wants_keyframe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_wants_keyframe = wants_keyframe.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let meta = meta.clone();
@@ -295,6 +308,7 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
                 presented_tx,
                 resized_tx,
                 ready_tx,
+                thread_wants_keyframe,
             )
         })
         .map_err(|e| WindowError::Backend(format!("spawn surrogate thread: {e}")))?;
@@ -311,6 +325,7 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
             requested_size: None,
             acks: PresentationAcks::new(meta.id),
             video_started: false,
+            wants_keyframe,
         }),
         Ok(Err(e)) => Err(WindowError::Backend(e)),
         Err(_) => Err(WindowError::Backend(
@@ -327,6 +342,7 @@ fn gtk_thread(
     presented_tx: mpsc::UnboundedSender<u32>,
     resized_tx: mpsc::UnboundedSender<(u32, u32)>,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
+    wants_keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     if let Err(e) = gtk::init() {
         let _ = ready_tx.send(Err(format!("gtk init: {e}")));
@@ -454,8 +470,14 @@ fn gtk_thread(
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "video decode failed; dropping packet")
+                            // Its reference pictures are now suspect; start
+                            // again from the host's next keyframe.
+                            tracing::warn!(error = %e, "video decode failed; restarting the decoder");
+                            decoder = None;
                         }
+                    }
+                    if !decoder.as_ref().is_some_and(VideoDecoder::synced) {
+                        wants_keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 Ok(SurrogateCommand::Resize { width, height }) => {

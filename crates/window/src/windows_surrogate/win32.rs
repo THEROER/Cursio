@@ -569,6 +569,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 /// Create the window and pump its message loop until told to stop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     meta: WindowMeta,
     selector: Option<mpsc::UnboundedSender<SourcePick>>,
@@ -577,6 +578,7 @@ pub(crate) fn run(
     presented_tx: mpsc::UnboundedSender<u32>,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
     closed: Arc<AtomicBool>,
+    wants_keyframe: Arc<AtomicBool>,
 ) {
     unsafe {
         // Declared before any window exists, because Windows fixes a process's
@@ -745,7 +747,16 @@ pub(crate) fn run(
                                     );
                                 }
                             }
-                            Err(e) => tracing::warn!(error = %e, "video decode failed"),
+                            Err(e) => {
+                                // Its reference pictures are now suspect, and
+                                // every later P-frame would build on them;
+                                // start again from the host's next keyframe.
+                                tracing::warn!(error = %e, "video decode failed; restarting the decoder");
+                                decoder = None;
+                            }
+                        }
+                        if !decoder.as_ref().is_some_and(VideoDecoder::synced) {
+                            wants_keyframe.store(true, Ordering::Relaxed);
                         }
                     }
                     Ok(SurrogateCommand::Resize { width, height }) => {
