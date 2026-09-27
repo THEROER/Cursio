@@ -105,11 +105,8 @@ impl CaptureSession for WgcCaptureSession {
     }
 
     fn on_ack(&mut self, ack: WindowFrameAck) {
-        // How far ahead of the viewer we are, in frames. `seq` is monotonic per
-        // window, so the difference is the backlog the link has not carried.
         let sent = self.last_seq.load(Ordering::Relaxed);
-        let gap = sent.saturating_sub(ack.acked_seq);
-        if let Some(threshold) = self.quality.observe(gap) {
+        if let Some((gap, threshold)) = self.quality.on_ack(ack.acked_seq, sent) {
             tracing::info!(
                 id = self.meta.id,
                 gap,

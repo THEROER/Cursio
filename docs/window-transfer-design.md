@@ -211,8 +211,19 @@ us target latency without saturating the channel.
 
 What the loop moves today (`frame_pipeline::AdaptiveQuality`):
 
-- **The lossless/lossy threshold** — how large a change must be before it
-  goes to video instead of a tile (15–45% of the window).
+- **The lossless/lossy threshold** (`ThresholdLadder`) — how large a change
+  must be before it goes to video instead of a tile (15–45% of the window).
+  Down 10 points on any ack showing more than 3 frames outstanding; up 10
+  only after 8 caught-up acks in a row (~2 s) and never within 4 s of a step
+  down. Moving both ways on single acks flapped 0.35↔0.25↔0.15 every 250 ms
+  on a live view: each raise sent the next repaint lossless, and its size was
+  the next backlog.
+
+The backlog is sent-minus-acked counted in frames: the pipeline numbers a
+frame only once the capture queue has taken it, so a refused update never
+reads as one the link failed to carry. An ack no newer than the last, or
+numbered past anything the capture sent (a leftover of the previous stream),
+is ignored rather than read as the link calming down.
 - **The lossy stream's bitrate** (`BitrateLadder`, 2026-09-27), as a
   percentage of `lossy_bitrate(w, h)` (≈12 Mbit/s at 1080p): 20–350%.
   Down 30% at once on a backlog of more than 3 frames, then no climbing for

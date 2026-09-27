@@ -162,7 +162,7 @@ impl FrameDiffer {
 ///   same change for ~0.1–280 KiB because it codes the *difference* from the
 ///   previous frame.
 ///
-/// Which fraction is not fixed, though — see [`next_threshold`]. This is the
+/// Which fraction is not fixed, though — see [`ThresholdLadder`]. This is the
 /// value used when the viewer is keeping up.
 ///
 /// The video path is **not** free: it is lossy, and visibly so on the content
@@ -186,9 +186,6 @@ pub const VIDEO_AREA_THRESHOLD_MAX: f64 = 0.45;
 /// the lesser harm.
 pub const VIDEO_AREA_THRESHOLD_MIN: f64 = 0.15;
 
-/// How far the threshold moves per adjustment.
-const THRESHOLD_STEP: f64 = 0.10;
-
 /// Frames the host may be ahead of the viewer before quality is stepped down.
 ///
 /// Sent-minus-acked, in frames. Small because a window transfer is meant to feel
@@ -202,24 +199,98 @@ const BACKLOG_HIGH: u32 = 3;
 /// quality instead of oscillating between the two.
 const BACKLOG_LOW: u32 = 1;
 
-/// Decide the next lossless/lossy threshold from the current one and the
-/// sent-vs-acked backlog.
+/// Moves the lossless/lossy threshold with what the link carries.
 ///
-/// Hysteretic, the same shape as the audio path's `next_bitrate`: a backlog over
-/// [`BACKLOG_HIGH`] steps toward [`VIDEO_AREA_THRESHOLD_MIN`] (more of the window
-/// goes through the cheap lossy encoder), a link caught up under [`BACKLOG_LOW`]
-/// steps back toward [`VIDEO_AREA_THRESHOLD_MAX`], and in between it holds.
+/// A backlog over [`BACKLOG_HIGH`] steps toward [`VIDEO_AREA_THRESHOLD_MIN`]
+/// (more of the window goes through the cheap lossy encoder) on that very
+/// ack; a link caught up under [`BACKLOG_LOW`] steps back toward
+/// [`VIDEO_AREA_THRESHOLD_MAX`] only after a streak of such acks, and never
+/// within a few seconds of a step down — the shape the audio path's bitrate
+/// and [`BitrateLadder`] have. Stepping both ways on single acks flapped
+/// 0.35 → 0.25 → 0.15 → 0.25 → 0.35 in two seconds on a live view: every
+/// raise sent the next repaint lossless, whose size was the next backlog.
 ///
 /// This is what makes quality follow the link rather than a constant: on a link
 /// with headroom even a game's full-window repaints can stay lossless, while a
 /// congested one gives up fidelity before it gives up latency.
-/// The current lossless/lossy threshold, shared between the session thread that
-/// receives acks and the capture thread that encodes frames.
+#[derive(Debug)]
+pub struct ThresholdLadder {
+    pct: u32,
+    calm_acks: u32,
+    hold_until: Option<std::time::Instant>,
+}
+
+impl Default for ThresholdLadder {
+    fn default() -> Self {
+        // Start optimistic: a link with headroom should not have to earn its
+        // way up to full quality, and a congested one is corrected within a
+        // few acks.
+        Self {
+            pct: Self::MAX_PCT,
+            calm_acks: 0,
+            hold_until: None,
+        }
+    }
+}
+
+impl ThresholdLadder {
+    const MAX_PCT: u32 = (VIDEO_AREA_THRESHOLD_MAX * 100.0) as u32;
+    const MIN_PCT: u32 = (VIDEO_AREA_THRESHOLD_MIN * 100.0) as u32;
+    const STEP_PCT: u32 = 10;
+    /// Caught-up acks in a row before one step up: two seconds at the rate
+    /// viewers ack.
+    const CALM_ACKS_TO_RAISE: u32 = 8;
+    /// No raising for this long after a step down.
+    const HOLD_AFTER_DROP: std::time::Duration = std::time::Duration::from_secs(4);
+
+    /// Fold in one ack's backlog; the new percentage when it moved.
+    pub fn observe(&mut self, gap: u32, now: std::time::Instant) -> Option<u32> {
+        if gap > BACKLOG_HIGH {
+            self.calm_acks = 0;
+            self.hold_until = Some(now + Self::HOLD_AFTER_DROP);
+            let next = self.pct.saturating_sub(Self::STEP_PCT).max(Self::MIN_PCT);
+            return self.moved_to(next);
+        }
+        if gap >= BACKLOG_LOW {
+            self.calm_acks = 0;
+            return None;
+        }
+        self.calm_acks += 1;
+        let held = self.hold_until.is_some_and(|until| now < until);
+        if self.calm_acks < Self::CALM_ACKS_TO_RAISE || held {
+            return None;
+        }
+        self.calm_acks = 0;
+        self.moved_to((self.pct + Self::STEP_PCT).min(Self::MAX_PCT))
+    }
+
+    fn moved_to(&mut self, next: u32) -> Option<u32> {
+        if next == self.pct {
+            return None;
+        }
+        self.pct = next;
+        Some(next)
+    }
+}
+
+/// What the ack path keeps between acks, behind one lock.
+#[derive(Debug, Default)]
+struct AckState {
+    bitrate: BitrateLadder,
+    threshold: ThresholdLadder,
+    /// The newest `seq` any ack has carried.
+    last_acked: Option<u32>,
+}
+
+/// The current lossless/lossy threshold and lossy bitrate, shared between the
+/// session thread that receives acks and the capture thread that encodes
+/// frames.
 ///
-/// An atomic rather than a channel or a lock: the capture thread reads it once
-/// per frame and must never block on it, and a missed update simply means one
-/// more frame at the previous quality. Stored as the numerator of a percentage
-/// so it fits an integer atomic.
+/// Atomics rather than a channel or a lock on the capture side: the capture
+/// thread reads them once per frame and must never block on them, and a
+/// missed update simply means one more frame at the previous quality. The
+/// threshold is stored as the numerator of a percentage so it fits an integer
+/// atomic.
 #[derive(Debug)]
 pub struct AdaptiveQuality {
     threshold_pct: std::sync::atomic::AtomicU32,
@@ -232,7 +303,7 @@ pub struct AdaptiveQuality {
     /// size, moved by [`BitrateLadder`] on the session thread and read by the
     /// capture thread per encoded frame.
     bitrate_pct: std::sync::atomic::AtomicU32,
-    ladder: std::sync::Mutex<BitrateLadder>,
+    acks: std::sync::Mutex<AckState>,
     /// When the capture thread last encoded video, in milliseconds since
     /// `epoch`; how the ladder tells an idle source from a congested link.
     last_video_ms: std::sync::atomic::AtomicU64,
@@ -241,16 +312,11 @@ pub struct AdaptiveQuality {
 
 impl Default for AdaptiveQuality {
     fn default() -> Self {
-        // Start optimistic: a link with headroom should not have to earn its
-        // way up to full quality, and a congested one is corrected within a few
-        // acks.
         Self {
-            threshold_pct: std::sync::atomic::AtomicU32::new(
-                (VIDEO_AREA_THRESHOLD_MAX * 100.0) as u32,
-            ),
+            threshold_pct: std::sync::atomic::AtomicU32::new(ThresholdLadder::MAX_PCT),
             lossless: std::sync::atomic::AtomicBool::new(false),
             bitrate_pct: std::sync::atomic::AtomicU32::new(BitrateLadder::START_PCT),
-            ladder: std::sync::Mutex::new(BitrateLadder::default()),
+            acks: std::sync::Mutex::new(AckState::default()),
             last_video_ms: std::sync::atomic::AtomicU64::new(0),
             epoch: std::time::Instant::now(),
         }
@@ -299,42 +365,48 @@ impl AdaptiveQuality {
             / 100.0
     }
 
-    /// Fold in what the viewer has acked: `gap` frames still unpresented.
+    /// Fold in an ack: the viewer has presented up to `acked_seq`, and the
+    /// capture has queued up to `sent_seq`.
     ///
-    /// Returns the new threshold when it moved, for the caller to log.
-    pub fn observe(&self, gap: u32) -> Option<f64> {
+    /// The gap is counted in frames because the pipeline numbers only frames
+    /// it actually queued (see [`CapturePipeline`]). An ack that is not news
+    /// is ignored: one no newer than an earlier ack says nothing the ladders
+    /// have not already acted on, and one newer than anything sent belongs to
+    /// a stream numbered before this capture. Neither is a reading of the
+    /// link, and folding them in moved quality on noise.
+    ///
+    /// Returns the backlog and the new threshold when the threshold moved,
+    /// for the caller to log.
+    pub fn on_ack(&self, acked_seq: u32, sent_seq: u32) -> Option<(u32, f64)> {
+        self.on_ack_at(acked_seq, sent_seq, std::time::Instant::now())
+    }
+
+    fn on_ack_at(
+        &self,
+        acked_seq: u32,
+        sent_seq: u32,
+        now: std::time::Instant,
+    ) -> Option<(u32, f64)> {
         let active = self.video_active();
-        if let Ok(mut ladder) = self.ladder.lock() {
-            if let Some(pct) = ladder.observe(gap, active, std::time::Instant::now()) {
-                self.bitrate_pct
-                    .store(pct, std::sync::atomic::Ordering::Relaxed);
-                tracing::info!(
-                    gap,
-                    bitrate_pct = pct,
-                    "link changed; moving the video bitrate"
-                );
-            }
-        }
-        let current = self.threshold();
-        let next = next_threshold(current, gap);
-        if (next - current).abs() < f64::EPSILON {
+        let mut acks = self.acks.lock().unwrap_or_else(|p| p.into_inner());
+        if acked_seq > sent_seq || acks.last_acked.is_some_and(|last| acked_seq <= last) {
             return None;
         }
-        self.threshold_pct.store(
-            (next * 100.0).round() as u32,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        Some(next)
-    }
-}
-
-pub fn next_threshold(current: f64, gap: u32) -> f64 {
-    if gap > BACKLOG_HIGH {
-        (current - THRESHOLD_STEP).max(VIDEO_AREA_THRESHOLD_MIN)
-    } else if gap < BACKLOG_LOW {
-        (current + THRESHOLD_STEP).min(VIDEO_AREA_THRESHOLD_MAX)
-    } else {
-        current
+        acks.last_acked = Some(acked_seq);
+        let gap = sent_seq - acked_seq;
+        if let Some(pct) = acks.bitrate.observe(gap, active, now) {
+            self.bitrate_pct
+                .store(pct, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                gap,
+                bitrate_pct = pct,
+                "link changed; moving the video bitrate"
+            );
+        }
+        let pct = acks.threshold.observe(gap, now)?;
+        self.threshold_pct
+            .store(pct, std::sync::atomic::Ordering::Relaxed);
+        Some((gap, self.threshold()))
     }
 }
 
@@ -737,11 +809,25 @@ impl<S: EncoderSource> CapturePipeline<S> {
         }
     }
 
-    fn next_seq(&mut self) -> u32 {
-        self.seq = self.seq.wrapping_add(1);
-        self.last_seq
-            .store(self.seq, std::sync::atomic::Ordering::Relaxed);
-        self.seq
+    /// The number the `n`th frame from now will carry, without spending it.
+    fn seq_ahead(&self, n: u32) -> u32 {
+        self.seq.wrapping_add(n)
+    }
+
+    /// Queue one update whole or not at all, and only then spend its numbers.
+    ///
+    /// The host reads the link from how far acks trail the last number spent,
+    /// so a number spent on a frame the queue refused read as a frame the
+    /// link had failed to carry — a backlog made of nothing.
+    fn queue(&mut self, frames: Vec<WindowFrame>) -> Result<(), FrameQueueError> {
+        let last = frames.last().map(|f| f.seq);
+        try_queue_frames(&self.frames, frames)?;
+        if let Some(seq) = last {
+            self.seq = seq;
+            self.last_seq
+                .store(seq, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn send_video(
@@ -791,15 +877,16 @@ impl<S: EncoderSource> CapturePipeline<S> {
         };
         let frames = packets
             .into_iter()
-            .map(|data| WindowFrame {
+            .zip(1..)
+            .map(|(data, n)| WindowFrame {
                 id: self.id,
-                seq: self.next_seq(),
+                seq: self.seq_ahead(n),
                 dirty: full,
                 codec: TileCodec::LossyVideo,
                 data,
             })
             .collect();
-        match try_queue_frames(&self.frames, frames) {
+        match self.queue(frames) {
             Ok(()) => {
                 self.quality.note_video_sent();
                 self.unrefined |= refine;
@@ -831,19 +918,19 @@ impl<S: EncoderSource> CapturePipeline<S> {
                 return;
             }
         };
-        let seq = self.next_seq();
         // Never block the capture thread: a full queue loses this delta, and
         // the resync replaces it with the whole picture.
-        match self.frames.try_send(WindowFrame {
+        let tile = WindowFrame {
             id: self.id,
-            seq,
+            seq: self.seq_ahead(1),
             dirty,
             codec,
             data,
-        }) {
+        };
+        match self.queue(vec![tile]) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => self.resync = true,
-            Err(mpsc::error::TrySendError::Closed(_)) => self.mark_closed(),
+            Err(FrameQueueError::Full) => self.resync = true,
+            Err(FrameQueueError::Closed) => self.mark_closed(),
         }
     }
 
@@ -863,7 +950,7 @@ impl<S: EncoderSource> CapturePipeline<S> {
         if self.frames.capacity() < rows.len() {
             return false;
         }
-        let seq = self.next_seq();
+        let seq = self.seq_ahead(1);
         let mut frames = Vec::with_capacity(rows.len());
         for (y, h) in rows {
             let dirty = Rect {
@@ -888,7 +975,7 @@ impl<S: EncoderSource> CapturePipeline<S> {
                 }
             }
         }
-        match try_queue_frames(&self.frames, frames) {
+        match self.queue(frames) {
             Ok(()) => true,
             Err(FrameQueueError::Full) => false,
             Err(FrameQueueError::Closed) => {
@@ -1072,32 +1159,55 @@ mod differ_tests {
         assert!(should_use_video(most, 1920, 1080, VIDEO_AREA_THRESHOLD_MAX));
     }
 
+    /// Acks a capture with a chosen backlog, each ack newer than the last.
+    #[derive(Default)]
+    struct Viewer {
+        sent: u32,
+    }
+
+    impl Viewer {
+        fn ack(
+            &mut self,
+            q: &AdaptiveQuality,
+            gap: u32,
+            now: std::time::Instant,
+        ) -> Option<(u32, f64)> {
+            self.sent += gap + 1;
+            q.on_ack_at(self.sent - gap, self.sent, now)
+        }
+    }
+
     /// A link that keeps up earns full quality; one that falls behind gives it
     /// up before it gives up latency.
     #[test]
     fn quality_follows_what_the_link_is_carrying() {
         let q = AdaptiveQuality::default();
+        let mut viewer = Viewer::default();
+        let start = std::time::Instant::now();
         // Starts optimistic, so a fast link pays nothing to get there.
         assert_eq!(q.threshold(), VIDEO_AREA_THRESHOLD_MAX);
 
-        // A backlog steps quality down, once per observation rather than all at
-        // once — a single late ack should not collapse the picture.
-        let after_one = q.observe(BACKLOG_HIGH + 1).expect("a backlog moves it");
+        // A backlog steps quality down, once per ack rather than all at once —
+        // a single late ack should not collapse the picture.
+        let (_, after_one) = viewer
+            .ack(&q, BACKLOG_HIGH + 1, start)
+            .expect("a backlog moves it");
         assert!(after_one < VIDEO_AREA_THRESHOLD_MAX);
 
         // Sustained congestion bottoms out at the floor and stays there.
         for _ in 0..20 {
-            q.observe(BACKLOG_HIGH + 1);
+            viewer.ack(&q, BACKLOG_HIGH + 1, start);
         }
         assert_eq!(q.threshold(), VIDEO_AREA_THRESHOLD_MIN);
         assert!(
-            q.observe(BACKLOG_HIGH + 1).is_none(),
+            viewer.ack(&q, BACKLOG_HIGH + 1, start).is_none(),
             "already at the floor: nothing to report"
         );
 
         // Recovery climbs back to full quality without a restart.
-        for _ in 0..20 {
-            q.observe(0);
+        let later = start + std::time::Duration::from_secs(10);
+        for _ in 0..30 {
+            viewer.ack(&q, 0, later);
         }
         assert_eq!(q.threshold(), VIDEO_AREA_THRESHOLD_MAX);
     }
@@ -1106,14 +1216,77 @@ mod differ_tests {
     /// limit does not oscillate between sharp and soft every few frames.
     #[test]
     fn a_link_at_the_limit_holds_its_quality() {
-        let steady = 0.35;
-        for gap in BACKLOG_LOW..=BACKLOG_HIGH {
+        let mut ladder = ThresholdLadder::default();
+        let now = std::time::Instant::now();
+        for gap in (BACKLOG_LOW..=BACKLOG_HIGH).cycle().take(40) {
             assert_eq!(
-                next_threshold(steady, gap),
-                steady,
+                ladder.observe(gap, now),
+                None,
                 "gap {gap} is neither congested nor clear"
             );
         }
+    }
+
+    /// The live trace: acks four times a second reading 4, 4, 7, then 0, 0,
+    /// then 9, 15 took the threshold 0.35 → 0.25 → 0.15 → 0.25 → 0.35 → 0.25
+    /// → 0.15 in under three seconds. A raise now waits out a calm streak and
+    /// a hold after the last drop, so the same acks only ever step down.
+    #[test]
+    fn a_brief_lull_between_backlogs_does_not_raise_the_threshold() {
+        let mut ladder = ThresholdLadder::default();
+        let start = std::time::Instant::now();
+        let quarter = std::time::Duration::from_millis(250);
+        let mut moves = Vec::new();
+        for (i, gap) in [4, 4, 7, 4, 0, 0, 0, 0, 9, 15, 0, 0]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(pct) = ladder.observe(gap, start + quarter * i as u32) {
+                moves.push(pct);
+            }
+        }
+        assert_eq!(moves, vec![35, 25, 15]);
+    }
+
+    #[test]
+    fn the_threshold_climbs_one_step_per_calm_streak_once_the_hold_is_over() {
+        let mut ladder = ThresholdLadder::default();
+        let start = std::time::Instant::now();
+        ladder.observe(BACKLOG_HIGH + 1, start);
+        let during_hold = start + std::time::Duration::from_secs(1);
+        for _ in 0..(ThresholdLadder::CALM_ACKS_TO_RAISE * 2) {
+            assert_eq!(ladder.observe(0, during_hold), None);
+        }
+        // A streak that ran through the hold has already shown the link calm.
+        let after = start + ThresholdLadder::HOLD_AFTER_DROP;
+        assert_eq!(ladder.observe(0, after), Some(ThresholdLadder::MAX_PCT));
+
+        ladder.observe(BACKLOG_HIGH + 1, after);
+        let later = after + ThresholdLadder::HOLD_AFTER_DROP;
+        for _ in 1..ThresholdLadder::CALM_ACKS_TO_RAISE {
+            assert_eq!(ladder.observe(0, later), None);
+        }
+        assert_eq!(ladder.observe(0, later), Some(ThresholdLadder::MAX_PCT));
+    }
+
+    /// An ack that is not news moves nothing: a repeat of the last one, an
+    /// older one, or one numbered past anything this capture sent (left over
+    /// from the stream before it).
+    #[test]
+    fn acks_that_are_not_news_leave_quality_alone() {
+        let q = AdaptiveQuality::default();
+        let now = std::time::Instant::now();
+        assert!(
+            q.on_ack_at(10, 20, now).is_some(),
+            "a real backlog moves it"
+        );
+        let after = q.threshold();
+
+        assert!(q.on_ack_at(10, 40, now).is_none());
+        assert!(q.on_ack_at(5, 40, now).is_none());
+        assert!(q.on_ack_at(90, 40, now).is_none());
+        assert_eq!(q.threshold(), after);
+        assert_eq!(q.bitrate_pct.load(std::sync::atomic::Ordering::Relaxed), 70);
     }
 
     /// The point of adapting: on a link with headroom, even a full-window
@@ -1137,8 +1310,9 @@ mod differ_tests {
 
         // The same repaint on a congested link goes lossy instead, trading
         // fidelity to keep the picture current.
+        let mut viewer = Viewer::default();
         for _ in 0..20 {
-            q.observe(BACKLOG_HIGH + 1);
+            viewer.ack(&q, BACKLOG_HIGH + 1, std::time::Instant::now());
         }
         assert!(should_use_video(
             most_of_the_window,
@@ -1503,6 +1677,24 @@ mod pipeline_tests {
         let sent = drain(&mut rx);
         assert_eq!(sent.len(), 1);
         assert!(is_idr(&sent[0]));
+    }
+
+    /// Numbers go only to frames the queue took, so the gap between the last
+    /// number and the viewer's ack counts frames that are actually on their
+    /// way — not refusals, which never left this machine.
+    #[test]
+    fn a_frame_the_queue_refused_spends_no_number() {
+        let (mut p, mut rx) = pipeline(true, 1);
+        let now = Instant::now();
+        p.frame(&solid(1), W, H, now);
+        p.frame(&solid(2), W, H, now + Duration::from_millis(10));
+        let first: Vec<u32> = drain(&mut rx).iter().map(|f| f.seq).collect();
+        assert_eq!(first, vec![1]);
+
+        p.idle(now + Duration::from_millis(20));
+        let next: Vec<u32> = drain(&mut rx).iter().map(|f| f.seq).collect();
+        assert_eq!(next, vec![2]);
+        assert_eq!(p.last_seq.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
