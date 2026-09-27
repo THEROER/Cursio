@@ -37,6 +37,9 @@ pub struct FileCtx {
     volume: String,
     path: String,
     is_dir: bool,
+    /// The file's length as this handle can vouch for it; see
+    /// [`crate::filesize`] for why the peer's latest answer is not enough.
+    size: crate::filesize::KnownSize,
     /// Bytes fetched ahead of what was asked for, while this handle is read
     /// sequentially. Per handle, so it dies with the file it belongs to.
     ahead: crate::readahead::ReadAhead,
@@ -138,6 +141,28 @@ impl RemoteFs {
         let fresh = self.peer.stat(volume, path);
         self.meta.put(volume, path, fresh.clone());
         fresh
+    }
+
+    /// Wait out every write still in flight on this handle, returning the
+    /// first failure among them.
+    ///
+    /// Anything that must see the file as the application left it — a flush,
+    /// a resize, an overwrite — goes through here first, so a pipelined write
+    /// can neither be reported as stored before it is nor land after a
+    /// request that was meant to follow it.
+    fn settle_writes(&self, context: &FileCtx, before: &'static str) -> Result<(), FileError> {
+        let mut pipeline = context.writes.lock().unwrap_or_else(|p| p.into_inner());
+        pipeline.drain(
+            |rx, limit| self.peer.await_write(rx, limit),
+            crate::bridge::BULK_OP_TIMEOUT,
+        );
+        match pipeline.take_failure() {
+            Some(e) => {
+                tracing::warn!(path = %context.path, error = ?e, before, "a write failed");
+                Err(e)
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -386,15 +411,15 @@ impl FileSystemContext for RemoteFs {
         }
 
         // A directory has nothing to open on the far side; only files do.
-        let remote = if is_dir {
-            None
+        let (remote, size) = if is_dir {
+            (None, 0)
         } else {
             let mode = access_to_mode(granted_access);
-            let (handle, _) = self
+            let (handle, size) = self
                 .peer
                 .open(&volume, &path, mode)
                 .map_err(|e| to_ntstatus(&e))?;
-            Some(handle)
+            (Some(handle), size)
         };
 
         Ok(FileCtx {
@@ -402,6 +427,7 @@ impl FileSystemContext for RemoteFs {
             volume,
             path,
             is_dir,
+            size: crate::filesize::KnownSize::new(size),
             ahead: crate::readahead::ReadAhead::new(),
             writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
         })
@@ -552,17 +578,16 @@ impl FileSystemContext for RemoteFs {
         // data more than three to one, and a link doing 41 MB/s on a plain
         // sequential write served Steam at 5.6.
         //
+        // The size is the handle's own figure, raised by this write and never
+        // lowered by it. It was once invented from the write itself —
+        // `offset + len` whenever the cache had expired — which told Windows a
+        // preallocated file had shrunk to the end of whatever chunk was being
+        // written. See `crate::filesize`.
+        //
         // The cached entry is updated to match instead of being dropped, so the
         // `get_file_info` that follows is answered from memory rather than
         // starting the round trip again.
-        // Only what is already held: going to the peer here is the round trip
-        // being removed. A file whose previous size is unknown is described by
-        // this write's own end, which is the truth as far as this call knows —
-        // and the next `get_file_info` past the cache lifetime corrects it.
-        let known = self
-            .meta
-            .get(&context.volume, &context.path)
-            .and_then(|r| r.ok());
+        let size = context.size.wrote(offset, written);
         let meta = FileMeta {
             name: context
                 .path
@@ -571,7 +596,7 @@ impl FileSystemContext for RemoteFs {
                 .unwrap_or(&context.path)
                 .to_string(),
             kind: FileKind::File,
-            size: known.as_ref().map_or(0, |m| m.size).max(offset + written),
+            size,
             modified_unix: now_unix(),
             writable: true,
             allocated: None,
@@ -650,18 +675,8 @@ impl FileSystemContext for RemoteFs {
         let Some(context) = context else {
             return Ok(());
         };
-        let mut pipeline = context.writes.lock().expect("handle writes");
-        pipeline.drain(
-            |rx, limit| self.peer.await_write(rx, limit),
-            crate::bridge::BULK_OP_TIMEOUT,
-        );
-        match pipeline.take_failure() {
-            Some(e) => {
-                tracing::warn!(path = %context.path, error = ?e, "a write failed before flush");
-                Err(to_ntstatus(&e))
-            }
-            None => Ok(()),
-        }
+        self.settle_writes(context, "flush")
+            .map_err(|e| to_ntstatus(&e))
     }
 
     /// Truncate an existing file that is being opened for overwrite.
@@ -683,14 +698,17 @@ impl FileSystemContext for RemoteFs {
         let Some(remote) = context.remote else {
             return Err(to_ntstatus(&FileError::WrongKind));
         };
+        self.settle_writes(context, "overwrite")
+            .map_err(|e| to_ntstatus(&e))?;
         self.peer.truncate(remote, 0).map_err(|e| to_ntstatus(&e))?;
         self.meta.forget(&context.volume, &context.path);
         context.ahead.invalidate();
         // Reported rather than passed over: see `write` for why an unfilled
         // `FileInfo` is worse than a refusal.
-        let meta = self
+        let mut meta = self
             .stat_path(&context.volume, &context.path)
             .map_err(|e| to_ntstatus(&e))?;
+        meta.size = context.size.observe(meta.size, false);
         fill_info(file_info, &meta);
         Ok(())
     }
@@ -767,9 +785,19 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let _call = crate::inflight::shared().enter("get_file_info");
-        let meta = self
+        let mut meta = self
             .stat_path(&context.volume, &context.path)
             .map_err(|e| to_ntstatus(&e))?;
+        if !context.is_dir {
+            // The peer's answer may predate writes still on their way to it,
+            // and reporting it as-is would shrink the file under them.
+            let outstanding = context
+                .writes
+                .lock()
+                .map(|w| w.has_outstanding())
+                .unwrap_or(true);
+            meta.size = context.size.observe(meta.size, outstanding);
+        }
         fill_info_at(file_info, &meta, &context.volume, &context.path);
         Ok(())
     }
@@ -916,14 +944,23 @@ impl FileSystemContext for RemoteFs {
         let Some(remote) = context.remote else {
             return Err(to_ntstatus(&FileError::WrongKind));
         };
+        // Writes still in flight must land before the resize, not after it: a
+        // `Truncate` goes to the wire directly while a write is compressed on
+        // a worker first, so an earlier write could otherwise arrive later and
+        // extend the file again past the length just set.
+        self.settle_writes(context, "set_file_size")
+            .map_err(|e| to_ntstatus(&e))?;
         self.peer
             .set_size(remote, new_size, set_allocation_size)
             .map_err(|e| to_ntstatus(&e))?;
         self.meta.forget(&context.volume, &context.path);
         context.ahead.invalidate();
-        let meta = self
+        // Nothing is outstanding any more, so the peer's answer is the length —
+        // the one place this handle's figure may go down.
+        let mut meta = self
             .stat_path(&context.volume, &context.path)
             .map_err(|e| to_ntstatus(&e))?;
+        meta.size = context.size.observe(meta.size, false);
         fill_info(file_info, &meta);
         Ok(())
     }
@@ -962,6 +999,7 @@ impl FileSystemContext for RemoteFs {
                 volume,
                 path,
                 is_dir: true,
+                size: crate::filesize::KnownSize::new(0),
                 ahead: crate::readahead::ReadAhead::new(),
                 writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
             });
@@ -995,6 +1033,7 @@ impl FileSystemContext for RemoteFs {
             volume,
             path,
             is_dir: false,
+            size: crate::filesize::KnownSize::new(size),
             ahead: crate::readahead::ReadAhead::new(),
             writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
         })
