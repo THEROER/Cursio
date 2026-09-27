@@ -28,12 +28,12 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, MSG,
-    PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, SW_SHOWNOACTIVATE,
-    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    MA_NOACTIVATE, MSG, PM_REMOVE, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    SW_SHOW, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::framebuffer::Framebuffer;
@@ -343,11 +343,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             WM_DISPLAYCHANGE => {
-                unseen::move_off_desktop(hwnd);
+                unseen::place(hwnd);
                 return LRESULT(0);
             }
+            // Show Desktop minimizes even topmost windows, and a capture app
+            // pauses a minimized source.
+            WM_SIZE if wparam.0 as u32 == SIZE_MINIMIZED => {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                unseen::place(hwnd);
+                return LRESULT(0);
+            }
+            WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
             m if m == view.taskbar_created => {
                 unseen::add_icon(hwnd, &view.tip);
+                unseen::remove_from_taskbar(hwnd);
                 return LRESULT(0);
             }
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
@@ -656,6 +665,7 @@ pub(crate) fn run(
             unseen::hide(hwnd);
             unseen::add_icon(hwnd, &meta.title);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            unseen::remove_from_taskbar(hwnd);
         } else {
             let _ = ShowWindow(hwnd, SW_SHOW);
         }

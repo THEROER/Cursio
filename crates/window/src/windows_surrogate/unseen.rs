@@ -17,57 +17,85 @@
 //! keeps it composed, with the picture intact in the capture (alpha applies to
 //! how the window is blended onto the screen, not to its surface). Both lists
 //! filter tool windows and cloaked ones, so neither of those hides it.
-//! `WS_EX_NOACTIVATE` keeps it off the taskbar and out of Alt+Tab while
-//! leaving it in both lists (they filter owned windows, not unactivatable
-//! ones), and off the desktop it can never sit under the pointer.
+//!
+//! Discord's own picker is stricter than Chromium's list, and was settled live
+//! against Discord itself rather than a probe (2026-09-27):
+//! - it drops `WS_EX_NOACTIVATE` windows from "Applications" entirely;
+//! - it pauses a shared window ("Stream Paused — switch to your application")
+//!   that is off the desktop, covered by other windows, or minimized.
+//!
+//! So the view sits *on* the primary monitor, topmost so nothing ever covers
+//! it, still alpha 0 so nobody sees it, and `WS_EX_TRANSPARENT` so every click
+//! and scroll falls through to whatever is underneath. Show Desktop (Win+D)
+//! minimizes even topmost windows; the view restores itself at once. It is kept
+//! off the taskbar through `ITaskbarList::DeleteTab`, since the styles that
+//! would do that (`WS_EX_TOOLWINDOW`, `WS_EX_NOACTIVATE`, an owner) are exactly
+//! the ones the pickers filter.
 //!
 //! The view's selector used to be a right-click menu on the window; nobody can
 //! right-click a window that is nowhere, so the same menu hangs off a
 //! notification-area icon, one per peer.
 
 use windows::Win32::Foundation::{COLORREF, HWND};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    ITaskbarList, Shell_NotifyIconW, TaskbarList, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD,
+    NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, GetWindowLongW, LoadIconW, RegisterWindowMessageW,
-    SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, IDI_APPLICATION,
-    LWA_ALPHA, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_APP, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    GetWindowLongW, LoadIconW, RegisterWindowMessageW, SetLayeredWindowAttributes, SetWindowLongW,
+    SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, IDI_APPLICATION, LWA_ALPHA, SWP_NOACTIVATE,
+    SWP_NOSIZE, WM_APP, WS_EX_LAYERED, WS_EX_TRANSPARENT,
 };
 
 /// The message the notification-area icon reports its clicks with.
 pub(super) const TRAY_MESSAGE: u32 = WM_APP + 1;
 
-/// Make `hwnd` unseen: layered and fully transparent, never activated, and
-/// placed past the bottom-right corner of every monitor.
+/// Make `hwnd` unseen: layered and fully transparent, click-through, and
+/// placed over the primary monitor above everything else.
 pub(super) unsafe fn hide(hwnd: HWND) {
     let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     let _ = SetWindowLongW(
         hwnd,
         GWL_EXSTYLE,
-        (ex | WS_EX_LAYERED.0 | WS_EX_NOACTIVATE.0) as i32,
+        (ex | WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) as i32,
     );
     if let Err(e) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA) {
         tracing::warn!(error = %e, "could not make the remote-screen view transparent");
     }
-    move_off_desktop(hwnd);
+    place(hwnd);
 }
 
-/// Put `hwnd` just past the virtual desktop. Again whenever the monitor
-/// layout changes, or a new monitor could land on top of it.
-pub(super) unsafe fn move_off_desktop(hwnd: HWND) {
-    let right = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    let bottom = GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+/// Pin `hwnd` topmost at the primary monitor's origin. Again whenever the
+/// monitor layout changes, since the primary monitor may have moved.
+pub(super) unsafe fn place(hwnd: HWND) {
     let _ = SetWindowPos(
         hwnd,
-        None,
-        right + 100,
-        bottom + 100,
+        Some(HWND_TOPMOST),
         0,
         0,
-        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE,
     );
+}
+
+/// Take `hwnd`'s button off the taskbar, which it gains on every show.
+pub(super) unsafe fn remove_from_taskbar(hwnd: HWND) {
+    // The thread may already be in the multithreaded apartment for the video
+    // decoder; either answer leaves COM usable here.
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let taskbar: windows::core::Result<ITaskbarList> =
+        CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER);
+    let removed = taskbar.and_then(|t| {
+        t.HrInit()?;
+        t.DeleteTab(hwnd)
+    });
+    if let Err(e) = removed {
+        tracing::warn!(error = %e, "could not take the remote-screen view off the taskbar");
+    }
 }
 
 /// The message Explorer broadcasts when it restarts, after which every
