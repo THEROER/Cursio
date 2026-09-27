@@ -8,12 +8,17 @@
 //!   install `.desktop` launchers (Linux).
 //! - `windows` — cross-compile the `.exe`s from Linux (mingw), no Windows box.
 //! - `logs`    — print the log directory (and `tail -f` it with `--follow`).
+//! - `deploy`  — build both halves, ship the `.exe` to the Windows peer under
+//!   a versioned name and restart it in the user's session.
 //!
 //! - `android` — cross-compile the mesh core for arm64 (needs the NDK and
 //!   cargo-ndk). The core only: the platform modules each need an Android
 //!   backend before they can be switched on.
 //!
 //! Run `cargo xtask <cmd> --help` for flags.
+
+mod deploy;
+mod remote;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -183,6 +188,8 @@ enum Command_ {
         #[arg(long)]
         follow: bool,
     },
+    /// Build both halves, ship the .exe to the Windows peer and restart it there.
+    Deploy(deploy::DeployArgs),
 }
 
 /// What `build` should produce.
@@ -232,10 +239,11 @@ fn main() -> Result<()> {
             once,
             args,
         } => run_task(!debug, bin, once, &args),
-        Command_::Windows { debug } => windows(!debug),
+        Command_::Windows { debug } => windows(!debug).map(drop),
         Command_::Macos => macos(),
         Command_::Android { debug } => android(!debug),
         Command_::Logs { follow } => logs(follow),
+        Command_::Deploy(args) => deploy::deploy(args),
     }
 }
 
@@ -248,7 +256,7 @@ fn main() -> Result<()> {
 fn build_target(target: TargetArg, release: bool, only: Option<BinArg>) -> Result<()> {
     match target {
         TargetArg::Host => build(release, only, None),
-        TargetArg::Windows => windows(release),
+        TargetArg::Windows => windows(release).map(drop),
         TargetArg::Macos => macos(),
         TargetArg::All => {
             // Windows cross-builds from Linux via cargo-xwin; macOS binaries
@@ -461,7 +469,7 @@ fn install(only: Option<BinArg>, no_build: bool) -> Result<()> {
 }
 
 /// Cross-compile the Windows binaries from Linux, via `cargo-xwin`.
-fn windows(release: bool) -> Result<()> {
+fn windows(release: bool) -> Result<PathBuf> {
     if !cfg!(target_os = "linux") {
         println!("note: `windows` is meant for cross-compiling from Linux.");
     }
@@ -535,7 +543,7 @@ fn windows(release: bool) -> Result<()> {
             dir.join(exe_name(b.bin, Some(WINDOWS_TARGET))).display()
         );
     }
-    Ok(())
+    Ok(dir)
 }
 
 fn macos() -> Result<()> {
@@ -710,9 +718,17 @@ fn run(mut cmd: Command) -> Result<()> {
     Ok(())
 }
 
-/// target/<triple?>/<profile> — where cargo drops the binaries.
+/// Where cargo puts build output: `CARGO_TARGET_DIR` when set, since cargo
+/// honours it and a literal `target/` would then name a stale binary.
+fn target_root() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"))
+}
+
+/// <target root>/<triple?>/<profile> — where cargo drops the binaries.
 fn out_dir(release: bool, target: Option<&str>) -> PathBuf {
-    let mut p = PathBuf::from("target");
+    let mut p = target_root();
     if let Some(t) = target {
         p.push(t);
     }
