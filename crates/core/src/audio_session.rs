@@ -207,6 +207,22 @@ pub struct AudioEngine {
     /// Streams we already failed to open, so the failure is reported once
     /// instead of on every subsequent chunk.
     failed_playbacks: std::collections::HashSet<u32>,
+    /// Every stream the peer has advertised to us, open or not.
+    ///
+    /// Demand is reported from here rather than from `playbacks`, and the
+    /// difference is the whole point: a playback exists only once a stream has
+    /// been opened, so a stream that *cannot* be opened had no entry anywhere
+    /// and therefore produced no demand message at all — neither "listening"
+    /// nor "not listening". The owner treats silence as consent and keeps
+    /// sending, forever.
+    ///
+    /// That is not hypothetical. Windows cannot publish a peer microphone as a
+    /// recording device (no driver; `Playback::virtual_source` reports
+    /// `Unsupported`), so a Linux machine's microphone streamed to it at
+    /// ~200 chunks/s for an entire session with `played=18` to show for it —
+    /// the only outbound audio on the link, and every byte of it wasted on a
+    /// stream with nowhere to land.
+    peer_streams: std::collections::HashSet<u32>,
     /// Watches our real devices' volume/mute (owner side) and applies changes to
     /// our Intent Sinks (non-owner side). `None` if the backend has no monitor
     /// (non-Linux today) — device-state replication is simply inert there.
@@ -364,6 +380,7 @@ impl AudioEngine {
             pending_labels: HashMap::new(),
             inbound_app_device: HashMap::new(),
             failed_playbacks: std::collections::HashSet::new(),
+            peer_streams: std::collections::HashSet::new(),
             device_monitor: None,
             owned_device_nodes: std::collections::HashSet::new(),
             owned_device_state: HashMap::new(),
@@ -798,6 +815,7 @@ impl SessionModule for AudioEngine {
                 self.inbound_app_device.remove(&id);
                 self.decoders.remove(&id);
                 self.failed_playbacks.remove(&id);
+                self.peer_streams.remove(&id);
                 self.opening_playbacks.remove(&id);
                 // Receiver-side rate-control/gain state for this stream — clear it
                 // so a reused id never inherits a stale gain or ack cadence.
@@ -1345,6 +1363,13 @@ impl AudioEngine {
     /// in our output list) plus playback; apps get playback only — you don't
     /// route audio *into* someone else's application.
     fn on_advertise(&mut self, meta: &cursio_protocol::AudioStreamMeta) {
+        // Recorded before any branch below can return early. Every advertised
+        // stream owes the owner an answer about demand, including the ones this
+        // machine turns out to be unable to play — those especially, since a
+        // stream that never opens is the one whose silence the owner would
+        // otherwise read as consent to keep sending.
+        self.peer_streams.insert(meta.id);
+
         let peer_name = &self.peer_name;
         if let Some(app) = &meta.app_name {
             let label = format!("Cursio({peer_name}): {app}");
@@ -1612,10 +1637,30 @@ impl AudioEngine {
     /// input rides on to say nothing new.
     async fn pump_demand(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
         let changed: Vec<(u32, bool)> = self
-            .playbacks
+            .peer_streams
             .iter()
-            .filter_map(|(&id, p)| {
-                let listening = p.is_listening();
+            .filter_map(|&id| {
+                // Three states, not two, and conflating the last two is fatal.
+                //
+                // - a playback that is open answers for itself;
+                // - one that FAILED to open will never answer, so refuse the
+                //   stream: this is the Windows microphone case, where nothing
+                //   can publish it and the owner would otherwise stream to a
+                //   machine that can never play it;
+                // - one that has not opened *yet* must say nothing at all,
+                //   because some playbacks open only on the stream's FIRST
+                //   CHUNK. Refuse one of those and the owner stops sending, so
+                //   the first chunk never arrives, so the playback never opens —
+                //   the refusal makes itself permanently true.
+                //
+                // Silence is the right answer for the third: the owner keeps
+                // sending, the playback opens, and the pump after that reports
+                // the truth.
+                let listening = match self.playbacks.get(&id) {
+                    Some(p) => p.is_listening(),
+                    None if self.failed_playbacks.contains(&id) => false,
+                    None => return None,
+                };
                 (self.demand_sent.get(&id) != Some(&listening)).then_some((id, listening))
             })
             .collect();
@@ -2295,6 +2340,41 @@ pub const VERSION: u16 = 1;
 mod tests {
     use super::*;
 
+    /// A transport that keeps what was sent, so a test can assert on the wire
+    /// traffic rather than on the engine's internals.
+    #[derive(Default)]
+    struct RecordingTx {
+        sent: Vec<Message>,
+    }
+
+    impl RecordingTx {
+        /// The `(id, listening)` pairs of every demand report sent, in order.
+        fn demands(&self) -> Vec<(u32, bool)> {
+            self.sent
+                .iter()
+                .filter_map(|m| match m.decode_module::<AudioMsg>(ModuleId::AUDIO) {
+                    Ok(Some(AudioMsg::StreamDemand { id, listening })) => Some((id, listening)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TransportTx for RecordingTx {
+        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
+            self.sent.push(msg.clone());
+            Ok(())
+        }
+
+        fn queue_depth(
+            &self,
+            _priority: cursio_protocol::Priority,
+        ) -> cursio_transport::QueueDepth {
+            cursio_transport::QueueDepth::default()
+        }
+    }
+
     /// Two nodes must land in different ranges, or their stream ids overlap and
     /// audio gets routed to the wrong device. (Not guaranteed for *every*
     /// possible pair — it's a hash — but it must hold for ordinary distinct ids.)
@@ -2795,6 +2875,47 @@ mod tests {
         );
     }
 
+    /// A stream this machine cannot play is reported as unwanted, not skipped.
+    ///
+    /// The owner only stops sending when told to, so a stream that produces no
+    /// demand message is one the owner keeps streaming forever. Reporting from
+    /// the playbacks alone could not say anything about a stream that has none —
+    /// which is exactly the stream that most needs to be refused. A Linux
+    /// microphone sent to a Windows peer, which has no way to publish it, ran
+    /// this way for a whole session: 200 chunks/s, `played=18`.
+    #[tokio::test]
+    async fn an_unplayable_stream_is_reported_as_unwanted() {
+        let mut e = engine();
+
+        // The peer advertises a microphone this machine cannot publish. The
+        // open was attempted and failed, so no playback will ever exist.
+        e.peer_streams.insert(476800);
+        e.failed_playbacks.insert(476800);
+
+        let mut tx = RecordingTx::default();
+        e.pump_demand(&mut tx)
+            .await
+            .expect("reporting demand must not fail");
+
+        assert_eq!(
+            tx.demands(),
+            vec![(476800, false)],
+            "a stream that failed to open must be refused, not passed over in silence"
+        );
+
+        // Only transitions go out: the owner holds the last value, and repeating
+        // it every pump (~100/s per stream) would flood the channel input rides
+        // on to say nothing new.
+        let mut again = RecordingTx::default();
+        e.pump_demand(&mut again)
+            .await
+            .expect("reporting demand must not fail");
+        assert!(
+            again.demands().is_empty(),
+            "an unchanged demand must not be resent"
+        );
+    }
+
     /// A stream keeps the name it was advertised under while its node comes up.
     ///
     /// The label used to be *taken* out of `pending_labels` by the first chunk,
@@ -2826,6 +2947,31 @@ mod tests {
             e.pending_labels.get(&85505).map(String::as_str),
             Some("Cursio(peer): spotify"),
             "the label must outlive the open, so a retry uses the right name"
+        );
+    }
+
+    /// A stream that has not opened *yet* is not refused.
+    ///
+    /// A stream into one of our devices opens its playback on its first chunk,
+    /// so refusing one that has no playback yet stops the owner from sending,
+    /// which stops the first chunk from arriving, which stops the playback from
+    /// ever opening: the refusal makes itself true and the audio never comes
+    /// back.
+    #[tokio::test]
+    async fn a_stream_whose_playback_has_not_opened_yet_is_left_alone() {
+        let mut e = engine();
+
+        // Advertised, never yet carried a chunk: no playback, and no failure.
+        e.peer_streams.insert(476500);
+
+        let mut tx = RecordingTx::default();
+        e.pump_demand(&mut tx)
+            .await
+            .expect("reporting demand must not fail");
+
+        assert!(
+            tx.demands().is_empty(),
+            "a stream still waiting for its first chunk must not be refused"
         );
     }
 
