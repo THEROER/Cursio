@@ -36,6 +36,13 @@
 //!   everything sharing it.
 
 use std::collections::HashMap;
+// Every lock of the file server recovers from poisoning rather than
+// propagating it. A panic in one request — the one kind the worker pool now
+// survives — would otherwise poison the server for every request after it,
+// and the peer's mount would stop answering for the rest of the session. The
+// server's state is a table of open handles; the entry a panicking request
+// was touching is the worst it can leave behind.
+use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
 use cursio_files::bridge::{Op, PeerLink};
@@ -972,7 +979,7 @@ impl FilesEngine {
         // Take delivery of a scan that finished since the last pump.
         while let Ok(after) = self.rescan_rx.try_recv() {
             self.rescanning = false;
-            let mut server = self.server.lock().expect("file server");
+            let mut server = self.server.lock().unwrap_or_else(PoisonError::into_inner);
             let before = server.volumes();
             if volume_identity(&after.volumes()) == volume_identity(&before) {
                 continue;
@@ -1365,7 +1372,24 @@ impl FilesEngine {
         let busy = InFlight::raise(&self.in_progress);
         self.workers.spawn(move || {
             let started = Instant::now();
-            let reply = run_request(&server, msg);
+            let req = request_req(&msg);
+            // A request that panicked is still owed an answer. Without one the
+            // peer's entry for it never clears, and those entries are what its
+            // window is counted from: enough of them and it sends nothing more
+            // until the link is torn down.
+            let reply = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_request(&server, msg)
+            })) {
+                Ok(reply) => reply,
+                Err(panic) => {
+                    let why = cursio_files::background::panic_message(&*panic).to_string();
+                    tracing::warn!(kind, why, "a request from the peer panicked");
+                    req.map(|req| FilesMsg::Failed {
+                        req,
+                        error: FileError::Io(format!("the request failed on the peer: {why}")),
+                    })
+                }
+            };
             drop(busy);
             let took = started.elapsed();
             // A request the peer is blocked on, taking long enough that its
@@ -1438,7 +1462,10 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
 
     match msg {
         FilesMsg::ReadDir { req, volume, path } => {
-            let r = server.lock().expect("file server").read_dir(&volume, &path);
+            let r = server
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .read_dir(&volume, &path);
             answer(req, &format!("readdir {volume}/{path}"), r, |entries| {
                 FilesMsg::DirEntries {
                     req,
@@ -1450,7 +1477,10 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             })
         }
         FilesMsg::Stat { req, volume, path } => {
-            let r = server.lock().expect("file server").stat(&volume, &path);
+            let r = server
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .stat(&volume, &path);
             answer(req, &format!("stat {volume}/{path}"), r, |meta| {
                 FilesMsg::StatResult { req, meta }
             })
@@ -1458,7 +1488,7 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
         FilesMsg::ReadLink { req, volume, path } => {
             let r = server
                 .lock()
-                .expect("file server")
+                .unwrap_or_else(PoisonError::into_inner)
                 .read_link(&volume, &path);
             answer(req, &format!("readlink {volume}/{path}"), r, |target| {
                 FilesMsg::LinkTarget { req, target }
@@ -1472,7 +1502,7 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
         } => {
             let r = server
                 .lock()
-                .expect("file server")
+                .unwrap_or_else(PoisonError::into_inner)
                 .open(&volume, &path, mode);
             answer(
                 req,
@@ -1499,7 +1529,7 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             // window of 128.
             let r = server
                 .lock()
-                .expect("file server")
+                .unwrap_or_else(PoisonError::into_inner)
                 .detach(handle)
                 .and_then(|file| file.read(offset, len));
             answer(
@@ -1524,7 +1554,7 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             let r = unpack(bytes).and_then(|bytes| {
                 server
                     .lock()
-                    .expect("file server")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .detach_writable(handle)
                     .and_then(|file| file.write(offset, &bytes))
             });
@@ -1543,7 +1573,7 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
         } => {
             let r = server
                 .lock()
-                .expect("file server")
+                .unwrap_or_else(PoisonError::into_inner)
                 .detach_writable(handle)
                 .and_then(|file| file.set_size(size, reserve));
             answer(
@@ -1554,13 +1584,19 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             )
         }
         FilesMsg::MkDir { req, volume, path } => {
-            let r = server.lock().expect("file server").mkdir(&volume, &path);
+            let r = server
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .mkdir(&volume, &path);
             answer(req, &format!("mkdir {volume}/{path}"), r, |()| {
                 FilesMsg::Ok { req }
             })
         }
         FilesMsg::Remove { req, volume, path } => {
-            let r = server.lock().expect("file server").remove(&volume, &path);
+            let r = server
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&volume, &path);
             answer(req, &format!("remove {volume}/{path}"), r, |()| {
                 FilesMsg::Ok { req }
             })
@@ -1573,7 +1609,7 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
         } => {
             let r = server
                 .lock()
-                .expect("file server")
+                .unwrap_or_else(PoisonError::into_inner)
                 .rename(&volume, &from, &to);
             answer(req, &format!("rename {volume}/{from} -> {to}"), r, |()| {
                 FilesMsg::Ok { req }
@@ -1583,11 +1619,17 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             // Answered with the announcement itself, which carries no request
             // id — the list is idempotent, so the asker takes the next one.
             Some(FilesMsg::Volumes(
-                server.lock().expect("file server").volumes(),
+                server
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .volumes(),
             ))
         }
         FilesMsg::Close { handle } => {
-            server.lock().expect("file server").close(handle);
+            server
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .close(handle);
             None // deliberately unanswered; see the protocol docs
         }
         // Replies and announcements are not requests: they are handled inline
@@ -1975,7 +2017,11 @@ impl SessionModule for FilesEngine {
     }
 
     async fn start(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
-        let volumes = self.server.lock().expect("file server").volumes();
+        let volumes = self
+            .server
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .volumes();
         tracing::info!(
             peer = %self.peer_name,
             volumes = volumes.len(),
@@ -1998,7 +2044,11 @@ impl SessionModule for FilesEngine {
         self.rescan_volumes();
 
         if self.announce_volumes {
-            let volumes = self.server.lock().expect("file server").volumes();
+            let volumes = self
+                .server
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .volumes();
             send(tx, FilesMsg::Volumes(volumes)).await?;
             self.announce_volumes = false;
         }
@@ -2178,6 +2228,26 @@ fn request_kind(msg: &FilesMsg) -> &'static str {
         FilesMsg::Close { .. } => "close",
         FilesMsg::ListVolumes { .. } => "volumes",
         _ => "other",
+    }
+}
+
+/// The id a request from the peer expects its answer under.
+///
+/// `None` for the two that are never answered by id: a `Close` is deliberately
+/// unanswered, and `ListVolumes` is answered with the announcement itself.
+fn request_req(msg: &FilesMsg) -> Option<FileReqId> {
+    match msg {
+        FilesMsg::ReadDir { req, .. }
+        | FilesMsg::Stat { req, .. }
+        | FilesMsg::ReadLink { req, .. }
+        | FilesMsg::Open { req, .. }
+        | FilesMsg::Read { req, .. }
+        | FilesMsg::Write { req, .. }
+        | FilesMsg::Truncate { req, .. }
+        | FilesMsg::MkDir { req, .. }
+        | FilesMsg::Remove { req, .. }
+        | FilesMsg::Rename { req, .. } => Some(*req),
+        _ => None,
     }
 }
 

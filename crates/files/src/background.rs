@@ -64,11 +64,27 @@ impl Workers {
                         // `recv` blocks; the lock is released before the job
                         // runs so the other workers keep taking work.
                         let job = {
-                            let guard = rx.lock().expect("file worker queue");
+                            let guard = rx.lock().unwrap_or_else(|p| p.into_inner());
                             guard.recv()
                         };
                         match job {
-                            Ok(job) => job(),
+                            // Caught, because an unwinding job otherwise takes
+                            // its thread with it and the pool never gets it
+                            // back: a handful of panics and nothing serves the
+                            // peer at all, while every request it sends waits
+                            // out its deadline and the link's window stays
+                            // shut until a reconnect. A job holds no state of
+                            // the pool's, so the next one starts clean.
+                            Ok(job) => {
+                                if let Err(panic) =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                                {
+                                    tracing::warn!(
+                                        why = panic_message(&panic),
+                                        "a file job panicked; the worker carries on"
+                                    );
+                                }
+                            }
                             // Every sender is gone: the session ended.
                             Err(_) => break,
                         }
@@ -90,6 +106,15 @@ impl Workers {
     pub fn spawn(&self, job: impl FnOnce() + Send + 'static) {
         let _ = self.jobs.send(Box::new(job));
     }
+}
+
+/// The text a panic was raised with, when it carried any.
+pub fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic with no message")
 }
 
 /// How many workers to run.
@@ -203,6 +228,24 @@ mod tests {
             "the second job must run while the first is still stuck"
         );
         blocker.wait();
+    }
+
+    /// A job that panics must not cost the pool its thread.
+    ///
+    /// With one worker this is the whole pool: if the panic took the thread,
+    /// the job after it would never run.
+    #[test]
+    fn a_panicking_job_does_not_take_its_worker_with_it() {
+        let workers = Workers::with_threads("test-files-panic", 1);
+        workers.spawn(|| panic!("a job that fails badly"));
+        let (tx, rx) = mpsc::channel();
+        workers.spawn(move || {
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the worker must still be there for the next job"
+        );
     }
 
     /// The pool has to stay bounded — being bounded is the point.
