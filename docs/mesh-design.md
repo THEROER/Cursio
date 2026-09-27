@@ -317,14 +317,29 @@ the joins some modules do on drop no longer happen on the loop either.
 The slow-pump (50 ms) and slow-message (20 ms) warnings survive, scoped to the
 module: they now mean that module's own traffic waited, not that input did.
 
-**Input lag is a number.** The session keeps two latency windows and logs
+**Input lag is a number.** The session keeps latency windows and logs
 p50/p99/max every 30 s when input moved (`warn` once p99 reaches 20 ms):
 `received->injected`, from the reader taking an `Input` off the wire to handing
 it to the injector, and `captured->sent`, from capture handing an event over
 (`CapturedInput` is stamped as it leaves the hotkey filter) to the transport
 accepting it — for coalesced motion, charged at its oldest part. The transport
-measures the remaining stretch, queue to socket, per priority class. Measured
+measures the remaining stretch, queue to socket, per priority class. A third
+window, `injector call`, is the injector's own share of `received->injected`;
+the rest is queueing. Measured
 over loopback with one module wedged in its pump for 30 s and another taking
 5 ms per message while both were flooded: 2000 pointer events injected at p50
 42 µs, p99 76 µs.
+
+**Received motion is merged when it has queued.** The injector, not the link,
+bounds how fast input lands: `SendInput` costs 1–2 ms per real pointer move on
+the Windows laptop, and a 1000 Hz mouse sends one every millisecond. One call
+per message let the backlog grow for as long as the hand moved — 24 ms median,
+240 ms p99, the cursor replaying a movement after the hand had stopped. The
+loop now drains every input message already queued behind the one it woke for
+and sums consecutive motion, exactly as the sending side does with captured
+input; a button, key or scroll keeps its place, and the first non-input message
+ends the batch and is handled next, since a `Grab` decides whether the input
+after it is injected at all. Over loopback with a 1.5 ms injector and 1000
+moves a second: p50 3.3 ms, p99 3.5 ms, where one call per message gave p50
+272 ms, p99 519 ms.
 

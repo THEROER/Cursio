@@ -223,7 +223,13 @@ async fn a_slow_module_does_not_hold_up_injecting_received_input() {
                 peer_takes_cursor: true,
             },
             None,
-            |_| *received_in_task.lock().unwrap() += 1,
+            // Motion that queued arrives merged, so what is counted is the
+            // distance moved, not the calls.
+            |ev| {
+                if let InputEvent::PointerMotion { dx, .. } = ev {
+                    *received_in_task.lock().unwrap() += dx as usize;
+                }
+            },
             None,
             |_| {},
             modules,
@@ -253,6 +259,95 @@ async fn a_slow_module_does_not_hold_up_injecting_received_input() {
         pumps.load(std::sync::atomic::Ordering::Relaxed) < N / 2,
         "modules were pumped once per input message"
     );
+    drop(client);
+    server_task.abort();
+}
+
+/// An injector as slow as `SendInput` on the Windows laptop (1.5 ms per real
+/// pointer move) keeps up with a 1000 Hz mouse. Injected one message at a
+/// time the queue grew for as long as the hand moved, and the cursor went on
+/// replaying the backlog for half a second after it stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_slow_injector_does_not_let_received_motion_queue_behind_it() {
+    const N: usize = 1000;
+    const INJECT_COST: Duration = Duration::from_micros(1500);
+    let (mut client, server) = encrypted_pair().await;
+
+    // (distance moved so far, when) after every call into the injector.
+    let landed = Arc::new(Mutex::new(Vec::<(usize, std::time::Instant)>::new()));
+    let landed_in_task = landed.clone();
+    let server_task = tokio::spawn(async move {
+        let mut moved = 0usize;
+        let _ = session::run_session(
+            Box::new(server),
+            session::CursorSetup {
+                start_active: true,
+                peer_takes_cursor: true,
+            },
+            None,
+            move |ev| {
+                let started = std::time::Instant::now();
+                while started.elapsed() < INJECT_COST {
+                    std::hint::spin_loop();
+                }
+                if let InputEvent::PointerMotion { dx, .. } = ev {
+                    moved += dx as usize;
+                }
+                landed_in_task
+                    .lock()
+                    .unwrap()
+                    .push((moved, std::time::Instant::now()));
+            },
+            None,
+            |_| {},
+            Vec::new(),
+            || None,
+        )
+        .await;
+    });
+
+    let mut sent_at = Vec::with_capacity(N);
+    let mut pace = tokio::time::interval(Duration::from_millis(1));
+    for _ in 0..N {
+        pace.tick().await;
+        sent_at.push(std::time::Instant::now());
+        client
+            .send(&cursio_protocol::Message::Input(
+                InputEvent::PointerMotion { dx: 1, dy: 0 },
+            ))
+            .await
+            .unwrap();
+    }
+    let hand_stopped = std::time::Instant::now();
+    while landed.lock().unwrap().last().map_or(0, |(moved, _)| *moved) < N {
+        assert!(
+            hand_stopped.elapsed() < Duration::from_secs(5),
+            "motion never finished arriving"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    // Each unit of motion, from being sent to the injector call that carried it.
+    let landed = landed.lock().unwrap();
+    let mut calls = landed.iter();
+    let mut call = calls.next().unwrap();
+    let mut lag: Vec<Duration> = sent_at
+        .iter()
+        .enumerate()
+        .map(|(k, sent)| {
+            while call.0 < k + 1 {
+                call = calls.next().unwrap();
+            }
+            call.1 - *sent
+        })
+        .collect();
+    lag.sort_unstable();
+    let (p50, p99) = (lag[N / 2], lag[N * 99 / 100]);
+    assert!(
+        p99 < Duration::from_millis(20),
+        "motion waited behind the injector: p50 {p50:?}, p99 {p99:?}"
+    );
+    assert_eq!(landed.last().unwrap().0, N, "motion was lost or duplicated");
     drop(client);
     server_task.abort();
 }

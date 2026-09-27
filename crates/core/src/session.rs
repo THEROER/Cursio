@@ -76,6 +76,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// five-second stall every five seconds.
 const SLOW_TURN_WARN: Duration = Duration::from_millis(250);
 
+/// Most queued messages folded into one batch of received input.
+///
+/// A bound only so a peer streaming input faster than it can be read cannot
+/// hold the loop inside one turn; draining costs nanoseconds a message, so in
+/// practice a batch ends where the queue does.
+const RECEIVED_INPUT_BATCH: usize = 1024;
+
 /// How long to wait for *any* inbound traffic before declaring the peer gone.
 ///
 /// A machine that loses power (or has its cable pulled) never sends a FIN, so
@@ -629,7 +636,14 @@ where
     // clean log. Set as each arm starts; see `SLOW_TURN_WARN`.
     let mut working_since: Option<tokio::time::Instant> = None;
 
+    // A message that ended a batch of received input, handled on the next
+    // turn so it keeps its place after the input read before it.
+    let mut held_back: Option<(Message, std::time::Instant)> = None;
+
     let mut inject_latency = LatencyWindow::new("received->injected");
+    // The injector's own share of the figure above. What is left over is
+    // queueing, and the two call for different fixes.
+    let mut inject_call = LatencyWindow::new("injector call");
     let mut forward_latency = LatencyWindow::new("captured->sent");
 
     let result = loop {
@@ -655,6 +669,7 @@ where
             _ = ticker.tick() => {
                 working_since = Some(tokio::time::Instant::now());
                 inject_latency.report_if_due();
+                inject_call.report_if_due();
                 forward_latency.report_if_due();
                 // Has the peer gone quiet? Checked on the heartbeat tick, so
                 // detection costs nothing extra and lands within one interval
@@ -806,11 +821,11 @@ where
                     None => captured = None,
                 }
             }
-            incoming = inbound_rx.recv() => {
+            incoming = next_inbound(&mut held_back, &mut inbound_rx) => {
                 working_since = Some(tokio::time::Instant::now());
                 let (incoming, read_at) = match incoming {
-                    Some((msg, read_at)) => (Some(msg), Some(read_at)),
-                    None => (None, None),
+                    Some((msg, read_at)) => (Some(msg), read_at),
+                    None => (None, std::time::Instant::now()),
                 };
                 match incoming {
                     Some(Message::Heartbeat { nonce }) => tracing::trace!(nonce, "peer heartbeat"),
@@ -824,9 +839,12 @@ where
                     Some(Message::Input(event)) => {
                         // Inject only while active (we hold the cursor).
                         if am_active {
-                            tracing::trace!(?event, "peer input");
-                            on_input(event);
-                            if let Some(read_at) = read_at {
+                            let batch = drain_received_input(event, read_at, &mut inbound_rx, &mut held_back);
+                            for (event, read_at) in batch {
+                                tracing::trace!(?event, "peer input");
+                                let started = std::time::Instant::now();
+                                on_input(event);
+                                inject_call.record(started.elapsed());
                                 inject_latency.record(read_at.elapsed());
                             }
                         }
@@ -1018,6 +1036,79 @@ async fn forward_captured(
     flush(tx, &mut pending, latency).await
 }
 
+/// The next message for the session: one held back from the last batch of
+/// received input first, then whatever the reader forwards.
+async fn next_inbound(
+    held_back: &mut Option<(Message, std::time::Instant)>,
+    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<(Message, std::time::Instant)>,
+) -> Option<(Message, std::time::Instant)> {
+    match held_back.take() {
+        Some(held) => Some(held),
+        None => inbound.recv().await,
+    }
+}
+
+/// Take `first` and every input message already queued behind it, merging
+/// consecutive pointer motion.
+///
+/// The injector, not the link, bounds how fast received input can land.
+/// `SendInput` measured 1–2 ms per real pointer move on the Windows laptop
+/// (p50 1.7 ms back to back, 25 ms at worst), and a 1000 Hz mouse on the peer
+/// sends a move every millisecond. Injected one message at a time, the queue
+/// grew for as long as the hand moved: 24 ms median and 240 ms p99 from
+/// reading an event to injecting it, the cursor still replaying a movement
+/// after the hand had stopped. Summing what has already queued is exact for
+/// relative deltas, and each call to the injector then carries whatever
+/// arrived while the previous one ran, so the backlog cannot outgrow one call.
+/// With nothing queued a move goes out alone, as before.
+///
+/// Stops at the first message that is not input and hands it back through
+/// `held_back` instead of handling it here: a `Grab` or `CrossEdge` decides
+/// whether the input after it is injected at all.
+///
+/// Each event comes with when the reader took it off the wire; merged motion
+/// keeps its oldest part's, which waited longest.
+fn drain_received_input(
+    first: cursio_protocol::InputEvent,
+    read_at: std::time::Instant,
+    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<(Message, std::time::Instant)>,
+    held_back: &mut Option<(Message, std::time::Instant)>,
+) -> Vec<(cursio_protocol::InputEvent, std::time::Instant)> {
+    let mut batch = Vec::new();
+    merge_received(&mut batch, first, read_at);
+    for _ in 1..RECEIVED_INPUT_BATCH {
+        match inbound.try_recv() {
+            Ok((Message::Input(event), at)) => merge_received(&mut batch, event, at),
+            Ok(other) => {
+                *held_back = Some(other);
+                break;
+            }
+            // Closed is left for the next `recv` to report, after this batch
+            // has been injected.
+            Err(_) => break,
+        }
+    }
+    batch
+}
+
+/// Append `event` to `batch`, folding it into the last entry when both are
+/// pointer motion.
+fn merge_received(
+    batch: &mut Vec<(cursio_protocol::InputEvent, std::time::Instant)>,
+    event: cursio_protocol::InputEvent,
+    at: std::time::Instant,
+) {
+    use cursio_protocol::InputEvent::PointerMotion;
+    if let (PointerMotion { dx, dy }, Some((PointerMotion { dx: sx, dy: sy }, _))) =
+        (event, batch.last_mut())
+    {
+        *sx = sx.saturating_add(dx);
+        *sy = sy.saturating_add(dy);
+        return;
+    }
+    batch.push((event, at));
+}
+
 /// Await the next item from an optional channel, or stay pending forever if
 /// there's no channel — so the `select!` arm is inert rather than busy-looping
 /// on `None`. Used for both the capture and the ownership-command channels.
@@ -1095,6 +1186,54 @@ mod tests {
         let (_, p99, max) = window.percentiles().unwrap();
         assert_eq!(p99, Duration::from_micros(100));
         assert_eq!(max, Duration::from_micros(100));
+    }
+
+    fn motion(dx: i32, dy: i32) -> cursio_protocol::InputEvent {
+        cursio_protocol::InputEvent::PointerMotion { dx, dy }
+    }
+
+    /// Queued motion reaches the injector as one move with the same total, a
+    /// click keeps its place between the moves either side of it, and the
+    /// merged move is charged with the wait of its oldest part.
+    #[test]
+    fn queued_received_motion_is_merged_around_a_click() {
+        let click = cursio_protocol::InputEvent::PointerButton {
+            button: cursio_protocol::MouseButton::Left,
+            pressed: true,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let first_at = std::time::Instant::now();
+        for event in [motion(2, 1), click, motion(-1, 0), motion(-2, 5)] {
+            tx.send((Message::Input(event), std::time::Instant::now()))
+                .unwrap();
+        }
+        let mut held_back = None;
+        let batch = drain_received_input(motion(1, 1), first_at, &mut rx, &mut held_back);
+        let events: Vec<_> = batch.iter().map(|(event, _)| *event).collect();
+        assert_eq!(events, vec![motion(3, 2), click, motion(-3, 5)]);
+        assert_eq!(batch[0].1, first_at);
+        assert!(held_back.is_none());
+    }
+
+    /// A handoff read in the middle of a burst ends the batch and is handed
+    /// back rather than handled here, and nothing behind it is taken: whether
+    /// the input after a `Grab` is injected at all depends on the `Grab`.
+    #[test]
+    fn a_handoff_ends_a_batch_of_received_input() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let now = std::time::Instant::now();
+        tx.send((Message::Input(motion(1, 0)), now)).unwrap();
+        tx.send((Message::Grab { active: false }, now)).unwrap();
+        tx.send((Message::Input(motion(5, 0)), now)).unwrap();
+        let mut held_back = None;
+        let batch = drain_received_input(motion(1, 0), now, &mut rx, &mut held_back);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].0, motion(2, 0));
+        assert!(matches!(
+            held_back,
+            Some((Message::Grab { active: false }, _))
+        ));
+        assert!(matches!(rx.try_recv(), Ok((Message::Input(_), _))));
     }
 
     /// Two machines with screens: the lower id starts with the cursor, and each

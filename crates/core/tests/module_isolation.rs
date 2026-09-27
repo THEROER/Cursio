@@ -129,8 +129,12 @@ async fn a_module_blocked_in_pump_delays_neither_input_nor_another_module() {
             Box::new(server),
             holder(),
             None,
-            move |_| {
-                injected_in_task.fetch_add(1, Ordering::Relaxed);
+            // Motion that queued arrives merged, so what is counted is the
+            // distance moved, not the calls.
+            move |ev| {
+                if let InputEvent::PointerMotion { dx, .. } = ev {
+                    injected_in_task.fetch_add(dx as usize, Ordering::Relaxed);
+                }
             },
             None,
             |_| {},
