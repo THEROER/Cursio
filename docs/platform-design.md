@@ -386,3 +386,15 @@ followed) inside the folder, and an open or a listing, which go *through* a
 final link, must land inside too. A link may still be listed and stat'ed as the
 link it is. A whole volume has nothing outside it to escape to and pays none of
 this.
+
+**The network** (`core/src/firewall.rs`). On Windows the mesh and discovery
+rules keep `profile=any` — Windows files many home LANs as Public, and a
+private-only rule would leave exactly those machines unreachable — but carry
+`remoteip=localsubnet`. The mesh is a LAN mesh found by mDNS, which never leaves
+the link, so a connection from beyond the subnet is never a peer; and with IPv6
+global addresses a permissive router no longer hides the machine, so an
+any-address rule left the handshake reachable from the internet. The price is a
+peer on a routed network (another VLAN, a VPN), which is refused. The rule name
+carries the scope, so an old any-address rule is not mistaken for the current
+one and is purged on the next start. `usbipd`'s own port is closed to the
+network by the USB setup (see `usb-design.md`).

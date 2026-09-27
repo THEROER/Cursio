@@ -31,6 +31,30 @@
 //! the user would have granted by clicking "Allow access", made without
 //! depending on them seeing a dialog.
 //!
+//! ## Profile any, but only from the local subnet
+//!
+//! "Every profile" answers *which networks* this machine may be on; it says
+//! nothing about *who* may connect, and before this the answer was anyone who
+//! could route a packet here. Cursio is a LAN mesh — peers find each other by
+//! mDNS, which never leaves the link — so a connection from beyond the local
+//! subnet is never a peer. Both rules therefore carry `remoteip=localsubnet`:
+//! the addresses on the same subnet as one of this machine's interfaces.
+//!
+//! The case this closes is IPv6. A home router hands out global addresses and
+//! NAT no longer hides the machine, so with an any-address rule the mesh port
+//! was reachable from the internet wherever the router's own firewall was
+//! permissive. Pairing still stood between that and a session, but a handshake
+//! surface open to the world is not something a LAN tool should offer.
+//!
+//! The cost is a peer on a *routed* network — another VLAN, a VPN such as
+//! Tailscale — which the firewall now refuses. Such a peer was never found by
+//! discovery either, and `--pair-addr` to it would have to be paired with a
+//! deliberately wider rule the user writes themselves.
+//!
+//! The rule name carries the scope so a machine with the older any-address
+//! rule does not find "its" rule and stop: the new name is absent, so the
+//! repair below runs once, purges the old rule by program and writes this one.
+//!
 //! ## Why a separate elevation, and not the process's own
 //!
 //! Adding the rule needs administrator rights, and Cursio does ask for them at
@@ -86,7 +110,7 @@ pub fn allow_mesh_port(port: u16) {
 /// instance on another port — do not fight over one rule.
 #[cfg(target_os = "windows")]
 fn rule_name(port: u16) -> String {
-    format!("Cursio mesh (TCP {port})")
+    format!("Cursio mesh (TCP {port}, local subnet)")
 }
 
 #[cfg(target_os = "windows")]
@@ -127,10 +151,18 @@ fn add_rule(name: &str, port: u16) -> Result<(), String> {
     // A block always beats an allow, so adding permission on top of them
     // changes nothing, and the node stays unreachable while the firewall
     // appears to have been asked nicely.
+    // All in one elevation: several prompts for one repair is too many, and
+    // stopping between them would leave the machine with neither rule.
+    run_elevated("cmd.exe", &repair_command(name, port, &exe))
+}
+
+/// The one `cmd.exe` line that replaces whatever rules name `exe` with ours.
+#[cfg(target_os = "windows")]
+fn repair_command(name: &str, port: u16, exe: &str) -> String {
     let purge = format!("advfirewall firewall delete rule name=all program=\"{exe}\"");
     let add = format!(
         "advfirewall firewall add rule name=\"{name}\" dir=in action=allow \
-         protocol=TCP localport={port} program=\"{exe}\" profile=any"
+         protocol=TCP localport={port} program=\"{exe}\" profile=any remoteip=localsubnet"
     );
     // The purge also removes the *allow* rule Windows may have written for
     // the mDNS socket, and inbound queries from peers are unsolicited UDP that
@@ -138,15 +170,12 @@ fn add_rule(name: &str, port: u16) -> Result<(), String> {
     // reachability would cost discoverability.
     let discovery = format!(
         "advfirewall firewall add rule name=\"Cursio discovery (UDP 5353)\" dir=in \
-         action=allow protocol=UDP localport=5353 program=\"{exe}\" profile=any"
+         action=allow protocol=UDP localport=5353 program=\"{exe}\" profile=any \
+         remoteip=localsubnet"
     );
-    // All in one elevation: several prompts for one repair is too many, and
-    // stopping between them would leave the machine with neither rule. `&&`
-    // so the exit status reports the first step that failed.
-    run_elevated(
-        "cmd.exe",
-        &format!("/c netsh {purge} & netsh {add} && netsh {discovery}"),
-    )
+    // `&&` so the exit status reports the first step that failed; the purge
+    // finding nothing to delete is not a failure.
+    format!("/c netsh {purge} & netsh {add} && netsh {discovery}")
 }
 
 /// Run one command with administrator rights, raising a UAC prompt.
@@ -248,6 +277,31 @@ mod tests {
     fn each_port_gets_its_own_rule() {
         assert_ne!(super::rule_name(46073), super::rule_name(46077));
         assert!(super::rule_name(46077).contains("46077"));
+    }
+
+    /// Every profile, but only the local subnet: a Public-labelled home LAN
+    /// still reaches the node, the internet over IPv6 does not.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn both_rules_admit_only_the_local_subnet_on_every_profile() {
+        let line = super::repair_command("Cursio mesh", 46073, r"C:\cursio\cursio.exe");
+        let adds: Vec<&str> = line
+            .split("netsh")
+            .filter(|c| c.contains("add rule"))
+            .collect();
+        assert_eq!(adds.len(), 2, "mesh and discovery: {line}");
+        for add in adds {
+            assert!(add.contains("profile=any"), "{add}");
+            assert!(add.contains("remoteip=localsubnet"), "{add}");
+        }
+    }
+
+    /// A machine carrying the old any-address rule must not find it under the
+    /// current name and skip the repair that narrows it.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_rule_name_says_its_scope() {
+        assert!(super::rule_name(46073).contains("local subnet"));
     }
 
     /// On platforms that do not filter inbound connections this does nothing
