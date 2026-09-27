@@ -1256,8 +1256,7 @@ fn run_capture_loop(
     // audio is silent forever (until a page *reload*, which does make a new node).
     // So we keep a live map of app-out-port -> link and re-link on a short
     // interval: drop links whose app port vanished, add links for new app ports.
-    let mut app_links: std::collections::HashMap<u32, (u32, pipewire::link::Link)> =
-        std::collections::HashMap::new();
+    let mut app_links: AppLinks = std::collections::HashMap::new();
     let app_id: u32 = if let CaptureMode::AppTap { node_id, .. } = &mode {
         node_id.parse().unwrap_or(u32::MAX)
     } else {
@@ -1297,7 +1296,7 @@ fn run_capture_loop(
             // it was routed — this links on the first try and loses nothing off
             // the front. Later passes settle longer, for a graph still forming.
             let settle = if attempt == 0 { 1 } else { 20 };
-            relink_app(&core, &loop_ref, app_id, &stream, &mut app_links, settle);
+            relink_app(&core, loop_ref, app_id, &stream, &mut app_links, settle);
             if !app_links.is_empty() {
                 tracing::info!(
                     app_id,
@@ -1327,7 +1326,7 @@ fn run_capture_loop(
             last_relink = std::time::Instant::now();
             // Short settle on the periodic pass: the registry is already cached,
             // and a long pump here would stall the capture loop (same thread).
-            relink_app(&core, &loop_ref, app_id, &stream, &mut app_links, 4);
+            relink_app(&core, loop_ref, app_id, &stream, &mut app_links, 4);
         }
     }
 }
@@ -1345,15 +1344,12 @@ const APP_RELINK_INTERVAL: Duration = Duration::from_millis(400);
 /// - drops any link whose app output port has disappeared (a pause/seek tore it
 ///   down; the dead proxy is removed so the map reflects reality), and
 /// - creates a link for any app output port not yet linked (a resume made new
-///   ports), pairing by channel (FL→FL, FR→FR, falling back to declaration
-///   order).
+///   ports), pairing by channel (FL→FL, FR→FR).
 ///
-/// `links` maps an app output port id to the input port it was wired to and the
-/// live link proxy. The input port is recorded so a later pass can tell which of
-/// our inputs are already spoken for. Those proxies must
-/// be **kept alive** — dropping one tears its link down, which is exactly how a
-/// stale link is removed above. Idempotent and safe to call on a timer: with no
-/// changes it walks the registry and does nothing.
+/// `links` is the [`AppLinks`] map; its proxies must be **kept alive** —
+/// dropping one tears its link down, which is exactly how a stale link is
+/// removed. Idempotent and safe to call on a timer: with no changes it walks the
+/// registry and does nothing. The decisions themselves are [`plan_app_links`].
 ///
 /// This heals the pause/seek silence: browsers recreate an app's output ports on
 /// resume (often on the same node id, so no Joined/Left fires), and without
@@ -1363,7 +1359,7 @@ fn relink_app(
     loop_ref: &pipewire::loop_::Loop,
     app_id: u32,
     stream: &StreamRc,
-    links: &mut std::collections::HashMap<u32, (u32, pipewire::link::Link)>,
+    links: &mut AppLinks,
     // How long to pump the loop so the registry dump arrives. The first link
     // needs a generous settle; a periodic re-check does not (objects are already
     // cached and re-listed fast), and a long pump here would block the capture
@@ -1378,9 +1374,9 @@ fn relink_app(
         return;
     };
 
-    // Collect (node_id, port_id, direction, channel) for the two nodes we care
-    // about, plus the name of a link factory.
-    type Port = (u32, u32, String, String); // node, port, direction, channel
+    // Collect the ports of the two nodes we care about, plus the name of a link
+    // factory.
+    type Port = (u32, String, LinkPort); // node, direction, port
     let ports: Rc<RefCell<Vec<Port>>> = Rc::new(RefCell::new(Vec::new()));
     let factory: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let ports_cb = ports.clone();
@@ -1406,9 +1402,21 @@ fn relink_app(
                 return;
             };
             let channel = props.get("audio.channel").unwrap_or("").to_string();
-            ports_cb
-                .borrow_mut()
-                .push((node, obj.id, dir.to_string(), channel));
+            // Absent only before PipeWire 0.3.50; 0 then compares equal every
+            // pass, which degrades to matching by id alone.
+            let serial = props
+                .get("object.serial")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            ports_cb.borrow_mut().push((
+                node,
+                dir.to_string(),
+                LinkPort {
+                    id: obj.id,
+                    serial,
+                    channel,
+                },
+            ));
         })
         .register();
 
@@ -1426,86 +1434,55 @@ fn relink_app(
     let factory = factory.borrow().clone();
     drop(_listener);
 
-    let outs: Vec<&Port> = ports
-        .iter()
-        .filter(|(n, _, d, _)| *n == app_id && d == "out")
-        .collect();
-    let ins: Vec<&Port> = ports
-        .iter()
-        .filter(|(n, _, d, _)| *n == our_node_id && d == "in")
-        .collect();
+    let side = |node: u32, dir: &str| -> Vec<LinkPort> {
+        ports
+            .iter()
+            .filter(|(n, d, _)| *n == node && d == dir)
+            .map(|(_, _, p)| p.clone())
+            .collect()
+    };
+    let outs = side(app_id, "out");
+    let ins = side(our_node_id, "in");
 
-    // Drop links whose app output port is gone (pause/seek destroyed it). Removing
-    // the proxy from the map drops it, which tears the (already dead) link down.
-    let live_outs: std::collections::HashSet<u32> = outs.iter().map(|(_, p, _, _)| *p).collect();
-    let before = links.len();
-    links.retain(|out_port, _| live_outs.contains(out_port));
-    if links.len() != before {
+    let linked: std::collections::HashMap<u32, (u64, u32)> = links
+        .iter()
+        .map(|(&out, (serial, input, _))| (out, (*serial, *input)))
+        .collect();
+    let plan = plan_app_links(&outs, &ins, &linked);
+
+    // Removing the proxy from the map drops it, which tears the (already dead)
+    // link down.
+    for out in &plan.stale {
+        links.remove(out);
+    }
+    if !plan.stale.is_empty() {
         tracing::info!(
             app_id,
-            dropped = before - links.len(),
+            dropped = plan.stale.len(),
             "dropped stale app links"
         );
     }
 
-    if outs.is_empty() || ins.is_empty() {
-        return; // nothing to (re)link right now
+    if plan.create.is_empty() {
+        return;
     }
     let Some(factory) = factory else {
         return; // no link factory this pass; try again next tick
     };
 
-    // Pair by channel name first, then positionally — but never send two app
-    // outputs into the same input.
-    //
-    // The registry hands ports back in arrival order, not channel order, so
-    // enumeration index is not a channel index: pairing on it could put FR into
-    // our FL. Sort both sides by channel name so "positional" means the same
-    // thing on each, and fall back to declaration order only for ports that
-    // carry no channel label at all.
-    let mut outs = outs;
-    let mut ins = ins;
-    outs.sort_by(|a, b| a.3.cmp(&b.3));
-    ins.sort_by(|a, b| a.3.cmp(&b.3));
-
-    // Inputs already spoken for: the ones surviving links point at, plus any
-    // claimed earlier in this pass. Without this a clamped positional fallback
-    // (`min(ins.len() - 1)`) silently piles every output onto the last input —
-    // one ear gets both channels, the other gets nothing.
-    //
-    // The claim is read back out of `links` rather than tracked alongside it:
-    // a second registry would have to be pruned in lockstep with the retain
-    // above, and any drift between the two reintroduces exactly this bug.
-    let mut taken: std::collections::HashSet<u32> =
-        links.values().map(|(input_port, _)| *input_port).collect();
-
-    // Create links for app output ports not already linked.
     let mut created = 0;
-    for (i, out) in outs.iter().enumerate() {
-        if links.contains_key(&out.1) {
-            continue; // already linked this port
-        }
-        // Prefer a free same-channel input (FL→FL), else the next free one.
-        let Some(input) = ins
-            .iter()
-            .find(|(_, p, _, ch)| !ch.is_empty() && *ch == out.3 && !taken.contains(p))
-            .or_else(|| ins.iter().filter(|(_, p, _, _)| !taken.contains(p)).nth(0))
-            .or_else(|| ins.get(i.min(ins.len() - 1)))
-        else {
-            continue;
-        };
-        taken.insert(input.1);
+    for (out, input) in plan.create {
         match core.create_object::<pipewire::link::Link>(
             &factory,
             &pipewire::properties::properties! {
-                "link.output.node" => out.0.to_string().as_str(),
-                "link.output.port" => out.1.to_string().as_str(),
-                "link.input.node" => input.0.to_string().as_str(),
-                "link.input.port" => input.1.to_string().as_str(),
+                "link.output.node" => app_id.to_string().as_str(),
+                "link.output.port" => out.id.to_string().as_str(),
+                "link.input.node" => our_node_id.to_string().as_str(),
+                "link.input.port" => input.to_string().as_str(),
             },
         ) {
             Ok(link) => {
-                links.insert(out.1, (input.1, link));
+                links.insert(out.id, (out.serial, input, link));
                 created += 1;
             }
             Err(e) => tracing::debug!(app_id, error = %e, "create link failed"),
@@ -1518,6 +1495,116 @@ fn relink_app(
             loop_ref.iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(25)));
         }
     }
+}
+
+/// An app tap's live links: app output port id → (that port's
+/// `object.serial`, the input port it feeds, the link proxy keeping it alive).
+type AppLinks = std::collections::HashMap<u32, (u64, u32, pipewire::link::Link)>;
+
+/// A port as the registry reported it on this pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkPort {
+    id: u32,
+    /// `object.serial`: unlike `id`, never reused for another object.
+    serial: u64,
+    /// `audio.channel` (`FL`, `FR`, `MONO`…), empty when the port has none.
+    channel: String,
+}
+
+/// What one [`relink_app`] pass has to change.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AppLinkPlan {
+    /// App output port ids whose recorded link no longer exists.
+    stale: Vec<u32>,
+    /// `(app output port, our input port id)` pairs to link.
+    create: Vec<(LinkPort, u32)>,
+}
+
+/// Decide which of an app tap's links are stale and which to create, given the
+/// app's output ports, our input ports, and what is linked already
+/// (`out port id → (its serial, input port id)`).
+///
+/// **A link is recognised by port id *and* serial.** PipeWire recycles object
+/// ids, and a browser recreates its output ports on every pause, seek or new
+/// video. When a recreated port happens to receive a dead port's id, matching
+/// by id alone takes the dead link for a live one: that port is never linked,
+/// and its record goes on claiming the input it used to feed. The other
+/// channel's new port then found its own input "taken" and fell back to the
+/// only free one — the *other* channel's — so the tap carried a single channel
+/// into a single ear, and which ear depended on which id was recycled. That is
+/// the Shorts pattern: both ears, then only left, then only right. The serial
+/// is never reused (PipeWire ≥ 0.3.50), so a changed serial marks the record
+/// stale.
+///
+/// **A labelled channel only ever feeds the input of the same channel.** If
+/// that input is taken this pass, the port waits for the next one
+/// ([`APP_RELINK_INTERVAL`]) rather than crossing over: a crossed link is heard
+/// as a missing ear, while a wait is a few hundred milliseconds of silence that
+/// fixes itself. Only ports whose channel no input carries (a `MONO` output, or
+/// one with no label) fall back to a free input, and never to one a labelled
+/// port has a claim on.
+///
+/// Both sides are sorted by channel first, because the registry lists ports in
+/// arrival order, not channel order.
+fn plan_app_links(
+    outs: &[LinkPort],
+    ins: &[LinkPort],
+    linked: &std::collections::HashMap<u32, (u64, u32)>,
+) -> AppLinkPlan {
+    let mut plan = AppLinkPlan::default();
+    let live = |id: u32, serial: u64| outs.iter().any(|o| o.id == id && o.serial == serial);
+
+    let mut stale: Vec<u32> = linked
+        .iter()
+        .filter(|(&id, &(serial, _))| !live(id, serial))
+        .map(|(&id, _)| id)
+        .collect();
+    stale.sort_unstable();
+    plan.stale = stale;
+
+    let mut taken: std::collections::HashSet<u32> = linked
+        .iter()
+        .filter(|(id, _)| !plan.stale.contains(id))
+        .map(|(_, &(_, input))| input)
+        .collect();
+
+    let mut outs: Vec<&LinkPort> = outs
+        .iter()
+        .filter(|o| !linked.contains_key(&o.id) || plan.stale.contains(&o.id))
+        .collect();
+    let mut ins: Vec<&LinkPort> = ins.iter().collect();
+    outs.sort_by(|a, b| a.channel.cmp(&b.channel));
+    ins.sort_by(|a, b| a.channel.cmp(&b.channel));
+
+    let own_input = |out: &LinkPort| {
+        ins.iter()
+            .find(|i| !out.channel.is_empty() && i.channel == out.channel)
+            .map(|i| i.id)
+    };
+    let matched: Vec<(&LinkPort, u32)> = outs
+        .iter()
+        .filter_map(|o| own_input(o).map(|input| (*o, input)))
+        .collect();
+    // Inputs some live labelled output has a claim on, so a fallback never
+    // takes one away from the port it belongs to.
+    let claimed: std::collections::HashSet<u32> = matched.iter().map(|&(_, i)| i).collect();
+
+    for &(out, input) in &matched {
+        if taken.insert(input) {
+            plan.create.push((out.clone(), input));
+        }
+    }
+    for &out in outs.iter().filter(|o| own_input(o).is_none()) {
+        if let Some(input) = ins
+            .iter()
+            .map(|i| i.id)
+            .find(|id| !taken.contains(id) && !claimed.contains(id))
+        {
+            taken.insert(input);
+            plan.create.push((out.clone(), input));
+        }
+    }
+    plan
 }
 
 // ---------------------------------------------------------------------------
@@ -1953,6 +2040,92 @@ fn run_playback_loop(
 mod tests {
     use super::*;
     use pipewire::spa::{pod::deserialize::PodDeserializer, sys::SPA_FORMAT_AUDIO_position};
+
+    fn port(id: u32, serial: u64, channel: &str) -> LinkPort {
+        LinkPort {
+            id,
+            serial,
+            channel: channel.into(),
+        }
+    }
+
+    /// Our capture's two inputs: 50 is FL, 51 is FR.
+    fn our_inputs() -> Vec<LinkPort> {
+        vec![port(51, 901, "FR"), port(50, 900, "FL")]
+    }
+
+    /// A recreated port that inherits a dead port's id is relinked, and each
+    /// channel lands on its own input.
+    ///
+    /// The Shorts case: Chromium replaced FL (10) and FR (11) with new ports,
+    /// and the new FR happened to get id 10. Matched by id alone, 10 still
+    /// looked linked, so it was never relinked and kept FL's input "taken" —
+    /// the new FL then crossed over into FR, and the tap carried one channel.
+    #[test]
+    fn a_port_that_reuses_a_dead_ports_id_is_relinked_to_its_own_channel() {
+        let linked = std::collections::HashMap::from([(10, (100, 50)), (11, (101, 51))]);
+        let outs = vec![port(12, 102, "FL"), port(10, 103, "FR")];
+
+        let plan = plan_app_links(&outs, &our_inputs(), &linked);
+
+        assert_eq!(
+            plan.stale,
+            vec![10, 11],
+            "both old links died with their ports"
+        );
+        assert_eq!(
+            plan.create,
+            vec![(port(12, 102, "FL"), 50), (port(10, 103, "FR"), 51)],
+            "each channel must be linked to the input of the same channel"
+        );
+    }
+
+    /// An unchanged graph needs no work, which is what makes the periodic pass
+    /// safe.
+    #[test]
+    fn a_live_link_with_the_same_serial_is_left_alone() {
+        let linked = std::collections::HashMap::from([(10, (100, 50)), (11, (101, 51))]);
+        let outs = vec![port(11, 101, "FR"), port(10, 100, "FL")];
+
+        assert_eq!(
+            plan_app_links(&outs, &our_inputs(), &linked),
+            AppLinkPlan::default()
+        );
+    }
+
+    /// A channel whose own input is occupied waits rather than crossing over.
+    ///
+    /// Crossing is heard as a missing ear for as long as the link lives; a
+    /// wait costs one relink interval and fixes itself once the occupant is
+    /// gone.
+    #[test]
+    fn a_channel_never_crosses_into_the_other_channels_input() {
+        // FL's input is held by a link still believed live.
+        let linked = std::collections::HashMap::from([(10, (100, 50))]);
+        let outs = vec![port(10, 100, "FR"), port(12, 102, "FL")];
+
+        let plan = plan_app_links(&outs, &our_inputs(), &linked);
+
+        assert!(
+            plan.create.is_empty(),
+            "FL must not be linked into FR's input: {:?}",
+            plan.create
+        );
+    }
+
+    /// A port with no channel of ours falls back to a free input, but never to
+    /// one a labelled port is about to need.
+    #[test]
+    fn an_unlabelled_port_takes_only_an_unclaimed_input() {
+        let outs = vec![port(20, 200, ""), port(21, 201, "FR")];
+
+        let plan = plan_app_links(&outs, &our_inputs(), &Default::default());
+
+        assert_eq!(
+            plan.create,
+            vec![(port(21, 201, "FR"), 51), (port(20, 200, ""), 50)]
+        );
+    }
 
     /// Our streams must declare FL/FR positions, not just "2 channels".
     ///
