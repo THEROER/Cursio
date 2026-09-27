@@ -42,6 +42,7 @@ use cursio_protocol::{
 use tokio::sync::mpsc;
 
 use crate::codec::decode_tile;
+use crate::framebuffer::{geometry_of, Geometry};
 use crate::{
     presentation_ack::PresentationAcks, SourcePick, Surrogate, WindowError, WindowRenderer,
 };
@@ -97,32 +98,15 @@ impl Surrogate for Win32Surrogate {
             return Err(WindowError::Backend("surrogate window was closed".into()));
         }
 
-        // A full-window frame at a size we don't have means the host resized.
-        let covers_full = frame.dirty.x == 0 && frame.dirty.y == 0;
-        if covers_full && (frame.dirty.width != self.width || frame.dirty.height != self.height) {
-            self.width = frame.dirty.width;
-            self.height = frame.dirty.height;
-            let _ = self.commands.send(SurrogateCommand::Resize {
-                width: self.width,
-                height: self.height,
-            });
-        } else {
-            // A tile reaching past the edge says the same thing without an
-            // origin to recognise it by — a `dirty` rect names only what
-            // changed, never the window's full size, and dragging a corner
-            // produces exactly that. The blit rejects an out-of-bounds tile
-            // rather than clipping it, so without this the picture froze for
-            // the rest of the session. See the Linux surrogate for the whole
-            // reasoning.
-            let need_w = frame.dirty.x.saturating_add(frame.dirty.width);
-            let need_h = frame.dirty.y.saturating_add(frame.dirty.height);
-            if need_w > self.width || need_h > self.height {
-                self.width = self.width.max(need_w);
-                self.height = self.height.max(need_h);
-                let _ = self.commands.send(SurrogateCommand::Grow {
-                    width: self.width,
-                    height: self.height,
-                });
+        match geometry_of(frame.dirty, frame.codec, self.width, self.height) {
+            Geometry::Unchanged => {}
+            Geometry::Resize { width, height } => {
+                (self.width, self.height) = (width, height);
+                let _ = self.commands.send(SurrogateCommand::Resize { width, height });
+            }
+            Geometry::Grow { width, height } => {
+                (self.width, self.height) = (width, height);
+                let _ = self.commands.send(SurrogateCommand::Grow { width, height });
             }
         }
 

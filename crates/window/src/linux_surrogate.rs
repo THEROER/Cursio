@@ -40,7 +40,9 @@ use gtk::{gdk, glib};
 use tokio::sync::mpsc;
 
 use crate::{
-    codec::decode_tile, framebuffer::Framebuffer, presentation_ack::PresentationAcks,
+    codec::decode_tile,
+    framebuffer::{geometry_of, Framebuffer, Geometry},
+    presentation_ack::PresentationAcks,
     video_decoder::VideoDecoder, Surrogate, WindowError, WindowRenderer,
 };
 /// Snapshot a framebuffer as a texture GTK can paint.
@@ -104,36 +106,17 @@ pub struct GtkSurrogate {
 
 impl Surrogate for GtkSurrogate {
     fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
-        // A frame covering a size we don't have means the host resized the
-        // window; adopt the new geometry before blitting into it.
-        let covers_full = frame.dirty.x == 0 && frame.dirty.y == 0;
-        if covers_full && (frame.dirty.width != self.width || frame.dirty.height != self.height) {
-            self.width = frame.dirty.width;
-            self.height = frame.dirty.height;
-            let _ = self.commands.send(SurrogateCommand::Resize {
-                width: self.width,
-                height: self.height,
-            });
-        } else {
-            // A tile reaching past the edge also means the host grew the window,
-            // but this one carries no origin to recognise it by: a `dirty` rect
-            // is only the region that changed, and the frame does not state the
-            // window's full size. Dragging a window's corner produces exactly
-            // that — tiles at a fixed offset whose extent creeps outwards — and
-            // rejecting them (the blit is deliberately strict, never clipping)
-            // froze the picture for the rest of the session, because every
-            // later tile was measured against the stale geometry too. Growing to
-            // fit keeps the stream alive; the host's next full frame settles the
-            // real size.
-            let need_w = frame.dirty.x.saturating_add(frame.dirty.width);
-            let need_h = frame.dirty.y.saturating_add(frame.dirty.height);
-            if need_w > self.width || need_h > self.height {
-                self.width = self.width.max(need_w);
-                self.height = self.height.max(need_h);
-                let _ = self.commands.send(SurrogateCommand::Grow {
-                    width: self.width,
-                    height: self.height,
-                });
+        // A frame the picture cannot hold means the host resized the window;
+        // adopt the new geometry before blitting into it.
+        match geometry_of(frame.dirty, frame.codec, self.width, self.height) {
+            Geometry::Unchanged => {}
+            Geometry::Resize { width, height } => {
+                (self.width, self.height) = (width, height);
+                let _ = self.commands.send(SurrogateCommand::Resize { width, height });
+            }
+            Geometry::Grow { width, height } => {
+                (self.width, self.height) = (width, height);
+                let _ = self.commands.send(SurrogateCommand::Grow { width, height });
             }
         }
 

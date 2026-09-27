@@ -5,7 +5,7 @@
 //! the final step (handing the pixels to the toolkit) differs — so it lives
 //! here rather than being written twice.
 
-use cursio_protocol::Rect;
+use cursio_protocol::{Rect, TileCodec};
 
 use crate::WindowError;
 
@@ -30,8 +30,8 @@ impl Framebuffer {
 
     /// Grow/shrink to a new geometry, dropping old contents.
     ///
-    /// The host signals a resize by sending a frame whose dirty rect covers the
-    /// full new size, so the discarded pixels are about to be replaced wholesale.
+    /// Only for a size learnt from a video frame (see [`geometry_of`]), which
+    /// replaces the discarded pixels wholesale.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.pixels = vec![0; (width as usize) * (height as usize) * 4];
         self.width = width;
@@ -86,6 +86,50 @@ impl Framebuffer {
         }
         Ok(())
     }
+}
+
+/// What an incoming frame says about the size of the window it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Geometry {
+    /// Fits the picture as it is.
+    Unchanged,
+    /// A new size whose frame replaces the whole picture: start over.
+    Resize { width: u32, height: u32 },
+    /// Larger than the picture, learnt from a tile: keep what is drawn.
+    Grow { width: u32, height: u32 },
+}
+
+/// Read a frame covering `dirty`, coded as `codec`, against a picture of
+/// `width`x`height`.
+///
+/// Only a video frame may shrink or reset the picture, because only a video
+/// frame is known to be the whole window — the stream is the full frame by
+/// construction. A tile names what changed and nothing more; reading "starts at
+/// the origin and differs in size" as a resize, as the surrogates once did,
+/// cleared the picture to black whenever a change happened to touch the
+/// top-left corner (GNOME's Activities button, a pointer in the corner), after
+/// which only the tiles that followed were drawn again. A tile reaching past
+/// the edge still grows the picture: dragging a window's corner produces
+/// exactly that, and the blit refuses a tile it cannot fit.
+pub fn geometry_of(dirty: Rect, codec: TileCodec, width: u32, height: u32) -> Geometry {
+    let reach_w = dirty.x.saturating_add(dirty.width);
+    let reach_h = dirty.y.saturating_add(dirty.height);
+    if codec == TileCodec::LossyVideo {
+        if (reach_w, reach_h) == (width, height) {
+            return Geometry::Unchanged;
+        }
+        return Geometry::Resize {
+            width: reach_w,
+            height: reach_h,
+        };
+    }
+    if reach_w > width || reach_h > height {
+        return Geometry::Grow {
+            width: width.max(reach_w),
+            height: height.max(reach_h),
+        };
+    }
+    Geometry::Unchanged
 }
 
 /// Where a `src_w`x`src_h` picture lands inside a `dst_w`x`dst_h` area when
@@ -286,5 +330,50 @@ mod tests {
         fb.resize(8, 4);
         assert_eq!(fb.width, 8);
         assert_eq!(fb.pixels.len(), 8 * 4 * 4);
+    }
+
+    fn rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn a_tile_in_the_top_left_corner_is_drawn_not_taken_for_a_resize() {
+        let corner = rect(0, 0, 120, 32);
+        for codec in [TileCodec::RawBgra8888, TileCodec::LosslessBgra8888] {
+            assert_eq!(geometry_of(corner, codec, 1920, 1080), Geometry::Unchanged);
+        }
+    }
+
+    #[test]
+    fn a_tile_past_the_edge_grows_the_picture() {
+        assert_eq!(
+            geometry_of(rect(1900, 1000, 40, 100), TileCodec::RawBgra8888, 1920, 1080),
+            Geometry::Grow {
+                width: 1940,
+                height: 1100
+            }
+        );
+    }
+
+    #[test]
+    fn a_video_frame_at_another_size_resizes_either_way() {
+        let smaller = rect(0, 0, 1280, 720);
+        assert_eq!(
+            geometry_of(smaller, TileCodec::LossyVideo, 1920, 1080),
+            Geometry::Resize {
+                width: 1280,
+                height: 720
+            }
+        );
+        let same = rect(0, 0, 1920, 1080);
+        assert_eq!(
+            geometry_of(same, TileCodec::LossyVideo, 1920, 1080),
+            Geometry::Unchanged
+        );
     }
 }

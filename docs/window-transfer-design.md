@@ -239,6 +239,25 @@ opened at all. Encoders are now shut down on drop, and `open` tries every
 encoder through to a started stream, so an exhausted GPU falls back to
 Microsoft's software encoder (measured there: 1080p at ~20 ms/frame).
 
+## Keeping the viewer's picture right (2026-09-27)
+
+A Windows view of a GNOME monitor showed black on first connect, then
+"imprints" of earlier frames that updated only where the pointer passed, and a
+closed menu stayed burnt into the picture. Several causes, each fixed where it
+lives:
+
+**Only video resizes the picture.** A frame carries its `dirty` rect and no
+window size, so viewers inferred the size: a frame at the origin whose size
+differed from theirs meant "the host resized". But a tile is only the region
+that changed, and any change touching the top-left corner (GNOME's Activities
+button, the pointer in the corner) starts at the origin — so the viewer
+cleared its picture to black at that tile's size, and only later tiles were
+drawn back. `framebuffer::geometry_of` now resizes only on a video frame (the
+stream is the whole window by construction) and only *grows* on a tile that
+reaches past the edge. A host resize reaches the viewer as video — the first
+frame at a new size is a full-window change — so what is lost is shrinking
+from tiles alone, when no encoder opens.
+
 ## Wire protocol
 
 `crates/protocol/src/window.rs` (added in `PROTOCOL_VERSION = 4`). All types are

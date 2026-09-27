@@ -41,7 +41,7 @@ use cursio_protocol::{
 use tokio::sync::mpsc;
 
 use crate::codec::decode_tile;
-use crate::framebuffer::{scale_into, Framebuffer};
+use crate::framebuffer::{geometry_of, scale_into, Framebuffer, Geometry};
 use crate::presentation_ack::PresentationAcks;
 use crate::video_decoder::VideoDecoder;
 use crate::{Surrogate, WindowError};
@@ -142,27 +142,15 @@ impl PipeWireScreenSource {
 
 impl Surrogate for PipeWireScreenSource {
     fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
-        // The same geometry reading as the window surrogates: a full-size
-        // frame at a new size means the host's source changed size, a tile
-        // past the edge means it grew.
-        let covers_full = frame.dirty.x == 0 && frame.dirty.y == 0;
-        if covers_full && (frame.dirty.width != self.width || frame.dirty.height != self.height) {
-            self.width = frame.dirty.width;
-            self.height = frame.dirty.height;
-            self.send(Command::Resize {
-                width: self.width,
-                height: self.height,
-            })?;
-        } else {
-            let need_w = frame.dirty.x.saturating_add(frame.dirty.width);
-            let need_h = frame.dirty.y.saturating_add(frame.dirty.height);
-            if need_w > self.width || need_h > self.height {
-                self.width = self.width.max(need_w);
-                self.height = self.height.max(need_h);
-                self.send(Command::Grow {
-                    width: self.width,
-                    height: self.height,
-                })?;
+        match geometry_of(frame.dirty, frame.codec, self.width, self.height) {
+            Geometry::Unchanged => {}
+            Geometry::Resize { width, height } => {
+                (self.width, self.height) = (width, height);
+                self.send(Command::Resize { width, height })?;
+            }
+            Geometry::Grow { width, height } => {
+                (self.width, self.height) = (width, height);
+                self.send(Command::Grow { width, height })?;
             }
         }
         if frame.codec == TileCodec::LossyVideo {
