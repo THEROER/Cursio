@@ -52,6 +52,8 @@ pub mod module;
 /// shared cursor rides.
 pub(crate) mod module_host;
 pub mod node_status;
+/// Who may pair right now, with what secret, and for how long.
+pub mod pairing_window;
 /// Installing Cursio as this user's ScreenCast portal backend.
 #[cfg(all(target_os = "linux", feature = "window"))]
 pub mod portal_setup;

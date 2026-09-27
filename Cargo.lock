@@ -1158,6 +1158,7 @@ dependencies = [
  "directories",
  "hostname",
  "libc",
+ "rand",
  "rpassword",
  "serde",
  "serde_json",

@@ -131,6 +131,15 @@ rather than an error, which is why an explicit key-confirmation step follows; on
 after it passes is the peer written to the trust store. `--pair-addr` names the
 machine directly when mDNS will not, and naming it also means this side dials.
 
+The same window can instead be opened with a **one-time code**
+(`core/src/pairing_window.rs`): one machine shows eight characters (`ABCD-EFGH`,
+no `0 O 1 I L`), the other types them, and the code *is* the SPAKE2 password —
+the protocol is unchanged. A short secret is safe here because SPAKE2 gives an
+eavesdropper nothing to test guesses against offline; every guess is a live
+handshake. So the window budgets those: three failed key confirmations shut it
+(for a password window too), a code lasts five minutes, and the first
+successful pairing spends it. A dropped socket does not count as a failure.
+
 ## Where a machine stands
 
 Placement is a **grid cell**, `--at X,Y`, carried in `Hello` — cells, not pixels,

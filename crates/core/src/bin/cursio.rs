@@ -31,6 +31,7 @@ use clap::{Parser, Subcommand};
 use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
 use cursio_core::node_status::NodeStatusMonitor;
+use cursio_core::pairing_window::PairingWindow;
 use cursio_core::session::{self};
 use cursio_core::NodeIdentity;
 use cursio_protocol::{Fitness, PeerId, Quality, ServiceId, ServiceOffer};
@@ -666,16 +667,15 @@ async fn main() -> anyhow::Result<()> {
             );
             // Read before anything binds a port, so a mistyped password costs
             // nothing and the prompt is not buried under startup logging.
-            let pairing = if pair {
+            let pairing = PairingWindow::closed();
+            if pair {
                 let password = read_pairing_password()?;
                 tracing::info!(
-                    minutes = PAIRING_WINDOW.as_secs() / 60,
+                    minutes = cursio_core::pairing_window::PASSWORD_LIFETIME.as_secs() / 60,
                     "pairing window open; run `cursio mesh --pair` on the other machine too"
                 );
-                PairingWindow::open(password, PAIRING_WINDOW, pair_addr)
-            } else {
-                PairingWindow::closed()
-            };
+                pairing.open_password(password, pair_addr);
+            }
             // Everything the service module needs, built before the registry
             // so the same state is read by the AirPlay bring-up below.
             let service_state = cursio_core::service_session::ServiceState::new();
@@ -1566,79 +1566,6 @@ async fn run_mesh(
 /// connection, where the identity is only known after the handshake. Either way
 /// the peer ends up `Offline` when the session finishes, so the next sweep can
 /// reconnect it.
-/// How long `--pair` stays willing to meet a machine it has never seen.
-const PAIRING_WINDOW: Duration = Duration::from_secs(10 * 60);
-
-/// A time-boxed willingness to pair with an unknown machine.
-///
-/// A mesh node refuses an inbound stranger outright: the trust store is the
-/// only way in, which is what keeps joining the mesh an explicit act. That left
-/// no way to *become* trusted: SPAKE2 needs both halves, and a node with no
-/// password bails before running its own. `--pair` opens this window at both
-/// ends so a first meeting can happen — it is what lets the mesh dial a machine
-/// it has never met, as well as accept one — and the deadline closes it again
-/// so a node left running overnight is not standing open to the LAN.
-#[derive(Clone)]
-struct PairingWindow(std::rc::Rc<std::cell::RefCell<Option<OpenPairingWindow>>>);
-
-struct OpenPairingWindow {
-    password: Zeroizing<String>,
-    closes_at: std::time::Instant,
-    /// Where to find the machine to pair with, when mDNS will not say. Part of
-    /// the window rather than carried beside it: both are the same fact —
-    /// this node is trying to meet a stranger, and here is what it knows.
-    addr: Option<SocketAddr>,
-}
-
-impl PairingWindow {
-    fn closed() -> Self {
-        Self(std::rc::Rc::new(std::cell::RefCell::new(None)))
-    }
-
-    fn open(password: Zeroizing<String>, for_: Duration, addr: Option<SocketAddr>) -> Self {
-        Self(std::rc::Rc::new(std::cell::RefCell::new(Some(
-            OpenPairingWindow {
-                password,
-                addr,
-                closes_at: std::time::Instant::now() + for_,
-            },
-        ))))
-    }
-
-    /// The address the user named, while the window is open.
-    fn addr(&self) -> Option<SocketAddr> {
-        self.0
-            .borrow()
-            .as_ref()
-            .filter(|open| open.closes_at > std::time::Instant::now())
-            .and_then(|open| open.addr)
-    }
-
-    fn is_open(&self) -> bool {
-        self.0
-            .borrow()
-            .as_ref()
-            .is_some_and(|open| open.closes_at > std::time::Instant::now())
-    }
-
-    /// The password to offer an inbound peer, or empty once the window shut.
-    ///
-    /// An expired window drops the password rather than merely ignoring it, so
-    /// it stops existing in the process at the moment it stops being usable.
-    fn password(&self) -> Zeroizing<String> {
-        let mut slot = self.0.borrow_mut();
-        match slot.as_ref() {
-            Some(open) if open.closes_at > std::time::Instant::now() => open.password.clone(),
-            Some(_) => {
-                *slot = None;
-                tracing::info!("pairing window closed; unknown machines are refused again");
-                Zeroizing::new(String::new())
-            }
-            None => Zeroizing::new(String::new()),
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn spawn_peer_session(
     transport: TcpTransport,
@@ -1712,11 +1639,10 @@ fn spawn_peer_session(
         // either can be the one that dialled a stranger — the mesh calls a
         // machine it has never met while `--pair` is open, and used to leave
         // this empty on the assumption that a dialled peer is always trusted.
-        let password = pairing.password();
         let result = run_pairing_and_session(
             transport,
             identity,
-            &password,
+            &pairing,
             role,
             false,
             capture_for_session,
@@ -1774,7 +1700,9 @@ type IdentifiedCallback<'a> = dyn FnMut(cursio_protocol::PeerId, &str) + 'a;
 async fn run_pairing_and_session(
     transport: TcpTransport,
     identity: NodeIdentity,
-    password: &str,
+    // Consulted only for a stranger, and told how the meeting went: a code
+    // is spent by one success, and every window shuts after a few failures.
+    pairing: &PairingWindow,
     role: Role,
     test_input: bool,
     // Capture is created ONCE by the caller and lent to each peer session — see
@@ -1797,9 +1725,10 @@ async fn run_pairing_and_session(
     // Handshake, pairing, Noise and module negotiation are the same five steps
     // for every node, so they live in `link` — the app and a phone run this
     // exact sequence rather than a second copy of it.
+    let password = pairing.password();
     let plan = cursio_core::link::Handshake {
         identity: &identity,
-        password,
+        password: &password,
         role,
         registry: modules,
         position,
@@ -1814,7 +1743,32 @@ async fn run_pairing_and_session(
     if let Some(cb) = on_identified {
         cb(identified.peer.peer_id, &identified.peer.display_name);
     }
-    let link = cursio_core::link::secure(identified, &plan).await?;
+    let stranger = !password.is_empty()
+        && TrustStore::load().is_ok_and(|store| store.get(&identified.peer.peer_id).is_none());
+    let peer_name = identified.peer.display_name.clone();
+    let link = match cursio_core::link::secure(identified, &plan).await {
+        Ok(link) => link,
+        Err(error) => {
+            // Only a wrong secret counts against the window. A dropped socket
+            // mid-handshake is the network, and closing the window for it
+            // would punish the user for Wi-Fi.
+            if stranger
+                && matches!(
+                    error.downcast_ref::<cursio_transport::pairing::PairingError>(),
+                    Some(
+                        cursio_transport::pairing::PairingError::ConfirmationFailed
+                            | cursio_transport::pairing::PairingError::Rejected(_)
+                    )
+                )
+            {
+                pairing.note_failure();
+            }
+            return Err(error);
+        }
+    };
+    if stranger {
+        pairing.note_paired(&peer_name);
+    }
     // Now that the peer has said where it stands, capture can watch the edge
     // between us. This is what replaced `--peer-edge`: both machines already
     // know, and the flag only existed because the barrier had to be armed

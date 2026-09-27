@@ -71,6 +71,8 @@ hostname.workspace = true
 directories.workspace = true
 toml.workspace = true
 zeroize = "1"
+# Pairing codes: drawn from the OS generator, since the code is the secret.
+rand.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Turning off terminal echo for the pairing prompt ourselves: rpassword 7.5 also
