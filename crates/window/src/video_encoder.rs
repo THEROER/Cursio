@@ -344,6 +344,37 @@ impl VideoEncoder {
         self.fidelity
     }
 
+    /// Move a lossy stream to `bitrate` without reopening it.
+    ///
+    /// Reopening would mean a keyframe — the most expensive frame there is,
+    /// sent exactly when the link has just said it is short — and a visible
+    /// restart. x264 re-reads the context's rate on the next frame and
+    /// reconfigures in place, no keyframe. NVENC through FFmpeg re-keys
+    /// anyway: its reconfigure sets `resetEncoder` and `forceIDR` for any rate
+    /// change (`nvenc.c`, FFmpeg 7.1; measured here as an IDR on the very next
+    /// frame). So NVENC moves only for a change of a quarter or more, which
+    /// lets a step down through and makes two small steps up cost one
+    /// keyframe instead of two. A lossless stream has no rate to move.
+    pub fn set_bitrate(&mut self, bitrate: u32) {
+        let Fidelity::Lossy { bitrate: current } = self.fidelity else {
+            return;
+        };
+        if current == bitrate {
+            return;
+        }
+        if self.kind == EncoderKind::Nvenc && current.abs_diff(bitrate) < current / 4 {
+            return;
+        }
+        // SAFETY: the context is owned by `self.encoder` and alive; FFmpeg's
+        // encoders read `bit_rate`/`rc_max_rate` from it on each frame.
+        unsafe {
+            let ctx = self.encoder.as_mut_ptr();
+            (*ctx).bit_rate = bitrate as i64;
+            (*ctx).rc_max_rate = bitrate as i64 * 2;
+        }
+        self.fidelity = Fidelity::Lossy { bitrate };
+    }
+
     /// The fixed frame size this encoder was opened for.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -523,6 +554,47 @@ mod tests {
         );
         let lossless = first_packet(Fidelity::Lossless);
         assert_eq!(sps_profile(&lossless), Some(244));
+    }
+
+    #[test]
+    fn changing_the_bitrate_keeps_the_stream_going_without_a_keyframe() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        // x264 specifically: NVENC re-keys on any rate change (see
+        // `set_bitrate`), which is a property of FFmpeg's wrapper, not ours.
+        let mut enc = VideoEncoder::try_open(
+            EncoderKind::Software,
+            320,
+            240,
+            Fidelity::Lossy { bitrate: 8_000_000 },
+        )
+        .expect("encoder");
+        // A small moving block on a still background: a whole-frame colour
+        // change would be a scene cut, which earns a keyframe on its own.
+        let frame = |i: usize| {
+            let mut f = solid_bgra(320, 240, 0x40);
+            for y in 100..116 {
+                let start = (y * 320 + i * 8) * 4;
+                f[start..start + 64].fill(0xF0);
+            }
+            f
+        };
+        for i in 0..5 {
+            enc.encode(&frame(i)).expect("encode");
+        }
+        enc.set_bitrate(2_000_000);
+        assert_eq!(enc.fidelity(), Fidelity::Lossy { bitrate: 2_000_000 });
+        let mut after = Vec::new();
+        for i in 5..15 {
+            after.extend(enc.encode(&frame(i)).expect("encode"));
+        }
+        assert!(
+            !after.is_empty(),
+            "the stream stopped after the rate change"
+        );
+        assert!(
+            !after.iter().any(|p| crate::video::contains_keyframe(p)),
+            "a rate change must not cost a keyframe"
+        );
     }
 
     #[test]

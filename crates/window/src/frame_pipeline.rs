@@ -223,6 +223,15 @@ pub struct AdaptiveQuality {
     /// viewer cannot decode shows nothing, while a lossy one it can is merely
     /// softer.
     lossless: std::sync::atomic::AtomicBool,
+    /// The lossy stream's bitrate as a percentage of [`lossy_bitrate`] for its
+    /// size, moved by [`BitrateLadder`] on the session thread and read by the
+    /// capture thread per encoded frame.
+    bitrate_pct: std::sync::atomic::AtomicU32,
+    ladder: std::sync::Mutex<BitrateLadder>,
+    /// When the capture thread last encoded video, in milliseconds since
+    /// `epoch`; how the ladder tells an idle source from a congested link.
+    last_video_ms: std::sync::atomic::AtomicU64,
+    epoch: std::time::Instant,
 }
 
 impl Default for AdaptiveQuality {
@@ -235,11 +244,38 @@ impl Default for AdaptiveQuality {
                 (VIDEO_AREA_THRESHOLD_MAX * 100.0) as u32,
             ),
             lossless: std::sync::atomic::AtomicBool::new(false),
+            bitrate_pct: std::sync::atomic::AtomicU32::new(BitrateLadder::START_PCT),
+            ladder: std::sync::Mutex::new(BitrateLadder::default()),
+            last_video_ms: std::sync::atomic::AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
         }
     }
 }
 
 impl AdaptiveQuality {
+    /// The bitrate a lossy stream of this size should run at now.
+    pub fn bitrate(&self, width: u32, height: u32) -> u32 {
+        let pct = self.bitrate_pct.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        (lossy_bitrate(width, height) as u64 * pct / 100) as u32
+    }
+
+    /// The capture thread just sent a video frame.
+    pub fn note_video_sent(&self) {
+        let ms = self.epoch.elapsed().as_millis() as u64;
+        self.last_video_ms
+            .store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether video went out recently enough for acks to say anything about
+    /// how much the link carries.
+    fn video_active(&self) -> bool {
+        let last = self
+            .last_video_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let now = self.epoch.elapsed().as_millis() as u64;
+        last != 0 && now.saturating_sub(last) < BitrateLadder::ACTIVE_WINDOW.as_millis() as u64
+    }
+
     /// Whether the video path may use a lossless stream.
     pub fn lossless(&self) -> bool {
         self.lossless.load(std::sync::atomic::Ordering::Relaxed)
@@ -262,6 +298,18 @@ impl AdaptiveQuality {
     ///
     /// Returns the new threshold when it moved, for the caller to log.
     pub fn observe(&self, gap: u32) -> Option<f64> {
+        let active = self.video_active();
+        if let Ok(mut ladder) = self.ladder.lock() {
+            if let Some(pct) = ladder.observe(gap, active, std::time::Instant::now()) {
+                self.bitrate_pct
+                    .store(pct, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    gap,
+                    bitrate_pct = pct,
+                    "link changed; moving the video bitrate"
+                );
+            }
+        }
         let current = self.threshold();
         let next = next_threshold(current, gap);
         if (next - current).abs() < f64::EPSILON {
@@ -295,6 +343,90 @@ pub fn lossy_bitrate(width: u32, height: u32) -> u32 {
     const MAX: u64 = 40_000_000;
     let bits = (width as u64) * (height as u64) * 60 / 10;
     bits.clamp(MIN, MAX) as u32
+}
+
+/// Moves a lossy stream's bitrate with what the link carries.
+///
+/// The same signal as the tile threshold — frames sent but not yet presented —
+/// read with more patience, because a bitrate change is more visible than a
+/// threshold change. Down is fast and up is slow, the shape every congestion
+/// controller has: a backlog costs latency on the cursor's own link *now*,
+/// while headroom unused for a few seconds costs only sharpness. After a step
+/// down the ladder holds before climbing again, so a link hovering at its
+/// limit settles below it instead of oscillating across it.
+///
+/// Silence is not calm. A source that stopped changing sends no frames, so
+/// every ack reads "caught up" — which says nothing about what the link would
+/// carry, and climbing on it would meet the next burst of motion at a bitrate
+/// the link never proved it takes. Only acks that arrive while video is
+/// flowing count towards a step up; a backlog counts whenever it is seen.
+///
+/// Levels are percentages of [`lossy_bitrate`] rather than bits per second,
+/// so the ladder needs no knowledge of the source's size and a resize keeps
+/// the level the link earned.
+#[derive(Debug)]
+pub struct BitrateLadder {
+    pct: u32,
+    calm_acks: u32,
+    hold_until: Option<std::time::Instant>,
+}
+
+impl Default for BitrateLadder {
+    fn default() -> Self {
+        Self {
+            pct: Self::START_PCT,
+            calm_acks: 0,
+            hold_until: None,
+        }
+    }
+}
+
+impl BitrateLadder {
+    pub const START_PCT: u32 = 100;
+    /// A fifth of the starting rate — below it H.264 on a desktop smears text
+    /// past reading, and a link that cannot carry this is better served by
+    /// the tile threshold dropping further.
+    pub const MIN_PCT: u32 = 20;
+    /// Three and a half times the start: about 43 Mbit/s at 1080p, where
+    /// further bits stop being visible on screen content.
+    pub const MAX_PCT: u32 = 350;
+    /// Acks while flowing and caught up before one step up (a few seconds at
+    /// the rate viewers ack).
+    const CALM_ACKS_TO_CLIMB: u32 = 6;
+    /// No climbing for this long after a step down.
+    const HOLD_AFTER_DROP: std::time::Duration = std::time::Duration::from_secs(4);
+    /// Video sent within this long counts as flowing.
+    pub const ACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Fold in one ack's backlog; the new level when it moved.
+    pub fn observe(&mut self, gap: u32, active: bool, now: std::time::Instant) -> Option<u32> {
+        if gap > BACKLOG_HIGH {
+            self.calm_acks = 0;
+            self.hold_until = Some(now + Self::HOLD_AFTER_DROP);
+            let next = (self.pct * 7 / 10).max(Self::MIN_PCT);
+            return self.moved_to(next);
+        }
+        if !active || gap > BACKLOG_LOW {
+            self.calm_acks = 0;
+            return None;
+        }
+        self.calm_acks += 1;
+        let held = self.hold_until.is_some_and(|until| now < until);
+        if self.calm_acks < Self::CALM_ACKS_TO_CLIMB || held {
+            return None;
+        }
+        self.calm_acks = 0;
+        let next = (self.pct * 115 / 100).min(Self::MAX_PCT);
+        self.moved_to(next)
+    }
+
+    fn moved_to(&mut self, next: u32) -> Option<u32> {
+        if next == self.pct {
+            return None;
+        }
+        self.pct = next;
+        Some(next)
+    }
 }
 
 /// Whether a change covering `dirty` of a `width`x`height` window should go
@@ -675,5 +807,76 @@ mod differ_tests {
         // compressing would make the tile *bigger*.
         assert_eq!(pick_codec(64), TileCodec::RawBgra8888);
         assert_eq!(pick_codec(64 * 1024), TileCodec::LosslessBgra8888);
+    }
+
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_backlog_drops_the_bitrate_at_once() {
+        let mut ladder = BitrateLadder::default();
+        assert_eq!(ladder.observe(10, true, Instant::now()), Some(70));
+    }
+
+    #[test]
+    fn a_calm_flowing_link_climbs_only_after_several_acks() {
+        let mut ladder = BitrateLadder::default();
+        let now = Instant::now();
+        for _ in 0..5 {
+            assert_eq!(ladder.observe(0, true, now), None);
+        }
+        assert_eq!(ladder.observe(0, true, now), Some(115));
+    }
+
+    #[test]
+    fn an_idle_source_never_climbs() {
+        let mut ladder = BitrateLadder::default();
+        let now = Instant::now();
+        for _ in 0..50 {
+            assert_eq!(
+                ladder.observe(0, false, now),
+                None,
+                "no frames because nothing changed says nothing about the link"
+            );
+        }
+    }
+
+    #[test]
+    fn after_a_drop_the_ladder_holds_before_climbing_again() {
+        let mut ladder = BitrateLadder::default();
+        let start = Instant::now();
+        ladder.observe(10, true, start);
+        for _ in 0..12 {
+            assert_eq!(
+                ladder.observe(0, true, start + Duration::from_secs(1)),
+                None
+            );
+        }
+        let later = start + Duration::from_secs(5);
+        let climbed = (0..6).filter_map(|_| ladder.observe(0, true, later)).last();
+        assert_eq!(climbed, Some(80));
+    }
+
+    #[test]
+    fn the_bitrate_stays_within_its_floor_and_ceiling() {
+        let mut ladder = BitrateLadder::default();
+        let now = Instant::now();
+        for _ in 0..50 {
+            ladder.observe(10, true, now);
+        }
+        assert_eq!(ladder.pct, BitrateLadder::MIN_PCT);
+        let mut ladder = BitrateLadder::default();
+        for _ in 0..500 {
+            ladder.observe(0, true, now);
+        }
+        assert_eq!(ladder.pct, BitrateLadder::MAX_PCT);
+    }
+
+    #[test]
+    fn a_middling_backlog_holds_the_bitrate() {
+        let mut ladder = BitrateLadder::default();
+        let now = Instant::now();
+        for _ in 0..20 {
+            assert_eq!(ladder.observe(2, true, now), None);
+        }
     }
 }

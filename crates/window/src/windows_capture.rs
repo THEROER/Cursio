@@ -400,7 +400,7 @@ fn emit_frame(
             // Too small to encode at all; the tile path below handles it.
         } else if video.is_none() && !failed_here {
             tracing::info!(width = vw, height = vh, "opening the video encoder");
-            match crate::video_encoder_win::VideoEncoder::open(vw, vh) {
+            match crate::video_encoder_win::VideoEncoder::open(vw, vh, quality.bitrate(vw, vh)) {
                 Ok(enc) => {
                     tracing::info!("video encoder opened");
                     *video = Some(enc);
@@ -417,6 +417,7 @@ fn emit_frame(
         }
 
         if let Some(enc) = video.as_mut() {
+            enc.set_bitrate(quality.bitrate(vw, vh));
             let first = *seq < 3;
             if first {
                 tracing::info!(seq = *seq, "encoding frame");
@@ -449,7 +450,6 @@ fn emit_frame(
                         .into_iter()
                         .map(|data| {
                             *seq = seq.wrapping_add(1);
-            last_seq.store(*seq, Ordering::Relaxed);
                             last_seq.store(*seq, Ordering::Relaxed);
                             WindowFrame {
                                 id,
@@ -463,6 +463,8 @@ fn emit_frame(
                     if crate::frame_pipeline::try_queue_frames(frames_tx, frames).is_err() {
                         differ.reset();
                         *video = None;
+                    } else {
+                        quality.note_video_sent();
                     }
                     return;
                 }
@@ -481,6 +483,9 @@ fn emit_frame(
     match crate::codec::encode_tile(codec, &tile) {
         Ok(data) => {
             *seq = seq.wrapping_add(1);
+            // Tiles count towards the backlog too: an ack is compared with
+            // the newest seq sent, whichever path carried it.
+            last_seq.store(*seq, Ordering::Relaxed);
             if frames_tx
                 .try_send(WindowFrame {
                     id,

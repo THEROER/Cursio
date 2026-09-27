@@ -16,9 +16,11 @@
 //!
 //! Media Foundation exposes no dependable lossless mode. `ICodecAPI` has a
 //! quality knob, but its meaning is vendor-defined, hardware encoders clamp it,
-//! and none of them promise exactness. So this encoder runs at **maximum
-//! quality**, not lossless, and the consequence is honest: on a Windows host,
-//! large updates are visually near-perfect but not bit-exact.
+//! and none of them promise exactness. So this encoder runs **lossy at a
+//! bitrate** that follows the link ([`BitrateLadder`](crate::frame_pipeline::BitrateLadder)),
+//! changed on the live stream, and the consequence is honest: on a Windows
+//! host, large updates are near-perfect with headroom and softer without it,
+//! never bit-exact.
 //!
 //! Why that is acceptable here rather than a blocker: the codec routing only
 //! sends a region to video once it is changing across a large fraction of the
@@ -52,8 +54,23 @@ const FRAME_RATE: u32 = 60;
 /// anything until one arrives, so this bounds that wait.
 const KEYFRAME_INTERVAL_SECS: u32 = 2;
 
+/// How long an asynchronous encoder may take to ask for the next frame. A
+/// hardware encoder asks within a millisecond or two of finishing the last;
+/// this long means it is stuck, and the caller falls back to tiles.
+const ASYNC_INPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long to wait for a frame's packet before returning without it. Most
+/// arrive within a few milliseconds; a late one goes out with the next frame.
+const ASYNC_OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Encodes one window's BGRA frames into an H.264 stream.
 pub struct VideoEncoder {
+    /// Kept to shut the transform down on drop. Releasing a hardware
+    /// encoder's last reference does not end its GPU session; only
+    /// `ShutdownObject` does. Without it every reopen leaked one: the
+    /// Windows peer's daemon was found holding all 12 of its NVENC sessions,
+    /// and every later open on that machine failed.
+    activate: IMFActivate,
     transform: IMFTransform,
     width: u32,
     height: u32,
@@ -62,6 +79,14 @@ pub struct VideoEncoder {
     /// Frame index, used to derive presentation timestamps. Must increase
     /// monotonically or the transform rejects the sample.
     frame_index: i64,
+    /// Set for an asynchronous (hardware) transform, which is driven by its
+    /// events rather than by calling it; see [`Self::encode_async`].
+    events: Option<IMFMediaEventGenerator>,
+    /// `METransformNeedInput` events not yet answered with a frame.
+    input_credits: u32,
+    /// Where the bitrate is changed on the live stream.
+    codec_api: Option<ICodecAPI>,
+    bitrate: u32,
 }
 
 impl VideoEncoder {
@@ -71,7 +96,7 @@ impl VideoEncoder {
     /// mid-stream, so a window resize means a new encoder (and a fresh
     /// keyframe). Same contract as the Linux encoder, which the capture backend
     /// relies on when it compares [`size`](Self::size).
-    pub fn open(width: u32, height: u32) -> Result<Self, WindowError> {
+    pub fn open(width: u32, height: u32, bitrate: u32) -> Result<Self, WindowError> {
         // 4:2:0 chroma is subsampled by two on both axes, so odd dimensions
         // have no valid chroma plane. Reject rather than silently skew.
         if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -88,26 +113,57 @@ impl VideoEncoder {
             MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)
                 .map_err(|e| WindowError::Backend(format!("MFStartup: {e}")))?;
 
-            let transform = find_h264_encoder()?;
-            // Output first: an encoder needs to know what it is producing
-            // before it will accept a description of the input. (The decoder
-            // is the other way round — the asymmetry is real, not a typo.)
-            set_output_type(&transform, width, height)?;
-            set_input_type(&transform, width, height)?;
-            configure_quality(&transform);
+            // Every candidate is tried all the way to a started stream, not
+            // just activated: a hardware encoder that activates can still
+            // refuse its media types — NVENC does, once the GPU's concurrent
+            // sessions are used up (`MF_E_UNSUPPORTED_D3D_TYPE`, measured with
+            // 12 of 12 taken) — and the software encoder behind it would
+            // have worked.
+            let mut failures = Vec::new();
+            let mut opened = None;
+            for activate in h264_encoders()? {
+                match start_encoder(&activate, width, height, bitrate) {
+                    Ok(transform) => {
+                        opened = Some((activate, transform));
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = activate.ShutdownObject();
+                        tracing::debug!(error = %e, "an H.264 encoder would not start; trying next");
+                        failures.push(e.to_string());
+                    }
+                }
+            }
+            let Some((activate, transform)) = opened else {
+                return Err(WindowError::Backend(format!(
+                    "no H.264 encoder would start: {}",
+                    failures.join("; ")
+                )));
+            };
+            let codec_api = transform.cast::<ICodecAPI>().ok();
+            let events = is_async(&transform)
+                .then(|| transform.cast::<IMFMediaEventGenerator>().ok())
+                .flatten();
 
-            transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
-                .map_err(|e| WindowError::Backend(format!("begin streaming: {e}")))?;
-
-            tracing::info!(width, height, "Media Foundation H.264 encoder opened");
+            tracing::info!(
+                width,
+                height,
+                bitrate,
+                asynchronous = events.is_some(),
+                "Media Foundation H.264 encoder opened"
+            );
 
             Ok(Self {
+                activate,
                 transform,
                 width,
                 height,
                 nv12: Vec::new(),
                 frame_index: 0,
+                events,
+                input_credits: 0,
+                codec_api,
+                bitrate,
             })
         }
     }
@@ -146,6 +202,9 @@ impl VideoEncoder {
 
         nv12::from_bgra(bgra, self.width, self.height, &mut self.nv12);
 
+        if self.events.is_some() {
+            return self.encode_async();
+        }
         unsafe {
             let sample = self.make_sample()?;
             self.transform
@@ -157,12 +216,126 @@ impl VideoEncoder {
         self.drain()
     }
 
+    /// Move the stream to `bitrate` in place.
+    ///
+    /// `CODECAPI_AVEncCommonMeanBitRate` is one of the properties Media
+    /// Foundation encoders accept mid-stream; reopening instead would restart
+    /// the stream on a keyframe exactly when the link has said it is short.
+    pub fn set_bitrate(&mut self, bitrate: u32) {
+        if bitrate == self.bitrate {
+            return;
+        }
+        let Some(api) = self.codec_api.as_ref() else {
+            return;
+        };
+        let value = windows::Win32::System::Variant::VARIANT::from(bitrate);
+        match unsafe { api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &value) } {
+            Ok(()) => self.bitrate = bitrate,
+            Err(e) => {
+                tracing::debug!(error = %e, bitrate, "encoder refused a live bitrate change")
+            }
+        }
+    }
+
+    /// Feed one frame to an asynchronous transform.
+    ///
+    /// Hardware H.264 encoders are asynchronous MFTs. Unlocking one
+    /// (`MF_TRANSFORM_ASYNC_UNLOCK`) lets it be called at all, but not called
+    /// like a synchronous one: it takes input only after asking for it
+    /// (`METransformNeedInput`) and has output only after announcing it
+    /// (`METransformHaveOutput`). Calling `ProcessInput` per frame regardless
+    /// was accepted once and then refused with `MF_E_NOTACCEPTING` on every
+    /// frame after — measured on the Windows peer, where every video frame
+    /// fell back to lossless tiles and every reopen failed a little worse.
+    fn encode_async(&mut self) -> Result<Vec<Vec<u8>>, WindowError> {
+        let mut out = Vec::new();
+        self.pump_events(&mut out, |enc, _| enc.input_credits > 0, ASYNC_INPUT_WAIT)?;
+        if self.input_credits == 0 {
+            return Err(WindowError::Backend(
+                "the encoder asked for no input in time".into(),
+            ));
+        }
+        unsafe {
+            let sample = self.make_sample()?;
+            self.transform
+                .ProcessInput(STREAM_ID, &sample, 0)
+                .map_err(|e| WindowError::Backend(format!("ProcessInput: {e}")))?;
+        }
+        self.input_credits -= 1;
+        self.frame_index += 1;
+        // Wait for this frame's packet rather than leaving it for the next
+        // call: on a source that just stopped changing there is no next call,
+        // and the viewer would be left a frame behind indefinitely.
+        let before = out.len();
+        self.pump_events(&mut out, |_, got| got > before, ASYNC_OUTPUT_WAIT)?;
+        Ok(out)
+    }
+
+    /// Handle the transform's events until `done` holds or `wait` passes.
+    fn pump_events(
+        &mut self,
+        out: &mut Vec<Vec<u8>>,
+        done: impl Fn(&Self, usize) -> bool,
+        wait: std::time::Duration,
+    ) -> Result<(), WindowError> {
+        let Some(events) = self.events.clone() else {
+            return Ok(());
+        };
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => {
+                    let kind = unsafe { event.GetType() }.unwrap_or(0) as i32;
+                    if kind == METransformNeedInput.0 {
+                        self.input_credits += 1;
+                    } else if kind == METransformHaveOutput.0 {
+                        if let Some(packet) = self.output_once()? {
+                            out.push(packet);
+                        }
+                    }
+                    continue;
+                }
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {}
+                Err(e) => return Err(WindowError::Backend(format!("GetEvent: {e}"))),
+            }
+            if done(self, out.len()) || std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// One `ProcessOutput`, answering one `METransformHaveOutput`.
+    fn output_once(&mut self) -> Result<Option<Vec<u8>>, WindowError> {
+        let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: STREAM_ID,
+            ..Default::default()
+        }];
+        let mut status = 0u32;
+        match unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) } {
+            Ok(()) => {
+                let sample = unsafe { std::mem::ManuallyDrop::take(&mut buffers[0].pSample) };
+                sample.map(|s| unsafe { read_sample(&s) }).transpose()
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                unsafe { set_output_type(&self.transform, self.width, self.height, self.bitrate)? };
+                Ok(None)
+            }
+            Err(e) => Err(WindowError::Backend(format!("ProcessOutput: {e}"))),
+        }
+    }
+
     /// Flush the encoder at end of stream, returning any packets still held.
     pub fn finish(&mut self) -> Result<Vec<Vec<u8>>, WindowError> {
         unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
                 .map_err(|e| WindowError::Backend(format!("drain: {e}")))?;
+        }
+        if self.events.is_some() {
+            let mut out = Vec::new();
+            self.pump_events(&mut out, |_, _| false, ASYNC_OUTPUT_WAIT)?;
+            return Ok(out);
         }
         self.drain()
     }
@@ -249,7 +422,9 @@ impl VideoEncoder {
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     // The encoder renegotiated its output; re-set and retry.
-                    unsafe { set_output_type(&self.transform, self.width, self.height)? };
+                    unsafe {
+                        set_output_type(&self.transform, self.width, self.height, self.bitrate)?
+                    };
                     continue;
                 }
                 Err(e) => return Err(WindowError::Backend(format!("ProcessOutput: {e}"))),
@@ -288,12 +463,55 @@ unsafe fn read_sample(sample: &IMFSample) -> Result<Vec<u8>, WindowError> {
     Ok(data)
 }
 
-/// Find an H.264 encoder MFT, preferring hardware.
+/// Activate `activate`'s transform and take it as far as a started stream.
+unsafe fn start_encoder(
+    activate: &IMFActivate,
+    width: u32,
+    height: u32,
+    bitrate: u32,
+) -> Result<IMFTransform, WindowError> {
+    let transform = activate
+        .ActivateObject::<IMFTransform>()
+        .map_err(|e| WindowError::Backend(format!("activate: {e}")))?;
+    unlock_if_async(&transform);
+    // Rate control is set before the media types: several hardware encoders
+    // fix their mode when the output type is accepted.
+    configure_rate(transform.cast::<ICodecAPI>().ok().as_ref(), bitrate);
+    // Output first: an encoder needs to know what it is producing before it
+    // will accept a description of the input. (The decoder is the other way
+    // round — the asymmetry is real, not a typo.)
+    set_output_type(&transform, width, height, bitrate)?;
+    set_input_type(&transform, width, height)?;
+    transform
+        .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+        .map_err(|e| WindowError::Backend(format!("begin streaming: {e}")))?;
+    // An asynchronous transform sends no `NeedInput` until told the stream
+    // has started; a synchronous one ignores this.
+    transform
+        .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+        .map_err(|e| WindowError::Backend(format!("start of stream: {e}")))?;
+    Ok(transform)
+}
+
+impl Drop for VideoEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            if let Err(e) = self.activate.ShutdownObject() {
+                tracing::warn!(error = %e, "could not shut the H.264 encoder down; its GPU session may leak");
+            }
+        }
+    }
+}
+
+/// Every H.264 encoder MFT, hardware first.
 ///
-/// `SORTANDFILTER` puts hardware transforms first, so taking the first that
-/// activates gets GPU encoding where it exists without naming a vendor, and
-/// falls back to Microsoft's software H.264 encoder where it doesn't.
-unsafe fn find_h264_encoder() -> Result<IMFTransform, WindowError> {
+/// `SORTANDFILTER` puts hardware transforms first, so the first that starts
+/// gets GPU encoding where it exists without naming a vendor, and Microsoft's
+/// software H.264 encoder behind it where it doesn't.
+unsafe fn h264_encoders() -> Result<Vec<IMFActivate>, WindowError> {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
@@ -324,24 +542,12 @@ unsafe fn find_h264_encoder() -> Result<IMFTransform, WindowError> {
         ));
     }
 
-    let list = std::slice::from_raw_parts(activates, count as usize);
-    let mut chosen = None;
-    for activate in list.iter().flatten() {
-        if chosen.is_none() {
-            match activate.ActivateObject::<IMFTransform>() {
-                Ok(t) => {
-                    unlock_if_async(&t);
-                    chosen = Some(t);
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "an H.264 encoder MFT failed to activate; trying next")
-                }
-            }
-        }
-    }
+    // The array is CoTaskMem holding owned references: move each out, then
+    // free the array itself.
+    let list = std::slice::from_raw_parts_mut(activates, count as usize);
+    let found: Vec<IMFActivate> = list.iter_mut().filter_map(Option::take).collect();
     windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _));
-
-    chosen.ok_or_else(|| WindowError::Backend("no H.264 encoder MFT could be activated".into()))
+    Ok(found)
 }
 
 /// Let a hardware encoder be driven synchronously.
@@ -370,6 +576,7 @@ unsafe fn set_output_type(
     transform: &IMFTransform,
     width: u32,
     height: u32,
+    bitrate: u32,
 ) -> Result<(), WindowError> {
     let ty = MFCreateMediaType().map_err(|e| WindowError::Backend(format!("media type: {e}")))?;
     ty.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -378,12 +585,7 @@ unsafe fn set_output_type(
         .and_then(|_| ty.SetUINT64(&MF_MT_FRAME_RATE, pack_ratio(FRAME_RATE, 1)))
         .and_then(|_| ty.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1)))
         .and_then(|_| ty.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32))
-        // Every H.264 encoder MFT requires a bitrate on its output type, even
-        // in a quality-driven rate-control mode where it is only a ceiling.
-        // Sized generously: the design measured 138 Mbit/s worst case, and a
-        // low cap here would quietly cost quality on exactly the motion the
-        // video path exists to carry.
-        .and_then(|_| ty.SetUINT32(&MF_MT_AVG_BITRATE, 200_000_000))
+        .and_then(|_| ty.SetUINT32(&MF_MT_AVG_BITRATE, bitrate))
         .map_err(|e| WindowError::Backend(format!("describe H.264 output: {e}")))?;
 
     transform
@@ -411,38 +613,50 @@ unsafe fn set_input_type(
         .map_err(|e| WindowError::Backend(format!("SetInputType: {e}")))
 }
 
-/// Ask for maximum quality and low latency, best-effort.
+/// Whether the transform is an asynchronous MFT (hardware encoders are).
+unsafe fn is_async(transform: &IMFTransform) -> bool {
+    transform
+        .GetAttributes()
+        .and_then(|attrs| attrs.GetUINT32(&MF_TRANSFORM_ASYNC))
+        .unwrap_or(0)
+        == 1
+}
+
+/// Ask for a bitrate-driven, low-latency stream, best-effort.
 ///
 /// Every one of these is optional: `ICodecAPI` is not implemented by all
 /// transforms, and a given encoder may reject any individual property. None of
 /// them is required for correct output, so a failure is logged at debug and
 /// ignored rather than failing the open — a working encoder at default
-/// settings beats no encoder at all.
-unsafe fn configure_quality(transform: &IMFTransform) {
-    let Ok(codec_api) = transform.cast::<ICodecAPI>() else {
+/// settings beats no encoder at all. Each value carries the VARIANT type its
+/// property is documented with (`VT_UI4`, `VT_BOOL`); a `VT_I4` for all of
+/// them, as before, had every encoder here reject two of the settings.
+unsafe fn configure_rate(codec_api: Option<&ICodecAPI>, bitrate: u32) {
+    use windows::Win32::System::Variant::VARIANT;
+    let Some(codec_api) = codec_api else {
         tracing::debug!("encoder exposes no ICodecAPI; using its defaults");
         return;
     };
 
-    let set = |name: *const windows::core::GUID, value: u32| {
-        let var = windows::Win32::System::Variant::VARIANT::from(value as i32);
-        if codec_api.SetValue(name, &var).is_err() {
-            tracing::debug!("encoder rejected a quality property; leaving it at default");
+    let set = |name: *const windows::core::GUID, value: VARIANT| {
+        if let Err(e) = codec_api.SetValue(name, &value) {
+            tracing::debug!(error = %e, "encoder rejected a rate property; leaving it at default");
         }
     };
 
-    // Quality-driven rather than bitrate-driven: a window's cost should follow
-    // its content, not be forced up to fill a budget on an idle window.
+    // Bitrate-driven, and the bitrate moves with the link (`set_bitrate`).
+    // The old quality-100 mode had no ceiling at all: a moving desktop could
+    // ask the link for whatever the encoder felt like, and nothing could
+    // lower it under congestion.
     set(
         &CODECAPI_AVEncCommonRateControlMode,
-        eAVEncCommonRateControlMode_Quality.0 as u32,
+        VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32),
     );
-    // 0..100, higher is better. Not lossless — see the module docs.
-    set(&CODECAPI_AVEncCommonQuality, 100);
+    set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
     // Bound how long a mid-stream viewer waits for its first showable frame.
     set(
         &CODECAPI_AVEncMPVGOPSize,
-        FRAME_RATE * KEYFRAME_INTERVAL_SECS,
+        VARIANT::from(FRAME_RATE * KEYFRAME_INTERVAL_SECS),
     );
 
     // Latency, not compression, is what this stream is judged on.
@@ -461,8 +675,8 @@ unsafe fn configure_quality(transform: &IMFTransform) {
     //
     // Both are advisory — `set` logs and continues when an encoder declines,
     // which the software fallback does for some of these.
-    set(&CODECAPI_AVEncCommonLowLatency, 1);
-    set(&CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+    set(&CODECAPI_AVEncCommonLowLatency, VARIANT::from(true));
+    set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
 }
 
 /// Media Foundation packs paired 32-bit values (size, frame rate, aspect

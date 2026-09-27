@@ -871,7 +871,7 @@ fn run_pipewire_loop(
                     Fidelity::Lossless
                 } else {
                     Fidelity::Lossy {
-                        bitrate: crate::frame_pipeline::lossy_bitrate(width, height),
+                        bitrate: st.quality.bitrate(width, height),
                     }
                 };
                 // Geometry changes invalidate the encoder: H.264 is fixed-size.
@@ -903,6 +903,9 @@ fn run_pipewire_loop(
                 }
 
                 if let Some(enc) = st.video.as_mut() {
+                    if let Fidelity::Lossy { bitrate } = fidelity {
+                        enc.set_bitrate(bitrate);
+                    }
                     match enc.encode(&frame) {
                         Ok(packets) => {
                             // One visual update can yield several packets, and
@@ -929,6 +932,8 @@ fn run_pipewire_loop(
                                 // update is a full frame and fresh keyframe.
                                 st.differ.reset();
                                 st.video = None;
+                            } else {
+                                st.quality.note_video_sent();
                             }
                             return;
                         }

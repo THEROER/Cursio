@@ -203,6 +203,36 @@ quality, and codec choice up or down. Acks are sent a few times a second (not
 per frame — that would itself cost bandwidth). This is the closed loop that lets
 us target latency without saturating the channel.
 
+What the loop moves today (`frame_pipeline::AdaptiveQuality`):
+
+- **The lossless/lossy threshold** — how large a change must be before it
+  goes to video instead of a tile (15–45% of the window).
+- **The lossy stream's bitrate** (`BitrateLadder`, 2026-09-27), as a
+  percentage of `lossy_bitrate(w, h)` (≈12 Mbit/s at 1080p): 20–350%.
+  Down 30% at once on a backlog of more than 3 frames, then no climbing for
+  4 s; up 15% only after 6 consecutive caught-up acks *while video is
+  flowing* — a source that stopped changing sends no frames, and its acks say
+  nothing about the link. The rate changes on the live encoder: x264 and
+  Media Foundation (`CODECAPI_AVEncCommonMeanBitRate`) reconfigure in place;
+  NVENC through FFmpeg forces an IDR on any rate change (`nvenc.c`
+  `reconfig_encoder` sets `resetEncoder`+`forceIDR`), so NVENC only moves for
+  a change of 25% or more. A lossless stream has no rate and ignores it.
+
+Resolution and frame rate do not adapt yet; below the bitrate floor the
+threshold keeps pushing more of the window to video.
+
+The Windows encoder was never on the video path at all before this: hardware
+H.264 MFTs are asynchronous, and calling one per frame like a synchronous
+transform was accepted once and refused (`MF_E_NOTACCEPTING`) ever after, so
+every frame fell back to lossless tiles. It is now driven by its
+`METransformNeedInput`/`HaveOutput` events. Each failed reopen also leaked an
+NVENC session — releasing the transform does not end it, only
+`IMFActivate::ShutdownObject` does — and the Windows peer was found holding
+all 12 of its sessions (`nvidia-smi encodersessions`), after which no encoder
+opened at all. Encoders are now shut down on drop, and `open` tries every
+encoder through to a started stream, so an exhausted GPU falls back to
+Microsoft's software encoder (measured there: 1080p at ~20 ms/frame).
+
 ## Wire protocol
 
 `crates/protocol/src/window.rs` (added in `PROTOCOL_VERSION = 4`). All types are
