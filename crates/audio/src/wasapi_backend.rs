@@ -629,14 +629,16 @@ impl WasapiSource {
     }
 }
 
+/// Signals the stream's thread and detaches it rather than joining: streams are
+/// dropped from the session loop, and waiting out a WASAPI teardown there
+/// stalls input, which rides the same loop. The thread owns its client and
+/// exits on the signal by itself.
 impl Drop for WasapiSource {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        drop(self.thread.take());
     }
 }
 
@@ -1021,14 +1023,13 @@ impl WasapiSink {
     }
 }
 
+/// Detaches rather than joins, for the reason given on `WasapiSource`'s `Drop`.
 impl Drop for WasapiSink {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        drop(self.thread.take());
     }
 }
 

@@ -222,14 +222,20 @@ impl PwSource {
     }
 }
 
+/// Signals the stream's thread and detaches it rather than joining.
+///
+/// Every stream is dropped from the session loop — a tap when its app's node
+/// goes away, a playback when the peer closes it — and tearing a PipeWire
+/// stream down takes the loop hundreds of milliseconds ("module pump blocked
+/// the session loop module=audio took_ms=380"), felt as a frozen cursor since
+/// input rides the same loop. Nothing needs the thread gone before `drop`
+/// returns: it owns its stream outright and exits on the signal by itself.
 impl Drop for PwSource {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        drop(self.thread.take());
     }
 }
 
@@ -309,14 +315,13 @@ impl PwIntentSink {
     }
 }
 
+/// Detaches rather than joins, for the reason given on `PwSource`'s `Drop`.
 impl Drop for PwIntentSink {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        drop(self.thread.take());
     }
 }
 
@@ -1273,19 +1278,11 @@ fn run_capture_loop(
         // navigation sounds are themselves only a few hundred milliseconds, so
         // their attack was cut off. The retry budget is unchanged.
         for attempt in 0..40 {
-            // Give up the moment the capture is dropped.
-            //
-            // `PwSource::drop` signals here and then joins this thread, so every
-            // pass of this loop is time the dropper spends blocked. It runs on
-            // the session loop — a tap is released there when the app's node
-            // goes away — and an app that vanishes *while* its tap is still
-            // trying to link is exactly when both happen at once. Measured on a
-            // Firefox tab that closed mid-open: the retries held the session
-            // loop for 16.4 s ("module pump blocked the session loop
-            // module=audio took_ms=16397"), long past the peer's 15 s liveness
-            // deadline, so the link was torn down and rebuilt for no reason but
-            // this wait. The budget is nominally 40 × 20 ms; a graph still
-            // forming makes each `relink_app` pump far longer than its settle.
+            // Give up the moment the capture is dropped: a tap whose app has
+            // vanished has nothing left to link, and the budget is nominally
+            // 40 × 20 ms, but a graph still forming makes each `relink_app` pump
+            // far longer than its settle — seconds of PipeWire work for a stream
+            // nobody will read.
             if stop_rx.try_recv().is_ok() {
                 tracing::debug!(app_id, attempt, "capture dropped while linking; giving up");
                 return;
@@ -1827,14 +1824,13 @@ impl PwSink {
     }
 }
 
+/// Detaches rather than joins, for the reason given on `PwSource`'s `Drop`.
 impl Drop for PwSink {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        drop(self.thread.take());
     }
 }
 
