@@ -12,7 +12,7 @@
 //! because the tests that need them live in `cursio-core`, a different crate.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -277,6 +277,7 @@ struct FakeSourcesState {
 #[derive(Clone, Default)]
 pub struct FakeScreenSources {
     state: Arc<Mutex<FakeSourcesState>>,
+    list_stalled: Arc<AtomicBool>,
 }
 
 impl FakeScreenSources {
@@ -312,6 +313,12 @@ impl FakeScreenSources {
         self.lock().fail_next = Some(reason.to_string());
     }
 
+    /// Hold every `list` until released, as an enumeration waiting on a busy
+    /// application's window would.
+    pub fn set_list_stalled(&self, stalled: bool) {
+        self.list_stalled.store(stalled, Ordering::Relaxed);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, FakeSourcesState> {
         self.state
             .lock()
@@ -321,6 +328,9 @@ impl FakeScreenSources {
 
 impl ScreenSources for FakeScreenSources {
     fn list(&self) -> Result<Vec<ScreenSource>, WindowError> {
+        while self.list_stalled.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         Ok(self.lock().sources.clone())
     }
 

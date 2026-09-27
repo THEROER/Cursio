@@ -323,7 +323,9 @@ pub enum SourcePick {
 /// state the session loop owns.
 pub trait ScreenSources: Send + Sync {
     /// What can be shown right now. Called every couple of seconds while a
-    /// viewer is subscribed, so it must be cheap.
+    /// viewer is subscribed, on a thread of its own: enumerating may wait on
+    /// other applications' message loops — Windows answers a window's title
+    /// by asking the thread that owns it — so it is never on the session loop.
     fn list(&self) -> Result<Vec<ScreenSource>, WindowError>;
 
     /// Start capturing `source`, stamping `id` into its meta and frames.

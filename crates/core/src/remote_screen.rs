@@ -91,13 +91,10 @@ async fn send_control(tx: &mut dyn TransportTx, msg: WindowMsg) -> Result<(), Tr
     tx.send(&framed).await
 }
 
-type OpenResult = Result<Box<dyn CaptureSession + Send>, WindowError>;
+/// The source that opened and its capture, or why the viewer gets nothing.
+type OpenResult = Result<(ScreenSource, Box<dyn CaptureSession + Send>), String>;
 
-/// A source being opened on its own thread.
-struct Opening {
-    source: ScreenSource,
-    result: std_mpsc::Receiver<OpenResult>,
-}
+type ListResult = Result<Vec<ScreenSource>, WindowError>;
 
 /// The host's half: publish the source list, stream the chosen source.
 pub struct ScreenHost {
@@ -110,9 +107,17 @@ pub struct ScreenHost {
     published: Option<Vec<ScreenSource>>,
     next_poll: Instant,
     current: Option<(SourceId, Box<dyn CaptureSession + Send>)>,
-    /// At most one: a newer request replaces an older one still opening. The
-    /// abandoned thread's send then fails and its capture is dropped with it.
-    opening: Option<Opening>,
+    /// A source being resolved and opened on its own thread. At most one: a
+    /// newer request replaces an older one still opening. The abandoned
+    /// thread's send then fails and its capture is dropped with it.
+    opening: Option<std_mpsc::Receiver<OpenResult>>,
+    /// A list being read on its own thread. Measured on Windows at 50–220 ms
+    /// every poll while a view was streaming: a window's title is answered by
+    /// the thread that owns the window, and this process's own view window is
+    /// owned by a thread busy decoding the stream. The mouse rides the same
+    /// loop. At most one in flight, so a list stuck on a hung application
+    /// stops the refreshes instead of piling up threads behind it.
+    listing: Option<std_mpsc::Receiver<ListResult>>,
     /// Control owed to the viewer that `handle` could not send itself.
     outbox: Vec<WindowMsg>,
     /// What the viewer's decoder takes, handed to every capture opened here.
@@ -149,6 +154,7 @@ impl ScreenHost {
             next_poll: Instant::now(),
             current: None,
             opening: None,
+            listing: None,
             outbox: Vec::new(),
             peer_video: VideoCaps::default(),
         }
@@ -194,41 +200,14 @@ impl ScreenHost {
             self.refusal_sent = false;
             return;
         };
-        // Resolved against a fresh list, not the published one: the viewer's
-        // menu may be a poll behind, and a window that closed since must fail
-        // here with its name rather than inside a capture backend.
-        let source = match sources.list() {
-            Ok(list) => list.into_iter().find(|s| s.id == id),
-            Err(e) => {
-                self.outbox.push(WindowMsg::SourceEnded {
-                    reason: format!("could not list sources: {e}"),
-                });
-                return;
-            }
-        };
-        let Some(source) = source else {
-            self.outbox.push(WindowMsg::SourceEnded {
-                reason: format!("source {id} no longer exists on this machine"),
-            });
-            return;
-        };
-        if source.picked_on_host {
-            tracing::info!(
-                title = %source.title,
-                "a peer asked to see this machine; pick what to show in the dialog here"
-            );
-        }
         let (tx, rx) = std_mpsc::channel();
-        let thread_source = source.clone();
         let spawned = std::thread::Builder::new()
             .name("cursio-screen-open".into())
             .spawn(move || {
-                let _ = tx.send(sources.open(SCREEN_STREAM_ID, &thread_source));
+                let _ = tx.send(open_source(sources.as_ref(), id));
             });
         match spawned {
-            Ok(_) => {
-                self.opening = Some(Opening { source, result: rx });
-            }
+            Ok(_) => self.opening = Some(rx),
             Err(e) => self.outbox.push(WindowMsg::SourceEnded {
                 reason: format!("could not start the capture thread: {e}"),
             }),
@@ -240,7 +219,7 @@ impl ScreenHost {
         if !self.subscribed {
             return None;
         }
-        let Some(sources) = self.sources.as_ref() else {
+        let Some(sources) = self.sources.clone() else {
             if self.refusal_sent {
                 return None;
             }
@@ -249,37 +228,56 @@ impl ScreenHost {
                 reason: self.refusal.clone(),
             });
         };
+        if let Some(listing) = self.listing.as_ref() {
+            let result = match listing.try_recv() {
+                Ok(result) => result,
+                Err(std_mpsc::TryRecvError::Empty) => return None,
+                Err(std_mpsc::TryRecvError::Disconnected) => Err(WindowError::Backend(
+                    "the source-listing thread died".into(),
+                )),
+            };
+            self.listing = None;
+            return match result {
+                Ok(list) if self.published.as_ref() != Some(&list) => {
+                    self.published = Some(list.clone());
+                    Some(WindowMsg::Sources(list))
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not list shareable sources for the peer");
+                    None
+                }
+            };
+        }
         let now = Instant::now();
         if now < self.next_poll {
             return None;
         }
         self.next_poll = now + SOURCE_POLL;
-        match sources.list() {
-            Ok(list) if self.published.as_ref() != Some(&list) => {
-                self.published = Some(list.clone());
-                Some(WindowMsg::Sources(list))
-            }
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not list shareable sources for the peer");
-                None
-            }
+        let (tx, rx) = std_mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("cursio-screen-list".into())
+            .spawn(move || {
+                let _ = tx.send(sources.list());
+            });
+        match spawned {
+            Ok(_) => self.listing = Some(rx),
+            Err(e) => tracing::warn!(error = %e, "could not start the source-listing thread"),
         }
+        None
     }
 
     /// A source that finished opening, swapped in for the one on screen.
     fn poll_opening(&mut self) -> Option<WindowMsg> {
         let opening = self.opening.as_ref()?;
-        let result = match opening.result.try_recv() {
+        let result = match opening.try_recv() {
             Ok(result) => result,
             Err(std_mpsc::TryRecvError::Empty) => return None,
-            Err(std_mpsc::TryRecvError::Disconnected) => {
-                Err(WindowError::Backend("the capture thread died".into()))
-            }
+            Err(std_mpsc::TryRecvError::Disconnected) => Err("the capture thread died".into()),
         };
-        let source = self.opening.take()?.source;
+        self.opening = None;
         match result {
-            Ok(mut session) => {
+            Ok((source, mut session)) => {
                 session.set_peer_video(self.peer_video);
                 if let Some((_, mut old)) = self.current.take() {
                     old.close(WindowCloseReason::Returned);
@@ -294,11 +292,9 @@ impl ScreenHost {
                     height: meta.height,
                 })
             }
-            Err(e) => {
-                tracing::warn!(error = %e, title = %source.title, "could not show source to the peer");
-                Some(WindowMsg::SourceEnded {
-                    reason: format!("{}: {e}", source.title),
-                })
+            Err(reason) => {
+                tracing::warn!(%reason, "could not show a source to the peer");
+                Some(WindowMsg::SourceEnded { reason })
             }
         }
     }
@@ -354,6 +350,31 @@ impl ScreenHost {
     /// Whether a source is streaming, for tests and logs.
     pub fn showing(&self) -> Option<SourceId> {
         self.current.as_ref().map(|(id, _)| *id)
+    }
+}
+
+/// Find `id` and start capturing it; run on the opening thread.
+///
+/// Resolved against a fresh list, not the published one: the viewer's menu
+/// may be a poll behind, and a window that closed since must fail here with
+/// its name rather than inside a capture backend.
+fn open_source(sources: &dyn ScreenSources, id: SourceId) -> OpenResult {
+    let list = sources
+        .list()
+        .map_err(|e| format!("could not list sources: {e}"))?;
+    let source = list
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| format!("source {id} no longer exists on this machine"))?;
+    if source.picked_on_host {
+        tracing::info!(
+            title = %source.title,
+            "a peer asked to see this machine; pick what to show in the dialog here"
+        );
+    }
+    match sources.open(SCREEN_STREAM_ID, &source) {
+        Ok(session) => Ok((source, session)),
+        Err(e) => Err(format!("{}: {e}", source.title)),
     }
 }
 
@@ -924,23 +945,39 @@ mod tests {
             down
         }
 
-        /// Exchange until the host has nothing opening, since opening runs on
-        /// a thread of its own.
+        /// Exchange until the host has nothing listing or opening, since both
+        /// run on threads of their own.
         async fn settle(&mut self) -> Vec<WindowMsg> {
             let mut seen = Vec::new();
             for _ in 0..400 {
                 seen.extend(self.exchange().await.control());
-                if self.host.opening.is_none() && self.viewer.outbox.is_empty() {
+                if host_idle(&self.host) && self.viewer.outbox.is_empty() {
                     let extra = self.exchange().await.control();
                     seen.extend(extra);
-                    if self.host.opening.is_none() {
+                    if host_idle(&self.host) {
                         return seen;
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            panic!("the host never finished opening a source");
+            panic!("the host never finished listing or opening a source");
         }
+    }
+
+    fn host_idle(host: &ScreenHost) -> bool {
+        host.opening.is_none() && host.listing.is_none()
+    }
+
+    /// Pump a lone host until its listing and opening threads have answered.
+    async fn pump_settled(host: &mut ScreenHost, tx: &mut RecordingTx) {
+        for _ in 0..400 {
+            host.pump(tx).await.unwrap();
+            if host_idle(host) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the host never finished listing or opening a source");
     }
 
     #[tokio::test]
@@ -964,9 +1001,9 @@ mod tests {
         host.handle(&WindowMsg::ListSources);
 
         let mut tx = RecordingTx::default();
-        host.pump(&mut tx).await.unwrap();
+        pump_settled(&mut host, &mut tx).await;
         host.next_poll = Instant::now();
-        host.pump(&mut tx).await.unwrap();
+        pump_settled(&mut host, &mut tx).await;
         let lists = |tx: &RecordingTx| {
             tx.control()
                 .iter()
@@ -977,8 +1014,39 @@ mod tests {
 
         sources.set_sources(vec![source(9, SourceKind::Window, "Discord", false)]);
         host.next_poll = Instant::now();
-        host.pump(&mut tx).await.unwrap();
+        pump_settled(&mut host, &mut tx).await;
         assert_eq!(lists(&tx), 2, "a window opening must reach the viewer");
+    }
+
+    /// Enumerating sources never holds up the loop the cursor rides on.
+    ///
+    /// On Windows a window's title is answered by the thread that owns the
+    /// window, and a view's own window thread is busy decoding: listing on the
+    /// session loop stalled it 50–220 ms every two seconds while a view ran.
+    #[tokio::test]
+    async fn a_slow_source_list_does_not_hold_up_the_pump() {
+        let sources = lightmoon();
+        let mut host = ScreenHost::serving(Arc::new(sources.clone()));
+        host.handle(&WindowMsg::ListSources);
+        sources.set_list_stalled(true);
+
+        let mut tx = RecordingTx::default();
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            host.pump(&mut tx).await.unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "the pump waited on the enumeration"
+        );
+        assert!(tx.control().is_empty());
+
+        sources.set_list_stalled(false);
+        pump_settled(&mut host, &mut tx).await;
+        assert!(matches!(
+            tx.control().as_slice(),
+            [WindowMsg::Sources(list)] if list.len() == 3
+        ));
     }
 
     #[tokio::test]
@@ -1172,7 +1240,7 @@ mod tests {
 
         host.handle(&WindowMsg::ShowSource { source: 1 });
         let mut tx = RecordingTx::default();
-        host.pump(&mut tx).await.unwrap();
+        pump_settled(&mut host, &mut tx).await;
 
         assert!(matches!(
             tx.control().as_slice(),

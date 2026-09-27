@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-    IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
+    GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
 };
 
 use super::Target;
@@ -106,6 +106,15 @@ struct Window {
 unsafe extern "system" fn window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let found = &mut *(lparam.0 as *mut Vec<Window>);
     if !IsWindowVisible(hwnd).as_bool() {
+        return TRUE;
+    }
+    // This process's own windows are never offered — a view or a transfer's
+    // surrogate shown back to the peer it came from is a hall of mirrors — and
+    // asking one its title waits on its thread, which is busy decoding the very
+    // stream the peer is watching.
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+    if pid == std::process::id() {
         return TRUE;
     }
     let len = GetWindowTextLengthW(hwnd);
