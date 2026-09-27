@@ -977,7 +977,14 @@ impl AudioEngine {
         let now = std::time::Instant::now();
 
         // Stall detection: audio was flowing, then stopped.
-        if let Some(last) = self.last_chunk_at {
+        //
+        // Only while something here is actually listening. A stream nobody
+        // plays is refused on purpose (see `unwanted_streams`), and the peer
+        // then correctly sends nothing — so after that refusal silence is the
+        // system working, not a fault. Warning about it would train the reader
+        // to ignore the one line that means a real stall.
+        let anyone_listening = self.playbacks.values().any(|p| p.is_listening());
+        if let Some(last) = self.last_chunk_at.filter(|_| anyone_listening) {
             let gap = now.duration_since(last);
             if gap >= AUDIO_STALL_AFTER && !self.stall_reported {
                 self.stall_reported = true;
