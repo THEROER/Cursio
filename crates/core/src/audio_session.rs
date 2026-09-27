@@ -568,6 +568,22 @@ impl SessionModule for AudioEngine {
 
         let mut budget = MAX_CHUNKS_PER_PUMP;
 
+        // Every live stream gets an equal share of the pump.
+        //
+        // The budget used to be one pot each stream drained `while budget > 0`,
+        // so the first stream served took everything it had queued and the rest
+        // shared the remainder. In ordinary use the pot is nowhere near
+        // exhausted (`over_budget` stays at zero), so this is not about
+        // capacity — it is about order: the iteration comes from a `HashMap`,
+        // so *which* stream is served first varies, and a burst from one stream
+        // delays the others by however long its backlog takes.
+        //
+        // At least one each, so a stream is never handed a share of zero and
+        // silenced outright by arithmetic; the whole-pump ceiling still bounds
+        // how long this blocks the session loop.
+        let live_streams = self.routed_apps.len() + self.mic_captures.len();
+        let share = (MAX_CHUNKS_PER_PUMP / live_streams.max(1)).max(1);
+
         // `routed_apps` holds `(stream_id, Capture)` — the per-app Remote Streams
         // born from Intent-Sink membership. Pump them alongside our mic taps.
         // (Device Intent Sinks carry no audio; they only observe membership.)
@@ -584,6 +600,10 @@ impl SessionModule for AudioEngine {
             if budget == 0 {
                 break;
             }
+            // This stream's slice of what is left. Capped by the pot so the sum
+            // of the slices can never exceed the whole-pump ceiling.
+            let allotted = share.min(budget);
+            let mut budget_for_stream = allotted;
             // Nobody on the far side is playing this stream: drain what the
             // capture produced and send none of it.
             //
@@ -617,11 +637,11 @@ impl SessionModule for AudioEngine {
             if dropped > 0 {
                 self.stale_dropped += dropped as u64;
             }
-            while budget > 0 {
+            while budget_for_stream > 0 {
                 if let Some(packet) = self
                     .pending_packets
                     .get_mut(id)
-                    .and_then(|packets| take_with_budget(packets, &mut budget))
+                    .and_then(|packets| take_with_budget(packets, &mut budget_for_stream))
                 {
                     let seq = packet.seq;
                     tx.send(&Message::AudioChunk(packet)).await?;
@@ -693,7 +713,11 @@ impl SessionModule for AudioEngine {
                 }));
                 // (health logging happens once per pump, above — not per stream)
             }
-            if budget == 0
+            // Charge what this stream actually used against the whole-pump pot,
+            // and hand back what it did not: a quiet stream leaves its share for
+            // the others rather than reserving capacity it has no audio for.
+            budget -= allotted - budget_for_stream;
+            if budget_for_stream == 0
                 && (self
                     .pending_packets
                     .get(id)
