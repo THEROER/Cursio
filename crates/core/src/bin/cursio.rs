@@ -630,11 +630,12 @@ async fn main() -> anyhow::Result<()> {
                 ..
             } = args;
             let pairing = PairingWindow::closed();
+            let running = config.clone();
             let control = cursio_core::control::NodeState::new(
                 &identity,
                 config_path.clone(),
                 overrides.clone(),
-                config.clone(),
+                running.clone(),
                 pairing.clone(),
             );
             start_control(control.clone());
@@ -769,16 +770,17 @@ async fn main() -> anyhow::Result<()> {
                 modules,
                 pairing,
                 offer,
-                control,
+                control.clone(),
             );
-            if !airplay.participates() {
-                // Nothing bound and nothing announced, and the service module
-                // is refusing on this machine's behalf, so a peer that asks
-                // learns to look elsewhere. With every machine here, AirPlay
-                // does not run at all — which is what asking for it means.
-                tracing::info!("AirPlay is off on this machine");
-                mesh.await
-            } else {
+            let node = async move {
+                if !airplay.participates() {
+                    // Nothing bound and nothing announced, and the service module
+                    // is refusing on this machine's behalf, so a peer that asks
+                    // learns to look elsewhere. With every machine here, AirPlay
+                    // does not run at all — which is what asking for it means.
+                    tracing::info!("AirPlay is off on this machine");
+                    return mesh.await;
+                }
                 // Is another cursio on *this* machine already announcing? No
                 // peer can answer that — both processes are the same peer — so
                 // a lock file settles it locally, before anything binds.
@@ -797,7 +799,23 @@ async fn main() -> anyhow::Result<()> {
                     mesh,
                 )
                 .await
-            }
+            };
+            let reason = tokio::select! {
+                result = node => return result,
+                changed = cursio_core::config::wait_for_change(&config_path, &overrides, &running) => {
+                    tracing::info!(
+                        modules = ?changed.modules,
+                        position = ?changed.position,
+                        "config changed; restarting the node to apply it"
+                    );
+                    "config changed"
+                }
+                _ = control.restart_requested() => {
+                    tracing::info!("restart requested over the control socket");
+                    "asked to"
+                }
+            };
+            restart_process(reason).await
         }
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Portal { action } => portal(action).await,
@@ -1624,6 +1642,51 @@ fn publish_mesh(
     );
 }
 
+/// Set in the environment of a node started by [`restart_process`], so it
+/// waits out the port its predecessor is still releasing.
+const RESTARTED_ENV: &str = "CURSIO_RESTARTED";
+
+/// Start this node again from the top, with the same command line.
+///
+/// By the time this runs the node future has been dropped, which drops every
+/// session and with them the modules' mounts, streams and capture handles.
+/// The pause lets the module threads notice their channels closing and
+/// unmount before the image is replaced; a mount that still outlives it is
+/// cleared by the next start, as after a crash.
+///
+/// Unix replaces the process image: same PID, so a supervisor (`cargo xtask
+/// run`, systemd) sees one continuous process, and the listener's descriptor
+/// is close-on-exec so the port is free at once. Windows has no exec: a child
+/// is started with the same arguments and this process exits; the child
+/// retries its bind while the port is released.
+async fn restart_process(reason: &str) -> anyhow::Result<()> {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let exe = std::env::current_exe()?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    tracing::info!(reason, exe = %exe.display(), "restarting");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new(&exe)
+            .args(&args)
+            .env(RESTARTED_ENV, "1")
+            .exec();
+        Err(anyhow::anyhow!(
+            "could not restart {}: {error}",
+            exe.display()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(&exe)
+            .args(&args)
+            .env(RESTARTED_ENV, "1")
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("could not restart {}: {e}", exe.display()))?;
+        std::process::exit(0)
+    }
+}
+
 /// Serve the control socket for this node.
 ///
 /// A second node for the same user is not refused here: two processes on one
@@ -2437,13 +2500,37 @@ struct NodeBase {
 /// sessions are `!Send` and never leave this thread.
 type SharedNodeStatus = std::rc::Rc<std::cell::RefCell<NodeStatusMonitor>>;
 
+/// Bind the mesh port, waiting a few seconds for it after a restart.
+///
+/// Only after a restart: then the previous process is known to be letting go
+/// of this port. Otherwise a busy port is another node, and saying so at once
+/// beats making the user wait to hear it.
+async fn bind_mesh_port(port: u16) -> anyhow::Result<TcpListenerHandle> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let mut attempts = match std::env::var_os(RESTARTED_ENV) {
+        Some(_) => 20,
+        None => 1,
+    };
+    loop {
+        attempts -= 1;
+        match TcpListenerHandle::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if attempts > 0 => {
+                tracing::debug!(error = %e, "mesh port still held by the previous run; retrying");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Bind, announce on the LAN, and bring up input capture.
 async fn start_node(
     identity: &NodeIdentity,
     port: u16,
     send_input: bool,
 ) -> anyhow::Result<NodeBase> {
-    let listener = TcpListenerHandle::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    let listener = bind_mesh_port(port).await?;
     let bound = listener.local_addr();
     tracing::info!(%bound, "listening for peers");
 
