@@ -352,7 +352,12 @@ mod tests {
     #[test]
     fn a_tile_past_the_edge_grows_the_picture() {
         assert_eq!(
-            geometry_of(rect(1900, 1000, 40, 100), TileCodec::RawBgra8888, 1920, 1080),
+            geometry_of(
+                rect(1900, 1000, 40, 100),
+                TileCodec::RawBgra8888,
+                1920,
+                1080
+            ),
             Geometry::Grow {
                 width: 1940,
                 height: 1100
