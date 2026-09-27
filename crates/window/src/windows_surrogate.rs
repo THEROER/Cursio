@@ -6,6 +6,13 @@
 //! from the user comes back out as [`WindowInput`] in the **host's** pixel
 //! space.
 //!
+//! The same window serves as a **remote-screen view**: view-only, letterboxed
+//! instead of resized to each source, and carrying a selector — a
+//! `TrackPopupMenu` context menu and the arrow keys — in place of input
+//! forwarding. It is an ordinary visible window, never the layered `alpha=0`
+//! trick a transfer's host uses, because a screen-sharing application has to
+//! be able to capture it.
+//!
 //! ## Why raw Win32 rather than a toolkit
 //!
 //! The Linux side uses GTK because it was already in the tree and gave cooked
@@ -30,13 +37,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use cursio_protocol::{
-    Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
-    WindowMeta,
+    Rect, ScreenSource, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId,
+    WindowInput, WindowMeta,
 };
 use tokio::sync::mpsc;
 
 use crate::codec::decode_tile;
-use crate::{presentation_ack::PresentationAcks, Surrogate, WindowError, WindowRenderer};
+use crate::{
+    presentation_ack::PresentationAcks, SourcePick, Surrogate, WindowError, WindowRenderer,
+};
 
 mod win32;
 
@@ -56,6 +65,11 @@ pub(crate) enum SurrogateCommand {
     /// The window grew, learnt from a tile rather than a full frame. Keeps the
     /// pixels already drawn — see [`Framebuffer::grow_to`].
     Grow { width: u32, height: u32 },
+    /// A remote-screen view's stream starts over with another source: drop the
+    /// decoder and the picture, keep the window.
+    Restart { title: String },
+    /// A remote-screen view's selector list changed.
+    Sources(Vec<ScreenSource>),
     /// Tear the window down.
     Close(WindowCloseReason),
 }
@@ -73,6 +87,8 @@ pub struct Win32Surrogate {
     /// Set by the window thread when the user closes the window, so the session
     /// learns about it even before the channels drop.
     closed: Arc<AtomicBool>,
+    /// Set for a remote-screen view: what the user picked in its selector.
+    picks: Option<mpsc::UnboundedReceiver<SourcePick>>,
 }
 
 impl Surrogate for Win32Surrogate {
@@ -150,6 +166,24 @@ impl Surrogate for Win32Surrogate {
         self.acks.take()
     }
 
+    fn restart_stream(&mut self, title: &str) {
+        self.video_started = false;
+        self.acks = PresentationAcks::new(self.id);
+        let _ = self.commands.send(SurrogateCommand::Restart {
+            title: title.to_string(),
+        });
+    }
+
+    fn set_sources(&mut self, sources: &[ScreenSource]) {
+        let _ = self
+            .commands
+            .send(SurrogateCommand::Sources(sources.to_vec()));
+    }
+
+    fn take_source_pick(&mut self) -> Option<SourcePick> {
+        self.picks.as_mut()?.try_recv().ok()
+    }
+
     fn close(&mut self, reason: WindowCloseReason) {
         tracing::info!(?reason, id = self.id, "closing surrogate window");
         let _ = self.commands.send(SurrogateCommand::Close(reason));
@@ -171,47 +205,62 @@ impl WindowRenderer for Win32WindowRenderer {
     type Surrogate = Win32Surrogate;
 
     fn open(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (input_tx, input_rx) = mpsc::unbounded_channel();
-        let (presented_tx, presented_rx) = mpsc::unbounded_channel();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let closed = Arc::new(AtomicBool::new(false));
+        open_surrogate(meta, false)
+    }
 
-        let meta = meta.clone();
-        let thread_meta = meta.clone();
-        let thread_closed = closed.clone();
-        std::thread::Builder::new()
-            .name(format!("cursio-surrogate-{}", meta.id))
-            .spawn(move || {
-                win32::run(
-                    thread_meta,
-                    cmd_rx,
-                    input_tx,
-                    presented_tx,
-                    ready_tx,
-                    thread_closed,
-                );
-            })
-            .map_err(|e| WindowError::Backend(format!("spawn surrogate thread: {e}")))?;
+    /// A plain, visible, captureable window — not the layered `alpha=0` trick a
+    /// transfer's *host* uses, which a screen-sharing application would record
+    /// as nothing.
+    fn open_screen_view(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
+        open_surrogate(meta, true)
+    }
+}
 
-        // Block until the window exists, so a failure surfaces from `open()`
-        // rather than as a window that never appears.
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Win32Surrogate {
-                id: meta.id,
-                width: meta.width,
-                height: meta.height,
-                commands: cmd_tx,
-                input: input_rx,
-                presented: presented_rx,
-                acks: PresentationAcks::new(meta.id),
-                video_started: false,
-                closed,
-            }),
-            Ok(Err(e)) => Err(WindowError::Backend(e)),
-            Err(_) => Err(WindowError::Backend(
-                "surrogate thread ended before signalling readiness".into(),
-            )),
-        }
+fn open_surrogate(meta: &WindowMeta, view: bool) -> Result<Win32Surrogate, WindowError> {
+    let (picks_tx, picks_rx) = mpsc::unbounded_channel();
+    let selector = view.then_some(picks_tx);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let (presented_tx, presented_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let closed = Arc::new(AtomicBool::new(false));
+
+    let meta = meta.clone();
+    let thread_meta = meta.clone();
+    let thread_closed = closed.clone();
+    std::thread::Builder::new()
+        .name(format!("cursio-surrogate-{}", meta.id))
+        .spawn(move || {
+            win32::run(
+                thread_meta,
+                selector,
+                cmd_rx,
+                input_tx,
+                presented_tx,
+                ready_tx,
+                thread_closed,
+            );
+        })
+        .map_err(|e| WindowError::Backend(format!("spawn surrogate thread: {e}")))?;
+
+    // Block until the window exists, so a failure surfaces from `open()`
+    // rather than as a window that never appears.
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(Win32Surrogate {
+            id: meta.id,
+            width: meta.width,
+            height: meta.height,
+            commands: cmd_tx,
+            input: input_rx,
+            presented: presented_rx,
+            acks: PresentationAcks::new(meta.id),
+            video_started: false,
+            closed,
+            picks: view.then_some(picks_rx),
+        }),
+        Ok(Err(e)) => Err(WindowError::Backend(e)),
+        Err(_) => Err(WindowError::Backend(
+            "surrogate thread ended before signalling readiness".into(),
+        )),
     }
 }

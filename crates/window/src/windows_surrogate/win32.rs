@@ -7,14 +7,19 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use cursio_protocol::ScreenSource;
 use cursio_protocol::{MouseButton, Rect, WindowInput, WindowMeta};
 use tokio::sync::mpsc;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, SetBrushOrgEx, SetStretchBltMode, StretchDIBits,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, DrawTextW, EndPaint, FillRect, GetStockObject, InvalidateRect, SetBkMode,
+    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, BLACK_BRUSH, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HALFTONE, HBRUSH,
+    PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
+
+use crate::SourcePick;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -47,6 +52,121 @@ struct WindowState {
     presented_tx: mpsc::UnboundedSender<u32>,
     pending_paint_seq: RefCell<Option<u32>>,
     closed: Arc<AtomicBool>,
+    /// Set when this window is a remote-screen view rather than a transfer's
+    /// surrogate.
+    view: Option<ViewState>,
+}
+
+/// What a remote-screen view needs beyond a surrogate.
+struct ViewState {
+    picks: mpsc::UnboundedSender<SourcePick>,
+    sources: RefCell<Vec<ScreenSource>>,
+    /// Text drawn while nothing streams; cleared by the first frame.
+    hint: RefCell<Option<String>>,
+}
+
+/// What an idle view says, so the one thing on screen is how to fill it.
+///
+/// Drawn only while nothing streams — it is inside the window a
+/// screen-sharing application captures, and must not sit over a picture.
+const VIEW_HINT: &str = "Right-click to choose what to show  ·  ← → to switch";
+
+/// The menu command for "show nothing"; sources use their index plus one.
+const STOP_COMMAND: usize = 0xFFFF;
+
+/// One line of the view's context menu.
+#[derive(Debug, PartialEq, Eq)]
+enum MenuEntry {
+    Item { command: usize, label: String },
+    Disabled(String),
+    Separator,
+}
+
+/// The view's menu: screens, then windows, then a way to show nothing.
+fn menu_entries(sources: &[ScreenSource]) -> Vec<MenuEntry> {
+    use cursio_protocol::SourceKind;
+    let mut out = Vec::new();
+    for kind in [SourceKind::Monitor, SourceKind::Window] {
+        let before = out.len();
+        for (index, source) in sources.iter().enumerate().filter(|(_, s)| s.kind == kind) {
+            out.push(MenuEntry::Item {
+                command: index + 1,
+                label: source.title.clone(),
+            });
+        }
+        if out.len() > before {
+            out.push(MenuEntry::Separator);
+        }
+    }
+    if sources.is_empty() {
+        out.push(MenuEntry::Disabled("Waiting for the peer's list…".into()));
+        out.push(MenuEntry::Separator);
+    }
+    out.push(MenuEntry::Item {
+        command: STOP_COMMAND,
+        label: "Show nothing".into(),
+    });
+    out
+}
+
+/// Show the view's context menu at the cursor and report the choice.
+///
+/// `TrackPopupMenu` opens a window of its own (class `#32768`), and window
+/// capture records only the captured `HWND`, so the menu stays out of what a
+/// screen-sharing application sends.
+unsafe fn show_source_menu(hwnd: HWND, view: &ViewState) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow,
+        TrackPopupMenu, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    };
+
+    let Ok(menu) = CreatePopupMenu() else {
+        return;
+    };
+    let sources = view.sources.borrow().clone();
+    for entry in menu_entries(&sources) {
+        let appended = match entry {
+            MenuEntry::Item { command, label } => {
+                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+                AppendMenuW(menu, MF_STRING, command, PCWSTR(wide.as_ptr()))
+            }
+            MenuEntry::Disabled(label) => {
+                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+                AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide.as_ptr()))
+            }
+            MenuEntry::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()),
+        };
+        if let Err(e) = appended {
+            tracing::debug!(error = %e, "could not build the source menu");
+        }
+    }
+    let mut at = POINT::default();
+    let _ = GetCursorPos(&mut at);
+    // Without this the menu does not close when the user clicks elsewhere — a
+    // documented `TrackPopupMenu` quirk.
+    let _ = SetForegroundWindow(hwnd);
+    let chosen = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        at.x,
+        at.y,
+        None,
+        hwnd,
+        None,
+    )
+    .0 as usize;
+    let _ = DestroyMenu(menu);
+
+    let pick = match chosen {
+        0 => return,
+        STOP_COMMAND => SourcePick::Stop,
+        n => match sources.get(n - 1) {
+            Some(source) => SourcePick::Source(source.id),
+            None => return,
+        },
+    };
+    let _ = view.picks.send(pick);
 }
 
 /// Map a click's `lParam` to host pixel coordinates.
@@ -207,12 +327,55 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
     let state = &*ptr;
 
+    // A view is view-only: the shared cursor already drives the peer, and a
+    // monitor has no window to replay into. Its mouse and keys drive the
+    // selector instead, and nothing reaches the host.
+    if let Some(view) = state.view.as_ref() {
+        match msg {
+            WM_RBUTTONUP => {
+                show_source_menu(hwnd, view);
+                return LRESULT(0);
+            }
+            WM_KEYDOWN => {
+                let pick = match wparam.0 as u16 {
+                    0x27 | 0x22 => Some(SourcePick::Next),     // right, page down
+                    0x25 | 0x21 => Some(SourcePick::Previous), // left, page up
+                    _ => None,
+                };
+                if let Some(pick) = pick {
+                    let _ = view.picks.send(pick);
+                }
+                return LRESULT(0);
+            }
+            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_MBUTTONDOWN
+            | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP | WM_MOUSEWHEEL | WM_KEYUP => {
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+    }
+
     match msg {
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
             let fb = state.fb.borrow();
             let mut painted = false;
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let (cw, ch) = (
+                (client.right - client.left).max(0) as u32,
+                (client.bottom - client.top).max(0) as u32,
+            );
+            // A view letterboxes rather than resizing itself to each source,
+            // so the bars are painted here — nothing else covers them.
+            let (dx, dy, dw, dh) = if state.view.is_some() {
+                let black = HBRUSH(GetStockObject(BLACK_BRUSH).0);
+                FillRect(hdc, &client, black);
+                crate::framebuffer::letterbox(fb.width, fb.height, cw, ch)
+            } else {
+                (0, 0, cw, ch)
+            };
             if fb.width > 0 && fb.height > 0 {
                 let info = BITMAPINFO {
                     bmiHeader: BITMAPINFOHEADER {
@@ -229,8 +392,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     },
                     ..Default::default()
                 };
-                let mut rect = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rect);
                 // The client area is kept at the host's resolution, so this is
                 // normally a straight copy. It stops being one the moment the
                 // user resizes the surrogate, and GDI's default stretch mode
@@ -243,10 +404,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = SetBrushOrgEx(hdc, 0, 0, None);
                 painted = StretchDIBits(
                     hdc,
-                    0,
-                    0,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
+                    dx as i32,
+                    dy as i32,
+                    dw as i32,
+                    dh as i32,
                     0,
                     0,
                     fb.width as i32,
@@ -256,6 +417,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     DIB_RGB_COLORS,
                     SRCCOPY,
                 ) != 0;
+            }
+            if let Some(text) = state.view.as_ref().and_then(|v| v.hint.borrow().clone()) {
+                let mut wide: Vec<u16> = text.encode_utf16().collect();
+                let mut area = client;
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+                DrawTextW(
+                    hdc,
+                    &mut wide,
+                    &mut area,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
             }
             let ended = EndPaint(hwnd, &ps).as_bool();
             if painted && ended {
@@ -349,6 +522,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// Create the window and pump its message loop until told to stop.
 pub(crate) fn run(
     meta: WindowMeta,
+    selector: Option<mpsc::UnboundedSender<SourcePick>>,
     mut commands: mpsc::UnboundedReceiver<SurrogateCommand>,
     input_tx: mpsc::UnboundedSender<WindowInput>,
     presented_tx: mpsc::UnboundedSender<u32>,
@@ -421,7 +595,13 @@ pub(crate) fn run(
             presented_tx,
             pending_paint_seq: RefCell::new(None),
             closed: closed.clone(),
+            view: selector.map(|picks| ViewState {
+                picks,
+                sources: RefCell::new(Vec::new()),
+                hint: RefCell::new(Some(VIEW_HINT.to_string())),
+            }),
         });
+        let is_view = state.view.is_some();
         let state_ptr = Box::into_raw(state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
 
@@ -486,7 +666,11 @@ pub(crate) fn run(
                                         // The encoder changed resolution
                                         // mid-stream; follow it, or every frame
                                         // from here is scaled to the old size.
-                                        fit_client(hwnd, pic.width, pic.height);
+                                        // A view letterboxes instead: its
+                                        // window is what is being captured.
+                                        if !is_view {
+                                            fit_client(hwnd, pic.width, pic.height);
+                                        }
                                     }
                                     let full = Rect {
                                         x: 0,
@@ -512,14 +696,42 @@ pub(crate) fn run(
                         state.fb.borrow_mut().resize(width, height);
                         // The host's window was resized, so this one follows it
                         // and keeps showing the pixels at their own size.
-                        fit_client(hwnd, width, height);
+                        if !is_view {
+                            fit_client(hwnd, width, height);
+                        }
                         painted = true;
                     }
                     Ok(SurrogateCommand::Grow { width, height }) => {
                         let state = &*state_ptr;
                         state.fb.borrow_mut().grow_to(width, height);
-                        fit_client(hwnd, width, height);
+                        if !is_view {
+                            fit_client(hwnd, width, height);
+                        }
                         painted = true;
+                    }
+                    Ok(SurrogateCommand::Restart { title }) => {
+                        // A new source is a new H.264 stream, possibly at
+                        // another size; the old decoder's reference frames
+                        // mean nothing to it.
+                        decoder = None;
+                        let state = &*state_ptr;
+                        let mut fb = state.fb.borrow_mut();
+                        let (w, h) = (fb.width, fb.height);
+                        fb.resize(w, h);
+                        if let Some(view) = state.view.as_ref() {
+                            *view.hint.borrow_mut() = Some(if title.is_empty() {
+                                VIEW_HINT.to_string()
+                            } else {
+                                format!("Starting {title}…")
+                            });
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    Ok(SurrogateCommand::Sources(list)) => {
+                        let state = &*state_ptr;
+                        if let Some(view) = state.view.as_ref() {
+                            *view.sources.borrow_mut() = list;
+                        }
                     }
                     Ok(SurrogateCommand::Close(reason)) => {
                         tracing::info!(?reason, id = meta.id, "surrogate closing");
@@ -533,6 +745,9 @@ pub(crate) fn run(
             if painted {
                 // One repaint per tick, not per tile: several tiles of the same
                 // visual update coalesce into a single present.
+                if let Some(view) = (*state_ptr).view.as_ref() {
+                    *view.hint.borrow_mut() = None;
+                }
                 if let Some(seq) = presented_seq {
                     let state = &*state_ptr;
                     let mut pending = state.pending_paint_seq.borrow_mut();
@@ -569,6 +784,42 @@ mod tests {
         assert_eq!(evdev_from_vk(0x30), Some(11)); // '0' -> KEY_0
         assert_eq!(evdev_from_vk(0x70), Some(59)); // F1
         assert_eq!(evdev_from_vk(0x7B), Some(88)); // F12
+    }
+
+    #[test]
+    fn the_view_menu_lists_screens_before_windows_and_ends_with_show_nothing() {
+        use cursio_protocol::SourceKind;
+        let source = |id, kind, title: &str| ScreenSource {
+            id,
+            kind,
+            title: title.into(),
+            width: 0,
+            height: 0,
+            picked_on_host: false,
+        };
+        let entries = menu_entries(&[
+            source(7, SourceKind::Window, "Firefox"),
+            source(0x8000_0000, SourceKind::Monitor, "Screen 1"),
+        ]);
+        assert_eq!(
+            entries,
+            vec![
+                MenuEntry::Item {
+                    command: 2,
+                    label: "Screen 1".into()
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    command: 1,
+                    label: "Firefox".into()
+                },
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    command: STOP_COMMAND,
+                    label: "Show nothing".into()
+                },
+            ]
+        );
     }
 
     #[test]

@@ -88,9 +88,46 @@ impl Framebuffer {
     }
 }
 
+/// Where a `src_w`x`src_h` picture lands inside a `dst_w`x`dst_h` area when
+/// scaled to fit without distortion, centred: `(x, y, width, height)`.
+///
+/// For a remote-screen view, which keeps one window while its source changes
+/// shape underneath — a portrait phone-sized window one moment, an ultrawide
+/// monitor the next. Stretching would be the only alternative, and a
+/// stretched desktop is unreadable.
+pub fn letterbox(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32, u32, u32) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return (0, 0, dst_w, dst_h);
+    }
+    // Compared by cross-multiplying, so no rounding decides which side fits.
+    let (w, h) = if (src_w as u64) * (dst_h as u64) >= (dst_w as u64) * (src_h as u64) {
+        let h = ((dst_w as u64) * (src_h as u64) / (src_w as u64)) as u32;
+        (dst_w, h.max(1))
+    } else {
+        let w = ((dst_h as u64) * (src_w as u64) / (src_h as u64)) as u32;
+        (w.max(1), dst_h)
+    };
+    ((dst_w - w) / 2, (dst_h - h) / 2, w, h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wide_source_gets_bars_above_and_below() {
+        assert_eq!(letterbox(1920, 1080, 1000, 1000), (0, 219, 1000, 562));
+    }
+
+    #[test]
+    fn a_tall_source_gets_bars_at_the_sides() {
+        assert_eq!(letterbox(1080, 1920, 1000, 1000), (219, 0, 562, 1000));
+    }
+
+    #[test]
+    fn a_matching_shape_fills_the_area() {
+        assert_eq!(letterbox(1280, 720, 1920, 1080), (0, 0, 1920, 1080));
+    }
 
     #[test]
     fn blit_places_a_tile_at_its_offset() {
