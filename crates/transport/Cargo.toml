@@ -25,3 +25,17 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+# `setsockopt` for `TCP_NOTSENT_LOWAT`, which tokio does not expose; see
+# `send_backlog`.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# `SIO_IDEAL_SEND_BACKLOG_QUERY` and `SO_SNDBUF`, the Windows substitute for
+# `TCP_NOTSENT_LOWAT`; see `send_backlog`.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Networking_WinSock",
+    # `WSAIoctl`'s signature names `OVERLAPPED`, even when none is passed.
+    "Win32_System_IO",
+] }

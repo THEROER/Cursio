@@ -3,6 +3,11 @@
 //! Wraps a [`tokio::net::TcpStream`] and speaks the length-prefixed framing
 //! from `cursio-protocol`. Incoming bytes accumulate in a read buffer until a
 //! whole frame is available, so partial reads are handled transparently.
+//!
+//! Every connection, dialled or accepted, has its kernel send backlog bounded
+//! before the first byte is written ([`crate::send_backlog`]): the priority
+//! drainer's ordering only holds if the socket does not keep a deep queue of
+//! its own.
 
 use std::net::SocketAddr;
 
@@ -24,18 +29,24 @@ pub struct TcpTransport {
 impl TcpTransport {
     /// Dial `addr` and wrap the resulting connection.
     pub async fn connect(addr: SocketAddr) -> Result<Self, TransportError> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        let peer_addr = stream.peer_addr()?;
-        Ok(Self {
-            stream,
-            read_buf: Vec::new(),
-            peer_addr,
-        })
+        Self::from_stream(TcpStream::connect(addr).await?)
     }
 
     /// Wrap an already-accepted connection (server side).
     pub fn from_stream(stream: TcpStream) -> Result<Self, TransportError> {
+        crate::send_backlog::bound(&stream);
+        Self::wrap(stream)
+    }
+
+    /// A connection that keeps the kernel's own, autotuned send buffer: what
+    /// every link was before the backlog was bounded, kept so tests can show
+    /// the difference the bound makes.
+    #[cfg(test)]
+    pub(crate) fn from_stream_unbounded(stream: TcpStream) -> Result<Self, TransportError> {
+        Self::wrap(stream)
+    }
+
+    fn wrap(stream: TcpStream) -> Result<Self, TransportError> {
         stream.set_nodelay(true)?;
         let peer_addr = stream.peer_addr()?;
         Ok(Self {
@@ -89,7 +100,11 @@ impl Transport for TcpTransport {
         // already-read bytes are lost across the split.
         let (read, write) = self.stream.into_split();
         (
-            Box::new(TcpTx { write }),
+            Box::new(TcpTx {
+                write,
+                #[cfg(target_os = "windows")]
+                backlog: crate::send_backlog::IdealBacklog::new(),
+            }),
             Box::new(TcpRx {
                 read,
                 read_buf: self.read_buf,
@@ -101,11 +116,17 @@ impl Transport for TcpTransport {
 /// Send half of a split [`TcpTransport`].
 pub struct TcpTx {
     write: tokio::net::tcp::OwnedWriteHalf,
+    /// The split tx is what the priority drainer writes through, so this is
+    /// where the send buffer follows the stack's estimate as a link ramps up.
+    #[cfg(target_os = "windows")]
+    backlog: crate::send_backlog::IdealBacklog,
 }
 
 #[async_trait]
 impl TransportTx for TcpTx {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
+        #[cfg(target_os = "windows")]
+        self.backlog.retune(self.write.as_ref());
         let payload = msg.to_bytes()?;
         let frame = encode_frame(&payload)?;
         self.write.write_all(&frame).await?;

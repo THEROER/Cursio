@@ -191,6 +191,48 @@ AirPlay) and have been ranking machines without knowing which of them is running
 out of power. A laptop below 15% and discharging is `is_power_critical`; a peer
 on cellular `is_metered`. Those are the questions the mesh will ask.
 
+## One link, priority end to end
+
+Every module rides one Noise-over-TCP link, so the order bytes leave in is the
+latency each module gets. `transport/src/priority.rs` queues frames per class —
+`Control` > `Input` > `Audio` > `Video` > `Metadata` > `Bulk` — and a drainer
+writes the most urgent one next, re-choosing between frames. That choice only
+reaches as far as the socket: whatever the kernel already holds goes out first,
+in the order it was written. Left alone, a TCP send buffer autotunes to
+megabytes, so a pointer event queued while the remote screen or a file transfer
+was running waited behind a few megabytes of IDR frames and file chunks already
+handed over — tens of milliseconds on gigabit, more on Wi-Fi, felt as a lagging
+mouse however well the queue above was ordered.
+
+So an input frame now waits behind at most two things, both bounded:
+
+- **The frame being written.** Once started, a frame must finish or the stream
+  is corrupt. Frames are at most one Noise message, 64 KiB: 0.5 ms on gigabit.
+  They are not cut smaller for the lower classes, because a 64 MiB message would
+  then need more parts than a receiver accepts.
+- **What the kernel holds unsent** (`transport/src/send_backlog.rs`). On Linux,
+  Android and macOS, `TCP_NOTSENT_LOWAT` = 32 KiB: the socket reports writable
+  only below that many unsent bytes. Sent-but-unacknowledged bytes are not
+  counted, so the congestion window — and throughput — is untouched; only the
+  queue in front of the next write is capped. Windows has no such option and
+  counts unacknowledged bytes in `SO_SNDBUF`, so a fixed cap would trade
+  throughput for latency; instead the send buffer follows
+  `SIO_IDEAL_SEND_BACKLOG_QUERY`, the stack's own bandwidth-delay estimate,
+  re-read every 100 ms as the link ramps (clamped to 128 KiB–4 MiB).
+
+32 KiB is two limits meeting: with the 64 KiB frame it is under 1 ms of wire
+time at gigabit, and it lasts 260 µs at gigabit before the link would idle,
+which a woken drainer meets easily. Over loopback in a release build, 16–128 KiB
+all carried bulk at the same 130–180 MB/s as the unbounded socket (the cipher is
+the limit there, and that is past gigabit); behind a 16 MiB backlog, input
+arrived after 0–256 KiB of it bounded against 0.75–1.5 MiB unbounded.
+
+**Lag is a number.** Each frame records how long it took from `send` to the
+socket accepting it, per class, in ten-second windows. The drainer logs the
+input p50/p99/max (with video and bulk p99 beside it) at `debug`, or `info` when
+input p99 reaches 4 ms; `TransportTx::queue_delay` returns the last complete
+window.
+
 ## Where it lives
 
 All five parts shipped, and the code is laid out along the same seams:
@@ -203,6 +245,7 @@ All five parts shipped, and the code is laid out along the same seams:
 | Peer registry | `PeerState`, `should_dial` — `registry.rs` |
 | N sessions | one task per peer, supervised by the registry |
 | Node state | `NodeStatus` — `protocol/src/node.rs`; reading it — `core/src/node_status.rs` |
+| Priority to the wire | drainer, queue delay — `transport/src/priority.rs`; kernel backlog — `transport/src/send_backlog.rs` |
 
 `PeerState` gained a third state the original design did not name: `Connecting`,
 so the supervisor does not start a second attempt for a peer that already has one

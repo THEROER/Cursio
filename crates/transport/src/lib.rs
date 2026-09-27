@@ -18,6 +18,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod pairing;
 pub mod priority;
+mod send_backlog;
 pub mod tcp;
 #[cfg(test)]
 pub(crate) mod test_util;

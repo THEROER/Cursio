@@ -34,6 +34,21 @@
 //! Only a genuine bulk transfer builds depth, and only in its own low-priority
 //! class where it can't delay anything above it.
 //!
+//! ## Where priority stops
+//!
+//! Ordering here is only worth as much as the queue *after* it is shallow.
+//! Two things bound what an input frame can find in front of it once chosen:
+//! the frame the drainer is part-way through writing, at most one Noise frame
+//! (64 KiB — a frame, once started, has to finish or the stream is corrupt),
+//! and whatever the kernel still holds unsent, which
+//! [`crate::send_backlog`] keeps to a few tens of KiB. Without that second
+//! bound the socket buffer autotuned to megabytes and the scheduling above
+//! was decided long before the bytes actually left.
+//!
+//! Frames stay at the Noise maximum rather than being cut smaller for the
+//! lower classes: at gigabit one is half a millisecond, and smaller parts
+//! would push a 64 MiB message past the part count every receiver accepts.
+//!
 //! ## Measuring it
 //!
 //! Every frame carries the instant it was queued, and the drainer records how
@@ -812,22 +827,17 @@ mod tests {
 
     // --- End-to-end scheduling + flush over the real encrypted transport. ---
     //
-    // NOTE on what is *not* unit-tested: the headline property — an input frame
-    // interleaving *between* the chunks of an in-flight bulk transfer — only
-    // manifests when the socket applies backpressure (the drainer parks mid
-    // transfer, letting a newly-queued input frame jump the remaining chunks).
-    // The in-memory transport uses unbounded channels with no backpressure, so
-    // the drainer would flush the whole bulk instantly and the interleave could
-    // never be observed. Asserting it here would test the mock, not the
-    // scheduler. The scheduler's ordering guarantee is covered by
-    // `pop_highest_prefers_lower_index`; the interleave is verified live on a
-    // real link. What we *can* pin down end-to-end is that priority scheduling
-    // doesn't corrupt the stream and that flush works — below.
+    // The in-memory transport has no backpressure — the drainer empties the
+    // queues into it instantly — so it can show that scheduling keeps the
+    // stream intact and that flush works, but not that input overtakes a
+    // backlog. That needs a socket whose far end is slower than the near one,
+    // which the loopback tests further down arrange.
 
     use crate::crypto::EncryptedTransport;
     use crate::pairing::Role;
+    use crate::tcp::TcpTransport;
     use crate::test_util::MemTransport;
-    use crate::Transport;
+    use crate::{Transport, TransportRx};
     use cursio_protocol::{InputEvent, Message};
 
     /// Priority-scheduled sends must still decode correctly on the far side: a
@@ -952,6 +962,186 @@ mod tests {
         assert_eq!(
             tx.queue_depth(Priority::Audio),
             crate::QueueDepth::default()
+        );
+    }
+
+    /// A prioritized sender and a plain receiver over real loopback TCP, plus
+    /// the halves each side does not use, kept alive so neither direction
+    /// shuts down under the test.
+    struct Loopback {
+        tx: Box<dyn TransportTx>,
+        rx: Box<dyn TransportRx>,
+        _unused: (Box<dyn TransportRx>, Box<dyn TransportTx>),
+    }
+
+    /// `receive_window` caps the receiver's socket buffer, standing in for the
+    /// bandwidth-delay product of a real link: left to autotune on loopback it
+    /// grows to tens of megabytes and would hold the backlog itself, which no
+    /// receiver that reads as fast as the network delivers ever does.
+    async fn loopback(bounded: bool, receive_window: Option<u32>) -> Loopback {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        if let Some(bytes) = receive_window {
+            // Set on the listener so the accepted socket starts with it, and
+            // the window it advertises never exceeds it.
+            socket.set_recv_buffer_size(bytes).unwrap();
+        }
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let dialled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let sender = if bounded {
+            TcpTransport::from_stream(dialled)
+        } else {
+            TcpTransport::from_stream_unbounded(dialled)
+        }
+        .unwrap();
+        let receiver = TcpTransport::from_stream(accepted.await.unwrap()).unwrap();
+
+        let init = tokio::spawn(async move {
+            EncryptedTransport::establish(sender, b"k", Role::Initiator)
+                .await
+                .unwrap()
+        });
+        let resp = EncryptedTransport::establish(receiver, b"k", Role::Responder)
+            .await
+            .unwrap();
+        let (tx, sender_rx) = Box::new(init.await.unwrap()).split_prioritized();
+        let (receiver_tx, rx) = Box::new(resp).split();
+        Loopback {
+            tx,
+            rx,
+            _unused: (sender_rx, receiver_tx),
+        }
+    }
+
+    /// One file read reply's worth: five Noise frames, like `FilesMsg::MAX_CHUNK`.
+    const BULK_MESSAGE: usize = 256 * 1024;
+
+    /// A gigabit LAN's bandwidth-delay product at about 1 ms.
+    const RECEIVE_WINDOW: u32 = 128 * 1024;
+
+    /// Queue sixteen megabytes of bulk, let the drainer push as much of it
+    /// into the socket as the socket will take, then send one pointer event,
+    /// and count the bulk bytes the receiver had to take before that event.
+    ///
+    /// Counted in bytes rather than milliseconds because bytes are what the
+    /// sender decides; how long they take depends on the receiver, which here
+    /// is an unoptimised test build decrypting on a loaded machine. The
+    /// receiver pauses between messages so it is slower than the sender, which
+    /// is what any real link is to the drainer.
+    async fn bulk_ahead_of_input(bounded: bool) -> usize {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let Loopback {
+            mut tx,
+            mut rx,
+            _unused,
+        } = loopback(bounded, Some(RECEIVE_WINDOW)).await;
+
+        let input = Message::Input(InputEvent::PointerMotion { dx: 1, dy: 1 });
+        let expected = input.clone();
+        let input_sent = Arc::new(AtomicBool::new(false));
+        let after_input = input_sent.clone();
+        let reader = tokio::spawn(async move {
+            let mut ahead = 0;
+            loop {
+                match rx.recv().await.unwrap() {
+                    msg if msg == expected => return ahead,
+                    Message::Opaque(bytes) if after_input.load(Ordering::SeqCst) => {
+                        ahead += bytes.len();
+                    }
+                    _ => {}
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        for _ in 0..64 {
+            tx.send(&Message::Opaque(vec![0u8; BULK_MESSAGE]))
+                .await
+                .unwrap();
+        }
+        // Long enough for the drainer to fill whatever the kernel will hold;
+        // an autotuned buffer is what this is here to expose.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        input_sent.store(true, Ordering::SeqCst);
+        tx.send(&input).await.unwrap();
+        reader.await.unwrap()
+    }
+
+    /// The headline property: a pointer event queued behind a transfer
+    /// reaches the peer after the few frames already committed to the wire,
+    /// not after the transfer.
+    ///
+    /// What may legitimately be ahead of it: the bulk message the receiver is
+    /// part-way through, the receive window (which Linux doubles), the frame
+    /// the drainer is writing and the kernel's unsent allowance. Measured,
+    /// that came to 0–256 KiB bounded and 768 KiB–1.5 MiB with the send
+    /// buffer left to autotune, even on loopback where autotuning stays
+    /// modest; on a real LAN it grows to megabytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_overtakes_a_bulk_backlog_already_handed_to_the_socket() {
+        const NOISE_FRAME: usize = 64 * 1024;
+        const KERNEL_UNSENT: usize = 128 * 1024;
+        let allowed = BULK_MESSAGE + 2 * RECEIVE_WINDOW as usize + NOISE_FRAME + KERNEL_UNSENT;
+
+        let ahead = bulk_ahead_of_input(true).await;
+        assert!(
+            ahead <= allowed,
+            "input arrived behind {} KiB of a transfer queued before it, over the {} KiB bound",
+            ahead / 1024,
+            allowed / 1024
+        );
+    }
+
+    /// Bytes a receiver takes as fast as it can, over one link.
+    async fn bulk_throughput(bounded: bool, messages: usize) -> f64 {
+        let Loopback {
+            mut tx,
+            mut rx,
+            _unused,
+        } = loopback(bounded, None).await;
+
+        let reader = tokio::spawn(async move {
+            for _ in 0..messages {
+                rx.recv().await.unwrap();
+            }
+            Instant::now()
+        });
+        let started = Instant::now();
+        for _ in 0..messages {
+            tx.send(&Message::Opaque(vec![0u8; BULK_MESSAGE]))
+                .await
+                .unwrap();
+        }
+        let finished = reader.await.unwrap();
+        (messages * BULK_MESSAGE) as f64 / finished.duration_since(started).as_secs_f64()
+    }
+
+    /// Bounding the kernel queue must not cost the transfer its speed.
+    ///
+    /// Loopback is far faster than any LAN, so the low-water mark drains
+    /// quicker here than it ever will on a real link: if the drainer keeps a
+    /// loopback socket fed, it keeps a gigabit one fed with room to spare.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "an unoptimised build measures its own cipher and serialiser, a few MB/s; \
+                  run with --release"
+    )]
+    async fn a_bounded_backlog_keeps_bulk_throughput() {
+        let unbounded = bulk_throughput(false, 128).await;
+        let bounded = bulk_throughput(true, 128).await;
+        // Both runs are limited by the cipher, not the socket, so they sit
+        // within run-to-run noise of each other (about a quarter, measured);
+        // a bound that stalled the drainer would show up as a halving.
+        assert!(
+            bounded >= unbounded * 0.5,
+            "bounded {:.0} MB/s against unbounded {:.0} MB/s",
+            bounded / 1e6,
+            unbounded / 1e6
         );
     }
 
