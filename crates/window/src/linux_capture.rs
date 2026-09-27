@@ -584,6 +584,13 @@ fn capture_thread(
         }
     };
 
+    // Held for the capture's life; dropping the connection is what releases
+    // the inhibition, so a crash cannot leave it behind.
+    let _scanout = match mode {
+        PortalMode::View(_) => rt.block_on(inhibit_direct_scanout()),
+        PortalMode::Transfer => None,
+    };
+
     // Phase 2: hand the thread to PipeWire. `cast` (and its portal session)
     // stays alive here for the duration.
     if let Err(e) = run_pipewire_loop(
@@ -593,6 +600,44 @@ fn capture_thread(
         // if we already did, the send is a no-op and the log is the record.
         tracing::error!(error = %e, "window capture loop ended with an error");
         let _ = ready_tx.send(Err(e));
+    }
+}
+
+/// Ask the Cursio Shell extension to keep Mutter compositing every frame.
+///
+/// A fullscreen window Mutter scans out directly is never composited, and a
+/// monitor cast records only what is: measured on GNOME 49, a fullscreen video
+/// in Chrome streamed ~30 buffers a second windowed and none a few seconds
+/// after going fullscreen, so the viewer's picture froze while the video
+/// played on. No client API turns scanout off; the compositor can, so the
+/// extension does it on request, per D-Bus sender. Returns the connection
+/// that holds the request — it lasts exactly as long as that connection does —
+/// or `None` when the extension is missing or too old, which costs only that
+/// fullscreen case.
+async fn inhibit_direct_scanout() -> Option<zbus::Connection> {
+    let conn = zbus::Connection::session().await.ok()?;
+    let reply = conn
+        .call_method(
+            Some("dev.cursio.Shell"),
+            "/dev/cursio/Shell",
+            Some("dev.cursio.Shell"),
+            "InhibitDirectScanout",
+            &(),
+        )
+        .await;
+    match reply {
+        Ok(_) => {
+            tracing::info!("direct scanout inhibited while this screen is shared");
+            Some(conn)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not inhibit direct scanout; a fullscreen app on the shared screen \
+                 may freeze the peer's view (update the Cursio GNOME extension and log in again)"
+            );
+            None
+        }
     }
 }
 

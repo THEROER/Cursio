@@ -24,6 +24,8 @@
  *   WindowDragMoved(i x, i y)             — pointer moved during that grab
  *   WindowDragEnded(i x, i y)             — the grab finished
  *   GetDraggedWindow() -> (s, i, i, i, i) — title + frame rect, or ("",0,0,0,0)
+ *   InhibitDirectScanout()                — composite every frame, see below
+ *   UninhibitDirectScanout()              — undo one InhibitDirectScanout
  *
  * Coordinates are the pointer's, in compositor-global pixels, which is what
  * the daemon's edge logic already speaks.
@@ -60,6 +62,8 @@ const IFACE = `
       <arg type="i" name="width" direction="out"/>
       <arg type="i" name="height" direction="out"/>
     </method>
+    <method name="InhibitDirectScanout"/>
+    <method name="UninhibitDirectScanout"/>
   </interface>
 </node>`;
 
@@ -74,6 +78,23 @@ const POLL_MS = 30;
  * Comparing without masking it off silently fails to recognise a plain move;
  * GNOME's own tiling-assistant does exactly this. */
 const GRAB_OP_WINDOW_FLAG_UNCONSTRAINED = 1024;
+
+/* Mutter counts these calls, so every disable must be matched by one enable.
+ * GNOME 46 moved the call onto the compositor; 45 still has the display-level
+ * function. */
+function setUnredirect(enabled) {
+    const compositor = global.compositor;
+    if (compositor?.disable_unredirect) {
+        if (enabled)
+            compositor.enable_unredirect();
+        else
+            compositor.disable_unredirect();
+    } else if (enabled) {
+        Meta.enable_unredirect_for_display(global.display);
+    } else {
+        Meta.disable_unredirect_for_display(global.display);
+    }
+}
 
 export default class CursioExtension {
     enable() {
@@ -90,6 +111,8 @@ export default class CursioExtension {
 
         this._window = null;
         this._pollId = 0;
+        // Sender -> how many inhibitions it holds.
+        this._scanoutHolders = new Map();
 
         global.display.connectObject(
             'grab-op-begin', this._onGrabBegin.bind(this),
@@ -103,6 +126,8 @@ export default class CursioExtension {
         // rest of the session and is re-added on unlock.
         this._stopPolling();
         global.display.disconnectObject(this);
+        for (const sender of [...this._scanoutHolders.keys()])
+            this._releaseScanout(sender);
 
         if (this._nameId) {
             Gio.bus_unown_name(this._nameId);
@@ -113,6 +138,58 @@ export default class CursioExtension {
             this._dbus = null;
         }
         this._window = null;
+    }
+
+    /* --- Direct scanout -------------------------------------------------- */
+
+    /* A fullscreen client Mutter scans out directly is never composited, and a
+     * monitor ScreenCast records only what is composited: measured on GNOME 49
+     * with a fullscreen video in Chrome, the monitor's stream delivered ~30
+     * buffers a second while the window was windowed and none at all a few
+     * seconds after it went fullscreen, so a peer watching that monitor saw
+     * the picture freeze. Only the compositor can turn scanout off, so the
+     * daemon asks for it here while it streams a monitor.
+     *
+     * Held per D-Bus sender and released when that sender leaves the bus, so
+     * a daemon that crashes mid-stream does not leave scanout disabled for
+     * the rest of the session. */
+    InhibitDirectScanoutAsync(_params, invocation) {
+        const sender = invocation.get_sender();
+        let holder = this._scanoutHolders.get(sender);
+        if (!holder) {
+            const watch = Gio.bus_watch_name_on_connection(
+                Gio.DBus.session, sender, Gio.BusNameWatcherFlags.NONE,
+                null, () => this._releaseScanout(sender));
+            holder = {count: 0, watch};
+            this._scanoutHolders.set(sender, holder);
+        }
+        holder.count++;
+        setUnredirect(false);
+        invocation.return_value(null);
+    }
+
+    UninhibitDirectScanoutAsync(_params, invocation) {
+        const sender = invocation.get_sender();
+        const holder = this._scanoutHolders.get(sender);
+        if (holder && holder.count > 0) {
+            holder.count--;
+            setUnredirect(true);
+            if (holder.count === 0) {
+                Gio.bus_unwatch_name(holder.watch);
+                this._scanoutHolders.delete(sender);
+            }
+        }
+        invocation.return_value(null);
+    }
+
+    _releaseScanout(sender) {
+        const holder = this._scanoutHolders.get(sender);
+        if (!holder)
+            return;
+        for (; holder.count > 0; holder.count--)
+            setUnredirect(true);
+        Gio.bus_unwatch_name(holder.watch);
+        this._scanoutHolders.delete(sender);
     }
 
     /* --- Mutter signals --------------------------------------------------- */

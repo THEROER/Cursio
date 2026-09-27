@@ -305,6 +305,22 @@ stream. The next video frame is a P-frame off the decoder's lossy reference, so
 motion is lossy again until it settles again; that is the trade the lossy
 stream already made.
 
+**Direct scanout freezes a GNOME monitor cast.** A fullscreen window Mutter
+scans out directly is never composited, and a monitor ScreenCast records only
+what is composited. Measured on GNOME 49 (NVIDIA) by counting buffers from
+Mutter's own ScreenCast API: a looping video in Chrome delivered ~35 buffers/s
+windowed on the captured monitor, and in kiosk fullscreen a few seconds of
+buffers followed by none at all while the video kept playing — the view froze
+whenever the pointer left or the player hid it. (Fullscreen mpv through
+`gpu-next` kept streaming at 30/s, so not every fullscreen client is scanned
+out.) Asking for a frame rate cannot help: Mutter has nothing to record. So
+while a remote-screen view streams from this machine, the capture asks the
+Shell extension (`dev.cursio.Shell.InhibitDirectScanout`) to disable
+unredirection, held per D-Bus sender and released when that sender leaves the
+bus, so a crash cannot leave scanout off. Without the extension (or before
+re-login loads the new version) the capture logs why and the fullscreen case
+still freezes.
+
 **Corrupted PipeWire buffers are skipped.** A buffer whose chunk carries
 `SPA_CHUNK_FLAG_CORRUPTED` holds no new picture — its memory is whatever an
 earlier frame left in that pool slot — and was diffed as current, sending the
