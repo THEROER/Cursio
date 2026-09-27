@@ -66,9 +66,58 @@ pub(crate) fn contains_keyframe(packet: &[u8]) -> bool {
     false
 }
 
+/// Cut `(x, y, w, h)` out of a tightly packed BGRA picture `width` pixels wide.
+///
+/// Returns the picture untouched when the area is the whole of it, which is the
+/// common case, and clamps an area reaching past the picture rather than
+/// indexing out of bounds.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn crop_bgra(pixels: Vec<u8>, width: u32, area: (u32, u32, u32, u32)) -> Vec<u8> {
+    let (x, y, w, h) = area;
+    let stride = width as usize * 4;
+    let height = pixels.len().checked_div(stride).unwrap_or(0);
+    let (x, y) = (x as usize, y as usize);
+    let w = (w as usize).min((width as usize).saturating_sub(x));
+    let h = (h as usize).min(height.saturating_sub(y));
+    if x == 0 && y == 0 && w == width as usize {
+        let mut pixels = pixels;
+        pixels.truncate(w * h * 4);
+        return pixels;
+    }
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in y..y + h {
+        let start = row * stride + x * 4;
+        out.extend_from_slice(&pixels[start..start + w * 4]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cropping_the_macroblock_padding_keeps_the_visible_rows() {
+        // A 2x3 picture whose last row is coding padding, like 1080 in 1088.
+        let pixels: Vec<u8> = (0..24).collect();
+        assert_eq!(crop_bgra(pixels.clone(), 2, (0, 0, 2, 2)), pixels[..16]);
+    }
+
+    #[test]
+    fn cropping_an_offset_area_takes_only_its_columns() {
+        let pixels: Vec<u8> = (0..32).collect();
+        // 4x2 picture, keep the middle two pixels of the second row.
+        assert_eq!(
+            crop_bgra(pixels, 4, (1, 1, 2, 1)),
+            (20..28).collect::<Vec<u8>>()
+        );
+    }
+
+    #[test]
+    fn a_crop_past_the_picture_is_clamped() {
+        let pixels = vec![7u8; 16];
+        assert_eq!(crop_bgra(pixels, 2, (0, 0, 4, 4)).len(), 16);
+    }
 
     #[test]
     fn keyframe_detection_finds_idr_and_sps() {

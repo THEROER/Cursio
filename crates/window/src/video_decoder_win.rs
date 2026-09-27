@@ -30,7 +30,7 @@ use windows::core::Interface;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-use crate::video::{contains_keyframe, DecodedFrame};
+use crate::video::{contains_keyframe, crop_bgra as crop, DecodedFrame};
 use crate::WindowError;
 
 /// The one input stream / one output stream an H.264 decoder MFT exposes.
@@ -42,6 +42,15 @@ pub struct VideoDecoder {
     /// Frame geometry, known only after the transform has parsed the stream's
     /// SPS and announced a format change. `None` until then.
     size: Option<(u32, u32)>,
+    /// The part of each decoded picture that is the window, `(x, y, w, h)`.
+    ///
+    /// H.264 codes whole 16-pixel macroblocks, so a 1080-line window decodes
+    /// as 1088 lines with the extra eight cropped by the SPS. The decoder
+    /// reports the coded size as the frame size and the crop only as the
+    /// display aperture; passing the coded picture on would make every video
+    /// frame taller than the tiles around it, and the view would rescale on
+    /// each switch between the two paths.
+    visible: Option<(u32, u32, u32, u32)>,
     /// Reused NV12 scratch, so a steady stream stops allocating.
     nv12: Vec<u8>,
     /// Whether a keyframe has been seen; see the Linux decoder for why.
@@ -75,6 +84,7 @@ impl VideoDecoder {
             Ok(Self {
                 transform,
                 size: None,
+                visible: None,
                 nv12: Vec::new(),
                 synced: false,
                 dropped_before_sync: 0,
@@ -131,10 +141,19 @@ impl VideoDecoder {
                 dwStreamID: STREAM_ID,
                 ..Default::default()
             }];
+            // Microsoft's software decoder — the one every machine has — does
+            // not allocate its own output outside D3D mode. Handed an empty
+            // slot it fails the very call that has a picture ready ("null
+            // output sample", E_INVALIDARG), so a stream it could decode
+            // perfectly produced no picture at all, and a view showed only the
+            // lossless tiles that happened to land between video frames.
+            if let Some(size) = unsafe { caller_allocated_size(&self.transform) } {
+                buffers[0].pSample =
+                    std::mem::ManuallyDrop::new(Some(unsafe { alloc_sample(size)? }));
+            }
             let mut status = 0u32;
 
             let result = unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
-
             match result {
                 Ok(()) => {
                     // `pSample` is `ManuallyDrop`, so taking the value out is
@@ -147,15 +166,23 @@ impl VideoDecoder {
                         }
                     }
                 }
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                    unsafe { std::mem::ManuallyDrop::drop(&mut buffers[0].pSample) };
+                    break;
+                }
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    unsafe { std::mem::ManuallyDrop::drop(&mut buffers[0].pSample) };
                     // The SPS has been parsed; the real size is now knowable.
                     unsafe { select_nv12_output(&self.transform)? };
                     self.size = unsafe { output_size(&self.transform) };
-                    tracing::debug!(size = ?self.size, "decoder announced frame geometry");
+                    self.visible = unsafe { visible_area(&self.transform) };
+                    tracing::debug!(size = ?self.size, visible = ?self.visible, "decoder announced frame geometry");
                     continue;
                 }
-                Err(e) => return Err(WindowError::Backend(format!("ProcessOutput: {e}"))),
+                Err(e) => {
+                    unsafe { std::mem::ManuallyDrop::drop(&mut buffers[0].pSample) };
+                    return Err(WindowError::Backend(format!("ProcessOutput: {e}")));
+                }
             }
         }
 
@@ -164,6 +191,14 @@ impl VideoDecoder {
 
     /// Turn one NV12 output sample into a tightly-packed BGRA frame.
     fn convert(&mut self, sample: &IMFSample) -> Result<Option<DecodedFrame>, WindowError> {
+        // Microsoft's software decoder can take its first SPS without ever
+        // announcing a stream change, because the NV12 output type was already
+        // set at open. The current output type is then the only place the
+        // geometry is written down.
+        if self.size.is_none() {
+            self.size = unsafe { output_size(&self.transform) };
+            self.visible = unsafe { visible_area(&self.transform) };
+        }
         let Some((width, height)) = self.size else {
             // A sample before the format change would have no geometry to
             // interpret it with. Not expected, but not worth crashing over.
@@ -213,13 +248,67 @@ impl VideoDecoder {
                 }
             }
 
+            let pixels = crate::video::nv12::to_bgra(&self.nv12, width, height, stride);
+            let (x, y, w, h) = self.visible.unwrap_or((0, 0, width, height));
             Ok(Some(DecodedFrame {
-                width,
-                height,
-                pixels: crate::video::nv12::to_bgra(&self.nv12, width, height, stride),
+                width: w,
+                height: h,
+                pixels: crop(pixels, width, (x, y, w, h)),
             }))
         }
     }
+}
+
+/// The output buffer size to allocate, when this transform wants the caller to
+/// allocate it; `None` when it provides its own samples.
+unsafe fn caller_allocated_size(transform: &IMFTransform) -> Option<u32> {
+    let info = transform.GetOutputStreamInfo(STREAM_ID).ok()?;
+    let provides = MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0;
+    if info.dwFlags as i32 & provides != 0 {
+        return None;
+    }
+    // Before the first format change the size is unknown and reported as 0;
+    // a tiny buffer is enough to be told `NEED_MORE_INPUT` or `STREAM_CHANGE`.
+    Some(info.cbSize.max(1))
+}
+
+/// Allocate an `IMFSample` backed by one empty buffer of `size` bytes.
+unsafe fn alloc_sample(size: u32) -> Result<IMFSample, WindowError> {
+    let buffer = MFCreateMemoryBuffer(size)
+        .map_err(|e| WindowError::Backend(format!("MFCreateMemoryBuffer: {e}")))?;
+    let sample =
+        MFCreateSample().map_err(|e| WindowError::Backend(format!("MFCreateSample: {e}")))?;
+    sample
+        .AddBuffer(&buffer)
+        .map_err(|e| WindowError::Backend(format!("AddBuffer: {e}")))?;
+    Ok(sample)
+}
+
+/// The display aperture of the current output type, `(x, y, w, h)`; `None`
+/// when the transform reports none, meaning the whole frame is visible.
+unsafe fn visible_area(transform: &IMFTransform) -> Option<(u32, u32, u32, u32)> {
+    let media_type = transform.GetOutputCurrentType(STREAM_ID).ok()?;
+    let mut area = MFVideoArea::default();
+    media_type
+        .GetBlob(
+            &MF_MT_MINIMUM_DISPLAY_APERTURE,
+            std::slice::from_raw_parts_mut(
+                &mut area as *mut MFVideoArea as *mut u8,
+                std::mem::size_of::<MFVideoArea>(),
+            ),
+            None,
+        )
+        .ok()?;
+    let (w, h) = (area.Area.cx, area.Area.cy);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some((
+        area.OffsetX.value.max(0) as u32,
+        area.OffsetY.value.max(0) as u32,
+        w as u32,
+        h as u32,
+    ))
 }
 
 /// Read the frame size the transform settled on, after a format change.
@@ -291,6 +380,15 @@ unsafe fn find_h264_decoder() -> Result<IMFTransform, WindowError> {
 /// and taking the NV12 one, rather than constructing it — a decoder may
 /// require attributes we would not know to set.
 unsafe fn configure(transform: &IMFTransform) -> Result<(), WindowError> {
+    // Without this Microsoft's decoder fills its whole reorder buffer before
+    // releasing a picture — up to sixteen frames for a 1080p stream — and a
+    // window that changes less often than that shows nothing at all. Our
+    // encoders never reorder (no B-frames), so there is nothing to wait for.
+    if let Ok(attrs) = transform.GetAttributes() {
+        if let Err(e) = attrs.SetUINT32(&MF_LOW_LATENCY, 1) {
+            tracing::warn!(error = %e, "decoder refused low-latency mode; pictures will lag");
+        }
+    }
     let input =
         MFCreateMediaType().map_err(|e| WindowError::Backend(format!("media type: {e}")))?;
     input
