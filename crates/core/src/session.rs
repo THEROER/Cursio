@@ -363,6 +363,124 @@ pub struct Ownership {
     pub driving: bool,
 }
 
+/// One locally captured input event, stamped when it was handed to sessions.
+///
+/// The stamp is what turns "the mouse lags" into a number on the sending side:
+/// how long an event waited between capture handing it over and this session
+/// giving it to the transport. The transport measures the rest of the way to
+/// the socket itself.
+#[derive(Debug, Clone, Copy)]
+pub struct CapturedInput {
+    pub event: cursio_protocol::InputEvent,
+    pub at: std::time::Instant,
+}
+
+impl From<cursio_protocol::InputEvent> for CapturedInput {
+    /// Stamped now: converting is the moment it is handed over.
+    fn from(event: cursio_protocol::InputEvent) -> Self {
+        Self {
+            event,
+            at: std::time::Instant::now(),
+        }
+    }
+}
+
+/// How often the input latency figures are logged, when there were any.
+const INPUT_LATENCY_WINDOW: Duration = Duration::from_secs(30);
+
+/// A p99 at or above this is logged at `warn`: a pointer that lags by this
+/// much in one frame out of a hundred is visibly trailing the hand.
+const INPUT_LATENCY_WARN: Duration = Duration::from_millis(20);
+
+/// Samples kept per window. Beyond this the oldest are overwritten, which
+/// keeps a gaming mouse's thousand events a second from growing memory while
+/// still leaving thousands of samples behind each percentile.
+const INPUT_LATENCY_SAMPLES: usize = 8192;
+
+/// Input latency over one window, reported as percentiles.
+///
+/// Two of these per session, one per direction: from the reader taking an
+/// `Input` off the wire to injecting it, and from capture handing an event
+/// over to the transport accepting it. Both measure exactly the stretch the
+/// session loop controls, which is where every lag this loop ever caused
+/// lived.
+pub(crate) struct LatencyWindow {
+    what: &'static str,
+    samples: Vec<Duration>,
+    next: usize,
+    total: u64,
+    started: tokio::time::Instant,
+}
+
+impl LatencyWindow {
+    pub(crate) fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            samples: Vec::new(),
+            next: 0,
+            total: 0,
+            started: tokio::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn record(&mut self, latency: Duration) {
+        if self.samples.len() < INPUT_LATENCY_SAMPLES {
+            self.samples.push(latency);
+        } else {
+            self.samples[self.next] = latency;
+            self.next = (self.next + 1) % INPUT_LATENCY_SAMPLES;
+        }
+        self.total += 1;
+    }
+
+    /// `(p50, p99, max)` of the samples held, or `None` with none.
+    pub(crate) fn percentiles(&self) -> Option<(Duration, Duration, Duration)> {
+        let mut sorted = self.samples.clone();
+        sorted.sort_unstable();
+        let last = *sorted.last()?;
+        let at = |fraction: f64| {
+            let idx = ((sorted.len() as f64 * fraction).ceil() as usize).clamp(1, sorted.len());
+            sorted[idx - 1]
+        };
+        Some((at(0.50), at(0.99), last))
+    }
+
+    /// Log and restart the window once it has run its length. A window with
+    /// no input says nothing and logs nothing, so an idle link stays quiet.
+    fn report_if_due(&mut self) {
+        if self.started.elapsed() < INPUT_LATENCY_WINDOW {
+            return;
+        }
+        if let Some((p50, p99, max)) = self.percentiles() {
+            let (p50_us, p99_us, max_us) = (
+                p50.as_micros() as u64,
+                p99.as_micros() as u64,
+                max.as_micros() as u64,
+            );
+            if p99 >= INPUT_LATENCY_WARN {
+                tracing::warn!(
+                    path = self.what,
+                    events = self.total,
+                    p50_us,
+                    p99_us,
+                    max_us,
+                    "input latency is high enough to feel"
+                );
+            } else {
+                tracing::info!(
+                    path = self.what,
+                    events = self.total,
+                    p50_us,
+                    p99_us,
+                    max_us,
+                    "input latency"
+                );
+            }
+        }
+        *self = Self::new(self.what);
+    }
+}
+
 /// Run the session loop until the peer leaves or the link drops.
 ///
 /// Ownership model — **one global active machine** (MWB shared cursor):
@@ -414,7 +532,7 @@ pub async fn run_session<F, G, H>(
     // Borrowed, not owned: the capture that feeds these outlives any single
     // session (it holds a portal permission that must not be re-acquired per
     // connection), so a session reads from them and hands them back.
-    mut captured: Option<&mut tokio::sync::mpsc::UnboundedReceiver<cursio_protocol::InputEvent>>,
+    mut captured: Option<&mut tokio::sync::mpsc::UnboundedReceiver<CapturedInput>>,
     mut on_input: F,
     mut commands: Option<&mut tokio::sync::mpsc::UnboundedReceiver<OwnershipCmd>>,
     mut on_ownership: G,
@@ -472,7 +590,7 @@ where
         while let Ok(msg) = rx.recv().await {
             reader_heard.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
             if let Some(msg) = router.route(msg) {
-                if inbound_tx.send(msg).is_err() {
+                if inbound_tx.send((msg, std::time::Instant::now())).is_err() {
                     break; // main task gone
                 }
             }
@@ -509,6 +627,9 @@ where
     // the user with a clean log.
     let mut last_turn: Option<tokio::time::Instant> = None;
 
+    let mut inject_latency = LatencyWindow::new("received->injected");
+    let mut forward_latency = LatencyWindow::new("captured->sent");
+
     let result = loop {
         if let Some(prev) = last_turn {
             let turn = prev.elapsed();
@@ -531,6 +652,8 @@ where
             biased;
 
             _ = ticker.tick() => {
+                inject_latency.report_if_due();
+                forward_latency.report_if_due();
                 // Has the peer gone quiet? Checked on the heartbeat tick, so
                 // detection costs nothing extra and lands within one interval
                 // of the deadline.
@@ -669,7 +792,7 @@ where
                             // `captured` is an Option<&mut _>, so reborrow through
                             // it rather than handing over an &mut &mut.
                             if let Err(e) =
-                                forward_captured(&mut tx, event, captured.as_deref_mut()).await
+                                forward_captured(&mut tx, event, captured.as_deref_mut(), &mut forward_latency).await
                             {
                                 break Err(e);
                             }
@@ -679,6 +802,10 @@ where
                 }
             }
             incoming = inbound_rx.recv() => {
+                let (incoming, read_at) = match incoming {
+                    Some((msg, read_at)) => (Some(msg), Some(read_at)),
+                    None => (None, None),
+                };
                 match incoming {
                     Some(Message::Heartbeat { nonce }) => tracing::trace!(nonce, "peer heartbeat"),
                     // The peer's power or network changed. Logged rather than
@@ -693,6 +820,9 @@ where
                         if am_active {
                             tracing::trace!(?event, "peer input");
                             on_input(event);
+                            if let Some(read_at) = read_at {
+                                inject_latency.record(read_at.elapsed());
+                            }
                         }
                     }
                     // A peer that cannot hold the cursor claiming it anyway.
@@ -793,45 +923,54 @@ where
 /// instead of hundreds, with identical resulting cursor movement.
 async fn forward_captured(
     tx: &mut dyn cursio_transport::TransportTx,
-    first: cursio_protocol::InputEvent,
-    captured: Option<&mut tokio::sync::mpsc::UnboundedReceiver<cursio_protocol::InputEvent>>,
+    first: CapturedInput,
+    captured: Option<&mut tokio::sync::mpsc::UnboundedReceiver<CapturedInput>>,
+    latency: &mut LatencyWindow,
 ) -> Result<(), SessionError> {
     use cursio_protocol::InputEvent;
     use tokio::sync::mpsc::error::TryRecvError;
 
-    // Accumulated relative motion not yet sent.
-    let mut acc_dx: i32 = 0;
-    let mut acc_dy: i32 = 0;
+    /// Motion not yet sent, and when the oldest part of it was captured —
+    /// what the latency figure charges a coalesced frame with, since that
+    /// part waited longest.
+    #[derive(Default)]
+    struct Pending {
+        dx: i32,
+        dy: i32,
+        oldest: Option<std::time::Instant>,
+    }
 
-    // Send whatever motion has accumulated (if any) as one event.
     async fn flush(
         tx: &mut dyn cursio_transport::TransportTx,
-        dx: &mut i32,
-        dy: &mut i32,
+        pending: &mut Pending,
+        latency: &mut LatencyWindow,
     ) -> Result<(), SessionError> {
-        if *dx != 0 || *dy != 0 {
+        if pending.dx != 0 || pending.dy != 0 {
             tx.send(&Message::Input(InputEvent::PointerMotion {
-                dx: *dx,
-                dy: *dy,
+                dx: pending.dx,
+                dy: pending.dy,
             }))
             .await?;
-            *dx = 0;
-            *dy = 0;
         }
+        if let Some(oldest) = pending.oldest {
+            latency.record(oldest.elapsed());
+        }
+        *pending = Pending::default();
         Ok(())
     }
 
-    // Handle one event: fold motion into the accumulator, or flush + send.
+    // Fold motion into the accumulator, or flush it and send the event.
     async fn handle(
         tx: &mut dyn cursio_transport::TransportTx,
-        event: InputEvent,
-        dx: &mut i32,
-        dy: &mut i32,
+        input: CapturedInput,
+        pending: &mut Pending,
+        latency: &mut LatencyWindow,
     ) -> Result<(), SessionError> {
-        match event {
-            InputEvent::PointerMotion { dx: ex, dy: ey } => {
-                *dx += ex;
-                *dy += ey;
+        match input.event {
+            InputEvent::PointerMotion { dx, dy } => {
+                pending.dx += dx;
+                pending.dy += dy;
+                pending.oldest.get_or_insert(input.at);
                 Ok(())
             }
             other => {
@@ -842,24 +981,25 @@ async fn forward_captured(
                 // would be left holding a button down — which looks exactly like
                 // "the cursor stopped moving after I clicked".
                 if matches!(other, InputEvent::PointerButton { .. }) {
-                    tracing::debug!(event = ?other, pending_dx = *dx, pending_dy = *dy,
+                    tracing::debug!(event = ?other, pending_dx = pending.dx, pending_dy = pending.dy,
                         "forwarding pointer button to peer");
                 }
-                flush(tx, dx, dy).await?;
-                tx.send(&Message::Input(other))
-                    .await
-                    .map_err(SessionError::from)
+                flush(tx, pending, latency).await?;
+                tx.send(&Message::Input(other)).await?;
+                latency.record(input.at.elapsed());
+                Ok(())
             }
         }
     }
 
-    handle(tx, first, &mut acc_dx, &mut acc_dy).await?;
+    let mut pending = Pending::default();
+    handle(tx, first, &mut pending, latency).await?;
 
     // Drain everything already queued without blocking, coalescing as we go.
     if let Some(rx) = captured {
         loop {
             match rx.try_recv() {
-                Ok(event) => handle(tx, event, &mut acc_dx, &mut acc_dy).await?,
+                Ok(input) => handle(tx, input, &mut pending, latency).await?,
                 Err(TryRecvError::Empty) => break,
                 // Sender gone: send what we have, then stop draining. The
                 // caller's next recv sees the closed channel and clears it.
@@ -869,8 +1009,7 @@ async fn forward_captured(
     }
 
     // Send any leftover coalesced motion.
-    flush(tx, &mut acc_dx, &mut acc_dy).await?;
-    Ok(())
+    flush(tx, &mut pending, latency).await
 }
 
 /// Await the next item from an optional channel, or stay pending forever if
@@ -917,6 +1056,39 @@ mod tests {
 
     fn id(byte: u8) -> PeerId {
         PeerId::from_bytes([byte; 16])
+    }
+
+    /// The figures a lag report quotes are the real percentiles of what was
+    /// recorded: a single slow event shows as the max, not as the typical case.
+    #[test]
+    fn input_latency_reports_the_median_and_the_tail_separately() {
+        let mut window = LatencyWindow::new("test");
+        assert_eq!(window.percentiles(), None, "no input, nothing to say");
+        for _ in 0..99 {
+            window.record(Duration::from_micros(200));
+        }
+        window.record(Duration::from_millis(40));
+        let (p50, p99, max) = window.percentiles().unwrap();
+        assert_eq!(p50, Duration::from_micros(200));
+        assert_eq!(p99, Duration::from_micros(200));
+        assert_eq!(max, Duration::from_millis(40));
+    }
+
+    /// A flood of events keeps a bounded window of the most recent ones, so an
+    /// hour of gaming does not grow memory and the report reflects now.
+    #[test]
+    fn input_latency_keeps_only_the_most_recent_samples() {
+        let mut window = LatencyWindow::new("test");
+        for _ in 0..INPUT_LATENCY_SAMPLES {
+            window.record(Duration::from_millis(30));
+        }
+        for _ in 0..INPUT_LATENCY_SAMPLES {
+            window.record(Duration::from_micros(100));
+        }
+        assert_eq!(window.samples.len(), INPUT_LATENCY_SAMPLES);
+        let (_, p99, max) = window.percentiles().unwrap();
+        assert_eq!(p99, Duration::from_micros(100));
+        assert_eq!(max, Duration::from_micros(100));
     }
 
     /// Two machines with screens: the lower id starts with the cursor, and each

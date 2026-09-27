@@ -267,7 +267,7 @@ async fn a_blocked_module_delays_neither_forwarded_input_nor_another_modules_sen
     tokio::time::sleep(Duration::from_millis(200)).await;
     let sent_at = Instant::now();
     capture_tx
-        .send(InputEvent::PointerMotion { dx: 3, dy: 0 })
+        .send(InputEvent::PointerMotion { dx: 3, dy: 0 }.into())
         .unwrap();
 
     let (mut got_input, mut got_audio) = (false, false);

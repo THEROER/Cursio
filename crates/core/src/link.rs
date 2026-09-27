@@ -29,7 +29,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use cursio_protocol::{InputEvent, ModuleAdvert, ModuleId, PeerId};
+use cursio_protocol::{ModuleAdvert, ModuleId, PeerId};
 use cursio_transport::discovery::{self, DiscoveredPeer};
 use cursio_transport::pairing::{self, Role, TrustStore};
 use cursio_transport::{EncryptedTransport, Transport};
@@ -266,7 +266,7 @@ impl Link {
     /// changes, they simply have nothing to change.
     pub async fn run_as_input_source(
         self,
-        input: &mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+        input: &mut tokio::sync::mpsc::UnboundedReceiver<session::CapturedInput>,
         poll_status: impl FnMut() -> Option<cursio_protocol::NodeStatus>,
     ) -> Result<(), SessionError> {
         debug_assert!(

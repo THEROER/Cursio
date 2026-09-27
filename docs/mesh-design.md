@@ -317,3 +317,14 @@ the joins some modules do on drop no longer happen on the loop either.
 The slow-pump (50 ms) and slow-message (20 ms) warnings survive, scoped to the
 module: they now mean that module's own traffic waited, not that input did.
 
+**Input lag is a number.** The session keeps two latency windows and logs
+p50/p99/max every 30 s when input moved (`warn` once p99 reaches 20 ms):
+`received->injected`, from the reader taking an `Input` off the wire to handing
+it to the injector, and `captured->sent`, from capture handing an event over
+(`CapturedInput` is stamped as it leaves the hotkey filter) to the transport
+accepting it — for coalesced motion, charged at its oldest part. The transport
+measures the remaining stretch, queue to socket, per priority class. Measured
+over loopback with one module wedged in its pump for 30 s and another taking
+5 ms per message while both were flooded: 2000 pointer events injected at p50
+42 µs, p99 76 µs.
+

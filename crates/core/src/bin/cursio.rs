@@ -1898,7 +1898,7 @@ fn spawn_hotkey_filter(
     mut upstream: tokio::sync::mpsc::UnboundedReceiver<cursio_protocol::InputEvent>,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<session::OwnershipCmd>,
     grab: cursio_input::GrabControl,
-) -> tokio::sync::mpsc::UnboundedReceiver<cursio_protocol::InputEvent> {
+) -> tokio::sync::mpsc::UnboundedReceiver<session::CapturedInput> {
     use cursio_protocol::InputEvent;
 
     let (down_tx, down_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1974,7 +1974,7 @@ fn spawn_hotkey_filter(
                     _ => {}
                 }
             }
-            if down_tx.send(event).is_err() {
+            if down_tx.send(session::CapturedInput::from(event)).is_err() {
                 break; // session gone
             }
         }
@@ -2203,7 +2203,7 @@ fn set_cursor_hidden(cursor: Option<&mut Box<dyn cursio_input::CursorControl>>, 
 /// receivers for as long as it runs.
 struct PersistentCapture {
     /// Captured input events, hotkey presses already filtered out.
-    events: tokio::sync::mpsc::UnboundedReceiver<cursio_protocol::InputEvent>,
+    events: tokio::sync::mpsc::UnboundedReceiver<session::CapturedInput>,
     /// Ownership requests, from either the hotkey or an edge crossing.
     commands: tokio::sync::mpsc::UnboundedReceiver<session::OwnershipCmd>,
     /// Freeze/release local input.
