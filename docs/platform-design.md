@@ -358,3 +358,31 @@ Short enough to actually apply in review:
 7. **Reuse the existing patterns.** Chunked bulk transfer, state replication,
    and adaptive rate control (ack-driven) all exist. A new module that invents
    its own is a bug, not a design choice.
+
+## What a peer may reach
+
+Pairing is trust, but not one amount of it. Every module that exposes this
+machine to a peer answers two questions in the same place its requests are
+already checked: *what* is offered, and *what the peer may do* with it. The
+answer is enforced on the machine being exposed, never left to the peer's own
+side — the peer is the party the rule constrains.
+
+**Files** (`cursio-files::share`, `--files-share <path>[:ro]`, repeatable).
+`SharePolicy { roots: Vec<ShareRoot { path, read_only }> }` is plain serde data
+so a config file can carry it. An empty policy offers every detected volume
+read-write — what sharing meant before a policy, so an unconfigured machine
+behaves as it did. Naming any root turns it into an allow-list: a volume's root
+(`/`, `C:\`) offers that disk; any other path offers that folder as a volume of
+its own, named after it; a stick plugged in later is offered only if named. The
+mode is read off the end of the argument because a Windows path has a colon of
+its own (`C:\:ro`).
+
+Enforcement is in `Namespace`, the one boundary every request already crosses:
+read-only refuses every mutating open, `mkdir`, `remove` and `rename`, and a
+folder root is *confined* — `..` was already refused, but a symlink inside the
+folder pointing at `/etc` would still carry a request out, since the OS follows
+links while opening. So the parent of every path must resolve (symlinks
+followed) inside the folder, and an open or a listing, which go *through* a
+final link, must land inside too. A link may still be listed and stat'ed as the
+link it is. A whole volume has nothing outside it to escape to and pays none of
+this.

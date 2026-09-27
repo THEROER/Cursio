@@ -107,11 +107,18 @@ enum Command {
         /// Share disks both ways: this machine's volumes appear on the peer,
         /// and the peer's appear here under `~/Cursio/<peer>/`.
         ///
-        /// Mounted read-write, so anything either machine can reach, the other
-        /// can change. Linux mounts with FUSE and Windows with WinFsp; macOS
-        /// serves its own volumes but cannot yet mount the peer's.
+        /// Unless `--files-share` narrows it, every disk is offered read-write,
+        /// so anything either machine can reach, the other can change. Linux
+        /// mounts with FUSE and Windows with WinFsp; macOS serves its own
+        /// volumes but cannot yet mount the peer's.
         #[arg(long, default_value_t = false)]
         files: bool,
+        /// Offer only this root to peers instead of every disk; repeat for
+        /// several. A volume's root (`/`, `C:\`) offers that disk, anything
+        /// else offers that folder alone. Append `:ro` to refuse every change
+        /// the peer asks for there: `C:\:ro`, `/home/me/Projects:ro`.
+        #[arg(long = "files-share", value_name = "PATH[:ro]")]
+        files_share: Vec<String>,
         /// Share this machine's USB devices with the mesh, and use the devices
         /// its peers are sharing. A device stays usable here while it is
         /// shared.
@@ -491,6 +498,7 @@ async fn main() -> anyhow::Result<()> {
             audio_render_device,
             clipboard,
             files,
+            files_share,
             usb,
             share_airplay,
             remote_screen,
@@ -565,6 +573,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 clipboard,
                 files,
+                cursio_files::SharePolicy::from_args(&files_share)?,
                 usb,
                 WindowOpts {
                     airplay: airplay_tap.clone().map(|tap| {
@@ -1159,6 +1168,7 @@ fn module_registry(
     audio: &AudioOpts,
     clipboard: bool,
     files: bool,
+    files_share: cursio_files::SharePolicy,
     usb: bool,
     window: WindowOpts,
     services: ServiceSetup,
@@ -1199,6 +1209,7 @@ fn module_registry(
         // nothing.
         .with(Box::new(cursio_core::files_session::FilesFactory {
             enabled: files,
+            share: files_share,
         }))
         // Like files, a machine both offers its own ports and attaches a
         // peer's. The factory carries the node-level state every link shares,

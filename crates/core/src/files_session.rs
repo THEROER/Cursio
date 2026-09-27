@@ -1049,10 +1049,13 @@ pub struct FilesEngine {
     /// changed, `None` when it did not.
     rescan_tx: tokio::sync::mpsc::UnboundedSender<Option<Vec<Volume>>>,
     rescan_rx: tokio::sync::mpsc::UnboundedReceiver<Option<Vec<Volume>>>,
+    /// What this machine offers. Applied to every rescan too, so a stick
+    /// plugged in later is offered only if the policy names it.
+    share: cursio_files::SharePolicy,
 }
 
 impl FilesEngine {
-    pub fn new(peer_name: String) -> anyhow::Result<Self> {
+    pub fn new(peer_name: String, share: cursio_files::SharePolicy) -> anyhow::Result<Self> {
         let (ops_tx, ops_rx) = tokio::sync::mpsc::unbounded_channel();
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
         let (outbox_tx, outbox_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1073,7 +1076,7 @@ impl FilesEngine {
         #[cfg(target_os = "linux")]
         cursio_files::mount::release_stale_peer_mounts(&mount_root(&peer_name));
 
-        let mut server = FileServer::detect();
+        let mut server = FileServer::detect_shared(&share);
         server.exclude(excluded_paths(&peer_name));
         let local_volumes = server.volumes();
         cursio_files::walk::set_reporter(report_walk);
@@ -1109,6 +1112,7 @@ impl FilesEngine {
             rescanning: false,
             rescan_tx,
             rescan_rx,
+            share,
         })
     }
 
@@ -1158,8 +1162,9 @@ impl FilesEngine {
         let tx = self.rescan_tx.clone();
         let server = std::sync::Arc::clone(&self.server);
         let peer = self.peer_name.clone();
+        let share = self.share.clone();
         self.workers.spawn(move || {
-            let after = FileServer::detect();
+            let after = FileServer::detect_shared(&share);
             let changed = {
                 let mut server = server.lock().unwrap_or_else(PoisonError::into_inner);
                 let before = server.volumes();
@@ -2349,6 +2354,11 @@ impl SessionModule for FilesEngine {
 /// mount half needs WinFsp on Windows.
 pub struct FilesFactory {
     pub enabled: bool,
+    /// What this machine offers its peers. [`SharePolicy::everything`] is what
+    /// sharing meant before there was a policy.
+    ///
+    /// [`SharePolicy::everything`]: cursio_files::SharePolicy::everything
+    pub share: cursio_files::SharePolicy,
 }
 
 impl crate::module::ModuleFactory for FilesFactory {
@@ -2362,7 +2372,10 @@ impl crate::module::ModuleFactory for FilesFactory {
     }
 
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
-        Ok(Box::new(FilesEngine::new(ctx.peer_name().to_string())?))
+        Ok(Box::new(FilesEngine::new(
+            ctx.peer_name().to_string(),
+            self.share.clone(),
+        )?))
     }
 }
 
@@ -2515,6 +2528,7 @@ mod tests {
             rescanning: false,
             rescan_tx,
             rescan_rx,
+            share: cursio_files::SharePolicy::everything(),
         };
         (engine, ops_tx)
     }

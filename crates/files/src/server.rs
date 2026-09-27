@@ -17,6 +17,10 @@ pub struct SharedVolume {
     pub info: Volume,
     /// Native path the volume's root maps to: `/` or `C:\`.
     pub root: PathBuf,
+    /// Whether every path must be checked to stay under `root` once symlinks
+    /// are followed. True for a folder offered by a share policy: a whole
+    /// volume has nothing outside it for a link to reach, a folder does.
+    pub confined: bool,
 }
 
 /// Serves the local filesystem to one peer.
@@ -116,6 +120,12 @@ impl FileServer {
     /// root, so each fixed drive letter is its own volume.
     pub fn detect() -> Self {
         Self::new(detect_volumes())
+    }
+
+    /// Detect what this machine can share, and offer what `policy` allows of
+    /// it. See [`crate::share`].
+    pub fn detect_shared(policy: &crate::SharePolicy) -> Self {
+        Self::new(policy.apply(detect_volumes()))
     }
 
     /// What to announce to the peer.
@@ -248,7 +258,33 @@ impl Namespace {
         if self.is_excluded(&out) {
             return Err(FileError::Denied);
         }
+        // The last component is left unfollowed here: a link inside a shared
+        // folder may be listed, stat'ed, renamed or removed as the link it is.
+        // Only the operations that go *through* it — see
+        // [`Namespace::resolve_through`] — must find its target inside too.
+        let parent = match out == vol.root {
+            true => None,
+            false => out.parent(),
+        };
+        if vol.confined && parent.is_some_and(|p| !stays_under(&vol.root, p)) {
+            return Err(FileError::Denied);
+        }
         Ok(out)
+    }
+
+    /// As [`Namespace::resolve`], for an operation the OS will carry through a
+    /// final symlink — opening a file, listing a directory.
+    fn resolve_through(&self, volume: &str, path: &str) -> Result<PathBuf, FileError> {
+        let out = self.resolve(volume, path)?;
+        let confined_root = self
+            .volumes
+            .iter()
+            .find(|v| v.info.id == volume && v.confined)
+            .map(|v| &v.root);
+        match confined_root {
+            Some(root) if !stays_under(root, &out) => Err(FileError::Denied),
+            _ => Ok(out),
+        }
     }
 
     /// Whether a volume accepts writes at all.
@@ -261,7 +297,7 @@ impl Namespace {
 
     /// List a directory.
     pub fn read_dir(&self, volume: &str, path: &str) -> Result<Vec<FileMeta>, FileError> {
-        let dir = self.resolve(volume, path)?;
+        let dir = self.resolve_through(volume, path)?;
         let writable = self.writable(volume);
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&dir).map_err(to_file_error)? {
@@ -335,7 +371,7 @@ impl Namespace {
         if mode.is_mutating() && !self.writable(volume) {
             return Err(FileError::ReadOnly);
         }
-        let target = self.resolve(volume, path)?;
+        let target = self.resolve_through(volume, path)?;
         let file = OpenOptions::new()
             .read(mode.read)
             .write(mode.write)
@@ -467,6 +503,32 @@ impl Namespace {
         let from = self.resolve(volume, from)?;
         let to = self.resolve(volume, to)?;
         std::fs::rename(from, to).map_err(to_file_error)
+    }
+}
+
+/// Whether `path`, with every symlink along it followed, is still under `root`.
+///
+/// Refusing `..` keeps a request's *spelling* inside the root; a link inside a
+/// shared folder pointing at `/etc` would still carry it out, because the OS
+/// follows links while opening. So the deepest part of the path that exists is
+/// resolved and compared: a name that does not exist yet (a file being
+/// created) can only land where its existing parent does.
+///
+/// A root that cannot be resolved confines to nothing, which is the safe
+/// reading of a folder that has vanished.
+fn stays_under(root: &Path, path: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let mut probe = path;
+    loop {
+        match probe.canonicalize() {
+            Ok(real) => return real.starts_with(&root),
+            Err(_) => match probe.parent() {
+                Some(parent) => probe = parent,
+                None => return false,
+            },
+        }
     }
 }
 
@@ -732,17 +794,14 @@ fn to_file_error(e: std::io::Error) -> FileError {
 /// free count makes others refuse to write, believing the disk full. A
 /// plausible figure is wrong in a way nothing crashes on; zero is wrong in a way
 /// that takes other programs down.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 pub(crate) const FALLBACK_TOTAL: u64 = 1 << 40; // 1 TiB
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 pub(crate) const FALLBACK_FREE: u64 = 1 << 39; // half of it
 
 /// Total and free bytes for the filesystem holding `path`.
 ///
 /// Falls back to [`FALLBACK_TOTAL`]/[`FALLBACK_FREE`] rather than zero when the
 /// query fails.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
-fn capacity_of(path: &Path) -> (u64, u64) {
+pub(crate) fn capacity_of(path: &Path) -> (u64, u64) {
     match raw_capacity(path) {
         // A total of zero is as dangerous as a failed query, so treat it the
         // same: some pseudo-filesystems really do report it.
@@ -803,10 +862,7 @@ fn raw_capacity(path: &Path) -> Option<(u64, u64)> {
     Some((total, free_to_caller))
 }
 
-#[cfg(all(
-    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
-    test
-))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn raw_capacity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
@@ -841,6 +897,7 @@ fn detect_volumes() -> Vec<SharedVolume> {
             removable: false,
         },
         root,
+        confined: false,
     }];
     volumes.extend(detect_disks());
     volumes
@@ -913,6 +970,7 @@ fn detect_disks() -> Vec<SharedVolume> {
                 removable: is_removable_disk(&disk),
             },
             root,
+            confined: false,
         });
     }
     out
@@ -1035,6 +1093,7 @@ fn detect_volumes() -> Vec<SharedVolume> {
                 removable: is_removable_drive(letter),
             },
             root,
+            confined: false,
         });
     }
     out
@@ -1259,6 +1318,7 @@ mod tests {
                 removable: false,
             },
             root: root.to_path_buf(),
+            confined: false,
         }])
     }
 
@@ -1410,6 +1470,7 @@ mod tests {
                 removable: true,
             },
             root: tmp.path().to_path_buf(),
+            confined: false,
         });
         let scanned = FileServer::new(volumes);
         srv.adopt_volumes(scanned);
@@ -1757,6 +1818,7 @@ mod tests {
                 removable: false,
             },
             root: tmp.path().to_path_buf(),
+            confined: false,
         }]);
 
         assert!(matches!(
@@ -1858,6 +1920,74 @@ mod tests {
         assert!(matches!(
             srv.read_link("T:", "../outside"),
             Err(FileError::Denied)
+        ));
+    }
+
+    /// A shared folder must not lead out of itself through a symlink the OS
+    /// would follow while opening — the escape `..` refusal cannot see.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_folder_refuses_a_path_through_a_link_that_leaves_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shared = tmp.path().join("Public");
+        let secret = tmp.path().join("secret");
+        std::fs::create_dir(&shared).expect("shared");
+        std::fs::create_dir(&secret).expect("secret");
+        std::fs::write(secret.join("key"), b"k").expect("key");
+        std::fs::write(shared.join("note.txt"), b"n").expect("note");
+        std::os::unix::fs::symlink(&secret, shared.join("way-out")).expect("link");
+
+        let policy =
+            crate::SharePolicy::from_args(&[shared.display().to_string()]).expect("policy");
+        let mut srv = FileServer::new(policy.apply(Vec::new()));
+        let id = srv.volumes()[0].id.clone();
+
+        assert!(srv.stat(&id, "note.txt").is_ok(), "inside is served");
+        assert!(
+            srv.stat(&id, "way-out").is_ok(),
+            "the link itself is inside and may be listed"
+        );
+        assert!(matches!(
+            srv.open(&id, "way-out/key", OpenMode::read_only()),
+            Err(FileError::Denied)
+        ));
+        assert!(matches!(
+            srv.stat(&id, "way-out/new-file"),
+            Err(FileError::Denied)
+        ));
+        assert!(matches!(
+            srv.read_dir(&id, "way-out"),
+            Err(FileError::Denied)
+        ));
+    }
+
+    /// Read-only is decided here, whatever the peer's mount believes.
+    #[test]
+    fn a_read_only_root_refuses_every_change() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.txt"), b"a").expect("writes");
+        let policy = crate::SharePolicy::from_args(&[format!("{}:ro", tmp.path().display())])
+            .expect("policy");
+        let mut srv = FileServer::new(policy.apply(Vec::new()));
+        let id = srv.volumes()[0].id.clone();
+
+        assert!(srv.open(&id, "a.txt", OpenMode::read_only()).is_ok());
+        let write = OpenMode {
+            read: true,
+            write: true,
+            create: false,
+            truncate: false,
+            exclusive: false,
+        };
+        assert!(matches!(
+            srv.open(&id, "a.txt", write),
+            Err(FileError::ReadOnly)
+        ));
+        assert!(matches!(srv.mkdir(&id, "d"), Err(FileError::ReadOnly)));
+        assert!(matches!(srv.remove(&id, "a.txt"), Err(FileError::ReadOnly)));
+        assert!(matches!(
+            srv.rename(&id, "a.txt", "b.txt"),
+            Err(FileError::ReadOnly)
         ));
     }
 }

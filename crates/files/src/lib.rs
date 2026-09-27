@@ -28,6 +28,8 @@ pub mod mount;
 /// many small reads share one round trip.
 pub mod readahead;
 pub mod server;
+/// Which roots a peer may reach, each read-only or read-write.
+pub mod share;
 /// Which process is walking a mounted peer volume, directory after directory.
 pub mod walk;
 /// Windows mounting, present only where `winfsp` can be built — see this
@@ -40,6 +42,18 @@ pub mod writeback;
 
 pub use background::Workers;
 pub use server::{FileServer, Namespace, SharedVolume};
+pub use share::{SharePolicy, ShareRoot};
+
+/// What went wrong setting up file sharing on this machine.
+///
+/// Requests from the peer answer with `cursio_protocol::FileError`, which is
+/// what crosses the wire; this is for the local side's own configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum FilesError {
+    /// A `--files-share` root (or its config equivalent) cannot be used.
+    #[error("invalid share root: {0}")]
+    ShareRoot(String),
+}
 
 /// Directory name a volume is presented under, on either mount.
 ///

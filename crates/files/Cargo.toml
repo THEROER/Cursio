@@ -8,6 +8,8 @@ cursio-protocol.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+# The share policy is plain data a config file carries; see share.rs.
+serde.workspace = true
 # Only for the channel the mount uses to reach the async session; no filesystem
 # work runs on the runtime (see mount::bridge).
 tokio = { workspace = true }
@@ -62,3 +64,4 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
+serde_json.workspace = true
