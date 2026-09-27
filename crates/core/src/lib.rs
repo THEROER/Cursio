@@ -41,6 +41,9 @@ pub mod link;
 pub mod logging;
 pub mod mesh;
 pub mod module;
+/// Running each session module on a thread of its own, off the loop the
+/// shared cursor rides.
+pub(crate) mod module_host;
 pub mod node_status;
 /// Installing Cursio as this user's ScreenCast portal backend.
 #[cfg(all(target_os = "linux", feature = "window"))]

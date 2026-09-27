@@ -471,6 +471,10 @@ impl SessionModule for AudioEngine {
         "audio"
     }
 
+    fn id(&self) -> ModuleId {
+        ModuleId::AUDIO
+    }
+
     /// Advertise everything this machine can offer: one stream per output
     /// device, one per input device (microphone), and one per playing
     /// application. There is no global "everything" stream — only apps and

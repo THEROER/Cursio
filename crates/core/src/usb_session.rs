@@ -551,6 +551,10 @@ impl SessionModule for UsbEngine {
         "usb"
     }
 
+    fn id(&self) -> ModuleId {
+        ModuleId::USB
+    }
+
     async fn start(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
         self.pump(tx).await
     }

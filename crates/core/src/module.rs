@@ -2,19 +2,24 @@
 //!
 //! A session used to be *either* input *or* audio, because each path split the
 //! transport and ran its own loop — and only one owner can hold the single
-//! Noise channel. Everything past input (audio today, window transfer next)
-//! needs to run *alongside* input, not instead of it.
+//! Noise channel. Everything past input needs to run *alongside* input, not
+//! instead of it.
 //!
 //! A [`SessionModule`] is a subsystem that speaks its own [`Message`] variants
-//! over the shared channel without owning it. [`crate::session::run_session`]
-//! keeps ownership of the transport and lends each module a `tx` at three
-//! points: once at startup, once per loop iteration to flush outbound work, and
-//! whenever an inbound message isn't one the session handles itself.
+//! over the shared channel without owning it. Each one runs on a thread of its
+//! own ([`crate::module_host`]), sending through its own handle onto the
+//! link's priority queue and receiving only the messages that name it
+//! ([`Message::module_id`]), which the reader routes straight to it.
 //!
-//! Multiplexing is by message *type*: modules are asked in turn whether a
-//! message is theirs, and the first to claim it wins. Input stays hard-wired in
-//! `run_session` — its ownership/grab/edge logic is deeply intertwined with the
-//! loop's state — so modules cover the subsystems layered on top of it.
+//! They used to share the session loop, lent a `tx` once per turn and offered
+//! every inbound message in turn. That loop also carries the shared cursor, so
+//! any module that waited on anything froze the mouse — the trait's methods
+//! were always meant to return promptly, and "meant to" did not survive a
+//! PipeWire thread join or a disk read under a lock. On its own thread a slow
+//! module delays only itself.
+//!
+//! Input stays hard-wired in `run_session`: its ownership/grab/edge logic is
+//! ordering-sensitive and `!Send`, and is the one thing that loop is for now.
 
 use async_trait::async_trait;
 use cursio_protocol::{Message, ModuleAdvert, ModuleId, Negotiated};
@@ -22,45 +27,52 @@ use cursio_transport::{TransportError, TransportTx};
 
 /// A subsystem multiplexed onto the session's encrypted channel.
 ///
-/// Implementors hold their own state and never own the transport; the session
-/// lends `tx` for the duration of each call.
+/// Implementors hold their own state and never own the transport; `tx` is the
+/// module's own handle onto the link, lent for each call by the host running
+/// it. Every method is called on that one thread, in order, so a module needs
+/// no locking against itself.
 #[async_trait]
 pub trait SessionModule: Send {
-    /// Human-readable name, for logs.
+    /// Human-readable name, for logs and the thread's name.
     fn name(&self) -> &'static str;
 
-    /// Announce ourselves to the peer once the session is up. Called before the
-    /// session loop starts. An error here aborts the session.
+    /// Which module this is: the key the reader routes inbound messages by.
+    /// Must match the id its factory advertises.
+    fn id(&self) -> ModuleId;
+
+    /// Announce ourselves to the peer once the session is up. Called first,
+    /// before anything is pumped or handled. An error here ends the session.
     async fn start(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError>;
 
-    /// Flush pending outbound work. Called once per loop iteration, *before*
-    /// the session's `select!`.
+    /// Flush pending outbound work. Called at the module's own pace: every few
+    /// milliseconds while it has traffic, more slowly once it is quiet, and
+    /// straight after it handles inbound messages.
     ///
-    /// Must return promptly and must not drain its sources dry: the session
-    /// can't reach its inbound branch while a module is pumping, so a module
-    /// that keeps sending while data keeps arriving starves the peer's
-    /// messages entirely. Send a bounded amount per call and return.
+    /// Send a bounded amount per call and return: while this runs, this
+    /// module's inbound messages wait. A slow pump no longer holds up input or
+    /// any other module, but it still holds up its own replies.
     async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError>;
 
     /// Whether this module has work outstanding that an answer will complete.
     ///
-    /// The session loop drops to an idle pace once nothing has been *sent* for
-    /// a short while, which is the wrong test for a module that spends its time
-    /// waiting: a mount serving a download sends little and owes much, so the
-    /// loop judged it idle, slept 50 ms, and delivered the next answer a tick
+    /// A module drops to an idle pace once it has *sent* nothing for a short
+    /// while, which is the wrong test for a module that spends its time
+    /// waiting: a mount serving a download sends little and owes much, so it
+    /// was judged idle, slept 50 ms, and delivered the next answer a tick
     /// late. Measured against Steam that was 111 ms per write on a link with a
     /// 10 ms round trip, and 391 trips into the idle pace during a single
     /// transfer.
     ///
-    /// Answering `true` keeps the loop at its fast pace. Modules that have
+    /// Answering `true` keeps the module at its fast pace. Modules that have
     /// nothing pending — the common case, and the whole point of the idle pace
     /// — leave this alone.
     fn has_pending_work(&self) -> bool {
         false
     }
 
-    /// Handle one message from the peer. Return `true` if it belonged to this
-    /// module, which stops it being offered to other modules.
+    /// Handle one message from the peer. Only messages whose
+    /// [`Message::module_id`] is this module's arrive here; return `false` for
+    /// one of those this build does not recognise, which is logged.
     fn handle_message(&mut self, msg: &Message) -> bool;
 
     /// Tear down cleanly when the session ends. Best-effort: the link may
@@ -147,9 +159,8 @@ impl ModuleRegistry {
         Self::default()
     }
 
-    /// Register a factory. Order is preserved, and it decides the order modules
-    /// are offered inbound messages in — first claim wins, so a module that
-    /// claims broadly should be registered last.
+    /// Register a factory. Order is preserved, and it is the order modules are
+    /// started in; inbound messages are routed by id, not by order.
     pub fn with(mut self, factory: Box<dyn ModuleFactory>) -> Self {
         self.factories.push(factory);
         self

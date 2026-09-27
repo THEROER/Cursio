@@ -259,3 +259,61 @@ Everything between "there is a socket" and "a session can start" lives in
 deliberately, so peer sessions are spawned with `spawn_local` onto a `LocalSet`
 and the registry is `Rc<RefCell<_>>`. This is single-threaded by design and is
 not to be "fixed" with `Arc`/`Mutex`.
+
+## Inside a session: one loop for the cursor, one thread per module
+
+A session used to be one loop per peer: each turn pumped every module, then a
+`select!` over capture, ownership commands, the heartbeat and inbound messages,
+with every inbound module message offered to the modules in turn. Modules are
+logically independent but were not isolated, so any one of them waiting froze
+the rest — and the cursor. In one day: audio joining a PipeWire thread
+(380 ms), files holding its server lock across disk reads (0.3–1.9 s every
+2 s), window listing windows through `GetWindowText` (50–220 ms), and every
+input event pumping every module until pointer motion queued for seconds. Each
+was fixed where it happened; the structure below is what makes the class of bug
+impossible rather than rare.
+
+**The session loop** (`session.rs`) keeps only what is `!Send` and
+ordering-sensitive: forwarding captured input, injecting the peer's,
+`CursorRole` and the handoff messages (`Grab`, `CrossEdge`), the hotkey,
+heartbeat and liveness, and `NodeStatus`. The ownership logic itself is
+unchanged — its ordering is what several past races were about.
+
+**Each module** runs on a dedicated OS thread (`module_host.rs`), driven with
+`Handle::block_on` on the runtime that owns the link. A thread rather than a
+task, because blocking is exactly the failure being contained: a task that
+blocks holds a runtime worker and whatever is queued behind it. The link's
+runtime rather than a private one, because modules spawn things (a drag
+watcher, an AirPlay forwarder, portal connections) that must not die with the
+module's thread. The `SessionModule` trait kept its shape — `start`, `pump`,
+`handle_message`, `shutdown`, `has_pending_work` — plus an `id`, since every
+module was already `Send` and never needed the loop, only a `tx`. Pacing (5 ms
+while a module has traffic, 50 ms after 100 ms of quiet) is per module now,
+following that module's own sends, inbound and pending work.
+
+**Sending**: each module has its own clone of the prioritized sender
+(`TransportTx::clone_sender`), a handle onto the same queue, so its frames are
+scheduled against input exactly as before and nothing serialises on a lock the
+session also takes. `queue_depth` still reads the shared queue.
+
+**Receiving**: the reader task routes by `Message::module_id()` straight into
+the named module's inbox. Only the session's own vocabulary reaches the session
+loop, so a flood of file or window traffic never sits between two input
+events. A module the peer addresses but that did not negotiate here gets
+nothing, and a module falling far behind logs its inbox depth rather than
+failing silently. Inboxes are unbounded because the reader carries the
+heartbeat and the cursor and must never block.
+
+**Liveness** is stamped by the reader on every message, module traffic
+included, and checked on the session's heartbeat tick — so a wedged module can
+neither fake nor hide a dead peer.
+
+**Teardown** stops every module at once and waits at most 3 s
+(`MODULE_SHUTDOWN_GRACE`) for all of them; a module still stuck in a blocking
+call is detached with a warning naming it and its sender closed, so the link
+closes and the mesh can reconnect. A module is dropped on its own thread, so
+the joins some modules do on drop no longer happen on the loop either.
+
+The slow-pump (50 ms) and slow-message (20 ms) warnings survive, scoped to the
+module: they now mean that module's own traffic waited, not that input did.
+

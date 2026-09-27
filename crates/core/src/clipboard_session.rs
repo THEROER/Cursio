@@ -201,6 +201,10 @@ impl SessionModule for ClipboardEngine {
         "clipboard"
     }
 
+    fn id(&self) -> ModuleId {
+        ModuleId::CLIPBOARD
+    }
+
     /// Begin watching the local clipboard. No offer is sent yet — the first one
     /// goes out from `pump` when the watcher reports the current content (or the
     /// next copy). Starting the watch is all that's needed up front.

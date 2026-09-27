@@ -173,6 +173,10 @@ impl cursio_core::module::SessionModule for SlowPump {
         "slow"
     }
 
+    fn id(&self) -> cursio_protocol::ModuleId {
+        cursio_protocol::ModuleId::FILES
+    }
+
     async fn start(
         &mut self,
         _tx: &mut dyn cursio_transport::TransportTx,

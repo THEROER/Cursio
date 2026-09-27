@@ -417,6 +417,10 @@ impl SessionModule for ServiceEngine {
         "service"
     }
 
+    fn id(&self) -> ModuleId {
+        ModuleId::SERVICE
+    }
+
     async fn start(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
         self.pump(tx).await
     }

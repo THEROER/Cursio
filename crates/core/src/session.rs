@@ -9,9 +9,14 @@
 use std::time::Duration;
 
 use cursio_protocol::{
-    DeviceKind, Hello, Message, ModuleAdvert, ModuleId, Negotiated, PeerId, PROTOCOL_VERSION,
+    DeviceKind, Hello, Message, ModuleAdvert, Negotiated, PeerId, PROTOCOL_VERSION,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use cursio_transport::{Transport, TransportError, TransportTx};
+
+use crate::module_host::{self, LinkTx, ModuleHost};
 
 /// Identity and capabilities learned from the peer's [`Hello`].
 #[derive(Debug, Clone)]
@@ -60,145 +65,14 @@ pub enum SessionError {
 /// How often to send a heartbeat while a session is idle.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How often the loop wakes up to let modules flush, when nothing else does.
-///
-/// Sized just under the audio chunk cadence (~10 ms) so a steady stream is
-/// pumped smoothly rather than in bursts. Without it the loop only woke on
-/// inbound traffic or the 5 s heartbeat, which turned continuous audio into
-/// one clump every five seconds.
-pub(crate) const MODULE_PUMP_INTERVAL: Duration = Duration::from_millis(5);
-
-/// The pace the loop falls back to once every module has been quiet for
-/// [`IDLE_PUMP_AFTER`] consecutive ticks.
-///
-/// The fast pace above exists for a *stream*: audio arriving every ~10 ms has
-/// to be picked up at least that often or it queues and lands as a burst. When
-/// nothing is streaming there is no such deadline, and 200 wakeups a second buy
-/// nothing — but they still cost, and not in CPU time. A tick that finds every
-/// module empty does almost no work, so it barely registers as usage; what it
-/// does is keep waking the core, which is what actually stops the package from
-/// reaching its deeper idle states. On an always-on mesh node that is a steady
-/// draw for no delivered work, and on a laptop it is measurably worse than the
-/// same load in fewer, longer wakeups.
-///
-/// 50 ms keeps the loop responsive to anything that does not announce itself
-/// through the transport (a module that starts producing between ticks waits at
-/// most one of these before its first pump), while cutting idle wakeups by an
-/// order of magnitude.
-const IDLE_PUMP_INTERVAL: Duration = Duration::from_millis(50);
-
-/// How many consecutive silent pumps before dropping to [`IDLE_PUMP_INTERVAL`].
-///
-/// Deliberately several rather than one: audio chunks do not arrive on a perfect
-/// 10 ms grid, so a single empty tick is normal mid-stream and must not slow the
-/// loop under a live stream. At the fast pace this is 100 ms of complete silence
-/// across every module before the pace changes at all.
-const IDLE_PUMP_AFTER: u32 = 20;
-
-/// Bytes the transport has written for everything a module can produce.
-///
-/// Sums the classes rather than reading one, because any of them appearing is
-/// reason to stay fast: audio and input are the latency-critical pair, video
-/// and bulk mean a window or a file transfer is live. [`Priority::Control`] is
-/// left out — the heartbeat ticks every 5 s on its own timer, and counting it
-/// would make an idle session look like a busy one forever.
-///
-/// A sender that writes inside `send` reports zero for every class (see
-/// [`TransportTx::queue_depth`]), so on that transport the sum never changes
-/// and the loop settles at the idle pace. That is the correct outcome: such a
-/// sender has no queue, so there is nothing for a fast pace to keep drained,
-/// and inbound traffic still wakes the loop through the `select!`.
-///
-/// Sending is only half of "busy", which is why the loop also counts inbound
-/// messages — see `saw_inbound` in [`run_session`]. A mount reading a file
-/// sends a small request and receives a large answer, so by this figure alone
-/// it looks nearly idle: the loop dropped to [`IDLE_PUMP_INTERVAL`] mid-read,
-/// and each following request then waited out a 50 ms tick before being
-/// pumped. On a workload of many small reads — a game loading assets, a build
-/// walking a source tree — that is the difference between the link's round trip
-/// and ten times it.
-fn module_sent_bytes(tx: &dyn TransportTx) -> u64 {
-    use cursio_protocol::Priority;
-    [
-        Priority::Audio,
-        Priority::Input,
-        Priority::Video,
-        // File metadata: small, but a directory walk is made of nothing else,
-        // and a loop that judged it idle would answer each request a tick late.
-        Priority::Metadata,
-        Priority::Bulk,
-    ]
-    .iter()
-    .map(|p| tx.queue_depth(*p).sent_bytes)
-    .fold(0u64, u64::wrapping_add)
-}
-
-/// Warn when a single module pump takes at least this long.
-///
-/// Input, audio and clipboard all share the session loop, so anything blocking
-/// here is felt as a freeze of *everything* at once. Set well above a normal
-/// pump (sub-millisecond) but below what a listener notices (~50 ms), so the
-/// log names the culprit instead of leaving "it froze" to guesswork.
-const SLOW_PUMP_WARN: Duration = Duration::from_millis(50);
-
-/// Warn when handling one inbound message takes at least this long.
-///
-/// Lower than [`SLOW_PUMP_WARN`], because the two are not the same kind of
-/// work. A pump is allowed to move a bounded batch and legitimately takes a few
-/// milliseconds; handling one message is a lookup and a state change, and
-/// anything approaching a frame's worth of time means it is waiting on
-/// something — a device node, a lock, a syscall — which is precisely what must
-/// not happen on this loop.
-const SLOW_HANDLE_WARN: Duration = Duration::from_millis(20);
-
 /// Warn when one turn of the session loop takes at least this long.
 ///
-/// A backstop for the two targeted measurements: they name a module, this one
-/// notices a stall wherever it happens, including code nobody thought to time.
-///
-/// Comfortably above [`IDLE_PUMP_INTERVAL`], because an idle loop deliberately
-/// parks for that long and a warning that fires on healthy idling teaches the
-/// reader to ignore it. Anything past this is a real freeze: every module and
-/// the shared cursor waited out the whole interval.
+/// The loop now holds only input, ownership, the heartbeat and node status, so
+/// a slow turn here is exactly a stall the cursor felt — no module can cause
+/// one any more, which is what makes the warning worth reading when it fires.
+/// Comfortably above the heartbeat's own work, so healthy idling never trips
+/// it.
 const SLOW_TURN_WARN: Duration = Duration::from_millis(250);
-
-/// The message's variant name, for a log line that has to name what stalled.
-///
-/// `Debug` on the message itself would carry the payload — an audio chunk's
-/// samples, a window's pixels — into a warning that fires exactly when the log
-/// is already the only evidence available. The variant alone is what identifies
-/// the path.
-fn message_kind(msg: &Message) -> &'static str {
-    match msg {
-        Message::Hello(_) => "Hello",
-        Message::PairRequest { .. } => "PairRequest",
-        Message::PairResponse { .. } => "PairResponse",
-        Message::PairConfirm { .. } => "PairConfirm",
-        Message::PairFailed { .. } => "PairFailed",
-        Message::Heartbeat { .. } => "Heartbeat",
-        Message::Bye => "Bye",
-        Message::NodeStatus(_) => "NodeStatus",
-        Message::Opaque(_) => "Opaque",
-        Message::Input(_) => "Input",
-        Message::Grab { .. } => "Grab",
-        Message::CrossEdge { .. } => "CrossEdge",
-        Message::WindowFrame(_) => "WindowFrame",
-        Message::WindowInput(_) => "WindowInput",
-        Message::AudioChunk(_) => "AudioChunk",
-        // The module's own vocabulary is opaque here by design, so this names
-        // the module rather than the message inside it — enough to say which
-        // subsystem to look at, which is what the warning is for.
-        Message::Module { module, .. } => match *module {
-            ModuleId::INPUT => "Module(input)",
-            ModuleId::AUDIO => "Module(audio)",
-            ModuleId::CLIPBOARD => "Module(clipboard)",
-            ModuleId::WINDOW => "Module(window)",
-            ModuleId::FILES => "Module(files)",
-            ModuleId::SERVICE => "Module(service)",
-            _ => "Module(other)",
-        },
-    }
-}
 
 /// How long to wait for *any* inbound traffic before declaring the peer gone.
 ///
@@ -519,12 +393,13 @@ pub struct Ownership {
 ///   initiates a handoff.
 /// - `on_ownership` — called on every change so the caller can grab/ungrab and
 ///   hide/show the cursor to match.
-/// - `modules` — subsystems multiplexed onto the same channel (audio today,
-///   window transfer next). They are started before the loop, pumped once per
-///   iteration, and offered any inbound message this loop doesn't handle
-///   itself. Input deliberately stays hard-wired here rather than becoming a
-///   module: its ownership/grab/edge logic is intertwined with the loop state
-///   above, and it already works.
+/// - `modules` — subsystems multiplexed onto the same channel. Each runs on a
+///   thread of its own ([`crate::module_host`]) with its own handle onto the
+///   link, and the reader routes its messages straight to it, so nothing a
+///   module does — however long it waits — reaches this loop. Input
+///   deliberately stays hard-wired here rather than becoming a module: its
+///   ownership/grab/edge logic is ordering-sensitive and `!Send`, and it is
+///   what this loop now exists for.
 ///
 /// Takes the transport **by value** (`Box<dyn Transport>`) so it can
 /// [`split`](Transport::split) it: the receive half runs in its own task and is
@@ -543,7 +418,7 @@ pub async fn run_session<F, G, H>(
     mut on_input: F,
     mut commands: Option<&mut tokio::sync::mpsc::UnboundedReceiver<OwnershipCmd>>,
     mut on_ownership: G,
-    mut modules: Vec<Box<dyn crate::module::SessionModule>>,
+    modules: Vec<Box<dyn crate::module::SessionModule>>,
     mut poll_status: H,
 ) -> Result<(), SessionError>
 where
@@ -556,21 +431,50 @@ where
     // drainer writes them, so a bulk transfer (clipboard image, file) can never
     // stall input on the shared channel. Falls back to a plain split for
     // transports that don't override it.
-    let (mut tx, mut rx) = transport.split_prioritized();
-    tracing::debug!("transport split; spawning reader");
+    let (tx, mut rx) = transport.split_prioritized();
+    let mut tx = LinkTx::new(tx);
+
+    // Each module on its own thread, sending through its own handle onto the
+    // queue. Started before the reader so nothing it is sent can arrive before
+    // it has an inbox; each one's `start` runs on its own thread, so a module
+    // listing devices no longer holds the first input event.
+    let (failures_tx, mut failures) = tokio::sync::mpsc::unbounded_channel();
+    let mut hosts = Vec::with_capacity(modules.len());
+    for module in modules {
+        let name = module.name();
+        match ModuleHost::spawn(module, tx.fork(), failures_tx.clone()) {
+            Ok(host) => hosts.push(host),
+            Err(e) => {
+                tracing::error!(module = name, error = %e, "could not start the module's thread; continuing without it");
+            }
+        }
+    }
+    drop(failures_tx);
+
+    // Liveness: when did we last hear *anything* from the peer? Any inbound
+    // message counts, not just heartbeats — module traffic proves the link just
+    // as well, so a busy session never trips the timeout. Stamped by the
+    // reader, because module traffic no longer passes through this loop.
+    let epoch = tokio::time::Instant::now();
+    let last_heard = Arc::new(AtomicU64::new(0));
 
     // Reader task: owns the receive half and never gets cancelled, so recv
-    // state stays consistent. It forwards every decoded message to the main
-    // task over a channel.
+    // state stays consistent. It routes each module's messages straight to
+    // that module and forwards only the session's own vocabulary here, so a
+    // flood of file or window traffic never sits between two input events.
+    let router = module_host::router_for(&hosts);
     let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let reader_heard = last_heard.clone();
     let reader = tokio::spawn(async move {
         tracing::debug!("session reader task started");
         // On any recv error the loop ends and `inbound_tx` drops, which the
         // main task observes as the channel closing (a dropped link).
         while let Ok(msg) = rx.recv().await {
-            tracing::trace!("reader got a message");
-            if inbound_tx.send(msg).is_err() {
-                break; // main task gone
+            reader_heard.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+            if let Some(msg) = router.route(msg) {
+                if inbound_tx.send(msg).is_err() {
+                    break; // main task gone
+                }
             }
         }
     });
@@ -588,49 +492,6 @@ where
     // re-announce the reading the greeting just carried.
     status_ticker.tick().await;
 
-    // Paces the loop for modules that produce a steady stream of their own.
-    //
-    // Modules are pumped at the top of the loop, then the `select!` below parks
-    // until *something* wakes it. With no inbound traffic the only wakeup was
-    // the 5 s heartbeat — so audio was pumped in bursts five seconds apart,
-    // queueing in between and arriving as a clump. Observed exactly that:
-    // alternating "stalled ~4.5 s" / "resumed ~5.0 s" lines, with the jitter
-    // buffer overflowing on every burst.
-    //
-    // A short tick keeps the loop turning at roughly the audio chunk rate, so
-    // pumping stays smooth while anything is streaming. When nothing is, the
-    // pace drops to `IDLE_PUMP_INTERVAL` — see the constant for why idle ticks
-    // are worth avoiding even though they do no work.
-    let mut pace = tokio::time::interval(MODULE_PUMP_INTERVAL);
-    // If a tick is missed (a long pump, a slow send), fire once and carry on
-    // rather than replaying the backlog as a burst — bursts are the very thing
-    // this is here to prevent.
-    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Whether the loop is currently on the fast pace, and how many pumps in a
-    // row have sent nothing. Tracked rather than re-read from `pace` because
-    // `tokio::time::Interval` does not expose its period.
-    let mut pace_is_fast = true;
-    let mut silent_pumps: u32 = 0;
-    // Total bytes the transport had written when the last pump finished. The
-    // counter is monotonic, so any increase means some module actually sent
-    // something — which is the signal the pace follows. Summed across the
-    // classes a module can produce; `Control` is excluded on purpose, since the
-    // heartbeat ticks on its own schedule and would otherwise read as traffic.
-    let mut last_sent_bytes: u64 = 0;
-    // Whether a module message arrived from the peer since the last pace
-    // decision. Receiving is activity just as much as sending: a mount reading
-    // a file sends little and receives a lot, and judging that idle put the
-    // loop on the 50 ms tick in the middle of the read — so the next request
-    // waited out a tick instead of going out on the answer that had just
-    // arrived. Cleared where it is read, so one message keeps the loop fast for
-    // one decision rather than forever.
-    let mut saw_inbound = false;
-
-    // Liveness: when did we last hear *anything* from the peer? Any inbound
-    // message counts, not just heartbeats — real traffic proves the link just
-    // as well, so a busy session never trips the timeout.
-    let mut last_seen = tokio::time::Instant::now();
-
     // Ownership: is THIS machine the active one (holds the shared cursor)?
     // Peers start in opposite states so exactly one is active from the outset.
     let mut role = CursorRole::new(cursor.start_active);
@@ -642,32 +503,11 @@ where
     });
     tracing::info!(am_active, "initial ownership");
 
-    // Bring each subsystem up on the shared channel before the loop starts.
-    for m in modules.iter_mut() {
-        tracing::info!(module = m.name(), "starting session module");
-        if let Err(e) = m.start(tx.as_mut()).await {
-            return Err(SessionError::from(e));
-        }
-    }
-
-    // When the previous turn of the loop came round. The two measurements below
-    // each time one *known* place; this times the turn itself, so a stall with
-    // no owner still leaves a mark. Without it a blocking call in a spot nobody
-    // thought to instrument is invisible — which is exactly how a 2.6 s freeze
-    // reached the user with a clean log.
+    // When the previous turn of the loop came round, so a stall with no owner
+    // still leaves a mark. Without it a blocking call in a spot nobody thought
+    // to instrument is invisible — which is how a 2.6 s freeze once reached
+    // the user with a clean log.
     let mut last_turn: Option<tokio::time::Instant> = None;
-
-    // Whether this turn runs the pump phase. Modules are pumped when the pace
-    // ticks or a module message arrives — not on every turn. Input turns the
-    // loop once per event, and a receiving machine gets several hundred pointer
-    // messages a second from a gaming mouse: when each of those first pumped
-    // audio, window and files, the pumps' few milliseconds decided how many
-    // events a second could be injected, the rest queued, and the cursor kept
-    // replaying a movement for seconds after the hand stopped. Measured from
-    // Nocturne's mouse into Windows; the laptop's touchpad in the other
-    // direction sends too few events to notice. The fast pace still pumps every
-    // few milliseconds, so modules lose nothing.
-    let mut pump_due = true;
 
     let result = loop {
         if let Some(prev) = last_turn {
@@ -681,83 +521,6 @@ where
         }
         last_turn = Some(tokio::time::Instant::now());
 
-        if pump_due {
-            pump_due = false;
-            // Let each module flush its outbound work. Modules send a bounded
-            // amount per call (see `SessionModule::pump`): draining fully here
-            // would starve the inbound branch below, which is exactly how a peer's
-            // audio advertisements once got silently ignored.
-            let mut pump_err = None;
-            for m in modules.iter_mut() {
-                // Time each pump: everything (input, audio, clipboard) shares this
-                // one loop, so a module that blocks here freezes all of them. A
-                // threshold log turns "it froze" into "this module took N ms".
-                let started = tokio::time::Instant::now();
-                let result = m.pump(tx.as_mut()).await;
-                let took = started.elapsed();
-                if took >= SLOW_PUMP_WARN {
-                    tracing::warn!(
-                        module = m.name(),
-                        took_ms = took.as_millis() as u64,
-                        "module pump blocked the session loop"
-                    );
-                }
-                if let Err(e) = result {
-                    pump_err = Some((m.name(), e));
-                    break;
-                }
-            }
-            if let Some((name, e)) = pump_err {
-                tracing::warn!(module = name, error = %e, "module pump failed");
-                break Err(SessionError::from(e));
-            }
-
-            // Follow the traffic: stay fast while modules are producing, fall back
-            // to the idle pace once they have all been quiet for a while.
-            //
-            // Read from the transport rather than from `pump`'s return: `pump`
-            // reports failure, not whether it sent, and every module would have to
-            // change to say so. `sent_bytes` already answers it for all of them at
-            // once, and counts what reached the socket rather than what a module
-            // believes it queued.
-            // A module waiting on an answer is working, however little it sends.
-            // Without this the loop slept 50 ms between a file request and its
-            // reply — 391 times during one download, at 111 ms per write on a link
-            // whose round trip is 10 ms.
-            let modules_busy = modules.iter().any(|m| m.has_pending_work());
-
-            let sent_now = module_sent_bytes(tx.as_ref());
-            if sent_now != last_sent_bytes || saw_inbound || modules_busy {
-                last_sent_bytes = sent_now;
-                saw_inbound = false;
-                silent_pumps = 0;
-                if !pace_is_fast {
-                    // Back to a stream: restore the fast pace immediately. The
-                    // first chunk has already been pumped by the time we get here,
-                    // so this only affects how soon the *next* one is picked up.
-                    pace = tokio::time::interval(MODULE_PUMP_INTERVAL);
-                    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    pace_is_fast = true;
-                    tracing::debug!("module traffic resumed; session loop back to fast pace");
-                }
-            } else if pace_is_fast {
-                silent_pumps = silent_pumps.saturating_add(1);
-                if silent_pumps >= IDLE_PUMP_AFTER {
-                    pace = tokio::time::interval(IDLE_PUMP_INTERVAL);
-                    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    pace_is_fast = false;
-                    tracing::debug!(
-                        idle_ms = IDLE_PUMP_INTERVAL.as_millis() as u64,
-                        "no module traffic; session loop dropping to idle pace"
-                    );
-                }
-            }
-        }
-
-        // NOTE: deliberately *not* `biased!` here. The inbound branch is written
-        // last, so biased polling would starve it — the opposite of what the
-        // audio path needs. Module sending happens above, outside the
-        // `select!`, so a busy module can't crowd out inbound messages anyway.
         tokio::select! {
             // Ordered, not random. The branches are already written most- to
             // least- urgent, and an ownership change queued alongside input has
@@ -767,14 +530,12 @@ where
             // above it fire on their own schedule, so nothing starves.
             biased;
 
-            // Just a wakeup: the work happens in the pump phase above, so this
-            // arm intentionally does nothing.
-            _ = pace.tick() => pump_due = true,
             _ = ticker.tick() => {
                 // Has the peer gone quiet? Checked on the heartbeat tick, so
                 // detection costs nothing extra and lands within one interval
                 // of the deadline.
-                let silent_for = last_seen.elapsed();
+                let heard_at = Duration::from_millis(last_heard.load(Ordering::Relaxed));
+                let silent_for = epoch.elapsed().saturating_sub(heard_at);
                 if silent_for >= PEER_TIMEOUT {
                     tracing::warn!(?silent_for, "peer stopped responding; ending session");
                     break Err(SessionError::PeerTimeout(silent_for));
@@ -807,6 +568,10 @@ where
                         break Err(SessionError::from(e));
                     }
                 }
+            }
+            Some(failure) = failures.recv() => {
+                tracing::warn!(module = failure.module, error = %failure.error, "module lost the link; ending session");
+                break Err(SessionError::from(failure.error));
             }
             cmd = recv_maybe(&mut commands) => {
                 match cmd {
@@ -904,7 +669,7 @@ where
                             // `captured` is an Option<&mut _>, so reborrow through
                             // it rather than handing over an &mut &mut.
                             if let Err(e) =
-                                forward_captured(tx.as_mut(), event, captured.as_deref_mut()).await
+                                forward_captured(&mut tx, event, captured.as_deref_mut()).await
                             {
                                 break Err(e);
                             }
@@ -914,10 +679,6 @@ where
                 }
             }
             incoming = inbound_rx.recv() => {
-                // Anything at all from the peer means it's still there.
-                if incoming.is_some() {
-                    last_seen = tokio::time::Instant::now();
-                }
                 match incoming {
                     Some(Message::Heartbeat { nonce }) => tracing::trace!(nonce, "peer heartbeat"),
                     // The peer's power or network changed. Logged rather than
@@ -984,46 +745,10 @@ where
                         tracing::info!("peer sent Bye; closing session");
                         break Err(SessionError::PeerLeft);
                     }
-                    // Not a message the session handles itself: offer it to the
-                    // modules, first claim wins. This is the multiplexing point
-                    // — audio chunks and advertisements land here.
+                    // Module traffic never gets here — the reader routes it — so
+                    // this is something neither side's session speaks.
                     Some(other) => {
-                        // Timed for the same reason as `pump`, and learned the
-                        // hard way: `handle_message` is synchronous, so a module
-                        // that waits for something here stops the entire loop,
-                        // and this path had no measurement at all. An audio
-                        // module creating a device node inline held it for 430 ms
-                        // per device — six devices, 2.6 s — during which the
-                        // mouse froze and the file mount timed out at 3 s and
-                        // reported the peer's drive as an I/O error. Every
-                        // symptom pointed somewhere other than the cause, and
-                        // the logs named nothing, because nothing was watching
-                        // this branch.
-                        let started = tokio::time::Instant::now();
-                        let mut claimed_by = None;
-                        for m in modules.iter_mut() {
-                            if m.handle_message(&other) {
-                                claimed_by = Some(m.name());
-                                break;
-                            }
-                        }
-                        let took = started.elapsed();
-                        if took >= SLOW_HANDLE_WARN {
-                            tracing::warn!(
-                                module = claimed_by.unwrap_or("none"),
-                                took_ms = took.as_millis() as u64,
-                                message = message_kind(&other),
-                                "module blocked the session loop handling a message"
-                            );
-                        }
-                        if claimed_by.is_none() {
-                            tracing::debug!(?other, "ignoring unexpected in-session message");
-                        } else {
-                            // A module is mid-exchange, so the loop is busy even
-                            // if this side is the one doing the listening.
-                            saw_inbound = true;
-                            pump_due = true;
-                        }
+                        tracing::debug!(message = module_host::message_kind(&other), "ignoring unexpected in-session message");
                     }
                     None => {
                         // Reader task ended; the link dropped.
@@ -1034,28 +759,21 @@ where
         }
     };
 
-    // TEMP hang-diagnosis tracing (2026-07-21): after a link drop the Windows
-    // session stopped progressing entirely. These lines pin which teardown step
-    // blocks. Remove once the hang is fixed.
+    // Bounded: a module wedged in a blocking call is left behind with a
+    // warning naming it, rather than holding up the reconnect. Each module's
+    // handle onto the link is closed either way, so the link closes when this
+    // session is done with it.
     tracing::info!("session ending; shutting down modules");
-    // Let each module tear down (best-effort — the link may already be dead,
-    // which is why modules must not treat send errors here as fatal).
-    for m in modules.iter_mut() {
-        tracing::info!(module = m.name(), "module shutdown begin");
-        m.shutdown(tx.as_mut()).await;
-        tracing::info!(module = m.name(), "module shutdown done");
-    }
+    module_host::shut_down(hosts, module_host::MODULE_SHUTDOWN_GRACE).await;
 
     // The prioritized sender only *queues* on `send`, so a final `Bye`/shutdown
     // message may still be waiting. Flush it to the wire before dropping `tx`,
     // or the drainer task gets cancelled with the goodbye still queued. No-op
     // for a plain (synchronous) sender.
-    tracing::info!("flushing tx");
     tx.flush().await;
-    tracing::info!("tx flushed; aborting reader");
-
+    tx.close().await;
     reader.abort();
-    tracing::info!("session teardown complete; returning (modules drop next)");
+    tracing::info!("session teardown complete");
     result
 }
 
@@ -1199,165 +917,6 @@ mod tests {
 
     fn id(byte: u8) -> PeerId {
         PeerId::from_bytes([byte; 16])
-    }
-
-    /// A stall warning has to say which subsystem to look at.
-    ///
-    /// Module traffic is opaque at this layer, so the id is the only thing that
-    /// identifies it. Logging "Module" alone would reproduce the situation this
-    /// warning exists to end: a freeze the log records without naming.
-    #[test]
-    fn a_module_message_is_named_by_its_module() {
-        let audio = Message::Module {
-            module: ModuleId::AUDIO,
-            priority: cursio_protocol::Priority::Audio,
-            payload: Vec::new(),
-        };
-        assert_eq!(message_kind(&audio), "Module(audio)");
-
-        let files = Message::Module {
-            module: ModuleId::FILES,
-            priority: cursio_protocol::Priority::Bulk,
-            payload: Vec::new(),
-        };
-        assert_eq!(message_kind(&files), "Module(files)");
-
-        // A first-class variant names itself; the audio hot path does not go
-        // through `Module`, so it would otherwise be reported as unknown.
-        assert_eq!(message_kind(&Message::Bye), "Bye");
-    }
-
-    /// A transport that reports whatever per-class totals it is told to.
-    ///
-    /// Only `queue_depth` matters here: the pace follows the bytes the classes
-    /// have written, so a stub that can move one class at a time is enough to
-    /// drive the decision without a real link.
-    #[derive(Default)]
-    struct CountingTx {
-        audio: u64,
-        input: u64,
-        video: u64,
-        metadata: u64,
-        bulk: u64,
-        control: u64,
-    }
-
-    #[async_trait::async_trait]
-    impl TransportTx for CountingTx {
-        async fn send(&mut self, _msg: &Message) -> Result<(), TransportError> {
-            Ok(())
-        }
-
-        fn queue_depth(&self, priority: cursio_protocol::Priority) -> cursio_transport::QueueDepth {
-            use cursio_protocol::Priority;
-            let sent = match priority {
-                Priority::Audio => self.audio,
-                Priority::Input => self.input,
-                Priority::Video => self.video,
-                Priority::Metadata => self.metadata,
-                Priority::Bulk => self.bulk,
-                Priority::Control => self.control,
-            };
-            cursio_transport::QueueDepth {
-                queued_bytes: 0,
-                sent_bytes: sent,
-            }
-        }
-    }
-
-    /// Every class a module can produce keeps the loop awake.
-    ///
-    /// Audio and input are the obvious ones, but a window transfer (`Video`) and
-    /// a file copy (`Bulk`) are just as much live traffic: reading only the
-    /// latency-critical pair would drop the loop to the idle pace in the middle
-    /// of a transfer and pace it at 50 ms.
-    #[test]
-    fn traffic_in_any_module_class_counts_as_activity() {
-        let bumps = [
-            ("audio", (|t: &mut CountingTx| t.audio += 100) as fn(&mut _)),
-            ("input", |t: &mut CountingTx| t.input += 100),
-            ("video", |t: &mut CountingTx| t.video += 100),
-            ("bulk", |t: &mut CountingTx| t.bulk += 100),
-        ];
-        for (name, bump) in bumps {
-            let mut tx = CountingTx::default();
-            let before = module_sent_bytes(&tx);
-            bump(&mut tx);
-            assert_ne!(
-                module_sent_bytes(&tx),
-                before,
-                "{name} traffic must register as a module producing"
-            );
-        }
-    }
-
-    /// The heartbeat must not read as module traffic.
-    ///
-    /// It ticks every 5 s forever, so counting `Control` would mean an idle
-    /// session sees the total move on every heartbeat and never settles onto the
-    /// idle pace — the loop would stay at 200 wakeups a second for the life of
-    /// the link, which is the exact cost this pacing exists to avoid.
-    #[test]
-    fn the_heartbeat_alone_does_not_hold_the_loop_at_the_fast_pace() {
-        let mut tx = CountingTx::default();
-        let before = module_sent_bytes(&tx);
-        tx.control += 4096;
-        assert_eq!(
-            module_sent_bytes(&tx),
-            before,
-            "control traffic must not count as a module producing"
-        );
-    }
-
-    /// A sender with no queue reports zeros, and that must be stable.
-    ///
-    /// `TransportTx::queue_depth` defaults to zero for a transport that writes
-    /// inside `send`. The loop then settles at the idle pace, which is correct —
-    /// there is no queue for a fast pace to keep drained — but only as long as
-    /// the reading does not drift, or the pace would flap on a link that is
-    /// doing nothing.
-    #[test]
-    fn a_queueless_transport_reads_as_steady() {
-        struct NoQueueTx;
-
-        #[async_trait::async_trait]
-        impl TransportTx for NoQueueTx {
-            async fn send(&mut self, _msg: &Message) -> Result<(), TransportError> {
-                Ok(())
-            }
-        }
-
-        let tx = NoQueueTx;
-        let first = module_sent_bytes(&tx);
-        assert_eq!(first, 0);
-        assert_eq!(
-            module_sent_bytes(&tx),
-            first,
-            "must not drift between reads"
-        );
-    }
-
-    /// The idle pace has to be slower than the fast one, and the switch has to
-    /// take long enough that a live stream never trips it.
-    ///
-    /// Both are silent when wrong: the loop keeps working either way, and the
-    /// only symptom is either audio pumped in clumps or a core that never gets
-    /// to idle.
-    #[test]
-    fn the_idle_pace_is_slower_and_slow_to_engage() {
-        assert!(
-            IDLE_PUMP_INTERVAL > MODULE_PUMP_INTERVAL,
-            "the idle pace must actually be slower"
-        );
-        let settle = MODULE_PUMP_INTERVAL * IDLE_PUMP_AFTER;
-        assert!(
-            settle >= Duration::from_millis(100),
-            "a stream with gaps must not be able to trip the idle pace"
-        );
-        assert!(
-            IDLE_PUMP_INTERVAL <= HEARTBEAT_INTERVAL,
-            "the idle pace must still turn the loop faster than the heartbeat"
-        );
     }
 
     /// Two machines with screens: the lower id starts with the cursor, and each

@@ -570,6 +570,10 @@ where
         "window"
     }
 
+    fn id(&self) -> ModuleId {
+        ModuleId::WINDOW
+    }
+
     /// Only what this machine's decoder takes goes out up front — before any
     /// window is offered either way, so a host never opens an encoder the
     /// viewer cannot decode. A transfer itself only exists once someone shares

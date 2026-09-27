@@ -538,7 +538,7 @@ impl Pacer {
         // One pump's share of a second, with a chunk as the floor so a single
         // message is never split across pumps — it cannot be, and a budget
         // below one chunk would stall the transfer instead of pacing it.
-        let per_pump = rate * crate::session::MODULE_PUMP_INTERVAL.as_secs_f64();
+        let per_pump = rate * crate::module_host::MODULE_PUMP_INTERVAL.as_secs_f64();
         Some((per_pump as usize).max(FilesMsg::MAX_CHUNK))
     }
 
@@ -2119,6 +2119,10 @@ impl FilesEngine {
 impl SessionModule for FilesEngine {
     fn name(&self) -> &'static str {
         "files"
+    }
+
+    fn id(&self) -> ModuleId {
+        ModuleId::FILES
     }
 
     /// Busy whenever anything is owed an answer, in either direction.

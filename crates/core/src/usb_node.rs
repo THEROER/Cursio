@@ -30,8 +30,8 @@
 //!
 //! Shared as an `Arc<Mutex<_>>`, the same shape
 //! [`service_session`](crate::service_session) uses for the state its links
-//! share: `SessionModule` is `Send`, so the node-level half cannot be an `Rc`
-//! even though the sessions themselves run on one thread.
+//! share: every link's module runs on a thread of its own, so the node-level
+//! half is genuinely contended and cannot be an `Rc`.
 //!
 //! [`DeviceOffers`]: cursio_usb::DeviceOffers
 //! [`SessionModule`]: crate::module::SessionModule
