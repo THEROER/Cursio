@@ -631,11 +631,32 @@ async fn inhibit_direct_scanout() -> Option<zbus::Connection> {
             Some(conn)
         }
         Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "could not inhibit direct scanout; a fullscreen app on the shared screen \
-                 may freeze the peer's view (update the Cursio GNOME extension and log in again)"
+            // Once per process: nothing changes between captures until the
+            // Shell reloads its extensions, and that takes a new login.
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!(error = %e, "direct scanout still not inhibited");
+                return None;
+            }
+            let missing_method = matches!(
+                &e,
+                zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
             );
+            if missing_method {
+                tracing::warn!(
+                    error = %e,
+                    "the running GNOME Shell has an older Cursio extension without \
+                     InhibitDirectScanout; expected until you log out and back in, after \
+                     which a fullscreen app on the shared screen no longer freezes the peer's view"
+                );
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    "could not inhibit direct scanout, so a fullscreen app on the shared screen \
+                     may freeze the peer's view; is the Cursio GNOME extension installed and enabled?"
+                );
+            }
             None
         }
     }
