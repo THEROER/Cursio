@@ -1448,11 +1448,34 @@ fn run_render_loop(
         let mut started = false;
         // Sign of the next keep-alive frame; see `fill_inaudible`.
         let mut keepalive_phase = false;
+        // The ramps assume f32 samples, as the rest of the render path does; on
+        // any other mix format they stand aside rather than scale garbage.
+        let channels = if mix.wBitsPerSample == 32 {
+            mix.nChannels as usize
+        } else {
+            0
+        };
+        let fade = crate::declick::fade_frames(mix.nSamplesPerSec);
+        let mut declick = crate::declick::Declick::new(fade);
+        let mut stopping = false;
+        let mut stop_deadline = std::time::Instant::now();
 
         loop {
-            if stop_rx.try_recv().is_ok() {
-                let _ = client.Stop();
-                break;
+            if !stopping && stop_rx.try_recv().is_ok() {
+                // `Stop` halts the device mid-buffer, so a stream closed while
+                // audio is still queued ends on a click. Write a fade-out, let
+                // the device play what it holds, and only then stop it.
+                stopping = true;
+                stop_deadline = std::time::Instant::now() + Duration::from_millis(300);
+            }
+            if stopping {
+                let padding = client.GetCurrentPadding().unwrap_or(0);
+                if (declick.is_silent() && padding == 0)
+                    || std::time::Instant::now() >= stop_deadline
+                {
+                    let _ = client.Stop();
+                    break;
+                }
             }
 
             // Pull any newly arrived chunks into the jitter buffer, converting
@@ -1467,9 +1490,8 @@ fn run_render_loop(
                 // speed, not audio speed); skip the multiply at unity.
                 let g = f32::from_bits(gain.load(std::sync::atomic::Ordering::Relaxed));
                 if (g - 1.0).abs() > f32::EPSILON {
-                    for s in bytes.chunks_exact_mut(4) {
-                        let v = f32::from_le_bytes([s[0], s[1], s[2], s[3]]) * g;
-                        s.copy_from_slice(&v.to_le_bytes());
+                    for s in bytes.as_chunks_mut::<4>().0 {
+                        *s = (f32::from_le_bytes(*s) * g).to_le_bytes();
                     }
                 }
                 jitter.extend(from_wire_format(&bytes, mix.nChannels, mix.nSamplesPerSec));
@@ -1484,7 +1506,7 @@ fn run_render_loop(
                     excess -= excess % frame;
                 }
                 if excess > 0 {
-                    jitter.drain(..excess);
+                    crate::declick::skip_crossfaded(&mut jitter, excess, channels, fade);
                     tracing::debug!(
                         dropped_bytes = excess,
                         "render jitter buffer over its limit; dropped stale audio to keep latency bounded"
@@ -1497,7 +1519,16 @@ fn run_render_loop(
 
             // Fill the device's currently-free space.
             let padding = client.GetCurrentPadding().unwrap_or(0);
-            let free_frames = buffer_frames.saturating_sub(padding);
+            let mut free_frames = buffer_frames.saturating_sub(padding);
+            if stopping {
+                // Only the fade-out itself is still written; anything after it
+                // would just delay the stop.
+                free_frames = if declick.is_silent() {
+                    0
+                } else {
+                    free_frames.min(fade as u32)
+                };
+            }
             if free_frames > 0 {
                 if let Ok(p_data) = render.GetBuffer(free_frames) {
                     if !p_data.is_null() {
@@ -1510,6 +1541,9 @@ fn run_render_loop(
                         for (i, b) in jitter.drain(..take).enumerate() {
                             dst[i] = b;
                         }
+                        // Emptying the jitter buffer re-arms the prefill below,
+                        // so what follows is keep-alive: this has to end at zero.
+                        declick.apply(&mut dst[..take], channels, stopping || jitter.is_empty());
                         // Fill the remainder (underrun / not started) with a
                         // signal far below hearing rather than with zeros.
                         //

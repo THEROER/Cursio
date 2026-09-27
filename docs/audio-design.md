@@ -166,6 +166,16 @@ touching the session. Channels, not callbacks (a slow link never stalls capture)
   PipeWire nodes; Windows = WASAPI render, with the `native/cursio-vad` driver
   (not WASAPI) responsible for making those nodes visible as real endpoints.
 
+  Both playback backends **ramp every edge** (`declick.rs`, 5 ms): a fade-in
+  when playback starts or recovers from an underrun, a fade-out on the buffer
+  that empties the jitter buffer and on stop, and a crossfade where a backlog
+  trim skips audio. System event sounds open a stream, play a few hundred
+  milliseconds and close it, so without ramps every one of them began and ended
+  on a step, heard as a click. On stop the render thread stays up until the
+  fade has played (bounded: 100 ms on PipeWire, 300 ms on WASAPI, whose `Stop`
+  otherwise cuts the device buffer off mid-waveform). Steady playback is left
+  bit-exact.
+
   There is deliberately **no fallback** on Windows when that driver is absent.
   The old one was actively harmful: every "mirror" captured the same full system
   mix, so per-app routing silently became a copy of everything. It now returns

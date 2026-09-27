@@ -30,6 +30,8 @@
 /// Opus compression for the wire format — used on every platform.
 pub mod codec;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod declick;
 #[cfg(target_os = "linux")]
 pub mod pipewire_backend;
 /// Drives the Cursio virtual audio driver, which is what gives Windows the

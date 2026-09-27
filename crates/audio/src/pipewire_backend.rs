@@ -1992,6 +1992,13 @@ fn run_playback_loop(
     let starts = std::cell::Cell::new(0u32);
     let underruns = std::cell::Cell::new(0u32);
     let node_label = node_name.clone();
+    let fade = crate::declick::fade_frames(SAMPLE_RATE);
+    let declick = RefCell::new(crate::declick::Declick::new(fade));
+    // Atomics, not `Cell`s: with RT_PROCESS the callback runs on PipeWire's data
+    // thread, while the loop below reads these from this one.
+    let stopping = Arc::new(AtomicBool::new(false));
+    let faded_out = Arc::new(AtomicBool::new(true));
+    let (stopping_cb, faded_out_cb) = (Arc::clone(&stopping), Arc::clone(&faded_out));
 
     let stride = BYTES_PER_FRAME;
 
@@ -2031,7 +2038,12 @@ fn run_playback_loop(
                     // and channels don't swap.
                     let excess = excess - (excess % BYTES_PER_FRAME);
                     if excess > 0 {
-                        jb.drain(..excess);
+                        crate::declick::skip_crossfaded(
+                            &mut jb,
+                            excess,
+                            CHANNELS as usize,
+                            fade,
+                        );
                         tracing::debug!(
                             dropped_bytes = excess,
                             "jitter buffer over its limit; dropped stale audio to keep latency bounded"
@@ -2066,11 +2078,16 @@ fn run_playback_loop(
             let want_bytes = cap_frames * stride;
 
             let mut jb = jitter.borrow_mut();
-            let filled = if started.get() {
+            let mut declick = declick.borrow_mut();
+            let stopping = stopping_cb.load(Ordering::Relaxed);
+            let filled = if started.get() && !(stopping && declick.is_silent()) {
                 let take = want_bytes.min(jb.len());
                 for (i, byte) in jb.drain(..take).enumerate() {
                     slice[i] = byte;
                 }
+                // Emptying the buffer means the next callback is silence (the
+                // prefill re-arms below), so this one has to end at zero.
+                declick.apply(&mut slice[..take], CHANNELS as usize, stopping || jb.is_empty());
                 // Apply the logical gain to the samples we just wrote. Read the
                 // atomic once per buffer (not per sample) — it changes at knob
                 // speed, not audio speed. Skip the multiply at unity so the
@@ -2078,15 +2095,15 @@ fn run_playback_loop(
                 // scale each 4-byte lane in place over the frames we filled.
                 let g = f32::from_bits(gain.load(Ordering::Relaxed));
                 if (g - 1.0).abs() > f32::EPSILON {
-                    for s in slice[..take].chunks_exact_mut(4) {
-                        let v = f32::from_le_bytes([s[0], s[1], s[2], s[3]]) * g;
-                        s.copy_from_slice(&v.to_le_bytes());
+                    for s in slice[..take].as_chunks_mut::<4>().0 {
+                        *s = (f32::from_le_bytes(*s) * g).to_le_bytes();
                     }
                 }
                 take
             } else {
                 0
             };
+            faded_out_cb.store(declick.is_silent(), Ordering::Relaxed);
             // Zero-fill the remainder (underrun / not started yet) so we output
             // silence rather than garbage or a stall.
             for b in slice.iter_mut().take(want_bytes).skip(filled) {
@@ -2132,6 +2149,18 @@ fn run_playback_loop(
     let loop_ref = main_loop.loop_();
     loop {
         if stop_rx.try_recv().is_ok() {
+            // Destroying the stream mid-waveform is a click, and a stream is
+            // usually closed while its last packets are still buffered. Let the
+            // callback ramp to silence first; a node nobody drives never runs
+            // it, hence the bound.
+            stopping.store(true, Ordering::Relaxed);
+            let deadline = std::time::Instant::now() + Duration::from_millis(100);
+            while !faded_out.load(Ordering::Relaxed)
+                && listening.load(Ordering::Relaxed)
+                && std::time::Instant::now() < deadline
+            {
+                loop_ref.iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(5)));
+            }
             break;
         }
         loop_ref.iterate(pipewire::loop_::Timeout::Finite(Duration::from_millis(50)));
