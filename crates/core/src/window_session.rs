@@ -33,6 +33,7 @@ use cursio_window::{CaptureSession, Surrogate, WindowCapture, WindowRenderer};
 
 use crate::module::SessionModule;
 use crate::remote_screen::{ScreenHost, ScreenViewer};
+use crate::screen_hub::ScreenHub;
 use cursio_protocol::SCREEN_STREAM_ID;
 
 /// Put one window *control* message on the wire, enveloped for this module.
@@ -165,6 +166,13 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
     /// Open a remote-screen view of the peer once it publishes its sources.
     pub fn with_screen_view(mut self) -> Self {
         self.screen_view = Some(ScreenViewer::new(self.peer_name.clone()));
+        self
+    }
+
+    /// Offer the peer's sources to capture apps through `hub`, opening a view
+    /// only when one of them asks (Linux, through the ScreenCast portal).
+    pub fn with_screen_view_on_demand(mut self, hub: ScreenHub, peer_key: String) -> Self {
+        self.screen_view = Some(ScreenViewer::new(self.peer_name.clone()).on_demand(hub, peer_key));
         self
     }
 
@@ -640,10 +648,14 @@ pub struct WindowFactory {
     /// a view is a different thing (see `remote_screen`), not a second way to
     /// start a transfer.
     pub airplay: Option<AirPlayShare>,
-    /// Open a remote-screen view of every peer that serves one
-    /// (`--remote-screen`). Off by default: the view is a window that appears
-    /// per peer, and nobody should find windows they never asked for.
+    /// Offer every peer's windows and screens to this machine's capture apps
+    /// (`--remote-screen`). Off by default: it asks each peer for its source
+    /// list, and on Windows keeps an unseen view window per peer.
     pub remote_screen: bool,
+    /// Where capture apps ask for a peer's source — set on Linux, where the
+    /// view is a PipeWire node opened on request through Cursio's ScreenCast
+    /// portal backend instead of a window kept open per peer.
+    pub screen_hub: Option<ScreenHub>,
     /// Serve peers' remote-screen views of this machine. On by default and
     /// turned off by `--no-screen-host`; either way the module still
     /// negotiates, so a peer asking gets a refusal with a reason rather than
@@ -672,10 +684,12 @@ impl WindowFactory {
             ))
         };
         let engine = engine.with_screen_host(host);
-        if self.remote_screen {
-            engine.with_screen_view()
-        } else {
-            engine
+        match (self.remote_screen, self.screen_hub.as_ref()) {
+            (false, _) => engine,
+            (true, Some(hub)) => {
+                engine.with_screen_view_on_demand(hub.clone(), ctx.peer.peer_id.to_string())
+            }
+            (true, None) => engine.with_screen_view(),
         }
     }
 }
@@ -997,7 +1011,7 @@ mod tests {
     use super::*;
     use cursio_protocol::{Rect, TileCodec, WindowFrame, WindowInput, WindowMeta};
     use cursio_transport::QueueDepth;
-    use cursio_window::{window_test_support::*, WindowError};
+    use cursio_window::window_test_support::*;
     use tokio::sync::mpsc;
 
     fn airplay_offer(

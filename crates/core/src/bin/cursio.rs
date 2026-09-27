@@ -129,13 +129,15 @@ enum Command {
         /// AirPlay is forwarded untouched, so nothing is re-encoded on the way.
         #[arg(long, default_value_t = false)]
         share_airplay: bool,
-        /// Open a window per peer, titled "Cursio — <peer>", showing one of
-        /// that peer's windows or monitors — something screen-sharing software
-        /// (Discord, OBS, a browser call) can pick like any local window.
+        /// Offer every peer's windows and monitors to screen-sharing software
+        /// here (Discord, OBS, a browser call), without drawing them on this
+        /// desktop.
         ///
-        /// Right-click it to choose what it shows; ← and → step between the
-        /// peer's monitors and windows. Switching keeps the window, so a share
-        /// already running follows along.
+        /// Linux: they appear in the app's own "share your screen" dialog,
+        /// through Cursio's ScreenCast portal backend (install it once with
+        /// `cursio portal install`). Windows: an unseen window per peer,
+        /// "Cursio — <peer>", appears in the app's window list; choose what it
+        /// shows from its icon in the notification area.
         #[arg(long, default_value_t = false)]
         remote_screen: bool,
         /// Refuse peers' --remote-screen views of this machine.
@@ -210,6 +212,23 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
     },
+    /// Cursio as this user's ScreenCast portal backend (Linux), which is how
+    /// peers' screens reach Discord's and OBS's "share your screen" dialogs.
+    Portal {
+        #[command(subcommand)]
+        action: PortalAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PortalAction {
+    /// Route ScreenCast through Cursio (per user; restart the portal after).
+    Install,
+    /// Give ScreenCast back to GNOME alone.
+    Uninstall,
+    /// Forward every screen-cast request to GNOME; what D-Bus starts when no
+    /// `cursio mesh` holds the backend's name.
+    Relay,
 }
 
 /// Parse `--at X,Y` into a grid cell.
@@ -428,6 +447,12 @@ fn apply_modifier_map(spec: &str) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The portal backend's screen chooser is this executable in a child
+    // process (see `linux_chooser`); it takes no flags a user would type.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some(cursio_window::linux_chooser::CHOOSER_ARG) {
+        std::process::exit(cursio_window::linux_chooser::run_chooser_process());
+    }
     let cli = Cli::parse();
 
     // Console (info) + rotating file (debug) logging. `_log` must live for the
@@ -552,6 +577,7 @@ async fn main() -> anyhow::Result<()> {
                     }),
                     remote_screen,
                     screen_host: !no_screen_host,
+                    screen_hub: start_screen_portal(remote_screen),
                 },
                 ServiceSetup {
                     state: service_state.clone(),
@@ -614,7 +640,51 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
+        Command::Portal { action } => portal(action).await,
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn portal(action: PortalAction) -> anyhow::Result<()> {
+    match action {
+        PortalAction::Install => cursio_core::portal_setup::install(),
+        PortalAction::Uninstall => cursio_core::portal_setup::uninstall(),
+        PortalAction::Relay => Ok(cursio_window::linux_portal::serve(None).await?),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn portal(_action: PortalAction) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "the ScreenCast portal exists only on Linux; on Windows `mesh --remote-screen` needs no setup"
+    )
+}
+
+/// Serve the ScreenCast portal backend with the mesh's peers behind it, for
+/// `--remote-screen` on Linux; `None` elsewhere, where views are windows.
+#[cfg(target_os = "linux")]
+fn start_screen_portal(remote_screen: bool) -> Option<cursio_core::screen_hub::ScreenHub> {
+    if !remote_screen {
+        return None;
+    }
+    let hub = cursio_core::screen_hub::ScreenHub::default();
+    let screens: std::sync::Arc<dyn cursio_window::linux_portal::RemoteScreens> =
+        std::sync::Arc::new(hub.clone());
+    tokio::spawn(async move {
+        if let Err(e) = cursio_window::linux_portal::serve(Some(screens)).await {
+            tracing::warn!(
+                error = %e,
+                "peers' screens will not appear in screen-sharing dialogs; \
+                 is the portal backend installed (`cursio portal install`)?"
+            );
+        }
+    });
+    Some(hub)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_screen_portal(_remote_screen: bool) -> Option<cursio_core::screen_hub::ScreenHub> {
+    None
 }
 
 /// Window-transfer options, grouped for the same reason [`AudioOpts`] is: the
@@ -625,10 +695,12 @@ struct WindowOpts {
     /// this machine's own moves by being dragged across the peer-facing edge,
     /// which needs no flag — the drag is the request.
     airplay: Option<cursio_core::window_session::AirPlayShare>,
-    /// `--remote-screen`: open a view of each peer's screen.
+    /// `--remote-screen`: offer each peer's screen to capture apps here.
     remote_screen: bool,
     /// `!--no-screen-host`: let peers view this machine's screen.
     screen_host: bool,
+    /// Where the portal backend's requests reach the links (Linux).
+    screen_hub: Option<cursio_core::screen_hub::ScreenHub>,
 }
 
 /// What the service module needs, gathered so `module_registry` takes one
@@ -1117,6 +1189,7 @@ fn module_registry(
             airplay: window.airplay,
             remote_screen: window.remote_screen,
             screen_host: window.screen_host,
+            screen_hub: window.screen_hub,
         }))
         // Registered everywhere, including the platforms with no mount backend.
         // Sharing is two independent halves and only one of them needs FUSE or

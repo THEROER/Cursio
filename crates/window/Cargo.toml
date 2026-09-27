@@ -153,3 +153,7 @@ required-features = ["linux-probes"]
 [[example]]
 name = "screen_node_probe"
 required-features = ["linux-probes"]
+
+[[example]]
+name = "portal_probe"
+required-features = ["linux-probes"]

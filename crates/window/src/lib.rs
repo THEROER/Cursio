@@ -107,7 +107,7 @@ pub use windows_surrogate::{Win32Surrogate, Win32WindowRenderer};
 #[cfg(target_os = "linux")]
 mod linux_surrogate;
 #[cfg(target_os = "linux")]
-pub use linux_surrogate::{GtkSurrogate, GtkWindowRenderer};
+pub use linux_surrogate::{GtkSurrogate, GtkWindowRenderer, LinuxSurrogate};
 
 /// A peer's screen source published as a PipeWire node instead of a window.
 #[cfg(target_os = "linux")]
@@ -270,6 +270,12 @@ pub trait Surrogate {
 
     /// A source the user picked in the view's selector, if one is pending.
     fn take_source_pick(&mut self) -> Option<SourcePick> {
+        None
+    }
+
+    /// The PipeWire node this view publishes, for a view that is a node
+    /// rather than a window (Linux); `None` for a window.
+    fn node_id(&self) -> Option<u32> {
         None
     }
 

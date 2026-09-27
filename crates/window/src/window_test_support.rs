@@ -148,6 +148,9 @@ pub struct FakeSurrogate {
     pub sources: Vec<ScreenSource>,
     /// Picks the test makes on the user's behalf, taken front first.
     pub picks: VecDeque<SourcePick>,
+    /// Set on a remote-screen view, standing in for a published node: the
+    /// number of views opened before it, plus 100.
+    pub node: Option<u32>,
 }
 
 impl FakeSurrogate {
@@ -168,6 +171,10 @@ impl Surrogate for FakeSurrogate {
 
     fn take_source_pick(&mut self) -> Option<SourcePick> {
         self.picks.pop_front()
+    }
+
+    fn node_id(&self) -> Option<u32> {
+        self.node
     }
 
     fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
@@ -223,11 +230,13 @@ impl WindowRenderer for FakeRenderer {
             restarts: Vec::new(),
             sources: Vec::new(),
             picks: VecDeque::new(),
+            node: None,
         })
     }
 
     fn open_screen_view(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
-        let view = self.open(meta)?;
+        let mut view = self.open(meta)?;
+        view.node = Some(100 + self.views_opened.len() as u32);
         self.views_opened.push(meta.title.clone());
         Ok(view)
     }

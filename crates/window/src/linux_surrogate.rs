@@ -252,18 +252,72 @@ impl Drop for GtkSurrogate {
     }
 }
 
-/// The Linux [`WindowRenderer`] backend: one GTK window per transferred window.
+/// The Linux [`WindowRenderer`] backend: one GTK window per transferred window,
+/// and a PipeWire node — no window — per remote-screen view.
 pub struct GtkWindowRenderer;
 
 impl WindowRenderer for GtkWindowRenderer {
-    type Surrogate = GtkSurrogate;
+    type Surrogate = LinuxSurrogate;
 
     fn open(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
-        spawn_surrogate(meta, false)
+        spawn_surrogate(meta, false).map(LinuxSurrogate::Window)
     }
 
+    /// A node the ScreenCast portal hands to the capture app; see
+    /// [`PipeWireScreenSource`](crate::PipeWireScreenSource).
     fn open_screen_view(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
-        spawn_surrogate(meta, true)
+        crate::PipeWireScreenSource::open(meta).map(LinuxSurrogate::Node)
+    }
+}
+
+/// What the Linux renderer opens: a transfer's window, or a view's node.
+pub enum LinuxSurrogate {
+    Window(GtkSurrogate),
+    Node(crate::PipeWireScreenSource),
+}
+
+impl LinuxSurrogate {
+    fn inner(&mut self) -> &mut dyn Surrogate {
+        match self {
+            Self::Window(w) => w,
+            Self::Node(n) => n,
+        }
+    }
+}
+
+impl Surrogate for LinuxSurrogate {
+    fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
+        self.inner().apply_frame(frame)
+    }
+
+    fn input(&mut self) -> &mut mpsc::UnboundedReceiver<WindowInput> {
+        match self {
+            Self::Window(w) => w.input(),
+            Self::Node(n) => n.input(),
+        }
+    }
+
+    fn take_ack(&mut self) -> Option<WindowFrameAck> {
+        self.inner().take_ack()
+    }
+
+    fn take_resize_request(&mut self) -> Option<(u32, u32)> {
+        self.inner().take_resize_request()
+    }
+
+    fn restart_stream(&mut self, title: &str) {
+        self.inner().restart_stream(title)
+    }
+
+    fn node_id(&self) -> Option<u32> {
+        match self {
+            Self::Window(_) => None,
+            Self::Node(n) => Some(n.node_id()),
+        }
+    }
+
+    fn close(&mut self, reason: WindowCloseReason) {
+        self.inner().close(reason)
     }
 }
 

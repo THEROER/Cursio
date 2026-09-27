@@ -42,10 +42,17 @@ pub mod logging;
 pub mod mesh;
 pub mod module;
 pub mod node_status;
+/// Installing Cursio as this user's ScreenCast portal backend.
+#[cfg(all(target_os = "linux", feature = "window"))]
+pub mod portal_setup;
 pub mod registry;
-/// Remote-screen views: an app or monitor of a peer, shown in a window here
-/// that screen-sharing software can capture.
+/// Remote-screen views: an app or monitor of a peer, offered to
+/// screen-sharing software here without being drawn on this desktop.
+#[cfg(feature = "window")]
 pub mod remote_screen;
+/// Where a capture app's request for a peer's screen meets that peer's link.
+#[cfg(feature = "window")]
+pub mod screen_hub;
 pub mod service_session;
 pub mod session;
 #[cfg(feature = "usb")]

@@ -191,6 +191,10 @@ impl Surrogate for PipeWireScreenSource {
         self.acks.take()
     }
 
+    fn node_id(&self) -> Option<u32> {
+        Some(self.node_id)
+    }
+
     fn restart_stream(&mut self, _title: &str) {
         self.acks = PresentationAcks::new(self.id);
         let _ = self.send(Command::Restart);

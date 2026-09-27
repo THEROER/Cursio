@@ -1,11 +1,24 @@
-//! Remote-screen views: a window here that shows an app or a monitor of a peer.
+//! Remote-screen views: an app or a monitor of a peer, offered to this
+//! machine's screen-sharing software without being drawn on its desktop.
 //!
-//! The use it exists for is screen-sharing software. Discord, OBS or a browser
-//! call can only offer what this machine has, and a window is the one thing
-//! every one of them lists on every platform. So the view is an ordinary,
-//! visible top-level window titled `Cursio — <peer>`, and what it shows is one
-//! source on the peer — any of its windows, or a whole monitor — chosen from a
-//! selector that never draws into the picture.
+//! Discord, OBS or a browser call can only offer what this machine has. What
+//! "has" means differs, so the view does too:
+//!
+//! - **Windows**: those apps list windows, so the view is one — titled
+//!   `Cursio — <peer>`, one per peer, kept for the life of the link, but
+//!   never on screen (see the Windows surrogate's `unseen` module for the
+//!   measurements behind "listed and recorded, yet unseen"). Its source is
+//!   chosen from a notification-area icon.
+//! - **Linux (GNOME)**: those apps take pixels only from the ScreenCast
+//!   portal, so the view is a PipeWire node, opened when a capture app picks
+//!   the peer's source in Cursio's portal backend dialog and closed when it is
+//!   done. Nothing is kept open per peer; the request travels through
+//!   [`ScreenHub`], because the portal runs apart from the session loops
+//!   ([`ScreenViewer::on_demand`]).
+//!
+//! The first version drew a visible window per peer on the viewing desktop,
+//! purely so it could be captured — rendering for nobody, which is what the
+//! user asked not to have.
 //!
 //! ## Pulled by the viewer, unlike a transfer
 //!
@@ -21,10 +34,13 @@
 //! Viewing stays passive in the other sense — nothing here opens unless the
 //! user asked for views with `--remote-screen`.
 //!
-//! ## One window across every switch
+//! ## One window across every switch (Windows)
 //!
 //! Screen-sharing software captures a *window*; recreate the window and the
-//! share ends. So a source switch never closes the view. The host swaps the
+//! share ends. So a source switch never closes the view. (On Linux a switch
+//! is a new pick in the capture app, which asks the portal afresh, so each
+//! pick gets its own node; one per peer at a time, a newer pick taking the
+//! stream from an older one.) The host swaps the
 //! capture underneath one reserved stream id ([`SCREEN_STREAM_ID`]) and sends
 //! [`WindowMsg::SourceShown`] ahead of the new source's first frame; the view
 //! restarts its decoder and picture on that marker and letterboxes whatever
@@ -46,6 +62,9 @@ use cursio_transport::{TransportError, TransportTx};
 use cursio_window::{
     CaptureSession, ScreenSources, SourcePick, Surrogate, WindowError, WindowRenderer,
 };
+use tokio::sync::oneshot;
+
+use crate::screen_hub::{HubRequest, ScreenHub, Shown};
 
 /// How often a subscribed host re-reads its source list.
 ///
@@ -350,6 +369,25 @@ pub struct ScreenViewer<S: Surrogate> {
     /// list refresh would pop it straight back up.
     dismissed: bool,
     outbox: Vec<WindowMsg>,
+    /// Set where views are asked for by capture apps (Linux, through the
+    /// portal) instead of kept open by the link: the hub, and this peer's
+    /// key in it.
+    demand: Option<(ScreenHub, String)>,
+    /// A capture app's request waiting for the host's `SourceShown`.
+    pending: Option<PendingShow>,
+    /// The showing a capture app holds now.
+    active: Option<ActiveShow>,
+}
+
+struct PendingShow {
+    token: u64,
+    source: SourceId,
+    reply: oneshot::Sender<Result<Shown, String>>,
+}
+
+struct ActiveShow {
+    token: u64,
+    ended: oneshot::Sender<()>,
 }
 
 impl<S: Surrogate> ScreenViewer<S> {
@@ -364,6 +402,133 @@ impl<S: Surrogate> ScreenViewer<S> {
             auto_picked: false,
             dismissed: false,
             outbox: Vec::new(),
+            demand: None,
+            pending: None,
+            active: None,
+        }
+    }
+
+    /// Open views only when a capture app asks for one through `hub`, where
+    /// this peer is `peer_key`.
+    pub fn on_demand(mut self, hub: ScreenHub, peer_key: String) -> Self {
+        self.demand = Some((hub, peer_key));
+        self
+    }
+
+    /// The host's answer to a capture app's request: open the node now that
+    /// its size is known, and tell the app where it is.
+    fn fulfil<R>(
+        &mut self,
+        source: SourceId,
+        title: &str,
+        width: u32,
+        height: u32,
+        renderer: &mut R,
+    ) where
+        R: WindowRenderer<Surrogate = S>,
+    {
+        let Some(pending) = self.pending.take_if(|p| p.source == source) else {
+            // Not what anyone is waiting for: the host restarted the stream a
+            // capture app already holds.
+            if let Some(view) = self.view.as_mut() {
+                view.restart_stream(title);
+            }
+            return;
+        };
+        if let Some(mut old) = self.view.take() {
+            old.close(WindowCloseReason::Returned);
+        }
+        let meta = WindowMeta {
+            id: SCREEN_STREAM_ID,
+            title: format!("{} · {title}", view_title(&self.peer_name)),
+            width,
+            height,
+        };
+        let opened = renderer.open_screen_view(&meta).and_then(|view| {
+            view.node_id()
+                .map(|node_id| (view, node_id))
+                .ok_or(WindowError::Unsupported)
+        });
+        match opened {
+            Ok((view, node_id)) => {
+                let kind = self
+                    .sources
+                    .iter()
+                    .find(|s| s.id == source)
+                    .map_or(SourceKind::Monitor, |s| s.kind);
+                let (ended_tx, ended_rx) = oneshot::channel();
+                let shown = Shown {
+                    node_id,
+                    width,
+                    height,
+                    kind,
+                    token: pending.token,
+                    ended: ended_rx,
+                };
+                if pending.reply.send(Ok(shown)).is_err() {
+                    // The app gave up while the host was opening.
+                    self.outbox.push(WindowMsg::StopSource);
+                    return;
+                }
+                self.view = Some(view);
+                self.active = Some(ActiveShow {
+                    token: pending.token,
+                    ended: ended_tx,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, peer = %self.peer_name, "could not publish the peer's screen here");
+                let _ = pending.reply.send(Err(e.to_string()));
+                self.outbox.push(WindowMsg::StopSource);
+            }
+        }
+    }
+
+    /// End the capture app's showing: its node goes, and the app is told.
+    fn end_active(&mut self) {
+        if let Some(mut view) = self.view.take() {
+            view.close(WindowCloseReason::HostClosed);
+        }
+        if let Some(active) = self.active.take() {
+            let _ = active.ended.send(());
+        }
+    }
+
+    /// Act on what capture apps asked of this peer since the last pump.
+    fn apply_demand(&mut self) {
+        let Some((hub, key)) = self.demand.as_ref() else {
+            return;
+        };
+        for request in hub.take_requests(key) {
+            match request {
+                HubRequest::Show {
+                    source,
+                    token,
+                    reply,
+                } => {
+                    // One stream per direction per link: a newer request
+                    // takes it over, and whoever held it is told so.
+                    if let Some(old) = self.pending.take() {
+                        let _ = old.reply.send(Err("replaced by a newer request".into()));
+                    }
+                    self.end_active();
+                    self.pending = Some(PendingShow {
+                        token,
+                        source,
+                        reply,
+                    });
+                    self.request(source);
+                }
+                HubRequest::Stop { token } => {
+                    if self.active.as_ref().is_some_and(|a| a.token == token) {
+                        self.end_active();
+                        self.outbox.push(WindowMsg::StopSource);
+                    } else if self.pending.as_ref().is_some_and(|p| p.token == token) {
+                        self.pending = None;
+                        self.outbox.push(WindowMsg::StopSource);
+                    }
+                }
+            }
         }
     }
 
@@ -375,6 +540,9 @@ impl<S: Surrogate> ScreenViewer<S> {
     where
         R: WindowRenderer<Surrogate = S>,
     {
+        if self.demand.is_some() {
+            return self.handle_on_demand(msg, renderer);
+        }
         match msg {
             WindowMsg::Sources(list) => {
                 self.sources = list.clone();
@@ -404,6 +572,44 @@ impl<S: Surrogate> ScreenViewer<S> {
                 if let Some(view) = self.view.as_mut() {
                     view.restart_stream("");
                 }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn handle_on_demand<R>(&mut self, msg: &WindowMsg, renderer: &mut R) -> bool
+    where
+        R: WindowRenderer<Surrogate = S>,
+    {
+        let Some((hub, key)) = self.demand.clone() else {
+            return false;
+        };
+        match msg {
+            WindowMsg::Sources(list) => {
+                self.sources = list.clone();
+                hub.publish(&key, &self.peer_name, list);
+            }
+            WindowMsg::SourcesRefused { reason } => {
+                tracing::info!(peer = %self.peer_name, %reason, "peer does not share its screen");
+                hub.withdraw(&key);
+            }
+            WindowMsg::SourceShown {
+                source,
+                title,
+                width,
+                height,
+            } => {
+                self.showing = Some(*source);
+                self.fulfil(*source, title, *width, *height, renderer);
+            }
+            WindowMsg::SourceEnded { reason } => {
+                tracing::info!(peer = %self.peer_name, %reason, "remote-screen source ended");
+                self.showing = None;
+                if let Some(pending) = self.pending.take() {
+                    let _ = pending.reply.send(Err(reason.clone()));
+                }
+                self.end_active();
             }
             _ => return false,
         }
@@ -485,6 +691,7 @@ impl<S: Surrogate> ScreenViewer<S> {
             self.subscribed = true;
             send_control(tx, WindowMsg::ListSources).await?;
         }
+        self.apply_demand();
 
         let mut closed = false;
         let mut picks = Vec::new();
@@ -544,8 +751,12 @@ impl<S: Surrogate> ScreenViewer<S> {
 
     /// Close the view; the link is going away.
     pub fn shutdown(&mut self) {
-        if let Some(mut view) = self.view.take() {
-            view.close(WindowCloseReason::HostClosed);
+        if let Some(pending) = self.pending.take() {
+            let _ = pending.reply.send(Err("the link to the peer ended".into()));
+        }
+        self.end_active();
+        if let Some((hub, key)) = self.demand.as_ref() {
+            hub.withdraw(key);
         }
     }
 
@@ -940,6 +1151,122 @@ mod tests {
             tx.control().as_slice(),
             [WindowMsg::SourceEnded { reason }] if reason.contains("no longer exists")
         ));
+    }
+
+    fn on_demand(sources: &FakeScreenSources) -> (Pair, ScreenHub) {
+        let hub = ScreenHub::default();
+        let mut pair = Pair::new(sources);
+        pair.viewer = ScreenViewer::new("Lightmoon".into()).on_demand(hub.clone(), "lm".into());
+        (pair, hub)
+    }
+
+    #[tokio::test]
+    async fn on_demand_the_peers_sources_reach_the_hub_and_nothing_opens_unasked() {
+        let sources = lightmoon();
+        let (mut pair, hub) = on_demand(&sources);
+
+        pair.settle().await;
+
+        assert_eq!(hub.peers().len(), 1);
+        assert_eq!(hub.peers()[0].2.len(), 3);
+        assert!(pair.renderer.views_opened.is_empty());
+        assert!(
+            sources.opened().is_empty(),
+            "no capture may start until a capture app asks"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_capture_apps_request_publishes_a_node_once_the_host_shows_the_source() {
+        let sources = lightmoon();
+        let (mut pair, hub) = on_demand(&sources);
+        pair.settle().await;
+
+        let answer = hub.show("lm", 2);
+        pair.settle().await;
+
+        let shown = answer.await.unwrap().expect("the source is shown");
+        assert_eq!(shown.node_id, 100);
+        assert_eq!((shown.width, shown.height), (800, 600));
+        assert_eq!(shown.kind, SourceKind::Window);
+        assert_eq!(pair.host.showing(), Some(2));
+        assert_eq!(
+            pair.renderer.views_opened,
+            ["Cursio — Lightmoon · Terminal"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_capture_app_stopping_ends_the_node_and_the_hosts_capture() {
+        let sources = lightmoon();
+        let (mut pair, hub) = on_demand(&sources);
+        pair.settle().await;
+        let shown = {
+            let answer = hub.show("lm", 1);
+            pair.settle().await;
+            answer.await.unwrap().unwrap()
+        };
+
+        hub.stop("lm", shown.token);
+        pair.settle().await;
+
+        assert_eq!(pair.host.showing(), None);
+        assert!(pair.viewer.view().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_newer_request_takes_the_stream_and_the_old_holder_is_told() {
+        let sources = lightmoon();
+        let (mut pair, hub) = on_demand(&sources);
+        pair.settle().await;
+        let first = {
+            let answer = hub.show("lm", 1);
+            pair.settle().await;
+            answer.await.unwrap().unwrap()
+        };
+
+        let second = hub.show("lm", 0x8000_0000);
+        pair.settle().await;
+
+        assert!(
+            first.ended.await.is_ok(),
+            "the first app must learn its share ended"
+        );
+        let second = second.await.unwrap().unwrap();
+        assert_eq!(second.kind, SourceKind::Monitor);
+        assert_eq!(pair.host.showing(), Some(0x8000_0000));
+    }
+
+    #[tokio::test]
+    async fn a_source_the_host_cannot_open_fails_the_request_with_its_reason() {
+        let sources = lightmoon();
+        let (mut pair, hub) = on_demand(&sources);
+        pair.settle().await;
+
+        sources.fail_next("the user cancelled the dialog");
+        let answer = hub.show("lm", 1);
+        pair.settle().await;
+
+        let err = answer.await.unwrap().unwrap_err();
+        assert!(err.contains("cancelled"));
+        assert!(pair.renderer.views_opened.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_link_ending_withdraws_the_peer_and_ends_its_share() {
+        let sources = lightmoon();
+        let (mut pair, hub) = on_demand(&sources);
+        pair.settle().await;
+        let shown = {
+            let answer = hub.show("lm", 1);
+            pair.settle().await;
+            answer.await.unwrap().unwrap()
+        };
+
+        pair.viewer.shutdown();
+
+        assert!(shown.ended.await.is_ok());
+        assert!(hub.peers().is_empty());
     }
 
     #[tokio::test]
