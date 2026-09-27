@@ -426,8 +426,12 @@ impl FileServer {
 
     /// Release a handle. Unknown handles are ignored: a close is the peer saying
     /// it is finished, and there is nothing useful to report back.
-    pub fn close(&mut self, handle: FileHandle) {
-        self.open.remove(&handle);
+    ///
+    /// The file comes back rather than being dropped here, so a caller holding
+    /// the server behind a lock can let go of the lock first: dropping the last
+    /// reference is the OS close, and that can wait on the disk.
+    pub fn close(&mut self, handle: FileHandle) -> Option<FileHandleRef> {
+        self.open.remove(&handle).map(FileHandleRef)
     }
 }
 

@@ -871,7 +871,18 @@ pub struct FilesEngine {
     peer_name: String,
     /// Our disks, as the peer sees them. Behind a mutex because the blocking
     /// tasks that touch the disk need it across await points.
+    ///
+    /// Never locked on the session loop. The workers take it for every request
+    /// the peer makes, and a worker that ends up holding it across the disk —
+    /// which a request did until recently, see [`run_request`] — turns a slow
+    /// disk into a frozen cursor. Seen live under heavy I/O pressure: the
+    /// loop's once-a-second rescan hand-over waited out 0.3–1.9 s reads every
+    /// two seconds. What the loop needs from the server is kept in
+    /// [`FilesEngine::local_volumes`] instead.
     server: std::sync::Arc<std::sync::Mutex<FileServer>>,
+    /// The volume set we last announced, owned by the loop so announcing it
+    /// needs no lock. Replaced by a rescan worker's result.
+    local_volumes: Vec<Volume>,
     /// Requests from the local FUSE mount, waiting to go out.
     ops_rx: tokio::sync::mpsc::UnboundedReceiver<Op>,
     /// Replies from disk work finished on a worker thread.
@@ -985,9 +996,10 @@ pub struct FilesEngine {
     /// Set while a rescan is running on a worker, so the once-a-second timer
     /// cannot stack a second one behind a scan that is still stuck.
     rescanning: bool,
-    /// Finished scans, collected by a later pump.
-    rescan_tx: tokio::sync::mpsc::UnboundedSender<FileServer>,
-    rescan_rx: tokio::sync::mpsc::UnboundedReceiver<FileServer>,
+    /// Finished scans, collected by a later pump: the new volume set when it
+    /// changed, `None` when it did not.
+    rescan_tx: tokio::sync::mpsc::UnboundedSender<Option<Vec<Volume>>>,
+    rescan_rx: tokio::sync::mpsc::UnboundedReceiver<Option<Vec<Volume>>>,
 }
 
 impl FilesEngine {
@@ -1014,10 +1026,12 @@ impl FilesEngine {
 
         let mut server = FileServer::detect();
         server.exclude(excluded_paths(&peer_name));
+        let local_volumes = server.volumes();
 
         Ok(Self {
             peer_name,
             server: std::sync::Arc::new(std::sync::Mutex::new(server)),
+            local_volumes,
             ops_rx,
             done_tx,
             done_rx,
@@ -1063,26 +1077,15 @@ impl FilesEngine {
     /// identical every time; only the statistics had moved. Capacity still
     /// reaches the peer, it just no longer *triggers* the announcement.
     fn rescan_volumes(&mut self) {
-        // Take delivery of a scan that finished since the last pump.
-        while let Ok(after) = self.rescan_rx.try_recv() {
+        // Take delivery of a scan that finished since the last pump. The worker
+        // has already put it into the server; see [`FilesEngine::server`] for
+        // why that is not done here.
+        while let Ok(changed) = self.rescan_rx.try_recv() {
             self.rescanning = false;
-            let mut server = self.server.lock().unwrap_or_else(PoisonError::into_inner);
-            let before = server.volumes();
-            if volume_identity(&after.volumes()) == volume_identity(&before) {
-                continue;
+            if let Some(volumes) = changed {
+                self.local_volumes = volumes;
+                self.announce_volumes = true;
             }
-            tracing::info!(
-                peer = %self.peer_name,
-                was = before.len(),
-                now = after.volumes().len(),
-                "local volumes changed"
-            );
-            // Only the volume set, never the open handles: see
-            // [`FileServer::adopt_volumes`] for what replacing the whole server
-            // did to a peer that had files open when a disk was unplugged.
-            server.adopt_volumes(after);
-            drop(server);
-            self.announce_volumes = true;
         }
 
         if self.rescanning || self.last_rescan.elapsed() < VOLUME_RESCAN {
@@ -1103,10 +1106,34 @@ impl FilesEngine {
         // comparison but not free, and the cost is the same kind: a stale NFS
         // or autofs mount blocks in `statfs` exactly the same way.
         let tx = self.rescan_tx.clone();
+        let server = std::sync::Arc::clone(&self.server);
+        let peer = self.peer_name.clone();
         self.workers.spawn(move || {
+            let after = FileServer::detect();
+            let changed = {
+                let mut server = server.lock().unwrap_or_else(PoisonError::into_inner);
+                let before = server.volumes();
+                let now = after.volumes();
+                if volume_identity(&now) == volume_identity(&before) {
+                    None
+                } else {
+                    tracing::info!(
+                        peer = %peer,
+                        was = before.len(),
+                        now = now.len(),
+                        "local volumes changed"
+                    );
+                    // Only the volume set, never the open handles: see
+                    // [`FileServer::adopt_volumes`] for what replacing the whole
+                    // server did to a peer that had files open when a disk was
+                    // unplugged.
+                    server.adopt_volumes(after);
+                    Some(now)
+                }
+            };
             // The receiver only closes when the session is ending, in which case
             // the scan is moot.
-            let _ = tx.send(FileServer::detect());
+            let _ = tx.send(changed);
         });
     }
 
@@ -1621,11 +1648,16 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             // file, queued behind it. Measured against a peer downloading a
             // game: 11 writes a second with 0.2 operations in flight, against a
             // window of 128.
-            let r = server
+            //
+            // So the detach is a statement of its own. Chaining the read onto
+            // it as `.and_then(..)` is the same expression, and kept the guard
+            // alive across the disk after all: under I/O pressure a 2 s read
+            // held the lock for 2 s, and everything else wanting it waited.
+            let file = server
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .detach(handle)
-                .and_then(|file| file.read(offset, len));
+                .detach(handle);
+            let r = file.and_then(|file| file.read(offset, len));
             answer(
                 req,
                 &format!("read handle {handle} at {offset}"),
@@ -1645,12 +1677,14 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             bytes,
             ..
         } => {
+            // Detached in a statement of its own, for the reason given under
+            // `Read`.
             let r = unpack(bytes).and_then(|bytes| {
-                server
+                let file = server
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .detach_writable(handle)
-                    .and_then(|file| file.write(offset, &bytes))
+                    .detach_writable(handle);
+                file.and_then(|file| file.write(offset, &bytes))
             });
             answer(
                 req,
@@ -1665,11 +1699,13 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             size,
             reserve,
         } => {
-            let r = server
+            // Reserving space for a large file writes it out; see `Read` for
+            // why the detach stands alone.
+            let file = server
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .detach_writable(handle)
-                .and_then(|file| file.set_size(size, reserve));
+                .detach_writable(handle);
+            let r = file.and_then(|file| file.set_size(size, reserve));
             answer(
                 req,
                 &format!("set_size handle {handle} to {size} reserve={reserve}"),
@@ -1711,10 +1747,14 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             ))
         }
         FilesMsg::Close { handle } => {
-            server
+            // Released after the lock, not under it: the last reference going
+            // is the actual `close`, which can wait on the disk — an antivirus
+            // scanning a file just written, a filesystem flushing on close.
+            let closed = server
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .close(handle);
+            drop(closed);
             None // deliberately unanswered; see the protocol docs
         }
         // Replies and announcements are not requests: they are handled inline
@@ -2096,11 +2136,7 @@ impl SessionModule for FilesEngine {
     }
 
     async fn start(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
-        let volumes = self
-            .server
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .volumes();
+        let volumes = self.local_volumes.clone();
         tracing::info!(
             peer = %self.peer_name,
             volumes = volumes.len(),
@@ -2123,12 +2159,7 @@ impl SessionModule for FilesEngine {
         self.rescan_volumes();
 
         if self.announce_volumes {
-            let volumes = self
-                .server
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .volumes();
-            send(tx, FilesMsg::Volumes(volumes)).await?;
+            send(tx, FilesMsg::Volumes(self.local_volumes.clone())).await?;
             self.announce_volumes = false;
         }
 
@@ -2395,9 +2426,11 @@ mod tests {
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
         let (outbox_tx, outbox_rx) = tokio::sync::mpsc::unbounded_channel();
         let (rescan_tx, rescan_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = FileServer::detect();
         let engine = FilesEngine {
             peer_name: "peer".into(),
-            server: std::sync::Arc::new(std::sync::Mutex::new(FileServer::detect())),
+            local_volumes: server.volumes(),
+            server: std::sync::Arc::new(std::sync::Mutex::new(server)),
             ops_rx,
             done_tx,
             done_rx,
@@ -2746,6 +2779,89 @@ mod tests {
         assert_eq!(
             engine.last_rescan, before,
             "a skipped tick must not count as a scan"
+        );
+    }
+
+    /// A worker stuck on the disk while holding the server's lock must not
+    /// hold up the session loop.
+    ///
+    /// The loop carries the cursor. Under heavy I/O pressure a peer's read
+    /// took 2 s with the lock held, and the pump that collected a finished
+    /// volume scan waited for that lock every time — 0.3–1.9 s frozen, every
+    /// two seconds. The lock is held here for far longer than the pump may
+    /// take, with a scan result waiting to be announced.
+    #[tokio::test]
+    async fn a_pump_does_not_wait_on_a_server_lock_held_across_the_disk() {
+        let (mut engine, _ops) = engine();
+        let stick = Volume {
+            id: "E:".into(),
+            label: "Stick".into(),
+            writable: true,
+            total_bytes: 1 << 30,
+            free_bytes: 1 << 29,
+            removable: true,
+        };
+        engine.rescanning = true;
+        engine
+            .rescan_tx
+            .send(Some(vec![stick.clone()]))
+            .expect("delivers");
+
+        let server = std::sync::Arc::clone(&engine.server);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let slow_disk = std::thread::spawn(move || {
+            let _held = server.lock().expect("server");
+            locked_tx.send(()).expect("reports");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        locked_rx.recv().expect("the lock is taken");
+
+        let mut tx = RecordingTx::default();
+        let started = Instant::now();
+        engine.pump(&mut tx).await.expect("pumps");
+        let took = started.elapsed();
+        slow_disk.join().expect("joins");
+
+        assert!(
+            took < Duration::from_millis(500),
+            "the pump waited {took:?} on a lock held by a slow worker"
+        );
+        assert!(
+            tx.sent
+                .iter()
+                .any(|m| matches!(m, FilesMsg::Volumes(v) if v == &vec![stick.clone()])),
+            "the new volume set is still announced"
+        );
+        assert!(!engine.rescanning, "the finished scan was collected");
+    }
+
+    /// A scan that finds a different volume set leaves the server already
+    /// serving it, and hands the loop only the list to announce.
+    #[test]
+    fn a_rescan_that_finds_a_new_set_is_adopted_off_the_loop() {
+        let (mut engine, _ops) = engine();
+        *engine.server.lock().expect("server") = FileServer::new(Vec::new());
+        engine.last_rescan = Instant::now() - VOLUME_RESCAN * 2;
+        engine.rescan_volumes();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.rescanning && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            engine.rescan_volumes();
+        }
+        assert!(!engine.rescanning, "the scan came back");
+        let detected = FileServer::detect().volumes();
+        assert!(!detected.is_empty(), "this machine offers a volume");
+        assert_eq!(
+            volume_identity(&engine.local_volumes),
+            volume_identity(&detected),
+            "the loop has the new set to announce"
+        );
+        assert!(engine.announce_volumes, "and announces it");
+        assert_eq!(
+            volume_identity(&engine.server.lock().expect("server").volumes()),
+            volume_identity(&detected),
+            "the server already serves it"
         );
     }
 
