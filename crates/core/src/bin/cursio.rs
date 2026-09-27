@@ -5,7 +5,9 @@
 //! to each other directly and reconnect when it returns. Nothing is a hub.
 //!
 //! Subcommands:
-//! - `mesh` — run a node: listen, dial every trusted peer, share input/audio/clipboard.
+//! - `mesh` — run a node: listen, dial every trusted peer, run the modules
+//!   `config.toml` names (flags override it for one run).
+//! - `config` — print the config `mesh` would run with.
 //! - `peers` — list peers discovered on the LAN and exit.
 //!
 //! Typical use: `cursio mesh --pair` on both machines once, with the same
@@ -49,6 +51,11 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Read the node's config from this file instead of the platform default
+    /// (`~/.config/cursio/config.toml`, `%APPDATA%\cursio\cursio\config\config.toml`).
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -63,157 +70,12 @@ enum Command {
     ///
     /// New machines are met explicitly, with `--pair` on both; the mesh
     /// only auto-dials machines already paired with.
-    Mesh {
-        /// TCP port to listen on. A **stable default** (not 0/OS-assigned) is
-        /// deliberate: the peer caches our last address to reconnect when mDNS is
-        /// slow or blocked, and a port that changed every restart made that cache
-        /// point at a dead port — so a bounced node was never redialled. Pass 0
-        /// explicitly for an ephemeral port.
-        #[arg(long, default_value_t = 46073)]
-        port: u16,
-        /// Capture this machine's mouse/keyboard and share it with peers.
-        #[arg(long, default_value_t = false)]
-        send_input: bool,
-        /// Where this machine stands, as a cell on a grid: `--at 1,0` is one
-        /// machine to the right of `0,0`.
-        ///
-        /// Cells, not pixels — nothing needs to know how wide anybody's screen
-        /// is. Four machines in a row are `0,0 1,0 2,0 3,0`, and each works out
-        /// for itself which of its edges faces which peer, and which peer is
-        /// nearest in that direction. Left unset every machine sits at `0,0`,
-        /// where nothing borders anything and Ctrl+Alt+G is the only handoff.
-        ///
-        /// `allow_hyphen_values` because half the grid is negative: a machine
-        /// to the left of the origin is `-1,0`, and clap would otherwise read
-        /// the leading minus as the start of another flag and refuse it.
-        #[arg(
-            long,
-            value_name = "X,Y",
-            default_value = "0,0",
-            allow_hyphen_values = true,
-            value_parser = parse_position
-        )]
-        at: cursio_protocol::Position,
-        /// Share audio with peers.
-        #[arg(long, default_value_t = false)]
-        audio: bool,
-        /// Render peer audio into the output device whose name contains this
-        /// (Windows only; ignored elsewhere, with a line in the log saying so).
-        #[arg(long)]
-        audio_render_device: Option<String>,
-        /// Share the clipboard with peers (text, images, and other formats).
-        #[arg(long, default_value_t = false)]
-        clipboard: bool,
-        /// Share disks both ways: this machine's volumes appear on the peer,
-        /// and the peer's appear here under `~/Cursio/<peer>/`.
-        ///
-        /// Unless `--files-share` narrows it, every disk is offered read-write,
-        /// so anything either machine can reach, the other can change. Linux
-        /// mounts with FUSE and Windows with WinFsp; macOS serves its own
-        /// volumes but cannot yet mount the peer's.
-        #[arg(long, default_value_t = false)]
-        files: bool,
-        /// Offer only this root to peers instead of every disk; repeat for
-        /// several. A volume's root (`/`, `C:\`) offers that disk, anything
-        /// else offers that folder alone. Append `:ro` to refuse every change
-        /// the peer asks for there: `C:\:ro`, `/home/me/Projects:ro`.
-        #[arg(long = "files-share", value_name = "PATH[:ro]")]
-        files_share: Vec<String>,
-        /// Share this machine's USB devices with the mesh, and use the devices
-        /// its peers are sharing. A device stays usable here while it is
-        /// shared.
-        ///
-        /// Needs the exporting half in place: `sudo modprobe usbip-host` on
-        /// Linux, `usbipd-win` installed on Windows. Without it the module is
-        /// not advertised and the log says why, rather than offering devices
-        /// that would fail on claim.
-        #[arg(long, default_value_t = false)]
-        usb: bool,
-        /// When this machine is the selected AirPlay host, offer the mirrored
-        /// screen to every peer instead of only peers using --airplay-window.
-        ///
-        /// The peer sees it as an ordinary transferred window: the H.264 from
-        /// AirPlay is forwarded untouched, so nothing is re-encoded on the way.
-        #[arg(long, default_value_t = false)]
-        share_airplay: bool,
-        /// Offer every peer's windows and monitors to screen-sharing software
-        /// here (Discord, OBS, a browser call), without drawing them on this
-        /// desktop.
-        ///
-        /// Linux: they appear in the app's own "share your screen" dialog,
-        /// through Cursio's ScreenCast portal backend (install it once with
-        /// `cursio portal install`). Windows: an unseen window per peer,
-        /// "Cursio — <peer>", appears in the app's window list; choose what it
-        /// shows from its icon in the notification area.
-        #[arg(long, default_value_t = false)]
-        remote_screen: bool,
-        /// Refuse peers' --remote-screen views of this machine.
-        #[arg(long, default_value_t = false)]
-        no_screen_host: bool,
-        /// Pair with a machine that is not trusted yet: run this on **both**,
-        /// with the same password, for the next ten minutes.
-        ///
-        /// Not two commands. The mesh already listens and dials at once; the
-        /// only thing it will not do on its own is call a machine it has never
-        /// met, because joining has to stay a deliberate, password-gated act.
-        /// This opens that window at both ends and lets the two sort out which
-        /// one places the call, the same way two trusted nodes do.
-        #[arg(long, default_value_t = false)]
-        pair: bool,
-        /// Where to find the machine to pair with, when mDNS will not say.
-        ///
-        /// Only consulted while `--pair` is open. Naming an address also means
-        /// this side places the call rather than waiting to be called.
-        #[arg(long, value_name = "HOST:PORT", requires = "pair")]
-        pair_addr: Option<SocketAddr>,
-        /// What this machine asks of the mesh's AirPlay receiver. On by
-        /// default.
-        ///
-        /// `on` — the default — takes part: this machine will hold the receiver
-        /// if the mesh picks it, with no request about quality. A profile in
-        /// its place asks the *mesh* for that quality — `1440p:30fps`,
-        /// `1080p60`, `2k` — and the receiver moves to whichever machine can deliver it,
-        /// which need not be this one. `off` steps out entirely: nothing is
-        /// bound, and a peer asking this machine to host is refused, so the
-        /// mesh picks another. Every machine `off` means AirPlay does not run.
-        ///
-        /// Where the picture *appears* is `--airplay-window`, not this.
-        #[arg(long, default_value = "on", value_name = "MODE")]
-        airplay: String,
-        /// Show the mirrored iPhone screen on this machine.
-        ///
-        /// Separate from `--airplay` because they answer different questions:
-        /// that one is about the picture the mesh receives, this one about
-        /// which desk it appears on. A machine can hold the receiver and show
-        /// nothing — passing the stream to peers with `--share-airplay` — or
-        /// show a picture another machine is receiving.
-        #[arg(long, default_value_t = false)]
-        airplay_window: bool,
-        /// AirPlay control port.
-        #[arg(long, default_value_t = cursio_airplay::DEFAULT_CONTROL_PORT)]
-        airplay_port: u16,
-        /// Pin AirPlay mDNS to the LAN interface with this address.
-        #[arg(long)]
-        airplay_interface: Option<IpAddr>,
-        /// Where a peer's modifier keys land on this machine (macOS only).
-        ///
-        /// `positional` — the default — puts every key where the hardware says
-        /// it is: Alt is Option, Ctrl is Control, the Windows key is Command.
-        /// `swapped` trades Control and the Windows key instead, so a PC
-        /// keyboard's Ctrl+C copies.
-        ///
-        /// Anything else can be written out as `from=to` pairs, e.g.
-        /// `ctrl=cmd,win=ctrl` (the swap spelled by hand) or
-        /// `rightalt=globe` (the right Alt changes input source, which is what
-        /// a modern MacBook's Globe key does and no PC keyboard has). Names:
-        /// ctrl, alt/option, win/cmd, shift, caps, globe/fn — each optionally
-        /// prefixed `left` or `right`.
-        ///
-        /// This also decides where the Ctrl+Alt+G hotkey lands on a Mac's own
-        /// keyboard; the log says which keys, at startup.
-        #[arg(long, default_value = "positional", value_name = "SPEC")]
-        mac_modifiers: String,
-    },
+    ///
+    /// What runs comes from `config.toml` (see `cursio config`); every flag
+    /// below overrides the file for this run only.
+    Mesh(MeshArgs),
+    /// Print the config `cursio mesh` would run with, and where it is read from.
+    Config,
     /// List peers discovered on the LAN, then exit.
     Peers {
         #[arg(long, default_value_t = 5)]
@@ -227,6 +89,216 @@ enum Command {
     },
 }
 
+/// `cursio mesh`'s flags. Each is an override of `config.toml`: absent means
+/// "whatever the file says", so every module switch comes as an on/off pair —
+/// a lone `--audio` that is false when omitted could never leave the file's
+/// answer standing.
+#[derive(clap::Args)]
+struct MeshArgs {
+    /// TCP port to listen on. A **stable default** (not 0/OS-assigned) is
+    /// deliberate: the peer caches our last address to reconnect when mDNS is
+    /// slow or blocked, and a port that changed every restart made that cache
+    /// point at a dead port — so a bounced node was never redialled. Pass 0
+    /// explicitly for an ephemeral port.
+    #[arg(long)]
+    port: Option<u16>,
+    /// Capture this machine's mouse/keyboard and share it with peers.
+    #[arg(long, overrides_with = "no_input")]
+    send_input: bool,
+    /// Do not capture or share this machine's mouse/keyboard.
+    #[arg(long, overrides_with = "send_input")]
+    no_input: bool,
+    /// Where this machine stands, as a cell on a grid: `--at 1,0` is one
+    /// machine to the right of `0,0`.
+    ///
+    /// Cells, not pixels — nothing needs to know how wide anybody's screen
+    /// is. Four machines in a row are `0,0 1,0 2,0 3,0`, and each works out
+    /// for itself which of its edges faces which peer, and which peer is
+    /// nearest in that direction. Left unset every machine sits at `0,0`,
+    /// where nothing borders anything and Ctrl+Alt+G is the only handoff.
+    ///
+    /// `allow_hyphen_values` because half the grid is negative: a machine
+    /// to the left of the origin is `-1,0`, and clap would otherwise read
+    /// the leading minus as the start of another flag and refuse it.
+    #[arg(
+            long,
+            value_name = "X,Y",
+            allow_hyphen_values = true,
+            value_parser = parse_position
+        )]
+    at: Option<cursio_protocol::Position>,
+    /// Share audio with peers.
+    #[arg(long, overrides_with = "no_audio")]
+    audio: bool,
+    #[arg(long, overrides_with = "audio")]
+    no_audio: bool,
+    /// Render peer audio into the output device whose name contains this
+    /// (Windows only; ignored elsewhere, with a line in the log saying so).
+    #[arg(long)]
+    audio_render_device: Option<String>,
+    /// Share the clipboard with peers (text, images, and other formats).
+    #[arg(long, overrides_with = "no_clipboard")]
+    clipboard: bool,
+    #[arg(long, overrides_with = "clipboard")]
+    no_clipboard: bool,
+    /// Share disks both ways: this machine's volumes appear on the peer,
+    /// and the peer's appear here under `~/Cursio/<peer>/`.
+    ///
+    /// Unless `--files-share` or `[files.share]` narrows it, every disk is
+    /// offered read-write, so anything either machine can reach, the other
+    /// can change. Linux mounts with FUSE and Windows with WinFsp; macOS
+    /// serves its own volumes but cannot yet mount the peer's.
+    #[arg(long, overrides_with = "no_files")]
+    files: bool,
+    #[arg(long, overrides_with = "files")]
+    no_files: bool,
+    /// Offer only this root to peers instead of every disk; repeat for
+    /// several. A volume's root (`/`, `C:\`) offers that disk, anything
+    /// else offers that folder alone. Append `:ro` to refuse every change
+    /// the peer asks for there: `C:\:ro`, `/home/me/Projects:ro`. Replaces
+    /// the config's `[files.share]` for this run.
+    #[arg(long = "files-share", value_name = "PATH[:ro]")]
+    files_share: Vec<String>,
+    /// Share this machine's USB devices with the mesh, and use the devices
+    /// its peers are sharing. A device stays usable here while it is
+    /// shared.
+    ///
+    /// Needs the exporting half in place: `sudo modprobe usbip-host` on
+    /// Linux, `usbipd-win` installed on Windows. Without it the module is
+    /// not advertised and the log says why, rather than offering devices
+    /// that would fail on claim.
+    #[arg(long, overrides_with = "no_usb")]
+    usb: bool,
+    #[arg(long, overrides_with = "usb")]
+    no_usb: bool,
+    /// When this machine is the selected AirPlay host, offer the mirrored
+    /// screen to every peer instead of only peers using --airplay-window.
+    ///
+    /// The peer sees it as an ordinary transferred window: the H.264 from
+    /// AirPlay is forwarded untouched, so nothing is re-encoded on the way.
+    #[arg(long, overrides_with = "no_share_airplay")]
+    share_airplay: bool,
+    #[arg(long, overrides_with = "share_airplay")]
+    no_share_airplay: bool,
+    /// Offer every peer's windows and monitors to screen-sharing software
+    /// here (Discord, OBS, a browser call), without drawing them on this
+    /// desktop.
+    ///
+    /// Linux: they appear in the app's own "share your screen" dialog,
+    /// through Cursio's ScreenCast portal backend (install it once with
+    /// `cursio portal install`). Windows: an unseen window per peer,
+    /// "Cursio — <peer>", appears in the app's window list; choose what it
+    /// shows from its icon in the notification area.
+    #[arg(long, overrides_with = "no_remote_screen")]
+    remote_screen: bool,
+    #[arg(long, overrides_with = "remote_screen")]
+    no_remote_screen: bool,
+    /// Refuse peers' --remote-screen views of this machine.
+    #[arg(long, overrides_with = "screen_host")]
+    no_screen_host: bool,
+    /// Serve peers' --remote-screen views of this machine.
+    #[arg(long, overrides_with = "no_screen_host")]
+    screen_host: bool,
+    /// Pair with a machine that is not trusted yet: run this on **both**,
+    /// with the same password, for the next ten minutes.
+    ///
+    /// Not two commands. The mesh already listens and dials at once; the
+    /// only thing it will not do on its own is call a machine it has never
+    /// met, because joining has to stay a deliberate, password-gated act.
+    /// This opens that window at both ends and lets the two sort out which
+    /// one places the call, the same way two trusted nodes do.
+    #[arg(long, default_value_t = false)]
+    pair: bool,
+    /// Where to find the machine to pair with, when mDNS will not say.
+    ///
+    /// Only consulted while `--pair` is open. Naming an address also means
+    /// this side places the call rather than waiting to be called.
+    #[arg(long, value_name = "HOST:PORT", requires = "pair")]
+    pair_addr: Option<SocketAddr>,
+    /// What this machine asks of the mesh's AirPlay receiver. On by
+    /// default.
+    ///
+    /// `on` — the default — takes part: this machine will hold the receiver
+    /// if the mesh picks it, with no request about quality. A profile in
+    /// its place asks the *mesh* for that quality — `1440p:30fps`,
+    /// `1080p60`, `2k` — and the receiver moves to whichever machine can deliver it,
+    /// which need not be this one. `off` steps out entirely: nothing is
+    /// bound, and a peer asking this machine to host is refused, so the
+    /// mesh picks another. Every machine `off` means AirPlay does not run.
+    ///
+    /// Where the picture *appears* is `--airplay-window`, not this.
+    #[arg(long, value_name = "MODE")]
+    airplay: Option<String>,
+    /// Show the mirrored iPhone screen on this machine.
+    ///
+    /// Separate from `--airplay` because they answer different questions:
+    /// that one is about the picture the mesh receives, this one about
+    /// which desk it appears on. A machine can hold the receiver and show
+    /// nothing — passing the stream to peers with `--share-airplay` — or
+    /// show a picture another machine is receiving.
+    #[arg(long, overrides_with = "no_airplay_window")]
+    airplay_window: bool,
+    #[arg(long, overrides_with = "airplay_window")]
+    no_airplay_window: bool,
+    /// AirPlay control port.
+    #[arg(long)]
+    airplay_port: Option<u16>,
+    /// Pin AirPlay mDNS to the LAN interface with this address.
+    #[arg(long)]
+    airplay_interface: Option<IpAddr>,
+    /// Where a peer's modifier keys land on this machine (macOS only).
+    ///
+    /// `positional` — the default — puts every key where the hardware says
+    /// it is: Alt is Option, Ctrl is Control, the Windows key is Command.
+    /// `swapped` trades Control and the Windows key instead, so a PC
+    /// keyboard's Ctrl+C copies.
+    ///
+    /// Anything else can be written out as `from=to` pairs, e.g.
+    /// `ctrl=cmd,win=ctrl` (the swap spelled by hand) or
+    /// `rightalt=globe` (the right Alt changes input source, which is what
+    /// a modern MacBook's Globe key does and no PC keyboard has). Names:
+    /// ctrl, alt/option, win/cmd, shift, caps, globe/fn — each optionally
+    /// prefixed `left` or `right`.
+    ///
+    /// This also decides where the Ctrl+Alt+G hotkey lands on a Mac's own
+    /// keyboard; the log says which keys, at startup.
+    #[arg(long, value_name = "SPEC")]
+    mac_modifiers: Option<String>,
+}
+
+/// `Some(true)` for the on flag, `Some(false)` for the off one, `None` for
+/// neither. `overrides_with` already leaves at most one of them set.
+fn switch(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+impl MeshArgs {
+    fn overrides(&self) -> cursio_core::config::Overrides {
+        cursio_core::config::Overrides {
+            port: self.port,
+            position: self.at,
+            input: switch(self.send_input, self.no_input),
+            clipboard: switch(self.clipboard, self.no_clipboard),
+            audio: switch(self.audio, self.no_audio),
+            files: switch(self.files, self.no_files),
+            usb: switch(self.usb, self.no_usb),
+            remote_screen: switch(self.remote_screen, self.no_remote_screen),
+            screen_host: switch(self.screen_host, self.no_screen_host),
+            audio_render_device: self.audio_render_device.clone(),
+            airplay_mode: self.airplay.clone(),
+            airplay_window: switch(self.airplay_window, self.no_airplay_window),
+            airplay_share: switch(self.share_airplay, self.no_share_airplay),
+            airplay_port: self.airplay_port,
+            airplay_interface: self.airplay_interface,
+            mac_modifiers: self.mac_modifiers.clone(),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum PortalAction {
     /// Route ScreenCast through Cursio (per user; restart the portal after).
@@ -236,6 +308,26 @@ enum PortalAction {
     /// Forward every screen-cast request to GNOME; what D-Bus starts when no
     /// `cursio mesh` holds the backend's name.
     Relay,
+}
+
+/// What this machine offers over `--files`: the flag's roots when any were
+/// given, else the config's `[files.share]`, else every disk.
+///
+/// The flag replaces the table rather than adding to it, so a one-off
+/// `--files-share /tmp:ro` narrows this run instead of widening the file.
+fn share_policy(
+    flag: &[String],
+    table: Option<toml::Table>,
+) -> anyhow::Result<cursio_files::SharePolicy> {
+    if !flag.is_empty() {
+        return Ok(cursio_files::SharePolicy::from_args(flag)?);
+    }
+    match table {
+        Some(table) => table
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("config [files.share]: {e}")),
+        None => Ok(cursio_files::SharePolicy::everything()),
+    }
 }
 
 /// Parse `--at X,Y` into a grid cell.
@@ -476,7 +568,7 @@ async fn main() -> anyhow::Result<()> {
     // Declining is fine and expected: `ensure_elevated` logs what will and won't
     // work and we carry on. Only `Relaunched` ends this process — an elevated
     // copy is taking over, and two nodes must not share the port and portal.
-    if matches!(cli.command, Command::Mesh { .. })
+    if matches!(cli.command, Command::Mesh(_))
         && cursio_core::elevate::ensure_elevated() == cursio_core::elevate::Elevation::Relaunched
     {
         return Ok(());
@@ -489,28 +581,62 @@ async fn main() -> anyhow::Result<()> {
         "this node"
     );
 
+    let config_path = match cli.config {
+        Some(path) => path,
+        None => cursio_core::config::default_path()?,
+    };
+
     match cli.command {
-        Command::Mesh {
-            port,
-            send_input,
-            at,
-            audio,
-            audio_render_device,
-            clipboard,
-            files,
-            files_share,
-            usb,
-            share_airplay,
-            remote_screen,
-            no_screen_host,
-            pair,
-            pair_addr,
-            airplay,
-            airplay_window,
-            airplay_port,
-            airplay_interface,
-            mac_modifiers,
-        } => {
+        Command::Config => {
+            let config = cursio_core::config::Config::load(&config_path)?;
+            let origin = match config_path.exists() {
+                true => "read from",
+                false => "defaults; no file at",
+            };
+            println!("# {origin} {}", config_path.display());
+            print!("{}", config.to_toml()?);
+            Ok(())
+        }
+        Command::Mesh(args) => {
+            let overrides = args.overrides();
+            let config =
+                cursio_core::config::Config::load(&config_path)?.with_overrides(&overrides);
+            tracing::info!(
+                path = %config_path.display(),
+                pinned_by_flags = ?overrides.pinned(),
+                "config"
+            );
+            let MeshArgs {
+                pair,
+                pair_addr,
+                files_share,
+                ..
+            } = args;
+            let cursio_core::config::Config {
+                port,
+                position: at,
+                modules,
+                audio: audio_config,
+                airplay: airplay_config,
+                input: input_config,
+                files: files_config,
+            } = config;
+            let send_input = modules.input;
+            let audio = modules.audio;
+            let audio_render_device = audio_config.render_device;
+            let clipboard = modules.clipboard;
+            let files = modules.files;
+            let usb = modules.usb;
+            let remote_screen = modules.remote_screen;
+            let no_screen_host = !modules.screen_host;
+            let share_airplay = airplay_config.share;
+            let airplay = airplay_config.mode;
+            let airplay_window = airplay_config.window;
+            let airplay_port = airplay_config
+                .port
+                .unwrap_or(cursio_airplay::DEFAULT_CONTROL_PORT);
+            let airplay_interface = airplay_config.interface;
+            let mac_modifiers = input_config.mac_modifiers;
             apply_modifier_map(&mac_modifiers)?;
             let airplay =
                 AirPlayMode::parse(&airplay).map_err(|e| anyhow::anyhow!("--airplay: {e}"))?;
@@ -573,7 +699,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 clipboard,
                 files,
-                cursio_files::SharePolicy::from_args(&files_share)?,
+                share_policy(&files_share, files_config.share)?,
                 usb,
                 WindowOpts {
                     airplay: airplay_tap.clone().map(|tap| {
@@ -2431,28 +2557,66 @@ mod tests {
         assert_eq!(after.verbose, 2);
     }
 
+    fn mesh_args(argv: &[&str]) -> MeshArgs {
+        let Command::Mesh(args) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("expected mesh");
+        };
+        args
+    }
+
+    /// What `argv` runs with when there is no config file.
+    fn effective(argv: &[&str]) -> cursio_core::config::Config {
+        cursio_core::config::Config::default().with_overrides(&mesh_args(argv).overrides())
+    }
+
     #[test]
     /// Unplaced machines must border nothing: a default that implied adjacency
     /// would hand the cursor away on a shove the user never meant.
     fn an_unplaced_node_sits_at_the_origin() {
-        let Command::Mesh { at, .. } = Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
-        else {
-            panic!("expected mesh");
-        };
+        let at = effective(&["cursio", "mesh"]).position;
         assert_eq!(at, cursio_protocol::Position::new(0, 0));
         assert_eq!(at.edge_toward(at), None);
+    }
+
+    /// The daily command lines must keep meaning what they meant, and the
+    /// bare command must now mean the same thing.
+    #[test]
+    fn the_everyday_flags_and_no_flags_run_the_same_set() {
+        let typed = effective(&[
+            "cursio",
+            "mesh",
+            "--send-input",
+            "--clipboard",
+            "--audio",
+            "--files",
+        ]);
+        assert_eq!(typed, effective(&["cursio", "mesh"]));
+    }
+
+    #[test]
+    fn an_off_flag_overrides_the_default_and_the_last_of_a_pair_wins() {
+        assert!(!effective(&["cursio", "mesh", "--no-audio"]).modules.audio);
+        assert!(
+            effective(&["cursio", "mesh", "--no-audio", "--audio"])
+                .modules
+                .audio
+        );
+        assert!(
+            !effective(&["cursio", "mesh", "--audio", "--no-audio"])
+                .modules
+                .audio
+        );
+        assert!(mesh_args(&["cursio", "mesh"])
+            .overrides()
+            .pinned()
+            .is_empty());
     }
 
     #[test]
     /// The case named sides could not express: with three in a row, each knows
     /// which way its neighbour lies without anyone being a designated centre.
     fn a_row_of_machines_faces_the_right_way() {
-        let Command::Mesh { at, .. } = Cli::try_parse_from(["cursio", "mesh", "--at", "1,0"])
-            .unwrap()
-            .command
-        else {
-            panic!("expected mesh");
-        };
+        let at = effective(&["cursio", "mesh", "--at", "1,0"]).position;
         assert_eq!(at, cursio_protocol::Position::new(1, 0));
         assert_eq!(
             at.edge_toward(cursio_protocol::Position::new(2, 0)),
@@ -2499,10 +2663,7 @@ mod tests {
             } else {
                 cursio_protocol::Position::new(-1, 0)
             };
-            let Command::Mesh { at, .. } = Cli::try_parse_from(&argv).unwrap().command else {
-                panic!("expected mesh");
-            };
-            assert_eq!(at, expected, "{argv:?}");
+            assert_eq!(effective(&argv).position, expected, "{argv:?}");
         }
     }
 
@@ -2526,13 +2687,7 @@ mod tests {
             Cli::try_parse_from(["cursio", "join"]).is_err(),
             "join is gone; `mesh --pair` is both halves"
         );
-        let Command::Mesh { pair, .. } = Cli::try_parse_from(["cursio", "mesh", "--pair"])
-            .unwrap()
-            .command
-        else {
-            unreachable!();
-        };
-        assert!(pair);
+        assert!(mesh_args(&["cursio", "mesh", "--pair"]).pair);
     }
 
     /// An address is only meaningful while a window is open, so naming one
@@ -2543,20 +2698,15 @@ mod tests {
         assert!(
             Cli::try_parse_from(["cursio", "mesh", "--pair-addr", "192.168.1.5:46073"]).is_err()
         );
-        let Command::Mesh { pair_addr, .. } = Cli::try_parse_from([
+        let args = mesh_args(&[
             "cursio",
             "mesh",
             "--pair",
             "--pair-addr",
             "192.168.1.5:46073",
-        ])
-        .unwrap()
-        .command
-        else {
-            unreachable!();
-        };
+        ]);
         assert_eq!(
-            pair_addr,
+            args.pair_addr,
             Some("192.168.1.5:46073".parse::<SocketAddr>().unwrap())
         );
     }
@@ -2565,11 +2715,7 @@ mod tests {
     /// machine should not have to know a flag exists.
     #[test]
     fn airplay_receives_without_being_asked_to() {
-        let Command::Mesh { airplay, .. } =
-            Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
-        else {
-            unreachable!();
-        };
+        let airplay = effective(&["cursio", "mesh"]).airplay.mode;
         assert_eq!(
             AirPlayMode::parse(&airplay).unwrap(),
             AirPlayMode::On { wanted: None }
@@ -2578,28 +2724,12 @@ mod tests {
 
     #[test]
     fn remote_screen_views_are_opt_in_and_hosting_them_is_opt_out() {
-        let Command::Mesh {
-            remote_screen,
-            no_screen_host,
-            ..
-        } = Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
-        else {
-            unreachable!();
-        };
-        assert!(!remote_screen, "no view window may appear unasked");
-        assert!(!no_screen_host, "a peer's view is served by default");
+        let modules = effective(&["cursio", "mesh"]).modules;
+        assert!(!modules.remote_screen, "no view window may appear unasked");
+        assert!(modules.screen_host, "a peer's view is served by default");
 
-        let Command::Mesh {
-            remote_screen,
-            no_screen_host,
-            ..
-        } = Cli::try_parse_from(["cursio", "mesh", "--remote-screen", "--no-screen-host"])
-            .unwrap()
-            .command
-        else {
-            unreachable!();
-        };
-        assert!(remote_screen && no_screen_host);
+        let modules = effective(&["cursio", "mesh", "--remote-screen", "--no-screen-host"]).modules;
+        assert!(modules.remote_screen && !modules.screen_host);
     }
 
     #[test]

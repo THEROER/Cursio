@@ -140,6 +140,48 @@ direction. Left unset, every machine sits at `0,0`, where nothing borders
 anything and the hotkey is the only handoff. The reasoning behind grid
 coordinates rather than "left"/"right" is in `input-design.md`.
 
+## What a machine runs: `config.toml`
+
+The set of modules, the grid cell, AirPlay mode and the rest live in
+`config.toml` in the platform config dir (`~/.config/cursio/config.toml`,
+`%APPDATA%\cursio\cursio\config\config.toml`; `--config PATH` points elsewhere).
+`cursio mesh` with no flags runs what it says; `cursio config` prints the
+effective result. Precedence is **defaults < file < flags**: the defaults are
+the everyday set (input, clipboard, audio, files; AirPlay `on`; `0,0`), a file
+overrides only the fields it names, and each flag overrides the file for that
+run. Module flags come in pairs (`--audio`/`--no-audio`) because a lone switch
+that is false when absent would erase the file's answer.
+
+```toml
+position = { x = 1, y = 0 }
+
+[modules]
+input = true
+clipboard = true
+audio = true
+files = true
+usb = false
+remote_screen = false
+screen_host = true
+
+[airplay]
+mode = "on"          # off | on | a profile such as 1080p60
+window = false
+
+[input]
+mac_modifiers = "positional"
+
+[files.share]        # opaque here: whatever the files module's SharePolicy reads
+```
+
+Unknown keys are refused rather than ignored — a misspelt module is otherwise a
+module that silently stays off. A running node polls the file every two seconds
+and, when the *effective* config changes, restarts itself from the top (see
+"Control socket" below): capture, the listener and every link's negotiated
+modules are all settled at startup, and a fresh start is the one reload that is
+exactly as correct as the first. Fields a flag pinned stay pinned across that
+restart and are reported as such.
+
 ## What a machine *is doing*
 
 `ModuleAdvert` says a node has audio; `DeviceKind` says it is a laptop. Neither

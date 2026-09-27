@@ -78,6 +78,9 @@ cc = "1"
 
 # Storage / config
 directories = "5"
+# `config.toml`: a format people edit by hand, with comments, unlike the JSON
+# the trust store and identity are kept in.
+toml = "0.8"
 
 # Errors, logging, misc
 thiserror = "1.0"
