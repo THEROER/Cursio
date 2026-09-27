@@ -1916,6 +1916,7 @@ impl Drop for PwSink {
 
 /// The PipeWire main-loop body for playback. Owns the jitter buffer (a byte
 /// `VecDeque` fed from `feed_rx`) and fills each requested output buffer from it.
+#[allow(clippy::too_many_arguments)]
 fn run_playback_loop(
     node_name: String,
     // Publish the node as `Audio/Source` (a virtual microphone) rather than an

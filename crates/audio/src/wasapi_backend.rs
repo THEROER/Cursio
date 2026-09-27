@@ -395,8 +395,10 @@ fn from_wire_format(src: &[u8], dst_channels: u16, dst_rate: u32) -> Vec<u8> {
     }
 
     let samples: Vec<f32> = src
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     let src_frames = samples.len() / CHANNELS as usize;
     if src_frames == 0 {
@@ -462,8 +464,10 @@ fn to_wire_format(src: &[u8], src_channels: u16, src_rate: u32) -> Vec<u8> {
     }
 
     let samples: Vec<f32> = src
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     let src_frames = samples.len() / src_channels as usize;
     if src_frames == 0 {
@@ -669,7 +673,7 @@ unsafe fn init_device_client(mic: Option<&str>) -> Result<(IAudioClient, WAVEFOR
         None => enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
             .map_err(|e| format!("default endpoint: {e}"))?,
-        Some(needle) if needle.is_empty() => enumerator
+        Some("") => enumerator
             .GetDefaultAudioEndpoint(eCapture, eConsole)
             .map_err(|e| format!("default input endpoint: {e}"))?,
         Some(needle) => find_capture_device(&enumerator, needle)?,
@@ -746,7 +750,7 @@ unsafe fn init_process_loopback_client(pid: u32) -> Result<(IAudioClient, WAVEFO
 
     let client = activate_process_loopback(pid)?;
 
-    let mut fmt = WAVEFORMATEX {
+    let fmt = WAVEFORMATEX {
         wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
         nChannels: CHANNELS,
         nSamplesPerSec: SAMPLE_RATE,
@@ -770,7 +774,7 @@ unsafe fn init_process_loopback_client(pid: u32) -> Result<(IAudioClient, WAVEFO
             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
             0,
             0,
-            &mut fmt,
+            &fmt,
             None,
         )
         .map_err(|e| format!("process-loopback init: {e}"))?;
@@ -905,8 +909,6 @@ fn run_capture_loop(
         tracing::error!("wasapi capture loop error: {e}");
     }
 }
-
-/// Helper: stop the client and produce an error to break the capture loop with.
 
 // ---------------------------------------------------------------------------
 // Playback (render / sink) side
@@ -1588,8 +1590,10 @@ mod format_tests {
         v.iter().flat_map(|s| s.to_le_bytes()).collect()
     }
     fn parse(b: &[u8]) -> Vec<f32> {
-        b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     }
 

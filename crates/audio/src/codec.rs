@@ -203,8 +203,10 @@ impl OpusEncoder {
     /// rather than padded, since padding would inject clicks.
     pub fn encode(&mut self, pcm: &[u8]) -> Result<Vec<Vec<u8>>, AudioError> {
         self.pending.extend(
-            pcm.chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            pcm.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b)),
         );
 
         let mut packets = Vec::new();
@@ -292,8 +294,10 @@ mod tests {
         }
 
         let out: Vec<f32> = decoded
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         assert_eq!(out.len(), samples.len(), "sample count must be preserved");
 

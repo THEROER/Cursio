@@ -33,8 +33,8 @@ async fn main() {
             c = src.chunks().recv() => match c {
                 Some(chunk) => {
                     // f32 stereo samples
-                    for s in chunk.data.chunks_exact(4) {
-                        let v = f32::from_le_bytes([s[0], s[1], s[2], s[3]]).abs();
+                    for s in chunk.data.as_chunks::<4>().0 {
+                        let v = f32::from_le_bytes(*s).abs();
                         if v > peak { peak = v; }
                         if v > 1.0 { over_full_scale += 1; }
                         total += 1;

@@ -257,7 +257,7 @@ impl Drop for VadDevice {
 
 /// The driver keys endpoints by a 32-bit id; derive it from the stream id.
 fn endpoint_id(id: AudioStreamId) -> u32 {
-    id as u32
+    id
 }
 
 fn wire_pcm_format() -> PcmFormat {
