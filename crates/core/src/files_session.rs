@@ -791,6 +791,73 @@ impl Pending {
     }
 }
 
+/// How long a request of ours may go unanswered before it is given up on here.
+///
+/// The mount's own caller has stopped waiting by then — no operation waits
+/// longer than `BULK_OP_TIMEOUT` — so the entry serves nobody. It still counts
+/// against the window, though, and that is what made an unanswered request
+/// expensive: the window is sized from the number of entries, so a handful the
+/// peer never answered (a job that died on its side, a reply lost to a
+/// reconnect of the transport under us) closed it for good, and every later
+/// operation timed out without ever being sent. Seen as a mount that stopped
+/// answering until the link was torn down and rebuilt.
+const PENDING_EXPIRY: Duration = cursio_files::bridge::BULK_OP_TIMEOUT;
+
+/// Requests we have sent and not yet had answered, with when each went out.
+#[derive(Default)]
+struct PendingMap(HashMap<FileReqId, (Pending, Instant)>);
+
+impl PendingMap {
+    fn insert(&mut self, req: FileReqId, pending: Pending) {
+        self.0.insert(req, (pending, Instant::now()));
+    }
+
+    fn remove(&mut self, req: &FileReqId) -> Option<Pending> {
+        self.0.remove(req).map(|(pending, _)| pending)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Every request still waiting for the peer's volume list.
+    fn waiting_for_volumes(&self) -> Vec<FileReqId> {
+        self.0
+            .iter()
+            .filter(|(_, (p, _))| matches!(p, Pending::Volumes(_)))
+            .map(|(&req, _)| req)
+            .collect()
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = Pending> + '_ {
+        self.0.drain().map(|(_, (pending, _))| pending)
+    }
+
+    /// Fail every request older than `limit`, returning how many there were.
+    ///
+    /// Failed rather than dropped, so a caller still waiting — there should be
+    /// none, but a clock can jump — hears why instead of waiting out its own
+    /// deadline.
+    fn expire(&mut self, now: Instant, limit: Duration) -> usize {
+        let stale: Vec<FileReqId> = self
+            .0
+            .iter()
+            .filter(|(_, (_, since))| now.saturating_duration_since(*since) >= limit)
+            .map(|(&req, _)| req)
+            .collect();
+        for req in &stale {
+            if let Some(pending) = self.remove(req) {
+                pending.fail(FileError::Io("the peer never answered".into()));
+            }
+        }
+        stale.len()
+    }
+}
+
 /// Serves our volumes to the peer and mounts theirs here.
 pub struct FilesEngine {
     peer_name: String,
@@ -834,7 +901,7 @@ pub struct FilesEngine {
     /// Sizes the in-flight window from what the link is measured to be doing.
     pace: Pacer,
     /// Requests we have sent and not yet had answered.
-    pending: HashMap<FileReqId, Pending>,
+    pending: PendingMap,
     next_req: FileReqId,
     /// Requests the peer asked of us, counted by kind.
     ///
@@ -941,7 +1008,7 @@ impl FilesEngine {
             deferred_closes: Vec::new(),
             workers: Workers::new("cursio-files"),
             pace: Pacer::new(),
-            pending: HashMap::new(),
+            pending: PendingMap::default(),
             next_req: 1,
             health: Health::default(),
             served: HashMap::new(),
@@ -1898,13 +1965,7 @@ impl FilesEngine {
                 // The peer announces its volumes unprompted at start, and also
                 // answers our request with the same message — so satisfy every
                 // waiting request rather than assuming there is exactly one.
-                let waiting: Vec<FileReqId> = self
-                    .pending
-                    .iter()
-                    .filter(|(_, p)| matches!(p, Pending::Volumes(_)))
-                    .map(|(&r, _)| r)
-                    .collect();
-                for req in waiting {
+                for req in self.pending.waiting_for_volumes() {
                     if let Some(Pending::Volumes(tx)) = self.pending.remove(&req) {
                         let _ = tx.send(Ok(volumes.clone()));
                     }
@@ -2072,6 +2133,17 @@ impl SessionModule for FilesEngine {
         // `mount_retry_at` keeps this to one attempt every few seconds.
         self.sync_peer_mounts();
 
+        // Before the window is sized from the entries: see [`PENDING_EXPIRY`].
+        let expired = self.pending.expire(now, PENDING_EXPIRY);
+        if expired > 0 {
+            self.health.failed += expired as u64;
+            tracing::warn!(
+                peer = %self.peer_name,
+                expired,
+                "requests the peer never answered were given up on"
+            );
+        }
+
         // Before draining, so a close whose writes finished compressing since
         // the last pump goes out behind them in this same pass.
         self.flush_deferred_closes();
@@ -2138,7 +2210,7 @@ impl SessionModule for FilesEngine {
         // Fail everything still in flight before the mount goes away, or its
         // FUSE threads sit out the full timeout for answers that will never
         // come — and the unmount blocks behind them.
-        for (_, pending) in self.pending.drain() {
+        for pending in self.pending.drain() {
             pending.fail(FileError::Io("session ended".into()));
         }
         // Release the mount's own threads before taking its mounts away.
@@ -2317,7 +2389,7 @@ mod tests {
             deferred_closes: Vec::new(),
             workers: Workers::with_threads("test-files", 2),
             pace: Pacer::new(),
-            pending: HashMap::new(),
+            pending: PendingMap::default(),
             next_req: 1,
             health: Health::default(),
             served: HashMap::new(),
@@ -2383,6 +2455,53 @@ mod tests {
             .await
             .expect("pumps");
         assert_eq!(tx.sent.len(), MIN_IN_FLIGHT, "the window is still full");
+    }
+
+    /// Requests the peer never answers must not keep the window shut.
+    ///
+    /// The window is sized from the outstanding entries, so entries that are
+    /// never cleared close it for good: every later operation times out in
+    /// the mount without having been sent.
+    #[tokio::test]
+    async fn requests_the_peer_never_answers_stop_holding_the_window() {
+        let (mut engine, ops) = engine();
+        for _ in 0..10 {
+            ops.send(a_request()).expect("queued");
+        }
+        let mut tx = RecordingTx::default();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        engine
+            .pump_requests(&mut tx, deadline)
+            .await
+            .expect("pumps");
+        assert_eq!(tx.sent.len(), MIN_IN_FLIGHT, "the window is full");
+
+        let later = Instant::now() + PENDING_EXPIRY + Duration::from_millis(1);
+        assert_eq!(engine.pending.expire(later, PENDING_EXPIRY), MIN_IN_FLIGHT);
+        assert!(engine.pending.is_empty());
+
+        engine
+            .pump_requests(&mut tx, deadline)
+            .await
+            .expect("pumps");
+        assert_eq!(
+            tx.sent.len(),
+            MIN_IN_FLIGHT * 2,
+            "with the dead entries gone the next requests go out"
+        );
+    }
+
+    /// An expired request is failed back to whoever asked, not dropped.
+    #[test]
+    fn an_expired_request_is_failed_back_to_its_caller() {
+        let mut pending = PendingMap::default();
+        let (reply, answer) = std::sync::mpsc::channel();
+        pending.insert(1, Pending::Stat(reply));
+
+        assert_eq!(pending.expire(Instant::now(), PENDING_EXPIRY), 0, "not yet");
+        let later = Instant::now() + PENDING_EXPIRY;
+        assert_eq!(pending.expire(later, PENDING_EXPIRY), 1);
+        assert!(matches!(answer.try_recv(), Ok(Err(FileError::Io(_)))));
     }
 
     /// The pump must stop when its slice is up, whatever is left waiting.
