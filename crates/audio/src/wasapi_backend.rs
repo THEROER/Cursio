@@ -25,8 +25,8 @@ use windows::Win32::Media::Audio::{
     IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
     IAudioRenderClient, IAudioSessionControl, IAudioSessionControl2, IAudioSessionManager2,
-    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, StructuredStorage::PropVariantToStringAlloc,
@@ -1323,6 +1323,50 @@ fn session_guid(display_name: &str) -> windows::core::GUID {
     windows::core::GUID::from_u128(hash)
 }
 
+/// Peak amplitude of the keep-alive signal, as a fraction of full scale.
+///
+/// **-96 dBFS**, which is one step of 16-bit quantisation: at any sane playback
+/// level this is below the noise floor of the equipment reproducing it, and it
+/// is quieter than the dither an idle endpoint already carries. It is not zero,
+/// because zero is what Windows watches for when deciding a session is idle.
+const KEEPALIVE_PEAK: f32 = 1.0 / 32768.0;
+
+/// Fill a device-format buffer with a signal too quiet to hear.
+///
+/// Alternating sign rather than a constant: a fixed offset is a DC bias, which
+/// some endpoints and every AC-coupled output stage handle badly, and which a
+/// downstream mixer can accumulate across streams. Flipping each frame keeps the
+/// mean at zero.
+///
+/// `phase` persists across calls so the alternation continues across buffers
+/// instead of restarting — a restart would put two like-signed frames together
+/// at every buffer boundary, which is a (still inaudible) impulse train.
+///
+/// The sign flips per *frame*, not per sample: flipping per sample on a stereo
+/// endpoint gives every left sample one sign and every right sample the other,
+/// which is exactly the DC bias this exists to avoid, once per channel.
+fn fill_inaudible(dst: &mut [u8], mix: &WAVEFORMATEX, phase: &mut bool) {
+    // Only 32-bit samples are filled, since the render path treats the mix
+    // format as f32 throughout (see `from_wire_format`). Anything else gets
+    // zeros: correct, merely without the keep-alive.
+    let frame_bytes = mix.nBlockAlign as usize;
+    if mix.wBitsPerSample != 32 || frame_bytes == 0 {
+        dst.fill(0);
+        return;
+    }
+    for frame in dst.chunks_mut(frame_bytes) {
+        let sample = if *phase {
+            KEEPALIVE_PEAK
+        } else {
+            -KEEPALIVE_PEAK
+        };
+        *phase = !*phase;
+        for slot in frame.as_chunks_mut::<4>().0 {
+            *slot = sample.to_le_bytes();
+        }
+    }
+}
+
 fn run_render_loop(
     device_name: Option<String>,
     display_name: String,
@@ -1401,6 +1445,8 @@ fn run_render_loop(
 
         let mut jitter: VecDeque<u8> = VecDeque::new();
         let mut started = false;
+        // Sign of the next keep-alive frame; see `fill_inaudible`.
+        let mut keepalive_phase = false;
 
         loop {
             if stop_rx.try_recv().is_ok() {
@@ -1463,16 +1509,30 @@ fn run_render_loop(
                         for (i, b) in jitter.drain(..take).enumerate() {
                             dst[i] = b;
                         }
-                        // Zero the remainder (underrun / not started).
-                        for b in dst.iter_mut().skip(take) {
-                            *b = 0;
-                        }
-                        let flags = if take == 0 {
-                            AUDCLNT_BUFFERFLAGS_SILENT.0 as u32
-                        } else {
-                            0
-                        };
-                        let _ = render.ReleaseBuffer(free_frames, flags);
+                        // Fill the remainder (underrun / not started) with a
+                        // signal far below hearing rather than with zeros.
+                        //
+                        // This is what keeps the application's row in the Windows
+                        // volume mixer. Windows hides a session that is not
+                        // playing, so a remote application that happens to be
+                        // quiet loses the very control the user wants in order to
+                        // set its volume *before* it makes a sound — and the set
+                        // of visible rows looked arbitrary, since it depended on
+                        // which applications had made a noise recently.
+                        //
+                        // The alternative — having the peer send real silence
+                        // over the link — fills the shared channel with audio
+                        // nobody hears, felt as mouse lag because input rides the
+                        // same link; the sender drops silent chunks for exactly
+                        // that reason. Generating it here costs nothing on the
+                        // wire.
+                        //
+                        // The flag matters as much as the samples: releasing the
+                        // buffer with AUDCLNT_BUFFERFLAGS_SILENT tells Windows the
+                        // content is silence, and it treats the session as idle no
+                        // matter what the bytes hold. So it is never set here.
+                        fill_inaudible(&mut dst[take..], &mix, &mut keepalive_phase);
+                        let _ = render.ReleaseBuffer(free_frames, 0);
                         if started && jitter.is_empty() {
                             started = false; // re-arm prefill after a drain
                         }
@@ -1569,6 +1629,42 @@ mod format_tests {
             spotify,
             session_guid("Cursio(Nocturne): Firefox"),
             "two applications must not share a row"
+        );
+    }
+
+    /// The keep-alive has no DC offset on any channel, and stays continuous
+    /// across buffers.
+    #[test]
+    fn keepalive_alternates_per_frame_so_no_channel_carries_dc() {
+        let mix = WAVEFORMATEX {
+            wFormatTag: 3,
+            nChannels: 2,
+            nSamplesPerSec: SAMPLE_RATE,
+            wBitsPerSample: 32,
+            nBlockAlign: 8,
+            nAvgBytesPerSec: SAMPLE_RATE * 8,
+            cbSize: 0,
+        };
+        let mut phase = false;
+        let mut first = vec![0u8; 8 * 3];
+        let mut second = vec![0u8; 8 * 3];
+        fill_inaudible(&mut first, &mix, &mut phase);
+        fill_inaudible(&mut second, &mix, &mut phase);
+
+        let bytes: Vec<u8> = first.iter().chain(&second).copied().collect();
+        let samples: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let left: Vec<f32> = samples.iter().step_by(2).copied().collect();
+        let right: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
+
+        assert_eq!(left, right, "both channels of a frame must carry one value");
+        assert!(
+            left.windows(2).all(|w| w[0] == -w[1] && w[0] != 0.0),
+            "each channel must alternate sign frame to frame, across the buffer boundary too: {left:?}"
         );
     }
 
