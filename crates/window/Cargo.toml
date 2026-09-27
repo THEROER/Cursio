@@ -91,6 +91,9 @@ windows = { version = "0.61", features = [
     "Win32_System_WinRT_Graphics_Capture",
     # Finding the window, hiding it (layered alpha), and PostMessage replay.
     "Win32_UI_WindowsAndMessaging",
+    # The remote-screen view's notification-area icon, which carries its
+    # source menu now that the view itself is never on screen.
+    "Win32_UI_Shell",
     # Per-monitor DPI awareness for the surrogate. Without it the client area is
     # reported in virtual pixels and DWM rescales the finished window, so the
     # host's frames reach the screen resampled twice.

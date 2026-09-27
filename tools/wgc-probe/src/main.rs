@@ -39,8 +39,15 @@ mod selftest;
 
 #[cfg(target_os = "windows")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().nth(1).as_deref() == Some("--selftest") {
-        return selftest::run();
+    match std::env::args().nth(1).as_deref() {
+        Some("--selftest") => return selftest::run(),
+        Some("--inspect") => {
+            let needle = std::env::args().nth(2).unwrap_or_default();
+            let (hwnd, title) = windows_probe::find_window(&needle)
+                .ok_or_else(|| format!("no visible window matching {needle:?}"))?;
+            return selftest::inspect(hwnd, &title);
+        }
+        _ => {}
     }
     windows_probe::run()
 }
@@ -96,7 +103,7 @@ mod windows_probe {
         TRUE
     }
 
-    fn find_window(needle: &str) -> Option<(HWND, String)> {
+    pub(crate) fn find_window(needle: &str) -> Option<(HWND, String)> {
         let mut search = Search {
             needle: needle.to_lowercase(),
             found: None,

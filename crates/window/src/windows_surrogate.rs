@@ -6,12 +6,11 @@
 //! from the user comes back out as [`WindowInput`] in the **host's** pixel
 //! space.
 //!
-//! The same window serves as a **remote-screen view**: view-only, letterboxed
-//! instead of resized to each source, and carrying a selector — a
-//! `TrackPopupMenu` context menu and the arrow keys — in place of input
-//! forwarding. It is an ordinary visible window, never the layered `alpha=0`
-//! trick a transfer's host uses, because a screen-sharing application has to
-//! be able to capture it.
+//! The same window serves as a **remote-screen view**: view-only, and
+//! **unseen** — layered at alpha 0, never activated, parked past the edge of
+//! every monitor — yet still listed and recorded by Discord and OBS, which is
+//! the only reason it exists. Its selector is a notification-area icon's menu.
+//! Why exactly that combination of states is in [`unseen`].
 //!
 //! ## Why raw Win32 rather than a toolkit
 //!
@@ -47,6 +46,7 @@ use crate::{
     presentation_ack::PresentationAcks, SourcePick, Surrogate, WindowError, WindowRenderer,
 };
 
+mod unseen;
 mod win32;
 
 /// What the session hands the window thread.
@@ -208,9 +208,8 @@ impl WindowRenderer for Win32WindowRenderer {
         open_surrogate(meta, false)
     }
 
-    /// A plain, visible, captureable window — not the layered `alpha=0` trick a
-    /// transfer's *host* uses, which a screen-sharing application would record
-    /// as nothing.
+    /// An unseen window that capture apps still list and record; see
+    /// [`unseen`] for the measurements behind "still".
     fn open_screen_view(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
         open_surrogate(meta, true)
     }

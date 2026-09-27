@@ -360,6 +360,36 @@ fn states() -> Vec<State> {
 static TARGET: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 
+/// `--inspect <title>`: the same questions about someone else's window,
+/// left exactly as it is — for checking Cursio's own remote-screen view.
+pub fn inspect(hwnd: HWND, title: &str) -> Result<(), Box<dyn std::error::Error>> {
+    unsafe {
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut rc);
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        println!(
+            "{title:?} at ({}, {}) {}x{}",
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top
+        );
+        println!(
+            "layered={} noactivate={} toolwindow={} cloaked={}",
+            ex & WS_EX_LAYERED.0 != 0,
+            ex & WS_EX_NOACTIVATE.0 != 0,
+            ex & WS_EX_TOOLWINDOW.0 != 0,
+            cloaked(hwnd)
+        );
+        println!("chromium lists it: {}", chromium_lists(hwnd));
+        println!("obs lists it: {}", obs_lists(hwnd));
+        let (frames, px) = wgc_capture(hwnd, Duration::from_secs(2))?;
+        println!("wgc: {frames} frames in 2 s, centre pixel {px:#010x}");
+        println!("printwindow centre: {:#08x}", print_window_centre(hwnd));
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         let instance = GetModuleHandleW(None)?;

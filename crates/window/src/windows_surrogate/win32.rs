@@ -29,16 +29,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, MSG,
-    PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE,
-    WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, SW_SHOWNOACTIVATE,
+    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::framebuffer::Framebuffer;
 use crate::video_decoder_win::VideoDecoder;
 
-use super::SurrogateCommand;
+use super::{unseen, SurrogateCommand};
 
 /// State the window procedure needs, reached through `GWLP_USERDATA`.
 ///
@@ -63,13 +64,15 @@ struct ViewState {
     sources: RefCell<Vec<ScreenSource>>,
     /// Text drawn while nothing streams; cleared by the first frame.
     hint: RefCell<Option<String>>,
+    /// The icon's tooltip: the view's own title.
+    tip: String,
+    /// Explorer's restart broadcast, after which the icon must be re-added.
+    taskbar_created: u32,
 }
 
-/// What an idle view says, so the one thing on screen is how to fill it.
-///
-/// Drawn only while nothing streams — it is inside the window a
-/// screen-sharing application captures, and must not sit over a picture.
-const VIEW_HINT: &str = "Right-click to choose what to show  ·  ← → to switch";
+/// What an idle view shows — seen only in a capture app's preview, which is
+/// exactly where someone wonders why the picture is empty.
+const VIEW_HINT: &str = "Choose what to show from the Cursio icon in the notification area";
 
 /// The menu command for "show nothing"; sources use their index plus one.
 const STOP_COMMAND: usize = 0xFFFF;
@@ -327,28 +330,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
     let state = &*ptr;
 
-    // A view is view-only: the shared cursor already drives the peer, and a
-    // monitor has no window to replay into. Its mouse and keys drive the
-    // selector instead, and nothing reaches the host.
+    // A view is view-only and unseen: nothing can point at it, and its
+    // selector is the notification-area icon's menu.
     if let Some(view) = state.view.as_ref() {
         match msg {
-            WM_RBUTTONUP => {
-                show_source_menu(hwnd, view);
-                return LRESULT(0);
-            }
-            WM_KEYDOWN => {
-                let pick = match wparam.0 as u16 {
-                    0x27 | 0x22 => Some(SourcePick::Next),     // right, page down
-                    0x25 | 0x21 => Some(SourcePick::Previous), // left, page up
-                    _ => None,
-                };
-                if let Some(pick) = pick {
-                    let _ = view.picks.send(pick);
+            unseen::TRAY_MESSAGE => {
+                // The low word of lParam is the mouse message on the icon.
+                let click = (lparam.0 & 0xFFFF) as u32;
+                if click == WM_RBUTTONUP || click == WM_LBUTTONUP {
+                    show_source_menu(hwnd, view);
                 }
                 return LRESULT(0);
             }
-            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_MBUTTONDOWN
-            | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP | WM_MOUSEWHEEL | WM_KEYUP => {
+            WM_DISPLAYCHANGE => {
+                unseen::move_off_desktop(hwnd);
+                return LRESULT(0);
+            }
+            m if m == view.taskbar_created => {
+                unseen::add_icon(hwnd, &view.tip);
+                return LRESULT(0);
+            }
+            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
+            | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP | WM_MOUSEWHEEL
+            | WM_KEYDOWN | WM_KEYUP => {
                 return LRESULT(0);
             }
             _ => {}
@@ -370,9 +374,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // A view letterboxes rather than resizing itself to each source,
             // so the bars are painted here — nothing else covers them.
             let (dx, dy, dw, dh) = if state.view.is_some() {
+                let (x, y, w, h) = crate::framebuffer::letterbox(fb.width, fb.height, cw, ch);
+                // Only the bars, never the whole client first: DWM composes a
+                // redirected window whenever it likes, and a capture taken
+                // between a full black fill and the blit over it records a
+                // black frame — measured on the peer as every other capture
+                // of the view coming back black, which is flicker in a share.
                 let black = HBRUSH(GetStockObject(BLACK_BRUSH).0);
-                FillRect(hdc, &client, black);
-                crate::framebuffer::letterbox(fb.width, fb.height, cw, ch)
+                let (x, y, w, h) = (x as i32, y as i32, w as i32, h as i32);
+                for bar in [
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: client.right,
+                        bottom: y,
+                    },
+                    RECT {
+                        left: 0,
+                        top: y + h,
+                        right: client.right,
+                        bottom: client.bottom,
+                    },
+                    RECT {
+                        left: 0,
+                        top: y,
+                        right: x,
+                        bottom: y + h,
+                    },
+                    RECT {
+                        left: x + w,
+                        top: y,
+                        right: client.right,
+                        bottom: y + h,
+                    },
+                ] {
+                    if bar.right > bar.left && bar.bottom > bar.top {
+                        FillRect(hdc, &bar, black);
+                    }
+                }
+                (x as u32, y as u32, w as u32, h as u32)
             } else {
                 (0, 0, cw, ch)
             };
@@ -599,6 +639,8 @@ pub(crate) fn run(
                 picks,
                 sources: RefCell::new(Vec::new()),
                 hint: RefCell::new(Some(VIEW_HINT.to_string())),
+                tip: meta.title.clone(),
+                taskbar_created: unseen::taskbar_created(),
             }),
         });
         let is_view = state.view.is_some();
@@ -610,7 +652,13 @@ pub(crate) fn run(
         // above.
         fit_client(hwnd, meta.width, meta.height);
 
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        if is_view {
+            unseen::hide(hwnd);
+            unseen::add_icon(hwnd, &meta.title);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
         let _ = ready_tx.send(Ok(()));
 
         let mut decoder: Option<VideoDecoder> = None;
@@ -666,11 +714,10 @@ pub(crate) fn run(
                                         // The encoder changed resolution
                                         // mid-stream; follow it, or every frame
                                         // from here is scaled to the old size.
-                                        // A view letterboxes instead: its
-                                        // window is what is being captured.
-                                        if !is_view {
-                                            fit_client(hwnd, pic.width, pic.height);
-                                        }
+                                        // A view follows too: nobody sees
+                                        // it, and at the source's own size
+                                        // the capture app records it 1:1.
+                                        fit_client(hwnd, pic.width, pic.height);
                                     }
                                     let full = Rect {
                                         x: 0,
@@ -696,17 +743,13 @@ pub(crate) fn run(
                         state.fb.borrow_mut().resize(width, height);
                         // The host's window was resized, so this one follows it
                         // and keeps showing the pixels at their own size.
-                        if !is_view {
-                            fit_client(hwnd, width, height);
-                        }
+                        fit_client(hwnd, width, height);
                         painted = true;
                     }
                     Ok(SurrogateCommand::Grow { width, height }) => {
                         let state = &*state_ptr;
                         state.fb.borrow_mut().grow_to(width, height);
-                        if !is_view {
-                            fit_client(hwnd, width, height);
-                        }
+                        fit_client(hwnd, width, height);
                         painted = true;
                     }
                     Ok(SurrogateCommand::Restart { title }) => {
@@ -762,6 +805,9 @@ pub(crate) fn run(
         }
 
         closed.store(true, Ordering::Relaxed);
+        if is_view {
+            unseen::remove_icon(hwnd);
+        }
         let _ = DestroyWindow(hwnd);
         // Reclaim the state only after the window is gone, so no late message
         // can reach a freed pointer.
