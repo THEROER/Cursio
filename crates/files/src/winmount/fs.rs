@@ -1312,36 +1312,23 @@ pub fn mount(
         // filesystem whose every request crosses a Wi-Fi link to another
         // machine. sshfs-win and rclone mount this way for the same reason.
         .prefix(prefix.as_str())
-        // Let the kernel cache file data, but not directory listings.
+        // No kernel cache: `FileInfoTimeout` is left at zero, which keeps the
+        // volume off the NT cache manager.
         //
-        // This is WinFsp's own recommendation for a network filesystem, and
-        // the three values go together. `FileInfoTimeout` of -1 is a switch as
-        // much as a timeout: it puts the volume on the NT cache manager, which
-        // brings read-ahead and lazy writes with it, so Windows coalesces an
-        // application's writes instead of handing us each one to carry across
-        // the link and wait out. Without it a download arrived as a strict
-        // sequence of 220 KiB writes from a single thread, each costing a full
-        // round trip — measured here at 56 writes a second, which is exactly
-        // one round trip's worth, while the link sat idle several times over.
+        // `u32::MAX` would put it on, and it was tried: the cache manager's lazy
+        // writer coalesces an application's writes, which is what it is for.
+        // But it accepts them at memory speed while this link drains at ~11
+        // MB/s, so a download piled gigabytes of dirty pages into RAM, and
+        // every `CloseHandle` — including the ones a dying process makes on
+        // its way out — then had to flush its share through the link
+        // synchronously. With the link stalled, Steam's download stopped at 0
+        // B/s and the process could not be killed short of a reboot. Nothing a
+        // user-mode filesystem does can interrupt that wait.
         //
-        // Directory listings and volume info are the part that must not be
-        // cached indefinitely: the person at the other machine can add or
-        // remove a file at any moment and nothing announces it. A second
-        // matches what `metacache` already allows itself, so both halves of the
-        // crate go stale on the same schedule.
-        .file_info_timeout(u32::MAX)
-        .dir_info_timeout(1000)
-        .volume_info_timeout(1000)
-        // Close the peer's handle when the application closes the file, not
-        // whenever the kernel finishes with its cache.
-        //
-        // The cache manager keeps a file mapped after the last handle to it is
-        // gone, which is what makes a re-open free — and on this volume would
-        // mean the peer holds a handle open for a file nobody is using, across
-        // a link that may drop in between. Flushing and purging at cleanup ties
-        // the two lifetimes back together, at the cost of the one thing the
-        // cache would have bought after the file was closed anyway.
-        .flush_and_purge_on_cleanup(true)
+        // The round-trip-per-write problem the cache was meant to solve is
+        // solved without it, and without the unbounded buffer: `writeback`
+        // keeps a bounded window of writes in flight and still reports every
+        // failure to the application that caused it.
         .case_sensitive_search(false)
         .case_preserved_names(true)
         .unicode_on_disk(true)
