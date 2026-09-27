@@ -69,8 +69,15 @@ uuid.workspace = true
 clap.workspace = true
 hostname.workspace = true
 directories.workspace = true
-rpassword = "7"
 zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+# Turning off terminal echo for the pairing prompt ourselves: rpassword 7.5 also
+# clears ISIG, and on Ctrl-C it raises SIGINT before restoring the terminal.
+libc.workspace = true
+
+[target.'cfg(not(unix))'.dependencies]
+rpassword = "7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Self-elevation at startup: without admin rights, Windows' UIPI silently drops

@@ -90,3 +90,4 @@ tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive"] }
 hostname = "0.4"
+libc = "0.2"

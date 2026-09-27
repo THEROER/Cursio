@@ -1157,6 +1157,7 @@ dependencies = [
  "cursio-window",
  "directories",
  "hostname",
+ "libc",
  "rpassword",
  "serde",
  "serde_json",

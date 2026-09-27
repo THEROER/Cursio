@@ -968,11 +968,78 @@ fn take_lock(path: &std::path::Path) -> Option<std::fs::File> {
 }
 
 fn read_pairing_password() -> anyhow::Result<Zeroizing<String>> {
-    let password = Zeroizing::new(rpassword::prompt_password("Pairing password: ")?);
+    let password = prompt_password("Pairing password: ")?;
     if password.is_empty() {
         anyhow::bail!("pairing password cannot be empty");
     }
     Ok(password)
+}
+
+/// Read a line from the terminal with echo off and nothing else changed.
+///
+/// Not rpassword: since 7.5 it puts the terminal in raw mode, ISIG included, and
+/// answers Ctrl-C by raising SIGINT at itself before its guard restores the
+/// terminal. The process dies with the terminal still raw, `cargo xtask run`
+/// exits normally on seeing that, and the shell adopts the raw settings as its
+/// own — so Ctrl-C stops interrupting anything in that terminal until `stty
+/// sane`. With only ECHO cleared, Ctrl-C is the terminal's own SIGINT to the
+/// whole foreground group, every parent dies by signal too, and the shell puts
+/// back the settings it saved.
+#[cfg(unix)]
+fn prompt_password(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
+    use std::io::{BufRead, Write};
+    use std::os::fd::AsRawFd;
+
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| anyhow::anyhow!("--pair needs a terminal to read the password from: {e}"))?;
+    let fd = tty.as_raw_fd();
+
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `fd` is an open terminal for the life of `tty`, and tcgetattr
+    // fully initialises the struct when it returns 0.
+    if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+        anyhow::bail!(
+            "cannot read the terminal settings: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let original = unsafe { original.assume_init() };
+    let mut silent = original;
+    silent.c_lflag &= !libc::ECHO;
+    silent.c_lflag |= libc::ECHONL;
+
+    struct Restore(i32, libc::termios);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: the fd outlives this guard (declared after `tty`).
+            unsafe { libc::tcsetattr(self.0, libc::TCSAFLUSH, &self.1) };
+        }
+    }
+
+    (&tty).write_all(prompt.as_bytes())?;
+    (&tty).flush()?;
+    // SAFETY: as above; `silent` is a copy of settings the kernel just gave us.
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &silent) } != 0 {
+        anyhow::bail!(
+            "cannot turn off terminal echo: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let _restore = Restore(fd, original);
+
+    let mut line = Zeroizing::new(String::new());
+    std::io::BufReader::new(&tty).read_line(&mut line)?;
+    let trimmed = line.trim_end_matches(['\n', '\r']).len();
+    line.truncate(trimmed);
+    Ok(line)
+}
+
+#[cfg(not(unix))]
+fn prompt_password(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
+    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
 
 /// Audio-share options for a session. When `audio` is set, audio runs as a
