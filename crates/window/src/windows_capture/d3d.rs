@@ -26,6 +26,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 
@@ -71,7 +72,14 @@ pub struct CapturedFrame {
     pub height: u32,
 }
 
-/// A running capture of one window.
+/// What a capture item is made from.
+#[derive(Clone, Copy)]
+pub enum CaptureTarget {
+    Window(HWND),
+    Monitor(HMONITOR),
+}
+
+/// A running capture of one window or monitor.
 pub struct CaptureStream {
     /// Kept alive: dropping either stops the capture.
     _session: GraphicsCaptureSession,
@@ -87,11 +95,11 @@ pub struct CaptureStream {
 }
 
 impl CaptureStream {
-    /// Begin capturing `hwnd`.
+    /// Begin capturing `target`.
     pub fn start(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
-        hwnd: HWND,
+        target: CaptureTarget,
     ) -> Result<Self, String> {
         unsafe {
             let dxgi: IDXGIDevice = device.cast().map_err(|e| format!("IDXGIDevice: {e}"))?;
@@ -105,9 +113,14 @@ impl CaptureStream {
             let interop: IGraphicsCaptureItemInterop =
                 windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
                     .map_err(|e| format!("capture interop: {e}"))?;
-            let item: GraphicsCaptureItem = interop
-                .CreateForWindow(hwnd)
-                .map_err(|e| format!("CreateForWindow: {e}"))?;
+            let item: GraphicsCaptureItem = match target {
+                CaptureTarget::Window(hwnd) => interop
+                    .CreateForWindow(hwnd)
+                    .map_err(|e| format!("CreateForWindow: {e}"))?,
+                CaptureTarget::Monitor(monitor) => interop
+                    .CreateForMonitor(monitor)
+                    .map_err(|e| format!("CreateForMonitor: {e}"))?,
+            };
             let size = item.Size().map_err(|e| format!("item size: {e}"))?;
 
             let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(

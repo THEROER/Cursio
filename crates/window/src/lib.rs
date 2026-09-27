@@ -65,7 +65,7 @@ pub mod linux_drag;
 #[cfg(target_os = "linux")]
 mod linux_capture;
 #[cfg(target_os = "linux")]
-pub use linux_capture::{PortalCaptureSession, PortalWindowCapture};
+pub use linux_capture::{PortalCaptureSession, PortalScreenSources, PortalWindowCapture};
 
 #[cfg(target_os = "macos")]
 mod macos_capture;
@@ -89,7 +89,7 @@ mod windows_capture;
 #[cfg(target_os = "windows")]
 mod windows_input;
 #[cfg(target_os = "windows")]
-pub use windows_capture::{WgcCaptureSession, WgcWindowCapture};
+pub use windows_capture::{WgcCaptureSession, WgcScreenSources, WgcWindowCapture};
 
 #[cfg(target_os = "windows")]
 mod windows_surrogate;

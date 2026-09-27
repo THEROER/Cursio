@@ -81,6 +81,10 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    # `DWMWA_CLOAKED`: the remote-screen source list leaves out windows DWM
+    # hides (suspended UWP apps, other virtual desktops), which are visible
+    # and titled by every other measure and capture as blank.
+    "Win32_Graphics_Dwm",
     # Interop: a capture item for an HWND, and the WinRT/D3D bridge.
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",

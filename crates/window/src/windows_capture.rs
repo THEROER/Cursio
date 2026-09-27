@@ -6,6 +6,10 @@
 //! the Linux backend uses — so diffing and codec routing behave identically on
 //! both platforms.
 //!
+//! A remote-screen view reuses the same path for any window or a whole monitor
+//! (`CreateForMonitor`), chosen from the list in `sources.rs`. A window shown
+//! that way is never hidden: the person at this machine is still using it.
+//!
 //! ## Hiding the source window
 //!
 //! The feature's goal is that a transferred window *disappears* from the host,
@@ -42,6 +46,7 @@ use crate::{CaptureSession, WindowCapture, WindowError};
 
 mod d3d;
 mod hide;
+mod sources;
 mod window_pick;
 
 pub use hide::HiddenWindow;
@@ -155,7 +160,53 @@ impl WindowCapture for WgcWindowCapture {
     fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError> {
         let (hwnd, title) = window_pick::find(&self.title_hint)?;
         tracing::info!(title = %title, "capturing window");
-        spawn_capture(id, hwnd, title, self.hide_source)
+        spawn_capture(
+            id,
+            Target::Window {
+                hwnd: hwnd.0 as isize,
+                hide: self.hide_source,
+            },
+            title,
+        )
+    }
+}
+
+/// What the capture thread captures.
+///
+/// Handles cross to the thread as integers: `HWND` and `HMONITOR` are raw
+/// pointers and so not `Send`, and they are only ever used on that thread.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    /// One window — a transfer, or a window picked for a remote-screen view.
+    Window { hwnd: isize, hide: bool },
+    /// A whole monitor, for a remote-screen view. Never hidden, never driven:
+    /// there is no window to hide or to replay input into.
+    Monitor {
+        monitor: isize,
+        width: u32,
+        height: u32,
+    },
+}
+
+/// The Windows [`ScreenSources`](crate::ScreenSources): every top-level window
+/// and every monitor, enumerated directly — Windows answers the question GNOME
+/// refuses to.
+pub struct WgcScreenSources;
+
+impl crate::ScreenSources for WgcScreenSources {
+    fn list(&self) -> Result<Vec<cursio_protocol::ScreenSource>, WindowError> {
+        Ok(sources::list())
+    }
+
+    fn open(
+        &self,
+        id: WindowId,
+        source: &cursio_protocol::ScreenSource,
+    ) -> Result<Box<dyn CaptureSession + Send>, WindowError> {
+        let target = sources::resolve(source)?;
+        tracing::info!(title = %source.title, "capturing a source for the peer's view");
+        let session = spawn_capture(id, target, source.title.clone())?;
+        Ok(Box::new(session))
     }
 }
 
@@ -168,9 +219,8 @@ impl WindowCapture for WgcWindowCapture {
 /// window that is not redrawing (see `capture_thread`).
 fn spawn_capture(
     id: WindowId,
-    hwnd: HWND,
+    target: Target,
     title: String,
-    hide_source: bool,
 ) -> Result<WgcCaptureSession, WindowError> {
     let (frames_tx, frames_rx) = mpsc::channel(crate::CAPTURE_FRAME_QUEUE_CAPACITY);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -182,18 +232,13 @@ fn spawn_capture(
     let thread_ended = ended.clone();
     let thread_quality = quality.clone();
     let thread_last_seq = last_seq.clone();
-    // `HWND` is a raw pointer and so not `Send`; it is only ever used on the
-    // capture thread, so move it as a plain integer.
-    let hwnd_bits = hwnd.0 as isize;
     std::thread::Builder::new()
         .name("cursio-wgc-capture".into())
         .spawn(move || {
-            let hwnd = HWND(hwnd_bits as *mut core::ffi::c_void);
             let result = capture_thread(
                 id,
-                hwnd,
+                target,
                 title,
-                hide_source,
                 frames_tx,
                 cmd_rx,
                 &ready_tx,
@@ -457,11 +502,11 @@ fn emit_frame(
 /// The capture thread: owns the WGC session, the D3D device, and the HWND.
 ///
 /// All of it stays here because none of it is `Send`; only channels cross out.
+#[allow(clippy::too_many_arguments)]
 fn capture_thread(
     id: WindowId,
-    hwnd: HWND,
+    target: Target,
     title: String,
-    hide_source: bool,
     frames_tx: mpsc::Sender<WindowFrame>,
     mut cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: &std::sync::mpsc::Sender<Result<WindowMeta, String>>,
@@ -502,6 +547,27 @@ fn capture_thread(
         }
     }
     let _com = ComGuard;
+
+    let (hwnd, hide_source) = match target {
+        Target::Window { hwnd, hide } => (HWND(hwnd as *mut core::ffi::c_void), hide),
+        Target::Monitor {
+            monitor,
+            width,
+            height,
+        } => {
+            return monitor_capture_loop(
+                id,
+                windows::Win32::Graphics::Gdi::HMONITOR(monitor as *mut core::ffi::c_void),
+                (width, height),
+                title,
+                frames_tx,
+                cmd_rx,
+                ready_tx,
+                quality,
+                last_seq,
+            )
+        }
+    };
 
     // Un-minimise first: a minimised window is the one state WGC yields nothing
     // from (see the table at the top of this file), and it also reports a stub
@@ -544,7 +610,8 @@ fn capture_thread(
     };
 
     let (device, context) = d3d::create_device()?;
-    let mut session = d3d::CaptureStream::start(&device, &context, hwnd)?;
+    let mut session =
+        d3d::CaptureStream::start(&device, &context, d3d::CaptureTarget::Window(hwnd))?;
 
     // Hide only after capture is running: if starting fails, the user's window
     // must not be left invisible.
@@ -677,6 +744,77 @@ fn capture_thread(
     }
 
     tracing::info!(id, "window capture stopped");
+    Ok(())
+}
+
+/// The capture loop for a whole monitor, run on the capture thread after COM
+/// is up.
+///
+/// Kept apart from the window loop rather than threaded through it: every
+/// window-specific step there — restoring a minimised window, hiding it,
+/// nudging it to repaint, replaying input, resizing it — has no monitor
+/// equivalent, and a loop full of "unless it is a monitor" would hide which
+/// steps a transfer actually depends on. What they share, turning frames into
+/// packets, is already one function.
+#[allow(clippy::too_many_arguments)]
+fn monitor_capture_loop(
+    id: WindowId,
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+    (width, height): (u32, u32),
+    title: String,
+    frames_tx: mpsc::Sender<WindowFrame>,
+    mut cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
+    ready_tx: &std::sync::mpsc::Sender<Result<WindowMeta, String>>,
+    quality: Arc<crate::frame_pipeline::AdaptiveQuality>,
+    last_seq: Arc<std::sync::atomic::AtomicU32>,
+) -> Result<(), String> {
+    let (device, context) = d3d::create_device()?;
+    let mut session =
+        d3d::CaptureStream::start(&device, &context, d3d::CaptureTarget::Monitor(monitor))?;
+    let _ = ready_tx.send(Ok(WindowMeta {
+        id,
+        title,
+        width,
+        height,
+    }));
+
+    let mut differ = FrameDiffer::new();
+    let mut seq = 0u32;
+    let mut video: Option<crate::video_encoder_win::VideoEncoder> = None;
+    let mut video_failed_for: Option<(u32, u32)> = None;
+    loop {
+        match cmd_rx.try_recv() {
+            Ok(CaptureCommand::Stop) | Err(mpsc::error::TryRecvError::Disconnected) => break,
+            // A view is view-only, and a monitor cannot be resized from here.
+            Ok(CaptureCommand::Input(_)) | Ok(CaptureCommand::Resize { .. }) => {}
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+        match session.next_frame() {
+            Ok(Some(d3d::CapturedFrame {
+                pixels,
+                width: w,
+                height: h,
+            })) => emit_frame(
+                id,
+                &pixels,
+                w,
+                h,
+                &mut differ,
+                &mut seq,
+                &mut video,
+                &mut video_failed_for,
+                &frames_tx,
+                &quality,
+                &last_seq,
+            ),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(4)),
+            Err(e) => {
+                tracing::info!(error = %e, "monitor capture ended");
+                break;
+            }
+        }
+    }
+    tracing::info!(id, "monitor capture stopped");
     Ok(())
 }
 

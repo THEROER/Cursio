@@ -122,16 +122,85 @@ fn save_restore_token(token: &str) {
 struct PortalCast {
     node_id: u32,
     fd: OwnedFd,
-    /// The RemoteDesktop proxy + session, kept for two reasons: the cast lives
-    /// exactly as long as the session object (dropping it kills the stream
-    /// mid-flight), and replaying the viewer's input goes back through this
-    /// same pair. Both stay on the capture thread — neither is `Send`.
-    remote: RemoteDesktop,
-    session: ashpd::desktop::Session<RemoteDesktop>,
+    /// The RemoteDesktop proxy + session of a transfer, kept for two reasons:
+    /// the cast lives exactly as long as the session object (dropping it kills
+    /// the stream mid-flight), and replaying the viewer's input goes back
+    /// through this same pair. Both stay on the capture thread — neither is
+    /// `Send`. `None` for a remote-screen view, which takes no input.
+    input: Option<(RemoteDesktop, ashpd::desktop::Session<RemoteDesktop>)>,
+    /// The plain ScreenCast session of a remote-screen view, held for the same
+    /// lifetime reason.
+    _view_session: Option<ashpd::desktop::Session<Screencast>>,
     /// Whether the portal actually granted input devices. When it didn't, the
     /// surrogate is view-only and we say so once rather than failing every
     /// event.
     input_granted: bool,
+}
+
+/// Which portal session a capture needs.
+#[derive(Debug, Clone, Copy)]
+enum PortalMode {
+    /// A dragged window: RemoteDesktop + ScreenCast, input replayed, restored
+    /// silently from the saved token.
+    Transfer,
+    /// A remote-screen view of a window or a monitor: ScreenCast alone.
+    ///
+    /// No RemoteDesktop, because a view takes no input — and asking for it
+    /// would make the dialog request keyboard and mouse control the user has
+    /// no reason to grant. No restore token either: the viewer chose "let me
+    /// pick", so the picker is the point; restoring the last source silently
+    /// would make every entry show the same thing. The cursor is embedded,
+    /// unlike a transfer's: here the audience is watching the host, and the
+    /// host's pointer is part of what they should see.
+    View(SourceType),
+}
+
+/// Open a ScreenCast-only session for a remote-screen view.
+async fn setup_view_portal(kind: SourceType) -> Result<PortalCast, String> {
+    let screencast = Screencast::new()
+        .await
+        .map_err(|e| format!("open ScreenCast portal: {e}"))?;
+    let session = screencast
+        .create_session(Default::default())
+        .await
+        .map_err(|e| format!("create portal session: {e}"))?;
+    tracing::info!(
+        ?kind,
+        "a peer asked to see this machine — pick what to show in the screen-share dialog \
+         (it may open BEHIND other windows; check Alt+Tab)"
+    );
+    screencast
+        .select_sources(
+            &session,
+            SelectSourcesOptions::default()
+                .set_cursor_mode(CursorMode::Embedded)
+                .set_sources(ashpd::enumflags2::BitFlags::from(kind))
+                .set_multiple(false),
+        )
+        .await
+        .map_err(|e| format!("select sources: {e}"))?;
+    let response = screencast
+        .start(&session, None, Default::default())
+        .await
+        .map_err(|e| format!("start session: {e}"))?
+        .response()
+        .map_err(|e| format!("the screen-share dialog was cancelled or failed: {e}"))?;
+    let node_id = response
+        .streams()
+        .first()
+        .ok_or_else(|| "portal returned no stream (nothing selected?)".to_string())?
+        .pipe_wire_node_id();
+    let fd = screencast
+        .open_pipe_wire_remote(&session, Default::default())
+        .await
+        .map_err(|e| format!("open_pipe_wire_remote: {e}"))?;
+    Ok(PortalCast {
+        node_id,
+        fd,
+        input: None,
+        _view_session: Some(session),
+        input_granted: false,
+    })
 }
 
 /// Open the portal and start streaming one window — *and* claim the right to
@@ -258,8 +327,8 @@ async fn setup_portal() -> Result<PortalCast, String> {
     Ok(PortalCast {
         node_id,
         fd,
-        remote,
-        session,
+        input: Some((remote, session)),
+        _view_session: None,
         input_granted,
     })
 }
@@ -361,7 +430,70 @@ impl WindowCapture for PortalWindowCapture {
     type Session = PortalCaptureSession;
 
     fn begin(&mut self, id: WindowId) -> Result<Self::Session, WindowError> {
-        spawn_capture(id)
+        // The portal deliberately doesn't expose the source window's title (it
+        // would leak what the user picked); a neutral label is honest until we
+        // can learn it another way.
+        spawn_capture(id, PortalMode::Transfer, "Shared window".into())
+    }
+}
+
+/// The Linux [`ScreenSources`](crate::ScreenSources): two portal pickers.
+///
+/// GNOME will not tell a client which windows or monitors exist — the only
+/// sanctioned way to name one is to let the ScreenCast portal ask the user.
+/// So the list is fixed: "choose a window" and "choose a screen", both
+/// `picked_on_host`, and choosing either opens the picker on this machine.
+/// `machine` is this node's name, so the viewer's menu says where the dialog
+/// will appear.
+pub struct PortalScreenSources {
+    pub machine: String,
+}
+
+const PICK_WINDOW: cursio_protocol::SourceId = 1;
+const PICK_MONITOR: cursio_protocol::SourceId = 2;
+
+impl crate::ScreenSources for PortalScreenSources {
+    fn list(&self) -> Result<Vec<cursio_protocol::ScreenSource>, WindowError> {
+        use cursio_protocol::{ScreenSource, SourceKind};
+        Ok(vec![
+            ScreenSource {
+                id: PICK_WINDOW,
+                kind: SourceKind::Window,
+                title: format!("Choose a window (dialog on {})…", self.machine),
+                width: 0,
+                height: 0,
+                picked_on_host: true,
+            },
+            ScreenSource {
+                id: PICK_MONITOR,
+                kind: SourceKind::Monitor,
+                title: format!("Choose a screen (dialog on {})…", self.machine),
+                width: 0,
+                height: 0,
+                picked_on_host: true,
+            },
+        ])
+    }
+
+    fn open(
+        &self,
+        id: WindowId,
+        source: &cursio_protocol::ScreenSource,
+    ) -> Result<Box<dyn CaptureSession + Send>, WindowError> {
+        let kind = match source.id {
+            PICK_WINDOW => SourceType::Window,
+            PICK_MONITOR => SourceType::Monitor,
+            other => {
+                return Err(WindowError::WindowGone(format!(
+                    "source {other} is not one this machine offers"
+                )))
+            }
+        };
+        let title = match kind {
+            SourceType::Monitor => format!("Screen of {}", self.machine),
+            _ => format!("Window on {}", self.machine),
+        };
+        Ok(Box::new(spawn_capture(id, PortalMode::View(kind), title)?))
     }
 }
 
@@ -370,7 +502,11 @@ impl WindowCapture for PortalWindowCapture {
 /// Blocking here is deliberate: a declined portal dialog or a missing PipeWire
 /// must surface as an error from `begin()`, not as a stream that silently never
 /// produces frames. Mirrors `spawn_wayland_capture` in `cursio-input`.
-fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
+fn spawn_capture(
+    id: WindowId,
+    mode: PortalMode,
+    title: String,
+) -> Result<PortalCaptureSession, WindowError> {
     let (frames_tx, frames_rx) = mpsc::channel(crate::CAPTURE_FRAME_QUEUE_CAPACITY);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     // Readiness carries the negotiated window geometry back, so the meta we
@@ -388,6 +524,8 @@ fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
         .spawn(move || {
             capture_thread(
                 id,
+                mode,
+                title,
                 frames_tx,
                 cmd_rx,
                 ready_tx,
@@ -417,8 +555,11 @@ fn spawn_capture(id: WindowId) -> Result<PortalCaptureSession, WindowError> {
 /// Both halves are pinned here because neither is `Send`. The portal `Session`
 /// inside [`PortalCast`] must outlive the stream, so it stays in scope for the
 /// whole function.
+#[allow(clippy::too_many_arguments)]
 fn capture_thread(
     id: WindowId,
+    mode: PortalMode,
+    title: String,
     frames_tx: mpsc::Sender<WindowFrame>,
     cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
     ready_tx: std::sync::mpsc::Sender<Result<WindowMeta, String>>,
@@ -437,7 +578,11 @@ fn capture_thread(
             return;
         }
     };
-    let cast = match rt.block_on(setup_portal()) {
+    let setup = match mode {
+        PortalMode::Transfer => rt.block_on(setup_portal()),
+        PortalMode::View(kind) => rt.block_on(setup_view_portal(kind)),
+    };
+    let cast = match setup {
         Ok(c) => c,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -448,7 +593,7 @@ fn capture_thread(
     // Phase 2: hand the thread to PipeWire. `cast` (and its portal session)
     // stays alive here for the duration.
     if let Err(e) = run_pipewire_loop(
-        id, cast, frames_tx, cmd_rx, &ready_tx, &rt, quality, last_seq,
+        id, title, cast, frames_tx, cmd_rx, &ready_tx, &rt, quality, last_seq,
     ) {
         // If we never signalled readiness, this is the error the caller sees;
         // if we already did, the send is a no-op and the log is the record.
@@ -554,8 +699,10 @@ fn format_param_pod() -> Vec<u8> {
 }
 
 /// Attach a PipeWire stream to the portal's node and pump frames until stopped.
+#[allow(clippy::too_many_arguments)]
 fn run_pipewire_loop(
     id: WindowId,
+    title: String,
     cast: PortalCast,
     frames_tx: mpsc::Sender<WindowFrame>,
     mut cmd_rx: mpsc::UnboundedReceiver<CaptureCommand>,
@@ -584,8 +731,8 @@ fn run_pipewire_loop(
     let PortalCast {
         node_id,
         fd,
-        remote,
-        session,
+        input,
+        _view_session,
         input_granted,
     } = cast;
 
@@ -661,10 +808,7 @@ fn run_pipewire_loop(
                 st.announced = true;
                 let _ = ready.send(Ok(WindowMeta {
                     id,
-                    // The portal deliberately doesn't expose the source window's
-                    // title (it would leak what the user picked); a neutral label
-                    // is honest until we can learn it another way.
-                    title: "Shared window".to_string(),
+                    title: title.clone(),
                     width: size.width,
                     height: size.height,
                 }));
@@ -834,7 +978,10 @@ fn run_pipewire_loop(
         // like lag. Bounded so a flood of motion can't stall capture entirely.
         for _ in 0..64 {
             match cmd_rx.try_recv() {
-                Ok(CaptureCommand::Input(input)) => {
+                Ok(CaptureCommand::Input(event)) => {
+                    let Some((remote, session)) = input.as_ref() else {
+                        continue;
+                    };
                     if !input_granted {
                         if !warned_no_input {
                             warned_no_input = true;
@@ -847,7 +994,7 @@ fn run_pipewire_loop(
                     // `block_on` is safe here: this thread's runtime is
                     // current-thread and nothing else is driving it while the
                     // PipeWire loop is between iterations.
-                    if let Err(e) = rt.block_on(replay_input(&remote, &session, node_id, input)) {
+                    if let Err(e) = rt.block_on(replay_input(remote, session, node_id, event)) {
                         tracing::debug!(error = %e, "could not replay input onto the window");
                     }
                 }
