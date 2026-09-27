@@ -6,10 +6,10 @@
 //! scrolls, and keys come back out as [`WindowInput`] in that window's own
 //! coordinates for the host to replay.
 //!
-//! The same window serves as a **remote-screen view**
-//! ([`WindowRenderer::open_screen_view`]): view-only, letterboxed instead of
-//! resized to each source, and carrying a selector — a right-click popover and
-//! arrow keys — in place of input forwarding.
+//! A **remote-screen view** is not one of these on Linux: nobody is meant to
+//! look at it here, so it is a PipeWire node instead
+//! ([`PipeWireScreenSource`](crate::PipeWireScreenSource)); [`LinuxSurrogate`]
+//! is the renderer's answer for either.
 //!
 //! ## Why GTK4
 //!
@@ -32,8 +32,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cursio_protocol::{
-    Rect, ScreenSource, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId,
-    WindowInput, WindowMeta,
+    Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
+    WindowMeta,
 };
 use gtk::prelude::*;
 use gtk::{gdk, glib};
@@ -41,7 +41,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     codec::decode_tile, framebuffer::Framebuffer, presentation_ack::PresentationAcks,
-    video_decoder::VideoDecoder, SourcePick, Surrogate, WindowError, WindowRenderer,
+    video_decoder::VideoDecoder, Surrogate, WindowError, WindowRenderer,
 };
 /// Snapshot a framebuffer as a texture GTK can paint.
 ///
@@ -75,25 +75,9 @@ enum SurrogateCommand {
     /// The window grew, learnt from a tile rather than a full frame. Keeps the
     /// pixels already drawn — see [`Framebuffer::grow_to`].
     Grow { width: u32, height: u32 },
-    /// A remote-screen view's stream starts over with another source: drop the
-    /// decoder and the picture, keep the window.
-    Restart { title: String },
-    /// A remote-screen view's selector list changed.
-    Sources(Vec<ScreenSource>),
     /// Tear the window down.
     Close(WindowCloseReason),
 }
-
-/// The selector a remote-screen view carries, and what it reports through.
-struct ViewSelector {
-    picks: mpsc::UnboundedSender<SourcePick>,
-}
-
-/// What an idle view says, so the one thing on screen is how to fill it.
-///
-/// Shown only while nothing streams — it is inside the window a
-/// screen-sharing application captures, and must not sit over a picture.
-const VIEW_HINT: &str = "Right-click to choose what to show  ·  ← → to switch";
 
 /// A surrogate window driven from the session, rendered by GTK on its own thread.
 pub struct GtkSurrogate {
@@ -116,8 +100,6 @@ pub struct GtkSurrogate {
     /// the stream switched to video. The decoder itself lives on the GTK
     /// thread — see [`SurrogateCommand::VideoPacket`].
     video_started: bool,
-    /// Set for a remote-screen view: what the user picked in its selector.
-    picks: Option<mpsc::UnboundedReceiver<SourcePick>>,
 }
 
 impl Surrogate for GtkSurrogate {
@@ -202,24 +184,6 @@ impl Surrogate for GtkSurrogate {
         self.acks.take()
     }
 
-    fn restart_stream(&mut self, title: &str) {
-        self.video_started = false;
-        self.acks = PresentationAcks::new(self.id);
-        let _ = self.commands.send(SurrogateCommand::Restart {
-            title: title.to_string(),
-        });
-    }
-
-    fn set_sources(&mut self, sources: &[ScreenSource]) {
-        let _ = self
-            .commands
-            .send(SurrogateCommand::Sources(sources.to_vec()));
-    }
-
-    fn take_source_pick(&mut self) -> Option<SourcePick> {
-        self.picks.as_mut()?.try_recv().ok()
-    }
-
     fn take_resize_request(&mut self) -> Option<(u32, u32)> {
         // Drain to the newest: a drag emits a size per frame, and only where the
         // user let go matters.
@@ -260,7 +224,7 @@ impl WindowRenderer for GtkWindowRenderer {
     type Surrogate = LinuxSurrogate;
 
     fn open(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
-        spawn_surrogate(meta, false).map(LinuxSurrogate::Window)
+        spawn_surrogate(meta).map(LinuxSurrogate::Window)
     }
 
     /// A node the ScreenCast portal hands to the capture app; see
@@ -326,9 +290,7 @@ impl Surrogate for LinuxSurrogate {
 /// Blocks on readiness so a failure to reach the display server surfaces from
 /// `open()` rather than as a window that never appears — the same contract as
 /// the capture side's `begin()`.
-fn spawn_surrogate(meta: &WindowMeta, view: bool) -> Result<GtkSurrogate, WindowError> {
-    let (picks_tx, picks_rx) = mpsc::unbounded_channel();
-    let selector = view.then_some(ViewSelector { picks: picks_tx });
+fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (presented_tx, presented_rx) = mpsc::unbounded_channel();
@@ -342,7 +304,6 @@ fn spawn_surrogate(meta: &WindowMeta, view: bool) -> Result<GtkSurrogate, Window
         .spawn(move || {
             gtk_thread(
                 thread_meta,
-                selector,
                 cmd_rx,
                 input_tx,
                 presented_tx,
@@ -364,7 +325,6 @@ fn spawn_surrogate(meta: &WindowMeta, view: bool) -> Result<GtkSurrogate, Window
             requested_size: None,
             acks: PresentationAcks::new(meta.id),
             video_started: false,
-            picks: view.then_some(picks_rx),
         }),
         Ok(Err(e)) => Err(WindowError::Backend(e)),
         Err(_) => Err(WindowError::Backend(
@@ -376,7 +336,6 @@ fn spawn_surrogate(meta: &WindowMeta, view: bool) -> Result<GtkSurrogate, Window
 /// The GTK thread: owns the window, the framebuffer, and the main loop.
 fn gtk_thread(
     meta: WindowMeta,
-    selector: Option<ViewSelector>,
     mut commands: mpsc::UnboundedReceiver<SurrogateCommand>,
     input_tx: mpsc::UnboundedSender<WindowInput>,
     presented_tx: mpsc::UnboundedSender<u32>,
@@ -389,7 +348,6 @@ fn gtk_thread(
     }
 
     let id = meta.id;
-    let is_view = selector.is_some();
     let fb = Rc::new(RefCell::new(Framebuffer::new(meta.width, meta.height)));
 
     let picture = gtk::Picture::builder()
@@ -399,62 +357,32 @@ fn gtk_thread(
         // this code would then have to track. Sharpness comes from the window
         // being resized to the source's resolution whenever that changes, so
         // the ratio stays 1:1 and nothing is resampled.
-        //
-        // A remote-screen view is the exception: it takes no input, so there
-        // is no mapping to keep, and it must not resize itself to each source
-        // — the window is what a screen-sharing application is capturing.
-        .content_fit(if is_view {
-            gtk::ContentFit::Contain
-        } else {
-            gtk::ContentFit::Fill
-        })
+        .content_fit(gtk::ContentFit::Fill)
         .build();
     picture.set_paintable(Some(&to_texture(&fb.borrow())));
-
-    let hint = gtk::Label::new(Some(VIEW_HINT));
-    hint.set_visible(is_view);
-    let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&picture));
-    overlay.add_overlay(&hint);
 
     let window = gtk::Window::builder()
         .title(&meta.title)
         .default_width(meta.width as i32)
         .default_height(meta.height as i32)
-        .child(&overlay)
+        .child(&picture)
         .build();
 
-    // Written by the command tick, read when the menu opens.
-    let sources: Rc<RefCell<Vec<ScreenSource>>> = Rc::new(RefCell::new(Vec::new()));
-
-    // A view's input channel has no controller holding its sender, and a
-    // dropped sender reads to the session as the user closing the window. Kept
-    // here, it drops exactly when this thread ends — which is that event.
-    let _view_input = match selector {
-        Some(selector) => {
-            attach_selector(&window, &picture, selector, sources.clone());
-            Some(input_tx)
-        }
-        None => {
-            attach_input_controllers(&window, &picture, id, input_tx, fb.clone());
-            // Report the size the user drags this window to, so the host can
-            // resize the real one. `default-width`/`default-height` rather than
-            // a size-allocate on the picture: the latter also fires for the
-            // resizes we perform ourselves when adopting the host's geometry,
-            // which would bounce a request straight back at the host for the
-            // size it just gave us.
-            for property in ["default-width", "default-height"] {
-                let (tx, win) = (resized_tx.clone(), window.clone());
-                window.connect_notify_local(Some(property), move |_, _| {
-                    let (w, h) = (win.default_width(), win.default_height());
-                    if w > 0 && h > 0 {
-                        let _ = tx.send((w as u32, h as u32));
-                    }
-                });
+    attach_input_controllers(&window, &picture, id, input_tx, fb.clone());
+    // Report the size the user drags this window to, so the host can resize
+    // the real one. `default-width`/`default-height` rather than a
+    // size-allocate on the picture: the latter also fires for the resizes we
+    // perform ourselves when adopting the host's geometry, which would bounce
+    // a request straight back at the host for the size it just gave us.
+    for property in ["default-width", "default-height"] {
+        let (tx, win) = (resized_tx.clone(), window.clone());
+        window.connect_notify_local(Some(property), move |_, _| {
+            let (w, h) = (win.default_width(), win.default_height());
+            if w > 0 && h > 0 {
+                let _ = tx.send((w as u32, h as u32));
             }
-            None
-        }
-    };
+        });
+    }
 
     // Drain the command channel on the GTK thread. `try_recv` in a timeout
     // source keeps this cooperative: GTK stays free to paint and dispatch input
@@ -462,8 +390,6 @@ fn gtk_thread(
     let main_loop_window = window.clone();
     let picture_for_frames = picture.clone();
     let fb_for_frames = fb.clone();
-    let hint_for_frames = hint.clone();
-    let sources_for_frames = sources.clone();
     // Lives on this thread because ffmpeg's scaler isn't `Send`; opened on the
     // first video packet, so a purely lossless stream never allocates one.
     let mut decoder: Option<VideoDecoder> = None;
@@ -523,10 +449,8 @@ fn gtk_thread(
                                     // an encoder rounding up to whole macroblocks
                                     // — would otherwise be scaled into the old
                                     // window's size for the rest of the session.
-                                    if !is_view {
-                                        main_loop_window
-                                            .set_default_size(pic.width as i32, pic.height as i32);
-                                    }
+                                    main_loop_window
+                                        .set_default_size(pic.width as i32, pic.height as i32);
                                 }
                                 let full = Rect {
                                     x: 0,
@@ -550,37 +474,13 @@ fn gtk_thread(
                 }
                 Ok(SurrogateCommand::Resize { width, height }) => {
                     fb_for_frames.borrow_mut().resize(width, height);
-                    if !is_view {
-                        main_loop_window.set_default_size(width as i32, height as i32);
-                    }
+                    main_loop_window.set_default_size(width as i32, height as i32);
                     painted = true;
                 }
                 Ok(SurrogateCommand::Grow { width, height }) => {
                     fb_for_frames.borrow_mut().grow_to(width, height);
-                    if !is_view {
-                        main_loop_window.set_default_size(width as i32, height as i32);
-                    }
+                    main_loop_window.set_default_size(width as i32, height as i32);
                     painted = true;
-                }
-                Ok(SurrogateCommand::Restart { title }) => {
-                    // A new source is a new H.264 stream, possibly at another
-                    // size; the old decoder's reference frames mean nothing
-                    // to it.
-                    decoder = None;
-                    let mut fb = fb_for_frames.borrow_mut();
-                    let (w, h) = (fb.width, fb.height);
-                    fb.resize(w, h);
-                    drop(fb);
-                    picture_for_frames.set_paintable(Some(&to_texture(&fb_for_frames.borrow())));
-                    hint_for_frames.set_text(&if title.is_empty() {
-                        VIEW_HINT.to_string()
-                    } else {
-                        format!("Starting {title}…")
-                    });
-                    hint_for_frames.set_visible(true);
-                }
-                Ok(SurrogateCommand::Sources(list)) => {
-                    *sources_for_frames.borrow_mut() = list;
                 }
                 Ok(SurrogateCommand::Close(reason)) => {
                     tracing::info!(?reason, id, "surrogate window closing");
@@ -611,7 +511,6 @@ fn gtk_thread(
         // One texture swap per tick, not per tile: several tiles of the same
         // visual update coalesce into a single present.
         if painted {
-            hint_for_frames.set_visible(false);
             picture_for_frames.set_paintable(Some(&to_texture(&fb_for_frames.borrow())));
             if let Some(seq) = presented_seq {
                 let _ = presented_tx.send(seq);
@@ -772,106 +671,6 @@ fn attach_input_controllers(
     window.add_controller(keys);
 }
 
-/// Give a remote-screen view its selector: a right-click menu of the peer's
-/// sources, and ←/→ (or Page Up/Down) to step between them.
-///
-/// A popover rather than anything in the window's own content: a GTK popover
-/// is an `xdg_popup`, a surface of its own, while a window screencast records
-/// the toplevel's surface — so the menu is not expected to reach the pixels a
-/// screen-sharing application sends. Keys draw nothing at all, which is why
-/// they exist beside the menu.
-fn attach_selector(
-    window: &gtk::Window,
-    picture: &gtk::Picture,
-    selector: ViewSelector,
-    sources: Rc<RefCell<Vec<ScreenSource>>>,
-) {
-    use gtk::gio;
-
-    let actions = gio::SimpleActionGroup::new();
-    let show = gio::SimpleAction::new("show", Some(glib::VariantTy::UINT32));
-    {
-        let picks = selector.picks.clone();
-        show.connect_activate(move |_, param| {
-            if let Some(id) = param.and_then(|v| v.get::<u32>()) {
-                let _ = picks.send(SourcePick::Source(id));
-            }
-        });
-    }
-    actions.add_action(&show);
-    let stop = gio::SimpleAction::new("stop", None);
-    {
-        let picks = selector.picks.clone();
-        stop.connect_activate(move |_, _| {
-            let _ = picks.send(SourcePick::Stop);
-        });
-    }
-    actions.add_action(&stop);
-    window.insert_action_group("view", Some(&actions));
-
-    let popover = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
-    popover.set_parent(picture);
-    popover.set_has_arrow(false);
-
-    let click = gtk::GestureClick::new();
-    click.set_button(3);
-    {
-        let popover = popover.clone();
-        click.connect_pressed(move |_, _, x, y| {
-            popover.set_menu_model(Some(&source_menu(&sources.borrow())));
-            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
-        });
-    }
-    picture.add_controller(click);
-
-    let keys = gtk::EventControllerKey::new();
-    {
-        let picks = selector.picks.clone();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            let pick = match key {
-                gdk::Key::Right | gdk::Key::Page_Down => SourcePick::Next,
-                gdk::Key::Left | gdk::Key::Page_Up => SourcePick::Previous,
-                _ => return glib::Propagation::Proceed,
-            };
-            let _ = picks.send(pick);
-            glib::Propagation::Stop
-        });
-    }
-    window.add_controller(keys);
-}
-
-/// The selector's menu: screens, then windows, then a way to show nothing.
-fn source_menu(sources: &[ScreenSource]) -> gtk::gio::Menu {
-    use cursio_protocol::SourceKind;
-    use gtk::gio;
-
-    let menu = gio::Menu::new();
-    for kind in [SourceKind::Monitor, SourceKind::Window] {
-        let section = gio::Menu::new();
-        for source in sources.iter().filter(|s| s.kind == kind) {
-            let item = gio::MenuItem::new(Some(&source.title), None);
-            item.set_action_and_target_value(Some("view.show"), Some(&source.id.to_variant()));
-            section.append_item(&item);
-        }
-        if section.n_items() > 0 {
-            let label = match kind {
-                SourceKind::Monitor => "Screens",
-                SourceKind::Window => "Windows",
-            };
-            menu.append_section(Some(label), &section);
-        }
-    }
-    if sources.is_empty() {
-        let waiting = gio::MenuItem::new(Some("Waiting for the peer's list…"), None);
-        menu.append_item(&waiting);
-    }
-    let end = gio::Menu::new();
-    end.append(Some("Show nothing"), Some("view.stop"));
-    menu.append_section(None, &end);
-    menu
-}
-
 /// GDK button number → the protocol's neutral [`MouseButton`].
 fn map_button(gdk_button: u32) -> Option<cursio_protocol::MouseButton> {
     use cursio_protocol::MouseButton;
@@ -919,38 +718,6 @@ mod input_tests {
         assert_eq!(map_button(8), Some(MouseButton::Back));
         assert_eq!(map_button(9), Some(MouseButton::Forward));
         assert_eq!(map_button(42), None);
-    }
-}
-
-#[cfg(test)]
-mod selector_tests {
-    use super::*;
-    use cursio_protocol::SourceKind;
-
-    fn source(id: u32, kind: SourceKind, title: &str) -> ScreenSource {
-        ScreenSource {
-            id,
-            kind,
-            title: title.into(),
-            width: 0,
-            height: 0,
-            picked_on_host: false,
-        }
-    }
-
-    #[test]
-    fn the_menu_lists_screens_before_windows_and_ends_with_show_nothing() {
-        let menu = source_menu(&[
-            source(1, SourceKind::Window, "Firefox"),
-            source(0x8000_0000, SourceKind::Monitor, "Screen 1"),
-        ]);
-        let label = |section: i32| {
-            menu.item_attribute_value(section, "label", None)
-                .and_then(|v| v.get::<String>())
-        };
-        assert_eq!(label(0).as_deref(), Some("Screens"));
-        assert_eq!(label(1).as_deref(), Some("Windows"));
-        assert_eq!(menu.n_items(), 3);
     }
 }
 
