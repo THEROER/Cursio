@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use cursio_core::link::{self, Link};
 use cursio_core::module::ModuleRegistry;
-use cursio_core::session::SessionError;
+use cursio_core::session::{CapturedInput, SessionError};
 use cursio_core::NodeIdentity;
 use cursio_protocol::{InputEvent, MouseButton};
 use cursio_transport::pairing::Role;
@@ -54,7 +54,7 @@ pub struct Touchpad {
     /// Events on their way to the peer. Present only while a link is up: with
     /// no session there is nothing to send to, and quietly buffering strokes
     /// that will never arrive is worse than dropping them.
-    events: Mutex<Option<UnboundedSender<InputEvent>>>,
+    events: Mutex<Option<UnboundedSender<CapturedInput>>>,
     status: Mutex<Status>,
 }
 
@@ -85,12 +85,12 @@ impl Touchpad {
     fn send(&self, event: InputEvent) -> bool {
         let guard = self.events.lock().expect("touchpad channel");
         match guard.as_ref() {
-            Some(tx) => tx.send(event).is_ok(),
+            Some(tx) => tx.send(CapturedInput::from(event)).is_ok(),
             None => false,
         }
     }
 
-    fn attach(&self, tx: UnboundedSender<InputEvent>) {
+    fn attach(&self, tx: UnboundedSender<CapturedInput>) {
         *self.events.lock().expect("touchpad channel") = Some(tx);
     }
 
@@ -120,7 +120,7 @@ pub fn button_named(name: &str) -> Option<MouseButton> {
 async fn run_link(
     identity: NodeIdentity,
     password: String,
-    mut events: UnboundedReceiver<InputEvent>,
+    mut events: UnboundedReceiver<CapturedInput>,
     report: impl Fn(Status),
 ) -> anyhow::Result<()> {
     report(Status::Searching);
@@ -297,7 +297,7 @@ mod tests {
 
         assert!(pad.send(InputEvent::PointerMotion { dx: 3, dy: -2 }));
         assert_eq!(
-            rx.try_recv().expect("delivered"),
+            rx.try_recv().expect("delivered").event,
             InputEvent::PointerMotion { dx: 3, dy: -2 }
         );
 
