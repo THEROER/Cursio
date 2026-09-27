@@ -50,6 +50,30 @@ struct OpenedTap {
     result: Result<cursio_audio::Capture, String>,
 }
 
+/// The result of creating an Intent Sink on a worker thread.
+///
+/// Carries the identity the sink was created for, because the advertisement it
+/// answers is long gone by the time it lands.
+struct OpenedIntentSink {
+    /// The peer's device stream id this sink represents.
+    id: u32,
+    /// PipeWire node name, and the peer device `(handle, description)` behind it.
+    node: String,
+    device: (String, String),
+    result: Result<cursio_audio::IntentSink, String>,
+}
+
+/// Builds an Intent Sink from its stream id, node name and description.
+type IntentSinkOpener =
+    fn(u32, String, String) -> Result<cursio_audio::IntentSink, cursio_audio::AudioError>;
+
+/// The result of opening a playback on a worker thread.
+struct OpenedPlayback {
+    /// Stream id the playback renders.
+    id: u32,
+    result: Result<cursio_audio::Playback, String>,
+}
+
 /// Live audio state for one session: what we capture and stream out, and what
 /// we play from the peer.
 pub struct AudioEngine {
@@ -134,6 +158,35 @@ pub struct AudioEngine {
     opening_taps: HashMap<u32, PendingTap>,
     tap_ready_tx: tokio::sync::mpsc::UnboundedSender<OpenedTap>,
     tap_ready_rx: tokio::sync::mpsc::UnboundedReceiver<OpenedTap>,
+    /// Intent Sinks being created on a worker, by the peer device stream id.
+    ///
+    /// Same reason as `opening_taps`, and the worse case of the two: creating a
+    /// sink waits for a PipeWire node to come up, measured here at ~430 ms
+    /// EACH — and the peer advertises its devices in one burst, so a machine
+    /// running Voicemeeter announced six and stalled the session for over two
+    /// seconds. Nothing moved in that window: not the cursor, not audio, and
+    /// not the file mount, whose own 3 s deadline it very nearly outlasted —
+    /// Explorer reported the peer's drive as an I/O error on a link that was
+    /// perfectly healthy.
+    ///
+    /// Tracked so a second advertisement for a device already being created
+    /// does not start a duplicate node.
+    opening_intent_sinks: std::collections::HashSet<u32>,
+    /// What actually builds an Intent Sink. A field so tests can exercise the
+    /// bookkeeping around it without publishing a real node into the desktop
+    /// session the tests happen to run in.
+    intent_sink_opener: IntentSinkOpener,
+    intent_sink_ready_tx: tokio::sync::mpsc::UnboundedSender<OpenedIntentSink>,
+    intent_sink_ready_rx: tokio::sync::mpsc::UnboundedReceiver<OpenedIntentSink>,
+    /// Playbacks being opened on a worker, by stream id.
+    ///
+    /// Opened on a stream's FIRST chunk, so unlike the other two this stall
+    /// arrives mid-session — whenever something starts playing on the peer —
+    /// which is what made the mouse freeze during ordinary use rather than only
+    /// at connect time.
+    opening_playbacks: std::collections::HashSet<u32>,
+    playback_ready_tx: tokio::sync::mpsc::UnboundedSender<OpenedPlayback>,
+    playback_ready_rx: tokio::sync::mpsc::UnboundedReceiver<OpenedPlayback>,
     /// Apps whose tunnel is open but whose node is currently absent, and since
     /// when. Cleared when the app comes back; see [`TUNNEL_IDLE_TIMEOUT`].
     tunnel_idle_since: HashMap<String, std::time::Instant>,
@@ -144,7 +197,8 @@ pub struct AudioEngine {
     /// when the playback opens and re-applied on every [`Message::AudioGain`].
     /// Absent ⇒ unity. See [`AudioEngine::on_gain`].
     gains: HashMap<u32, f32>,
-    /// Labels held until a stream's first chunk actually arrives.
+    /// The name each advertised stream renders under, kept for as long as the
+    /// peer offers the stream so a failed open can retry under the right name.
     pending_labels: HashMap<u32, String>,
     /// For an inbound per-app stream tagged with a target device (the peer routed
     /// an app into one of OUR devices via its Intent Sink), the device to render
@@ -277,6 +331,8 @@ impl AudioEngine {
     pub fn new(local_id: PeerId, render_device: Option<String>, peer_name: String) -> Self {
         let id_base = id_base_for(local_id);
         let (tap_ready_tx, tap_ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (intent_sink_ready_tx, intent_sink_ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (playback_ready_tx, playback_ready_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             id_base,
             inbound_targets: HashMap::new(),
@@ -295,6 +351,13 @@ impl AudioEngine {
             opening_taps: HashMap::new(),
             tap_ready_tx,
             tap_ready_rx,
+            opening_intent_sinks: std::collections::HashSet::new(),
+            intent_sink_opener: cursio_audio::IntentSink::create,
+            intent_sink_ready_tx,
+            intent_sink_ready_rx,
+            opening_playbacks: std::collections::HashSet::new(),
+            playback_ready_tx,
+            playback_ready_rx,
             tunnel_idle_since: HashMap::new(),
             playbacks: HashMap::new(),
             gains: HashMap::new(),
@@ -471,6 +534,11 @@ impl SessionModule for AudioEngine {
         // case where the send path below never executes, so checking only there
         // would stay silent exactly when a warning is wanted.
         self.log_health();
+
+        // Take delivery of anything a worker finished building. First, so a node
+        // that came up since the last pump is usable for the rest of this one.
+        self.collect_opened_intent_sinks();
+        self.collect_opened_playbacks();
 
         // Turn Intent-Sink membership into per-app Remote Streams: apps funnelled
         // into a peer device's Intent Sink get tapped and shipped, tagged to render
@@ -730,6 +798,7 @@ impl SessionModule for AudioEngine {
                 self.inbound_app_device.remove(&id);
                 self.decoders.remove(&id);
                 self.failed_playbacks.remove(&id);
+                self.opening_playbacks.remove(&id);
                 // Receiver-side rate-control/gain state for this stream — clear it
                 // so a reused id never inherits a stale gain or ack cadence.
                 self.gains.remove(&id);
@@ -997,9 +1066,7 @@ impl AudioEngine {
                     });
                 })
                 .map_err(|e| {
-                    TransportError::Io(std::io::Error::other(format!(
-                        "spawn tap opener: {e}"
-                    )))
+                    TransportError::Io(std::io::Error::other(format!("spawn tap opener: {e}")))
                 })?;
             self.opening_taps.insert(
                 app_node_id,
@@ -1291,9 +1358,9 @@ impl AudioEngine {
             } else {
                 tracing::info!(id = meta.id, %label, "peer advertised an app stream");
             }
-            // Remember the label but DON'T open playback yet — see
-            // `pending_labels`: one node per advertisement filled the mixer
-            // with identical idle rows.
+            // Remember the label but DON'T open playback yet: one node per
+            // advertisement filled the mixer with identical idle rows. The
+            // stream's first chunk opens it.
             self.pending_labels.insert(meta.id, label);
             return;
         }
@@ -1310,15 +1377,14 @@ impl AudioEngine {
                 .map(|(_, d)| d.clone())
                 .unwrap_or_else(|| "Microphone".to_string());
             let label = format!("Cursio({peer_name}): {desc}");
-            tracing::info!(id = meta.id, %label, "peer advertised a microphone");
-            match cursio_audio::Playback::virtual_source(meta.id, label.clone()) {
-                Ok(p) => {
-                    self.playbacks.insert(meta.id, p);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, %label, "cannot publish the peer's microphone here")
-                }
-            }
+            let id = meta.id;
+            tracing::info!(id, %label, "peer advertised a microphone");
+            // Published on a worker for the same reason as an Intent Sink: this
+            // waits for a PipeWire node, and a peer offering several microphones
+            // would otherwise stall the loop once per microphone.
+            self.open_playback_off_loop(meta.id, move || {
+                cursio_audio::Playback::virtual_source(id, label)
+            });
             return;
         }
 
@@ -1342,19 +1408,134 @@ impl AudioEngine {
         let label = format!("Cursio({peer_name}): {desc}");
         tracing::info!(id = meta.id, %label, "peer advertised a device; creating Intent Sink");
 
-        match cursio_audio::IntentSink::create(meta.id, node.clone(), label.clone()) {
-            Ok(sink) => {
-                self.intent_sinks.insert(meta.id, sink);
-                self.intent_sink_device
-                    .insert(meta.id, (dev_id.clone(), desc.clone()));
-                // Remember the mapping both ways, so an inbound DeviceState replica
-                // reaches this Intent Sink and a local turn of the sink is
-                // attributed to the peer device it mirrors.
-                self.sink_node_for_peer_device
-                    .insert(dev_id.clone(), node.clone());
-                self.peer_device_for_sink_node.insert(node, dev_id.clone());
+        // Already have it, or already making it: a device is advertised again on
+        // every reconnect, and creating a second node for it would leave the
+        // user with duplicate outputs for one peer device.
+        if self.intent_sinks.contains_key(&meta.id) || !self.opening_intent_sinks.insert(meta.id) {
+            return;
+        }
+
+        // Create on a worker: this waits for a PipeWire node to come up (~430 ms
+        // here), and the session loop cannot sit through that — see
+        // [`AudioEngine::opening_intent_sinks`]. The finished sink is collected
+        // by a later pump.
+        let ready = self.intent_sink_ready_tx.clone();
+        let id = meta.id;
+        let device = (dev_id.clone(), desc.clone());
+        let node_arg = node.clone();
+        let label_arg = label.clone();
+        let opener = self.intent_sink_opener;
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("cursio-pw-sink-open-{id}"))
+            .spawn(move || {
+                let result = opener(id, node_arg.clone(), label_arg).map_err(|e| e.to_string());
+                // The receiver only closes when the session is ending, in which
+                // case the sink is moot.
+                let _ = ready.send(OpenedIntentSink {
+                    id,
+                    node: node_arg,
+                    device,
+                    result,
+                });
+            })
+        {
+            self.opening_intent_sinks.remove(&id);
+            tracing::error!(error = %e, %label, "cannot spawn the Intent Sink opener");
+        }
+    }
+
+    /// Open a playback on a worker thread, to be collected by a later pump.
+    ///
+    /// Both kinds of playback go through here — a peer microphone published as
+    /// a virtual source, and an ordinary render opened on a stream's first
+    /// chunk — because the cost being avoided is the same in both: bringing a
+    /// PipeWire node up takes hundreds of milliseconds, and the session loop is
+    /// single-threaded, so waiting inline stops input, audio and file traffic
+    /// alike.
+    fn open_playback_off_loop(
+        &mut self,
+        id: u32,
+        open: impl FnOnce() -> Result<cursio_audio::Playback, cursio_audio::AudioError> + Send + 'static,
+    ) {
+        // One playback per stream. Chunks keep arriving at ~200/s while the
+        // node comes up, and a stream is advertised again on every reconnect;
+        // either would otherwise start another node for a stream that has one,
+        // and the newcomer would replace — and so tear down — the row the user
+        // had already set a volume on.
+        if self.playbacks.contains_key(&id) || !self.opening_playbacks.insert(id) {
+            return;
+        }
+        let ready = self.playback_ready_tx.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("cursio-pw-play-open-{id}"))
+            .spawn(move || {
+                let result = open().map_err(|e| e.to_string());
+                // The receiver only closes when the session is ending, in which
+                // case the playback is moot.
+                let _ = ready.send(OpenedPlayback { id, result });
+            })
+        {
+            self.opening_playbacks.remove(&id);
+            tracing::error!(error = %e, id, "cannot spawn the playback opener");
+        }
+    }
+
+    /// Take delivery of playbacks whose worker has finished.
+    fn collect_opened_playbacks(&mut self) {
+        while let Ok(opened) = self.playback_ready_rx.try_recv() {
+            // No longer wanted: the peer closed the stream while its node was
+            // coming up. Keeping it would leave a mixer row for a stream that
+            // will never be closed again, since its close has already come.
+            if !self.opening_playbacks.remove(&opened.id) {
+                continue;
             }
-            Err(e) => tracing::error!(error = %e, %label, "failed to create Intent Sink"),
+            match opened.result {
+                Ok(p) => {
+                    // Apply any gain that arrived while the node was coming up,
+                    // so a knob turned during the open is not lost.
+                    if let Some(&g) = self.gains.get(&opened.id) {
+                        p.set_gain(g);
+                    }
+                    self.playbacks.insert(opened.id, p);
+                }
+                Err(e) => {
+                    // Complain ONCE per stream: chunks arrive at ~200/s, and a
+                    // stream that cannot open would otherwise log at that rate.
+                    if self.failed_playbacks.insert(opened.id) {
+                        tracing::warn!(error = %e, id = opened.id,
+                            "cannot open playback; ignoring this stream");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take delivery of Intent Sinks whose worker has finished.
+    ///
+    /// The bookkeeping lands here rather than at request time because a sink
+    /// that failed to come up must leave no trace: a node name mapped to a sink
+    /// that does not exist would silently swallow every device-state replica
+    /// aimed at that peer device.
+    fn collect_opened_intent_sinks(&mut self) {
+        while let Ok(opened) = self.intent_sink_ready_rx.try_recv() {
+            self.opening_intent_sinks.remove(&opened.id);
+            let (dev_id, desc) = opened.device;
+            match opened.result {
+                Ok(sink) => {
+                    self.intent_sinks.insert(opened.id, sink);
+                    self.intent_sink_device
+                        .insert(opened.id, (dev_id.clone(), desc));
+                    // Remember the mapping both ways, so an inbound DeviceState replica
+                    // reaches this Intent Sink and a local turn of the sink is
+                    // attributed to the peer device it mirrors.
+                    self.sink_node_for_peer_device
+                        .insert(dev_id.clone(), opened.node.clone());
+                    self.peer_device_for_sink_node.insert(opened.node, dev_id);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, device = %desc, "failed to create Intent Sink")
+                }
+            }
         }
     }
 
@@ -1820,54 +2001,60 @@ impl AudioEngine {
             .and_modify(|s| *s = (*s).max(chunk.seq))
             .or_insert(chunk.seq);
 
+        // Already coming up on a worker: drop this chunk and wait.
+        //
+        // Checked BEFORE the label is taken below, because taking it is
+        // destructive. Bringing a node up takes hundreds of milliseconds and
+        // chunks arrive at ~200/s, so without this the second chunk of a stream
+        // finds `pending_labels` already emptied by the first, falls through to
+        // the "never advertised" arm, and the stream loses the name it was
+        // advertised under. Every app then rendered under whichever name did
+        // survive — one mixer row on the peer, carrying every application's
+        // audio at once.
+        if self.opening_playbacks.contains(&id) {
+            return;
+        }
+
         if !self.playbacks.contains_key(&id) {
             // First chunk for this stream — open playback now, not at advertise
             // time, so only streams that really carry audio get a node (and a
             // row in the user's mixer).
             let peer_name = &self.peer_name;
-            let opened = if let Some(dev) = self.inbound_targets.get(&id).cloned() {
+            if let Some(dev) = self.inbound_targets.get(&id).cloned() {
                 // A device WE advertised: render into that exact local device.
                 let label = format!("Cursio({peer_name}): {dev}");
-                cursio_audio::Playback::open_on(id, label, Some(dev))
-            } else if let Some(label) = self.pending_labels.remove(&id) {
+                self.open_playback_off_loop(id, move || {
+                    cursio_audio::Playback::open_on(id, label, Some(dev))
+                });
+            } else if let Some(label) = self.pending_labels.get(&id).cloned() {
                 // A stream the PEER advertised (its device or app). If it was
                 // tagged with one of OUR devices (the peer routed this app into our
                 // device via its Intent Sink), render into that device; otherwise
                 // into our default output.
+                //
+                // Read, not taken: the label identifies the stream for as long as
+                // the peer offers it, and a failed open must be able to try again
+                // under the right name. It is dropped with the rest of the
+                // stream's state on `StreamClose`.
                 let target = self
                     .inbound_app_device
                     .get(&id)
                     .cloned()
                     .or_else(|| self.render_device.clone());
                 tracing::info!(id, %label, ?target, "first audio; opening playback");
-                cursio_audio::Playback::open_on(id, label, target)
-            } else {
-                Err(cursio_audio::AudioError::StreamGone(format!(
-                    "unknown stream {id}"
-                )))
-            };
-            match opened {
-                Ok(p) => {
-                    // Apply any gain that arrived before this playback existed,
-                    // so a knob turn made while the stream was silent is not lost
-                    // when it finally starts.
-                    if let Some(&g) = self.gains.get(&id) {
-                        p.set_gain(g);
-                    }
-                    self.playbacks.insert(id, p);
-                }
-                Err(e) => {
-                    // Complain ONCE per stream, not once per chunk.
-                    //
-                    // Chunks keep arriving at ~200/s, so a stream we cannot open
-                    // used to emit a warning at that same rate — 10218 identical
-                    // lines in one session, which is most of a 17 MB log file and
-                    // buries everything useful.
-                    if self.failed_playbacks.insert(id) {
-                        tracing::warn!(error = %e, id, "cannot open playback; ignoring this stream");
-                    }
-                }
+                self.open_playback_off_loop(id, move || {
+                    cursio_audio::Playback::open_on(id, label, target)
+                });
+            } else if self.failed_playbacks.insert(id) {
+                tracing::warn!(id, "audio for a stream that was never advertised; ignoring");
             }
+            // The node is not up yet, so this chunk has nowhere to go. Dropping
+            // it is the right answer and not a loss: playback opens on the first
+            // chunk of a stream that has only just started, the receiver fills a
+            // gap with silence anyway, and the alternative — holding chunks
+            // until the node arrives — is the buffering that made audio latency
+            // grow without bound.
+            return;
         }
         // Decompress before playback. One decoder per stream, mirroring the
         // encoders — Opus carries state between frames.
@@ -2605,6 +2792,96 @@ mod tests {
         assert!(
             !is_startup_leftover(false, std::time::Duration::from_millis(10)),
             "an app's only tunnel is never an orphan"
+        );
+    }
+
+    /// A stream keeps the name it was advertised under while its node comes up.
+    ///
+    /// The label used to be *taken* out of `pending_labels` by the first chunk,
+    /// which was safe only while opening blocked the loop: no second chunk
+    /// could exist yet. Once the open moved to a worker, chunks kept arriving
+    /// at ~200/s during the hundreds of milliseconds it takes, each finding the
+    /// label gone and treating a properly advertised stream as one that was
+    /// never announced. On the peer every application collapsed into a single
+    /// mixer row bearing whichever name survived.
+    #[test]
+    fn an_advertised_label_survives_the_wait_for_a_node() {
+        let mut e = engine();
+
+        e.pending_labels
+            .insert(85505, "Cursio(peer): spotify".into());
+
+        // The open is in flight on a worker; chunks keep arriving meanwhile.
+        e.opening_playbacks.insert(85505);
+        for seq in 0..3 {
+            e.on_chunk(&cursio_protocol::AudioChunk {
+                id: 85505,
+                seq,
+                timestamp: 0,
+                data: vec![0; 16],
+            });
+        }
+
+        assert_eq!(
+            e.pending_labels.get(&85505).map(String::as_str),
+            Some("Cursio(peer): spotify"),
+            "the label must outlive the open, so a retry uses the right name"
+        );
+    }
+
+    /// Opening a playback never happens twice for one stream.
+    ///
+    /// The open is handed to a worker and the node takes hundreds of
+    /// milliseconds to appear, during which chunks keep arriving at ~200/s. If
+    /// each of those started another opener, one stream would spawn a node per
+    /// chunk — the session-loop stall this moved off the loop, turned into a
+    /// flood of PipeWire nodes instead.
+    #[test]
+    fn a_stream_opens_only_one_playback_while_its_node_comes_up() {
+        let mut e = engine();
+
+        for _ in 0..5 {
+            e.open_playback_off_loop(7, || {
+                Err(cursio_audio::AudioError::StreamGone("test".into()))
+            });
+        }
+
+        assert_eq!(
+            e.opening_playbacks.len(),
+            1,
+            "one stream must have exactly one open in flight"
+        );
+    }
+
+    /// A device advertised twice does not become two local outputs.
+    ///
+    /// The peer re-advertises its devices on every reconnect, and creating a
+    /// second Intent Sink for one device would leave the user picking between
+    /// duplicate outputs that mirror the same thing.
+    #[test]
+    fn a_device_advertised_twice_creates_one_intent_sink() {
+        let mut e = engine();
+        e.intent_sink_opener = |_, _, _| Err(cursio_audio::AudioError::Unsupported);
+
+        let meta = cursio_protocol::AudioStreamMeta {
+            id: 42,
+            app_name: None,
+            device: Some(("dev-handle".into(), "Speakers".into())),
+            role: cursio_protocol::StreamRole::Playback,
+            format: cursio_protocol::AudioFormat {
+                sample_rate: 48000,
+                channels: 2,
+                sample_kind: cursio_protocol::SampleKind::F32,
+            },
+            codec: cursio_protocol::AudioCodec::Opus,
+        };
+        e.on_advertise(&meta);
+        e.on_advertise(&meta);
+
+        assert_eq!(
+            e.opening_intent_sinks.len(),
+            1,
+            "one device must have exactly one Intent Sink in flight"
         );
     }
 
