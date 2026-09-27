@@ -14,9 +14,18 @@ pub mod background;
 /// by both mount implementations — the platform differences are all in how the
 /// OS asks, not in how the answer is fetched.
 pub mod bridge;
+/// Which mount callbacks entered and never returned, the one failure a stuck
+/// caller cannot report for itself.
+pub mod inflight;
 #[cfg(target_os = "linux")]
 pub mod mount;
+/// A per-file read buffer that fetches ahead while access stays sequential, so
+/// many small reads share one round trip.
+pub mod readahead;
 pub mod server;
+/// Several writes in flight against one handle, without acknowledging any of
+/// them before the peer has stored it.
+pub mod writeback;
 /// Windows mounting, present only where `winfsp` can be built — see this
 /// crate's `Cargo.toml` for why that means MSVC rather than Windows in general.
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
