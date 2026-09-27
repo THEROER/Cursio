@@ -657,6 +657,18 @@ where
     // reached the user with a clean log.
     let mut last_turn: Option<tokio::time::Instant> = None;
 
+    // Whether this turn runs the pump phase. Modules are pumped when the pace
+    // ticks or a module message arrives — not on every turn. Input turns the
+    // loop once per event, and a receiving machine gets several hundred pointer
+    // messages a second from a gaming mouse: when each of those first pumped
+    // audio, window and files, the pumps' few milliseconds decided how many
+    // events a second could be injected, the rest queued, and the cursor kept
+    // replaying a movement for seconds after the hand stopped. Measured from
+    // Nocturne's mouse into Windows; the laptop's touchpad in the other
+    // direction sends too few events to notice. The fast pace still pumps every
+    // few milliseconds, so modules lose nothing.
+    let mut pump_due = true;
+
     let result = loop {
         if let Some(prev) = last_turn {
             let turn = prev.elapsed();
@@ -669,73 +681,76 @@ where
         }
         last_turn = Some(tokio::time::Instant::now());
 
-        // Let each module flush its outbound work. Modules send a bounded
-        // amount per call (see `SessionModule::pump`): draining fully here
-        // would starve the inbound branch below, which is exactly how a peer's
-        // audio advertisements once got silently ignored.
-        let mut pump_err = None;
-        for m in modules.iter_mut() {
-            // Time each pump: everything (input, audio, clipboard) shares this
-            // one loop, so a module that blocks here freezes all of them. A
-            // threshold log turns "it froze" into "this module took N ms".
-            let started = tokio::time::Instant::now();
-            let result = m.pump(tx.as_mut()).await;
-            let took = started.elapsed();
-            if took >= SLOW_PUMP_WARN {
-                tracing::warn!(
-                    module = m.name(),
-                    took_ms = took.as_millis() as u64,
-                    "module pump blocked the session loop"
-                );
+        if pump_due {
+            pump_due = false;
+            // Let each module flush its outbound work. Modules send a bounded
+            // amount per call (see `SessionModule::pump`): draining fully here
+            // would starve the inbound branch below, which is exactly how a peer's
+            // audio advertisements once got silently ignored.
+            let mut pump_err = None;
+            for m in modules.iter_mut() {
+                // Time each pump: everything (input, audio, clipboard) shares this
+                // one loop, so a module that blocks here freezes all of them. A
+                // threshold log turns "it froze" into "this module took N ms".
+                let started = tokio::time::Instant::now();
+                let result = m.pump(tx.as_mut()).await;
+                let took = started.elapsed();
+                if took >= SLOW_PUMP_WARN {
+                    tracing::warn!(
+                        module = m.name(),
+                        took_ms = took.as_millis() as u64,
+                        "module pump blocked the session loop"
+                    );
+                }
+                if let Err(e) = result {
+                    pump_err = Some((m.name(), e));
+                    break;
+                }
             }
-            if let Err(e) = result {
-                pump_err = Some((m.name(), e));
-                break;
+            if let Some((name, e)) = pump_err {
+                tracing::warn!(module = name, error = %e, "module pump failed");
+                break Err(SessionError::from(e));
             }
-        }
-        if let Some((name, e)) = pump_err {
-            tracing::warn!(module = name, error = %e, "module pump failed");
-            break Err(SessionError::from(e));
-        }
 
-        // Follow the traffic: stay fast while modules are producing, fall back
-        // to the idle pace once they have all been quiet for a while.
-        //
-        // Read from the transport rather than from `pump`'s return: `pump`
-        // reports failure, not whether it sent, and every module would have to
-        // change to say so. `sent_bytes` already answers it for all of them at
-        // once, and counts what reached the socket rather than what a module
-        // believes it queued.
-        // A module waiting on an answer is working, however little it sends.
-        // Without this the loop slept 50 ms between a file request and its
-        // reply — 391 times during one download, at 111 ms per write on a link
-        // whose round trip is 10 ms.
-        let modules_busy = modules.iter().any(|m| m.has_pending_work());
+            // Follow the traffic: stay fast while modules are producing, fall back
+            // to the idle pace once they have all been quiet for a while.
+            //
+            // Read from the transport rather than from `pump`'s return: `pump`
+            // reports failure, not whether it sent, and every module would have to
+            // change to say so. `sent_bytes` already answers it for all of them at
+            // once, and counts what reached the socket rather than what a module
+            // believes it queued.
+            // A module waiting on an answer is working, however little it sends.
+            // Without this the loop slept 50 ms between a file request and its
+            // reply — 391 times during one download, at 111 ms per write on a link
+            // whose round trip is 10 ms.
+            let modules_busy = modules.iter().any(|m| m.has_pending_work());
 
-        let sent_now = module_sent_bytes(tx.as_ref());
-        if sent_now != last_sent_bytes || saw_inbound || modules_busy {
-            last_sent_bytes = sent_now;
-            saw_inbound = false;
-            silent_pumps = 0;
-            if !pace_is_fast {
-                // Back to a stream: restore the fast pace immediately. The
-                // first chunk has already been pumped by the time we get here,
-                // so this only affects how soon the *next* one is picked up.
-                pace = tokio::time::interval(MODULE_PUMP_INTERVAL);
-                pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                pace_is_fast = true;
-                tracing::debug!("module traffic resumed; session loop back to fast pace");
-            }
-        } else if pace_is_fast {
-            silent_pumps = silent_pumps.saturating_add(1);
-            if silent_pumps >= IDLE_PUMP_AFTER {
-                pace = tokio::time::interval(IDLE_PUMP_INTERVAL);
-                pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                pace_is_fast = false;
-                tracing::debug!(
-                    idle_ms = IDLE_PUMP_INTERVAL.as_millis() as u64,
-                    "no module traffic; session loop dropping to idle pace"
-                );
+            let sent_now = module_sent_bytes(tx.as_ref());
+            if sent_now != last_sent_bytes || saw_inbound || modules_busy {
+                last_sent_bytes = sent_now;
+                saw_inbound = false;
+                silent_pumps = 0;
+                if !pace_is_fast {
+                    // Back to a stream: restore the fast pace immediately. The
+                    // first chunk has already been pumped by the time we get here,
+                    // so this only affects how soon the *next* one is picked up.
+                    pace = tokio::time::interval(MODULE_PUMP_INTERVAL);
+                    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    pace_is_fast = true;
+                    tracing::debug!("module traffic resumed; session loop back to fast pace");
+                }
+            } else if pace_is_fast {
+                silent_pumps = silent_pumps.saturating_add(1);
+                if silent_pumps >= IDLE_PUMP_AFTER {
+                    pace = tokio::time::interval(IDLE_PUMP_INTERVAL);
+                    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    pace_is_fast = false;
+                    tracing::debug!(
+                        idle_ms = IDLE_PUMP_INTERVAL.as_millis() as u64,
+                        "no module traffic; session loop dropping to idle pace"
+                    );
+                }
             }
         }
 
@@ -754,7 +769,7 @@ where
 
             // Just a wakeup: the work happens in the pump phase above, so this
             // arm intentionally does nothing.
-            _ = pace.tick() => {}
+            _ = pace.tick() => pump_due = true,
             _ = ticker.tick() => {
                 // Has the peer gone quiet? Checked on the heartbeat tick, so
                 // detection costs nothing extra and lands within one interval
@@ -1007,6 +1022,7 @@ where
                             // A module is mid-exchange, so the loop is busy even
                             // if this side is the one doing the listening.
                             saw_inbound = true;
+                            pump_due = true;
                         }
                     }
                     None => {

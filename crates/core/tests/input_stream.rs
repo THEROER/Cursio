@@ -161,3 +161,94 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
     // Sanity: coalescing actually did something under this flood.
     assert!(!events.is_empty(), "receiver got no events at all");
 }
+
+/// A module whose pump costs 2 ms, counting how often it runs.
+struct SlowPump {
+    pumps: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl cursio_core::module::SessionModule for SlowPump {
+    fn name(&self) -> &'static str {
+        "slow"
+    }
+
+    async fn start(
+        &mut self,
+        _tx: &mut dyn cursio_transport::TransportTx,
+    ) -> Result<(), cursio_transport::TransportError> {
+        Ok(())
+    }
+
+    async fn pump(
+        &mut self,
+        _tx: &mut dyn cursio_transport::TransportTx,
+    ) -> Result<(), cursio_transport::TransportError> {
+        self.pumps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(2));
+        Ok(())
+    }
+
+    fn handle_message(&mut self, _msg: &cursio_protocol::Message) -> bool {
+        false
+    }
+}
+
+/// A receiver injects a flood of separate pointer messages without pumping its
+/// modules once per message. 2000 messages behind a 2 ms pump each would take
+/// four seconds to drain — the cursor replaying a movement long after the hand
+/// stopped — where the pace alone pumps a few hundred times.
+#[tokio::test]
+async fn a_slow_module_does_not_hold_up_injecting_received_input() {
+    const N: usize = 2000;
+    let (mut client, server) = encrypted_pair().await;
+
+    let pumps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let received = Arc::new(Mutex::new(0usize));
+    let received_in_task = received.clone();
+    let modules: Vec<Box<dyn cursio_core::module::SessionModule>> = vec![Box::new(SlowPump {
+        pumps: pumps.clone(),
+    })];
+    let server_task = tokio::spawn(async move {
+        let server: Box<dyn Transport> = Box::new(server);
+        let _ = session::run_session(
+            server,
+            session::CursorSetup {
+                start_active: true,
+                peer_takes_cursor: true,
+            },
+            None,
+            |_| *received_in_task.lock().unwrap() += 1,
+            None,
+            |_| {},
+            modules,
+            || None,
+        )
+        .await;
+    });
+
+    let started = std::time::Instant::now();
+    for _ in 0..N {
+        client
+            .send(&cursio_protocol::Message::Input(
+                InputEvent::PointerMotion { dx: 1, dy: 0 },
+            ))
+            .await
+            .unwrap();
+    }
+    while *received.lock().unwrap() < N {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "only {} of {N} injected after 2 s",
+            *received.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        pumps.load(std::sync::atomic::Ordering::Relaxed) < N / 2,
+        "modules were pumped once per input message"
+    );
+    drop(client);
+    server_task.abort();
+}
