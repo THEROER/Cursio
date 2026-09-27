@@ -329,6 +329,10 @@ struct CaptureState {
     /// minutes silently dropped the grab and desynced the session on the next
     /// move.
     deadline: Option<tokio::time::Instant>,
+    /// The activation holding input now, which is what `Release` must name.
+    activation_id: Option<u32>,
+    /// Where the pointer was pinned when that activation began.
+    activated_at: Option<(f32, f32)>,
 }
 
 impl CaptureState {
@@ -339,11 +343,20 @@ impl CaptureState {
         self.deadline = Some(tokio::time::Instant::now() + auto_release());
     }
 
+    /// A barrier fired: remember which activation now holds input.
+    fn activated(&mut self, id: Option<u32>, at: Option<(f32, f32)>) {
+        self.activation_id = id;
+        self.activated_at = at;
+        self.holding();
+    }
+
     /// Input is back with the desktop. Leaves `enabled` alone: releasing the
     /// grab and taking the barriers down are different things.
     fn released(&mut self) {
         self.captured = false;
         self.deadline = None;
+        self.activation_id = None;
+        self.activated_at = None;
     }
 
     /// Whether the dead-man timer should be armed at all.
@@ -679,7 +692,7 @@ async fn capture_loop(
                         tracing::info!(pos = ?a.cursor_position(), barrier = ?a.barrier_id(), "barrier activated");
                         // Start the inactivity countdown now that the portal holds
                         // input; each subsequent event pushes it forward.
-                        state.holding();
+                        state.activated(a.activation_id(), a.cursor_position());
 
                         // Only the side that OWNS the cursor may hand it off.
                         //
@@ -732,10 +745,34 @@ async fn capture_loop(
             // arming barriers while Active can't lock anyone out, so `captured`
             // (a barrier fired, portal holds input) gates the timer, and the
             // deadline is cleared whenever capture ends.
+            //
+            // `Release`, not `Disable`: the grab is what could trap the user, the
+            // barriers are not. Disabling took the barriers down while the mode
+            // stayed Dormant, and only a mode change puts them back — so after
+            // ten idle minutes with the cursor on the peer, shoving it at the
+            // edge again did nothing until the peer sent the cursor back or
+            // cursio was restarted. The pointer is placed just inside the edge
+            // so the still-armed barrier does not catch it again at once.
             _ = sleep_until_opt(state.deadline), if state.can_time_out() => {
                 tracing::warn!("auto-releasing portal capture after inactivity timeout");
-                let _ = ic.disable(&session, Default::default()).await;
-                state.enabled = false;
+                let options = ashpd::desktop::input_capture::ReleaseOptions::default()
+                    .set_activation_id(state.activation_id)
+                    .set_cursor_position(
+                        state.activated_at.map(|at| inside_edge(at, peer_edge)),
+                    );
+                if let Err(e) = ic.release(&session, options).await {
+                    // Without a release the grab is still held, and the dead-man
+                    // exists precisely so it cannot be held forever. Cycling the
+                    // barriers drops it and leaves them armed.
+                    tracing::warn!(error = %e, "release failed; cycling the barriers instead");
+                    let _ = ic.disable(&session, Default::default()).await;
+                    state.enabled = false;
+                    if let Err(e) = ic.enable(&session, Default::default()).await {
+                        tracing::warn!(error = %e, "re-arm after auto-release failed; edge crossing is off until the next ownership change");
+                    } else {
+                        state.enabled = true;
+                    }
+                }
                 state.released();
             }
         }
@@ -789,6 +826,20 @@ fn nudge_off_edge(tx: &mpsc::UnboundedSender<InputEvent>, peer_edge: Option<Edge
         None => return,
     };
     let _ = tx.send(InputEvent::PointerMotion { dx, dy });
+}
+
+/// `at`, moved [`EDGE_NUDGE_PX`] inward from `peer_edge`, in the portal's
+/// absolute coordinates — where to leave the pointer when handing input back.
+fn inside_edge(at: (f32, f32), peer_edge: Option<Edge>) -> (f64, f64) {
+    let (x, y) = (f64::from(at.0), f64::from(at.1));
+    let inset = f64::from(EDGE_NUDGE_PX);
+    match peer_edge {
+        Some(Edge::Right) => (x - inset, y),
+        Some(Edge::Left) => (x + inset, y),
+        Some(Edge::Bottom) => (x, y - inset),
+        Some(Edge::Top) => (x, y + inset),
+        None => (x, y),
+    }
 }
 
 /// Turn a portal [`Activated`] into an [`EdgeCrossing`], or `None` if we can't
@@ -958,6 +1009,29 @@ mod tests {
         let mut r = MotionRemainder::default();
         let moved: i32 = (0..10).map(|_| r.take(0.3, 0.0).0).sum();
         assert_eq!(moved, 3);
+    }
+
+    #[test]
+    fn auto_release_leaves_the_pointer_off_the_barrier_it_crossed() {
+        let at = (3840.0, 1061.5);
+        assert_eq!(inside_edge(at, Some(Edge::Right)), (3828.0, 1061.5));
+        assert_eq!(inside_edge(at, Some(Edge::Left)), (3852.0, 1061.5));
+        assert_eq!(inside_edge(at, Some(Edge::Bottom)), (3840.0, 1049.5));
+        assert_eq!(inside_edge(at, None), (3840.0, 1061.5));
+    }
+
+    #[test]
+    fn releasing_the_grab_keeps_the_barriers_armed() {
+        let mut state = CaptureState {
+            enabled: true,
+            ..Default::default()
+        };
+        state.activated(Some(7), Some((3840.0, 500.0)));
+        assert!(state.can_time_out());
+        state.released();
+        assert!(state.enabled);
+        assert!(!state.can_time_out());
+        assert_eq!(state.activation_id, None);
     }
 
     /// A single screen with the peer on the right: one barrier, on the right
