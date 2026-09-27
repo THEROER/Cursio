@@ -97,6 +97,9 @@ windows = { version = "0.61", features = [
     # GetSystemPowerStatus — battery level and mains state for `NodeStatus`,
     # in one call that needs neither WMI nor a COM apartment.
     "Win32_System_Power",
+    # GlobalMemoryStatusEx — commit charge against its limit, for the pressure
+    # monitor; see pressure.rs.
+    "Win32_System_SystemInformation",
 ] }
 
 [dev-dependencies]

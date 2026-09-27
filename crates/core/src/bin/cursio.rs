@@ -2249,6 +2249,10 @@ async fn start_node(
     // node started on a different one opens that.
     cursio_core::firewall::allow_mesh_port(bound.port());
 
+    // A machine short of memory looks, from inside Cursio, like a network
+    // fault in every module at once; this says which it is.
+    cursio_core::pressure::watch();
+
     // Announce ourselves so other nodes can find us. Pin mDNS to the real LAN
     // interface so VPN/virtual interfaces don't break it.
     let instance = discovery::mdns_label(&identity.display_name, "cursio-node");

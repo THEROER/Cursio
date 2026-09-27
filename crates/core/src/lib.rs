@@ -50,6 +50,8 @@ pub mod node_status;
 /// Installing Cursio as this user's ScreenCast portal backend.
 #[cfg(all(target_os = "linux", feature = "window"))]
 pub mod portal_setup;
+/// Raising memory, swap and i/o pressure as a problem while it lasts.
+pub mod pressure;
 pub mod registry;
 /// Remote-screen views: an app or monitor of a peer, offered to
 /// screen-sharing software here without being drawn on this desktop.

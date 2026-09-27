@@ -241,6 +241,18 @@ rights over its memory. Distinct directories, because a file manager re-listing
 the folder it shows is not a walk. It ends after 20 s of quiet, noticed by the
 files module's pump since a walker that stopped no longer calls the mount.
 
+**The machine itself** (`core/src/pressure.rs`, a thread polling every 5 s).
+Memory pressure does not fail anything; it slows everything, and from inside
+Cursio that reads as a network fault in every module at once — seen live with
+swap 100% full, each symptom chased as its own bug. Linux reads pressure stall
+information (`/proc/pressure/{memory,io}` `avg10`: the share of time work
+actually *waited*, not free memory, which a healthy page cache keeps near zero)
+plus swap from `/proc/meminfo`; Windows reads `GlobalMemoryStatusEx`'s commit
+charge against its limit, its equivalent of full swap. Each figure raises at one
+level and clears at a lower one (memory full-stall 10%/5%, some-stall 20%/10%,
+I/O full-stall 20%/10%, swap or commit 90%/80%), because a single line would
+make a panel blink while pressure hovers at it.
+
 ## One link, priority end to end
 
 Every module rides one Noise-over-TCP link, so the order bytes leave in is the
