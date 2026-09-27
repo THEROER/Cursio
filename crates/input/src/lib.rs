@@ -109,6 +109,10 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
 static PEER_EDGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Tell capture which edge borders the peer. `None` turns edge crossing off.
+///
+/// Callers with several peers must not pass `None` for one of them: this is
+/// machine-wide, so it would take the barrier down for all of them. See the
+/// call in `run_pairing_and_session` in the `cursio` binary.
 pub fn set_peer_edge(edge: Option<cursio_protocol::Edge>) {
     let code = match edge {
         None => 0,
