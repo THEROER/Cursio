@@ -65,13 +65,15 @@ pub enum SessionError {
 /// How often to send a heartbeat while a session is idle.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Warn when one turn of the session loop takes at least this long.
+/// Warn when one turn of the session loop works for at least this long.
 ///
 /// The loop now holds only input, ownership, the heartbeat and node status, so
 /// a slow turn here is exactly a stall the cursor felt — no module can cause
 /// one any more, which is what makes the warning worth reading when it fires.
-/// Comfortably above the heartbeat's own work, so healthy idling never trips
-/// it.
+/// Timed from the moment a turn wakes, not from the previous turn: with no
+/// module ticking it, an idle loop waits in `select!` for up to a heartbeat,
+/// and measuring the gap between turns reported that idleness as a
+/// five-second stall every five seconds.
 const SLOW_TURN_WARN: Duration = Duration::from_millis(250);
 
 /// How long to wait for *any* inbound traffic before declaring the peer gone.
@@ -621,26 +623,25 @@ where
     });
     tracing::info!(am_active, "initial ownership");
 
-    // When the previous turn of the loop came round, so a stall with no owner
-    // still leaves a mark. Without it a blocking call in a spot nobody thought
-    // to instrument is invisible — which is how a 2.6 s freeze once reached
-    // the user with a clean log.
-    let mut last_turn: Option<tokio::time::Instant> = None;
+    // When the current turn woke, so a stall with no owner still leaves a
+    // mark. Without it a blocking call in a spot nobody thought to instrument
+    // is invisible — which is how a 2.6 s freeze once reached the user with a
+    // clean log. Set as each arm starts; see `SLOW_TURN_WARN`.
+    let mut working_since: Option<tokio::time::Instant> = None;
 
     let mut inject_latency = LatencyWindow::new("received->injected");
     let mut forward_latency = LatencyWindow::new("captured->sent");
 
     let result = loop {
-        if let Some(prev) = last_turn {
-            let turn = prev.elapsed();
+        if let Some(woke) = working_since.take() {
+            let turn = woke.elapsed();
             if turn >= SLOW_TURN_WARN {
                 tracing::warn!(
                     took_ms = turn.as_millis() as u64,
-                    "session loop turn was slow; input, audio and file traffic all waited"
+                    "session loop turn was slow; input and cursor handoffs waited"
                 );
             }
         }
-        last_turn = Some(tokio::time::Instant::now());
 
         tokio::select! {
             // Ordered, not random. The branches are already written most- to
@@ -652,6 +653,7 @@ where
             biased;
 
             _ = ticker.tick() => {
+                working_since = Some(tokio::time::Instant::now());
                 inject_latency.report_if_due();
                 forward_latency.report_if_due();
                 // Has the peer gone quiet? Checked on the heartbeat tick, so
@@ -681,6 +683,7 @@ where
                 tracing::trace!(nonce, "sent heartbeat");
             }
             _ = status_ticker.tick() => {
+                working_since = Some(tokio::time::Instant::now());
                 // `poll_status` reads the machine-wide monitor and answers
                 // `None` unless something changed by the protocol's own
                 // standard — so a plugged-in desktop sends nothing here for the
@@ -697,6 +700,7 @@ where
                 break Err(SessionError::from(failure.error));
             }
             cmd = recv_maybe(&mut commands) => {
+                working_since = Some(tokio::time::Instant::now());
                 match cmd {
                     // Hotkey: flip which machine is active. Works from EITHER
                     // side — if we're active we hand the cursor over; if we're
@@ -781,6 +785,7 @@ where
                 }
             }
             local = recv_maybe(&mut captured) => {
+                working_since = Some(tokio::time::Instant::now());
                 match local {
                     // Forwarded only while actually driving the peer. The
                     // active side's input already acts locally; so does the
@@ -802,6 +807,7 @@ where
                 }
             }
             incoming = inbound_rx.recv() => {
+                working_since = Some(tokio::time::Instant::now());
                 let (incoming, read_at) = match incoming {
                     Some((msg, read_at)) => (Some(msg), Some(read_at)),
                     None => (None, None),
