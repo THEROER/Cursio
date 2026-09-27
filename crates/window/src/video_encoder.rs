@@ -96,10 +96,21 @@ impl EncoderKind {
 
     /// The options for `fidelity`, always low-latency.
     fn options(self, fidelity: Fidelity) -> Vec<(&'static str, &'static str)> {
-        match fidelity {
+        let mut options = match fidelity {
             Fidelity::Lossless => self.lossless_options(),
             Fidelity::Lossy { .. } => self.lossy_options(),
+        };
+        if self == EncoderKind::Nvenc {
+            // FFmpeg's NVENC wrapper holds `delay` frames before releasing a
+            // packet, defaulting to one less than its surface pool (three), and
+            // `zerolatency` does not touch it. Capture only encodes when the
+            // screen changed, so a held frame waits for the next change: the
+            // opening keyframe of a view sat in the encoder for five seconds
+            // on a still desktop, and the last frame of every burst of motion
+            // never left at all — a closed menu stayed on the viewer's screen.
+            options.push(("delay", "0"));
         }
+        options
     }
 
     /// Low-latency, rate-controlled, and in a profile every decoder takes.
@@ -632,6 +643,25 @@ mod tests {
         // The real assertion: bytes came out. An encoder that silently produced
         // nothing would leave the viewer with a blank window.
         assert!(total > 0, "encoder produced no data at all");
+    }
+
+    #[test]
+    fn every_frame_leaves_the_encoder_before_the_next_goes_in() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        for fidelity in [Fidelity::Lossless, Fidelity::Lossy { bitrate: 4_000_000 }] {
+            let mut enc = VideoEncoder::open(640, 480, fidelity).expect("encoder");
+            for i in 0..3u8 {
+                let packets = enc
+                    .encode(&solid_bgra(640, 480, 0x20 + i * 0x30))
+                    .expect("encode");
+                assert!(
+                    !packets.is_empty(),
+                    "{:?} held frame {i} back; on a screen that then stops changing \
+                     it never reaches the viewer",
+                    enc.kind()
+                );
+            }
+        }
     }
 
     #[test]

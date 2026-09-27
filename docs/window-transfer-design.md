@@ -91,7 +91,13 @@ favour of p1–p7). p4 matches the old preset exactly on realistic content, sits
 mid-pack on motion (60.9 Mbit/s vs p1 60.2, p7 51.3) and encodes 3 s of 1080p60
 in 1.2 s. p7 compresses motion ~16% better for 40% more encode time — not worth
 trading latency for bytes there is already room for. No B-frames (they reorder
-output, which means holding frames back). Encoder choice is NVENC → VAAPI →
+output, which means holding frames back). NVENC also gets `delay=0`: FFmpeg's
+wrapper otherwise holds up to three frames before releasing a packet
+(`zerolatency` does not change that), and because capture only encodes when
+the screen changed, a held frame waited for the next change — the opening
+keyframe of a view sat in the encoder for 5 s on a still desktop, and the last
+frame of each burst of motion never left at all (measured 2026-09-27: frame 0
+of a fresh NVENC encoder produced no packet). Encoder choice is NVENC → VAAPI →
 libx264 by what will actually **open**: this box lists `h264_vaapi` yet fails to
 initialise it, since its only render node is NVIDIA. Software is a real
 fallback, not a token one — x264 `ultrafast -qp 0` encoded the realistic
