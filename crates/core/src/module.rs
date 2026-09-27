@@ -42,6 +42,23 @@ pub trait SessionModule: Send {
     /// messages entirely. Send a bounded amount per call and return.
     async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError>;
 
+    /// Whether this module has work outstanding that an answer will complete.
+    ///
+    /// The session loop drops to an idle pace once nothing has been *sent* for
+    /// a short while, which is the wrong test for a module that spends its time
+    /// waiting: a mount serving a download sends little and owes much, so the
+    /// loop judged it idle, slept 50 ms, and delivered the next answer a tick
+    /// late. Measured against Steam that was 111 ms per write on a link with a
+    /// 10 ms round trip, and 391 trips into the idle pace during a single
+    /// transfer.
+    ///
+    /// Answering `true` keeps the loop at its fast pace. Modules that have
+    /// nothing pending — the common case, and the whole point of the idle pace
+    /// — leave this alone.
+    fn has_pending_work(&self) -> bool {
+        false
+    }
+
     /// Handle one message from the peer. Return `true` if it belonged to this
     /// module, which stops it being offered to other modules.
     fn handle_message(&mut self, msg: &Message) -> bool;
