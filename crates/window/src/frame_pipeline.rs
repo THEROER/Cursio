@@ -606,6 +606,8 @@ pub struct CapturePipeline<S: EncoderSource> {
     unrefined: bool,
     /// When the source last changed.
     last_change: Option<std::time::Instant>,
+    /// Nobody takes frames any more: the session dropped this capture.
+    closed: bool,
     seq: u32,
     quality: std::sync::Arc<AdaptiveQuality>,
     last_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -629,6 +631,7 @@ impl<S: EncoderSource> CapturePipeline<S> {
             resync: false,
             unrefined: false,
             last_change: None,
+            closed: false,
             seq: 0,
             quality,
             last_seq,
@@ -641,8 +644,28 @@ impl<S: EncoderSource> CapturePipeline<S> {
         self.resync = true;
     }
 
+    /// Whether the frames' receiver is gone, so the capture should end.
+    ///
+    /// A full queue and a closed one are opposite cases. Full means the
+    /// viewer is owed a resync, so the encoder is dropped and the next frame
+    /// opens a fresh one on a keyframe. Closed means there is no viewer:
+    /// treating it as full made a replaced capture reopen NVENC — a GPU
+    /// session and a keyframe for nobody — in the moment between the session
+    /// dropping it and its thread reading the stop command.
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+
+    fn mark_closed(&mut self) {
+        self.closed = true;
+        self.video = None;
+    }
+
     /// One captured frame, tightly packed BGRA.
     pub fn frame(&mut self, frame: &[u8], width: u32, height: u32, now: std::time::Instant) {
+        if self.closed {
+            return;
+        }
         let dirty = self.differ.diff(frame, width, height);
         if dirty.is_some() {
             self.last_change = Some(now);
@@ -677,6 +700,9 @@ impl<S: EncoderSource> CapturePipeline<S> {
     /// window, so the whole window is what needs replacing. Once per settle:
     /// only new lossy video arms it again.
     pub fn idle(&mut self, now: std::time::Instant) {
+        if self.closed {
+            return;
+        }
         let settled = self.unrefined
             && self
                 .last_change
@@ -779,12 +805,16 @@ impl<S: EncoderSource> CapturePipeline<S> {
                 self.unrefined |= refine;
                 VideoSend::Sent
             }
-            Err(_) => {
+            Err(FrameQueueError::Full) => {
                 // The viewer never saw this encoder state; the next encoder
                 // opens on a keyframe, and the resync makes it the whole
                 // picture even if the screen stops changing here.
                 self.video = None;
                 self.resync = true;
+                VideoSend::Dropped
+            }
+            Err(FrameQueueError::Closed) => {
+                self.mark_closed();
                 VideoSend::Dropped
             }
         }
@@ -804,18 +834,16 @@ impl<S: EncoderSource> CapturePipeline<S> {
         let seq = self.next_seq();
         // Never block the capture thread: a full queue loses this delta, and
         // the resync replaces it with the whole picture.
-        if self
-            .frames
-            .try_send(WindowFrame {
-                id: self.id,
-                seq,
-                dirty,
-                codec,
-                data,
-            })
-            .is_err()
-        {
-            self.resync = true;
+        match self.frames.try_send(WindowFrame {
+            id: self.id,
+            seq,
+            dirty,
+            codec,
+            data,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => self.resync = true,
+            Err(mpsc::error::TrySendError::Closed(_)) => self.mark_closed(),
         }
     }
 
@@ -860,7 +888,14 @@ impl<S: EncoderSource> CapturePipeline<S> {
                 }
             }
         }
-        try_queue_frames(&self.frames, frames).is_ok()
+        match try_queue_frames(&self.frames, frames) {
+            Ok(()) => true,
+            Err(FrameQueueError::Full) => false,
+            Err(FrameQueueError::Closed) => {
+                self.mark_closed();
+                false
+            }
+        }
     }
 }
 
@@ -1345,6 +1380,7 @@ mod pipeline_tests {
     /// Opens a [`FakeEncoder`], or refuses to when `available` is false.
     struct FakeSource {
         available: bool,
+        opened: usize,
     }
 
     impl EncoderSource for FakeSource {
@@ -1359,6 +1395,9 @@ mod pipeline_tests {
         ) -> Option<(u32, u32)> {
             if !self.available {
                 return None;
+            }
+            if slot.is_none() {
+                self.opened += 1;
             }
             slot.get_or_insert(FakeEncoder {
                 forced: false,
@@ -1378,7 +1417,10 @@ mod pipeline_tests {
         let (tx, rx) = mpsc::channel(capacity);
         let p = CapturePipeline::new(
             7,
-            FakeSource { available },
+            FakeSource {
+                available,
+                opened: 0,
+            },
             Default::default(),
             Default::default(),
             tx,
@@ -1506,6 +1548,42 @@ mod pipeline_tests {
         drain(&mut rx);
         p.idle(later + SETTLE);
         assert!(!drain(&mut rx).is_empty());
+    }
+
+    /// A replaced capture's receiver goes before its thread reads the stop
+    /// command. Read as a full queue, that reopened NVENC for nobody: a GPU
+    /// session and a keyframe, logged on the host as a second "video encoder
+    /// opened" 200 ms after the new source's.
+    #[test]
+    fn a_capture_nobody_receives_from_stops_instead_of_reopening_its_encoder() {
+        let (mut p, rx) = pipeline(true, 8);
+        let now = Instant::now();
+        p.frame(&solid(1), W, H, now);
+        p.frame(&solid(2), W, H, now + Duration::from_millis(10));
+        drop(rx);
+
+        p.frame(&solid(3), W, H, now + Duration::from_millis(20));
+        assert!(p.closed());
+        assert!(p.video.is_none(), "the encoder must be released at once");
+
+        p.request_resync();
+        p.idle(now + Duration::from_millis(30));
+        p.frame(&solid(4), W, H, now + Duration::from_millis(40));
+        p.idle(now + Duration::from_secs(5));
+        assert_eq!(
+            p.source.opened, 1,
+            "no encoder may open after the viewer left"
+        );
+    }
+
+    #[test]
+    fn a_tile_only_capture_notices_its_viewer_leaving() {
+        let (mut p, rx) = pipeline(false, 8);
+        let now = Instant::now();
+        p.frame(&solid(1), W, H, now);
+        drop(rx);
+        p.frame(&solid(2), W, H, now + Duration::from_millis(10));
+        assert!(p.closed());
     }
 
     #[test]

@@ -579,6 +579,9 @@ fn capture_thread(
                 break;
             }
         }
+        if pipeline.closed() {
+            break;
+        }
     }
 
     tracing::info!(id, "window capture stopped");
@@ -642,6 +645,9 @@ fn monitor_capture_loop(
                 tracing::info!(error = %e, "monitor capture ended");
                 break;
             }
+        }
+        if pipeline.closed() {
+            break;
         }
     }
     tracing::info!(id, "monitor capture stopped");

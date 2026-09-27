@@ -973,6 +973,9 @@ fn run_pipewire_loop(
         // Between buffers, on this same thread: a still screen delivers none,
         // and what the viewer is owed must not wait for one.
         state.borrow_mut().pipeline.idle(std::time::Instant::now());
+        if state.borrow().pipeline.closed() {
+            break;
+        }
     }
 
     tracing::info!("window capture stream stopped");
