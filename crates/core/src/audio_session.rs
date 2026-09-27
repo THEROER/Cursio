@@ -293,12 +293,28 @@ pub struct AudioEngine {
     pending_packets: HashMap<u32, VecDeque<cursio_protocol::AudioChunk>>,
     /// Per-stream Opus decoders (inbound), for the same reason.
     decoders: HashMap<u32, cursio_audio::codec::OpusDecoder>,
-    /// Highest chunk `seq` we have *sent* per outbound stream, so the sent-vs-
-    /// acked gap (below) can be measured for rate control.
-    last_sent_seq: HashMap<u32, u32>,
+    /// The `seq` of every chunk sent per outbound stream and not yet
+    /// acknowledged, oldest first. Its length is the backlog rate control acts
+    /// on.
+    ///
+    /// Counted in chunks actually *sent*, not as a difference of seqs. The seq
+    /// comes from the capture and keeps counting through silence, whose chunks
+    /// are dropped rather than sent — so after a pause the first packet out
+    /// carries a seq thousands past the last one acknowledged. Measured as
+    /// `last_sent - acked`, a 55 s pause between two videos read as a backlog
+    /// of 10993 chunks, and rate control walked the stream down to its floor
+    /// and back within two seconds of the audio resuming.
+    unacked: HashMap<u32, VecDeque<u32>>,
+    /// Outbound streams that sent anything since rate control last looked at
+    /// them. A stream that sent nothing has produced no new evidence about the
+    /// link, and judging it again on the old evidence repeats the last verdict.
+    sent_since_adapt: std::collections::HashSet<u32>,
+    /// How many consecutive evaluations each outbound stream has found the link
+    /// caught up; see [`BITRATE_RAISE_AFTER`].
+    caught_up_streak: HashMap<u32, u32>,
     /// Highest chunk `seq` the peer reports having *played* per outbound stream,
-    /// from [`Message::AudioFrameAck`]. The gap `last_sent - acked` is how far the
-    /// link is behind. See [`AudioEngine::on_ack`] / [`AudioEngine::adapt_bitrate`].
+    /// from [`Message::AudioFrameAck`]. See [`AudioEngine::on_ack`] /
+    /// [`AudioEngine::adapt_bitrate`].
     acked_seq: HashMap<u32, u32>,
     /// Current target Opus bitrate per outbound stream, lowered under a sustained
     /// backlog and raised back when it clears — the design's degrade-not-buffer
@@ -404,7 +420,9 @@ impl AudioEngine {
             encoders: HashMap::new(),
             pending_packets: HashMap::new(),
             decoders: HashMap::new(),
-            last_sent_seq: HashMap::new(),
+            unacked: HashMap::new(),
+            sent_since_adapt: std::collections::HashSet::new(),
+            caught_up_streak: HashMap::new(),
             acked_seq: HashMap::new(),
             stream_bitrate: HashMap::new(),
             last_adapt: HashMap::new(),
@@ -645,10 +663,7 @@ impl SessionModule for AudioEngine {
                 {
                     let seq = packet.seq;
                     tx.send(&Message::AudioChunk(packet)).await?;
-                    self.last_sent_seq
-                        .entry(*id)
-                        .and_modify(|sent| *sent = (*sent).max(seq))
-                        .or_insert(seq);
+                    record_sent(&mut self.unacked, &mut self.sent_since_adapt, *id, seq);
                     self.sent += 1;
                     continue;
                 }
@@ -938,6 +953,41 @@ const BACKLOG_HIGH: u32 = 100;
 /// Gap below which the link is considered caught up, so bitrate may climb back.
 /// Kept well under [`BACKLOG_HIGH`] so the two thresholds don't chatter.
 const BACKLOG_LOW: u32 = 20;
+
+/// Consecutive caught-up evaluations before the bitrate may climb one step.
+///
+/// Down stays immediate — a backlog is felt as mouse lag, since input shares
+/// the link — but up waits for the link to hold for 1.5 s. Climbing on the
+/// first calm sample let a single hiccup flap a stream between two rates, which
+/// the logs showed many times a day, seconds apart.
+const BITRATE_RAISE_AFTER: u32 = 3;
+
+/// Most unacknowledged chunks remembered per stream.
+///
+/// Only a bound on memory for a peer that stopped acking altogether: the
+/// backlog is already far past [`BACKLOG_HIGH`] long before this is reached, so
+/// forgetting the oldest changes no decision.
+const UNACKED_CAP: usize = 4096;
+
+/// Note that a chunk of stream `id` went out, for rate control.
+///
+/// One chunk becomes several Opus packets sharing its seq; it is recorded once,
+/// so the backlog stays in the chunks [`BACKLOG_HIGH`] is written in.
+fn record_sent(
+    unacked: &mut HashMap<u32, VecDeque<u32>>,
+    sent_since_adapt: &mut std::collections::HashSet<u32>,
+    id: u32,
+    seq: u32,
+) {
+    let queue = unacked.entry(id).or_default();
+    if queue.back() != Some(&seq) {
+        queue.push_back(seq);
+        if queue.len() > UNACKED_CAP {
+            queue.pop_front();
+        }
+    }
+    sent_since_adapt.insert(id);
+}
 
 /// Bitrate floor and ceiling for adaptation (bits/s). The ceiling is the codec
 /// default; the floor stays intelligible for speech/music while cutting the
@@ -1345,7 +1395,9 @@ impl AudioEngine {
         // rather than inheriting a throttled encoder.
         self.encoders.remove(&stream_id);
         self.pending_packets.remove(&stream_id);
-        self.last_sent_seq.remove(&stream_id);
+        self.unacked.remove(&stream_id);
+        self.sent_since_adapt.remove(&stream_id);
+        self.caught_up_streak.remove(&stream_id);
         self.acked_seq.remove(&stream_id);
         self.stream_bitrate.remove(&stream_id);
         self.last_adapt.remove(&stream_id);
@@ -1906,9 +1958,14 @@ impl AudioEngine {
     /// link is falling behind. The rule is the design's — **degrade rather than
     /// buffer unboundedly** — so a sustained backlog drops the stream's Opus
     /// bitrate; a recovered link lets it climb back. (Applied on the encoder in
-    /// `pump`; here we only record the newest acked seq.)
+    /// `adapt_bitrate`; here we only retire what the ack covers.)
     fn on_ack(&mut self, ack: &cursio_protocol::AudioFrameAck) {
         self.acked_seq.insert(ack.id, ack.acked_seq);
+        if let Some(unacked) = self.unacked.get_mut(&ack.id) {
+            while unacked.front().is_some_and(|&seq| seq <= ack.acked_seq) {
+                unacked.pop_front();
+            }
+        }
     }
 
     /// A peer **requested** a change to a device we OWN (invariant #3: only the
@@ -2010,41 +2067,50 @@ impl AudioEngine {
     /// Re-evaluate each outbound stream's Opus bitrate from its sent-vs-acked gap.
     ///
     /// The design's rule is **degrade rather than buffer unboundedly**: a
-    /// sustained backlog (`sent - acked` over [`BACKLOG_HIGH`]) steps the bitrate
-    /// down; a caught-up link (under [`BACKLOG_LOW`]) steps it back up toward the
-    /// default. A change is applied to the running encoder, never by replacing
-    /// it: the peer's decoder carries the old encoder's state, and a fresh
-    /// encoder's first packets decode against that state as a loud burst. Runs
-    /// at most once per [`ADAPT_INTERVAL`] per stream, with hysteresis, so it
-    /// tracks trends instead of oscillating on jitter.
+    /// sustained backlog (chunks sent but unacknowledged, over [`BACKLOG_HIGH`])
+    /// steps the bitrate down; a link that has stayed caught up (under
+    /// [`BACKLOG_LOW`]) for [`BITRATE_RAISE_AFTER`] evaluations steps it back up
+    /// toward the default. A change is applied to the running encoder, never by
+    /// replacing it: the peer's decoder carries the old encoder's state, and a
+    /// fresh encoder's first packets decode against that state as a loud
+    /// burst. Runs at most once per [`ADAPT_INTERVAL`] per stream, and only for
+    /// a stream that sent something since the last look.
     fn adapt_bitrate(&mut self) {
         let now = std::time::Instant::now();
-        // Only streams we're actively sending have a last_sent_seq entry.
-        let ids: Vec<u32> = self.last_sent_seq.keys().copied().collect();
+        // Only streams we're actively sending have an `unacked` entry.
+        let ids: Vec<u32> = self.unacked.keys().copied().collect();
         for id in ids {
             let due = self
                 .last_adapt
                 .get(&id)
                 .is_none_or(|t| now.duration_since(*t) >= ADAPT_INTERVAL);
-            if !due {
+            if !due || !self.sent_since_adapt.contains(&id) {
+                continue;
+            }
+            // No ack yet ⇒ assume the link is fine and leave the rate alone; a
+            // missing ack is not evidence of congestion.
+            if !self.acked_seq.contains_key(&id) {
                 continue;
             }
             self.last_adapt.insert(id, now);
-
-            let sent = self.last_sent_seq.get(&id).copied().unwrap_or(0);
-            // No ack yet ⇒ assume the link is fine and leave the rate alone; a
-            // missing ack is not evidence of congestion.
-            let Some(&acked) = self.acked_seq.get(&id) else {
-                continue;
-            };
-            let gap = sent.saturating_sub(acked);
+            self.sent_since_adapt.remove(&id);
+            let gap = self.unacked.get(&id).map_or(0, |q| q.len()) as u32;
 
             let current = self
                 .stream_bitrate
                 .get(&id)
                 .copied()
                 .unwrap_or(BITRATE_START);
-            let target = next_bitrate(current, gap);
+            let streak = self.caught_up_streak.entry(id).or_insert(0);
+            *streak = if gap < BACKLOG_LOW { *streak + 1 } else { 0 };
+            let mut target = next_bitrate(current, gap);
+            if target > current {
+                if *streak < BITRATE_RAISE_AFTER {
+                    target = current;
+                } else {
+                    *streak = 0;
+                }
+            }
 
             if target != current {
                 // No encoder yet means nothing to change: `pump` builds the
@@ -2649,6 +2715,98 @@ mod tests {
             b, def,
             "repeated recovery must settle exactly at the default"
         );
+    }
+
+    /// Send chunks `seqs` on stream `id`, then run one rate-control evaluation
+    /// as though its interval had elapsed.
+    fn send_and_adapt(e: &mut AudioEngine, id: u32, seqs: std::ops::Range<u32>) {
+        for seq in seqs {
+            record_sent(&mut e.unacked, &mut e.sent_since_adapt, id, seq);
+        }
+        e.last_adapt.clear();
+        e.adapt_bitrate();
+    }
+
+    fn ack(e: &mut AudioEngine, id: u32, acked_seq: u32) {
+        e.on_ack(&cursio_protocol::AudioFrameAck { id, acked_seq });
+    }
+
+    /// Silence between two sounds is not a backlog.
+    ///
+    /// The capture's seq keeps counting through silence, whose chunks are
+    /// dropped rather than sent, so the first chunk after a pause carries a seq
+    /// far past the last one acknowledged. Read as `last_sent - acked`, 10 000
+    /// chunks of silence between two videos looked like 50 s of unplayed audio,
+    /// and the stream was stepped to its floor the moment sound came back.
+    #[test]
+    fn a_long_silence_followed_by_audio_does_not_lower_the_bitrate() {
+        let mut e = engine();
+        let def = cursio_audio::codec::DEFAULT_BITRATE;
+        e.stream_bitrate.insert(7, def);
+
+        send_and_adapt(&mut e, 7, 0..50);
+        ack(&mut e, 7, 49);
+
+        // Resume after 10 000 silent chunks; nothing new acknowledged yet.
+        for tick in 0..6 {
+            send_and_adapt(&mut e, 7, 10_050 + tick * 10..10_060 + tick * 10);
+            assert_eq!(
+                e.stream_bitrate.get(&7),
+                Some(&def),
+                "the first seconds after a pause must not read as a backlog"
+            );
+        }
+    }
+
+    /// A real backlog still steps the rate down, once per new piece of
+    /// evidence rather than once per tick.
+    #[test]
+    fn a_real_backlog_lowers_the_bitrate_once_per_evaluation_with_new_sends() {
+        let mut e = engine();
+        let def = cursio_audio::codec::DEFAULT_BITRATE;
+        e.stream_bitrate.insert(7, def);
+        ack(&mut e, 7, 0);
+
+        send_and_adapt(&mut e, 7, 1..BACKLOG_HIGH + 50);
+        let lowered = *e.stream_bitrate.get(&7).unwrap();
+        assert!(
+            lowered < def,
+            "a backlog over the threshold must shed bitrate"
+        );
+
+        // Nothing sent since: the same evidence must not be judged again.
+        e.last_adapt.clear();
+        e.adapt_bitrate();
+        assert_eq!(
+            e.stream_bitrate.get(&7),
+            Some(&lowered),
+            "an unchanged backlog must not step the rate down a second time"
+        );
+    }
+
+    /// The rate climbs back only after the link has stayed caught up.
+    #[test]
+    fn bitrate_climbs_only_after_the_link_stays_caught_up() {
+        let mut e = engine();
+        e.stream_bitrate.insert(7, BITRATE_START);
+        ack(&mut e, 7, 0);
+
+        let mut seq = 1;
+        for tick in 1..=BITRATE_RAISE_AFTER {
+            send_and_adapt(&mut e, 7, seq..seq + 5);
+            ack(&mut e, 7, seq + 4);
+            seq += 5;
+            let expected = if tick < BITRATE_RAISE_AFTER {
+                BITRATE_START
+            } else {
+                BITRATE_START + BITRATE_STEP
+            };
+            assert_eq!(
+                e.stream_bitrate.get(&7),
+                Some(&expected),
+                "tick {tick}: one calm sample must not raise the rate"
+            );
+        }
     }
 
     fn engine() -> AudioEngine {
