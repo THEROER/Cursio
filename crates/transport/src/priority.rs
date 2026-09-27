@@ -20,6 +20,13 @@
 //! at `send` time would fix the nonce order at enqueue time and interleaving
 //! would corrupt the stream.
 //!
+//! ## Starvation
+//!
+//! Strict priority is broken on purpose in one place: when bulk traffic has
+//! waited out `BULK_STARVATION_LIMIT` frames of the classes above it, one
+//! whole bulk message goes next. Control and input are exempt and still go
+//! first; see `Queues::pop_highest`.
+//!
 //! ## Latency vs. buffering
 //!
 //! Queues are unbounded but drained continuously, so steady traffic (input,
@@ -34,11 +41,22 @@ use async_trait::async_trait;
 use cursio_protocol::{Message, Priority};
 use tokio::sync::Notify;
 
-use crate::crypto::{chunk_plaintext, seal_frame, SharedNoise};
+use crate::crypto::{chunk_plaintext, has_more_parts, seal_frame, SharedNoise};
 use crate::{TransportError, TransportTx};
 
 /// Number of priority classes (see [`Priority`]). Kept as an array index space.
-const CLASS_COUNT: usize = 5;
+const CLASS_COUNT: usize = 6;
+
+/// Frames of higher-priority traffic that may go ahead of a waiting bulk frame
+/// before one is let through regardless.
+///
+/// Sized so the guarantee is cheap for everything above: at 32, a transfer gets
+/// at least one message through per 32 frames of audio, video or metadata, and
+/// those wait out one bulk message when it happens. Input and control never
+/// do, since a forced frame does not overtake them. Lower would spend more of
+/// a busy link on bulk than a latency-sensitive session can afford; much
+/// higher stops rescuing the transfer at all.
+const BULK_STARVATION_LIMIT: u32 = 32;
 
 /// Map a [`Priority`] to a queue index, highest priority = lowest index so the
 /// drainer can scan `0..` and stop at the first non-empty class.
@@ -48,7 +66,8 @@ fn class_index(p: Priority) -> usize {
         Priority::Input => 1,
         Priority::Audio => 2,
         Priority::Video => 3,
-        Priority::Bulk => 4,
+        Priority::Metadata => 4,
+        Priority::Bulk => 5,
     }
 }
 
@@ -63,6 +82,21 @@ struct Queues {
     /// Bytes of each class actually written to the socket, ever. Paired with
     /// `queued_bytes` in [`QueueDepth`]; see there for what it is for.
     sent_bytes: [u64; CLASS_COUNT],
+    /// Frames sent from a class above `Bulk` since the last `Bulk` frame went
+    /// out, counted only while `Bulk` has something waiting.
+    ///
+    /// Strict priority alone starves the bottom class whenever the one above it
+    /// is never empty, and file traffic makes that ordinary rather than
+    /// exceptional: serving a download, four of every five messages are
+    /// metadata — an `open`, a `stat` and a `close` around each chunk — so
+    /// `Metadata` refilled faster than it drained and the chunks themselves sat
+    /// behind it. Measured against Steam: 3355 metadata messages in a
+    /// half-minute carried 1 write, and windows with 800-odd carried none at
+    /// all, while the loop's own pace allowed two hundred a second.
+    starved_bulk: u32,
+    /// Mid-message: a forced bulk frame was a part, so the rest of that message
+    /// goes out before higher-priority traffic resumes.
+    releasing_bulk: bool,
     /// Set once the sender side is gone *and* all queues are empty, so the
     /// drainer knows to exit cleanly rather than park forever.
     closed: bool,
@@ -84,11 +118,49 @@ impl Queues {
     /// Returns the class alongside the frame so the drainer can credit the
     /// bytes to it once they are on the wire.
     fn pop_highest(&mut self) -> Option<(usize, Vec<u8>)> {
-        let (idx, frame) = self
-            .classes
-            .iter_mut()
-            .enumerate()
-            .find_map(|(idx, q)| q.pop_front().map(|f| (idx, f)))?;
+        // A bulk frame forced through after `BULK_STARVATION_LIMIT` frames of
+        // higher-priority traffic went ahead of it. One in every few dozen is
+        // far too little to be felt by anything above, and it is the difference
+        // between a transfer that progresses and one that does not.
+        //
+        // Once a bulk frame is forced through, the rest of its message follows
+        // before the count starts again. A logical message is chunked to the
+        // Noise plaintext limit, so one `FilesMsg::MAX_CHUNK` read reply leaves
+        // here as five frames; charging each of them separately meant a single
+        // reply needed five turns of the quota, with a hundred and sixty
+        // metadata frames passing in between. Releasing the run keeps the
+        // guarantee at one *message* rather than one frame.
+        //
+        // Control and Input stay above a forced frame and above a release in
+        // progress. They cannot starve anything — neither stays non-empty — and
+        // a logical message may be up to 64 MiB, so a release that held them
+        // back would stall heartbeats and the cursor for the whole of it.
+        let bulk = CLASS_COUNT - 1;
+        let urgent = class_index(Priority::Input);
+        let urgent_waiting = self.classes[..=urgent].iter().any(|q| !q.is_empty());
+        let forced = !urgent_waiting
+            && !self.classes[bulk].is_empty()
+            && (self.releasing_bulk || self.starved_bulk >= BULK_STARVATION_LIMIT);
+        let (idx, frame) = if forced {
+            self.classes[bulk].pop_front().map(|f| (bulk, f))?
+        } else {
+            self.classes
+                .iter_mut()
+                .enumerate()
+                .find_map(|(idx, q)| q.pop_front().map(|f| (idx, f)))?
+        };
+        if idx == bulk {
+            self.starved_bulk = 0;
+            // `send` queues a message's parts contiguously under one lock, so
+            // the frame behind a part that is not the last belongs to the same
+            // message. Its last part ends the run.
+            self.releasing_bulk = (forced || self.releasing_bulk) && has_more_parts(&frame);
+        } else if !self.classes[bulk].is_empty() {
+            // Counted only against a queue that actually has something waiting:
+            // metadata flowing while nothing bulk is pending is not starvation,
+            // and must not bank credit for a transfer that starts later.
+            self.starved_bulk += 1;
+        }
         // Leaving the queue is what "no longer waiting" means; the bytes are
         // credited as sent only after the socket takes them.
         self.queued_bytes[idx] -= frame.len();
@@ -285,6 +357,162 @@ mod tests {
         assert_eq!(q.pop_highest().map(|(_, f)| f), Some(vec![AUDIO]));
         assert_eq!(q.pop_highest().map(|(_, f)| f), Some(vec![BULK]));
         assert!(q.pop_highest().is_none());
+    }
+
+    /// A busy class above must not stop bulk traffic entirely.
+    ///
+    /// Strict priority assumed the upper class drains; file traffic breaks that
+    /// assumption, since serving a download queues an `open`, a `stat` and a
+    /// `close` around every chunk. Live against Steam, half-minute windows
+    /// carrying 800 metadata messages carried no writes at all.
+    #[test]
+    fn endless_metadata_still_lets_bulk_through() {
+        let mut q = Queues::default();
+        let bulk = class_index(Priority::Bulk);
+        let meta = class_index(Priority::Metadata);
+
+        // One transfer waiting, and metadata arriving faster than it drains.
+        for _ in 0..8 {
+            q.push(bulk, vec![0u8; 4]);
+        }
+        let mut sent_bulk = 0;
+        for _ in 0..(BULK_STARVATION_LIMIT * 4) {
+            q.push(meta, vec![0u8; 1]);
+            if let Some((idx, _)) = q.pop_highest() {
+                if idx == bulk {
+                    sent_bulk += 1;
+                }
+            }
+        }
+
+        assert!(
+            sent_bulk > 0,
+            "a transfer makes progress however busy the class above it is"
+        );
+    }
+
+    /// A forced bulk frame releases the rest of its message with it.
+    ///
+    /// The quota counts frames, but a bulk message is many: an application's
+    /// 1.2 MB write is chunked to the Noise plaintext limit and arrives here as
+    /// thirteen. Charged one at a time, that write needed thirteen turns of the
+    /// quota and four hundred metadata frames could pass in between — which is
+    /// why guaranteeing one frame in thirty-two barely moved a transfer.
+    #[test]
+    fn a_forced_bulk_message_goes_out_whole() {
+        let mut q = Queues::default();
+        let bulk = class_index(Priority::Bulk);
+        let meta = class_index(Priority::Metadata);
+
+        // One file-sized message, and endless metadata alongside it.
+        let parts = chunked_message();
+        let part_count = parts.len();
+        assert!(part_count > 1, "the test message must need several frames");
+        for f in parts {
+            q.push(bulk, f);
+        }
+        for _ in 0..64 {
+            q.push(meta, vec![0u8; 1]);
+        }
+
+        // Drain until the first bulk frame is forced, then the run must follow
+        // without interruption.
+        let mut seen_bulk = 0;
+        let mut run_broken = false;
+        while let Some((idx, _)) = q.pop_highest() {
+            if idx == bulk {
+                seen_bulk += 1;
+            } else if seen_bulk > 0 && seen_bulk < part_count {
+                run_broken = true;
+            }
+        }
+
+        assert_eq!(seen_bulk, part_count, "every part of the message went out");
+        assert!(
+            !run_broken,
+            "the parts of one message are not split by other traffic"
+        );
+    }
+
+    /// A release ends with its message, not with the bulk queue.
+    ///
+    /// Every piece of a chunked message is tagged `PART`, the last included, so
+    /// keying the release on the tag alone let one forced frame carry every
+    /// transfer queued behind it — and nothing else went out meanwhile.
+    #[test]
+    fn a_release_stops_at_the_end_of_its_message() {
+        let mut q = Queues::default();
+        let bulk = class_index(Priority::Bulk);
+        let meta = class_index(Priority::Metadata);
+
+        let part_count = chunked_message().len();
+        for _ in 0..3 {
+            for f in chunked_message() {
+                q.push(bulk, f);
+            }
+        }
+        q.starved_bulk = BULK_STARVATION_LIMIT;
+        q.push(meta, vec![0u8; 1]);
+
+        for _ in 0..part_count {
+            assert_eq!(q.pop_highest().map(|(idx, _)| idx), Some(bulk));
+        }
+        assert_eq!(
+            q.pop_highest().map(|(idx, _)| idx),
+            Some(meta),
+            "the next message waits for its own turn of the quota"
+        );
+    }
+
+    /// Input and control still go first while a bulk message is released.
+    ///
+    /// A logical message may run to 64 MiB; holding the cursor and heartbeats
+    /// back for all of it would be felt as a frozen pointer or a dropped link.
+    #[test]
+    fn input_overtakes_a_bulk_release_in_progress() {
+        let mut q = Queues::default();
+        let bulk = class_index(Priority::Bulk);
+        let input = class_index(Priority::Input);
+        let control = class_index(Priority::Control);
+
+        for f in chunked_message() {
+            q.push(bulk, f);
+        }
+        q.starved_bulk = BULK_STARVATION_LIMIT;
+        assert_eq!(q.pop_highest().map(|(idx, _)| idx), Some(bulk));
+
+        q.push(input, vec![0u8; 1]);
+        q.push(control, vec![0u8; 1]);
+        assert_eq!(q.pop_highest().map(|(idx, _)| idx), Some(control));
+        assert_eq!(q.pop_highest().map(|(idx, _)| idx), Some(input));
+        assert_eq!(
+            q.pop_highest().map(|(idx, _)| idx),
+            Some(bulk),
+            "the release resumes once the urgent frames are out"
+        );
+    }
+
+    /// The tagged frames of one message the size of a file read reply.
+    fn chunked_message() -> Vec<Vec<u8>> {
+        chunk_plaintext(&Message::Opaque(vec![0u8; 256 * 1024])).unwrap()
+    }
+
+    /// Credit is not banked while nothing bulk is waiting.
+    ///
+    /// Otherwise a quiet period of metadata would buy a later transfer the
+    /// right to jump the queue for frames that had never been delayed.
+    #[test]
+    fn metadata_alone_banks_no_credit_against_bulk() {
+        let mut q = Queues::default();
+        let meta = class_index(Priority::Metadata);
+        for _ in 0..(BULK_STARVATION_LIMIT * 2) {
+            q.push(meta, vec![0u8; 1]);
+            q.pop_highest();
+        }
+        assert_eq!(
+            q.starved_bulk, 0,
+            "no bulk was waiting, so nothing was starved"
+        );
     }
 
     /// The backlog a class reports must be its own, and must fall as the

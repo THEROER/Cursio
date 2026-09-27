@@ -64,6 +64,21 @@ mod frame_tag {
 /// Fixed 8 bytes, big-endian, right after [`frame_tag::PART`].
 const PART_HEADER_LEN: usize = 4 + 2 + 2;
 
+/// Whether a tagged plaintext frame has more of its message queued behind it,
+/// which is what lets the drainer release a whole message as a unit.
+///
+/// The tag alone cannot answer this: the *last* piece of a chunked message is
+/// tagged `PART` like every other, so a drainer keying on the tag never sees a
+/// message end while chunked messages keep arriving back to back.
+pub(crate) fn has_more_parts(tagged: &[u8]) -> bool {
+    if tagged.first() != Some(&frame_tag::PART) || tagged.len() < 1 + PART_HEADER_LEN {
+        return false;
+    }
+    let idx = u16::from_be_bytes([tagged[5], tagged[6]]);
+    let count = u16::from_be_bytes([tagged[7], tagged[8]]);
+    idx.saturating_add(1) < count
+}
+
 /// Usable payload per `PART` frame: the Noise budget minus the 1-byte tag and
 /// the part header. What's left is how much of the message each frame carries.
 const MAX_CHUNK_PAYLOAD: usize = MAX_NOISE_PLAINTEXT - 1 - PART_HEADER_LEN;
@@ -783,5 +798,16 @@ mod tests {
         assert!(reassembler.accept(&tagged).is_err());
         assert!(reassembler.in_progress.is_empty());
         assert_eq!(reassembler.buffered_bytes, 0);
+    }
+
+    #[test]
+    fn only_the_last_part_of_a_chunked_message_ends_it() {
+        let frames = chunk_plaintext(&Message::Opaque(vec![0u8; 3 * MAX_CHUNK_PAYLOAD])).unwrap();
+        let (last, rest) = frames.split_last().unwrap();
+        assert!(rest.iter().all(|f| has_more_parts(f)));
+        assert!(!has_more_parts(last), "the last part is tagged PART too");
+
+        let whole = chunk_plaintext(&Message::Opaque(vec![0u8; 16])).unwrap();
+        assert!(!has_more_parts(&whole[0]));
     }
 }
