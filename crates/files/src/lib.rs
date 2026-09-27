@@ -37,7 +37,7 @@ pub mod winmount;
 pub mod writeback;
 
 pub use background::Workers;
-pub use server::{FileServer, SharedVolume};
+pub use server::{FileServer, Namespace, SharedVolume};
 
 /// Directory name a volume is presented under, on either mount.
 ///

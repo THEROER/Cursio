@@ -1547,12 +1547,19 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
         })
     }
 
+    // Path operations never hold the server's lock across the disk: taken for
+    // the length of an `Arc` clone, released before anything is read. See
+    // [`cursio_files::Namespace`].
+    let ns = || {
+        server
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .namespace()
+    };
+
     match msg {
         FilesMsg::ReadDir { req, volume, path } => {
-            let r = server
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .read_dir(&volume, &path);
+            let r = ns().read_dir(&volume, &path);
             answer(req, &format!("readdir {volume}/{path}"), r, |entries| {
                 FilesMsg::DirEntries {
                     req,
@@ -1564,19 +1571,13 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             })
         }
         FilesMsg::Stat { req, volume, path } => {
-            let r = server
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .stat(&volume, &path);
+            let r = ns().stat(&volume, &path);
             answer(req, &format!("stat {volume}/{path}"), r, |meta| {
                 FilesMsg::StatResult { req, meta }
             })
         }
         FilesMsg::ReadLink { req, volume, path } => {
-            let r = server
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .read_link(&volume, &path);
+            let r = ns().read_link(&volume, &path);
             answer(req, &format!("readlink {volume}/{path}"), r, |target| {
                 FilesMsg::LinkTarget { req, target }
             })
@@ -1587,10 +1588,16 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             path,
             mode,
         } => {
-            let r = server
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .open(&volume, &path, mode);
+            // Opened outside the lock — on Windows an open can wait on another
+            // process's sharing lock or an antivirus scan — and handed a handle
+            // under it afterwards.
+            let r = ns().open(&volume, &path, mode).map(|(file, size)| {
+                let handle = server
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .adopt(file, mode.write);
+                (handle, size)
+            });
             answer(
                 req,
                 &format!("open {volume}/{path}"),
@@ -1671,19 +1678,13 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             )
         }
         FilesMsg::MkDir { req, volume, path } => {
-            let r = server
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .mkdir(&volume, &path);
+            let r = ns().mkdir(&volume, &path);
             answer(req, &format!("mkdir {volume}/{path}"), r, |()| {
                 FilesMsg::Ok { req }
             })
         }
         FilesMsg::Remove { req, volume, path } => {
-            let r = server
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&volume, &path);
+            let r = ns().remove(&volume, &path);
             answer(req, &format!("remove {volume}/{path}"), r, |()| {
                 FilesMsg::Ok { req }
             })
@@ -1694,10 +1695,7 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             from,
             to,
         } => {
-            let r = server
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .rename(&volume, &from, &to);
+            let r = ns().rename(&volume, &from, &to);
             answer(req, &format!("rename {volume}/{from} -> {to}"), r, |()| {
                 FilesMsg::Ok { req }
             })

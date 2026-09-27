@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use cursio_protocol::{FileError, FileHandle, FileKind, FileMeta, OpenMode, Volume};
 
 /// A volume this machine offers, and where it actually lives.
+#[derive(Clone)]
 pub struct SharedVolume {
     pub info: Volume,
     /// Native path the volume's root maps to: `/` or `C:\`.
@@ -23,9 +24,25 @@ pub struct SharedVolume {
 /// Owns the open-file table: handles are indices into it, so a handle the peer
 /// invents addresses nothing.
 pub struct FileServer {
-    volumes: Vec<SharedVolume>,
+    ns: std::sync::Arc<Namespace>,
     open: HashMap<FileHandle, OpenFile>,
     next_handle: FileHandle,
+}
+
+/// What the peer may address, and everything that works on a path alone.
+///
+/// Split from [`FileServer`] so path operations run without its lock. The
+/// server sits behind one mutex for the sake of its open-file table, and a
+/// `readdir` or `stat` done under it held every other request — for every
+/// other file — for as long as the disk took. On a Windows host one slow
+/// directory (a `C:\Windows` subtree, a file Defender was scanning) stalled six
+/// unrelated requests for 3.45 s, all answered in the same millisecond, past
+/// the peer's 3 s deadline; a download writing through the same server stalls
+/// the same way. The caller takes an `Arc` of this under the lock and does the
+/// disk work after releasing it, as [`FileHandleRef`] already does for reads
+/// and writes.
+pub struct Namespace {
+    volumes: Vec<SharedVolume>,
     /// Native paths that must never be served, however the peer addresses them.
     ///
     /// This is where the peer's own disks are mounted on this machine. Serving
@@ -67,24 +84,29 @@ impl FileServer {
     /// Offer the volumes this machine has.
     pub fn new(volumes: Vec<SharedVolume>) -> Self {
         Self {
-            volumes,
+            ns: std::sync::Arc::new(Namespace {
+                volumes,
+                excluded: Vec::new(),
+            }),
             open: HashMap::new(),
             next_handle: 1,
-            excluded: Vec::new(),
         }
     }
 
     /// Refuse to serve anything under these native paths.
     ///
     /// Set to where the peer's own volumes are mounted here; see
-    /// [`FileServer::excluded`] for what serving them back costs.
+    /// [`Namespace::excluded`] for what serving them back costs.
     pub fn exclude(&mut self, paths: Vec<PathBuf>) {
-        self.excluded = paths;
+        self.ns = std::sync::Arc::new(Namespace {
+            volumes: self.ns.volumes.clone(),
+            excluded: paths,
+        });
     }
 
-    /// Whether this resolved path lies in a place that must not be served.
-    fn is_excluded(&self, path: &Path) -> bool {
-        self.excluded.iter().any(|e| path.starts_with(e))
+    /// The path half of the server, to use after releasing its lock.
+    pub fn namespace(&self) -> std::sync::Arc<Namespace> {
+        self.ns.clone()
     }
 
     /// Detect what this machine can share.
@@ -98,7 +120,7 @@ impl FileServer {
 
     /// What to announce to the peer.
     pub fn volumes(&self) -> Vec<Volume> {
-        self.volumes.iter().map(|v| v.info.clone()).collect()
+        self.ns.volumes.iter().map(|v| v.info.clone()).collect()
     }
 
     /// Take the volume set from a fresh scan, keeping the handles this one has
@@ -118,7 +140,70 @@ impl FileServer {
     /// does. That is the same answer a local program gets, and a truthful error
     /// from the kernel beats a fabricated one from us.
     pub fn adopt_volumes(&mut self, scanned: FileServer) {
-        self.volumes = scanned.volumes;
+        self.ns = std::sync::Arc::new(Namespace {
+            volumes: scanned.ns.volumes.clone(),
+            excluded: self.ns.excluded.clone(),
+        });
+    }
+
+    pub fn resolve(&self, volume: &str, path: &str) -> Result<PathBuf, FileError> {
+        self.ns.resolve(volume, path)
+    }
+
+    pub fn read_dir(&self, volume: &str, path: &str) -> Result<Vec<FileMeta>, FileError> {
+        self.ns.read_dir(volume, path)
+    }
+
+    pub fn stat(&self, volume: &str, path: &str) -> Result<FileMeta, FileError> {
+        self.ns.stat(volume, path)
+    }
+
+    pub fn read_link(&self, volume: &str, path: &str) -> Result<String, FileError> {
+        self.ns.read_link(volume, path)
+    }
+
+    /// Open a file, returning a handle and its current size.
+    pub fn open(
+        &mut self,
+        volume: &str,
+        path: &str,
+        mode: OpenMode,
+    ) -> Result<(FileHandle, u64), FileError> {
+        let (file, size) = self.ns.open(volume, path, mode)?;
+        Ok((self.adopt(file, mode.write), size))
+    }
+
+    /// Give a file opened through [`Namespace::open`] a handle.
+    pub fn adopt(&mut self, file: File, writable: bool) -> FileHandle {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        self.open.insert(
+            handle,
+            OpenFile {
+                file: std::sync::Arc::new(file),
+                writable,
+            },
+        );
+        handle
+    }
+
+    pub fn mkdir(&self, volume: &str, path: &str) -> Result<(), FileError> {
+        self.ns.mkdir(volume, path)
+    }
+
+    pub fn remove(&self, volume: &str, path: &str) -> Result<(), FileError> {
+        self.ns.remove(volume, path)
+    }
+
+    pub fn rename(&self, volume: &str, from: &str, to: &str) -> Result<(), FileError> {
+        self.ns.rename(volume, from, to)
+    }
+}
+
+impl Namespace {
+    /// Whether this resolved path lies in a place that must not be served.
+    fn is_excluded(&self, path: &Path) -> bool {
+        self.excluded.iter().any(|e| path.starts_with(e))
     }
 
     /// Resolve a wire path (volume id + `/`-separated relative path) to a native
@@ -159,7 +244,7 @@ impl FileServer {
         }
         // Where the peer's own disks are mounted here. Refused rather than
         // served, or the peer follows the path back to its own files across the
-        // network — see [`FileServer::excluded`].
+        // network — see [`Namespace::excluded`].
         if self.is_excluded(&out) {
             return Err(FileError::Denied);
         }
@@ -244,13 +329,9 @@ impl FileServer {
             .ok_or(FileError::Io("link target is not valid utf-8".into()))
     }
 
-    /// Open a file, returning a handle and its current size.
-    pub fn open(
-        &mut self,
-        volume: &str,
-        path: &str,
-        mode: OpenMode,
-    ) -> Result<(FileHandle, u64), FileError> {
+    /// Open a file, returning it and its current size. It has no handle until
+    /// [`FileServer::adopt`] gives it one.
+    pub fn open(&self, volume: &str, path: &str, mode: OpenMode) -> Result<(File, u64), FileError> {
         if mode.is_mutating() && !self.writable(volume) {
             return Err(FileError::ReadOnly);
         }
@@ -264,19 +345,11 @@ impl FileServer {
             .open(&target)
             .map_err(to_file_error)?;
         let size = file.metadata().map_err(to_file_error)?.len();
-
-        let handle = self.next_handle;
-        self.next_handle += 1;
-        self.open.insert(
-            handle,
-            OpenFile {
-                file: std::sync::Arc::new(file),
-                writable: mode.write,
-            },
-        );
-        Ok((handle, size))
+        Ok((file, size))
     }
+}
 
+impl FileServer {
     /// Read from an open handle. Returns fewer bytes than asked at end of file.
     pub fn read(&self, handle: FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, FileError> {
         // The handle is looked up under the caller's lock; the disk is touched
@@ -356,7 +429,9 @@ impl FileServer {
     pub fn close(&mut self, handle: FileHandle) {
         self.open.remove(&handle);
     }
+}
 
+impl Namespace {
     /// Create a directory.
     pub fn mkdir(&self, volume: &str, path: &str) -> Result<(), FileError> {
         if !self.writable(volume) {
@@ -1139,6 +1214,36 @@ mod tests {
         assert!(backing_disk("proc").is_none());
     }
 
+    #[test]
+    fn path_operations_run_while_the_server_is_locked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.txt"), b"x").expect("write");
+        let server = std::sync::Mutex::new(server_on(tmp.path()));
+        let ns = server.lock().expect("lock").namespace();
+
+        // Another request holding the server — a handle being adopted or
+        // closed — must not stop a listing, a stat or an open elsewhere.
+        let held = server.lock().expect("lock");
+        let listing = std::thread::scope(|s| {
+            s.spawn(|| {
+                let names: Vec<String> = ns
+                    .read_dir("T:", "")
+                    .expect("lists")
+                    .into_iter()
+                    .map(|m| m.name)
+                    .collect();
+                ns.stat("T:", "a.txt").expect("stats");
+                ns.open("T:", "a.txt", OpenMode::read_only())
+                    .expect("opens");
+                names
+            })
+            .join()
+            .expect("path work finished with the server locked")
+        });
+        drop(held);
+        assert_eq!(listing, vec!["a.txt".to_string()]);
+    }
+
     fn server_on(root: &Path) -> FileServer {
         FileServer::new(vec![SharedVolume {
             info: Volume {
@@ -1290,8 +1395,8 @@ mod tests {
 
         // A rescan finds a second volume: the set changed, so the session
         // adopts it.
-        let mut scanned = server_on(tmp.path());
-        scanned.volumes.push(SharedVolume {
+        let mut volumes = server_on(tmp.path()).ns.volumes.clone();
+        volumes.push(SharedVolume {
             info: Volume {
                 id: "U:".to_string(),
                 label: "Added".to_string(),
@@ -1302,6 +1407,7 @@ mod tests {
             },
             root: tmp.path().to_path_buf(),
         });
+        let scanned = FileServer::new(volumes);
         srv.adopt_volumes(scanned);
 
         assert_eq!(srv.volumes().len(), 2, "the new set is in place");
