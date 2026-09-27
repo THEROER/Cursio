@@ -104,7 +104,28 @@ pub struct UsbNode {
     /// rather than as a special case. The arbiter keys a lease by peer, and the
     /// host contends for it like everybody else.
     host: PeerId,
+    /// Drained output no session has claimed yet, with when it was drained.
+    ///
+    /// The backend is drained by whichever session pumps first, and that
+    /// session used to keep its own streams and throw the rest away — so with
+    /// two peers attached, every URB reply and every stream end owed to the
+    /// other link was lost to the first one's pump. What a caller does not own
+    /// now waits here for the session that does.
+    unclaimed: Vec<(std::time::Instant, Unclaimed)>,
 }
+
+/// One piece of drained output waiting for its session.
+enum Unclaimed {
+    Data(UsbStreamId, Vec<u8>),
+    Ended(UsbStreamId),
+}
+
+/// How long drained output waits for a session to claim it.
+///
+/// Every session pumps every few milliseconds, so anything still here after
+/// this belongs to a stream whose link has gone — held longer, it would only
+/// grow for the life of the process.
+const UNCLAIMED_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl UsbNode {
     pub fn new(backend: Box<dyn UsbBackend>, host: PeerId) -> Self {
@@ -114,7 +135,49 @@ impl UsbNode {
             next_stream: 1,
             answers: Vec::new(),
             host,
+            unclaimed: Vec::new(),
         }
+    }
+
+    /// Drain the backend and hand back only what `peer` is owed, keeping the
+    /// rest for the sessions it belongs to.
+    ///
+    /// `borrowed` are the streams `peer`'s session opened as an importer; the
+    /// streams it holds on this machine's devices are known here.
+    pub fn drain_for(&mut self, peer: PeerId, borrowed: &[UsbStreamId]) -> Drained {
+        let now = std::time::Instant::now();
+        let fresh = self.drain();
+        self.unclaimed.extend(
+            fresh
+                .to_peers
+                .into_iter()
+                .map(|(s, b)| (now, Unclaimed::Data(s, b)))
+                .chain(fresh.ended.into_iter().map(|s| (now, Unclaimed::Ended(s)))),
+        );
+
+        let owns = |node: &Self, stream: UsbStreamId| {
+            borrowed.contains(&stream)
+                || node
+                    .device_of_stream(stream)
+                    .is_some_and(|device| node.holds(device, peer, stream))
+        };
+        let mut out = Drained::default();
+        let mut kept = Vec::with_capacity(self.unclaimed.len());
+        for (at, item) in std::mem::take(&mut self.unclaimed) {
+            let stream = match &item {
+                Unclaimed::Data(s, _) | Unclaimed::Ended(s) => *s,
+            };
+            if owns(self, stream) {
+                match item {
+                    Unclaimed::Data(s, b) => out.to_peers.push((s, b)),
+                    Unclaimed::Ended(s) => out.ended.push(s),
+                }
+            } else if now.duration_since(at) < UNCLAIMED_TTL {
+                kept.push((at, item));
+            }
+        }
+        self.unclaimed = kept;
+        out
     }
 
     /// This machine's devices, each carrying who is using it.

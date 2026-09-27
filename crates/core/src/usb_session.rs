@@ -204,22 +204,6 @@ impl UsbEngine {
         }
     }
 
-    /// Whether a stream belongs to this link — either lent to this peer or
-    /// borrowed from it.
-    ///
-    /// Streams are numbered per machine and carried per link, so this is what
-    /// keeps one session from sending another's traffic.
-    fn owns_stream(&self, stream: UsbStreamId) -> bool {
-        if self.borrowed.values().any(|held| *held == stream) {
-            return true;
-        }
-        // One lock for both questions: `Mutex` is not reentrant, so taking it
-        // twice in one expression would deadlock this session against itself.
-        let node = self.node();
-        node.device_of_stream(stream)
-            .is_some_and(|device| node.holds(device, self.peer_id, stream))
-    }
-
     /// How many devices this machine is serving, for tests that assert a
     /// device was given back.
     #[cfg(test)]
@@ -575,16 +559,11 @@ impl SessionModule for UsbEngine {
         //
         // The node drains because the backend is one per machine: a session
         // collecting for itself would take the bytes belonging to every other
-        // link. What comes back is already routed, and the host's own loop has
-        // been closed inside it.
-        let drained = self.node().drain();
+        // link. It hands back only this link's streams and keeps the rest for
+        // their own sessions; the host's own loop has been closed inside it.
+        let borrowed: Vec<UsbStreamId> = self.borrowed.values().copied().collect();
+        let drained = self.node().drain_for(self.peer_id, &borrowed);
         for (stream, bytes) in drained.to_peers {
-            // Only this link's traffic. A stream belongs to one peer, and
-            // sending another's down this link would hand it URBs for an
-            // attachment it never made.
-            if !self.owns_stream(stream) {
-                continue;
-            }
             // Split at the protocol's cap rather than trusting the kernel to
             // read small: one read can be a whole bulk transfer, and a frame
             // over the limit is refused by the transport rather than sent.
@@ -596,9 +575,7 @@ impl SessionModule for UsbEngine {
             }
         }
         for stream in drained.ended {
-            if self.owns_stream(stream) {
-                self.end_stream(stream);
-            }
+            self.end_stream(stream);
         }
 
         // Replies the arbiter produced without the device — a cached
@@ -1508,6 +1485,43 @@ mod tests {
         assert!(
             e.node().is_local(UsbDeviceId(1)),
             "the host must attach its own device back to itself"
+        );
+    }
+
+    /// Two peers on one device: whichever session drains first must leave the
+    /// other's replies and stream ends for it, not throw them away.
+    #[test]
+    fn a_drain_by_one_link_keeps_another_links_traffic_for_it() {
+        let device = UsbDeviceId(1);
+        let produced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let node = node_of(FakeBackend {
+            produced: produced.clone(),
+            ..FakeBackend::with(&[1])
+        });
+        let mut a = UsbEngine::new("a".into(), peer(1), node.clone());
+        let mut b = UsbEngine::new("b".into(), peer(2), node.clone());
+        let grant = |e: &mut UsbEngine| match taken(e).as_slice() {
+            [UsbMsg::Claimed { stream, .. }] => *stream,
+            other => panic!("expected a grant, got {other:?}"),
+        };
+        a.on_claim(device, "adb");
+        let stream_a = grant(&mut a);
+        b.on_claim(device, "adb");
+        let stream_b = grant(&mut b);
+
+        produced
+            .lock()
+            .expect("test lock")
+            .extend([(stream_a, b"for a".to_vec()), (stream_b, b"for b".to_vec())]);
+
+        let first = node.lock().expect("node").drain_for(peer(1), &[]);
+        assert_eq!(first.to_peers, vec![(stream_a, b"for a".to_vec())]);
+
+        let second = node.lock().expect("node").drain_for(peer(2), &[]);
+        assert_eq!(
+            second.to_peers,
+            vec![(stream_b, b"for b".to_vec())],
+            "the second link's reply survived the first link's drain"
         );
     }
 
