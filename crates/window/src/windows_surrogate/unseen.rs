@@ -20,13 +20,16 @@
 //!
 //! Discord's own picker is stricter than Chromium's list, and was settled live
 //! against Discord itself rather than a probe (2026-09-27):
-//! - it drops `WS_EX_NOACTIVATE` windows from "Applications" entirely;
+//! - it drops `WS_EX_NOACTIVATE` and `WS_EX_TRANSPARENT` windows from
+//!   "Applications" entirely;
 //! - it pauses a shared window ("Stream Paused — switch to your application")
 //!   that is off the desktop, covered by other windows, or minimized.
 //!
 //! So the view sits *on* the primary monitor, topmost so nothing ever covers
-//! it, still alpha 0 so nobody sees it, and `WS_EX_TRANSPARENT` so every click
-//! and scroll falls through to whatever is underneath. Show Desktop (Win+D)
+//! it, and alpha 0 so nobody sees it. Alpha 0 is also what lets every click and
+//! scroll fall through to whatever is underneath: a layered window is hit-tested
+//! by its transparency, so `WS_EX_TRANSPARENT` would add nothing but Discord's
+//! filter — confirmed live with the view covering the whole screen. Show Desktop (Win+D)
 //! minimizes even topmost windows; the view restores itself at once. It is kept
 //! off the taskbar through `ITaskbarList::DeleteTab`, since the styles that
 //! would do that (`WS_EX_TOOLWINDOW`, `WS_EX_NOACTIVATE`, an owner) are exactly
@@ -47,21 +50,17 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongW, LoadIconW, RegisterWindowMessageW, SetLayeredWindowAttributes, SetWindowLongW,
     SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, IDI_APPLICATION, LWA_ALPHA, SWP_NOACTIVATE,
-    SWP_NOSIZE, WM_APP, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    SWP_NOSIZE, WM_APP, WS_EX_LAYERED,
 };
 
 /// The message the notification-area icon reports its clicks with.
 pub(super) const TRAY_MESSAGE: u32 = WM_APP + 1;
 
-/// Make `hwnd` unseen: layered and fully transparent, click-through, and
-/// placed over the primary monitor above everything else.
+/// Make `hwnd` unseen: layered and fully transparent (which also makes it
+/// click-through), placed over the primary monitor above everything else.
 pub(super) unsafe fn hide(hwnd: HWND) {
     let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-    let _ = SetWindowLongW(
-        hwnd,
-        GWL_EXSTYLE,
-        (ex | WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) as i32,
-    );
+    let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, (ex | WS_EX_LAYERED.0) as i32);
     if let Err(e) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA) {
         tracing::warn!(error = %e, "could not make the remote-screen view transparent");
     }
