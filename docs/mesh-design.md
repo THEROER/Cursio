@@ -221,10 +221,12 @@ asks is about the machine, not about a link. The lock is held only to copy a few
 small structs.
 
 Ids are dotted by subsystem so a panel can group them: `usb.held.<busid>`,
-`files.walk.<pid>.<peer>.<volume>`, `machine.memory` / `machine.swap` / `machine.io`,
-`peer.<peer-id>.down`, `module.<name>.<peer>.stalled`, `audio.driver`,
-`window.extension`, `portal.<name>`. The producers that live behind the platform
-crates (`cursio-usb`, `cursio-files`) cannot name `cursio-core`, so they report
+`usb.usbipd-exposed`, `files.walk.<pid>.<peer>.<volume>`, `machine.memory` /
+`machine.swap` / `machine.io` / `machine.commit`, `peer.<peer-id>.down`,
+`module.<name>.<peer>.stalled`, `audio.virtual-devices`,
+`window.shell-extension`, `portal.<name>`, `input.capture`. The producers that
+live behind the platform crates (`cursio-usb`, `cursio-files`, `cursio-window`)
+cannot name `cursio-core`, so they report
 through their own errors or a reporter hook that the matching `*_session.rs`
 turns into a `Problem`.
 
