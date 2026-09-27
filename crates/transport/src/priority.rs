@@ -33,16 +33,26 @@
 //! audio) never accumulates — latency stays minimal, which is the whole point.
 //! Only a genuine bulk transfer builds depth, and only in its own low-priority
 //! class where it can't delay anything above it.
+//!
+//! ## Measuring it
+//!
+//! Every frame carries the instant it was queued, and the drainer records how
+//! long it took to reach the socket, per class, over a [`DELAY_WINDOW`]. The
+//! input figure is logged at the end of each window (see [`log_window`]), so
+//! "the mouse lags" can be answered with a number, and read back through
+//! [`TransportTx::queue_delay`].
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cursio_protocol::{Message, Priority};
 use tokio::sync::Notify;
+use tracing::Instrument;
 
 use crate::crypto::{chunk_plaintext, has_more_parts, seal_frame, SharedNoise};
-use crate::{TransportError, TransportTx};
+use crate::{QueueDelay, TransportError, TransportTx};
 
 /// Number of priority classes (see [`Priority`]). Kept as an array index space.
 const CLASS_COUNT: usize = 6;
@@ -71,11 +81,107 @@ fn class_index(p: Priority) -> usize {
     }
 }
 
+/// How long a queue-delay measurement runs before it is logged and published.
+///
+/// Long enough that one window of ordinary pointer motion holds thousands of
+/// input frames, so a p99 is a p99; short enough that a lag the user just
+/// noticed shows up in the log while they are still looking at it.
+const DELAY_WINDOW: Duration = Duration::from_secs(10);
+
+/// Input p99 at which a window is logged at `info` rather than `debug`.
+///
+/// Half a frame at 120–144 Hz: below it the pointer lands in the frame it was
+/// moved in; above it the user starts to see it trail.
+const INPUT_DELAY_NOTICE: Duration = Duration::from_millis(4);
+
+/// Quarter-octave buckets of microseconds, up to 2^27 µs (over two minutes);
+/// anything longer lands in the last one.
+const DELAY_BUCKETS: usize = 4 * 27;
+
+/// Wait times of one class, bucketed so recording is a single increment and
+/// the drainer — which records every frame it writes — never sorts or
+/// allocates. The quarter-octave resolution (about 19%) is far finer than the
+/// question asked of it, which is whether input waits microseconds or
+/// milliseconds.
+#[derive(Clone)]
+struct DelayHistogram {
+    counts: [u32; DELAY_BUCKETS],
+    frames: u32,
+    max: Duration,
+}
+
+impl Default for DelayHistogram {
+    fn default() -> Self {
+        Self {
+            counts: [0; DELAY_BUCKETS],
+            frames: 0,
+            max: Duration::ZERO,
+        }
+    }
+}
+
+impl DelayHistogram {
+    fn bucket(wait: Duration) -> usize {
+        let micros = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX).max(1);
+        let octave = 63 - micros.leading_zeros() as usize;
+        // The two bits below the leading one pick the quarter of the octave.
+        let quarter = if octave >= 2 {
+            (micros >> (octave - 2)) & 0b11
+        } else {
+            (micros << (2 - octave)) & 0b11
+        } as usize;
+        (octave * 4 + quarter).min(DELAY_BUCKETS - 1)
+    }
+
+    /// The top of bucket `idx`, which is what a percentile falling in it is
+    /// reported as: an honest upper bound rather than a flattering midpoint.
+    fn upper_bound(idx: usize) -> Duration {
+        let (octave, quarter) = (idx / 4, (idx % 4) as u64);
+        Duration::from_micros(((4 + quarter + 1) << octave) / 4)
+    }
+
+    fn record(&mut self, wait: Duration) {
+        self.counts[Self::bucket(wait)] += 1;
+        self.frames += 1;
+        self.max = self.max.max(wait);
+    }
+
+    fn percentile(&self, fraction: f64) -> Duration {
+        let target = ((f64::from(self.frames) * fraction).ceil() as u32).max(1);
+        let mut seen = 0;
+        for (idx, &count) in self.counts.iter().enumerate() {
+            seen += count;
+            if seen >= target {
+                return Self::upper_bound(idx).min(self.max);
+            }
+        }
+        self.max
+    }
+
+    fn summary(&self) -> QueueDelay {
+        if self.frames == 0 {
+            return QueueDelay::default();
+        }
+        QueueDelay {
+            frames: self.frames,
+            p50: self.percentile(0.50),
+            p99: self.percentile(0.99),
+            max: self.max,
+        }
+    }
+}
+
+/// One tagged-plaintext frame awaiting sealing, and when `send` queued it.
+struct Queued {
+    frame: Vec<u8>,
+    queued_at: Instant,
+}
+
 /// The per-class frame queues, shared between the [`PrioritizedTx`] handles and
-/// the drainer task. Each entry is one tagged-plaintext frame awaiting sealing.
+/// the drainer task.
 #[derive(Default)]
 struct Queues {
-    classes: [VecDeque<Vec<u8>>; CLASS_COUNT],
+    classes: [VecDeque<Queued>; CLASS_COUNT],
     /// Bytes waiting in each class, kept alongside the queues so a producer can
     /// read its own backlog without walking a `VecDeque` of frames.
     queued_bytes: [usize; CLASS_COUNT],
@@ -103,13 +209,44 @@ struct Queues {
     /// Fatal drainer error. Once set, the socket can never accept another
     /// frame; producers must see an error instead of filling dead queues.
     terminal_error: Option<String>,
+    /// Waits recorded in the window now running, per class.
+    delay: [DelayHistogram; CLASS_COUNT],
+    /// When the running window began; `None` until the first frame is sent.
+    window_start: Option<Instant>,
+    /// The last complete window, per class — what `queue_delay` reports, so
+    /// every reader sees the same finished figures rather than a window that
+    /// is still filling.
+    last_window: [QueueDelay; CLASS_COUNT],
 }
 
 impl Queues {
     /// Queue one frame in `class`, keeping the byte count with it.
     fn push(&mut self, class: usize, frame: Vec<u8>) {
         self.queued_bytes[class] += frame.len();
-        self.classes[class].push_back(frame);
+        self.classes[class].push_back(Queued {
+            frame,
+            queued_at: Instant::now(),
+        });
+    }
+
+    /// Record that a frame of `class` queued at `queued_at` reached the socket
+    /// at `now`. Returns the window just completed, when this closes one.
+    fn record_sent(
+        &mut self,
+        class: usize,
+        queued_at: Instant,
+        now: Instant,
+    ) -> Option<[QueueDelay; CLASS_COUNT]> {
+        self.delay[class].record(now.saturating_duration_since(queued_at));
+        let start = *self.window_start.get_or_insert(now);
+        if now.duration_since(start) < DELAY_WINDOW {
+            return None;
+        }
+        let finished: [QueueDelay; CLASS_COUNT] = std::array::from_fn(|c| self.delay[c].summary());
+        self.last_window = finished;
+        self.delay = Default::default();
+        self.window_start = Some(now);
+        Some(finished)
     }
 
     /// Pop the next frame to send: the front of the highest-priority non-empty
@@ -117,7 +254,7 @@ impl Queues {
     ///
     /// Returns the class alongside the frame so the drainer can credit the
     /// bytes to it once they are on the wire.
-    fn pop_highest(&mut self) -> Option<(usize, Vec<u8>)> {
+    fn pop_highest(&mut self) -> Option<(usize, Queued)> {
         // A bulk frame forced through after `BULK_STARVATION_LIMIT` frames of
         // higher-priority traffic went ahead of it. One in every few dozen is
         // far too little to be felt by anything above, and it is the difference
@@ -154,7 +291,7 @@ impl Queues {
             // `send` queues a message's parts contiguously under one lock, so
             // the frame behind a part that is not the last belongs to the same
             // message. Its last part ends the run.
-            self.releasing_bulk = (forced || self.releasing_bulk) && has_more_parts(&frame);
+            self.releasing_bulk = (forced || self.releasing_bulk) && has_more_parts(&frame.frame);
         } else if !self.classes[bulk].is_empty() {
             // Counted only against a queue that actually has something waiting:
             // metadata flowing while nothing bulk is pending is not starvation,
@@ -163,7 +300,7 @@ impl Queues {
         }
         // Leaving the queue is what "no longer waiting" means; the bytes are
         // credited as sent only after the socket takes them.
-        self.queued_bytes[idx] -= frame.len();
+        self.queued_bytes[idx] -= frame.frame.len();
         Some((idx, frame))
     }
 
@@ -220,7 +357,10 @@ impl PrioritizedTx {
         });
         let drain_shared = shared.clone();
 
-        tokio::spawn(async move {
+        // Carried into the task so the delay report names the link it is
+        // about; a spawned task otherwise starts with no span at all.
+        let span = tracing::Span::current();
+        let drainer = async move {
             loop {
                 // Take the next frame under the lock, then release it before any
                 // await (sealing is CPU-only; the socket write is the await).
@@ -233,7 +373,11 @@ impl PrioritizedTx {
                 };
 
                 match frame {
-                    Some((class, tagged)) => {
+                    Some((class, queued)) => {
+                        let Queued {
+                            frame: tagged,
+                            queued_at,
+                        } = queued;
                         let len = tagged.len();
                         let sealed = match seal_frame(&noise, &tagged) {
                             Ok(m) => m,
@@ -253,8 +397,17 @@ impl PrioritizedTx {
                         }
                         // Credited only now: a producer pacing itself against
                         // this rate must see bytes the socket has taken, not
-                        // bytes we merely intended to write.
-                        drain_shared.queues.lock().unwrap().sent_bytes[class] += len as u64;
+                        // bytes we merely intended to write. The wait is
+                        // measured to the same point, since the socket
+                        // refusing more is part of what a frame waits for.
+                        let finished = {
+                            let mut q = drain_shared.queues.lock().unwrap();
+                            q.sent_bytes[class] += len as u64;
+                            q.record_sent(class, queued_at, Instant::now())
+                        };
+                        if let Some(window) = finished {
+                            log_window(&window);
+                        }
                     }
                     None => {
                         // Queues are empty: wake anyone blocked in `flush`.
@@ -268,12 +421,50 @@ impl PrioritizedTx {
                 }
             }
             drain_shared.drained.notify_waiters();
-        });
+        };
+        tokio::spawn(drainer.instrument(span));
 
         PrioritizedTx {
             _open: Arc::new(OpenHandle(shared.clone())),
             shared,
         }
+    }
+}
+
+/// Report a finished delay window, if input moved during it.
+///
+/// A window with no input frames says nothing about the pointer and is not
+/// logged: an idle link would otherwise write a line every ten seconds
+/// forever. Video and bulk ride along because they are what input waits
+/// behind, and seeing them deep while input stays shallow is the evidence
+/// that priority is holding.
+fn log_window(window: &[QueueDelay; CLASS_COUNT]) {
+    let input = window[class_index(Priority::Input)];
+    if input.frames == 0 {
+        return;
+    }
+    let video = window[class_index(Priority::Video)];
+    let bulk = window[class_index(Priority::Bulk)];
+    if input.p99 >= INPUT_DELAY_NOTICE {
+        tracing::info!(
+            input_frames = input.frames,
+            input_p50 = ?input.p50,
+            input_p99 = ?input.p99,
+            input_max = ?input.max,
+            video_p99 = ?video.p99,
+            bulk_p99 = ?bulk.p99,
+            "input waited long enough to be felt before reaching the socket"
+        );
+    } else {
+        tracing::debug!(
+            input_frames = input.frames,
+            input_p50 = ?input.p50,
+            input_p99 = ?input.p99,
+            input_max = ?input.max,
+            video_p99 = ?video.p99,
+            bulk_p99 = ?bulk.p99,
+            "send queue delay"
+        );
     }
 }
 
@@ -306,6 +497,10 @@ impl TransportTx for PrioritizedTx {
             queued_bytes: q.queued_bytes[idx],
             sent_bytes: q.sent_bytes[idx],
         }
+    }
+
+    fn queue_delay(&self, priority: Priority) -> QueueDelay {
+        self.shared.queues.lock().unwrap().last_window[class_index(priority)]
     }
 
     fn clone_sender(&self) -> Option<Box<dyn TransportTx>> {
@@ -367,9 +562,9 @@ mod tests {
         q.push(class_index(Priority::Input), vec![INPUT]);
         q.push(class_index(Priority::Audio), vec![AUDIO]);
         // Input must come out before audio, audio before bulk.
-        assert_eq!(q.pop_highest().map(|(_, f)| f), Some(vec![INPUT]));
-        assert_eq!(q.pop_highest().map(|(_, f)| f), Some(vec![AUDIO]));
-        assert_eq!(q.pop_highest().map(|(_, f)| f), Some(vec![BULK]));
+        assert_eq!(q.pop_highest().map(|(_, f)| f.frame), Some(vec![INPUT]));
+        assert_eq!(q.pop_highest().map(|(_, f)| f.frame), Some(vec![AUDIO]));
+        assert_eq!(q.pop_highest().map(|(_, f)| f.frame), Some(vec![BULK]));
         assert!(q.pop_highest().is_none());
     }
 
@@ -549,7 +744,7 @@ mod tests {
         // Input drains first, leaving the bulk backlog untouched.
         let (class, frame) = q.pop_highest().expect("a frame");
         assert_eq!(class, class_index(Priority::Input));
-        assert_eq!(frame.len(), 7);
+        assert_eq!(frame.frame.len(), 7);
         assert_eq!(q.queued_bytes[class_index(Priority::Bulk)], 150);
         assert_eq!(q.queued_bytes[class_index(Priority::Input)], 0);
 
@@ -568,6 +763,51 @@ mod tests {
         assert_eq!(q.queued_bytes, [0; CLASS_COUNT]);
         assert_eq!(q.terminal_error.as_deref(), Some("socket closed"));
         assert!(q.closed);
+    }
+
+    #[test]
+    fn delay_percentiles_bound_the_recorded_waits_from_above() {
+        let mut h = DelayHistogram::default();
+        for _ in 0..98 {
+            h.record(Duration::from_micros(100));
+        }
+        h.record(Duration::from_millis(5));
+        h.record(Duration::from_millis(40));
+
+        let s = h.summary();
+        assert_eq!(s.frames, 100);
+        assert_eq!(s.max, Duration::from_millis(40));
+        assert!(
+            s.p50 >= Duration::from_micros(100) && s.p50 < Duration::from_micros(125),
+            "p50 is the top of the 100 µs bucket, got {:?}",
+            s.p50
+        );
+        assert!(
+            s.p99 >= Duration::from_millis(5) && s.p99 < Duration::from_micros(6250),
+            "p99 lands in the 5 ms bucket, got {:?}",
+            s.p99
+        );
+    }
+
+    #[test]
+    fn a_delay_window_is_published_only_once_it_completes() {
+        let mut q = Queues::default();
+        let input = class_index(Priority::Input);
+        let start = Instant::now();
+
+        let queued = start;
+        assert!(q
+            .record_sent(input, queued, start + Duration::from_millis(2))
+            .is_none());
+        assert_eq!(q.last_window[input], QueueDelay::default());
+
+        let closing = start + DELAY_WINDOW + Duration::from_millis(3);
+        let window = q
+            .record_sent(input, queued, closing)
+            .expect("the window has run its length");
+        assert_eq!(window[input].frames, 2);
+        assert_eq!(q.last_window[input], window[input]);
+        assert_eq!(q.delay[input].frames, 0, "the next window starts empty");
     }
 
     // --- End-to-end scheduling + flush over the real encrypted transport. ---

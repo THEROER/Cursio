@@ -100,10 +100,38 @@ pub struct QueueDepth {
     pub sent_bytes: u64,
 }
 
+/// How long one priority class's frames waited to reach the socket, over the
+/// most recent complete measurement window.
+///
+/// Measured from `send` queuing a frame to the socket accepting its last byte,
+/// so it covers both waiting behind other classes in our queue and waiting for
+/// the kernel to take the frame. For input this is the lag the scheduler adds
+/// to the pointer — the number to read when a mouse feels slow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueDelay {
+    /// Frames of this class sent in the window; zero means the other fields
+    /// say nothing.
+    pub frames: u32,
+    /// Median wait, to within a quarter octave.
+    pub p50: std::time::Duration,
+    /// 99th-percentile wait, to within a quarter octave.
+    pub p99: std::time::Duration,
+    /// Longest single wait, exact.
+    pub max: std::time::Duration,
+}
+
 /// The send half of a split [`Transport`].
 #[async_trait]
 pub trait TransportTx: Send {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError>;
+
+    /// How long `priority`'s frames have recently waited to reach the socket.
+    ///
+    /// Zero for a sender that writes inside `send`, for the same reason as
+    /// [`Self::queue_depth`]: nothing waits in a queue it does not have.
+    fn queue_delay(&self, _priority: cursio_protocol::Priority) -> QueueDelay {
+        QueueDelay::default()
+    }
 
     /// How much of `priority` is queued here and how much has left.
     ///
