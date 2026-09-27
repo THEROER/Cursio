@@ -1444,16 +1444,16 @@ fn relink_app(
     let outs = side(app_id, "out");
     let ins = side(our_node_id, "in");
 
-    let linked: std::collections::HashMap<u32, (u64, u32)> = links
+    let linked: std::collections::HashMap<(u32, u32), u64> = links
         .iter()
-        .map(|(&out, (serial, input, _))| (out, (*serial, *input)))
+        .map(|(&pair, (serial, _))| (pair, *serial))
         .collect();
     let plan = plan_app_links(&outs, &ins, &linked);
 
     // Removing the proxy from the map drops it, which tears the (already dead)
     // link down.
-    for out in &plan.stale {
-        links.remove(out);
+    for pair in &plan.stale {
+        links.remove(pair);
     }
     if !plan.stale.is_empty() {
         tracing::info!(
@@ -1482,7 +1482,7 @@ fn relink_app(
             },
         ) {
             Ok(link) => {
-                links.insert(out.id, (out.serial, input, link));
+                links.insert((out.id, input), (out.serial, link));
                 created += 1;
             }
             Err(e) => tracing::debug!(app_id, error = %e, "create link failed"),
@@ -1497,9 +1497,10 @@ fn relink_app(
     }
 }
 
-/// An app tap's live links: app output port id → (that port's
-/// `object.serial`, the input port it feeds, the link proxy keeping it alive).
-type AppLinks = std::collections::HashMap<u32, (u64, u32, pipewire::link::Link)>;
+/// An app tap's live links: (app output port id, input port it feeds) → (that
+/// output port's `object.serial`, the link proxy keeping it alive). Keyed by
+/// the pair because a mono output feeds two inputs.
+type AppLinks = std::collections::HashMap<(u32, u32), (u64, pipewire::link::Link)>;
 
 /// A port as the registry reported it on this pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1514,15 +1515,16 @@ struct LinkPort {
 /// What one [`relink_app`] pass has to change.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AppLinkPlan {
-    /// App output port ids whose recorded link no longer exists.
-    stale: Vec<u32>,
+    /// `(app output port, input port)` links whose output port no longer
+    /// exists.
+    stale: Vec<(u32, u32)>,
     /// `(app output port, our input port id)` pairs to link.
     create: Vec<(LinkPort, u32)>,
 }
 
 /// Decide which of an app tap's links are stale and which to create, given the
 /// app's output ports, our input ports, and what is linked already
-/// (`out port id → (its serial, input port id)`).
+/// (`(out port id, input port id) → the out port's serial`).
 ///
 /// **A link is recognised by port id *and* serial.** PipeWire recycles object
 /// ids, and a browser recreates its output ports on every pause, seek or new
@@ -1540,40 +1542,42 @@ struct AppLinkPlan {
 /// that input is taken this pass, the port waits for the next one
 /// ([`APP_RELINK_INTERVAL`]) rather than crossing over: a crossed link is heard
 /// as a missing ear, while a wait is a few hundred milliseconds of silence that
-/// fixes itself. Only ports whose channel no input carries (a `MONO` output, or
-/// one with no label) fall back to a free input, and never to one a labelled
-/// port has a claim on.
+/// fixes itself.
+///
+/// **A mono output feeds every input.** A `MONO` port, or an app's only port
+/// when it carries no label, is one signal meant for both ears; linking it to
+/// the first free input alone played it in the left ear only. It is fanned out
+/// to each input no labelled port has a claim on. Any other unlabelled port
+/// takes one free input, again never one a labelled port has a claim on.
 ///
 /// Both sides are sorted by channel first, because the registry lists ports in
 /// arrival order, not channel order.
 fn plan_app_links(
     outs: &[LinkPort],
     ins: &[LinkPort],
-    linked: &std::collections::HashMap<u32, (u64, u32)>,
+    linked: &std::collections::HashMap<(u32, u32), u64>,
 ) -> AppLinkPlan {
     let mut plan = AppLinkPlan::default();
     let live = |id: u32, serial: u64| outs.iter().any(|o| o.id == id && o.serial == serial);
 
-    let mut stale: Vec<u32> = linked
+    let mut stale: Vec<(u32, u32)> = linked
         .iter()
-        .filter(|(&id, &(serial, _))| !live(id, serial))
-        .map(|(&id, _)| id)
+        .filter(|(&(out, _), &serial)| !live(out, serial))
+        .map(|(&pair, _)| pair)
         .collect();
     stale.sort_unstable();
     plan.stale = stale;
 
-    let mut taken: std::collections::HashSet<u32> = linked
-        .iter()
-        .filter(|(id, _)| !plan.stale.contains(id))
-        .map(|(_, &(_, input))| input)
+    // Which output each input is already fed by, from the links that survive.
+    let mut taken: std::collections::HashMap<u32, u32> = linked
+        .keys()
+        .filter(|pair| !plan.stale.contains(pair))
+        .map(|&(out, input)| (input, out))
         .collect();
 
-    let mut outs: Vec<&LinkPort> = outs
-        .iter()
-        .filter(|o| !linked.contains_key(&o.id) || plan.stale.contains(&o.id))
-        .collect();
+    let mut outs: Vec<&LinkPort> = outs.iter().collect();
     let mut ins: Vec<&LinkPort> = ins.iter().collect();
-    outs.sort_by(|a, b| a.channel.cmp(&b.channel));
+    outs.sort_by(|a, b| a.channel.cmp(&b.channel).then(a.id.cmp(&b.id)));
     ins.sort_by(|a, b| a.channel.cmp(&b.channel));
 
     let own_input = |out: &LinkPort| {
@@ -1581,27 +1585,49 @@ fn plan_app_links(
             .find(|i| !out.channel.is_empty() && i.channel == out.channel)
             .map(|i| i.id)
     };
-    let matched: Vec<(&LinkPort, u32)> = outs
+    let is_mono =
+        |out: &LinkPort| out.channel == "MONO" || (out.channel.is_empty() && outs.len() == 1);
+    // Inputs some labelled output has a claim on, so a fallback never takes
+    // one away from the port it belongs to.
+    let claimed: std::collections::HashSet<u32> =
+        outs.iter().filter_map(|o| own_input(o)).collect();
+    let unclaimed: Vec<u32> = ins
         .iter()
-        .filter_map(|o| own_input(o).map(|input| (*o, input)))
+        .map(|i| i.id)
+        .filter(|id| !claimed.contains(id))
         .collect();
-    // Inputs some live labelled output has a claim on, so a fallback never
-    // takes one away from the port it belongs to.
-    let claimed: std::collections::HashSet<u32> = matched.iter().map(|&(_, i)| i).collect();
 
-    for &(out, input) in &matched {
-        if taken.insert(input) {
+    // An input already fed — by this port or another — is left as it is: one
+    // port per input, and a port waits rather than doubling up.
+    fn link(
+        taken: &mut std::collections::HashMap<u32, u32>,
+        plan: &mut AppLinkPlan,
+        out: &LinkPort,
+        input: u32,
+    ) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = taken.entry(input) {
+            slot.insert(out.id);
             plan.create.push((out.clone(), input));
         }
     }
-    for &out in outs.iter().filter(|o| own_input(o).is_none()) {
-        if let Some(input) = ins
-            .iter()
-            .map(|i| i.id)
-            .find(|id| !taken.contains(id) && !claimed.contains(id))
-        {
-            taken.insert(input);
-            plan.create.push((out.clone(), input));
+    for &out in &outs {
+        if let Some(input) = own_input(out) {
+            link(&mut taken, &mut plan, out, input);
+        } else if is_mono(out) {
+            for &input in &unclaimed {
+                link(&mut taken, &mut plan, out, input);
+            }
+        }
+    }
+    for &out in outs
+        .iter()
+        .filter(|o| own_input(o).is_none() && !is_mono(o))
+    {
+        if taken.values().any(|&owner| owner == out.id) {
+            continue;
+        }
+        if let Some(&input) = unclaimed.iter().find(|id| !taken.contains_key(id)) {
+            link(&mut taken, &mut plan, out, input);
         }
     }
     plan
@@ -2063,14 +2089,14 @@ mod tests {
     /// the new FL then crossed over into FR, and the tap carried one channel.
     #[test]
     fn a_port_that_reuses_a_dead_ports_id_is_relinked_to_its_own_channel() {
-        let linked = std::collections::HashMap::from([(10, (100, 50)), (11, (101, 51))]);
+        let linked = std::collections::HashMap::from([((10, 50), 100), ((11, 51), 101)]);
         let outs = vec![port(12, 102, "FL"), port(10, 103, "FR")];
 
         let plan = plan_app_links(&outs, &our_inputs(), &linked);
 
         assert_eq!(
             plan.stale,
-            vec![10, 11],
+            vec![(10, 50), (11, 51)],
             "both old links died with their ports"
         );
         assert_eq!(
@@ -2084,7 +2110,7 @@ mod tests {
     /// safe.
     #[test]
     fn a_live_link_with_the_same_serial_is_left_alone() {
-        let linked = std::collections::HashMap::from([(10, (100, 50)), (11, (101, 51))]);
+        let linked = std::collections::HashMap::from([((10, 50), 100), ((11, 51), 101)]);
         let outs = vec![port(11, 101, "FR"), port(10, 100, "FL")];
 
         assert_eq!(
@@ -2100,16 +2126,16 @@ mod tests {
     /// gone.
     #[test]
     fn a_channel_never_crosses_into_the_other_channels_input() {
-        // FL's input is held by a link still believed live.
-        let linked = std::collections::HashMap::from([(10, (100, 50))]);
-        let outs = vec![port(10, 100, "FR"), port(12, 102, "FL")];
+        // FL's input is held by a live FL port; a second FL port appears.
+        let linked = std::collections::HashMap::from([((10, 50), 100)]);
+        let outs = vec![port(10, 100, "FL"), port(12, 102, "FL")];
 
         let plan = plan_app_links(&outs, &our_inputs(), &linked);
 
-        assert!(
-            plan.create.is_empty(),
-            "FL must not be linked into FR's input: {:?}",
-            plan.create
+        assert_eq!(
+            plan,
+            AppLinkPlan::default(),
+            "the second FL must not be linked into FR's input"
         );
     }
 
@@ -2125,6 +2151,35 @@ mod tests {
             plan.create,
             vec![(port(21, 201, "FR"), 51), (port(20, 200, ""), 50)]
         );
+    }
+
+    /// A mono output plays in both ears: it is linked to every input.
+    #[test]
+    fn a_mono_output_is_linked_to_both_inputs() {
+        for channel in ["MONO", ""] {
+            let outs = vec![port(30, 300, channel)];
+
+            let plan = plan_app_links(&outs, &our_inputs(), &Default::default());
+
+            assert_eq!(
+                plan.create,
+                vec![(port(30, 300, channel), 50), (port(30, 300, channel), 51)],
+                "a single {channel:?} port must feed FL and FR alike"
+            );
+        }
+    }
+
+    /// A mono output linked to one input so far gains the other on a later
+    /// pass, and its existing link is kept.
+    #[test]
+    fn a_half_linked_mono_output_gains_its_missing_input() {
+        let linked = std::collections::HashMap::from([((30, 50), 300)]);
+        let outs = vec![port(30, 300, "MONO")];
+
+        let plan = plan_app_links(&outs, &our_inputs(), &linked);
+
+        assert!(plan.stale.is_empty(), "the live FL link must be kept");
+        assert_eq!(plan.create, vec![(port(30, 300, "MONO"), 51)]);
     }
 
     /// Our streams must declare FL/FR positions, not just "2 channels".
