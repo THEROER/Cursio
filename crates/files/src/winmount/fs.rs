@@ -143,6 +143,27 @@ impl RemoteFs {
         fresh
     }
 
+    /// What a file looks like once a write to it has been sent, remembered so
+    /// the query Windows follows almost every write with needs no round trip.
+    fn described_after_write(&self, context: &FileCtx, size: u64) -> FileMeta {
+        let meta = FileMeta {
+            name: context
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&context.path)
+                .to_string(),
+            kind: FileKind::File,
+            size,
+            modified_unix: now_unix(),
+            writable: true,
+            allocated: None,
+        };
+        self.meta
+            .put(&context.volume, &context.path, Ok(meta.clone()));
+        meta
+    }
+
     /// Wait out every write still in flight on this handle, returning the
     /// first failure among them.
     ///
@@ -483,8 +504,8 @@ impl FileSystemContext for RemoteFs {
         context: &Self::FileContext,
         buffer: &[u8],
         offset: u64,
-        _write_to_eof: bool,
-        _constrained_io: bool,
+        write_to_eof: bool,
+        constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
         let _call = crate::inflight::shared().enter("write");
@@ -513,6 +534,23 @@ impl FileSystemContext for RemoteFs {
             );
             return Err(to_ntstatus(&e));
         }
+
+        // Placed while the pipeline is held, so two appends on one handle
+        // cannot both be told the same end of file.
+        let (offset, len) = crate::filesize::place_write(
+            context.size.get(),
+            offset,
+            buffer.len(),
+            write_to_eof,
+            constrained_io,
+        );
+        if len == 0 {
+            drop(pipeline);
+            let meta = self.described_after_write(context, context.size.get());
+            fill_info(file_info, &meta);
+            return Ok(0);
+        }
+        let buffer = &buffer[..len];
 
         // A slot on the link, or an answer collected to free one. Collecting is
         // the work this thread would be waiting to do in any case, and it keeps
@@ -564,6 +602,7 @@ impl FileSystemContext for RemoteFs {
         // `rclone`'s pipeline does not give on Windows, where WinFsp drops an
         // error returned from `flush`.
         let written = buffer.len() as u64;
+        let size = context.size.wrote(offset, written);
         drop(pipeline);
         // Windows expects the file's state after the write, and takes what it
         // is given: a `FileInfo` left untouched is whatever the caller's memory
@@ -587,22 +626,7 @@ impl FileSystemContext for RemoteFs {
         // The cached entry is updated to match instead of being dropped, so the
         // `get_file_info` that follows is answered from memory rather than
         // starting the round trip again.
-        let size = context.size.wrote(offset, written);
-        let meta = FileMeta {
-            name: context
-                .path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&context.path)
-                .to_string(),
-            kind: FileKind::File,
-            size,
-            modified_unix: now_unix(),
-            writable: true,
-            allocated: None,
-        };
-        self.meta
-            .put(&context.volume, &context.path, Ok(meta.clone()));
+        let meta = self.described_after_write(context, size);
         context.ahead.invalidate();
         fill_info(file_info, &meta);
         Ok(written as u32)

@@ -56,9 +56,63 @@ impl KnownSize {
     }
 }
 
+/// Where a write lands, and how many of its bytes may be written, given the
+/// file's length.
+///
+/// Two flags WinFsp passes change the answer, and ignoring either writes to
+/// the wrong place:
+///
+/// - `write_to_eof` is an append: the offset the caller gave means nothing and
+///   the bytes go at the current end.
+/// - `constrained_io` marks paging I/O — the memory manager writing back a
+///   mapped view — which must never move the end of the file. A page is a
+///   whole 4 KiB even when the file ends partway through it, so an
+///   unconstrained paging write pads the file out to a page boundary with
+///   whatever the page held past the end; after a truncate it resurrects bytes
+///   that were cut. It is clipped at the end, and dropped entirely past it.
+pub fn place_write(
+    size: u64,
+    offset: u64,
+    len: usize,
+    write_to_eof: bool,
+    constrained_io: bool,
+) -> (u64, usize) {
+    let at = match write_to_eof {
+        true => size,
+        false => offset,
+    };
+    if !constrained_io {
+        return (at, len);
+    }
+    let room = size.saturating_sub(at);
+    (at, len.min(usize::try_from(room).unwrap_or(usize::MAX)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_append_lands_at_the_end_whatever_offset_it_carries() {
+        assert_eq!(place_write(100, 0, 10, true, false), (100, 10));
+    }
+
+    /// Paging I/O writes whole pages, and the part past the end of the file
+    /// must not reach it.
+    #[test]
+    fn a_paging_write_is_clipped_at_the_end_of_the_file() {
+        assert_eq!(place_write(5000, 4096, 4096, false, true), (4096, 904));
+    }
+
+    #[test]
+    fn a_paging_write_past_the_end_writes_nothing() {
+        assert_eq!(place_write(4096, 8192, 4096, false, true), (8192, 0));
+    }
+
+    #[test]
+    fn an_ordinary_write_may_extend_the_file() {
+        assert_eq!(place_write(10, 8, 100, false, false), (8, 100));
+    }
 
     /// The bug this exists for: a write into a preallocated file must not be
     /// reported as the end of it.
