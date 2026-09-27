@@ -191,6 +191,37 @@ modules are all settled at startup, and a fresh start is the one reload that is
 exactly as correct as the first. Fields a flag pinned stay pinned across that
 restart and are reported as such.
 
+## Control socket
+
+A running node answers on a local socket (`core/src/control/`): a Unix socket
+at `$XDG_RUNTIME_DIR/cursio/control.sock` (0700 dir, 0600 socket; the temp-dir
+fallback is refused unless it is this user's and private), or the named pipe
+`\\.\pipe\cursio-control-<user>` with a DACL of this user's SID and SYSTEM only,
+a medium integrity label (the node self-elevates, the app does not) and remote
+clients rejected. Whoever reaches it can open a pairing window, so it is kept
+exactly as private as the trust store.
+
+Newline-delimited JSON, `{"id":1,"cmd":"status"}` → `{"id":1,"reply":"status",…}`.
+Commands: `ping`, `status` (node, peers with presence/position/`NodeStatus`/
+negotiated and skipped modules, configured modules, what flags pin, input
+latency, `diagnostics` problems, the pairing window), `config`, `set_config`,
+`set_module`, `set_position`, `pair_show`, `pair_enter`, `pair_cancel`,
+`pairing`, `restart`. No pushed events — clients poll `status`.
+
+Changes go through `config.toml` rather than around it, so there is one path
+for every change and the file always says what runs; the reply names any field
+a flag pins. The mesh loop is `!Send`, so it *publishes* a snapshot every sweep
+and each link reports itself up and down; the socket's handler only reads that.
+A second node for the same user finds the socket answering and runs without
+one, rather than being refused — two nodes on one machine on different ports is
+a real test setup.
+
+`cursio status` and `cursio pair [CODE]` are clients of it: `cursio pair` shows
+a code, `cursio pair ABCD-EFGH` on the other machine enters it, and both wait
+for the outcome. The Tauri app (`app/`) is another client and never runs the
+mesh itself: the node self-elevates on Windows and drives GTK4 on Linux while
+the webview is GTK3, and it has to keep running with no window open.
+
 ## What a machine *is doing*
 
 `ModuleAdvert` says a node has audio; `DeviceKind` says it is a laptop. Neither

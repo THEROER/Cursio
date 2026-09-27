@@ -90,6 +90,9 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     # OpenProcessToken/GetTokenInformation — are we already elevated?
     "Win32_Security",
+    # SDDL → security descriptor and SID → string, for the control pipe's
+    # owner-only DACL.
+    "Win32_Security_Authorization",
     "Win32_System_Threading",
     # ShellExecuteExW with the "runas" verb — the actual UAC prompt.
     # SHELLEXECUTEINFOW carries an HKEY field, so the binding is gated on

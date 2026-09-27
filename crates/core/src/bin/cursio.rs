@@ -77,6 +77,20 @@ enum Command {
     Mesh(MeshArgs),
     /// Print the config `cursio mesh` would run with, and where it is read from.
     Config,
+    /// Ask the running node what it is doing: peers, modules, latency, problems.
+    Status {
+        /// Print the raw control reply instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pair with a new machine using a one-time code, through the running node.
+    ///
+    /// Without a code, this machine shows one; run `cursio pair <CODE>` (or
+    /// enter it in the app) on the other machine within five minutes.
+    Pair {
+        /// The code shown on the other machine, e.g. `ABCD-EFGH`.
+        code: Option<String>,
+    },
     /// List peers discovered on the LAN, then exit.
     Peers {
         #[arg(long, default_value_t = 5)]
@@ -598,6 +612,8 @@ async fn main() -> anyhow::Result<()> {
             print!("{}", config.to_toml()?);
             Ok(())
         }
+        Command::Status { json } => print_status(json).await,
+        Command::Pair { code } => pair_with_code(code).await,
         Command::Mesh(args) => {
             let overrides = args.overrides();
             let config =
@@ -613,6 +629,15 @@ async fn main() -> anyhow::Result<()> {
                 files_share,
                 ..
             } = args;
+            let pairing = PairingWindow::closed();
+            let control = cursio_core::control::NodeState::new(
+                &identity,
+                config_path.clone(),
+                overrides.clone(),
+                config.clone(),
+                pairing.clone(),
+            );
+            start_control(control.clone());
             let cursio_core::config::Config {
                 port,
                 position: at,
@@ -667,7 +692,6 @@ async fn main() -> anyhow::Result<()> {
             );
             // Read before anything binds a port, so a mistyped password costs
             // nothing and the prompt is not buried under startup logging.
-            let pairing = PairingWindow::closed();
             if pair {
                 let password = read_pairing_password()?;
                 tracing::info!(
@@ -745,6 +769,7 @@ async fn main() -> anyhow::Result<()> {
                 modules,
                 pairing,
                 offer,
+                control,
             );
             if !airplay.participates() {
                 // Nothing bound and nothing announced, and the service module
@@ -1353,6 +1378,7 @@ fn module_registry(
 /// Sessions are spawned on a [`tokio::task::LocalSet`], not `tokio::spawn`: the
 /// input path shares its injector/cursor between closures via `Rc` and so isn't
 /// `Send`. Keeping sessions single-threaded lets that stay exactly as it is.
+#[allow(clippy::too_many_arguments)]
 async fn run_mesh(
     identity: NodeIdentity,
     port: u16,
@@ -1361,6 +1387,7 @@ async fn run_mesh(
     modules: cursio_core::module::ModuleRegistry,
     pairing: PairingWindow,
     offer: ServiceOffer,
+    control: cursio_core::control::NodeState,
 ) -> anyhow::Result<()> {
     let NodeBase {
         listener,
@@ -1437,6 +1464,7 @@ async fn run_mesh(
                             None,
                             registry.clone(),
                             pairing.clone(),
+                            control.clone(),
                             capture.clone(),
                             status.clone(),
                             position,
@@ -1473,6 +1501,7 @@ async fn run_mesh(
 
                     // Time to dial whoever is known, offline, and ours to call.
                     _ = sweep.tick() => {
+                        publish_mesh(&control, &registry, &status);
                         // A machine that is not trusted yet, while the window is
                         // open. This is what `join` used to be: the mesh only
                         // ever dials the trust store, so somebody has to make
@@ -1506,6 +1535,7 @@ async fn run_mesh(
                                     None,
                                     registry.clone(),
                                     pairing.clone(),
+                                    control.clone(),
                                     capture.clone(),
                                     status.clone(),
                                     position,
@@ -1545,6 +1575,7 @@ async fn run_mesh(
                                 Some(target.peer_id),
                                 registry.clone(),
                                 pairing.clone(),
+                                control.clone(),
                                 capture.clone(),
                                 status.clone(),
                                 position,
@@ -1566,6 +1597,53 @@ async fn run_mesh(
 /// connection, where the identity is only known after the handshake. Either way
 /// the peer ends up `Offline` when the session finishes, so the next sweep can
 /// reconnect it.
+/// Hand the control socket what the mesh loop knows. Once per sweep: the
+/// registry is `!Send` and this is the loop that owns it.
+fn publish_mesh(
+    control: &cursio_core::control::NodeState,
+    registry: &cursio_core::mesh::SharedRegistry,
+    status: &SharedNodeStatus,
+) {
+    use cursio_core::control::{KnownPeerView, Presence};
+    use cursio_core::registry::PeerState;
+    control.set_local_status(status.borrow().current());
+    control.set_known(
+        registry
+            .borrow()
+            .all()
+            .map(|peer| KnownPeerView {
+                id: peer.peer_id,
+                name: peer.display_name.clone(),
+                presence: match peer.state {
+                    PeerState::Online => Presence::Online,
+                    PeerState::Connecting => Presence::Connecting,
+                    PeerState::Offline { .. } => Presence::Offline,
+                },
+            })
+            .collect(),
+    );
+}
+
+/// Serve the control socket for this node.
+///
+/// A second node for the same user is not refused here: two processes on one
+/// machine are an existing, deliberate setup (a test node on another port),
+/// and the first one keeps answering for the machine. The second says so.
+fn start_control(state: cursio_core::control::NodeState) {
+    let endpoint = match cursio_core::control::transport::endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            tracing::warn!(%error, "no control socket; the app and `cursio status` cannot reach this node");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        if let Err(error) = cursio_core::control::transport::serve(endpoint, state).await {
+            tracing::warn!(%error, "control socket stopped; the app and `cursio status` cannot reach this node");
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_peer_session(
     transport: TcpTransport,
@@ -1576,6 +1654,7 @@ fn spawn_peer_session(
     // Only consulted for an inbound connection: a peer we dialled is one we
     // already trust, so it never needs a password.
     pairing: PairingWindow,
+    control: cursio_core::control::NodeState,
     // Shared with every other mesh session: capture is one machine-wide
     // resource (one portal permission, one grab), so sessions take turns on it
     // rather than each building their own. See [`PersistentCapture`].
@@ -1643,6 +1722,7 @@ fn spawn_peer_session(
             transport,
             identity,
             &pairing,
+            &control,
             role,
             false,
             capture_for_session,
@@ -1676,6 +1756,7 @@ fn spawn_peer_session(
         // right now. This is the whole point of the registry.
         if let Some(id) = who {
             registry.borrow_mut().mark_offline(id);
+            control.link_down(&id);
         }
     });
 }
@@ -1703,6 +1784,8 @@ async fn run_pairing_and_session(
     // Consulted only for a stranger, and told how the meeting went: a code
     // is spent by one success, and every window shuts after a few failures.
     pairing: &PairingWindow,
+    // Told what this link agreed once it is up, and forgets it when it ends.
+    control: &cursio_core::control::NodeState,
     role: Role,
     test_input: bool,
     // Capture is created ONCE by the caller and lent to each peer session — see
@@ -1746,6 +1829,7 @@ async fn run_pairing_and_session(
     let stranger = !password.is_empty()
         && TrustStore::load().is_ok_and(|store| store.get(&identified.peer.peer_id).is_none());
     let peer_name = identified.peer.display_name.clone();
+    let negotiated = identified.negotiated().clone();
     let link = match cursio_core::link::secure(identified, &plan).await {
         Ok(link) => link,
         Err(error) => {
@@ -1790,6 +1874,22 @@ async fn run_pairing_and_session(
     }
 
     let peer = link.peer;
+    control.link_up(
+        peer.peer_id,
+        &peer.display_name,
+        cursio_core::control::LinkView {
+            position: peer.position,
+            device_kind: peer.device_kind,
+            status: peer.status,
+            modules: negotiated.agreed.iter().map(|id| id.to_string()).collect(),
+            skipped: negotiated
+                .skipped
+                .iter()
+                .map(|(id, why)| (id.to_string(), why.to_string()))
+                .collect(),
+            since: std::time::SystemTime::now(),
+        },
+    );
     let mut secure = link.transport;
     let modules = link.modules;
 
@@ -2471,6 +2571,124 @@ fn inject(
             }
         }
         None => tracing::info!(?event, "peer input (no backend to inject)"),
+    }
+}
+
+async fn control_client(
+) -> anyhow::Result<cursio_core::control::transport::Client<cursio_core::control::transport::Stream>>
+{
+    let endpoint = cursio_core::control::transport::endpoint()?;
+    Ok(cursio_core::control::transport::connect(&endpoint).await?)
+}
+
+async fn print_status(json: bool) -> anyhow::Result<()> {
+    use cursio_core::control::{Command, Presence, Reply};
+    let reply = control_client().await?.request(Command::Status).await?;
+    let status = match reply {
+        Reply::Status(status) => status,
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected reply {other:?}"),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+    let at = |p: cursio_protocol::Position| format!("{},{}", p.x, p.y);
+    let online = status
+        .peers
+        .iter()
+        .filter(|p| p.presence == Presence::Online)
+        .count();
+    println!(
+        "{} at {} — {online} of {} peers online",
+        status.node.name,
+        at(status.node.position),
+        status.peers.len()
+    );
+    for peer in &status.peers {
+        let presence = match peer.presence {
+            Presence::Online => "online",
+            Presence::Connecting => "connecting",
+            Presence::Offline => "offline",
+        };
+        match &peer.link {
+            Some(link) => println!(
+                "  {:<16} {presence:<10} at {:<6} {}  modules: {}",
+                peer.name,
+                at(link.position),
+                link.status,
+                link.modules.join(", ")
+            ),
+            None => println!("  {:<16} {presence}", peer.name),
+        }
+    }
+    for r in &status.latency {
+        println!(
+            "input latency {}: p50 {:.1} ms, p99 {:.1} ms over {} events",
+            r.path,
+            r.p50_us as f64 / 1000.0,
+            r.p99_us as f64 / 1000.0,
+            r.events
+        );
+    }
+    if status.problems.is_empty() {
+        println!("no problems");
+    }
+    for problem in &status.problems {
+        println!("{:?}: {}", problem.severity, problem.summary);
+        if let Some(hint) = &problem.hint {
+            println!("  {hint}");
+        }
+    }
+    if !status.pinned.is_empty() {
+        println!("pinned by flags: {}", status.pinned.join(", "));
+    }
+    Ok(())
+}
+
+/// Open a code window on the running node and wait for it to be used.
+///
+/// Through the node rather than on its own: the pairing is the mesh's own
+/// handshake with the stranger, and only the running node is listening.
+async fn pair_with_code(code: Option<String>) -> anyhow::Result<()> {
+    use cursio_core::control::{Command, Reply};
+    use cursio_core::pairing_window::PairingOutcome;
+    let mut client = control_client().await?;
+    let command = match code {
+        Some(code) => Command::PairEnter { code },
+        None => Command::PairShow,
+    };
+    match client.request(command).await? {
+        Reply::Pairing {
+            state: Some(state), ..
+        } => match state.code {
+            Some(code) => println!(
+                "Pairing code: {code}\nOn the other machine run `cursio pair {code}`, or enter it in the Cursio app."
+            ),
+            None => println!("Code accepted; waiting for the other machine…"),
+        },
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected reply {other:?}"),
+    }
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let Reply::Pairing { state, last } = client.request(Command::Pairing).await? else {
+            anyhow::bail!("unexpected reply while waiting for pairing");
+        };
+        if state.is_some() {
+            continue;
+        }
+        return match last {
+            Some(PairingOutcome::Paired { peer }) => {
+                println!("Paired with {peer}.");
+                Ok(())
+            }
+            Some(PairingOutcome::Expired) => anyhow::bail!("the code expired before it was used"),
+            Some(PairingOutcome::TooManyAttempts) => {
+                anyhow::bail!("too many wrong codes; the window is closed — start again")
+            }
+            Some(PairingOutcome::Cancelled) | None => anyhow::bail!("pairing was cancelled"),
+        };
     }
 }
 
