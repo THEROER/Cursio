@@ -180,8 +180,8 @@ pub struct AudioEngine {
     intent_sink_ready_rx: tokio::sync::mpsc::UnboundedReceiver<OpenedIntentSink>,
     /// Playbacks being opened on a worker, by stream id.
     ///
-    /// Opened on a stream's FIRST chunk, so unlike the other two this stall
-    /// arrives mid-session — whenever something starts playing on the peer —
+    /// Opened when an application appears on the peer, or on a stream's first
+    /// chunk, so unlike the other two this stall arrives mid-session —
     /// which is what made the mouse freeze during ordinary use rather than only
     /// at connect time.
     opening_playbacks: std::collections::HashSet<u32>,
@@ -1383,18 +1383,43 @@ impl AudioEngine {
             } else {
                 tracing::info!(id = meta.id, %label, "peer advertised an app stream");
             }
-            // Remember the label but DON'T open playback yet: one node per
-            // advertisement filled the mixer with identical idle rows. The
-            // stream's first chunk opens it.
-            self.pending_labels.insert(meta.id, label);
+            // Open the playback NOW, on the advertisement, rather than waiting
+            // for the stream's first chunk.
+            //
+            // Waiting made a mixer row appear only once an application actually
+            // made a sound, which is too late to be useful: the row is where the
+            // user sets that application's volume, and an application they have
+            // not started playing yet is exactly when they want to set it. It
+            // also made the set of rows look arbitrary — three applications
+            // running, two rows, because the third had been quiet since the
+            // session began. Measured here: a Java application's row appeared 90
+            // seconds after it was advertised, when it finally played something.
+            //
+            // The cost is a node per advertised stream whether or not it ever
+            // carries audio, which is what this used to avoid. That trade is now
+            // the right way round: a silent row is a row the user can still
+            // reach, while a missing row is a control they cannot find. No
+            // filtering by name — a stream that looks like a service today
+            // ("speech-dispatcher") is one that chimes tomorrow, and guessing
+            // wrong hides a real application.
+            self.pending_labels.insert(meta.id, label.clone());
+            let target = self
+                .inbound_app_device
+                .get(&meta.id)
+                .cloned()
+                .or_else(|| self.render_device.clone());
+            let id = meta.id;
+            self.open_playback_off_loop(id, move || {
+                cursio_audio::Playback::open_on(id, label, target)
+            });
             return;
         }
 
         // A microphone the peer is offering. This is the mirror image of a
         // device: instead of a virtual speaker we publish a virtual *source*, so
         // local apps can select the peer's mic as a recording input. Opened
-        // eagerly (not on first chunk like playback) because it must appear in
-        // the input list before anything can choose to record from it.
+        // eagerly because it must appear in the input list before anything can
+        // choose to record from it.
         if meta.role == cursio_protocol::StreamRole::Capture {
             let desc = meta
                 .device
@@ -1471,12 +1496,12 @@ impl AudioEngine {
 
     /// Open a playback on a worker thread, to be collected by a later pump.
     ///
-    /// Both kinds of playback go through here — a peer microphone published as
-    /// a virtual source, and an ordinary render opened on a stream's first
-    /// chunk — because the cost being avoided is the same in both: bringing a
-    /// PipeWire node up takes hundreds of milliseconds, and the session loop is
-    /// single-threaded, so waiting inline stops input, audio and file traffic
-    /// alike.
+    /// Every kind of playback goes through here — a peer microphone published
+    /// as a virtual source, an application stream opened on its advertisement,
+    /// a device stream opened on its first chunk — because the cost being
+    /// avoided is the same in all of them: bringing a PipeWire node up takes
+    /// hundreds of milliseconds, and the session loop is single-threaded, so
+    /// waiting inline stops input, audio and file traffic alike.
     fn open_playback_off_loop(
         &mut self,
         id: u32,
@@ -2061,9 +2086,10 @@ impl AudioEngine {
         }
 
         if !self.playbacks.contains_key(&id) {
-            // First chunk for this stream — open playback now, not at advertise
-            // time, so only streams that really carry audio get a node (and a
-            // row in the user's mixer).
+            // No playback for this stream yet. A stream rendering into one of
+            // OUR devices opens here, on its first chunk; an application stream
+            // was already opened on its advertisement and arrives here only if
+            // that open failed, which makes this its retry.
             let peer_name = &self.peer_name;
             if let Some(dev) = self.inbound_targets.get(&id).cloned() {
                 // A device WE advertised: render into that exact local device.
