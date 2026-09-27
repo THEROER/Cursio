@@ -1253,8 +1253,12 @@ fn run_device_monitor_loop(
 /// Acquire a render device's `IAudioClient` for shared-mode playback, plus its
 /// mix format and total buffer frame count. `device_name = None` uses the
 /// default endpoint; `Some(name)` matches a device by friendly name.
+///
+/// `session` is the audio session this stream belongs to, and it must differ
+/// per stream — see the call to `Initialize` below.
 unsafe fn init_render_client(
     device_name: Option<&str>,
+    session: &windows::core::GUID,
 ) -> Result<(IAudioClient, WAVEFORMATEX, u32), String> {
     let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
         .map_err(|e| format!("enumerator: {e}"))?;
@@ -1275,7 +1279,20 @@ unsafe fn init_render_client(
             200 * 10_000, // 200ms buffer, 100ns units
             0,
             mix_ptr,
-            None,
+            // The audio SESSION this stream joins, and the reason every remote
+            // app gets its own mixer row.
+            //
+            // Passing `None` here does not mean "no session" — it means the
+            // process's DEFAULT session, so every stream cursio renders lands in
+            // the same one. The volume mixer shows a row per session, so three
+            // remote applications appeared as a single row, and each stream's
+            // `SetDisplayName` overwrote the shared name: the row ended up
+            // labelled after whichever app opened last, carrying all of them.
+            //
+            // Distinct from the *grouping* param warned about below: grouping
+            // yokes separate sessions to one slider, whereas this decides which
+            // session a stream is in at all.
+            Some(session),
         )
         .map_err(|e| format!("audio client init: {e}"))?;
 
@@ -1284,6 +1301,26 @@ unsafe fn init_render_client(
         .map_err(|e| format!("buffer size: {e}"))?;
 
     Ok((client, mix, buffer_frames))
+}
+
+/// A session GUID derived from the name a stream renders under.
+///
+/// Stable on purpose: Windows remembers a volume setting per session GUID, so a
+/// GUID that changed per run — from a stream id, say, which is allocated fresh
+/// each session — would give Spotify a new mixer row every time cursio
+/// reconnected, with the volume the user set last time left behind on a row
+/// nothing plays into any more. Keyed by the display name instead, so the same
+/// application lands on the same row and keeps its slider across restarts.
+///
+/// FNV-1a rather than a cryptographic hash: this needs to be stable and spread
+/// out, not unpredictable, and it must not pull in a dependency for 16 bytes.
+fn session_guid(display_name: &str) -> windows::core::GUID {
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for byte in display_name.as_bytes() {
+        hash ^= *byte as u128;
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    windows::core::GUID::from_u128(hash)
 }
 
 fn run_render_loop(
@@ -1306,13 +1343,15 @@ fn run_render_loop(
 
     // SAFETY: all WASAPI calls run on this COM-initialized thread.
     unsafe {
-        let (client, mix, buffer_frames) = match init_render_client(device_name.as_deref()) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
-        };
+        let session = session_guid(&display_name);
+        let (client, mix, buffer_frames) =
+            match init_render_client(device_name.as_deref(), &session) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
 
         let render: IAudioRenderClient = match client.GetService() {
             Ok(r) => r,
@@ -1322,19 +1361,11 @@ fn run_render_loop(
             }
         };
 
-        // Label this stream in the Windows volume mixer and give it its OWN row.
+        // Label this stream's row in the Windows volume mixer.
         //
-        // Each IAudioClient is its own audio session, but the mixer groups
-        // sessions by their *grouping GUID* — and every session we create is
-        // owned by the same process (cursio.exe), so Windows lumped them all
-        // under one grouping and showed a single "RemoteApp" row instead of one
-        // per peer app. SetDisplayName alone can't split them: the mixer takes
-        // the label from the group, not the individual session. So we hand each
-        // session a unique grouping GUID (derived from the stream id, stable
-        // across reconnects) BEFORE naming it — that is what makes Firefox,
-        // Spotify, etc. appear as separate, individually adjustable rows.
-        // Each render stream is its own WASAPI session. Sndvol gives every
-        // session its OWN volume slider *by default* — as long as its grouping
+        // The row itself comes from the session GUID handed to `Initialize`
+        // (see `session_guid`). Sndvol gives every session its OWN volume
+        // slider *by default* — as long as its grouping
         // param stays GUID_NULL (the default). We must NOT set a grouping param:
         // per Microsoft's docs, sessions that SHARE a grouping GUID are yoked to a
         // single slider. An earlier attempt set a grouping GUID thinking it split
@@ -1515,6 +1546,30 @@ mod format_tests {
         let bytes = f32s(&[0.1, 0.2, 0.3, 0.4]);
         assert_eq!(to_wire_format(&bytes, 2, SAMPLE_RATE), bytes);
         assert_eq!(from_wire_format(&bytes, 2, SAMPLE_RATE), bytes);
+    }
+
+    /// One application keeps one session across reconnects, and two never
+    /// share one.
+    ///
+    /// Windows files a volume setting under the session GUID. Deriving it from
+    /// anything per-run — a stream id, a counter — would hand Spotify a fresh
+    /// mixer row on every reconnect and strand the volume the user had set;
+    /// deriving it from nothing at all (the `None` this replaced) put every
+    /// remote application in the process's default session, which is what
+    /// collapsed them into a single row.
+    #[test]
+    fn a_session_is_stable_per_application_and_distinct_between_them() {
+        let spotify = session_guid("Cursio(Nocturne): spotify");
+        assert_eq!(
+            spotify,
+            session_guid("Cursio(Nocturne): spotify"),
+            "the same application must land on the same mixer row every run"
+        );
+        assert_ne!(
+            spotify,
+            session_guid("Cursio(Nocturne): Firefox"),
+            "two applications must not share a row"
+        );
     }
 
     /// Render into a multi-channel endpoint must fill every channel, not leave
