@@ -724,6 +724,55 @@ fn excluded_paths(_peer_name: &str) -> Vec<std::path::PathBuf> {
     Vec::new()
 }
 
+/// Turn a walk a mount noticed into this machine's problem, or end one.
+///
+/// Installed once for the process, since a walk is a fact about this machine
+/// whichever peer's disk it happens on.
+fn report_walk(event: &cursio_files::walk::WalkEvent) {
+    use cursio_files::walk::{WalkEvent, Walker};
+    let id = |w: &Walker| {
+        format!(
+            "files.walk.{}.{}.{}",
+            w.pid,
+            w.peer,
+            cursio_files::volume_dir_name(&w.volume)
+        )
+    };
+    match event {
+        WalkEvent::Started(walker) => crate::diagnostics::raise(crate::diagnostics::Problem {
+            id: id(walker),
+            severity: crate::diagnostics::Severity::Warning,
+            summary: walk_summary(walker),
+            hint: Some(walk_hint(walker.pid)),
+            since: std::time::SystemTime::now(),
+        }),
+        WalkEvent::Ended(walker) => crate::diagnostics::clear(&id(walker)),
+    }
+}
+
+fn walk_summary(walker: &cursio_files::walk::Walker) -> String {
+    let who = match &walker.command {
+        Some(command) => format!("PID {} (`{command}`)", walker.pid),
+        None => format!("PID {}", walker.pid),
+    };
+    format!(
+        "{who} is walking {}'s whole {} disk over the network, one round trip per directory",
+        walker.peer,
+        cursio_files::volume_dir_name(&walker.volume)
+    )
+}
+
+fn walk_hint(pid: u32) -> String {
+    let stop = match cfg!(target_os = "windows") {
+        true => format!("taskkill /PID {pid}"),
+        false => format!("kill {pid}"),
+    };
+    format!(
+        "if it is an indexer, a backup tool or a search, exclude the peer's drives from it; \
+         otherwise stop it with `{stop}`"
+    )
+}
+
 /// A live mount of the peer's volumes, whichever OS is presenting them.
 #[cfg(target_os = "linux")]
 type Mount = cursio_files::mount::MountHandle;
@@ -1027,6 +1076,7 @@ impl FilesEngine {
         let mut server = FileServer::detect();
         server.exclude(excluded_paths(&peer_name));
         let local_volumes = server.volumes();
+        cursio_files::walk::set_reporter(report_walk);
 
         Ok(Self {
             peer_name,
@@ -2161,6 +2211,9 @@ impl SessionModule for FilesEngine {
 
     async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
         self.rescan_volumes();
+        // A walker that stopped makes no further call into the mount, so its
+        // end is noticed here rather than there.
+        cursio_files::walk::sweep();
 
         if self.announce_volumes {
             send(tx, FilesMsg::Volumes(self.local_volumes.clone())).await?;
@@ -3620,5 +3673,34 @@ mod tests {
             matches!(rx.recv(), Ok(Err(FileError::Io(_)))),
             "a waiting caller must be told, not left hanging"
         );
+    }
+
+    /// The user must be able to recognise the walker from the sentence alone:
+    /// its PID, what it is, and whose disk it is costing.
+    #[test]
+    fn a_disk_walk_is_raised_naming_the_process_and_the_peer_and_cleared_when_it_ends() {
+        use cursio_files::walk::{WalkEvent, Walker};
+        let walker = Walker {
+            pid: 4_000_001,
+            command: Some("find / -name *.rs".into()),
+            peer: "Lightmoon".into(),
+            volume: "C:".into(),
+        };
+        report_walk(&WalkEvent::Started(walker.clone()));
+        let raised = crate::diagnostics::snapshot()
+            .into_iter()
+            .find(|p| p.id.starts_with("files.walk.4000001."))
+            .expect("raised");
+        assert_eq!(
+            raised.summary,
+            "PID 4000001 (`find / -name *.rs`) is walking Lightmoon's whole C disk over the \
+             network, one round trip per directory"
+        );
+        assert!(raised.hint.expect("a hint").contains("4000001"));
+
+        report_walk(&WalkEvent::Ended(walker));
+        assert!(!crate::diagnostics::snapshot()
+            .iter()
+            .any(|p| p.id.starts_with("files.walk.4000001.")));
     }
 }

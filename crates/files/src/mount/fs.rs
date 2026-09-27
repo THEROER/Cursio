@@ -92,6 +92,8 @@ pub struct RemoteFs {
     /// `GProxyMount`, so one mount per volume is exactly one sidebar entry per
     /// volume, each with its own eject button.
     bound: String,
+    /// Whose disk this is, for naming it when something walks it.
+    peer_name: String,
 }
 
 struct State {
@@ -129,6 +131,7 @@ impl RemoteFs {
             peer,
             meta: crate::metacache::MetaCache::new(),
             bound: bound.into(),
+            peer_name: String::new(),
             state: Mutex::new(State {
                 inodes: InodeTable::new(),
                 volumes: Vec::new(),
@@ -140,6 +143,12 @@ impl RemoteFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
         }
+    }
+
+    /// Name the peer this volume belongs to.
+    pub fn of_peer(mut self, peer_name: &str) -> Self {
+        self.peer_name = peer_name.to_string();
+        self
     }
 
     /// The peer's volumes, refetched when the cached list has expired.
@@ -470,7 +479,7 @@ impl Filesystem for RemoteFs {
 
     fn readdir(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         _fh: fuser::FileHandle,
         offset: u64,
@@ -479,6 +488,11 @@ impl Filesystem for RemoteFs {
         let Some(entry) = self.entry_of(ino.0) else {
             return reply.error(Errno::ENOENT);
         };
+        // Once per listing: a large directory arrives in several calls, and
+        // only the first says a new directory was opened.
+        if offset == 0 {
+            crate::walk::observe(&self.peer_name, &self.bound, req.pid(), ino.0);
+        }
 
         // `.` and `..` come first and are part of the offset sequence, so a
         // resumed readdir skips them along with everything else already sent.
@@ -562,7 +576,7 @@ impl Filesystem for RemoteFs {
     /// emitted without being counted.
     fn readdirplus(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         _fh: fuser::FileHandle,
         offset: u64,
@@ -571,6 +585,9 @@ impl Filesystem for RemoteFs {
         let Some(entry) = self.entry_of(ino.0) else {
             return reply.error(Errno::ENOENT);
         };
+        if offset == 0 {
+            crate::walk::observe(&self.peer_name, &self.bound, req.pid(), ino.0);
+        }
 
         // Gather the listing first, without touching reference counts: the
         // peer's answer may fail, and a failed reply must leave the table
@@ -1426,8 +1443,12 @@ pub fn mount(
     std::fs::create_dir_all(&mountpoint)?;
 
     let config = mount_config(peer_name);
-    let session =
-        fuser::Session::new(RemoteFs::new(peer, volume), &mountpoint, &config)?.spawn()?;
+    let session = fuser::Session::new(
+        RemoteFs::new(peer, volume).of_peer(peer_name),
+        &mountpoint,
+        &config,
+    )?
+    .spawn()?;
     tracing::info!(mount = %mountpoint.display(), peer = peer_name, volume, "peer volume mounted");
     Ok(MountHandle {
         _session: session,

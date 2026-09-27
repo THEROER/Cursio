@@ -221,12 +221,25 @@ asks is about the machine, not about a link. The lock is held only to copy a few
 small structs.
 
 Ids are dotted by subsystem so a panel can group them: `usb.held.<busid>`,
-`files.walk.<pid>`, `machine.memory` / `machine.swap` / `machine.io`,
+`files.walk.<pid>.<peer>.<volume>`, `machine.memory` / `machine.swap` / `machine.io`,
 `peer.<peer-id>.down`, `module.<name>.<peer>.stalled`, `audio.driver`,
 `window.extension`, `portal.<name>`. The producers that live behind the platform
 crates (`cursio-usb`, `cursio-files`) cannot name `cursio-core`, so they report
 through their own errors or a reporter hook that the matching `*_session.rs`
 turns into a `Problem`.
+
+**A walk of a peer's disk** is the clearest case of a problem nobody sees. A
+mounted peer volume looks local, so `find /`, a desktop indexer or a backup tool
+walks it like any other — and every directory is a round trip, while the copy
+the user did ask for crawls behind the metadata. The mount is the one place
+that knows the caller: FUSE hands each request its PID, and WinFsp carries it on
+the open that precedes a listing (a listing itself has no token). A process
+that lists 200 *distinct* directories within 10 s is reported
+(`cursio-files::walk`) with its command line — `/proc/<pid>/cmdline` on Linux,
+the image path on Windows, where reading another process's command line needs
+rights over its memory. Distinct directories, because a file manager re-listing
+the folder it shows is not a walk. It ends after 20 s of quiet, noticed by the
+files module's pump since a walker that stopped no longer calls the mount.
 
 ## One link, priority end to end
 

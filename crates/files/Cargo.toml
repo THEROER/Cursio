@@ -46,6 +46,8 @@ windows = { version = "0.61", features = ["Win32_Foundation"] }
 # to gain from the safe wrappers.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
+    # `CloseHandle`, for the process queried to name a disk walker; see walk.rs.
+    "Win32_Foundation",
     "Win32_Storage_FileSystem",
     # Lowering the priority of the file worker threads; see background.rs.
     "Win32_System_Threading",

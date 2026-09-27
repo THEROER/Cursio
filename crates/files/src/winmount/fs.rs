@@ -49,6 +49,12 @@ pub struct FileCtx {
     /// this a download runs at one write per round trip however much bandwidth
     /// is free. See [`crate::writeback`].
     writes: Mutex<crate::writeback::WriteBack>,
+    /// The process that opened this handle, or 0 when WinFsp could not say.
+    ///
+    /// Captured at open because that is the only time WinFsp carries it: the
+    /// caller's PID rides the access token of a create request, and a
+    /// directory listing is a request with no token at all.
+    opener: u32,
 }
 
 /// The peer's volumes, presented as a Windows drive.
@@ -80,6 +86,8 @@ pub struct RemoteFs {
     /// exist yet — and 4896 files of a game took longer than Steam was willing
     /// to wait.
     meta: crate::metacache::MetaCache,
+    /// Whose disk this is, for naming it when something walks it.
+    peer_name: String,
 }
 
 impl RemoteFs {
@@ -91,7 +99,27 @@ impl RemoteFs {
             bound: bound.into(),
             meta: crate::metacache::MetaCache::new(),
             write_budget: crate::writeback::InFlightBudget::new(),
+            peer_name: String::new(),
         }
+    }
+
+    /// Name the peer this volume belongs to.
+    pub fn of_peer(mut self, peer_name: &str) -> Self {
+        self.peer_name = peer_name.to_string();
+        self
+    }
+
+    /// The process behind the create or open being served, or 0.
+    fn caller(&self) -> u32 {
+        // SAFETY: called only from `open` and `create`, synchronous operations
+        // during which WinFsp has set this thread's operation context, and
+        // whose request is a create request — so reading the union as one is
+        // reading what is there. The PID is the high half of the token field,
+        // as `FSP_FSCTL_TRANSACT_REQ_TOKEN_PID` defines it.
+        unsafe {
+            self.with_operation_request(|request| (request.Req.Create.AccessToken >> 32) as u32)
+        }
+        .unwrap_or(0)
     }
 
     /// The peer's volumes, refetched when the cached list has expired.
@@ -441,6 +469,7 @@ impl FileSystemContext for RemoteFs {
             size: crate::filesize::KnownSize::new(size),
             ahead: crate::readahead::ReadAhead::new(),
             writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
+            opener: self.caller(),
         })
     }
 
@@ -827,6 +856,16 @@ impl FileSystemContext for RemoteFs {
         if !context.is_dir {
             return Err(to_ntstatus(&FileError::WrongKind));
         }
+        // Once per enumeration: a continuation carries a marker and lists the
+        // same directory again.
+        if marker.inner_as_cstr().is_none() {
+            crate::walk::observe(
+                &self.peer_name,
+                &self.bound,
+                context.opener,
+                crate::walk::dir_key(&context.volume, &context.path),
+            );
+        }
 
         // Fill the caller's buffer directly, the way WinFsp's own MEMFS sample
         // does, rather than going through a `DirBuffer`.
@@ -1007,6 +1046,7 @@ impl FileSystemContext for RemoteFs {
                 size: crate::filesize::KnownSize::new(0),
                 ahead: crate::readahead::ReadAhead::new(),
                 writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
+                opener: self.caller(),
             });
         }
 
@@ -1041,6 +1081,7 @@ impl FileSystemContext for RemoteFs {
             size: crate::filesize::KnownSize::new(size),
             ahead: crate::readahead::ReadAhead::new(),
             writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
+            opener: self.caller(),
         })
     }
 
@@ -1400,9 +1441,11 @@ pub fn mount(
     // Labelled with the peer and the disk, because several of these now sit
     // side by side in Explorer and "cursio" alone would not say which is which.
     let label = format!("{volume_label} ({peer_name})");
-    let mut host: FileSystemHost<RemoteFs> =
-        FileSystemHost::new(params, RemoteFs::new(peer, label, volume))
-            .map_err(|e| anyhow::anyhow!("cannot create the filesystem host: {e:?}"))?;
+    let mut host: FileSystemHost<RemoteFs> = FileSystemHost::new(
+        params,
+        RemoteFs::new(peer, label, volume).of_peer(peer_name),
+    )
+    .map_err(|e| anyhow::anyhow!("cannot create the filesystem host: {e:?}"))?;
 
     // Name the drive letter explicitly.
     //

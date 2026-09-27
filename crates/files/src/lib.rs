@@ -28,6 +28,8 @@ pub mod mount;
 /// many small reads share one round trip.
 pub mod readahead;
 pub mod server;
+/// Which process is walking a mounted peer volume, directory after directory.
+pub mod walk;
 /// Windows mounting, present only where `winfsp` can be built — see this
 /// crate's `Cargo.toml` for why that means MSVC rather than Windows in general.
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
