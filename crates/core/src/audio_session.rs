@@ -2378,10 +2378,10 @@ fn next_bitrate(current: u32, gap: u32) -> u32 {
 /// Used to skip sending idle streams. Mis-classifying real audio as silence
 /// would drop it, so the threshold is deliberately conservative.
 fn is_silent(data: &[u8]) -> bool {
-    data.chunks_exact(4).all(|b| {
-        let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-        v.abs() < SILENCE_THRESHOLD
-    })
+    data.as_chunks::<4>()
+        .0
+        .iter()
+        .all(|b| f32::from_le_bytes(*b).abs() < SILENCE_THRESHOLD)
 }
 
 /// Width of one node's stream-id range. A node allocates devices at
