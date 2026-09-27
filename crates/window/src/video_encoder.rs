@@ -520,6 +520,10 @@ impl crate::frame_pipeline::StreamEncoder for VideoEncoder {
     fn force_keyframe(&mut self) {
         VideoEncoder::force_keyframe(self)
     }
+
+    fn lossy(&self) -> bool {
+        matches!(self.fidelity, Fidelity::Lossy { .. })
+    }
 }
 
 /// Opens FFmpeg encoders for the capture pipeline, following what the viewer

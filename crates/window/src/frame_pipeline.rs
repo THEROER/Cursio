@@ -538,6 +538,9 @@ pub trait StreamEncoder {
     fn encode(&mut self, bgra: &[u8]) -> Result<Vec<Vec<u8>>, crate::WindowError>;
     /// Make the next encoded frame an IDR.
     fn force_keyframe(&mut self);
+    /// Whether what this encoder produces loses detail, and so leaves the
+    /// viewer a picture worth refining once the source stands still.
+    fn lossy(&self) -> bool;
 }
 
 /// Opens and tunes a backend's encoders; what differs between platforms.
@@ -573,6 +576,14 @@ enum VideoSend {
 /// uncompressed.
 const FULL_PICTURE_BANDS: u32 = 4;
 
+/// How long a source must stand still after lossy video before its final
+/// picture is resent exactly.
+///
+/// Long enough that a pause between keystrokes or scroll steps is not taken
+/// for the end of the motion — each refinement is a whole picture — and short
+/// enough that the blur is gone before the eye settles on what stopped.
+pub const SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Everything a capture backend does with a captured frame, and between them.
 ///
 /// Both backends feed it full BGRA frames; it diffs them, routes each change to
@@ -591,6 +602,10 @@ pub struct CapturePipeline<S: EncoderSource> {
     /// The viewer lacks a picture to build on: it asked, or an update it needed
     /// was dropped.
     resync: bool,
+    /// Lossy video reached the viewer and no exact picture has replaced it.
+    unrefined: bool,
+    /// When the source last changed.
+    last_change: Option<std::time::Instant>,
     seq: u32,
     quality: std::sync::Arc<AdaptiveQuality>,
     last_seq: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -612,6 +627,8 @@ impl<S: EncoderSource> CapturePipeline<S> {
             video: None,
             keyframes: KeyframeClock::default(),
             resync: false,
+            unrefined: false,
+            last_change: None,
             seq: 0,
             quality,
             last_seq,
@@ -627,6 +644,9 @@ impl<S: EncoderSource> CapturePipeline<S> {
     /// One captured frame, tightly packed BGRA.
     pub fn frame(&mut self, frame: &[u8], width: u32, height: u32, now: std::time::Instant) {
         let dirty = self.differ.diff(frame, width, height);
+        if dirty.is_some() {
+            self.last_change = Some(now);
+        }
         if self.resync {
             self.send_resync(frame, width, height, now);
             return;
@@ -645,8 +665,23 @@ impl<S: EncoderSource> CapturePipeline<S> {
     }
 
     /// Between frames: answer what the viewer is owed from the last frame.
+    ///
+    /// Besides a resync, that is a *refinement*. A lossy stream spends few
+    /// bits on each frame of motion because the next frame will correct it —
+    /// but when the source stops, no next frame comes, and the last one's
+    /// blur stays: a closed menu left a faint imprint where it had been. So
+    /// once lossy video has stood still for [`SETTLE`], the final picture is
+    /// sent once more as lossless tiles. Tiles rather than a better IDR: they
+    /// are exact, need no encoder retuned for one frame, and a viewer blits
+    /// them over whatever its decoder left. Each video frame covers the whole
+    /// window, so the whole window is what needs replacing. Once per settle:
+    /// only new lossy video arms it again.
     pub fn idle(&mut self, now: std::time::Instant) {
-        if !self.resync {
+        let settled = self.unrefined
+            && self
+                .last_change
+                .is_some_and(|at| now.saturating_duration_since(at) >= SETTLE);
+        if !self.resync && !settled {
             return;
         }
         let Some((frame, width, height)) = self.differ.last() else {
@@ -654,7 +689,11 @@ impl<S: EncoderSource> CapturePipeline<S> {
             return;
         };
         let frame = frame.to_vec();
-        self.send_resync(&frame, width, height, now);
+        if self.resync {
+            self.send_resync(&frame, width, height, now);
+        } else if self.send_full_picture(&frame, width, height) {
+            self.unrefined = false;
+        }
     }
 
     /// The whole picture, as an IDR where an encoder opens and as lossless
@@ -666,6 +705,7 @@ impl<S: EncoderSource> CapturePipeline<S> {
             VideoSend::Unavailable => {
                 if self.send_full_picture(frame, width, height) {
                     self.resync = false;
+                    self.unrefined = false;
                 }
             }
         }
@@ -716,6 +756,7 @@ impl<S: EncoderSource> CapturePipeline<S> {
             }
         };
         self.keyframes.note_sent(&packets, now);
+        let refine = !packets.is_empty() && enc.lossy();
         let full = Rect {
             x: 0,
             y: 0,
@@ -735,6 +776,7 @@ impl<S: EncoderSource> CapturePipeline<S> {
         match try_queue_frames(&self.frames, frames) {
             Ok(()) => {
                 self.quality.note_video_sent();
+                self.unrefined |= refine;
                 VideoSend::Sent
             }
             Err(_) => {
@@ -1294,6 +1336,10 @@ mod pipeline_tests {
         fn force_keyframe(&mut self) {
             self.forced = true;
         }
+
+        fn lossy(&self) -> bool {
+            true
+        }
     }
 
     /// Opens a [`FakeEncoder`], or refuses to when `available` is false.
@@ -1354,7 +1400,8 @@ mod pipeline_tests {
 
     #[test]
     fn a_still_screen_owes_nothing_however_long_it_idles() {
-        let (mut p, mut rx) = pipeline(true, 8);
+        // Tiles only: lossy video would owe its one refinement, tested below.
+        let (mut p, mut rx) = pipeline(false, 8);
         let now = Instant::now();
         p.frame(&solid(1), W, H, now);
         drain(&mut rx);
@@ -1425,5 +1472,50 @@ mod pipeline_tests {
         p.frame(&solid(3), W, H, start + KEYFRAME_INTERVAL);
         let keys: Vec<bool> = drain(&mut rx).iter().map(is_idr).collect();
         assert_eq!(keys, vec![true, false, true]);
+    }
+
+    #[test]
+    fn lossy_video_that_stands_still_is_refined_exactly_once() {
+        let (mut p, mut rx) = pipeline(true, 8);
+        let start = Instant::now();
+        p.frame(&solid(1), W, H, start);
+        p.frame(&solid(2), W, H, start + Duration::from_millis(16));
+        drain(&mut rx);
+
+        // Still moving, as far as the settle window can tell.
+        p.idle(start + Duration::from_millis(100));
+        assert!(drain(&mut rx).is_empty());
+
+        let settled = start + Duration::from_millis(16) + SETTLE;
+        p.idle(settled);
+        let refined = drain(&mut rx);
+        assert!(!refined.is_empty());
+        assert!(refined.iter().all(|f| f.codec.is_lossless()));
+        let rows: u32 = refined.iter().map(|f| f.dirty.height).sum();
+        assert_eq!(rows, H, "the refinement must cover the whole picture");
+
+        // A still screen never loops.
+        for i in 1..50 {
+            p.idle(settled + Duration::from_millis(16 * i));
+        }
+        assert!(drain(&mut rx).is_empty());
+
+        // Only new lossy video arms it again.
+        let later = settled + Duration::from_secs(1);
+        p.frame(&solid(3), W, H, later);
+        drain(&mut rx);
+        p.idle(later + SETTLE);
+        assert!(!drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_screen_that_only_changed_through_tiles_needs_no_refinement() {
+        let (mut p, mut rx) = pipeline(false, 8);
+        let start = Instant::now();
+        p.frame(&solid(1), W, H, start);
+        p.frame(&solid(2), W, H, start + Duration::from_millis(16));
+        drain(&mut rx);
+        p.idle(start + Duration::from_secs(5));
+        assert!(drain(&mut rx).is_empty());
     }
 }

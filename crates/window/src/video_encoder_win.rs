@@ -718,6 +718,12 @@ impl crate::frame_pipeline::StreamEncoder for VideoEncoder {
     fn force_keyframe(&mut self) {
         VideoEncoder::force_keyframe(self)
     }
+
+    /// Media Foundation has no dependable lossless mode; see the module
+    /// docs.
+    fn lossy(&self) -> bool {
+        true
+    }
 }
 
 /// Opens Media Foundation encoders for the capture pipeline.

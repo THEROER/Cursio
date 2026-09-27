@@ -291,6 +291,20 @@ instead of only resetting the differ: the old reset made the *next* change a
 full frame, but on a screen that then stood still there was no next change,
 and the viewer kept the gap.
 
+**Refine lossy video once the source settles.** A lossy stream spends few bits
+per frame of motion because the next frame corrects it; when the source stops
+there is no next frame, and the last one's blur stays — GNOME's screenshot
+toolbar left a faint imprint after it closed. Once lossy video has stood still
+for `SETTLE` (400 ms), `CapturePipeline::idle` sends the last captured frame
+once more as lossless tiles (four bands, zstd). Tiles rather than a
+higher-quality IDR: exact, no encoder retuned for one frame, and a viewer
+blits them over whatever its decoder produced. The whole window, because each
+video frame replaced the whole window. Once per settle — only new lossy video
+arms it again, so a still screen never loops — and never for a lossless
+stream. The next video frame is a P-frame off the decoder's lossy reference, so
+motion is lossy again until it settles again; that is the trade the lossy
+stream already made.
+
 ## Wire protocol
 
 `crates/protocol/src/window.rs` (added in `PROTOCOL_VERSION = 4`). All types are
