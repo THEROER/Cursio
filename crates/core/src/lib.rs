@@ -12,7 +12,7 @@
 //! ## What is always here, and what is a feature
 //!
 //! The mesh core — [`identity`], [`link`], [`session`], [`mesh`], [`registry`],
-//! [`module`], [`node_status`] — depends on no platform crate at all. The
+//! [`module`], [`node_status`], [`diagnostics`] — depends on no platform crate at all. The
 //! `*_session.rs` files are the policy layer on top, and each is gated by the
 //! feature naming its subsystem (all on by default). A phone builds the core
 //! plus the modules it can implement and never compiles PipeWire, a FUSE mount
@@ -23,6 +23,8 @@ pub mod airplay_window;
 #[cfg(feature = "audio")]
 pub mod audio_session;
 pub mod clipboard_session;
+/// This machine's current problems, each with the fix where there is one.
+pub mod diagnostics;
 /// Windows self-elevation, so injected input isn't blocked by UIPI.
 pub mod elevate;
 /// File sharing. Serving this machine's volumes is portable and always built;

@@ -191,6 +191,43 @@ AirPlay) and have been ranking machines without knowing which of them is running
 out of power. A laptop below 15% and discharging is `is_power_critical`; a peer
 on cellular `is_metered`. Those are the questions the mesh will ask.
 
+## What is wrong here, in words
+
+The log says everything once, among thousands of lines. A user who opens it an
+hour after the USB claim failed finds `no such device` and has to work out that
+`adb` was holding the phone. `core/src/diagnostics.rs` is the other half: the
+set of problems that hold **right now**, each a `Problem` with a stable `id`, a
+`Severity`, a one-line `summary` naming the concrete cause, an optional `hint`
+(the command that fixes it) and the `since` of the first time it was seen.
+
+```rust
+diagnostics::raise(problem);        // idempotent by id; keeps the first `since`
+diagnostics::clear("usb.held.1-1"); // the condition ended
+diagnostics::snapshot()             // most severe first, oldest first within it
+```
+
+**A set keyed by id, not a stream.** A problem is a state, so a producer that
+sees it every second raises it every second and it stays one entry, dated from
+when it began — "swap has been full for twenty minutes" is the useful sentence.
+A producer never has to remember what it already raised, which is what keeps
+every producer a one-line call at the place that already detects the condition.
+A repeat that changes nothing logs nothing; a raise that changes what the
+registry says logs once at the matching level, so the log and a status panel
+never disagree.
+
+**One per machine.** Problems come from module threads, FUSE and WinFsp
+callbacks, a pressure monitor and the mesh supervisor, and the question the user
+asks is about the machine, not about a link. The lock is held only to copy a few
+small structs.
+
+Ids are dotted by subsystem so a panel can group them: `usb.held.<busid>`,
+`files.walk.<pid>`, `machine.memory` / `machine.swap` / `machine.io`,
+`peer.<peer-id>.down`, `module.<name>.<peer>.stalled`, `audio.driver`,
+`window.extension`, `portal.<name>`. The producers that live behind the platform
+crates (`cursio-usb`, `cursio-files`) cannot name `cursio-core`, so they report
+through their own errors or a reporter hook that the matching `*_session.rs`
+turns into a `Problem`.
+
 ## One link, priority end to end
 
 Every module rides one Noise-over-TCP link, so the order bytes leave in is the
