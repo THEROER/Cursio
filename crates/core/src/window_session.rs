@@ -619,6 +619,64 @@ pub struct WindowFactory {
     /// a flag that meant the same thing was a second way to say it that had to
     /// agree with the first.
     pub airplay: Option<AirPlayShare>,
+    /// Open a remote-screen view of every peer that serves one
+    /// (`--remote-screen`). Off by default: the view is a window that appears
+    /// per peer, and nobody should find windows they never asked for.
+    pub remote_screen: bool,
+    /// Serve peers' remote-screen views of this machine. On by default and
+    /// turned off by `--no-screen-host`; either way the module still
+    /// negotiates, so a peer asking gets a refusal with a reason rather than
+    /// silence.
+    pub screen_host: bool,
+}
+
+impl WindowFactory {
+    /// Give an engine this node's remote-screen configuration.
+    ///
+    /// Applied to every engine this factory builds, including an AirPlay one:
+    /// hosting and viewing a screen are independent of which window, if any,
+    /// this node is transferring.
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    fn with_screen<C: WindowCapture, R: WindowRenderer>(
+        &self,
+        engine: WindowEngine<C, R>,
+        ctx: &crate::module::SessionCtx,
+    ) -> WindowEngine<C, R> {
+        let host = if self.screen_host {
+            screen_sources(&ctx.local.display_name)
+        } else {
+            ScreenHost::refusing(format!(
+                "{} was started with --no-screen-host",
+                ctx.local.display_name
+            ))
+        };
+        let engine = engine.with_screen_host(host);
+        if self.remote_screen {
+            engine.with_screen_view()
+        } else {
+            engine
+        }
+    }
+}
+
+/// This platform's remote-screen source list, or a refusal naming why not.
+#[cfg(target_os = "linux")]
+fn screen_sources(machine: &str) -> ScreenHost {
+    ScreenHost::serving(std::sync::Arc::new(cursio_window::PortalScreenSources {
+        machine: machine.to_string(),
+    }))
+}
+
+#[cfg(target_os = "windows")]
+fn screen_sources(_machine: &str) -> ScreenHost {
+    ScreenHost::serving(std::sync::Arc::new(cursio_window::WgcScreenSources))
+}
+
+#[cfg(target_os = "macos")]
+fn screen_sources(machine: &str) -> ScreenHost {
+    ScreenHost::refusing(format!(
+        "{machine} is a Mac, and remote-screen sources are not implemented on macOS yet"
+    ))
 }
 
 /// The receiver stream this node can offer through the window module.
@@ -671,9 +729,8 @@ impl crate::module::ModuleFactory for WindowFactory {
                 .clone()
                 .filter(|share| share.force || ctx.peer.service.show_window)
             {
-                return Ok(Box::new(airplay_engine(
-                    airplay,
-                    cursio_window::GtkWindowRenderer,
+                return Ok(Box::new(self.with_screen(
+                    airplay_engine(airplay, cursio_window::GtkWindowRenderer, ctx),
                     ctx,
                 )));
             }
@@ -688,7 +745,7 @@ impl crate::module::ModuleFactory for WindowFactory {
             )
             .with_requests(requests)
             .with_transfer_ended(ended);
-            Ok(Box::new(engine))
+            Ok(Box::new(self.with_screen(engine, ctx)))
         }
         #[cfg(target_os = "windows")]
         {
@@ -697,9 +754,8 @@ impl crate::module::ModuleFactory for WindowFactory {
                 .clone()
                 .filter(|share| share.force || ctx.peer.service.show_window)
             {
-                return Ok(Box::new(airplay_engine(
-                    airplay,
-                    cursio_window::Win32WindowRenderer,
+                return Ok(Box::new(self.with_screen(
+                    airplay_engine(airplay, cursio_window::Win32WindowRenderer, ctx),
                     ctx,
                 )));
             }
@@ -717,7 +773,7 @@ impl crate::module::ModuleFactory for WindowFactory {
             )
             .with_requests(requests)
             .with_transfer_ended(ended);
-            Ok(Box::new(engine))
+            Ok(Box::new(self.with_screen(engine, ctx)))
         }
         #[cfg(target_os = "macos")]
         {
@@ -726,9 +782,8 @@ impl crate::module::ModuleFactory for WindowFactory {
                 .clone()
                 .filter(|share| share.force || ctx.peer.service.show_window)
             {
-                return Ok(Box::new(airplay_engine(
-                    airplay,
-                    cursio_window::MacWindowRenderer,
+                return Ok(Box::new(self.with_screen(
+                    airplay_engine(airplay, cursio_window::MacWindowRenderer, ctx),
                     ctx,
                 )));
             }
@@ -740,7 +795,7 @@ impl crate::module::ModuleFactory for WindowFactory {
             )
             .with_requests(requests)
             .with_transfer_ended(ended);
-            Ok(Box::new(engine))
+            Ok(Box::new(self.with_screen(engine, ctx)))
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {

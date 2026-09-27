@@ -129,6 +129,18 @@ enum Command {
         /// AirPlay is forwarded untouched, so nothing is re-encoded on the way.
         #[arg(long, default_value_t = false)]
         share_airplay: bool,
+        /// Open a window per peer, titled "Cursio — <peer>", showing one of
+        /// that peer's windows or monitors — something screen-sharing software
+        /// (Discord, OBS, a browser call) can pick like any local window.
+        ///
+        /// Right-click it to choose what it shows; ← and → step between the
+        /// peer's monitors and windows. Switching keeps the window, so a share
+        /// already running follows along.
+        #[arg(long, default_value_t = false)]
+        remote_screen: bool,
+        /// Refuse peers' --remote-screen views of this machine.
+        #[arg(long, default_value_t = false)]
+        no_screen_host: bool,
         /// Pair with a machine that is not trusted yet: run this on **both**,
         /// with the same password, for the next ten minutes.
         ///
@@ -456,6 +468,8 @@ async fn main() -> anyhow::Result<()> {
             files,
             usb,
             share_airplay,
+            remote_screen,
+            no_screen_host,
             pair,
             pair_addr,
             airplay,
@@ -536,6 +550,8 @@ async fn main() -> anyhow::Result<()> {
                             force: share_airplay,
                         }
                     }),
+                    remote_screen,
+                    screen_host: !no_screen_host,
                 },
                 ServiceSetup {
                     state: service_state.clone(),
@@ -609,6 +625,10 @@ struct WindowOpts {
     /// this machine's own moves by being dragged across the peer-facing edge,
     /// which needs no flag — the drag is the request.
     airplay: Option<cursio_core::window_session::AirPlayShare>,
+    /// `--remote-screen`: open a view of each peer's screen.
+    remote_screen: bool,
+    /// `!--no-screen-host`: let peers view this machine's screen.
+    screen_host: bool,
 }
 
 /// What the service module needs, gathered so `module_registry` takes one
@@ -1095,6 +1115,8 @@ fn module_registry(
         // before the AirPlay window trigger makes a placement decision.
         .with(Box::new(cursio_core::window_session::WindowFactory {
             airplay: window.airplay,
+            remote_screen: window.remote_screen,
+            screen_host: window.screen_host,
         }))
         // Registered everywhere, including the platforms with no mount backend.
         // Sharing is two independent halves and only one of them needs FUSE or
@@ -2449,6 +2471,32 @@ mod tests {
             AirPlayMode::parse(&airplay).unwrap(),
             AirPlayMode::On { wanted: None }
         );
+    }
+
+    #[test]
+    fn remote_screen_views_are_opt_in_and_hosting_them_is_opt_out() {
+        let Command::Mesh {
+            remote_screen,
+            no_screen_host,
+            ..
+        } = Cli::try_parse_from(["cursio", "mesh"]).unwrap().command
+        else {
+            unreachable!();
+        };
+        assert!(!remote_screen, "no view window may appear unasked");
+        assert!(!no_screen_host, "a peer's view is served by default");
+
+        let Command::Mesh {
+            remote_screen,
+            no_screen_host,
+            ..
+        } = Cli::try_parse_from(["cursio", "mesh", "--remote-screen", "--no-screen-host"])
+            .unwrap()
+            .command
+        else {
+            unreachable!();
+        };
+        assert!(remote_screen && no_screen_host);
     }
 
     #[test]
