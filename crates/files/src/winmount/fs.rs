@@ -14,7 +14,7 @@ use winfsp::filesystem::{
 };
 use winfsp::host::{FileSystemHost, VolumeParams};
 
-use super::convert::{attributes_of, dir_name_of, split_path, to_filetime, to_ntstatus};
+use super::convert::{attributes_of, dir_name_of, to_filetime, to_ntstatus};
 use crate::bridge::PeerLink;
 
 /// How long the volume list is trusted before being fetched again. Drives do
@@ -37,23 +37,57 @@ pub struct FileCtx {
     volume: String,
     path: String,
     is_dir: bool,
+    /// Bytes fetched ahead of what was asked for, while this handle is read
+    /// sequentially. Per handle, so it dies with the file it belongs to.
+    ahead: crate::readahead::ReadAhead,
+    /// Writes sent against this handle and not yet accounted for.
+    ///
+    /// Windows hands cached writes to a filesystem from one thread, so without
+    /// this a download runs at one write per round trip however much bandwidth
+    /// is free. See [`crate::writeback`].
+    writes: Mutex<crate::writeback::WriteBack>,
 }
 
 /// The peer's volumes, presented as a Windows drive.
 pub struct RemoteFs {
     peer: PeerLink,
+    /// Writes in flight across every handle on this drive — see
+    /// [`crate::writeback::InFlightBudget`] for why it is not per handle.
+    write_budget: crate::writeback::InFlightBudget,
     volumes: Mutex<(Vec<Volume>, Option<std::time::Instant>)>,
     /// What the drive calls itself in Explorer; also answered to anything
     /// asking the volume for its label.
     label: String,
+    /// The peer volume this drive letter *is*.
+    ///
+    /// One letter per volume, because on Windows a peer's disk has the same
+    /// nature as a local one: its own root, its own capacity, its own letter.
+    /// Presenting several as folders under one letter — which is what the Linux
+    /// mount does, since it has no letters to give — meant the drive could only
+    /// report one capacity for all of them, so it reported the sum: a peer with
+    /// five disks showed as a single 2 TB drive that matched none of them.
+    bound: String,
+    /// What the peer last said about each path, briefly remembered.
+    ///
+    /// Windows asks about a path far more often than an application does: an
+    /// open is preceded by a query, a write is followed by one, and a listing
+    /// is followed by a query per entry. Each was a round trip. Measured
+    /// against a peer 9 ms away, Steam's preallocation pass spent about 150 ms
+    /// on each file it created — seventeen round trips for a file that did not
+    /// exist yet — and 4896 files of a game took longer than Steam was willing
+    /// to wait.
+    meta: crate::metacache::MetaCache,
 }
 
 impl RemoteFs {
-    pub fn new(peer: PeerLink, label: impl Into<String>) -> Self {
+    pub fn new(peer: PeerLink, label: impl Into<String>, bound: impl Into<String>) -> Self {
         Self {
             peer,
             volumes: Mutex::new((Vec::new(), None)),
             label: label.into(),
+            bound: bound.into(),
+            meta: crate::metacache::MetaCache::new(),
+            write_budget: crate::writeback::InFlightBudget::new(),
         }
     }
 
@@ -75,20 +109,35 @@ impl RemoteFs {
         Ok(fetched)
     }
 
-    /// Resolve a Windows path to the volume and wire path it addresses.
-    fn resolve(&self, file_name: &U16CStr) -> Result<Option<(String, String)>, FileError> {
+    /// Resolve a Windows path against the volume this drive is bound to.
+    ///
+    /// The path names nothing but a location *inside* that volume: the letter
+    /// already said which one. Every path, `\` included, belongs to the bound
+    /// volume, and `\` is that volume's own root.
+    fn resolve(&self, file_name: &U16CStr) -> (String, String) {
         let win_path = file_name.to_string_lossy();
-        let volumes = self.volumes()?;
-        Ok(split_path(&win_path, &volumes).map(|(v, p)| (v.to_string(), p)))
+        let path = win_path.trim_start_matches('\\').replace('\\', "/");
+        (self.bound.clone(), path)
     }
 
-    /// Metadata for a path, treating the mount root and each volume's own
-    /// directory as synthetic directories — they exist here, not on the peer.
+    /// Metadata for a path, answered from the cache when it was asked for
+    /// recently. The volume's root is a synthetic directory: it exists here,
+    /// not as an entry the peer could stat.
+    ///
+    /// Both outcomes are remembered. A `NotFound` is as much an answer as a
+    /// `FileMeta`, and an installer asks about thousands of paths that do not
+    /// exist yet — going back to the peer to be told the same thing again is a
+    /// round trip spent on a fact already in hand.
     fn stat_path(&self, volume: &str, path: &str) -> Result<FileMeta, FileError> {
         if path.is_empty() {
             return Ok(synthetic_dir(volume));
         }
-        self.peer.stat(volume, path)
+        if let Some(hit) = self.meta.get(volume, path) {
+            return hit;
+        }
+        let fresh = self.peer.stat(volume, path);
+        self.meta.put(volume, path, fresh.clone());
+        fresh
     }
 }
 
@@ -101,6 +150,7 @@ fn synthetic_dir(name: &str) -> FileMeta {
         size: 0,
         modified_unix: 0,
         writable: true,
+        allocated: None,
     }
 }
 
@@ -269,14 +319,8 @@ impl FileSystemContext for RemoteFs {
         _security_descriptor: Option<&mut [std::ffi::c_void]>,
         _resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        let Some((volume, path)) = self.resolve(file_name).map_err(|e| to_ntstatus(&e))? else {
-            // The mount root: a directory belonging to no volume.
-            return Ok(FileSecurity {
-                reparse: false,
-                sz_security_descriptor: 0,
-                attributes: attributes_of(&synthetic_dir("")),
-            });
-        };
+        let _call = crate::inflight::shared().enter("get_security_by_name");
+        let (volume, path) = self.resolve(file_name);
         let meta = self
             .stat_path(&volume, &path)
             .map_err(|e| to_ntstatus(&e))?;
@@ -298,11 +342,8 @@ impl FileSystemContext for RemoteFs {
         granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        let resolved = self.resolve(file_name).map_err(|e| to_ntstatus(&e))?;
-        let (volume, path) = match resolved {
-            Some(v) => v,
-            None => (String::new(), String::new()),
-        };
+        let _call = crate::inflight::shared().enter("open");
+        let (volume, path) = self.resolve(file_name);
 
         let meta = self
             .stat_path(&volume, &path)
@@ -361,10 +402,27 @@ impl FileSystemContext for RemoteFs {
             volume,
             path,
             is_dir,
+            ahead: crate::readahead::ReadAhead::new(),
+            writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
         })
     }
 
     fn close(&self, context: Self::FileContext) {
+        let _call = crate::inflight::shared().enter("close");
+        // Outstanding writes first: the close is what tells the peer the file
+        // is done, and it must not overtake bytes still on their way to it.
+        // A failure here has nowhere to be reported — `close` returns nothing —
+        // but it is logged, and `flush` and the next `write` both report it
+        // while the application can still act on it.
+        if let Ok(mut pipeline) = context.writes.lock() {
+            pipeline.drain(
+                |rx, limit| self.peer.await_write(rx, limit),
+                crate::bridge::BULK_OP_TIMEOUT,
+            );
+            if let Some(e) = pipeline.take_failure() {
+                tracing::warn!(path = %context.path, error = ?e, "a write failed before close");
+            }
+        }
         if let Some(remote) = context.remote {
             self.peer.close(remote);
         }
@@ -376,12 +434,18 @@ impl FileSystemContext for RemoteFs {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
+        let _call = crate::inflight::shared().enter("read");
         let Some(remote) = context.remote else {
             return Err(to_ntstatus(&FileError::WrongKind));
         };
-        let bytes = self
-            .peer
-            .read(remote, offset, buffer.len() as u32)
+        // Through the read-ahead buffer: Windows asks in whatever size the
+        // application chose, often 4 KiB, and each of those was a round trip.
+        // One fetch now serves every read that lands inside it.
+        let bytes = context
+            .ahead
+            .read(offset, buffer.len(), |at, len| {
+                self.peer.read(remote, at, len)
+            })
             .map_err(|e| to_ntstatus(&e))?;
         let n = bytes.len().min(buffer.len());
         buffer[..n].copy_from_slice(&bytes[..n]);
@@ -397,18 +461,125 @@ impl FileSystemContext for RemoteFs {
         _constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
+        let _call = crate::inflight::shared().enter("write");
         let Some(remote) = context.remote else {
             return Err(to_ntstatus(&FileError::WrongKind));
         };
-        let written = self
-            .peer
-            .write(remote, offset, buffer.to_vec())
-            .map_err(|e| to_ntstatus(&e))?;
-        // Windows expects the file's state after the write, so re-stat rather
-        // than guessing at the new size.
-        if let Ok(meta) = self.stat_path(&context.volume, &context.path) {
-            fill_info(file_info, &meta);
+        // Pipelined: this write is sent now and its answer collected later,
+        // while the answer being waited on here belongs to a write already a
+        // window behind. Nothing is acknowledged before the peer has stored it
+        // — what changes is only which write the caller waits out, so the
+        // link carries several at once instead of one per round trip. See
+        // `crate::writeback`.
+        let mut pipeline = context.writes.lock().expect("handle writes");
+        if let Some(e) = pipeline.take_failure() {
+            // An earlier write in this pipeline failed. Report it here rather
+            // than letting the application believe its file is complete.
+            pipeline.drain(
+                |rx, limit| self.peer.await_write(rx, limit),
+                crate::bridge::BULK_OP_TIMEOUT,
+            );
+            tracing::warn!(
+                path = %context.path,
+                offset,
+                error = ?e,
+                "a write earlier in this file failed"
+            );
+            return Err(to_ntstatus(&e));
         }
+
+        // A slot on the link, or an answer collected to free one. Collecting is
+        // the work this thread would be waiting to do in any case, and it keeps
+        // the queue on the link bounded by what the link carries rather than by
+        // how many files the application has open.
+        if !pipeline.reserve() {
+            match pipeline.collect_one(
+                |rx, limit| self.peer.await_write(rx, limit),
+                crate::bridge::BULK_OP_TIMEOUT,
+            ) {
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        path = %context.path,
+                        offset,
+                        error = ?e,
+                        "a write to the peer failed"
+                    );
+                    return Err(to_ntstatus(&e));
+                }
+                // The slot that answer held is free now. If another handle
+                // took it first this write still goes out — one over the
+                // budget is a rounding error next to stalling the thread.
+                _ => drop(pipeline.reserve()),
+            }
+        }
+
+        let rx = self
+            .peer
+            .write_later(remote, offset, buffer.to_vec())
+            .map_err(|e| {
+                // Named with the path and offset Steam quotes back — its
+                // "writing chunk, offset N" names the same write, so the two
+                // logs can be lined up against each other.
+                tracing::warn!(
+                    path = %context.path,
+                    offset,
+                    len = buffer.len(),
+                    error = ?e,
+                    "a write to the peer failed"
+                );
+                to_ntstatus(&e)
+            })?;
+        pipeline.push(rx, buffer.len() as u64);
+
+        // Report this write's own length as accepted. It is not an
+        // acknowledgement: the bytes are still outstanding, and any failure
+        // reaches the application at a later write or at `flush`/`cleanup`,
+        // before the file can be closed as complete — which is the guarantee
+        // `rclone`'s pipeline does not give on Windows, where WinFsp drops an
+        // error returned from `flush`.
+        let written = buffer.len() as u64;
+        drop(pipeline);
+        // Windows expects the file's state after the write, and takes what it
+        // is given: a `FileInfo` left untouched is whatever the caller's memory
+        // held — a size and timestamps invented from nothing.
+        //
+        // Computed rather than fetched. The peer was just told to put `written`
+        // bytes at `offset`, so the file is at least that long and its contents
+        // changed now; asking for that back is a round trip spent learning what
+        // this call already decided. It is not a small saving: Windows follows
+        // almost every write with a `get_file_info`, and Steam's unpacking
+        // measured 3.3 stats per write — the metadata traffic outnumbered the
+        // data more than three to one, and a link doing 41 MB/s on a plain
+        // sequential write served Steam at 5.6.
+        //
+        // The cached entry is updated to match instead of being dropped, so the
+        // `get_file_info` that follows is answered from memory rather than
+        // starting the round trip again.
+        // Only what is already held: going to the peer here is the round trip
+        // being removed. A file whose previous size is unknown is described by
+        // this write's own end, which is the truth as far as this call knows —
+        // and the next `get_file_info` past the cache lifetime corrects it.
+        let known = self
+            .meta
+            .get(&context.volume, &context.path)
+            .and_then(|r| r.ok());
+        let meta = FileMeta {
+            name: context
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&context.path)
+                .to_string(),
+            kind: FileKind::File,
+            size: known.as_ref().map_or(0, |m| m.size).max(offset + written),
+            modified_unix: now_unix(),
+            writable: true,
+            allocated: None,
+        };
+        self.meta
+            .put(&context.volume, &context.path, Ok(meta.clone()));
+        context.ahead.invalidate();
+        fill_info(file_info, &meta);
         Ok(written as u32)
     }
 
@@ -422,27 +593,30 @@ impl FileSystemContext for RemoteFs {
     /// Explorer, cmd and .NET — none of which make that call — worked fine.
     /// The same refusal is what `fsutil` reported as "Incorrect function".
     ///
-    /// The figures are the peer's own, summed across its volumes: the mount is
-    /// one drive letter as far as Windows is concerned, so it reports one
-    /// capacity. Reporting the drive as full instead — which this did while the
-    /// wire carried no capacity — draws a red bar over an empty disk and makes
-    /// Explorer refuse a copy before attempting it, on a volume with hundreds
-    /// of gigabytes free.
+    /// The figures are those of the one peer volume this letter is bound to.
+    ///
+    /// This used to sum every volume the peer offered, because the mount was a
+    /// single letter standing for all of them — so a machine with five disks
+    /// reported one drive of their combined size, a figure matching no disk the
+    /// user has. One letter per volume removes the question: the drive reports
+    /// what its own disk holds.
     ///
     /// The fallback is deliberately not zero. A volume answering zero total
     /// makes "percent used" a division by zero in callers that compute it, and
     /// zero free makes file managers refuse to write; see `FALLBACK_TOTAL` in
     /// [`crate::server`], which the FUSE half answers with for the same reason.
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
+        let _call = crate::inflight::shared().enter("get_volume_info");
         let (total, free) = match self.volumes() {
-            Ok(volumes) if !volumes.is_empty() => volumes.iter().fold((0u64, 0u64), |(t, f), v| {
-                (
-                    t.saturating_add(v.total_bytes),
-                    f.saturating_add(v.free_bytes),
-                )
-            }),
-            // The peer has not answered yet, or cannot be reached. A plausible
-            // figure keeps Explorer usable while the link wakes up.
+            Ok(volumes) => volumes
+                .iter()
+                .find(|v| v.id == self.bound)
+                .map(|v| (v.total_bytes, v.free_bytes))
+                // Bound to a volume the peer no longer lists: it was unplugged,
+                // or the link has not answered yet. Either way a plausible
+                // figure keeps Explorer usable until the mount goes away.
+                .unwrap_or((crate::server::FALLBACK_TOTAL, crate::server::FALLBACK_FREE)),
+            // The peer cannot be reached.
             _ => (crate::server::FALLBACK_TOTAL, crate::server::FALLBACK_FREE),
         };
         out_volume_info.total_size = total;
@@ -451,23 +625,43 @@ impl FileSystemContext for RemoteFs {
         Ok(())
     }
 
-    /// Accept a flush.
+    /// Wait for every write still in flight against this handle.
     ///
-    /// Writes are forwarded to the peer as they arrive and nothing is buffered
-    /// on this side, so there is nothing here to force out; the peer's own
-    /// filesystem owns the durability guarantee. The default refuses with
+    /// This is where a pipelined write stops being outstanding. An application
+    /// that flushes is asking whether its bytes are safe, and the honest answer
+    /// needs the peer's — so the window is emptied here and any failure it
+    /// collected is returned. Past that the peer's own filesystem owns the
+    /// durability guarantee.
+    ///
+    /// Implemented at all because the default refuses with
     /// `STATUS_INVALID_DEVICE_REQUEST`, which Windows surfaces as "function not
     /// supported" — and rustc calls `FlushFileBuffers` after writing every
     /// object file, so a cargo build on the drive failed with
-    /// `could not write output to ...build_script_build-....o`.
-    ///
-    /// A null context is a volume-wide flush, which is equally a no-op here.
+    /// `could not write output to ...build_script_build-....o`. A null context
+    /// is a volume-wide flush, which has no handle to wait on.
     fn flush(
         &self,
-        _context: Option<&Self::FileContext>,
+        context: Option<&Self::FileContext>,
         _file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        Ok(())
+        let _call = crate::inflight::shared().enter("flush");
+        // A flush with no context is a volume-wide flush; there is no handle
+        // whose writes could be waited on.
+        let Some(context) = context else {
+            return Ok(());
+        };
+        let mut pipeline = context.writes.lock().expect("handle writes");
+        pipeline.drain(
+            |rx, limit| self.peer.await_write(rx, limit),
+            crate::bridge::BULK_OP_TIMEOUT,
+        );
+        match pipeline.take_failure() {
+            Some(e) => {
+                tracing::warn!(path = %context.path, error = ?e, "a write failed before flush");
+                Err(to_ntstatus(&e))
+            }
+            None => Ok(()),
+        }
     }
 
     /// Truncate an existing file that is being opened for overwrite.
@@ -485,13 +679,19 @@ impl FileSystemContext for RemoteFs {
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _call = crate::inflight::shared().enter("overwrite");
         let Some(remote) = context.remote else {
             return Err(to_ntstatus(&FileError::WrongKind));
         };
         self.peer.truncate(remote, 0).map_err(|e| to_ntstatus(&e))?;
-        if let Ok(meta) = self.stat_path(&context.volume, &context.path) {
-            fill_info(file_info, &meta);
-        }
+        self.meta.forget(&context.volume, &context.path);
+        context.ahead.invalidate();
+        // Reported rather than passed over: see `write` for why an unfilled
+        // `FileInfo` is worse than a refusal.
+        let meta = self
+            .stat_path(&context.volume, &context.path)
+            .map_err(|e| to_ntstatus(&e))?;
+        fill_info(file_info, &meta);
         Ok(())
     }
 
@@ -513,6 +713,7 @@ impl FileSystemContext for RemoteFs {
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _call = crate::inflight::shared().enter("set_basic_info");
         if let Ok(meta) = self.stat_path(&context.volume, &context.path) {
             fill_info(file_info, &meta);
         }
@@ -531,6 +732,7 @@ impl FileSystemContext for RemoteFs {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
+        let _call = crate::inflight::shared().enter("set_delete");
         if context.path.is_empty() {
             // The mount root and the volume folders are ours, not the peer's.
             return Err(to_ntstatus(&FileError::Denied));
@@ -564,6 +766,7 @@ impl FileSystemContext for RemoteFs {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _call = crate::inflight::shared().enter("get_file_info");
         let meta = self
             .stat_path(&context.volume, &context.path)
             .map_err(|e| to_ntstatus(&e))?;
@@ -578,6 +781,7 @@ impl FileSystemContext for RemoteFs {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
+        let _call = crate::inflight::shared().enter("read_directory");
         if !context.is_dir {
             return Err(to_ntstatus(&FileError::WrongKind));
         }
@@ -682,22 +886,45 @@ impl FileSystemContext for RemoteFs {
         Ok(cursor)
     }
 
+    /// Set a file's length, or reserve the space it will need.
+    ///
+    /// `set_allocation_size` picks which. The two are genuinely different
+    /// requests, and treating both as a truncate is what stalled Steam's
+    /// preallocation pass partway through Forza's 4896 files.
+    ///
+    /// Windows keeps two numbers per file: `FileSize`, the bytes the file
+    /// contains, and `AllocationSize`, the room committed for it on the medium
+    /// — and requires `FileSize <= AllocationSize` always. An installer
+    /// reserves the whole download up front by raising `AllocationSize` alone,
+    /// so that a disk filling later cannot leave a half-written game. Passing
+    /// that reservation through as a truncate does the opposite of what was
+    /// asked: it moves the end of the file to the reserved figure, which is the
+    /// very shortening NTFS performs when it sees an allocation smaller than
+    /// the file.
+    ///
+    /// A reservation is forwarded as one, so the owner's filesystem can commit
+    /// the space for real (`fallocate` on Linux, which `set_len` — a hole —
+    /// does not). The peer's answer is what tells us the space exists.
     fn set_file_size(
         &self,
         context: &Self::FileContext,
         new_size: u64,
-        _set_allocation_size: bool,
+        set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _call = crate::inflight::shared().enter("set_file_size");
         let Some(remote) = context.remote else {
             return Err(to_ntstatus(&FileError::WrongKind));
         };
         self.peer
-            .truncate(remote, new_size)
+            .set_size(remote, new_size, set_allocation_size)
             .map_err(|e| to_ntstatus(&e))?;
-        if let Ok(meta) = self.stat_path(&context.volume, &context.path) {
-            fill_info(file_info, &meta);
-        }
+        self.meta.forget(&context.volume, &context.path);
+        context.ahead.invalidate();
+        let meta = self
+            .stat_path(&context.volume, &context.path)
+            .map_err(|e| to_ntstatus(&e))?;
+        fill_info(file_info, &meta);
         Ok(())
     }
 
@@ -713,11 +940,8 @@ impl FileSystemContext for RemoteFs {
         _extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        let Some((volume, path)) = self.resolve(file_name).map_err(|e| to_ntstatus(&e))? else {
-            // Nothing may be created at the mount root: that level is the
-            // volume list, which is ours to present, not the peer's to hold.
-            return Err(to_ntstatus(&FileError::Denied));
-        };
+        let _call = crate::inflight::shared().enter("create");
+        let (volume, path) = self.resolve(file_name);
 
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
         let want_dir = file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
@@ -726,6 +950,8 @@ impl FileSystemContext for RemoteFs {
             self.peer
                 .mkdir(&volume, &path)
                 .map_err(|e| to_ntstatus(&e))?;
+            // It exists now; a cached `NotFound` from moments ago does not.
+            self.meta.forget(&volume, &path);
             let meta = self
                 .stat_path(&volume, &path)
                 .map_err(|e| to_ntstatus(&e))?;
@@ -736,6 +962,8 @@ impl FileSystemContext for RemoteFs {
                 volume,
                 path,
                 is_dir: true,
+                ahead: crate::readahead::ReadAhead::new(),
+                writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
             });
         }
 
@@ -750,12 +978,15 @@ impl FileSystemContext for RemoteFs {
             .peer
             .open(&volume, &path, mode)
             .map_err(|e| to_ntstatus(&e))?;
+        // `create` reaches here, so the path may have just come into existence.
+        self.meta.forget(&volume, &path);
         let meta = FileMeta {
             name: path.rsplit('/').next().unwrap_or(&path).to_string(),
             kind: FileKind::File,
             size,
             modified_unix: now_unix(),
             writable: true,
+            allocated: None,
         };
         fill_info(file_info.as_mut(), &meta);
         set_normalized_name(file_info, file_name);
@@ -764,6 +995,8 @@ impl FileSystemContext for RemoteFs {
             volume,
             path,
             is_dir: false,
+            ahead: crate::readahead::ReadAhead::new(),
+            writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
         })
     }
 
@@ -774,23 +1007,27 @@ impl FileSystemContext for RemoteFs {
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> winfsp::Result<()> {
-        let from = self.resolve(file_name).map_err(|e| to_ntstatus(&e))?;
-        let to = self.resolve(new_file_name).map_err(|e| to_ntstatus(&e))?;
-        let (Some((volume, from)), Some((new_volume, to))) = (from, to) else {
-            return Err(to_ntstatus(&FileError::Denied));
-        };
+        let _call = crate::inflight::shared().enter("rename");
+        let (volume, from) = self.resolve(file_name);
+        let (new_volume, to) = self.resolve(new_file_name);
         // A move between volumes is a copy plus a delete, which Windows does
         // itself when told the rename cannot span them.
         if volume != new_volume {
             const STATUS_NOT_SAME_DEVICE: i32 = 0xC00000D4u32 as i32;
             return Err(winfsp::FspError::NTSTATUS(STATUS_NOT_SAME_DEVICE));
         }
-        self.peer
+        let renamed = self
+            .peer
             .rename(&volume, &from, &to)
-            .map_err(|e| to_ntstatus(&e))
+            .map_err(|e| to_ntstatus(&e));
+        // Both ends move, and a directory takes everything under it.
+        self.meta.forget_dir(&volume, &from);
+        self.meta.forget_dir(&volume, &to);
+        renamed
     }
 
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
+        let _call = crate::inflight::shared().enter("cleanup");
         // WinFsp signals a delete through cleanup rather than a separate call.
         const FSP_CLEANUP_DELETE: u32 = 0x01;
         if flags & FSP_CLEANUP_DELETE != 0 {
@@ -804,22 +1041,44 @@ impl FileSystemContext for RemoteFs {
             if let Err(e) = r {
                 tracing::warn!(path = %context.path, error = ?e, "cannot delete on the peer");
             }
+            // Gone, along with anything that was inside it. A cached answer here
+            // would report a deleted file as still present for another second.
+            self.meta.forget_dir(&context.volume, &context.path);
         }
     }
 }
 
 impl RemoteFs {
-    /// Entries of a directory: the volume list at the mount root, otherwise the
-    /// peer's listing.
+    /// Entries of a directory, as the peer lists them.
     fn entries_of(&self, context: &FileCtx) -> Result<Vec<FileMeta>, FileError> {
-        if context.volume.is_empty() {
-            let volumes = self.volumes()?;
-            return Ok(volumes
-                .iter()
-                .map(|v| synthetic_dir(&dir_name_of(&v.id)))
-                .collect());
+        // Windows enumerates a directory in batches and calls back for each
+        // one, so one pass over a folder asks for the same listing several
+        // times. Measured against Steam: 1980 listings in 30 seconds, of
+        // directories holding up to 1815 entries — around 11 MB/s of metadata,
+        // which is the whole link. The writes sharing it then missed the
+        // mount's deadline and Windows reported the drive as failing.
+        if let Some(held) = self.meta.listing(&context.volume, &context.path) {
+            return Ok(held);
         }
-        self.peer.read_dir(&context.volume, &context.path)
+        let entries = self.peer.read_dir(&context.volume, &context.path)?;
+        self.meta
+            .put_listing(&context.volume, &context.path, entries.clone());
+        // A listing already carries every entry's metadata, and what follows a
+        // listing is almost always a query per entry — Explorer does it to fill
+        // its columns, and a directory walk does it to decide where to descend.
+        // Remembering them here turns that per-entry round trip into none: the
+        // batch is free, since the answer has already crossed the wire.
+        //
+        // This is what a batched `stat` would buy, without a message for it: the
+        // owner's `read_dir` stats every entry anyway to build the reply.
+        for meta in &entries {
+            let child = match context.path.is_empty() {
+                true => meta.name.clone(),
+                false => format!("{}/{}", context.path, meta.name),
+            };
+            self.meta.put(&context.volume, &child, Ok(meta.clone()));
+        }
+        Ok(entries)
     }
 }
 
@@ -1001,8 +1260,17 @@ impl Drop for MountHandle {
     }
 }
 
-/// Mount the peer's volumes on the next free drive letter.
-pub fn mount(peer: PeerLink, peer_name: &str) -> anyhow::Result<MountHandle> {
+/// Mount ONE of the peer's volumes on the next free drive letter.
+///
+/// Called once per volume the peer offers: `volume` is the wire id (`"C:"`,
+/// `"/"`, a removable medium's mount path) and `volume_label` is what the drive
+/// calls itself in Explorer.
+pub fn mount(
+    peer: PeerLink,
+    peer_name: &str,
+    volume: &str,
+    volume_label: &str,
+) -> anyhow::Result<MountHandle> {
     // Load WinFsp's DLL from where the installer actually put it, before
     // anything asks for a symbol from it.
     load_winfsp_dll()?;
@@ -1015,7 +1283,12 @@ pub fn mount(peer: PeerLink, peer_name: &str) -> anyhow::Result<MountHandle> {
     // The share this filesystem is published as. `prefix` is what WinFsp wants
     // (one leading backslash); `unc` is the same thing as a path a user or
     // `WNetAddConnection2` would name.
-    let prefix = format!(r"\cursio\{peer_name}");
+    // One share per volume, so the UNC path stays a working way in when the
+    // drive letter is invisible (see the elevation note below). The volume's
+    // directory name rather than its raw id: a share name cannot contain a
+    // colon, which every Windows volume id ends with.
+    let share = dir_name_of(volume);
+    let prefix = format!(r"\cursio\{peer_name}-{share}");
     let unc = format!(r"\{prefix}");
 
     let mut params = VolumeParams::new();
@@ -1039,9 +1312,36 @@ pub fn mount(peer: PeerLink, peer_name: &str) -> anyhow::Result<MountHandle> {
         // filesystem whose every request crosses a Wi-Fi link to another
         // machine. sshfs-win and rclone mount this way for the same reason.
         .prefix(prefix.as_str())
-        // The peer answers over a network, so its metadata can change without
-        // us knowing. Caching is left to WinFsp's defaults rather than being
-        // widened; a stale listing is worse than a slightly slower one.
+        // Let the kernel cache file data, but not directory listings.
+        //
+        // This is WinFsp's own recommendation for a network filesystem, and
+        // the three values go together. `FileInfoTimeout` of -1 is a switch as
+        // much as a timeout: it puts the volume on the NT cache manager, which
+        // brings read-ahead and lazy writes with it, so Windows coalesces an
+        // application's writes instead of handing us each one to carry across
+        // the link and wait out. Without it a download arrived as a strict
+        // sequence of 220 KiB writes from a single thread, each costing a full
+        // round trip — measured here at 56 writes a second, which is exactly
+        // one round trip's worth, while the link sat idle several times over.
+        //
+        // Directory listings and volume info are the part that must not be
+        // cached indefinitely: the person at the other machine can add or
+        // remove a file at any moment and nothing announces it. A second
+        // matches what `metacache` already allows itself, so both halves of the
+        // crate go stale on the same schedule.
+        .file_info_timeout(u32::MAX)
+        .dir_info_timeout(1000)
+        .volume_info_timeout(1000)
+        // Close the peer's handle when the application closes the file, not
+        // whenever the kernel finishes with its cache.
+        //
+        // The cache manager keeps a file mapped after the last handle to it is
+        // gone, which is what makes a re-open free — and on this volume would
+        // mean the peer holds a handle open for a file nobody is using, across
+        // a link that may drop in between. Flushing and purging at cleanup ties
+        // the two lifetimes back together, at the cost of the one thing the
+        // cache would have bought after the file was closed anyway.
+        .flush_and_purge_on_cleanup(true)
         .case_sensitive_search(false)
         .case_preserved_names(true)
         .unicode_on_disk(true)
@@ -1066,8 +1366,11 @@ pub fn mount(peer: PeerLink, peer_name: &str) -> anyhow::Result<MountHandle> {
         // disposition class, which is why it never hit this.
         .supports_posix_unlink_rename(true);
 
+    // Labelled with the peer and the disk, because several of these now sit
+    // side by side in Explorer and "cursio" alone would not say which is which.
+    let label = format!("{volume_label} ({peer_name})");
     let mut host: FileSystemHost<RemoteFs> =
-        FileSystemHost::new(params, RemoteFs::new(peer, peer_name))
+        FileSystemHost::new(params, RemoteFs::new(peer, label, volume))
             .map_err(|e| anyhow::anyhow!("cannot create the filesystem host: {e:?}"))?;
 
     // Name the drive letter explicitly.
@@ -1095,8 +1398,12 @@ pub fn mount(peer: PeerLink, peer_name: &str) -> anyhow::Result<MountHandle> {
     // boundary UAC draws; or the mount moves into an unelevated helper process,
     // which means forwarding every filesystem operation across a process
     // boundary. See `docs/files-design.md`.
-    let letter = free_drive_letter()
-        .ok_or_else(|| anyhow::anyhow!("no free drive letter for the peer's volumes"))?;
+    // Refused rather than folded in with another volume: there are 26 letters
+    // for every disk on the machine and every peer's, and a volume quietly
+    // sharing a letter with another is the ambiguity this change removes.
+    let letter = free_drive_letter().ok_or_else(|| {
+        anyhow::anyhow!("no free drive letter left for {peer_name}'s volume {volume}")
+    })?;
     let mountpoint = format!("{letter}:");
     match host.mount(mountpoint.as_str()) {
         Ok(()) => tracing::debug!(drive = %mountpoint, "mounted"),
@@ -1126,7 +1433,8 @@ pub fn mount(peer: PeerLink, peer_name: &str) -> anyhow::Result<MountHandle> {
         // fails to appear, this is the way in.
         unc = %unc,
         peer = peer_name,
-        "peer volumes mounted"
+        volume,
+        "peer volume mounted"
     );
     Ok(MountHandle { host, mountpoint })
 }

@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use cursio_protocol::{FileError, FileKind, OpenMode};
 use fuser::{
-    Errno, FileAttr, FileType, Filesystem, INodeNo, MountOption, ReplyAttr, ReplyData,
+    Errno, FileAttr, FileType, Filesystem, INodeNo, InitFlags, MountOption, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
 };
 
@@ -38,6 +38,20 @@ use crate::bridge::{mount_threads, PeerLink};
 use crate::server::{FALLBACK_FREE, FALLBACK_TOTAL};
 use crate::volume_dir_name;
 
+/// Ask for one kernel capability, saying so if this kernel does not have it.
+///
+/// Named individually rather than requested as one set: a kernel missing any
+/// one of them would otherwise refuse the whole set, and the rest are still
+/// worth having.
+fn request(config: &mut fuser::KernelConfig, flag: InitFlags, what: &str) {
+    if config.add_capabilities(flag).is_err() {
+        tracing::debug!(
+            what,
+            "this kernel does not offer the capability; going without"
+        );
+    }
+}
+
 /// Generation number for every inode we hand out.
 ///
 /// Zero throughout: generations only matter when inode numbers are reused
@@ -45,12 +59,39 @@ use crate::volume_dir_name;
 /// retired when the kernel forgets it and the next allocation takes a fresh one.
 const GENERATION: fuser::Generation = fuser::Generation(0);
 
-/// The peer's volumes, presented as a filesystem.
+/// One of the peer's volumes, presented as a filesystem.
 pub struct RemoteFs {
     peer: PeerLink,
     state: Mutex<State>,
+    /// What the peer last said about a path.
+    ///
+    /// The kernel caches an answer for `CACHE_TTL` once it has one, but the
+    /// question still reaches this filesystem the first time and every time the
+    /// entry expires — and an application walking a tree asks about each path
+    /// several times over in quick succession. Measured on a real transfer,
+    /// `LOOKUP` was 5.4 calls per file and `GETATTR` another 2, against 1.2
+    /// writes: two thirds of a copy's round trips were questions about paths
+    /// rather than the bytes of them.
+    ///
+    /// The Windows half has had this since it was written; this side went
+    /// without, which is most of why the same copy costs so much more here.
+    meta: crate::metacache::MetaCache,
     uid: u32,
     gid: u32,
+    /// The peer volume this mount *is*.
+    ///
+    /// One mount per volume, because a peer's disk should look here the way it
+    /// looks on the machine that owns it: its own root, its own capacity, its
+    /// own entry in a file manager's sidebar. Presenting them as folders under
+    /// one mount — which is what this did — meant the mount could report only
+    /// one capacity for all of them, and a file manager showed a single device
+    /// whose free space matched no disk the user has. It is also what the
+    /// Windows half does with drive letters, so both sides now agree.
+    ///
+    /// gvfs picks each FUSE mount up through its UDisks2 monitor as its own
+    /// `GProxyMount`, so one mount per volume is exactly one sidebar entry per
+    /// volume, each with its own eject button.
+    bound: String,
 }
 
 struct State {
@@ -83,9 +124,11 @@ struct Plus {
 const VOLUMES_TTL: Duration = Duration::from_secs(30);
 
 impl RemoteFs {
-    pub fn new(peer: PeerLink) -> Self {
+    pub fn new(peer: PeerLink, bound: impl Into<String>) -> Self {
         Self {
             peer,
+            meta: crate::metacache::MetaCache::new(),
+            bound: bound.into(),
             state: Mutex::new(State {
                 inodes: InodeTable::new(),
                 volumes: Vec::new(),
@@ -117,6 +160,21 @@ impl RemoteFs {
         state.volumes = fetched.clone();
         state.volumes_fetched = Some(std::time::Instant::now());
         Ok(fetched)
+    }
+
+    /// Ask the peer about a path, or answer from what it said a moment ago.
+    ///
+    /// A negative answer is remembered too: an application that checks whether
+    /// a file exists before creating it asks about a name that is not there,
+    /// and asking the peer again each time costs the same round trip as a real
+    /// one.
+    fn stat_path(&self, volume: &str, path: &str) -> Result<cursio_protocol::FileMeta, FileError> {
+        if let Some(hit) = self.meta.get(volume, path) {
+            return hit;
+        }
+        let fresh = self.peer.stat(volume, path);
+        self.meta.put(volume, path, fresh.clone());
+        fresh
     }
 
     /// The peer's handle behind one of ours.
@@ -166,6 +224,8 @@ impl RemoteFs {
             Ok(v) => v,
             Err(e) => return reply.error(e),
         };
+        // Gone, along with anything inside it if it was a directory.
+        self.meta.forget_dir(&volume, &path);
         match self.peer.remove(&volume, &path) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_errno(&e)),
@@ -173,17 +233,75 @@ impl RemoteFs {
     }
 
     /// Resolve an inode to the path it names.
+    ///
+    /// The mount root resolves to the bound volume's own root rather than to
+    /// [`Entry::Root`]: this mount *is* one volume, so `/` here is that
+    /// volume's `/`. Translating in one place keeps every caller — lookup,
+    /// getattr, readdir, create, unlink — working on paths without each having
+    /// to know that the root is special, and leaves [`Entry::Root`] meaning
+    /// only "the inode table's origin".
     fn entry_of(&self, ino: u64) -> Option<Entry> {
-        self.state
+        let entry = self
+            .state
             .lock()
             .expect("inode state")
             .inodes
             .get(ino)
-            .cloned()
+            .cloned()?;
+        Some(match entry {
+            Entry::Root => Entry::Path {
+                volume: self.bound.clone(),
+                path: String::new(),
+            },
+            other => other,
+        })
     }
 }
 
 impl Filesystem for RemoteFs {
+    /// Ask the kernel to do the work it can do closer to the application.
+    ///
+    /// Every capability here removes round trips that this filesystem would
+    /// otherwise make one at a time, and each of them helps the case that
+    /// matters most: a person dragging a folder in a file manager, or an
+    /// installer writing a file. Those are single-threaded and strictly
+    /// sequential — the parallelism has to come from somewhere else, and the
+    /// kernel is the only party positioned to create it without the
+    /// application knowing.
+    ///
+    /// Left unrequested, none of it happens: the default is that the kernel
+    /// forwards each operation as the application made it. Measured against
+    /// that default, a copy of 300 small files cost 457 ms per file, nearly all
+    /// of it round trips.
+    ///
+    /// Failures are logged and skipped rather than fatal. A capability the
+    /// running kernel does not have is a missed optimisation, not a reason to
+    /// refuse the mount — and the set differs across the kernels Cursio runs
+    /// on.
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+        // Buffered writes are collected by the kernel and handed over in large
+        // pieces, instead of arriving one application-sized write at a time.
+        // This is what the Windows half already gets from the WinFsp cache
+        // manager; without it the Linux mount carries every 4 KiB write across
+        // the link on its own and waits out the round trip.
+        request(config, InitFlags::FUSE_WRITEBACK_CACHE, "writeback cache");
+        // Lookups and directory reads may overlap. A tree walk is otherwise
+        // strictly serial, which is exactly the shape of a file manager's copy.
+        request(config, InitFlags::FUSE_PARALLEL_DIROPS, "parallel dirops");
+        // `readdir` carries the attributes with it, so the `lookup` per entry
+        // that follows a listing never has to be asked for. This is the same
+        // idea NFSv4 and SMB2 call compounding: fewer, larger requests.
+        request(config, InitFlags::FUSE_DO_READDIRPLUS, "readdirplus");
+        request(
+            config,
+            InitFlags::FUSE_READDIRPLUS_AUTO,
+            "adaptive readdirplus",
+        );
+        // `FUSE_ASYNC_READ` and `FUSE_BIG_WRITES` are not named here: the
+        // crate requests both for every filesystem it mounts.
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(name) = name.to_str() else {
             // A name the peer could never have sent: wire paths are UTF-8.
@@ -215,7 +333,7 @@ impl Filesystem for RemoteFs {
             }
             Entry::Path { volume, path } => {
                 let child = join(&path, name);
-                let meta = match self.peer.stat(&volume, &child) {
+                let meta = match self.stat_path(&volume, &child) {
                     Ok(m) => m,
                     Err(e) => return reply.error(to_errno(&e)),
                 };
@@ -325,11 +443,20 @@ impl Filesystem for RemoteFs {
 
     /// Nothing to flush.
     ///
-    /// Writes are not buffered here: each one is a `Write` request answered by
-    /// the peer before the caller returns, so by the time a `close()` reaches
-    /// this there is nothing left to push. Left unimplemented it answers
-    /// `ENOSYS` — which the kernel tolerates, but which logs a warning on every
-    /// single file close.
+    /// Buffering happens in the kernel, not here: with `FUSE_WRITEBACK_CACHE`
+    /// the page cache collects an application's small writes and hands them
+    /// over in large pieces, but each piece that reaches [`RemoteFs::write`] is
+    /// still a `Write` the peer answers before the caller returns. So anything
+    /// the kernel had has already been pushed by the time a `close()` arrives,
+    /// and there is nothing here that could still fail.
+    ///
+    /// That is what makes the writeback cache safe to ask for. A scheme that
+    /// acknowledged a write before the peer stored it would need this call to
+    /// report the failure instead — and would then depend on the caller
+    /// checking a `close()` return that most programs ignore.
+    ///
+    /// Left unimplemented it answers `ENOSYS` — which the kernel tolerates, but
+    /// which logs a warning on every single file close.
     fn flush(
         &self,
         _req: &Request,
@@ -361,21 +488,10 @@ impl Filesystem for RemoteFs {
         ];
 
         match &entry {
-            Entry::Root => {
-                let volumes = match self.volumes() {
-                    Ok(v) => v,
-                    Err(e) => return reply.error(to_errno(&e)),
-                };
-                let mut state = self.state.lock().expect("inode state");
-                for vol in &volumes {
-                    // A readdir entry does not give the kernel a reference —
-                    // only lookup and readdirplus do — so the inode is resolved
-                    // without counting one. Counting here would leak entries
-                    // that are never forgotten.
-                    let child = state.inodes.resolve(&vol.id, "");
-                    listing.push((child, FileType::Directory, volume_dir_name(&vol.id)));
-                }
-            }
+            // Unreachable: `entry_of` resolves the root to the bound volume's
+            // own root, so every listing is the peer's. Listing the volumes
+            // here is what the mount did when it stood for all of them.
+            Entry::Root => {}
             Entry::Path { volume, path } => {
                 let entries = match self.peer.read_dir(volume, path) {
                     Ok(e) => e,
@@ -390,6 +506,10 @@ impl Filesystem for RemoteFs {
                         FileKind::Symlink => FileType::Symlink,
                         FileKind::File => FileType::RegularFile,
                     };
+                    // Kept for the `lookup` per entry that follows any listing,
+                    // exactly as in `readdirplus`: the answers arrived with
+                    // this one request and cost nothing to hold.
+                    self.meta.put(volume, &child_path, Ok(meta.clone()));
                     listing.push((child, kind, meta.name));
                 }
             }
@@ -505,6 +625,15 @@ impl Filesystem for RemoteFs {
                 for meta in entries {
                     let child_path = join(path, &meta.name);
                     let child = state.inodes.resolve(volume, &child_path);
+                    // The listing already carries what a `stat` of each entry
+                    // would return, so keep it: this one request has answered
+                    // every `lookup` and `getattr` that follows a directory
+                    // read, which is what makes a listing worth a round trip
+                    // instead of one per name. It is the same economy NFSv4 and
+                    // SMB2 get by compounding operations into one request —
+                    // here the compound already exists on the wire and its
+                    // answers were being thrown away.
+                    self.meta.put(volume, &child_path, Ok(meta.clone()));
                     listing.push(Plus {
                         ino: child,
                         attr: attr_from(child, &meta, self.uid, self.gid),
@@ -559,16 +688,22 @@ impl Filesystem for RemoteFs {
         // programs with SIGFPE this way — and a zero free count makes file
         // managers refuse to copy, believing the disk full.
         //
-        // Several volumes are summed into one figure, because the mount is one
-        // filesystem as far as `statfs` is concerned. The peer's own fallback
-        // guarantees each is non-zero, so the total is too.
+        // The figures are those of the one peer volume this mount is bound to.
+        //
+        // This used to sum every volume the peer offered, because the mount
+        // stood for all of them — so a machine with five disks showed as one
+        // filesystem of their combined size, a figure matching no disk the user
+        // has, and a file manager's free-space bar meant nothing. One mount per
+        // volume removes the question.
         let (total, free) = match self.volumes() {
-            Ok(volumes) if !volumes.is_empty() => volumes.iter().fold((0u64, 0u64), |(t, f), v| {
-                (
-                    t.saturating_add(v.total_bytes),
-                    f.saturating_add(v.free_bytes),
-                )
-            }),
+            Ok(volumes) => volumes
+                .iter()
+                .find(|v| v.id == self.bound)
+                .map(|v| (v.total_bytes, v.free_bytes))
+                // Bound to a volume the peer no longer lists: it was unplugged,
+                // or the link has not answered yet. A plausible figure keeps
+                // `df` and file managers usable until the mount goes away.
+                .unwrap_or((FALLBACK_TOTAL, FALLBACK_FREE)),
             // The peer has not said yet, or cannot be reached. Answering an
             // error here would make `df` and every file manager show the mount
             // as broken while it is merely still waking up.
@@ -838,7 +973,7 @@ impl Filesystem for RemoteFs {
     fn write(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
@@ -850,6 +985,12 @@ impl Filesystem for RemoteFs {
         let Some(remote) = self.remote_handle(fh) else {
             return reply.error(Errno::EBADF);
         };
+        // The size and modification time this changes are exactly what the
+        // cache holds, so it must not answer the next `getattr` with what it
+        // knew before the write.
+        if let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) {
+            self.meta.forget(&volume, &path);
+        }
         match self.peer.write(remote, offset, data.to_vec()) {
             // A short write would make the caller retry the remainder; the peer
             // writes all or fails, so this is always the full length.
@@ -883,6 +1024,9 @@ impl Filesystem for RemoteFs {
             Ok(v) => v,
             Err(e) => return reply.error(to_errno(&e)),
         };
+        // The `lookup` that preceded this was very likely a `NotFound`, and
+        // the cache would keep answering it for the rest of its lifetime.
+        self.meta.forget(&volume, &path);
 
         let (ino, fh) = {
             let mut state = self.state.lock().expect("inode state");
@@ -899,6 +1043,7 @@ impl Filesystem for RemoteFs {
             size,
             modified_unix: now_unix(),
             writable: true,
+            allocated: None,
         };
         reply.created(
             &CACHE_TTL,
@@ -922,6 +1067,7 @@ impl Filesystem for RemoteFs {
             Ok(v) => v,
             Err(e) => return reply.error(e),
         };
+        self.meta.forget(&volume, &path);
         if let Err(e) = self.peer.mkdir(&volume, &path) {
             return reply.error(to_errno(&e));
         }
@@ -965,6 +1111,9 @@ impl Filesystem for RemoteFs {
         if volume != new_volume {
             return reply.error(Errno::EXDEV);
         }
+        // Both ends move, and a directory takes its contents with it.
+        self.meta.forget_dir(&volume, &from);
+        self.meta.forget_dir(&volume, &to);
         if let Err(e) = self.peer.rename(&volume, &from, &to) {
             return reply.error(to_errno(&e));
         }
@@ -1013,6 +1162,13 @@ impl Filesystem for RemoteFs {
                 return reply.error(to_errno(&e));
             }
         }
+        // Whatever this call changed, the cached answer describes the file as
+        // it was before it. `setattr` is 3.5 calls per file on a real copy —
+        // second only to `lookup` — because that is how a tool restores
+        // timestamps and permissions after writing.
+        if let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) {
+            self.meta.forget(&volume, &path);
+        }
         self.getattr(_req, ino, fh, reply);
     }
 
@@ -1055,7 +1211,12 @@ fn now_unix() -> i64 {
 fn open_mode_from(flags: fuser::OpenFlags) -> OpenMode {
     let acc = flags.acc_mode();
     OpenMode {
-        read: !matches!(acc, fuser::OpenAccMode::O_WRONLY),
+        // Readable even when opened write-only. With `FUSE_WRITEBACK_CACHE` the
+        // kernel fills a partially written page by reading it first, through
+        // the very handle the application opened `O_WRONLY` — and a peer
+        // handle without read access answers that with `EBADF`, which reaches
+        // the application as a failed write to the middle of a file.
+        read: true,
         write: !matches!(acc, fuser::OpenAccMode::O_RDONLY),
         // The kernel resolves creation itself and calls `create`, so an `open`
         // never has to make the file.
@@ -1076,6 +1237,23 @@ pub struct MountHandle {
 impl MountHandle {
     pub fn mountpoint(&self) -> &std::path::Path {
         &self.mountpoint
+    }
+}
+
+impl Drop for MountHandle {
+    /// Remove the mount point once the mount is gone.
+    ///
+    /// Field order does the unmounting: `_session` is declared first, so it
+    /// drops before this runs and the directory is empty by the time it is
+    /// removed. Without this an unplugged disk leaves an empty folder behind
+    /// under `~/Cursio/<peer>`, and a file manager shows it as a directory that
+    /// is not a disk at all.
+    ///
+    /// `remove_dir` rather than `remove_dir_all`, and its failure ignored: it
+    /// removes only an empty directory, so an unmount that did not take cannot
+    /// take the peer's files with it.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.mountpoint);
     }
 }
 
@@ -1131,6 +1309,40 @@ fn is_mounted(mountpoint: &std::path::Path) -> bool {
         .any(|p| p == needle)
 }
 
+/// Release every Cursio mount left under `root` by a previous run.
+///
+/// [`release_stale_mount`] clears one known path; this clears the ones whose
+/// names are no longer known. A volume's directory is named after the disk, so
+/// anything that changes the name — the peer relabelling a drive, or a version
+/// of Cursio that named them differently — leaves the old mount behind with
+/// nothing left to look it up by. They accumulate: a file manager's sidebar
+/// fills with entries for disks that answer nothing, and `~/Cursio/<peer>`
+/// cannot be tidied because each one is a live mount point.
+///
+/// Only `fuse.cursio` mounts under this root are touched, so a filesystem the
+/// user mounted there themselves is left alone.
+pub fn release_stale_peer_mounts(root: &std::path::Path) {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return;
+    };
+    let prefix = format!("{}/", root.to_string_lossy().replace(' ', "\\040"));
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(_source), Some(target), Some(fstype)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if fstype != "fuse.cursio" || !target.starts_with(&prefix) {
+            continue;
+        }
+        // Undo the escaping `/proc/mounts` applies, so the path handed to
+        // `fusermount` is the real one.
+        let target = target.replace("\\040", " ");
+        release_stale_mount(std::path::Path::new(&target));
+    }
+}
+
 /// The session configuration the mount runs under.
 ///
 /// Split out from [`mount`] so the settings can be asserted on without mounting
@@ -1177,11 +1389,18 @@ fn mount_config(peer_name: &str) -> fuser::Config {
     config
 }
 
-/// Mount the peer's volumes at `mountpoint`, returning once they are visible.
+/// Mount ONE of the peer's volumes at `mountpoint`, returning once it is
+/// visible.
+///
+/// Called once per volume the peer offers: `volume` is the wire id (`"C:"`,
+/// `"/"`, a removable medium's mount path). Each mount is its own entry in a
+/// file manager's sidebar, with the capacity of that disk alone — see
+/// [`RemoteFs::bound`].
 pub fn mount(
     peer: PeerLink,
     mountpoint: impl AsRef<std::path::Path>,
     peer_name: &str,
+    volume: &str,
 ) -> std::io::Result<MountHandle> {
     let mountpoint = mountpoint.as_ref().to_path_buf();
     // Clear a mount left behind by a previous run before creating anything.
@@ -1190,12 +1409,26 @@ pub fn mount(
     // filesystem was wedged — leaves the old mount in place, and the next start
     // fails with `EEXIST` on a point that looks like an ordinary directory. The
     // user would have to know to run `fusermount3 -u` by hand, so do it here.
+    // The parent first, then the mount point itself.
+    //
+    // The parent matters because this path moved: a mount used to be
+    // `~/Cursio/<peer>` and is now `~/Cursio/<peer>/<volume>`, so a version
+    // before that change — or a crash from one — leaves a mount sitting on the
+    // very directory the volumes now live in. Every path inside a wedged FUSE
+    // mount answers `ENOTCONN`, so `create_dir_all` below fails and every one
+    // of the peer's volumes is refused. Seen live: all six of a peer's drives
+    // failed with "Transport endpoint is not connected" and none returned,
+    // because nothing retried and nothing cleared the parent.
+    if let Some(parent) = mountpoint.parent() {
+        release_stale_mount(parent);
+    }
     release_stale_mount(&mountpoint);
     std::fs::create_dir_all(&mountpoint)?;
 
     let config = mount_config(peer_name);
-    let session = fuser::Session::new(RemoteFs::new(peer), &mountpoint, &config)?.spawn()?;
-    tracing::info!(mount = %mountpoint.display(), peer = peer_name, "peer volumes mounted");
+    let session =
+        fuser::Session::new(RemoteFs::new(peer, volume), &mountpoint, &config)?.spawn()?;
+    tracing::info!(mount = %mountpoint.display(), peer = peer_name, volume, "peer volume mounted");
     Ok(MountHandle {
         _session: session,
         mountpoint,
@@ -1205,6 +1438,115 @@ pub fn mount(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repeated question about one path costs one round trip, not several.
+    ///
+    /// Measured on a real transfer through this mount, `lookup` was 5.4 calls
+    /// per file and `getattr` another 2, against 1.2 writes — two thirds of a
+    /// copy's round trips were questions about paths rather than the bytes of
+    /// them. The Windows half has cached these since it was written; this side
+    /// did not, which is most of why the same copy cost so much more here.
+    #[test]
+    fn repeated_questions_about_a_path_cost_one_round_trip() {
+        let cache = crate::metacache::MetaCache::new();
+        let meta = cursio_protocol::FileMeta {
+            name: "a.txt".into(),
+            kind: FileKind::File,
+            size: 10,
+            modified_unix: 0,
+            writable: true,
+            allocated: None,
+        };
+        assert!(
+            cache.get("C:", "a.txt").is_none(),
+            "nothing is known before the peer has been asked"
+        );
+        cache.put("C:", "a.txt", Ok(meta));
+        assert!(
+            cache.get("C:", "a.txt").is_some(),
+            "the answer serves the questions that follow"
+        );
+    }
+
+    /// A listing answers the questions that follow it.
+    ///
+    /// This is compounding of the kind NFSv4 and SMB2 do explicitly: one
+    /// request returns what a `stat` of every entry would, and an application
+    /// reading a directory then asks about each name in turn. The compound
+    /// already existed on our wire — `read_dir` has always returned full
+    /// metadata — and its answers were being discarded, so those 5.4 lookups
+    /// per file each cost their own round trip.
+    #[test]
+    fn a_listing_answers_the_lookups_that_follow_it() {
+        let cache = crate::metacache::MetaCache::new();
+        let entries = ["a.txt", "b.txt", "c.txt"];
+        for name in entries {
+            cache.put(
+                "C:",
+                &join("dir", name),
+                Ok(cursio_protocol::FileMeta {
+                    name: name.into(),
+                    kind: FileKind::File,
+                    size: 1,
+                    modified_unix: 0,
+                    writable: true,
+                    allocated: None,
+                }),
+            );
+        }
+        for name in entries {
+            assert!(
+                cache.get("C:", &join("dir", name)).is_some(),
+                "{name} was answered by the listing, not by a round trip"
+            );
+        }
+    }
+
+    /// A change made here must not be readable as the value it had before.
+    #[test]
+    fn a_change_drops_what_was_cached_about_the_path() {
+        let cache = crate::metacache::MetaCache::new();
+        cache.put(
+            "C:",
+            "a.txt",
+            Ok(cursio_protocol::FileMeta {
+                name: "a.txt".into(),
+                kind: FileKind::File,
+                size: 10,
+                modified_unix: 0,
+                writable: true,
+                allocated: None,
+            }),
+        );
+        cache.forget("C:", "a.txt");
+        assert!(
+            cache.get("C:", "a.txt").is_none(),
+            "a write, truncate or rename leaves nothing stale behind it"
+        );
+    }
+
+    /// The mount root is the bound volume's own root, not a list of volumes.
+    ///
+    /// This is what makes one mount per volume work: every caller — lookup,
+    /// getattr, readdir, create — resolves paths through `entry_of`, so
+    /// translating the root in that one place is what turns "the peer's disks
+    /// as folders under one mount" into "each disk mounted as itself". A mount
+    /// that still answered [`Entry::Root`] here would list volumes inside a
+    /// volume.
+    #[test]
+    fn the_mount_root_is_the_bound_volumes_own_root() {
+        let (ops, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let fs = RemoteFs::new(PeerLink::new(ops), "C:");
+
+        assert_eq!(
+            fs.entry_of(ROOT_INO),
+            Some(Entry::Path {
+                volume: "C:".to_string(),
+                path: String::new(),
+            }),
+            "the root must address the volume this mount is bound to"
+        );
+    }
 
     /// The mount check must answer from `/proc/mounts` and never stat the path.
     ///
@@ -1274,7 +1616,11 @@ mod tests {
         assert!(!ro.is_mutating(), "a read-only open must not look mutating");
 
         let wo = open_mode_from(fuser::OpenFlags(libc::O_WRONLY));
-        assert!(!wo.read && wo.write, "O_WRONLY writes only");
+        assert!(wo.write, "O_WRONLY writes");
+        assert!(
+            wo.read,
+            "and reads too: the writeback cache fills partial pages through it"
+        );
 
         let rw = open_mode_from(fuser::OpenFlags(libc::O_RDWR));
         assert!(rw.read && rw.write, "O_RDWR does both");

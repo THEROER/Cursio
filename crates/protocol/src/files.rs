@@ -128,6 +128,20 @@ pub struct FileMeta {
     pub modified_unix: i64,
     /// Whether the owner will accept writes to this specific path.
     pub writable: bool,
+    /// Bytes the file actually occupies on the owner's disk, when that differs
+    /// from `size`.
+    ///
+    /// A sparse file is one whose declared length is far larger than what was
+    /// ever written to it — a virtual machine's disk image is the usual case,
+    /// and Android emulators ship one routinely. Reporting only `size` makes
+    /// every tool that adds up disk usage produce a number the disk could not
+    /// hold: measured here, a 118 GB volume was described as holding 615 GB,
+    /// with a single 550 GB image at the top of the list.
+    ///
+    /// `None` when the owner cannot tell — Windows, whose `Metadata` does not
+    /// carry the figure. The mount then falls back to `size`, which is what it
+    /// always did.
+    pub allocated: Option<u64>,
 }
 
 /// The three kinds of entry a listing distinguishes.
@@ -393,11 +407,27 @@ pub enum FilesMsg {
         from: String,
         to: String,
     },
-    /// Mount -> owner: set a file's length.
+    /// Mount -> owner: set a file's length, or reserve space for it.
+    ///
+    /// The two are different requests that look alike. Setting the length says
+    /// how long the file *is*; reserving says how much room it will need, and
+    /// asks for that room to be committed while the file stays as short as it
+    /// was. Windows makes the distinction explicitly (`AllocationSize` against
+    /// `EndOfFile`) and an installer relies on it: it reserves the whole
+    /// download up front so a disk that fills later cannot leave a half-written
+    /// game.
+    ///
+    /// Carrying both as one request meant every reservation became a truncate,
+    /// and on Linux `set_len` writes nothing — it makes a hole. So the space
+    /// was never committed, the reply said it had been, and Steam's
+    /// preallocation pass stalled partway through 4896 files with 55.9 GB
+    /// "allocated" against 904 KB actually used.
     Truncate {
         req: FileReqId,
         handle: FileHandle,
         size: u64,
+        /// Commit the space rather than move the end of the file.
+        reserve: bool,
     },
     /// Owner -> mount: a mutating request succeeded and has nothing to return.
     Ok { req: FileReqId },
@@ -415,6 +445,46 @@ impl FilesMsg {
     /// one. Anything higher would let a file copy be felt as input lag — the
     /// exact problem the priority scheduler exists to prevent.
     pub const PRIORITY: crate::Priority = crate::Priority::Bulk;
+
+    /// The class this particular message rides in.
+    ///
+    /// Metadata and data are the same module but not the same kind of traffic.
+    /// A `stat` is tens of bytes and something is blocked in a filesystem call
+    /// waiting for it; a chunk is 256 KiB and nothing waits on any single one.
+    /// Behind a copy in one queue, that `stat` waited out every chunk already
+    /// committed — so an `ls` during a transfer stalled for as long as the
+    /// queue was deep, which is the delay the mount reports as a hung drive.
+    ///
+    /// So metadata rides one class up. It stays below input and audio, which
+    /// have deadlines a person hears; it sits above the bytes of a copy, which
+    /// do not. The volume is self-limiting: metadata messages are small and
+    /// answer a caller that cannot ask again until it is answered, so they
+    /// cannot crowd out the data they are interleaved with.
+    pub fn priority(&self) -> crate::Priority {
+        match self {
+            // The bytes themselves, and the requests that ask for them.
+            FilesMsg::Read { .. }
+            | FilesMsg::Write { .. }
+            | FilesMsg::Data { .. }
+            | FilesMsg::Wrote { .. } => crate::Priority::Bulk,
+            // Everything else is metadata: a question about the shape of the
+            // filesystem, with a caller blocked on the answer.
+            _ => crate::Priority::Metadata,
+        }
+    }
+
+    /// Roughly what this message costs the link, in bytes.
+    ///
+    /// Only the payload-carrying variants are worth counting: everything else
+    /// is tens of bytes and is not what a transfer's pacing has to account for.
+    /// Used to spread one pump's sending across the link rather than emptying
+    /// the window into it at once.
+    pub fn wire_cost(&self) -> usize {
+        match self {
+            FilesMsg::Write { bytes, .. } | FilesMsg::Data { bytes, .. } => bytes.wire_len(),
+            _ => 0,
+        }
+    }
 
     /// Largest payload carried in one [`FilesMsg::Data`] or [`FilesMsg::Write`].
     ///
@@ -458,6 +528,59 @@ mod tests {
             encoded.len(),
             crate::MAX_FRAME_LEN
         );
+    }
+
+    /// A question someone is blocked on must not queue behind a copy's bytes.
+    ///
+    /// The two are the same module and not the same kind of traffic: a `stat`
+    /// is tens of bytes with a process asleep until it is answered, a chunk is
+    /// 256 KiB and nothing waits on any particular one. Sharing a class made an
+    /// `ls` during a transfer wait out every chunk already committed.
+    #[test]
+    fn metadata_outranks_the_bytes_of_a_copy() {
+        let stat = FilesMsg::Stat {
+            req: 1,
+            volume: "C:".into(),
+            path: "a.txt".into(),
+        };
+        let data = FilesMsg::Data {
+            req: 1,
+            offset: 0,
+            bytes: Chunk::Raw(vec![0u8; 1024]),
+            last: true,
+        };
+        assert!(
+            stat.priority() > data.priority(),
+            "a blocked question must go out ahead of bulk bytes"
+        );
+
+        // ...but neither may outrank what a person hears or feels.
+        for msg in [&stat, &data] {
+            assert!(msg.priority() < crate::Priority::Audio);
+            assert!(msg.priority() < crate::Priority::Input);
+        }
+        // Nor delay a window being streamed, which has a frame rate to keep.
+        assert!(stat.priority() < crate::Priority::Video);
+    }
+
+    /// The bytes of a transfer stay in the bulk class, whichever way they go.
+    #[test]
+    fn file_data_is_bulk_in_both_directions() {
+        let read = FilesMsg::Read {
+            req: 1,
+            handle: 1,
+            offset: 0,
+            len: 4096,
+        };
+        let write = FilesMsg::Write {
+            req: 1,
+            handle: 1,
+            offset: 0,
+            bytes: Chunk::Raw(vec![0u8; 16]),
+            last: true,
+        };
+        assert_eq!(read.priority(), crate::Priority::Bulk);
+        assert_eq!(write.priority(), crate::Priority::Bulk);
     }
 
     /// File traffic must never outrank the cursor.

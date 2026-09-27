@@ -297,7 +297,10 @@ mod tests {
         assert_eq!(t.resolve("C:", "a.txt"), ino, "resolving twice is stable");
 
         t.reference(ino);
-        assert!(t.get(ino).is_some(), "the entry the kernel received is held");
+        assert!(
+            t.get(ino).is_some(),
+            "the entry the kernel received is held"
+        );
         t.forget(ino, 1);
         assert!(t.get(ino).is_none());
 
@@ -343,7 +346,10 @@ mod tests {
         // The third was resolved but never sent, so it holds no reference and
         // the kernel will never forget it — the listing drops it itself.
         t.release_unreferenced(inos[2]);
-        assert!(t.get(inos[2]).is_none(), "the entry that did not fit is free");
+        assert!(
+            t.get(inos[2]).is_none(),
+            "the entry that did not fit is free"
+        );
 
         // Pass two: the kernel asks again from the third, which is sent now.
         let resumed = t.resolve("C:", names[2]);

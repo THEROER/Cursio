@@ -17,19 +17,22 @@ pub mod bridge;
 /// Which mount callbacks entered and never returned, the one failure a stuck
 /// caller cannot report for itself.
 pub mod inflight;
+/// A short-lived cache of the peer's answers about paths, so a burst of
+/// repeated questions costs one round trip rather than one each.
+pub mod metacache;
 #[cfg(target_os = "linux")]
 pub mod mount;
 /// A per-file read buffer that fetches ahead while access stays sequential, so
 /// many small reads share one round trip.
 pub mod readahead;
 pub mod server;
-/// Several writes in flight against one handle, without acknowledging any of
-/// them before the peer has stored it.
-pub mod writeback;
 /// Windows mounting, present only where `winfsp` can be built — see this
 /// crate's `Cargo.toml` for why that means MSVC rather than Windows in general.
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 pub mod winmount;
+/// Several writes in flight against one handle, without acknowledging any of
+/// them before the peer has stored it.
+pub mod writeback;
 
 pub use background::Workers;
 pub use server::{FileServer, SharedVolume};
@@ -80,9 +83,60 @@ pub fn volume_dir_name(id: &str) -> String {
     }
 }
 
+/// What a peer's volume is called where a person will read it.
+///
+/// [`volume_dir_name`] alone answers `C`, `V`, `Z` — which says nothing about
+/// what the disk *is*. A bare letter is the peer's own private naming: it means
+/// something on the machine that assigned it and nothing on the machine
+/// reading it, and with two Windows peers in the mesh both offer a `C` that are
+/// different disks. So the label leads and the letter follows in brackets, the
+/// way a file manager writes it: `Games (V)`, `Windows (C)`.
+///
+/// Falls back to the bare directory name when the label adds nothing — it is
+/// empty, or it already *is* the name, which is the case for a removable
+/// medium whose id is its mount path and for a Linux root called "Root".
+pub fn volume_display_name(id: &str, label: &str) -> String {
+    let dir = volume_dir_name(id);
+    let label = label.trim();
+    if label.is_empty() || label.eq_ignore_ascii_case(&dir) {
+        return dir;
+    }
+    // Only a drive letter gains the bracket: for anything else the directory
+    // name is already the medium's own name, and "MY_USB (MY_USB)" helps
+    // nobody.
+    match dir.chars().count() == 1 && dir.chars().all(|c| c.is_ascii_alphabetic()) {
+        true => format!("{label} ({dir})"),
+        false => dir,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::volume_dir_name;
+    use super::{volume_dir_name, volume_display_name};
+
+    /// A drive letter alone does not say what the disk is.
+    ///
+    /// `C`, `V`, `Z` are the peer's private naming: they mean something on the
+    /// machine that assigned them and nothing on the machine reading them —
+    /// and two Windows peers each offer a `C` that are different disks.
+    #[test]
+    fn a_drive_letter_is_shown_with_the_name_of_its_disk() {
+        assert_eq!(volume_display_name("C:", "Windows"), "Windows (C)");
+        assert_eq!(volume_display_name("V:", "Games"), "Games (V)");
+    }
+
+    /// A medium already named by its own label gains nothing from repeating it.
+    #[test]
+    fn a_name_is_not_doubled_when_it_says_the_same_thing() {
+        assert_eq!(
+            volume_display_name("/media/theroer/MY_USB", "MY_USB"),
+            "MY_USB"
+        );
+        assert_eq!(volume_display_name("/", "Root"), "root");
+        // Nothing to add: the label is empty.
+        assert_eq!(volume_display_name("C:", ""), "C");
+        assert_eq!(volume_display_name("C:", "   "), "C");
+    }
 
     /// A removable medium is offered under its mount path, and only the last
     /// component names the stick. Showing the whole path would nest it several

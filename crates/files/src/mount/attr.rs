@@ -56,7 +56,15 @@ pub fn attr_from(ino: u64, meta: &FileMeta, uid: u32, gid: u32) -> FileAttr {
         size: meta.size,
         // Reported in 512-byte units, rounded up: `du` and friends read this,
         // and a file of one byte still occupies a block.
-        blocks: meta.size.div_ceil(512),
+        //
+        // What the owner says it occupies, not what it claims to be long. The
+        // two differ for a sparse file — a virtual machine's disk image is the
+        // ordinary case — and deriving this from the length made every tool
+        // that adds up disk usage describe the volume as holding more than it
+        // can: a 118 GB drive was reported as holding 615 GB, with one 550 GB
+        // emulator image at the top. A peer that cannot tell sends nothing and
+        // the length is used, which is what this always did.
+        blocks: meta.allocated.unwrap_or(meta.size).div_ceil(512),
         // Only modification time survives the crossing; the peer does not send
         // atime or ctime, and inventing distinct values would be a lie. Using
         // mtime for all three is the conventional answer.
@@ -139,6 +147,49 @@ pub fn to_errno(e: &FileError) -> Errno {
 mod tests {
     use super::*;
 
+    /// A sparse file occupies what the owner says, not what it claims to be.
+    ///
+    /// A virtual machine's disk image declares a length it has never come near
+    /// using — an Android emulator ships one as a matter of course. Deriving
+    /// the block count from that length made a 118 GB volume report 615 GB of
+    /// contents, with a single 550 GB image at the top of the listing.
+    #[test]
+    fn a_sparse_file_reports_what_it_occupies() {
+        let meta = cursio_protocol::FileMeta {
+            name: "userdata.img".into(),
+            kind: cursio_protocol::FileKind::File,
+            size: 550 * 1024 * 1024 * 1024,
+            modified_unix: 0,
+            writable: true,
+            allocated: Some(4 * 1024 * 1024 * 1024),
+        };
+        let attr = super::attr_from(1, &meta, 1000, 1000);
+        assert_eq!(attr.size, meta.size, "the length is still the length");
+        assert_eq!(
+            attr.blocks,
+            4 * 1024 * 1024 * 1024 / 512,
+            "but the blocks are what it takes up"
+        );
+    }
+
+    /// A peer that cannot tell leaves this alone, and the length is used —
+    /// which is what every peer did before the field existed.
+    #[test]
+    fn an_owner_that_cannot_tell_falls_back_to_the_length() {
+        let meta = cursio_protocol::FileMeta {
+            name: "a.txt".into(),
+            kind: cursio_protocol::FileKind::File,
+            size: 1000,
+            modified_unix: 0,
+            writable: true,
+            allocated: None,
+        };
+        assert_eq!(
+            super::attr_from(1, &meta, 1000, 1000).blocks,
+            1000u64.div_ceil(512)
+        );
+    }
+
     fn meta(kind: FileKind, size: u64, writable: bool) -> FileMeta {
         FileMeta {
             name: "x".into(),
@@ -146,6 +197,7 @@ mod tests {
             size,
             modified_unix: 1_700_000_000,
             writable,
+            allocated: None,
         }
     }
 

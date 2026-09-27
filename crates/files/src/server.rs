@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use cursio_protocol::{FileError, FileHandle, FileKind, FileMeta, OpenMode, Volume};
@@ -27,10 +26,40 @@ pub struct FileServer {
     volumes: Vec<SharedVolume>,
     open: HashMap<FileHandle, OpenFile>,
     next_handle: FileHandle,
+    /// Native paths that must never be served, however the peer addresses them.
+    ///
+    /// This is where the peer's own disks are mounted on this machine. Serving
+    /// them sends the peer its own files back: on Linux the offered volume is
+    /// `/`, and the peer's drives hang off it at `~/Cursio/<peer>/…`, so a
+    /// machine with two real disks was offering six — its own two plus four of
+    /// the peer's, arriving home under new letters. Following one of those is
+    /// a round trip across the network for a file the asking machine already
+    /// has, and a directory walk into it recurses until something gives up.
+    ///
+    /// Held as native paths and matched by prefix, because the loop has to be
+    /// refused wherever it is reached from — a volume of its own, a symlink, or
+    /// a path that walks into it from the volume above.
+    excluded: Vec<PathBuf>,
 }
 
+/// An open file, shared so its I/O can happen outside the server's lock.
+///
+/// `Arc` rather than ownership because the whole `FileServer` sits behind one
+/// mutex, and a `read`/`write` that borrowed from it would hold that mutex for
+/// the length of a disk operation. Every other request — including requests for
+/// other files entirely — then queued behind it, and measured against a peer
+/// downloading a game that came to 11 writes a second with 0.2 operations
+/// actually in flight, against a window of 128. Cloning the handle costs an
+/// atomic increment and lets the lock be released before the disk is touched.
+///
+/// Positioned reads and writes (`read_at`/`write_at`) rather than
+/// `seek` + `read`/`write`: a shared file has one cursor, so two concurrent
+/// operations on the same handle would move it under each other. The positioned
+/// calls carry the offset with them and leave no cursor to race over — which is
+/// also exactly what the wire protocol supplies.
+#[derive(Clone)]
 struct OpenFile {
-    file: File,
+    file: std::sync::Arc<File>,
     writable: bool,
 }
 
@@ -41,7 +70,21 @@ impl FileServer {
             volumes,
             open: HashMap::new(),
             next_handle: 1,
+            excluded: Vec::new(),
         }
+    }
+
+    /// Refuse to serve anything under these native paths.
+    ///
+    /// Set to where the peer's own volumes are mounted here; see
+    /// [`FileServer::excluded`] for what serving them back costs.
+    pub fn exclude(&mut self, paths: Vec<PathBuf>) {
+        self.excluded = paths;
+    }
+
+    /// Whether this resolved path lies in a place that must not be served.
+    fn is_excluded(&self, path: &Path) -> bool {
+        self.excluded.iter().any(|e| path.starts_with(e))
     }
 
     /// Detect what this machine can share.
@@ -56,6 +99,26 @@ impl FileServer {
     /// What to announce to the peer.
     pub fn volumes(&self) -> Vec<Volume> {
         self.volumes.iter().map(|v| v.info.clone()).collect()
+    }
+
+    /// Take the volume set from a fresh scan, keeping the handles this one has
+    /// open.
+    ///
+    /// A rescan used to replace the whole server, which threw away `open` and
+    /// reset `next_handle` to 1. Both halves were wrong, and neither announced
+    /// itself: every file the peer had open — on *every* volume, not just the
+    /// one that changed — became `BadHandle` on its next write, and the handles
+    /// handed out afterwards repeated numbers the peer was still using, so a
+    /// write meant for one file could land in another. Plugging in a stick or
+    /// unplugging a disk is enough to trigger it, since it is the volume *set*
+    /// that changes.
+    ///
+    /// A handle whose volume genuinely went away keeps working here: it holds
+    /// an open `File`, and the OS decides what a write to a vanished device
+    /// does. That is the same answer a local program gets, and a truthful error
+    /// from the kernel beats a fabricated one from us.
+    pub fn adopt_volumes(&mut self, scanned: FileServer) {
+        self.volumes = scanned.volumes;
     }
 
     /// Resolve a wire path (volume id + `/`-separated relative path) to a native
@@ -94,6 +157,12 @@ impl FileServer {
                 _ => return Err(FileError::Denied),
             }
         }
+        // Where the peer's own disks are mounted here. Refused rather than
+        // served, or the peer follows the path back to its own files across the
+        // network — see [`FileServer::excluded`].
+        if self.is_excluded(&out) {
+            return Err(FileError::Denied);
+        }
         Ok(out)
     }
 
@@ -113,6 +182,13 @@ impl FileServer {
         for entry in std::fs::read_dir(&dir).map_err(to_file_error)? {
             let entry = entry.map_err(to_file_error)?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Hidden, not merely refused on entry: a directory the peer can see
+            // but never open is worse than one that was never offered — a file
+            // manager shows it, a copy walks into it, and both fail. This is
+            // where the peer's own disks are mounted here.
+            if self.is_excluded(&entry.path()) {
+                continue;
+            }
             // `symlink_metadata`, not `metadata`: a listing must describe the
             // link itself, or a link pointing outside the volume would be
             // reported as whatever it targets.
@@ -194,7 +270,7 @@ impl FileServer {
         self.open.insert(
             handle,
             OpenFile {
-                file,
+                file: std::sync::Arc::new(file),
                 writable: mode.write,
             },
         );
@@ -202,58 +278,77 @@ impl FileServer {
     }
 
     /// Read from an open handle. Returns fewer bytes than asked at end of file.
-    pub fn read(
-        &mut self,
-        handle: FileHandle,
-        offset: u64,
-        len: u32,
-    ) -> Result<Vec<u8>, FileError> {
-        let open = self.open.get_mut(&handle).ok_or(FileError::BadHandle)?;
-        open.file
-            .seek(SeekFrom::Start(offset))
-            .map_err(to_file_error)?;
-        let mut buf = vec![0u8; len as usize];
-        let mut filled = 0usize;
-        // `read` may return short for reasons other than EOF, so loop until the
-        // buffer is full or the file really ends — a short read reported as EOF
-        // would silently truncate the file as the peer sees it.
-        while filled < buf.len() {
-            match open.file.read(&mut buf[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(to_file_error(e)),
-            }
-        }
-        buf.truncate(filled);
-        Ok(buf)
+    pub fn read(&self, handle: FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, FileError> {
+        // The handle is looked up under the caller's lock; the disk is touched
+        // after it is released. See [`OpenFile`].
+        let open = self.handle(handle)?;
+        read_at(&open.file, offset, len as usize)
     }
 
     /// Write to an open handle.
-    pub fn write(
-        &mut self,
-        handle: FileHandle,
-        offset: u64,
-        bytes: &[u8],
-    ) -> Result<u64, FileError> {
-        let open = self.open.get_mut(&handle).ok_or(FileError::BadHandle)?;
-        if !open.writable {
-            return Err(FileError::ReadOnly);
-        }
-        open.file
-            .seek(SeekFrom::Start(offset))
-            .map_err(to_file_error)?;
-        open.file.write_all(bytes).map_err(to_file_error)?;
+    pub fn write(&self, handle: FileHandle, offset: u64, bytes: &[u8]) -> Result<u64, FileError> {
+        let open = self.writable_handle(handle)?;
+        write_at(&open.file, offset, bytes)?;
         Ok(bytes.len() as u64)
     }
 
     /// Set an open file's length.
     pub fn truncate(&mut self, handle: FileHandle, size: u64) -> Result<(), FileError> {
-        let open = self.open.get_mut(&handle).ok_or(FileError::BadHandle)?;
-        if !open.writable {
-            return Err(FileError::ReadOnly);
+        self.set_size(handle, size, false)
+    }
+
+    /// Set an open file's length, or commit space for it.
+    ///
+    /// `reserve` picks which. Setting the length is `set_len`, which on every
+    /// platform here leaves a hole rather than writing anything — cheap, and
+    /// correct for a truncate. Reserving is the opposite request: the caller
+    /// wants the space to *exist*, so that a write later cannot fail for want
+    /// of it, and a hole is precisely what it must not get.
+    ///
+    /// The distinction is what a game installer relies on. Steam reserves a
+    /// download's full size before fetching a byte, so that a disk filling up
+    /// midway cannot leave an unusable install. Answering that reservation with
+    /// `set_len` reported success while committing nothing — 55.9 GB of
+    /// "allocated" files occupying 904 KB — and its preallocation pass stalled
+    /// partway through.
+    pub fn set_size(&self, handle: FileHandle, size: u64, reserve: bool) -> Result<(), FileError> {
+        let open = self.writable_handle(handle)?;
+        if reserve {
+            return reserve_space(&open.file, size);
         }
         open.file.set_len(size).map_err(to_file_error)
+    }
+
+    /// The open file behind a handle, detached from the server.
+    ///
+    /// This is how a caller does disk work without holding the server's lock:
+    /// take the handle, release the lock, then read or write through
+    /// [`FileHandleRef`]. `read` and `write` above are the convenience form for
+    /// callers that are not contending — the session uses this one, because
+    /// holding the lock across a disk operation serialised every request in the
+    /// system behind whichever one was unlucky enough to be first.
+    pub fn detach(&self, handle: FileHandle) -> Result<FileHandleRef, FileError> {
+        Ok(FileHandleRef(self.handle(handle)?))
+    }
+
+    /// As [`FileServer::detach`], refusing a handle not opened for writing.
+    pub fn detach_writable(&self, handle: FileHandle) -> Result<FileHandleRef, FileError> {
+        Ok(FileHandleRef(self.writable_handle(handle)?))
+    }
+
+    /// The open file behind a handle, cloned so the caller can drop the lock.
+    fn handle(&self, handle: FileHandle) -> Result<OpenFile, FileError> {
+        self.open.get(&handle).cloned().ok_or(FileError::BadHandle)
+    }
+
+    /// As [`FileServer::handle`], refusing a handle that was not opened for
+    /// writing.
+    fn writable_handle(&self, handle: FileHandle) -> Result<OpenFile, FileError> {
+        let open = self.handle(handle)?;
+        match open.writable {
+            true => Ok(open),
+            false => Err(FileError::ReadOnly),
+        }
     }
 
     /// Release a handle. Unknown handles are ignored: a close is the peer saying
@@ -296,6 +391,187 @@ impl FileServer {
     }
 }
 
+/// An open file taken out of the server, so its I/O needs no lock.
+///
+/// Holds its own reference to the file, so the server's mutex can be released
+/// the moment this is obtained — which is the whole point. See
+/// [`FileServer::detach`].
+pub struct FileHandleRef(OpenFile);
+
+impl FileHandleRef {
+    /// Read from the file. Short only at end of file.
+    pub fn read(&self, offset: u64, len: u32) -> Result<Vec<u8>, FileError> {
+        read_at(&self.0.file, offset, len as usize)
+    }
+
+    /// Write to the file, returning how many bytes were accepted.
+    pub fn write(&self, offset: u64, bytes: &[u8]) -> Result<u64, FileError> {
+        write_at(&self.0.file, offset, bytes)?;
+        Ok(bytes.len() as u64)
+    }
+
+    /// Set the file's length, or commit space for it.
+    pub fn set_size(&self, size: u64, reserve: bool) -> Result<(), FileError> {
+        match reserve {
+            true => reserve_space(&self.0.file, size),
+            false => self.0.file.set_len(size).map_err(to_file_error),
+        }
+    }
+}
+
+/// Read `len` bytes from `offset`, without disturbing the file's cursor.
+///
+/// Short only at end of file: a short read reported as the whole answer would
+/// silently truncate the file as the peer sees it, so this loops until the
+/// buffer is full or the file really ends.
+fn read_at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>, FileError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+
+    let mut buf = vec![0u8; len];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        #[cfg(unix)]
+        let got = file.read_at(&mut buf[filled..], offset + filled as u64);
+        #[cfg(windows)]
+        let got = file.seek_read(&mut buf[filled..], offset + filled as u64);
+        match got {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(to_file_error(e)),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// Write `bytes` at `offset`, without disturbing the file's cursor.
+///
+/// Loops for the same reason a positioned read does: a partial write is not an
+/// error, and stopping at one would leave a hole in the file the peer believes
+/// it wrote.
+fn write_at(file: &File, offset: u64, bytes: &[u8]) -> Result<(), FileError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+
+    let mut written = 0usize;
+    while written < bytes.len() {
+        #[cfg(unix)]
+        let put = file.write_at(&bytes[written..], offset + written as u64);
+        #[cfg(windows)]
+        let put = file.seek_write(&bytes[written..], offset + written as u64);
+        match put {
+            Ok(0) => {
+                return Err(FileError::Io("the disk accepted no bytes".into()));
+            }
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(to_file_error(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Commit `size` bytes of storage to a file, without changing its length.
+///
+/// This is Windows' `AllocationSize`, relayed, and it keeps that contract:
+/// `FileSize` stays where it was, and an allocation *below* the current length
+/// truncates to it. Growing the length instead — which `posix_fallocate` does —
+/// made every reservation look like a file already written to its full size,
+/// so the mount reported gigabytes of zeroes as content and an append landed
+/// after them rather than at the real end.
+///
+/// `fallocate(2)` with `FALLOC_FL_KEEP_SIZE` commits the blocks and leaves the
+/// length alone. A filesystem that cannot do that (`EOPNOTSUPP`: FAT, some
+/// network filesystems) keeps the file as it is: space not reserved in advance
+/// is what every such filesystem gives a local program too, whereas faking the
+/// reservation by moving the end of the file would corrupt what the caller
+/// reads back.
+///
+/// `ENOSPC` is the answer that matters: an installer asking for room it cannot
+/// have must be told so now rather than partway through a download.
+#[cfg(target_os = "linux")]
+fn reserve_space(file: &File, size: u64) -> Result<(), FileError> {
+    use std::os::fd::AsRawFd;
+
+    let len = file.metadata().map_err(to_file_error)?.len();
+    if size < len {
+        return file.set_len(size).map_err(to_file_error);
+    }
+    if size == 0 {
+        return Ok(());
+    }
+    // SAFETY: `fd` is owned by `file` and valid for this call; the mode, offset
+    // and length are plain integers.
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_KEEP_SIZE,
+            0,
+            size as libc::off_t,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP) => {
+            tracing::debug!(
+                size,
+                "this filesystem cannot reserve space; leaving the file as it is"
+            );
+            Ok(())
+        }
+        _ => Err(to_file_error(err)),
+    }
+}
+
+/// Windows commits space through the file's own allocation size, which is
+/// exactly the request being relayed — so it is passed through as that, not as
+/// `set_len`, which would move the end of the file.
+#[cfg(target_os = "windows")]
+fn reserve_space(file: &File, size: u64) -> Result<(), FileError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileAllocationInfo, SetFileInformationByHandle, FILE_ALLOCATION_INFO,
+    };
+
+    let info = FILE_ALLOCATION_INFO {
+        AllocationSize: size as i64,
+    };
+    // SAFETY: the handle is owned by `file` and valid for this call; `info` is
+    // a live, correctly sized `FILE_ALLOCATION_INFO` for the class named.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileAllocationInfo,
+            (&info as *const FILE_ALLOCATION_INFO).cast(),
+            std::mem::size_of::<FILE_ALLOCATION_INFO>() as u32,
+        )
+    };
+    match ok {
+        0 => Err(to_file_error(std::io::Error::last_os_error())),
+        _ => Ok(()),
+    }
+}
+
+/// No way to reserve without moving the end of the file here, so only the
+/// truncating half of the contract is honoured.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn reserve_space(file: &File, size: u64) -> Result<(), FileError> {
+    let len = file.metadata().map_err(to_file_error)?.len();
+    if size < len {
+        return file.set_len(size).map_err(to_file_error);
+    }
+    Ok(())
+}
+
 fn meta_from(name: String, md: &std::fs::Metadata, volume_writable: bool) -> FileMeta {
     let kind = if md.file_type().is_symlink() {
         FileKind::Symlink
@@ -322,7 +598,38 @@ fn meta_from(name: String, md: &std::fs::Metadata, volume_writable: bool) -> Fil
         size: if md.is_dir() { 0 } else { md.len() },
         modified_unix,
         writable: volume_writable && !md.permissions().readonly(),
+        allocated: allocated_bytes(md),
     }
+}
+
+/// What the file occupies on this machine's disk, when that is knowable.
+///
+/// Reported alongside the length because the two can differ by orders of
+/// magnitude for a sparse file, and a mount that only knows the length makes
+/// every disk-usage tool describe a volume as holding more than it can.
+#[cfg(unix)]
+fn allocated_bytes(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    // `blocks` counts 512-byte units regardless of the filesystem's own block
+    // size — that is the unit `stat(2)` defines, not a guess.
+    Some(md.blocks() * 512)
+}
+
+/// Windows does not offer the figure through `Metadata`.
+///
+/// `file_size()` there is the declared length, which is the number this exists
+/// to correct rather than a second source for it. Reaching the real occupancy
+/// means `GetFileInformationByHandleEx` on an open handle, which a listing of
+/// thousands of entries cannot afford one file at a time — so this side says
+/// "unknown" and the mount falls back to the length, exactly as before.
+#[cfg(windows)]
+fn allocated_bytes(_md: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn allocated_bytes(_md: &std::fs::Metadata) -> Option<u64> {
+    None
 }
 
 /// Map a local IO error onto the wire vocabulary.
@@ -584,7 +891,10 @@ fn disk_label(root: &Path, target: &str, total_bytes: u64) -> String {
 }
 
 /// Round a capacity the way a file manager labels a disk: "239 GB", "1,0 TB".
-#[cfg(target_os = "linux")]
+///
+/// Used on both platforms, for the same reason on each: a disk the user never
+/// named has to be called something, and its size is what a file manager shows.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn human_size(bytes: u64) -> String {
     // Decimal units, as every disk vendor and file manager uses: a 240 GB SSD
     // labelled "223 GiB" reads as the wrong disk.
@@ -626,11 +936,20 @@ fn detect_volumes() -> Vec<SharedVolume> {
         if std::fs::metadata(&root).is_err() {
             continue;
         }
+        // Not a disk of ours: this letter is a peer's volume, mounted here by
+        // Cursio itself. Offering it back sends the peer its own files across
+        // the network to arrive home under a new letter — a machine with two
+        // real disks announced six, four of them the asking machine's own,
+        // labelled with that machine's name. Following one is a round trip for
+        // a file the caller already has, and a walk into it recurses.
+        if is_own_mount(letter) {
+            continue;
+        }
         let (total_bytes, free_bytes) = capacity_of(&root);
         out.push(SharedVolume {
             info: Volume {
                 id: format!("{letter}:"),
-                label: format!("Disk ({letter}:)"),
+                label: volume_label(letter).unwrap_or_else(|| human_size(total_bytes)),
                 writable: true,
                 total_bytes,
                 free_bytes,
@@ -640,6 +959,90 @@ fn detect_volumes() -> Vec<SharedVolume> {
         });
     }
     out
+}
+
+/// The name the user gave this drive, as Explorer shows it.
+///
+/// The volume label, not a name of our own. This used to answer
+/// `format!("Disk ({letter}:)")`, which says only what the caller already knew
+/// — and the letter is the peer's private naming: it means something on the
+/// machine that assigned it and nothing on the machine reading it, where two
+/// Windows peers each offer a `C` that are different disks. The mount that
+/// presents this then added the letter back, giving the reader `Disk (C:) (C)`.
+///
+/// `None` when the drive has no label — plenty of disks are never named — and
+/// the caller falls back to the size, exactly as a file manager writes
+/// "239 GB Volume" for the same disk.
+#[cfg(target_os = "windows")]
+fn volume_label(letter: char) -> Option<String> {
+    let root: Vec<u16> = format!("{letter}:\\")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // `MAX_PATH + 1`, which is what `GetVolumeInformationW` documents as the
+    // required size for the label buffer.
+    let mut label = [0u16; 261];
+    // Safe: `root` is a valid NUL-terminated wide string, and the buffer is
+    // owned here and passed with its true length. The out-params this call does
+    // not need are null, which the API accepts.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW(
+            root.as_ptr(),
+            label.as_mut_ptr(),
+            label.len() as u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let end = label.iter().position(|&c| c == 0).unwrap_or(label.len());
+    let name = String::from_utf16_lossy(&label[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether this drive letter is a peer's volume that Cursio mounted here.
+///
+/// Identified by the UNC name behind the letter. [`crate::winmount`] publishes
+/// every mount as a network filesystem under `\cursio\<peer>-<volume>`, so that
+/// prefix is exactly our own mounts and nothing else — a real network drive the
+/// user mapped keeps its own server name and is offered to the peer like any
+/// other disk, which is right: it is storage this machine can reach and the
+/// peer may not.
+///
+/// Tested by the name rather than by `DRIVE_REMOTE`, which would also catch
+/// those genuine mappings.
+#[cfg(target_os = "windows")]
+fn is_own_mount(letter: char) -> bool {
+    use windows_sys::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+
+    let device: Vec<u16> = format!("{letter}:")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `device` is a NUL-terminated UTF-16 string that outlives the call.
+    if unsafe { GetDriveTypeW(device.as_ptr()) } != DRIVE_REMOTE {
+        return false;
+    }
+
+    let mut name = [0u16; 512];
+    let mut len = name.len() as u32;
+    // SAFETY: both buffers are owned here and passed with their true lengths;
+    // `len` is in-out and the API writes no more than it says.
+    let ok = unsafe { WNetGetConnectionW(device.as_ptr(), name.as_mut_ptr(), &mut len) };
+    if ok != 0 {
+        return false;
+    }
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    String::from_utf16_lossy(&name[..end])
+        .trim_start_matches('\\')
+        .starts_with("cursio\\")
 }
 
 /// Whether a drive letter is a removable medium.
@@ -856,6 +1259,327 @@ mod tests {
 
         // The volume root itself.
         assert_eq!(srv.resolve("T:", "").expect("root"), tmp.path());
+    }
+
+    /// A volume set changing under an open file must not disturb the file.
+    ///
+    /// Plugging a stick in, or pulling a disk out, changes the *set* — and the
+    /// rescan that notices used to swap in a whole fresh `FileServer`. That
+    /// dropped the open-file table with it, so every handle the peer held, on
+    /// every volume, became `BadHandle` on its next use: a copy in progress
+    /// failed at whatever point the user happened to touch an unrelated disk.
+    #[test]
+    fn a_volume_set_change_keeps_open_handles_alive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.txt"), b"before").expect("seed");
+        let mut srv = server_on(tmp.path());
+
+        let (handle, _) = srv
+            .open(
+                "T:",
+                "a.txt",
+                OpenMode {
+                    read: true,
+                    write: true,
+                    create: false,
+                    truncate: false,
+                    exclusive: false,
+                },
+            )
+            .expect("opens");
+
+        // A rescan finds a second volume: the set changed, so the session
+        // adopts it.
+        let mut scanned = server_on(tmp.path());
+        scanned.volumes.push(SharedVolume {
+            info: Volume {
+                id: "U:".to_string(),
+                label: "Added".to_string(),
+                writable: true,
+                total_bytes: FALLBACK_TOTAL,
+                free_bytes: FALLBACK_FREE,
+                removable: true,
+            },
+            root: tmp.path().to_path_buf(),
+        });
+        srv.adopt_volumes(scanned);
+
+        assert_eq!(srv.volumes().len(), 2, "the new set is in place");
+        assert_eq!(
+            srv.write(handle, 0, b"after!").expect("still writable"),
+            6,
+            "the handle must survive a volume set change"
+        );
+    }
+
+    /// Handle numbers must never be reused while the peer still holds them.
+    ///
+    /// The rescan that replaced the whole server also reset `next_handle` to 1,
+    /// so after any volume change the next file opened was handed a number the
+    /// peer was still using for a different file — and a write meant for one
+    /// landed in the other. Silent corruption, which is worse than the lost
+    /// handles above.
+    #[test]
+    fn handle_numbers_are_not_reused_after_a_volume_set_change() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.txt"), b"a").expect("seed");
+        std::fs::write(tmp.path().join("b.txt"), b"b").expect("seed");
+        let mut srv = server_on(tmp.path());
+
+        let read_only = OpenMode {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+            exclusive: false,
+        };
+        let (first, _) = srv.open("T:", "a.txt", read_only).expect("opens");
+
+        srv.adopt_volumes(server_on(tmp.path()));
+
+        let (second, _) = srv.open("T:", "b.txt", read_only).expect("opens");
+        assert_ne!(
+            first, second,
+            "a handle still held by the peer must not be handed out again"
+        );
+    }
+
+    /// Disk work must not hold the server's lock.
+    ///
+    /// This is the property that decides whether requests run concurrently or
+    /// one at a time. It was not held: `server.lock().write(..)` keeps the
+    /// temporary guard alive to the end of the expression, so every request in
+    /// the system — for every file — queued behind whichever write was first.
+    /// Measured against a peer downloading a game, that was 11 writes a second
+    /// with 0.2 operations in flight against a window of 128.
+    ///
+    /// Asserted by holding the lock and doing I/O at the same time: if the
+    /// handle still borrowed from the server, this would not compile, and if
+    /// the I/O needed the lock, it would deadlock.
+    #[test]
+    fn disk_work_does_not_need_the_server_lock() {
+        use std::sync::Mutex;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.bin"), b"0123456789").expect("seed");
+        let server = Mutex::new(server_on(tmp.path()));
+
+        let handle = {
+            let mut guard = server.lock().expect("server");
+            let (h, _) = guard
+                .open(
+                    "T:",
+                    "a.bin",
+                    OpenMode {
+                        read: true,
+                        write: true,
+                        create: false,
+                        truncate: false,
+                        exclusive: false,
+                    },
+                )
+                .expect("opens");
+            h
+        };
+
+        let file = server
+            .lock()
+            .expect("server")
+            .detach(handle)
+            .expect("detaches");
+
+        // The lock is free while the file is being used: taking it here would
+        // hang if the handle still held it.
+        let held = server.lock().expect("server");
+        assert_eq!(file.read(0, 4).expect("reads"), b"0123");
+        file.write(0, b"ABCD").expect("writes");
+        assert_eq!(file.read(0, 4).expect("reads"), b"ABCD");
+        drop(held);
+    }
+
+    /// Positioned I/O must not move a cursor other operations depend on.
+    ///
+    /// A detached handle is shared, so two operations on the same file run at
+    /// once. With `seek` + `read` they would move one cursor under each other
+    /// and return each other's bytes.
+    #[test]
+    fn concurrent_operations_on_one_file_do_not_disturb_each_other() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.bin"), (0..=255u8).collect::<Vec<_>>()).expect("seed");
+        let mut srv = server_on(tmp.path());
+        let (handle, _) = srv
+            .open(
+                "T:",
+                "a.bin",
+                OpenMode {
+                    read: true,
+                    write: false,
+                    create: false,
+                    truncate: false,
+                    exclusive: false,
+                },
+            )
+            .expect("opens");
+        let file = std::sync::Arc::new(srv.detach(handle).expect("detaches"));
+
+        // Interleaved reads at different offsets, each of which must see its
+        // own bytes.
+        let threads: Vec<_> = (0..8u64)
+            .map(|i| {
+                let file = std::sync::Arc::clone(&file);
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        let at = i * 16;
+                        let got = file.read(at, 16).expect("reads");
+                        assert_eq!(
+                            got[0], at as u8,
+                            "a concurrent read returned another read's bytes"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("thread finishes");
+        }
+    }
+
+    /// Reserving space must actually commit it, not leave a hole.
+    ///
+    /// The distinction is the whole point of the request: an installer reserves
+    /// a download's full size up front so that a disk filling later cannot
+    /// leave it half-written. `set_len` reports success while writing nothing,
+    /// which is how 55.9 GB of Steam's "allocated" files came to occupy 904 KB
+    /// — and why its preallocation pass stalled partway through.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reserving_space_commits_blocks_rather_than_making_a_hole() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.bin"), b"").expect("seed");
+        let mut srv = server_on(tmp.path());
+        let write = OpenMode {
+            read: true,
+            write: true,
+            create: false,
+            truncate: false,
+            exclusive: false,
+        };
+
+        // A truncate is allowed to be a hole: nothing promised the space.
+        let (h, _) = srv.open("T:", "a.bin", write).expect("opens");
+        srv.set_size(h, 1024 * 1024, false).expect("truncates");
+        let holey = tmp.path().join("a.bin").metadata().expect("stat");
+        assert_eq!(holey.len(), 1024 * 1024, "the file is a megabyte long");
+        assert_eq!(holey.blocks(), 0, "and occupies nothing: it is a hole");
+
+        // A reservation must not be.
+        srv.set_size(h, 1024 * 1024, true).expect("reserves");
+        let committed = tmp.path().join("a.bin").metadata().expect("stat");
+        assert!(
+            committed.blocks() * 512 >= 1024 * 1024,
+            "reserved space must exist on the medium; got {} bytes of blocks",
+            committed.blocks() * 512
+        );
+    }
+
+    /// A reservation commits room; it does not say how long the file is.
+    ///
+    /// Windows keeps the two apart (`AllocationSize` against `EndOfFile`), and
+    /// an installer reserves a whole download before writing a byte of it.
+    /// Moving the end of the file to the reservation made the mount report
+    /// the full size as content, and anything appending wrote after gigabytes
+    /// of zeroes.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reserving_space_leaves_the_length_alone_and_truncates_below_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.bin"), b"0123456789").expect("seed");
+        let mut srv = server_on(tmp.path());
+        let write = OpenMode {
+            read: true,
+            write: true,
+            create: false,
+            truncate: false,
+            exclusive: false,
+        };
+        let (h, _) = srv.open("T:", "a.bin", write).expect("opens");
+
+        srv.set_size(h, 1024 * 1024, true).expect("reserves");
+        let len = tmp.path().join("a.bin").metadata().expect("stat").len();
+        assert_eq!(len, 10, "a reservation must not move the end of the file");
+
+        // An allocation below the length is the one case that does: Windows
+        // truncates a file whose allocation shrinks past its end.
+        srv.set_size(h, 4, true).expect("shrinks");
+        let len = tmp.path().join("a.bin").metadata().expect("stat").len();
+        assert_eq!(len, 4);
+    }
+
+    /// A reservation on a read-only handle is refused like any other write.
+    #[test]
+    fn reserving_space_needs_a_writable_handle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.bin"), b"x").expect("seed");
+        let mut srv = server_on(tmp.path());
+        let (h, _) = srv
+            .open(
+                "T:",
+                "a.bin",
+                OpenMode {
+                    read: true,
+                    write: false,
+                    create: false,
+                    truncate: false,
+                    exclusive: false,
+                },
+            )
+            .expect("opens");
+
+        assert!(matches!(
+            srv.set_size(h, 4096, true),
+            Err(FileError::ReadOnly)
+        ));
+    }
+
+    /// The peer's own disks must not be served back to it.
+    ///
+    /// Linux offers `/`, and the peer's drives are mounted below it at
+    /// `~/Cursio/<peer>/…`. Serving that path sends the peer its own files
+    /// across the network to come home under a new drive letter — seen live as
+    /// a machine with two disks announcing six, four of which were the asking
+    /// machine's own. Following one is a round trip for a file the caller
+    /// already has, and a directory walk into it recurses.
+    #[test]
+    fn the_peers_own_mounts_are_never_served_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let loops = tmp.path().join("Cursio");
+        std::fs::create_dir_all(loops.join("Lightmoon").join("V")).expect("peer mount");
+        std::fs::write(tmp.path().join("ours.txt"), b"ours").expect("seed");
+
+        let mut srv = server_on(tmp.path());
+        srv.exclude(vec![loops.clone()]);
+
+        // Refused however it is addressed.
+        assert!(matches!(
+            srv.resolve("T:", "Cursio/Lightmoon/V"),
+            Err(FileError::Denied)
+        ));
+        assert!(matches!(
+            srv.resolve("T:", "Cursio/Lightmoon/V/SteamLibrary"),
+            Err(FileError::Denied)
+        ));
+        // And the directory above it does not even offer it.
+        let listing = srv.read_dir("T:", "").expect("lists");
+        assert!(
+            listing.iter().all(|e| e.name != "Cursio"),
+            "the peer's own mounts must not appear in a listing: {:?}",
+            listing.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        // Everything else on the volume is unaffected.
+        assert!(listing.iter().any(|e| e.name == "ours.txt"));
+        assert!(srv.resolve("T:", "ours.txt").is_ok());
     }
 
     /// An unknown volume is not a path error — there is nothing to resolve

@@ -12,4 +12,4 @@ pub mod inode;
 // Re-exported so existing callers keep naming these through `mount`, though the
 // bridge itself now lives at the crate root: Windows needs it too.
 pub use crate::bridge::{Op, PeerLink, OP_TIMEOUT};
-pub use fs::{mount, MountHandle, RemoteFs};
+pub use fs::{mount, release_stale_peer_mounts, MountHandle, RemoteFs};
