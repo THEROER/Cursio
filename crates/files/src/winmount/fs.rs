@@ -421,16 +421,6 @@ impl FileSystemContext for RemoteFs {
         fill_info_at(file_info.as_mut(), &meta, &volume, &path);
         set_normalized_name(file_info, file_name);
 
-        if path.contains("temp-archive") {
-            tracing::debug!(
-                path = %path,
-                is_dir,
-                create_options = format_args!("{create_options:#010x}"),
-                granted_access = format_args!("{granted_access:#010x}"),
-                "winmount open(temp-archive)"
-            );
-        }
-
         // A directory has nothing to open on the far side; only files do.
         let (remote, size) = if is_dir {
             (None, 0)
@@ -894,15 +884,6 @@ impl FileSystemContext for RemoteFs {
         // malformed reply, which is how `cargo` clearing a `.temp-archive`
         // directory got `ERROR_INVALID_NAME` on a name that was perfectly valid.
         let entries = self.entries_of(context).map_err(|e| to_ntstatus(&e))?;
-        if context.path.contains("temp-archive") {
-            tracing::debug!(
-                path = %context.path,
-                pattern = ?pattern,
-                marker = ?skip_until,
-                entries = entries.len(),
-                "winmount read_directory(temp-archive)"
-            );
-        }
         let mut past_marker = skip_until.is_none();
         for meta in entries {
             if let Some(pat) = pattern.as_deref() {
