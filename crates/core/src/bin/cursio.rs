@@ -1550,6 +1550,7 @@ fn spawn_peer_session(
             if reg.is_known(&id) {
                 reg.set_state(id, cursio_core::registry::PeerState::Online);
                 tracing::info!(peer = %name, "peer online");
+                cursio_core::health::link_restored(id);
             } else if pairing_for_cb.is_open() {
                 tracing::info!(peer = %name, %id, "unknown machine dialled in; pairing it");
             } else {
@@ -1590,14 +1591,26 @@ fn spawn_peer_session(
         )
         .await;
 
+        let who = *identified.borrow();
         match &result {
             Ok(()) => tracing::info!("peer session ended"),
-            Err(e) => tracing::warn!(error = %e, "peer session ended with error"),
+            Err(e) => {
+                tracing::warn!(error = %e, "peer session ended with error");
+                // Only a peer that was greeted: a stranger refused at the
+                // door, or a socket that closed before `Hello`, is not a link
+                // the user has to hear dropped.
+                let known = who.and_then(|id| {
+                    let reg = registry.borrow();
+                    reg.get(&id).map(|peer| (id, peer.display_name.clone()))
+                });
+                if let Some((id, name)) = known {
+                    cursio_core::health::link_dropped(id, &name, &e.to_string());
+                }
+            }
         }
 
         // Offline, never removed: the machine still exists, it's just not here
         // right now. This is the whole point of the registry.
-        let who = *identified.borrow();
         if let Some(id) = who {
             registry.borrow_mut().mark_offline(id);
         }
@@ -2338,10 +2351,12 @@ fn make_capture() -> Option<cursio_input::CaptureHandle> {
     match cursio_input::spawn_capture() {
         Ok(handle) => {
             tracing::info!(devices = ?handle.devices, "capturing local input");
+            cursio_core::health::input_capture_started();
             Some(handle)
         }
         Err(e) => {
             tracing::warn!(error = %e, "could not start input capture");
+            cursio_core::health::input_capture_unavailable(&e.to_string());
             None
         }
     }

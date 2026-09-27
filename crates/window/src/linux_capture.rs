@@ -184,7 +184,14 @@ async fn setup_view_portal(kind: SourceType) -> Result<PortalCast, String> {
         .await
         .map_err(|e| format!("start session: {e}"))?
         .response()
-        .map_err(|e| format!("the screen-share dialog was cancelled or failed: {e}"))?;
+        .map_err(|e| {
+            let detail = format!("the screen-share dialog was cancelled or failed: {e}");
+            crate::notice::report(crate::notice::Notice::ScreenCastRefused {
+                detail: detail.clone(),
+            });
+            detail
+        })?;
+    crate::notice::report(crate::notice::Notice::ScreenCastGranted);
     let node_id = response
         .streams()
         .first()
@@ -286,7 +293,14 @@ async fn setup_portal() -> Result<PortalCast, String> {
         .await
         .map_err(|e| format!("start session: {e}"))?
         .response()
-        .map_err(|e| format!("start session response: {e}"))?;
+        .map_err(|e| {
+            let detail = format!("start session response: {e}");
+            crate::notice::report(crate::notice::Notice::ScreenCastRefused {
+                detail: detail.clone(),
+            });
+            detail
+        })?;
+    crate::notice::report(crate::notice::Notice::ScreenCastGranted);
 
     // A new token is issued whenever the portal decides to; store it so the
     // next run restores silently.
@@ -625,6 +639,7 @@ async fn inhibit_direct_scanout() -> Option<zbus::Connection> {
     match reply {
         Ok(_) => {
             tracing::info!("direct scanout inhibited while this screen is shared");
+            crate::notice::report(crate::notice::Notice::ShellExtensionCurrent);
             Some(conn)
         }
         Err(e) => {
@@ -647,12 +662,18 @@ async fn inhibit_direct_scanout() -> Option<zbus::Connection> {
                      InhibitDirectScanout; expected until you log out and back in, after \
                      which a fullscreen app on the shared screen no longer freezes the peer's view"
                 );
+                crate::notice::report(crate::notice::Notice::ShellExtensionOutdated {
+                    missing: "no InhibitDirectScanout".into(),
+                });
             } else {
                 tracing::warn!(
                     error = %e,
                     "could not inhibit direct scanout, so a fullscreen app on the shared screen \
                      may freeze the peer's view; is the Cursio GNOME extension installed and enabled?"
                 );
+                crate::notice::report(crate::notice::Notice::ShellExtensionMissing {
+                    detail: e.to_string(),
+                });
             }
             None
         }

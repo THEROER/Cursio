@@ -43,6 +43,8 @@ pub mod codec;
 pub mod frame_pipeline;
 /// The viewer's assembled window image, shared by every surrogate backend.
 pub mod framebuffer;
+/// What the backends found that the user has to fix, for the core to list.
+pub mod notice;
 pub mod window_test_support;
 
 #[cfg(any(target_os = "linux", target_os = "windows", test))]

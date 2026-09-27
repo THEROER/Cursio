@@ -104,6 +104,7 @@ fn report_no_virtual_devices(reported: &std::sync::atomic::AtomicBool, what: &st
         "this machine cannot publish a peer's audio outputs or microphones; {VIRTUAL_DEVICES_HINT} \
          (application audio from the peer still plays)"
     );
+    crate::health::audio_devices_unavailable(VIRTUAL_DEVICES_HINT, cfg!(target_os = "windows"));
     true
 }
 

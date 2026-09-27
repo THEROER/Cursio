@@ -253,6 +253,22 @@ level and clears at a lower one (memory full-stall 10%/5%, some-stall 20%/10%,
 I/O full-stall 20%/10%, swap or commit 90%/80%), because a single line would
 make a panel blink while pressure hovers at it.
 
+**Links, modules and missing pieces** (`core/src/health.rs`) are one function
+per condition, so the sentence, severity and id live in one place and a raise
+cannot drift from its clear:
+
+| Condition | Raised by | Cleared by |
+|---|---|---|
+| A greeted peer's session ended in an error | the mesh supervisor (`peer.<id>.down`) | that peer greeting again |
+| A module's turn is too slow | `health::module_stalled(module, peer, took)` | `health::module_recovered` |
+| No virtual audio driver (Windows: install `cursio-vad`) | the audio module, once | — (a capability, not an event) |
+| The GNOME Shell extension is outdated or absent | `cursio-window::notice`, from the scanout inhibit call | the same call succeeding |
+| A portal dialog was cancelled | `cursio-window::notice` (screen sharing); input capture failing to start | the next grant |
+
+`module_stalled`/`module_recovered` are for the loop that already times every
+module turn (`module_host.rs`); it is the one place that can tell a module that
+fell behind from one that has caught up.
+
 ## One link, priority end to end
 
 Every module rides one Noise-over-TCP link, so the order bytes leave in is the

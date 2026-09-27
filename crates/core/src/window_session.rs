@@ -792,6 +792,22 @@ const SUPPORTED: bool = cfg!(any(
     target_os = "macos"
 ));
 
+/// What a window backend found, as this machine's problem list says it.
+fn report_notice(notice: &cursio_window::notice::Notice) {
+    use cursio_window::notice::Notice;
+    match notice {
+        Notice::ShellExtensionOutdated { missing } => {
+            crate::health::shell_extension_outdated(missing)
+        }
+        Notice::ShellExtensionMissing { detail } => crate::health::shell_extension_missing(detail),
+        Notice::ShellExtensionCurrent => crate::health::shell_extension_current(),
+        Notice::ScreenCastRefused { detail } => {
+            crate::health::portal_refused("screen sharing", detail)
+        }
+        Notice::ScreenCastGranted => crate::health::portal_granted("screen sharing"),
+    }
+}
+
 impl crate::module::ModuleFactory for WindowFactory {
     fn id(&self) -> ModuleId {
         ModuleId::WINDOW
@@ -809,6 +825,7 @@ impl crate::module::ModuleFactory for WindowFactory {
 
     #[allow(unused_variables)]
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
+        cursio_window::notice::set_reporter(report_notice);
         if let Some(share) = &self.airplay {
             share.state.note_offer(ctx.peer.peer_id, ctx.peer.service);
         }

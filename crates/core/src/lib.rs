@@ -35,6 +35,8 @@ pub mod elevate;
 #[cfg(feature = "files")]
 pub mod files_session;
 pub mod firewall;
+/// Link, module and platform problems, each raised and cleared by name.
+pub mod health;
 pub mod identity;
 /// Bringing a link up to the point a session can start: handshake, pairing,
 /// encryption, module negotiation. Shared by the CLI and the app, desktop and
