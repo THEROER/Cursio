@@ -352,6 +352,34 @@ impl Message {
         }
     }
 
+    /// Which module this message belongs to, or `None` for the session's own
+    /// vocabulary (greeting, pairing, liveness, input and ownership).
+    ///
+    /// The receiver routes by this before anything decodes the payload, so a
+    /// frame reaches exactly one module instead of being offered to each in
+    /// turn. The first-class hot paths are named here too: a window frame is
+    /// the window module's however it travels, and forgetting one would hand
+    /// it to the session loop that the shared cursor rides.
+    pub fn module_id(&self) -> Option<ModuleId> {
+        match self {
+            Message::Module { module, .. } => Some(*module),
+            Message::AudioChunk(_) => Some(ModuleId::AUDIO),
+            Message::WindowFrame(_) | Message::WindowInput(_) => Some(ModuleId::WINDOW),
+            Message::Hello(_)
+            | Message::PairRequest { .. }
+            | Message::PairResponse { .. }
+            | Message::PairConfirm { .. }
+            | Message::PairFailed { .. }
+            | Message::Heartbeat { .. }
+            | Message::Bye
+            | Message::NodeStatus(_)
+            | Message::Opaque(_)
+            | Message::Input(_)
+            | Message::Grab { .. }
+            | Message::CrossEdge { .. } => None,
+        }
+    }
+
     /// Envelope a module's own message for the shared channel.
     ///
     /// The module's enum is serialized here and routed by `module` on the far
@@ -481,6 +509,49 @@ mod tests {
         let msg = Message::Heartbeat { nonce: 42 };
         let bytes = msg.to_bytes().unwrap();
         assert_eq!(Message::from_bytes(&bytes).unwrap(), msg);
+    }
+
+    /// Module traffic names its module whether it is enveloped or rides a
+    /// first-class hot path, and the session's own vocabulary names none.
+    #[test]
+    fn every_module_frame_names_its_module_and_session_frames_name_none() {
+        let files = Message::Module {
+            module: ModuleId::FILES,
+            priority: Priority::Bulk,
+            payload: Vec::new(),
+        };
+        assert_eq!(files.module_id(), Some(ModuleId::FILES));
+
+        let chunk = Message::AudioChunk(audio::AudioChunk {
+            id: 1,
+            seq: 0,
+            timestamp: 0,
+            data: Vec::new(),
+        });
+        assert_eq!(chunk.module_id(), Some(ModuleId::AUDIO));
+
+        let frame = Message::WindowFrame(window::WindowFrame {
+            id: 1,
+            seq: 0,
+            dirty: window::Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            codec: window::TileCodec::RawBgra8888,
+            data: Vec::new(),
+        });
+        assert_eq!(frame.module_id(), Some(ModuleId::WINDOW));
+
+        for session in [
+            Message::Heartbeat { nonce: 1 },
+            Message::Bye,
+            Message::Input(InputEvent::PointerMotion { dx: 1, dy: 0 }),
+            Message::Grab { active: true },
+        ] {
+            assert_eq!(session.module_id(), None, "{session:?} is the session's");
+        }
     }
 
     /// A stand-in for a module's own enum — the point being that `Message` has
