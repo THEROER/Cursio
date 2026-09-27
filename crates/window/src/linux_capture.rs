@@ -333,23 +333,6 @@ async fn setup_portal() -> Result<PortalCast, String> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn buttons_replay_as_evdev_codes() {
-        use cursio_protocol::MouseButton;
-        // These must match `input-event-codes.h`: the surrogate's click is
-        // replayed by number, so a wrong code silently presses another button.
-        assert_eq!(evdev_button(MouseButton::Left), 0x110);
-        assert_eq!(evdev_button(MouseButton::Right), 0x111);
-        assert_eq!(evdev_button(MouseButton::Middle), 0x112);
-        assert_eq!(evdev_button(MouseButton::Back), 0x113);
-        assert_eq!(evdev_button(MouseButton::Forward), 0x114);
-    }
-}
-
 /// What the capture thread is told to do from the outside.
 enum CaptureCommand {
     /// Replay one viewer input event onto the real window.
@@ -1151,5 +1134,22 @@ async fn replay_input(
                 )
                 .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buttons_replay_as_evdev_codes() {
+        use cursio_protocol::MouseButton;
+        // These must match `input-event-codes.h`: the surrogate's click is
+        // replayed by number, so a wrong code silently presses another button.
+        assert_eq!(evdev_button(MouseButton::Left), 0x110);
+        assert_eq!(evdev_button(MouseButton::Right), 0x111);
+        assert_eq!(evdev_button(MouseButton::Middle), 0x112);
+        assert_eq!(evdev_button(MouseButton::Back), 0x113);
+        assert_eq!(evdev_button(MouseButton::Forward), 0x114);
     }
 }

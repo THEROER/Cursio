@@ -740,7 +740,8 @@ mod framebuffer_tests {
             &tile,
         )
         .unwrap();
-        let i = ((1 * 4 + 2) * 4) as usize;
+        let (row, col, width) = (1usize, 2usize, 4usize);
+        let i = (row * width + col) * 4;
         assert_eq!(&fb.pixels[i..i + 4], &tile);
         // Everything else stays untouched.
         assert!(fb.pixels[..i].iter().all(|&b| b == 0));

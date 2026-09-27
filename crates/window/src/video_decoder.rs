@@ -239,10 +239,7 @@ mod tests {
 
         // Opaque mid-grey: no chroma detail for 4:2:0 subsampling to lose, so
         // any colour difference here would be genuine codec loss.
-        let mut source = vec![0u8; (w as usize) * (h as usize) * 4];
-        for px in source.chunks_exact_mut(4) {
-            px.copy_from_slice(&[0x80, 0x80, 0x80, 0xFF]);
-        }
+        let source = [0x80u8, 0x80, 0x80, 0xFF].repeat((w as usize) * (h as usize));
 
         let mut decoded = Vec::new();
         for packet in enc.encode(&source).expect("encode") {
@@ -255,8 +252,10 @@ mod tests {
         let frame = decoded.first().expect("a frame must come back");
         let mismatched = frame
             .pixels
-            .chunks_exact(4)
-            .zip(source.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(source.as_chunks::<4>().0)
             // Compare B, G, R only — index 3 is the alpha we knowingly drop.
             .filter(|(got, want)| got[..3] != want[..3])
             .count();
