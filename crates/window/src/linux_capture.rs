@@ -611,6 +611,7 @@ struct StreamState {
     /// change frame size mid-stream, so a new geometry means a new encoder (and
     /// a fresh keyframe).
     video: Option<crate::video_encoder::VideoEncoder>,
+    keyframes: crate::frame_pipeline::KeyframeClock,
     /// Shared with the session thread, which moves it as acks arrive. Read per
     /// frame so a link that frees up restores quality without a restart.
     quality: std::sync::Arc<crate::frame_pipeline::AdaptiveQuality>,
@@ -750,6 +751,7 @@ fn run_pipewire_loop(
         differ: FrameDiffer::new(),
         announced: false,
         video: None,
+        keyframes: Default::default(),
     }));
 
     let ready = ready_tx.clone();
@@ -885,15 +887,21 @@ fn run_pipewire_loop(
                     }
                 }
 
+                let now = std::time::Instant::now();
+                let key = st.keyframes.due(now);
                 if let Some(enc) = st.video.as_mut() {
                     if let Fidelity::Lossy { bitrate } = fidelity {
                         enc.set_bitrate(bitrate);
+                    }
+                    if key {
+                        enc.force_keyframe();
                     }
                     match enc.encode(&frame) {
                         Ok(packets) => {
                             // One visual update can yield several packets, and
                             // sometimes none — the encoder decides.
                             let full = enc.full_rect();
+                            st.keyframes.note_sent(&packets, now);
                             let frames = packets
                                 .into_iter()
                                 .map(|data| {

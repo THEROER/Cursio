@@ -366,6 +366,7 @@ fn emit_frame(
     // Geometry whose encoder already failed to open, so we don't retry it once
     // per frame.
     video_failed_for: &mut Option<(u32, u32)>,
+    keyframes: &mut crate::frame_pipeline::KeyframeClock,
     frames_tx: &mpsc::Sender<WindowFrame>,
     quality: &crate::frame_pipeline::AdaptiveQuality,
     last_seq: &std::sync::atomic::AtomicU32,
@@ -438,8 +439,13 @@ fn emit_frame(
                 cropped = buf;
                 &cropped
             };
+            let now = std::time::Instant::now();
+            if keyframes.due(now) {
+                enc.force_keyframe();
+            }
             match enc.encode(to_encode) {
                 Ok(packets) => {
+                    keyframes.note_sent(&packets, now);
                     if first {
                         tracing::info!(packets = packets.len(), "frame encoded");
                     }
@@ -659,6 +665,7 @@ fn capture_thread(
     // (H.264 cannot change frame size mid-stream).
     let mut video: Option<crate::video_encoder_win::VideoEncoder> = None;
     let mut video_failed_for: Option<(u32, u32)> = None;
+    let mut keyframes = crate::frame_pipeline::KeyframeClock::default();
 
     loop {
         match cmd_rx.try_recv() {
@@ -730,6 +737,7 @@ fn capture_thread(
                     &mut seq,
                     &mut video,
                     &mut video_failed_for,
+                    &mut keyframes,
                     &frames_tx,
                     &quality,
                     &last_seq,
@@ -787,6 +795,7 @@ fn monitor_capture_loop(
     let mut seq = 0u32;
     let mut video: Option<crate::video_encoder_win::VideoEncoder> = None;
     let mut video_failed_for: Option<(u32, u32)> = None;
+    let mut keyframes = crate::frame_pipeline::KeyframeClock::default();
     loop {
         match cmd_rx.try_recv() {
             Ok(CaptureCommand::Stop) | Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -808,6 +817,7 @@ fn monitor_capture_loop(
                 &mut seq,
                 &mut video,
                 &mut video_failed_for,
+                &mut keyframes,
                 &frames_tx,
                 &quality,
                 &last_seq,

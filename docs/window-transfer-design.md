@@ -258,6 +258,20 @@ reaches past the edge. A host resize reaches the viewer as video — the first
 frame at a new size is a full-window change — so what is lost is shrinking
 from tiles alone, when no encoder opens.
 
+**Keyframes by the clock.** A decoder can start only at an IDR, and drops
+everything before one. Both encoders keyed on their own GOP — 120 *frames* —
+but capture encodes a frame only when the screen changed, so on a desktop
+where a clock ticks and the pointer moves (tiles, not video) the next IDR could
+be minutes away, and a viewer that missed the first saw black plus whatever
+tiles landed. The encoders' GOPs are now effectively infinite and the capture
+loop's `frame_pipeline::KeyframeClock` forces an IDR on the first video frame
+at least `KEYFRAME_INTERVAL` (2 s) after the last one it saw go out — read
+from the bitstream, so an IDR the encoder chose itself counts. FFmpeg marks the
+frame `I` with `forced-idr=1` (NVENC and x264 otherwise make it a plain intra
+frame, which a fresh decoder cannot enter on); Media Foundation takes
+`CODECAPI_AVEncVideoForceKeyFrame` before the sample. A rate change still costs
+no keyframe on x264 and Media Foundation.
+
 ## Wire protocol
 
 `crates/protocol/src/window.rs` (added in `PROTOCOL_VERSION = 4`). All types are

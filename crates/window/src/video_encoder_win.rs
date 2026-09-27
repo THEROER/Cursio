@@ -47,12 +47,16 @@ use cursio_protocol::Rect;
 const STREAM_ID: u32 = 0;
 
 /// Frame rate the encoder is configured for. Matches the Linux encoder: it only
-/// affects timing metadata and the keyframe interval, not capture pacing.
+/// affects timing metadata, not capture pacing.
 const FRAME_RATE: u32 = 60;
 
-/// Seconds between forced keyframes. A viewer joining mid-stream cannot show
-/// anything until one arrives, so this bounds that wait.
-const KEYFRAME_INTERVAL_SECS: u32 = 2;
+/// The encoder's own GOP, in frames: an hour of them, so in practice never.
+///
+/// Keyframes are placed by the capture loop's
+/// [`KeyframeClock`](crate::frame_pipeline::KeyframeClock) through
+/// [`VideoEncoder::force_keyframe`]: a GOP counts frames, and capture hands
+/// the encoder one only when the window changed.
+const GOP_FRAMES: u32 = FRAME_RATE * 3600;
 
 /// How long an asynchronous encoder may take to ask for the next frame. A
 /// hardware encoder asks within a millisecond or two of finishing the last;
@@ -87,6 +91,8 @@ pub struct VideoEncoder {
     /// Where the bitrate is changed on the live stream.
     codec_api: Option<ICodecAPI>,
     bitrate: u32,
+    /// Whether the next [`encode`](Self::encode) must produce an IDR.
+    keyframe: bool,
 }
 
 impl VideoEncoder {
@@ -164,6 +170,7 @@ impl VideoEncoder {
                 input_credits: 0,
                 codec_api,
                 bitrate,
+                keyframe: false,
             })
         }
     }
@@ -202,6 +209,10 @@ impl VideoEncoder {
 
         nv12::from_bgra(bgra, self.width, self.height, &mut self.nv12);
 
+        if std::mem::take(&mut self.keyframe) {
+            self.request_keyframe();
+        }
+
         if self.events.is_some() {
             return self.encode_async();
         }
@@ -234,6 +245,24 @@ impl VideoEncoder {
             Err(e) => {
                 tracing::debug!(error = %e, bitrate, "encoder refused a live bitrate change")
             }
+        }
+    }
+
+    /// Make the next encoded frame an IDR, which a decoder can start from.
+    pub fn force_keyframe(&mut self) {
+        self.keyframe = true;
+    }
+
+    /// `CODECAPI_AVEncVideoForceKeyFrame` applies to the next input sample, so
+    /// this runs just before it is handed over.
+    fn request_keyframe(&self) {
+        let Some(api) = self.codec_api.as_ref() else {
+            tracing::debug!("encoder exposes no ICodecAPI; cannot force a keyframe");
+            return;
+        };
+        let value = windows::Win32::System::Variant::VARIANT::from(1u32);
+        if let Err(e) = unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value) } {
+            tracing::debug!(error = %e, "encoder refused to force a keyframe");
         }
     }
 
@@ -653,11 +682,7 @@ unsafe fn configure_rate(codec_api: Option<&ICodecAPI>, bitrate: u32) {
         VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32),
     );
     set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
-    // Bound how long a mid-stream viewer waits for its first showable frame.
-    set(
-        &CODECAPI_AVEncMPVGOPSize,
-        VARIANT::from(FRAME_RATE * KEYFRAME_INTERVAL_SECS),
-    );
+    set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(GOP_FRAMES));
 
     // Latency, not compression, is what this stream is judged on.
     //

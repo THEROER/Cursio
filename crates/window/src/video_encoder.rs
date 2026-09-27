@@ -100,6 +100,11 @@ impl EncoderKind {
             Fidelity::Lossless => self.lossless_options(),
             Fidelity::Lossy { .. } => self.lossy_options(),
         };
+        if self != EncoderKind::Vaapi {
+            // A frame marked `I` is otherwise only an intra frame to NVENC and
+            // x264, which a decoder that missed the stream cannot start from.
+            options.push(("forced-idr", "1"));
+        }
         if self == EncoderKind::Nvenc {
             // FFmpeg's NVENC wrapper holds `delay` frames before releasing a
             // packet, defaulting to one less than its surface pool (three), and
@@ -171,18 +176,18 @@ impl EncoderKind {
     }
 }
 
-/// How often to force a keyframe.
+/// The encoder's own GOP, in frames: effectively never.
 ///
-/// A viewer that joins late or loses packets can only resynchronise on a
-/// keyframe, so this bounds that wait. Keyframes are the expensive frames in a
-/// lossless stream (no inter-frame prediction to exploit), which is exactly why
-/// this is seconds rather than fractions of one; a transfer also always starts
-/// with a keyframe regardless.
-const KEYFRAME_INTERVAL_SECS: u32 = 2;
+/// Keyframes are placed by the capture loop's
+/// [`KeyframeClock`](crate::frame_pipeline::KeyframeClock) through
+/// [`VideoEncoder::force_keyframe`], because a GOP counts frames and frames
+/// arrive only when the screen changes. `1 << 30` is x264's own "infinite",
+/// and NVENC takes it as a plain length.
+const GOP_FRAMES: u32 = 1 << 30;
 
 /// Frame rate the encoder is configured for. Capture is driven by the
 /// compositor, which caps at the display's rate; 60 matches the common case and
-/// only affects timing metadata and the keyframe interval.
+/// only affects timing metadata.
 const FRAME_RATE: i32 = 60;
 
 /// What kind of stream to produce.
@@ -222,6 +227,8 @@ pub struct VideoEncoder {
     /// Presentation timestamp, in the encoder's `1/FRAME_RATE` time base. Must
     /// increase monotonically or the encoder rejects the frame.
     pts: i64,
+    /// Whether the next [`encode`](Self::encode) must produce an IDR.
+    keyframe: bool,
 }
 
 impl VideoEncoder {
@@ -299,7 +306,7 @@ impl VideoEncoder {
         enc.set_format(ffmpeg_next::format::Pixel::YUV420P);
         enc.set_time_base(ffmpeg_next::Rational(1, FRAME_RATE));
         enc.set_frame_rate(Some(ffmpeg_next::Rational(FRAME_RATE, 1)));
-        enc.set_gop(FRAME_RATE as u32 * KEYFRAME_INTERVAL_SECS);
+        enc.set_gop(GOP_FRAMES);
         // No B-frames: they reorder output, so the encoder must hold a frame
         // back to encode a later one. That is latency we refuse to pay for a
         // live window.
@@ -342,7 +349,13 @@ impl VideoEncoder {
             scaler,
             yuv: ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height),
             pts: 0,
+            keyframe: false,
         })
+    }
+
+    /// Make the next encoded frame an IDR, which a decoder can start from.
+    pub fn force_keyframe(&mut self) {
+        self.keyframe = true;
     }
 
     /// Which backend this encoder is using.
@@ -446,6 +459,13 @@ impl VideoEncoder {
         // PTS must advance monotonically; the encoder rejects a repeat.
         self.yuv.set_pts(Some(self.pts));
         self.pts += 1;
+        // `yuv` is reused, so the type must be cleared again after a forced
+        // keyframe or every later frame would be one too.
+        self.yuv.set_kind(if std::mem::take(&mut self.keyframe) {
+            ffmpeg_next::picture::Type::I
+        } else {
+            ffmpeg_next::picture::Type::None
+        });
 
         self.encoder
             .send_frame(&self.yuv)
@@ -606,6 +626,72 @@ mod tests {
             !after.iter().any(|p| crate::video::contains_keyframe(p)),
             "a rate change must not cost a keyframe"
         );
+    }
+
+    /// A small block moving across a still background, frame `i`.
+    fn moving_block(i: usize) -> Vec<u8> {
+        let mut f = solid_bgra(320, 240, 0x40);
+        for y in 100..116 {
+            let start = (y * 320 + (i % 30) * 8) * 4;
+            f[start..start + 64].fill(0xF0);
+        }
+        f
+    }
+
+    fn encoders_here() -> Vec<VideoEncoder> {
+        let lossy = Fidelity::Lossy { bitrate: 4_000_000 };
+        let mut encoders =
+            vec![VideoEncoder::try_open(EncoderKind::Software, 320, 240, lossy).expect("x264")];
+        // NVENC where this machine has one: its keyframe path is FFmpeg's
+        // wrapper, not x264's, and it is the encoder real hosts use.
+        if let Ok(nvenc) = VideoEncoder::try_open(EncoderKind::Nvenc, 320, 240, lossy) {
+            encoders.push(nvenc);
+        }
+        encoders
+    }
+
+    #[test]
+    fn a_forced_keyframe_is_an_idr_on_exactly_that_frame() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        for mut enc in encoders_here() {
+            for i in 0..5 {
+                enc.encode(&moving_block(i)).expect("encode");
+            }
+            enc.force_keyframe();
+            let forced = enc.encode(&moving_block(5)).expect("encode");
+            assert!(
+                forced.iter().any(|p| crate::video::contains_keyframe(p)),
+                "{:?} ignored a forced keyframe",
+                enc.kind()
+            );
+            let next = enc.encode(&moving_block(6)).expect("encode");
+            assert!(
+                !next.iter().any(|p| crate::video::contains_keyframe(p)),
+                "{:?} kept keying after the forced frame",
+                enc.kind()
+            );
+        }
+    }
+
+    #[test]
+    fn the_encoder_does_not_key_on_its_own_frame_count() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        for mut enc in encoders_here() {
+            let keyed: Vec<usize> = (0..150)
+                .filter(|&i| {
+                    enc.encode(&moving_block(i))
+                        .expect("encode")
+                        .iter()
+                        .any(|p| crate::video::contains_keyframe(p))
+                })
+                .collect();
+            assert_eq!(
+                keyed,
+                vec![0],
+                "{:?} placed keyframes by frame count; the capture loop's clock places them",
+                enc.kind()
+            );
+        }
     }
 
     #[test]
