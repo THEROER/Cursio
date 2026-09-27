@@ -60,7 +60,7 @@ struct OpenedIntentSink {
     /// PipeWire node name, and the peer device `(handle, description)` behind it.
     node: String,
     device: (String, String),
-    result: Result<cursio_audio::IntentSink, String>,
+    result: Result<cursio_audio::IntentSink, cursio_audio::AudioError>,
 }
 
 /// Builds an Intent Sink from its stream id, node name and description.
@@ -71,7 +71,40 @@ type IntentSinkOpener =
 struct OpenedPlayback {
     /// Stream id the playback renders.
     id: u32,
-    result: Result<cursio_audio::Playback, String>,
+    result: Result<cursio_audio::Playback, cursio_audio::AudioError>,
+}
+
+/// Whether this process has said it cannot publish a peer's devices.
+static VIRTUAL_DEVICES_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What to install so a peer's outputs and microphones appear here.
+#[cfg(target_os = "windows")]
+const VIRTUAL_DEVICES_HINT: &str =
+    "install the Cursio virtual audio driver (native/cursio-vad) to get them";
+#[cfg(not(target_os = "windows"))]
+const VIRTUAL_DEVICES_HINT: &str = "this platform has no backend for them yet";
+
+/// Say once per process that a peer's devices cannot be published here.
+///
+/// A peer's outputs (as Intent Sinks) and its microphone (as a recording
+/// device) need a virtual audio endpoint, which Windows cannot create from
+/// user mode. That is a capability this machine lacks, not a failure: every
+/// device the peer advertises, on every reconnect, hits it again, and logging
+/// each as an error buried the one line that says what to install. The
+/// streams themselves are refused through demand either way, so nothing is
+/// sent for them. Returns whether this call was the one that reported.
+fn report_no_virtual_devices(reported: &std::sync::atomic::AtomicBool, what: &str) -> bool {
+    if reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!(%what, "peer audio device not published here (no virtual devices)");
+        return false;
+    }
+    tracing::warn!(
+        %what,
+        "this machine cannot publish a peer's audio outputs or microphones; {VIRTUAL_DEVICES_HINT} \
+         (application audio from the peer still plays)"
+    );
+    true
 }
 
 /// Live audio state for one session: what we capture and stream out, and what
@@ -1560,7 +1593,7 @@ impl AudioEngine {
         if let Err(e) = std::thread::Builder::new()
             .name(format!("cursio-pw-sink-open-{id}"))
             .spawn(move || {
-                let result = opener(id, node_arg.clone(), label_arg).map_err(|e| e.to_string());
+                let result = opener(id, node_arg.clone(), label_arg);
                 // The receiver only closes when the session is ending, in which
                 // case the sink is moot.
                 let _ = ready.send(OpenedIntentSink {
@@ -1601,7 +1634,7 @@ impl AudioEngine {
         if let Err(e) = std::thread::Builder::new()
             .name(format!("cursio-pw-play-open-{id}"))
             .spawn(move || {
-                let result = open().map_err(|e| e.to_string());
+                let result = open();
                 // The receiver only closes when the session is ending, in which
                 // case the playback is moot.
                 let _ = ready.send(OpenedPlayback { id, result });
@@ -1633,7 +1666,13 @@ impl AudioEngine {
                 Err(e) => {
                     // Complain ONCE per stream: chunks arrive at ~200/s, and a
                     // stream that cannot open would otherwise log at that rate.
-                    if self.failed_playbacks.insert(opened.id) {
+                    if !self.failed_playbacks.insert(opened.id) {
+                        continue;
+                    }
+                    if matches!(e, cursio_audio::AudioError::Unsupported) {
+                        let what = format!("stream {}", opened.id);
+                        report_no_virtual_devices(&VIRTUAL_DEVICES_REPORTED, &what);
+                    } else {
                         tracing::warn!(error = %e, id = opened.id,
                             "cannot open playback; ignoring this stream");
                     }
@@ -1663,6 +1702,9 @@ impl AudioEngine {
                     self.sink_node_for_peer_device
                         .insert(dev_id.clone(), opened.node.clone());
                     self.peer_device_for_sink_node.insert(opened.node, dev_id);
+                }
+                Err(cursio_audio::AudioError::Unsupported) => {
+                    report_no_virtual_devices(&VIRTUAL_DEVICES_REPORTED, &desc);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, device = %desc, "failed to create Intent Sink")
@@ -3219,6 +3261,46 @@ mod tests {
             1,
             "one stream must have exactly one open in flight"
         );
+    }
+
+    /// A machine that cannot publish virtual devices says so once, however
+    /// many devices the peer advertises and however often it reconnects.
+    #[test]
+    fn a_missing_virtual_device_backend_is_reported_once() {
+        let reported = std::sync::atomic::AtomicBool::new(false);
+        assert!(report_no_virtual_devices(&reported, "Speakers"));
+        assert!(!report_no_virtual_devices(&reported, "Virtual"));
+        assert!(!report_no_virtual_devices(&reported, "stream 85800"));
+    }
+
+    /// A device this machine cannot publish leaves nothing behind that would
+    /// swallow the peer's device-state replicas.
+    #[test]
+    fn an_unpublishable_device_leaves_no_intent_sink() {
+        let mut e = engine();
+        e.intent_sink_opener = |_, _, _| Err(cursio_audio::AudioError::Unsupported);
+        e.on_advertise(&cursio_protocol::AudioStreamMeta {
+            id: 43,
+            app_name: None,
+            device: Some(("dev-handle".into(), "Speakers".into())),
+            role: cursio_protocol::StreamRole::Playback,
+            format: cursio_protocol::AudioFormat {
+                sample_rate: 48000,
+                channels: 2,
+                sample_kind: cursio_protocol::SampleKind::F32,
+            },
+            codec: cursio_protocol::AudioCodec::Opus,
+        });
+        for _ in 0..400 {
+            e.collect_opened_intent_sinks();
+            if e.opening_intent_sinks.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(e.opening_intent_sinks.is_empty());
+        assert!(e.intent_sinks.is_empty());
+        assert!(e.sink_node_for_peer_device.is_empty());
     }
 
     /// A device advertised twice does not become two local outputs.
