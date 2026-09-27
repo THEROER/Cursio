@@ -218,6 +218,11 @@ const BACKLOG_LOW: u32 = 1;
 #[derive(Debug)]
 pub struct AdaptiveQuality {
     threshold_pct: std::sync::atomic::AtomicU32,
+    /// Whether the viewer decodes lossless H.264; see
+    /// [`VideoCaps`](cursio_protocol::VideoCaps). Starts `false`: a stream the
+    /// viewer cannot decode shows nothing, while a lossy one it can is merely
+    /// softer.
+    lossless: std::sync::atomic::AtomicBool,
 }
 
 impl Default for AdaptiveQuality {
@@ -229,14 +234,28 @@ impl Default for AdaptiveQuality {
             threshold_pct: std::sync::atomic::AtomicU32::new(
                 (VIDEO_AREA_THRESHOLD_MAX * 100.0) as u32,
             ),
+            lossless: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
 
 impl AdaptiveQuality {
+    /// Whether the video path may use a lossless stream.
+    pub fn lossless(&self) -> bool {
+        self.lossless.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record what the viewer's decoder takes.
+    pub fn set_peer_video(&self, caps: cursio_protocol::VideoCaps) {
+        self.lossless
+            .store(caps.lossless, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The threshold to judge this frame by.
     pub fn threshold(&self) -> f64 {
-        self.threshold_pct.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
+        self.threshold_pct
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 100.0
     }
 
     /// Fold in what the viewer has acked: `gap` frames still unpresented.
@@ -264,6 +283,18 @@ pub fn next_threshold(current: f64, gap: u32) -> f64 {
     } else {
         current
     }
+}
+
+/// The bitrate a lossy stream of a `width`x`height` source runs at.
+///
+/// A tenth of a bit per pixel per frame at 60 fps — about 12 Mbit/s for
+/// 1080p, where H.264 High reads as clean on desktop content — within bounds
+/// that keep a tiny window legible and a huge one off the cursor's link.
+pub fn lossy_bitrate(width: u32, height: u32) -> u32 {
+    const MIN: u64 = 2_000_000;
+    const MAX: u64 = 40_000_000;
+    let bits = (width as u64) * (height as u64) * 60 / 10;
+    bits.clamp(MIN, MAX) as u32
 }
 
 /// Whether a change covering `dirty` of a `width`x`height` window should go
@@ -463,7 +494,12 @@ mod differ_tests {
             width: 8,
             height: 20,
         };
-        assert!(!should_use_video(caret, 1920, 1080, VIDEO_AREA_THRESHOLD_MAX));
+        assert!(!should_use_video(
+            caret,
+            1920,
+            1080,
+            VIDEO_AREA_THRESHOLD_MAX
+        ));
     }
 
     #[test]
@@ -570,7 +606,12 @@ mod differ_tests {
             width: 1000,
             height: 451,
         };
-        assert!(!should_use_video(under, 1000, 1000, VIDEO_AREA_THRESHOLD_MAX));
+        assert!(!should_use_video(
+            under,
+            1000,
+            1000,
+            VIDEO_AREA_THRESHOLD_MAX
+        ));
         assert!(should_use_video(over, 1000, 1000, VIDEO_AREA_THRESHOLD_MAX));
 
         // The case the raised threshold exists for: a repaint big enough to be

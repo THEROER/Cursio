@@ -43,7 +43,7 @@ pub use input::{neighbour_across, Edge, InputEvent, MouseButton, Position};
 pub use node::{NetworkKind, NodeStatus, PowerSource};
 pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{
-    Rect, ScreenSource, SourceId, SourceKind, TileCodec, WindowCloseReason, WindowFrame,
+    Rect, ScreenSource, SourceId, SourceKind, TileCodec, VideoCaps, WindowCloseReason, WindowFrame,
     WindowFrameAck, WindowId, WindowInput, WindowMeta, WindowMsg, SCREEN_STREAM_ID,
 };
 

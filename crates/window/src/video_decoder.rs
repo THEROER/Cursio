@@ -172,7 +172,7 @@ fn repack(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -> Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video_encoder::VideoEncoder;
+    use crate::video_encoder::{Fidelity, VideoEncoder};
 
     fn solid(w: u32, h: u32, v: u8) -> Vec<u8> {
         vec![v; (w as usize) * (h as usize) * 4]
@@ -197,7 +197,7 @@ mod tests {
     fn round_trips_through_encoder_and_decoder() {
         ffmpeg_next::init().expect("ffmpeg init");
         let (w, h) = (320u32, 240u32);
-        let mut enc = VideoEncoder::open(w, h).expect("encoder");
+        let mut enc = VideoEncoder::open(w, h, Fidelity::Lossless).expect("encoder");
         let mut dec = VideoDecoder::open().expect("decoder");
 
         let mut decoded = Vec::new();
@@ -234,7 +234,7 @@ mod tests {
         // 160x128: NVENC refuses frames below its minimum dimensions, and a
         // too-small test would silently only ever exercise the x264 fallback.
         let (w, h) = (160u32, 128u32);
-        let mut enc = VideoEncoder::open(w, h).expect("encoder");
+        let mut enc = VideoEncoder::open(w, h, Fidelity::Lossless).expect("encoder");
         let mut dec = VideoDecoder::open().expect("decoder");
 
         // Opaque mid-grey: no chroma detail for 4:2:0 subsampling to lose, so

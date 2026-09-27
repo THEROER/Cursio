@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cursio_protocol::{
-    Message, ModuleId, Priority, ScreenSource, SourceId, SourceKind, WindowCloseReason,
+    Message, ModuleId, Priority, ScreenSource, SourceId, SourceKind, VideoCaps, WindowCloseReason,
     WindowFrame, WindowFrameAck, WindowMeta, WindowMsg, SCREEN_STREAM_ID,
 };
 use cursio_transport::{TransportError, TransportTx};
@@ -95,9 +95,20 @@ pub struct ScreenHost {
     opening: Option<Opening>,
     /// Control owed to the viewer that `handle` could not send itself.
     outbox: Vec<WindowMsg>,
+    /// What the viewer's decoder takes, handed to every capture opened here.
+    peer_video: VideoCaps,
 }
 
 impl ScreenHost {
+    /// Record what the viewer's decoder takes; applies to the source on
+    /// screen now and to every one opened after.
+    pub fn set_peer_video(&mut self, caps: VideoCaps) {
+        self.peer_video = caps;
+        if let Some((_, session)) = self.current.as_mut() {
+            session.set_peer_video(caps);
+        }
+    }
+
     /// A host that serves views from `sources`.
     pub fn serving(sources: Arc<dyn ScreenSources>) -> Self {
         Self::new(Some(sources), String::new())
@@ -119,6 +130,7 @@ impl ScreenHost {
             current: None,
             opening: None,
             outbox: Vec::new(),
+            peer_video: VideoCaps::default(),
         }
     }
 
@@ -242,7 +254,8 @@ impl ScreenHost {
         };
         let source = self.opening.take()?.source;
         match result {
-            Ok(session) => {
+            Ok(mut session) => {
+                session.set_peer_video(self.peer_video);
                 if let Some((_, mut old)) = self.current.take() {
                     old.close(WindowCloseReason::Returned);
                 }

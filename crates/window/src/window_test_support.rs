@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use cursio_protocol::{
-    ScreenSource, SourceId, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
-    WindowMeta,
+    ScreenSource, SourceId, VideoCaps, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId,
+    WindowInput, WindowMeta,
 };
 
 use crate::{
@@ -36,9 +36,15 @@ pub struct FakeCaptureSession {
     pub acks: Vec<WindowFrameAck>,
     /// Set once `close` has been called.
     pub closed: Option<WindowCloseReason>,
+    /// What the engine last said the viewer's decoder takes.
+    pub peer_video: Option<VideoCaps>,
 }
 
 impl CaptureSession for FakeCaptureSession {
+    fn set_peer_video(&mut self, caps: VideoCaps) {
+        self.peer_video = Some(caps);
+    }
+
     fn meta(&self) -> &WindowMeta {
         &self.meta
     }
@@ -121,6 +127,7 @@ impl WindowCapture for FakeCapture {
             applied_input: Vec::new(),
             acks: Vec::new(),
             closed: None,
+            peer_video: None,
         })
     }
 }
@@ -308,6 +315,7 @@ impl ScreenSources for FakeScreenSources {
             applied_input: Vec::new(),
             acks: Vec::new(),
             closed: None,
+            peer_video: None,
         }))
     }
 }

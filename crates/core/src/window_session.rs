@@ -25,7 +25,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use cursio_protocol::{Message, ModuleId, Priority, WindowCloseReason, WindowId, WindowMsg};
+use cursio_protocol::{
+    Message, ModuleId, Priority, VideoCaps, WindowCloseReason, WindowId, WindowMsg,
+};
 use cursio_transport::{TransportError, TransportTx};
 use cursio_window::{CaptureSession, Surrogate, WindowCapture, WindowRenderer};
 
@@ -118,6 +120,9 @@ pub struct WindowEngine<C: WindowCapture, R: WindowRenderer> {
     screen_host: ScreenHost,
     /// Our remote-screen view of the peer, when the user asked for views.
     screen_view: Option<ScreenViewer<R::Surrogate>>,
+    /// What the peer's decoder takes, from its [`WindowMsg::VideoCaps`].
+    /// Only the High profile until it says otherwise.
+    peer_video: VideoCaps,
 }
 
 /// A transfer asked for from outside the session loop.
@@ -146,6 +151,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             transfer_ended: None,
             screen_host: ScreenHost::refusing("this machine has no remote-screen capture backend"),
             screen_view: None,
+            peer_video: VideoCaps::default(),
         }
     }
 
@@ -247,7 +253,8 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
     pub fn share_window(&mut self) -> Result<WindowId, cursio_window::WindowError> {
         let id = self.next_id;
         self.next_id += 1;
-        let session = self.capture.begin(id)?;
+        let mut session = self.capture.begin(id)?;
+        session.set_peer_video(self.peer_video);
         tracing::info!(
             id,
             peer = %self.peer_name,
@@ -315,6 +322,14 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             }
         }
         match msg {
+            WindowMsg::VideoCaps(caps) => {
+                tracing::info!(peer = %self.peer_name, ?caps, "peer's video decoder");
+                self.peer_video = caps;
+                for hosted in self.hosted.values_mut() {
+                    hosted.session.set_peer_video(caps);
+                }
+                self.screen_host.set_peer_video(caps);
+            }
             WindowMsg::Offer(meta) => match self.renderer.open(&meta) {
                 Ok(surrogate) => {
                     tracing::info!(
@@ -496,10 +511,12 @@ where
         "window"
     }
 
-    /// Nothing to announce up front: unlike audio (which advertises its devices)
-    /// a window transfer only exists once someone shares a window, so the wire
-    /// stays silent until then.
-    async fn start(&mut self, _tx: &mut dyn TransportTx) -> Result<(), TransportError> {
+    /// Only what this machine's decoder takes goes out up front — before any
+    /// window is offered either way, so a host never opens an encoder the
+    /// viewer cannot decode. A transfer itself only exists once someone shares
+    /// a window.
+    async fn start(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
+        send_control(tx, WindowMsg::VideoCaps(cursio_window::LOCAL_VIDEO_CAPS)).await?;
         tracing::info!(
             peer = %self.peer_name,
             "window transfer ready — share a window to stream it to the peer"
@@ -812,7 +829,7 @@ impl crate::module::ModuleFactory for WindowFactory {
 
 /// Version of this module's wire vocabulary ([`WindowMsg`]). Bump when those
 /// types change shape; peers run the module only on an exact match.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 /// Watch for windows dragged toward the peer's edge and turn that into
 /// [`TransferRequest`]s.
@@ -1465,6 +1482,43 @@ mod tests {
         let offered: Vec<WindowId> = eng.take_unsent_offers().iter().map(|m| m.id).collect();
         assert_eq!(offered.len(), 2);
         assert!(eng.take_unsent_offers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_engine_announces_its_decoder_before_anything_else() {
+        let (_frames_tx, frames_rx) = frame_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        );
+        let mut tx = RecordingTx::default();
+        eng.start(&mut tx).await.unwrap();
+        assert_eq!(
+            tx.control().first(),
+            Some(&WindowMsg::VideoCaps(cursio_window::LOCAL_VIDEO_CAPS))
+        );
+    }
+
+    #[test]
+    fn the_peers_decoder_reaches_captures_running_and_started_later() {
+        let (_frames_tx, frames_rx) = frame_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        );
+        let early = eng.share_window().unwrap();
+        assert_eq!(
+            eng.hosted[&early].session.peer_video,
+            Some(VideoCaps { lossless: false }),
+            "until the viewer speaks, only the High profile is safe"
+        );
+
+        let caps = VideoCaps { lossless: true };
+        eng.handle_message(&control_frame(WindowMsg::VideoCaps(caps)));
+        let late = eng.share_window().unwrap();
+
+        assert_eq!(eng.hosted[&early].session.peer_video, Some(caps));
+        assert_eq!(eng.hosted[&late].session.peer_video, Some(caps));
     }
 
     /// Input names the window it belongs to, so it reaches that one.

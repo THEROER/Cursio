@@ -411,6 +411,10 @@ impl CaptureSession for PortalCaptureSession {
         }
     }
 
+    fn set_peer_video(&mut self, caps: cursio_protocol::VideoCaps) {
+        self.quality.set_peer_video(caps);
+    }
+
     fn close(&mut self, reason: WindowCloseReason) {
         tracing::info!(?reason, id = self.meta.id, "closing window capture");
         let _ = self.commands.send(CaptureCommand::Stop);
@@ -862,6 +866,14 @@ fn run_pipewire_loop(
             // goes through the video encoder, which codes the difference from
             // the previous frame rather than the pixels themselves.
             if should_use_video(dirty, width, height, st.quality.threshold()) {
+                use crate::video_encoder::Fidelity;
+                let fidelity = if st.quality.lossless() {
+                    Fidelity::Lossless
+                } else {
+                    Fidelity::Lossy {
+                        bitrate: crate::frame_pipeline::lossy_bitrate(width, height),
+                    }
+                };
                 // Geometry changes invalidate the encoder: H.264 is fixed-size.
                 if st
                     .video
@@ -871,8 +883,16 @@ fn run_pipewire_loop(
                     tracing::info!(width, height, "window resized; reopening video encoder");
                     st.video = None;
                 }
+                if st
+                    .video
+                    .as_ref()
+                    .is_some_and(|e| !e.fidelity().same_stream(fidelity))
+                {
+                    tracing::info!(?fidelity, "the viewer's decoder changed what to encode");
+                    st.video = None;
+                }
                 if st.video.is_none() {
-                    match crate::video_encoder::VideoEncoder::open(width, height) {
+                    match crate::video_encoder::VideoEncoder::open(width, height, fidelity) {
                         Ok(enc) => st.video = Some(enc),
                         Err(e) => {
                             // Not fatal: fall through to the lossless path,

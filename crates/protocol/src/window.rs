@@ -338,6 +338,24 @@ pub enum WindowMsg {
     /// Host -> viewer: the view's stream ended (source closed, capture failed,
     /// picker cancelled). The window stays; it simply shows nothing.
     SourceEnded { reason: String },
+    /// Either direction, once per link: what this machine's video decoder can
+    /// take, so the peer encodes a stream that will actually show here.
+    VideoCaps(VideoCaps),
+}
+
+/// What a viewer's H.264 decoder accepts, beyond the High profile every
+/// decoder here takes.
+///
+/// Announced rather than assumed from the platform because the stream a host
+/// would pick on its own is the best one *it* can make, and the best one is not
+/// universally decodable: pixel-exact H.264 requires the High 4:4:4 Predictive
+/// profile, which Media Foundation does not implement. It accepts the packets,
+/// never emits a picture, and reports no error — so a Windows view of a Linux
+/// host showed only the lossless tiles landing between video frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoCaps {
+    /// Decodes High 4:4:4 Predictive, the profile lossless H.264 needs.
+    pub lossless: bool,
 }
 
 impl WindowMsg {
@@ -364,7 +382,8 @@ impl WindowMsg {
             | Self::Sources(_)
             | Self::SourcesRefused { .. }
             | Self::ShowSource { .. }
-            | Self::StopSource => crate::Priority::Control,
+            | Self::StopSource
+            | Self::VideoCaps(_) => crate::Priority::Control,
             _ => Self::PRIORITY,
         }
     }

@@ -11,7 +11,7 @@
 //!   cargo run -p cursio-window --release --example encode_bench
 //! ```
 
-use cursio_window::video_encoder::VideoEncoder;
+use cursio_window::video_encoder::{Fidelity, VideoEncoder};
 
 const W: u32 = 1920;
 const H: u32 = 1080;
@@ -63,7 +63,7 @@ fn motion_frames() -> Vec<Vec<u8>> {
 }
 
 fn bench(label: &str, frames: &[Vec<u8>]) {
-    let mut enc = match VideoEncoder::open(W, H) {
+    let mut enc = match VideoEncoder::open(W, H, Fidelity::Lossless) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("{label}: encoder unavailable: {e}");

@@ -26,8 +26,16 @@
 //! latency budget, and the milestones.
 
 use cursio_protocol::{
-    ScreenSource, SourceId, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
-    WindowMeta,
+    ScreenSource, SourceId, VideoCaps, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId,
+    WindowInput, WindowMeta,
+};
+
+/// What this machine's H.264 decoder takes, for the peer's encoder.
+///
+/// FFmpeg decodes High 4:4:4 Predictive; Media Foundation silently does not
+/// (see [`VideoCaps`]), and macOS has no viewer yet.
+pub const LOCAL_VIDEO_CAPS: VideoCaps = VideoCaps {
+    lossless: cfg!(target_os = "linux"),
 };
 
 pub mod codec;
@@ -157,6 +165,11 @@ pub trait CaptureSession {
     fn request_resize(&mut self, _width: u32, _height: u32) -> Result<(), WindowError> {
         Ok(())
     }
+
+    /// What the viewer's decoder takes, so the encoder picks a stream that
+    /// will show there. Until told, a backend must assume only the High
+    /// profile. Default is a no-op for a backend with one kind of stream.
+    fn set_peer_video(&mut self, _caps: VideoCaps) {}
 
     /// Stop capturing and release the window. After this the session is done;
     /// callers should send a [`Message::WindowClose`](cursio_protocol::Message::WindowClose).
@@ -308,6 +321,10 @@ impl CaptureSession for Box<dyn CaptureSession + Send> {
 
     fn request_resize(&mut self, width: u32, height: u32) -> Result<(), WindowError> {
         (**self).request_resize(width, height)
+    }
+
+    fn set_peer_video(&mut self, caps: VideoCaps) {
+        (**self).set_peer_video(caps)
     }
 
     fn close(&mut self, reason: WindowCloseReason) {

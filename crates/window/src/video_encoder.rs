@@ -47,6 +47,17 @@
 //! node is NVIDIA. Order is NVENC → VAAPI → libx264. Software is a genuine
 //! fallback, not a token one: x264 `ultrafast -qp 0` encoded the realistic
 //! workload in 0.50 s per 3 s of video — comfortably real-time.
+//!
+//! ## Only for a viewer that can decode it
+//!
+//! Lossless H.264 exists only in the High 4:4:4 Predictive profile — NVENC
+//! and x264 both switch to it for `qp=0`, even from 4:2:0 input. FFmpeg decodes
+//! it; Media Foundation does not, and says nothing: measured on the Windows
+//! peer (2026-09-27, `h264_decode_probe`), 30 lossless packets went in and no
+//! picture came out, while the same content as a High-profile stream decoded
+//! all 30. So the lossless stream is used only for a viewer that announced it
+//! decodes it ([`Fidelity`]), and every other viewer gets a lossy High-profile
+//! stream at a bitrate.
 
 use cursio_protocol::Rect;
 
@@ -81,6 +92,34 @@ impl EncoderKind {
             EncoderKind::Vaapi,
             EncoderKind::Software,
         ]
+    }
+
+    /// The options for `fidelity`, always low-latency.
+    fn options(self, fidelity: Fidelity) -> Vec<(&'static str, &'static str)> {
+        match fidelity {
+            Fidelity::Lossless => self.lossless_options(),
+            Fidelity::Lossy { .. } => self.lossy_options(),
+        }
+    }
+
+    /// Low-latency, rate-controlled, and in a profile every decoder takes.
+    /// The bitrate itself is set on the codec context, not here.
+    fn lossy_options(self) -> Vec<(&'static str, &'static str)> {
+        match self {
+            EncoderKind::Nvenc => vec![
+                ("preset", "p4"),
+                ("tune", "ll"),
+                ("profile", "high"),
+                ("rc", "vbr"),
+                ("zerolatency", "1"),
+            ],
+            EncoderKind::Vaapi => vec![("rc_mode", "VBR"), ("profile", "high")],
+            EncoderKind::Software => vec![
+                ("preset", "superfast"),
+                ("tune", "zerolatency"),
+                ("profile", "high"),
+            ],
+        }
     }
 
     /// The options that put this encoder into lossless, low-latency mode.
@@ -135,9 +174,32 @@ const KEYFRAME_INTERVAL_SECS: u32 = 2;
 /// only affects timing metadata and the keyframe interval.
 const FRAME_RATE: i32 = 60;
 
-/// A lossless H.264 encoder for one window's stream.
+/// What kind of stream to produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fidelity {
+    /// Pixel-exact, High 4:4:4 Predictive — only for a viewer that decodes it.
+    Lossless,
+    /// High profile at about `bitrate` bits per second.
+    Lossy { bitrate: u32 },
+}
+
+impl Fidelity {
+    /// Whether an encoder opened for `self` can serve `other` without being
+    /// reopened. The bitrate is not part of it: a lossy encoder changes rate
+    /// in place.
+    pub fn same_stream(self, other: Fidelity) -> bool {
+        matches!(
+            (self, other),
+            (Fidelity::Lossless, Fidelity::Lossless)
+                | (Fidelity::Lossy { .. }, Fidelity::Lossy { .. })
+        )
+    }
+}
+
+/// An H.264 encoder for one window's stream.
 pub struct VideoEncoder {
     kind: EncoderKind,
+    fidelity: Fidelity,
     width: u32,
     height: u32,
     encoder: ffmpeg_next::encoder::Video,
@@ -158,10 +220,10 @@ impl VideoEncoder {
     /// encode at all. The size is fixed for the encoder's life: H.264 cannot
     /// change frame size mid-stream, so a window resize means a new encoder
     /// (and a fresh keyframe).
-    pub fn open(width: u32, height: u32) -> Result<Self, WindowError> {
+    pub fn open(width: u32, height: u32, fidelity: Fidelity) -> Result<Self, WindowError> {
         // 4:2:0 chroma is subsampled by two on both axes, so odd dimensions
         // have no valid chroma plane. Reject rather than silently skew.
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(WindowError::Backend(format!(
                 "video encoder needs even dimensions, got {width}x{height}"
             )));
@@ -172,9 +234,9 @@ impl VideoEncoder {
 
         let mut attempts = Vec::new();
         for kind in EncoderKind::candidates() {
-            match Self::try_open(kind, width, height) {
+            match Self::try_open(kind, width, height, fidelity) {
                 Ok(enc) => {
-                    tracing::info!(?kind, width, height, "lossless video encoder opened");
+                    tracing::info!(?kind, ?fidelity, width, height, "video encoder opened");
                     return Ok(enc);
                 }
                 Err(e) => {
@@ -194,7 +256,12 @@ impl VideoEncoder {
 
     /// Try one backend. Presence is not availability — the codec must also
     /// *open*, which is what rules out `h264_vaapi` on an NVIDIA-only box.
-    fn try_open(kind: EncoderKind, width: u32, height: u32) -> Result<Self, WindowError> {
+    fn try_open(
+        kind: EncoderKind,
+        width: u32,
+        height: u32,
+        fidelity: Fidelity,
+    ) -> Result<Self, WindowError> {
         let name = kind.codec_name();
 
         // NVENC rejects small frames outright ("Frame Dimension less than the
@@ -226,9 +293,13 @@ impl VideoEncoder {
         // back to encode a later one. That is latency we refuse to pay for a
         // live window.
         enc.set_max_b_frames(0);
+        if let Fidelity::Lossy { bitrate } = fidelity {
+            enc.set_bit_rate(bitrate as usize);
+            enc.set_max_bit_rate(bitrate as usize * 2);
+        }
 
         let mut opts = ffmpeg_next::Dictionary::new();
-        for (k, v) in kind.lossless_options() {
+        for (k, v) in kind.options(fidelity) {
             opts.set(k, v);
         }
 
@@ -253,6 +324,7 @@ impl VideoEncoder {
 
         Ok(Self {
             kind,
+            fidelity,
             width,
             height,
             encoder,
@@ -265,6 +337,11 @@ impl VideoEncoder {
     /// Which backend this encoder is using.
     pub fn kind(&self) -> EncoderKind {
         self.kind
+    }
+
+    /// The kind of stream this encoder produces.
+    pub fn fidelity(&self) -> Fidelity {
+        self.fidelity
     }
 
     /// The fixed frame size this encoder was opened for.
@@ -380,15 +457,15 @@ mod tests {
     #[test]
     fn odd_or_zero_dimensions_are_rejected() {
         assert!(matches!(
-            VideoEncoder::open(1921, 1080),
+            VideoEncoder::open(1921, 1080, Fidelity::Lossless),
             Err(WindowError::Backend(_))
         ));
         assert!(matches!(
-            VideoEncoder::open(1920, 1081),
+            VideoEncoder::open(1920, 1081, Fidelity::Lossless),
             Err(WindowError::Backend(_))
         ));
         assert!(matches!(
-            VideoEncoder::open(0, 0),
+            VideoEncoder::open(0, 0, Fidelity::Lossless),
             Err(WindowError::Backend(_))
         ));
     }
@@ -418,6 +495,43 @@ mod tests {
         }
     }
 
+    /// `profile_idc` from the first SPS in `packet`: 100 is High, 244 is
+    /// High 4:4:4 Predictive.
+    fn sps_profile(packet: &[u8]) -> Option<u8> {
+        packet
+            .windows(5)
+            .find(|w| w[..3] == [0, 0, 1] && w[3] & 0x1F == 7)
+            .map(|w| w[4])
+    }
+
+    #[test]
+    fn a_lossy_stream_is_high_profile_and_a_lossless_one_is_not() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        let frame = solid_bgra(320, 240, 0x40);
+        let first_packet = |fidelity| {
+            let mut enc = VideoEncoder::open(320, 240, fidelity).expect("encoder");
+            let mut packets = enc.encode(&frame).expect("encode");
+            packets.extend(enc.finish().expect("flush"));
+            packets.concat()
+        };
+
+        let lossy = first_packet(Fidelity::Lossy { bitrate: 4_000_000 });
+        assert_eq!(
+            sps_profile(&lossy),
+            Some(100),
+            "a lossy stream must stay in the High profile every decoder takes"
+        );
+        let lossless = first_packet(Fidelity::Lossless);
+        assert_eq!(sps_profile(&lossless), Some(244));
+    }
+
+    #[test]
+    fn a_new_bitrate_is_the_same_stream_but_losslessness_is_not() {
+        let lossy = Fidelity::Lossy { bitrate: 1 };
+        assert!(lossy.same_stream(Fidelity::Lossy { bitrate: 2 }));
+        assert!(!lossy.same_stream(Fidelity::Lossless));
+    }
+
     /// A solid-colour BGRA frame of the given size.
     fn solid_bgra(w: u32, h: u32, v: u8) -> Vec<u8> {
         vec![v; (w as usize) * (h as usize) * 4]
@@ -426,7 +540,7 @@ mod tests {
     #[test]
     fn encodes_frames_into_packets() {
         ffmpeg_next::init().expect("ffmpeg init");
-        let mut enc = VideoEncoder::open(320, 240).expect("encoder");
+        let mut enc = VideoEncoder::open(320, 240, Fidelity::Lossless).expect("encoder");
 
         let mut total = 0usize;
         for i in 0..10 {
@@ -451,7 +565,7 @@ mod tests {
     #[test]
     fn wrong_sized_frame_is_rejected() {
         ffmpeg_next::init().expect("ffmpeg init");
-        let mut enc = VideoEncoder::open(320, 240).expect("encoder");
+        let mut enc = VideoEncoder::open(320, 240, Fidelity::Lossless).expect("encoder");
         // A short buffer would otherwise read out of bounds during the row copy.
         assert!(matches!(
             enc.encode(&solid_bgra(320, 120, 0)),
@@ -463,7 +577,7 @@ mod tests {
     fn static_content_costs_far_less_than_raw() {
         ffmpeg_next::init().expect("ffmpeg init");
         let (w, h) = (640u32, 480u32);
-        let mut enc = VideoEncoder::open(w, h).expect("encoder");
+        let mut enc = VideoEncoder::open(w, h, Fidelity::Lossless).expect("encoder");
 
         let frame = solid_bgra(w, h, 0x40);
         let mut total = 0usize;
@@ -497,7 +611,7 @@ mod tests {
     #[test]
     fn opens_on_some_backend() {
         ffmpeg_next::init().expect("ffmpeg init");
-        let enc = VideoEncoder::open(640, 480).expect("some encoder must open");
+        let enc = VideoEncoder::open(640, 480, Fidelity::Lossless).expect("some encoder must open");
         assert_eq!(enc.size(), (640, 480));
         assert_eq!(
             enc.full_rect(),

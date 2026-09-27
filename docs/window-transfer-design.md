@@ -97,6 +97,32 @@ initialise it, since its only render node is NVIDIA. Software is a real
 fallback, not a token one — x264 `ultrafast -qp 0` encoded the realistic
 workload in 0.50 s per 3 s of video.
 
+### …but only for a viewer that can decode it (2026-09-27)
+
+Lossless H.264 exists only in the **High 4:4:4 Predictive** profile; NVENC and
+x264 both switch to it for `qp=0` even from 4:2:0 input. FFmpeg decodes it.
+Media Foundation — every Windows viewer — does not, and says nothing: measured
+on the Windows peer with `examples/h264_decode_probe` (a High 4:4:4 stream from
+each encoder, 30 packets in, **0 pictures out, 0 errors**; the same content as
+High profile, 30 out). A Windows view of a Linux host therefore showed only the
+lossless tiles that landed between video frames, over whatever the black
+framebuffer held — the "patchwork, stale blocks, flicker" report.
+
+So each window engine announces its decoder once per link, before anything is
+offered (`WindowMsg::VideoCaps { lossless }`, window module v4). A host uses the
+lossless stream only for a viewer that said it decodes it, and a lossy
+High-profile stream at a bitrate (`frame_pipeline::lossy_bitrate`) for every
+other. Until the announcement arrives it assumes High only: a stream that
+cannot be decoded shows nothing, while a lossy one merely shows softer.
+
+The same probe found two bugs in the Windows decoder itself, which had kept it
+from showing even High-profile video: Microsoft's software decoder does not
+allocate its output samples (handed an empty slot it fails with "null output
+sample" exactly when a picture is ready), and by default it fills its whole
+reorder buffer before releasing anything (`MF_LOW_LATENCY` turns that off). It
+also reports the macroblock-padded size (1088 for 1080); the display aperture
+is cropped so video frames and tiles agree on the picture's size.
+
 ## Model: one seamless remote window, app stays home
 
 You grab a window's titlebar, drag it past the screen edge toward the peer, and
