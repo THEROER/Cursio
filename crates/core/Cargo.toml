@@ -94,6 +94,8 @@ windows = { version = "0.61", features = [
     # owner-only DACL.
     "Win32_Security_Authorization",
     "Win32_System_Threading",
+    # GetConsoleWindow — whether a relaunched copy should have a window.
+    "Win32_System_Console",
     # ShellExecuteExW with the "runas" verb — the actual UAC prompt.
     # SHELLEXECUTEINFOW carries an HKEY field, so the binding is gated on
     # Win32_System_Registry even though we never touch the registry.

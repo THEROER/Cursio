@@ -24,6 +24,23 @@
 //!
 //! On non-Windows this is a no-op, so callers need no `#[cfg]`.
 
+/// Whether this process has a console window someone is watching.
+///
+/// A node started from a terminal has one, and a copy of itself it starts
+/// should be seen there too. One started by the app or at login was started
+/// without a console, and a copy it starts must stay without one: Windows gives
+/// every console program that has none a fresh, visible window.
+#[cfg(target_os = "windows")]
+pub fn has_console() -> bool {
+    // SAFETY: no arguments; returns the calling process's console window or null.
+    !unsafe { windows::Win32::System::Console::GetConsoleWindow() }.is_invalid()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn has_console() -> bool {
+    true
+}
+
 /// What happened when we asked for elevation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Elevation {
@@ -114,7 +131,7 @@ fn relaunch_as_admin() -> Result<bool, String> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::ERROR_CANCELLED;
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
 
@@ -136,7 +153,9 @@ fn relaunch_as_admin() -> Result<bool, String> {
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(params.as_ptr()),
-        nShow: SW_SHOWNORMAL.0,
+        // An elevated process cannot share an unelevated console, so the copy
+        // always gets a new one; it is shown only if this one had one to show.
+        nShow: if has_console() { SW_SHOWNORMAL.0 } else { SW_HIDE.0 },
         ..Default::default()
     };
 

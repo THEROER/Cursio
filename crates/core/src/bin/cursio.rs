@@ -1678,9 +1678,15 @@ async fn restart_process(reason: &str) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        std::process::Command::new(&exe)
-            .args(&args)
-            .env(RESTARTED_ENV, "1")
+        let mut command = std::process::Command::new(&exe);
+        command.args(&args).env(RESTARTED_ENV, "1");
+        #[cfg(windows)]
+        if !cursio_core::elevate::has_console() {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        command
             .spawn()
             .map_err(|e| anyhow::anyhow!("could not restart {}: {e}", exe.display()))?;
         std::process::exit(0)
