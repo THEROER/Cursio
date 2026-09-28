@@ -351,9 +351,16 @@ macFUSE 5.3; macFUSE's kext needs Reduced Security set from Recovery on Apple
 Silicon; its kext-free FSKit backend exposes no FUSE device fd (only the
 still-changing `MFMount.framework`), mounts only under `/Volumes`, and is
 slower; FUSE-T replaces libfuse rather than exposing an fd, and is free only
-for personal use. First step: confirm a non-root mount of a localhost NFS
-export on a Mac. Fallback if that fails: a `fuser` transport over
-`MFMount.framework`, macOS 26 only.
+for personal use. A non-root `mount_nfs` of a localhost export is what
+Hugging Face's hf-mount and `rclone nfsmount` already ship. The server side is
+`nfs3_server` (its CI covers macOS arm64), with two gaps to patch: FSSTAT and
+PATHCONF are constants in it (1 TiB free, case-sensitive), so a hook for each
+goes upstream while a patched copy is vendored. NFS has no open/close, so the
+adapter keeps peer handles per file id and closes them before a remove or
+rename, which a Windows peer otherwise refuses. Mount options: `vers=3,tcp,
+noresvport,locallocks` (`nolocks` makes `flock` fail with `ENOTSUP`), `intr`
+and a `deadtimeout` so a crashed node does not wedge callers, and rsize/wsize
+of 1 MiB.
 
 ## License
 
