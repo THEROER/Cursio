@@ -288,6 +288,26 @@ impl TrustStore {
         Ok(())
     }
 
+    /// Stop trusting a peer and persist that at once, returning what was
+    /// forgotten. Its shared key goes with it, so the next meeting is a fresh
+    /// pairing; an unknown peer is not an error and writes nothing.
+    pub fn remove(&mut self, peer_id: &PeerId) -> Result<Option<TrustedPeer>, PairingError> {
+        let path = Self::path()?;
+        self.remove_saving_to(peer_id, &path)
+    }
+
+    fn remove_saving_to(
+        &mut self,
+        peer_id: &PeerId,
+        path: &std::path::Path,
+    ) -> Result<Option<TrustedPeer>, PairingError> {
+        let removed = self.peers.remove(peer_id);
+        if removed.is_some() {
+            self.save_to(path)?;
+        }
+        Ok(removed)
+    }
+
     /// Look up a previously paired peer.
     pub fn get(&self, peer_id: &PeerId) -> Option<&TrustedPeer> {
         self.peers.get(peer_id)
@@ -476,6 +496,47 @@ mod tests {
         );
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_removed_peer_stays_forgotten_after_reload() {
+        let dir = std::env::temp_dir().join(format!("cursio-trust-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("trusted_peers.json");
+        let kept = PeerId::new_v4();
+        let gone = PeerId::new_v4();
+        let mut store = TrustStore::default();
+        for (id, name) in [(kept, "kept"), (gone, "gone")] {
+            store.peers.insert(
+                id,
+                TrustedPeer {
+                    peer_id: id,
+                    display_name: name.into(),
+                    shared_key_hex: "00".into(),
+                    last_addr: None,
+                },
+            );
+        }
+        store.save_to(&path).unwrap();
+
+        let removed = store.remove_saving_to(&gone, &path).unwrap();
+        assert_eq!(removed.map(|p| p.display_name), Some("gone".to_string()));
+
+        let reloaded = TrustStore::load_from(&path).unwrap();
+        assert!(reloaded.get(&gone).is_none());
+        assert!(reloaded.get(&kept).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn removing_an_unknown_peer_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("cursio-trust-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("trusted_peers.json");
+        let mut store = TrustStore::default();
+        assert!(store
+            .remove_saving_to(&PeerId::new_v4(), &path)
+            .unwrap()
+            .is_none());
+        assert!(!path.exists());
     }
 
     #[test]
