@@ -48,7 +48,7 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     let (edges_tx, edges_rx) = mpsc::unbounded_channel();
     // Where the pointer is comes from the X server when there is one; without
     // it this backend cannot see an edge, and the edges channel stays silent.
-    let motion = crate::x11_edges::spawn(edges_tx, grab_rx.clone());
+    crate::x11_edges::spawn(edges_tx, grab_rx.clone());
     let mut opened = Vec::new();
 
     // Enumerate paths, but (re)open each via `Device::open` so we drive the
@@ -82,7 +82,7 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
             }
         };
 
-        match start_reader(device, tx.clone(), grab_rx.clone(), motion.clone()) {
+        match start_reader(device, tx.clone(), grab_rx.clone()) {
             Ok(()) => {
                 tracing::info!(device = %name, ?path, "capturing device");
                 opened.push(name);
@@ -123,8 +123,6 @@ fn start_reader(
     device: Device,
     tx: mpsc::UnboundedSender<InputEvent>,
     mut grab_rx: tokio::sync::watch::Receiver<crate::InputMode>,
-    // Pointer motion also goes to the X11 edge watcher, when there is one.
-    motion: Option<std::sync::mpsc::Sender<(i32, i32)>>,
 ) -> Result<(), InputError> {
     let mut stream = device.into_event_stream()?;
     tokio::spawn(async move {
@@ -163,8 +161,8 @@ fn start_reader(
                         }
                     };
                     if let Some(neutral) = translate(event) {
-                        if let (Some(motion), InputEvent::PointerMotion { dx, dy }) = (&motion, neutral) {
-                            let _ = motion.send((dx, dy));
+                        if let InputEvent::PointerMotion { dx, dy } = neutral {
+                            crate::x11_edges::note_motion(dx, dy);
                         }
                         if !grab_rx.borrow().forwards_events() {
                             continue;

@@ -158,6 +158,9 @@ impl InputInjector for UinputInjector {
 
         match event {
             InputEvent::PointerMotion { dx, dy } => {
+                // A peer pushing this desktop's pointer into its edge is how
+                // the cursor leaves by it; the X11 watcher has to hear of it.
+                crate::x11_edges::note_motion(dx, dy);
                 // X and Y are separate REL events, committed together by emit.
                 self.emit(&[
                     RelativeAxisEvent::new(RelativeAxisCode::REL_X, dx).into(),

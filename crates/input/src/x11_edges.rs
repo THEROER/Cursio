@@ -43,33 +43,61 @@ const NUDGE_PX: i32 = 12;
 /// changes it, and asking on every motion would double the round trips.
 const GEOMETRY_REFRESH: Duration = Duration::from_secs(2);
 
-/// Start watching, if there is an X server to ask. Motion deltas are sent to
-/// the returned channel by the evdev readers.
+/// Where motion is reported, once a watcher is running.
+///
+/// Fed from two places, because the pointer on this desktop moves for two
+/// reasons: this machine's own mouse, read by the evdev readers, and a peer's,
+/// injected through uinput. The second is the common case — the user sits at
+/// the other machine and pushes this one's cursor back up to its edge — and
+/// the readers never see it, since capture skips Cursio's own virtual devices
+/// so injected input cannot loop back out. Without it the cursor could reach
+/// this machine and never leave by the edge, exactly the fault this module
+/// exists to fix. The Windows hook and the macOS tap see injected motion
+/// themselves; here it has to be handed over.
+static MOTION: std::sync::OnceLock<Sender<(i32, i32)>> = std::sync::OnceLock::new();
+
+/// Report pointer motion to the watcher, if one is running.
+pub(crate) fn note_motion(dx: i32, dy: i32) {
+    if let Some(motion) = MOTION.get() {
+        let _ = motion.send((dx, dy));
+    }
+}
+
+/// Start watching, if there is an X server to ask. Motion reaches it through
+/// [`note_motion`]. Returns whether it is running.
 pub(crate) fn spawn(
     edges: tokio::sync::mpsc::UnboundedSender<EdgeCrossing>,
     mode: tokio::sync::watch::Receiver<InputMode>,
-) -> Option<Sender<(i32, i32)>> {
-    std::env::var_os("DISPLAY")?;
+) -> bool {
+    if std::env::var_os("DISPLAY").is_none() {
+        return false;
+    }
     let (conn, screen) = match x11rb::connect(None) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "cannot reach the X server; edge crossing is off, Ctrl+Alt+G still hands the cursor over");
-            return None;
+            return false;
         }
     };
     let root = conn.setup().roots[screen].root;
     let (tx, rx) = std::sync::mpsc::channel();
+    // Capture starts once per process; a second start would find the first
+    // watcher's channel here and leave the new one unfed.
+    if MOTION.set(tx).is_err() {
+        tracing::debug!("an X11 edge watcher is already running");
+        return true;
+    }
     let spawned = std::thread::Builder::new()
         .name("cursio-x11-edges".into())
         .spawn(move || watch(conn, root, rx, edges, mode));
     match spawned {
         Ok(_) => {
             tracing::info!("watching the X11 pointer for edge crossings");
-            Some(tx)
+            true
         }
         Err(e) => {
             tracing::warn!(error = %e, "could not start the X11 edge watcher; edge crossing is off");
-            None
+            false
         }
     }
 }
