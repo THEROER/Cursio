@@ -593,12 +593,27 @@ fn apply_modifier_map(spec: &str) -> anyhow::Result<()> {
 /// 258 MB by default, 49 MB with four arenas. Four rather than one because the
 /// input, audio and video threads allocate on their hot paths, and one lock
 /// for all of them would trade memory for contention.
+///
+/// The cap alone held only until the first large block was freed. glibc's mmap
+/// threshold is dynamic: freeing an mmapped block raises it to that block's
+/// size, up to 32 MiB, and from then on a 16 MiB buffer is carved from an
+/// arena heap — memory earlier mounts already dirtied, which `calloc` must
+/// clear. Every peer reconnect rebuilds the mounts, so an idle node climbed to
+/// 2.6 GB with 32 arena heaps each holding exactly three such buffers.
+/// Pinning the threshold keeps it fixed: blocks of 16 MiB and up always come
+/// from `mmap`, lazily zeroed and returned on free, while everything smaller —
+/// video frames included — stays in the arenas as before. Measured over three
+/// rebuilds of 48 mount threads: 261 MB resident unpinned, 2 MB pinned.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn limit_malloc_arenas() {
     // SAFETY: mallopt only adjusts allocator parameters; called before any
     // other thread is started, so nothing is allocating concurrently.
     if unsafe { libc::mallopt(libc::M_ARENA_MAX, 4) } == 0 {
         eprintln!("warning: glibc refused M_ARENA_MAX; mount threads may hold 16 MiB each");
+    }
+    // SAFETY: as above.
+    if unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 16 * 1024 * 1024) } == 0 {
+        eprintln!("warning: glibc refused M_MMAP_THRESHOLD; mount buffers may stay resident after a reconnect");
     }
 }
 
