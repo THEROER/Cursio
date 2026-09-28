@@ -211,7 +211,19 @@ impl InputInjector for WinInjector {
                         } else {
                             self.held_keys.remove(&(scancode, extended));
                         }
-                        self.send_key(scancode, extended, pressed)
+                        let result = self.send_key(scancode, extended, pressed);
+                        // The peer end of the key trace (see wl_capture's
+                        // "captured key"). A key sent into an elevated window
+                        // is dropped by UIPI with `ok` still true, so a stuck
+                        // modifier here can also be a release that did arrive.
+                        tracing::debug!(
+                            key,
+                            pressed,
+                            held = self.held_keys.len(),
+                            ok = result.is_ok(),
+                            "injected key"
+                        );
+                        result
                     }
                     None => {
                         tracing::trace!(key, "unmapped evdev key; dropping");

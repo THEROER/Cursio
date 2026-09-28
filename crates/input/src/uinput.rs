@@ -193,7 +193,19 @@ impl InputInjector for UinputInjector {
                     return Ok(());
                 }
                 self.track(key, pressed);
-                self.emit_keyboard(&[KeyEvent::new(KeyCode::new(key), pressed as i32).into()])
+                let result =
+                    self.emit_keyboard(&[KeyEvent::new(KeyCode::new(key), pressed as i32).into()]);
+                // The peer end of the key trace (see wl_capture's "captured
+                // key"): `held` that stays up after the hands are off the
+                // keyboard is a release that never arrived.
+                tracing::debug!(
+                    key,
+                    pressed,
+                    held = self.held.len(),
+                    ok = result.is_ok(),
+                    "injected key"
+                );
+                result
             }
         }
     }

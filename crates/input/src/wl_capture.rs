@@ -934,11 +934,18 @@ fn handle_ei_event(
             }
             InputEvent::PointerMotion { dx, dy }
         }
-        EiEvent::KeyboardKey(k) => InputEvent::Key {
-            // libei key codes are evdev keycodes — our neutral namespace.
-            key: k.key as u16,
-            pressed: matches!(k.state, KeyState::Press),
-        },
+        EiEvent::KeyboardKey(k) => {
+            let pressed = matches!(k.state, KeyState::Press);
+            // The capture end of the key trace, as for buttons below: a peer
+            // left holding Alt and Shift after both were let go here shows as
+            // a release logged here and never injected there.
+            tracing::debug!(key = k.key, pressed, "captured key");
+            InputEvent::Key {
+                // libei key codes are evdev keycodes — our neutral namespace.
+                key: k.key as u16,
+                pressed,
+            }
+        }
         EiEvent::Button(b) => {
             let pressed = matches!(b.state, ButtonState::Press);
             // Buttons are logged at both ends of the wire (capture here, inject
