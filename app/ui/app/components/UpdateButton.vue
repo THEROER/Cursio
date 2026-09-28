@@ -65,6 +65,17 @@ async function confirmRollback() {
   }
 }
 
+/**
+ * Close the popover before asking. Both are floating layers, and the popover
+ * stayed open above the confirmation it had raised, covering the buttons that
+ * answer it.
+ */
+function ask(what: "apply" | "rollback") {
+  open.value = false
+  if (what === "apply") confirmingApply.value = true
+  else confirming.value = true
+}
+
 watch(open, (o) => {
   if (o) void refreshInstall()
 })
@@ -99,7 +110,7 @@ watch(open, (o) => {
         <p v-if="mesh?.waiting_for" class="text-xs text-muted">
           {{ t("update.waitingFor", { reason: mesh.waiting_for }) }}
         </p>
-        <LpButton class="mt-2" variant="solid" size="sm" @click="confirmingApply = true">
+        <LpButton class="mt-2" variant="solid" size="sm" @click="ask('apply')">
           <LpIcon name="lucide:refresh-cw" :size="14" />
           {{ t("update.apply") }}
         </LpButton>
@@ -131,7 +142,7 @@ watch(open, (o) => {
         variant="soft"
         size="sm"
         :disabled="!install?.previous"
-        @click="confirming = true"
+        @click="ask('rollback')"
       >
         <LpIcon name="lucide:history" :size="14" />
         {{ t("update.rollback") }}
