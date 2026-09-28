@@ -117,10 +117,13 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 "open.status" => open(app, "/"),
                 "open.placement" => open(app, "/placement"),
                 "open.pair" => open(app, "/pair"),
+                // Menu events arrive on the thread that runs the event loop.
                 "start" => {
-                    if let Err(e) = crate::node::start_node() {
-                        tracing::warn!(error = ?e, "could not start the node from the tray");
-                    }
+                    tauri::async_runtime::spawn_blocking(|| {
+                        if let Err(e) = crate::node::start_node() {
+                            tracing::warn!(error = ?e, "could not start the node from the tray");
+                        }
+                    });
                 }
                 "quit" => app.exit(0),
                 _ => {

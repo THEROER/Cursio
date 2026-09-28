@@ -334,8 +334,13 @@ pub mod commands {
         link.request(Command::Restart).await
     }
 
+    /// Off the window's thread: `systemctl` or a process spawn can take a
+    /// noticeable moment, and a synchronous command would freeze the window
+    /// for it.
     #[tauri::command]
-    pub fn node_start() -> Result<(), NodeError> {
-        start_node()
+    pub async fn node_start() -> Result<(), NodeError> {
+        tauri::async_runtime::spawn_blocking(start_node)
+            .await
+            .map_err(NodeError::failed)?
     }
 }

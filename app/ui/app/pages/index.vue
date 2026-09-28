@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core"
 import {
   LpAlert,
   LpBadge,
+  LpButton,
   LpCard,
   LpEmptyState,
   LpSection,
@@ -12,7 +13,7 @@ import {
 import type { ModuleSwitch, NodeStatus, PeerView } from "~/composables/useNode"
 
 const { t } = useI18n()
-const { status, setModule } = useNode()
+const { status, setModule, pendingSwitches, restart } = useNode()
 
 // A phone has no node to show: its face is the touchpad.
 onMounted(async () => {
@@ -39,10 +40,8 @@ const switches: { key: ModuleSwitch; label: string; hint: string }[] = [
   { key: "screen_host", label: "modules.screenHost", hint: "modules.screenHostHint" },
 ]
 
-const pending = ref<ModuleSwitch | null>(null)
 const toggleError = ref("")
 async function toggle(key: ModuleSwitch, enabled: boolean) {
-  pending.value = key
   toggleError.value = ""
   try {
     const reply = await setModule(key, enabled)
@@ -51,8 +50,18 @@ async function toggle(key: ModuleSwitch, enabled: boolean) {
     }
   } catch (e) {
     toggleError.value = (e as { message?: string }).message ?? String(e)
+  }
+}
+
+const restarting = ref(false)
+async function restartNode() {
+  restarting.value = true
+  try {
+    await restart()
+  } catch (e) {
+    toggleError.value = (e as { message?: string }).message ?? String(e)
   } finally {
-    pending.value = null
+    restarting.value = false
   }
 }
 
@@ -139,14 +148,23 @@ const severityVariant = { Info: "info", Warning: "warning", Error: "danger" } as
               </div>
               <LpSwitch
                 :model-value="status.modules[s.key]"
-                :disabled="pending !== null || isPinned(s.key)"
+                :disabled="pendingSwitches.has(s.key) || isPinned(s.key)"
                 @update:model-value="(v: boolean) => toggle(s.key, v)"
               />
             </li>
           </ul>
           <p v-if="toggleError" class="mt-3 text-xs text-danger">{{ toggleError }}</p>
-          <p class="mt-3 text-xs text-muted">{{ t("modules.restartNote", { path: status.config_path }) }}</p>
+          <p class="mt-3 text-xs text-muted">{{ t("modules.appliedNote", { path: status.config_path }) }}</p>
         </LpCard>
+        <LpAlert
+          v-if="status.restart_needed.length"
+          variant="warning"
+          :title="t('modules.restartNeeded', { fields: status.restart_needed.join(', ') })"
+        >
+          <LpButton variant="soft" size="sm" :disabled="restarting" @click="restartNode">
+            {{ t("settings.restart") }}
+          </LpButton>
+        </LpAlert>
       </section>
 
       <section class="flex flex-col gap-3">

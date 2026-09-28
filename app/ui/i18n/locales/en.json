@@ -48,7 +48,8 @@
     "screenHostHint": "Answer peers asking for this machine's windows",
     "flag": "set by a flag",
     "pinned": "Saved, but a command-line flag overrides it until the node is started without that flag.",
-    "restartNote": "Changes are written to {path} and the node restarts to apply them."
+    "appliedNote": "Changes are written to {path} and take effect at once; links stay up.",
+    "restartNeeded": "Waiting for a restart to apply: {fields}"
   },
   "peers": {
     "title": "Peers",
@@ -92,7 +93,7 @@
     "here": "This machine: {x}, {y}",
     "reset": "Reset",
     "apply": "Apply",
-    "applied": "Saved; the node restarts with the new position.",
+    "applied": "Saved; peers see the new position at once.",
     "pinned": "Saved, but --at on the command line overrides it until the node is started without it.",
     "sameCell": "Same cell as {names}: machines in one cell border nothing, so the cursor will not cross between them.",
     "unplaced": "Not shown until they connect: {names}"

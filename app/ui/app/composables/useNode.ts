@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core"
+import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 
 /** `std::time::SystemTime` as serde writes it. */
 export interface SystemTime {
@@ -90,6 +91,8 @@ export interface NodeStatusReply {
   peers: PeerView[]
   modules: Modules
   pinned: string[]
+  /** Settings changed since the node started that only a restart applies. */
+  restart_needed: string[]
   config_path: string
   latency: LatencyReading[]
   problems: Problem[]
@@ -97,7 +100,7 @@ export interface NodeStatusReply {
 }
 
 export type Reply =
-  | { reply: "saved"; pinned: string[] }
+  | { reply: "saved"; pinned: string[]; restart_needed: string[] }
   | { reply: "pairing"; state: PairingState | null; last: PairingOutcome | null }
   | { reply: "done" }
   | { reply: string; [key: string]: unknown }
@@ -114,18 +117,17 @@ function asNodeError(e: unknown): NodeError {
   return { kind: "failed", message: String(e) }
 }
 
-/** How often the window asks the node. The same pace the tray keeps. */
-const POLL_MS = 1500
-
 /**
- * The node as the status window sees it: polled, never pushed.
+ * The node as the window sees it: pushed, never polled.
  *
- * Shared by every page, so switching pages does not start a second poll or
- * flash an empty state while the first answer arrives.
+ * The Rust side keeps one subscribed connection and re-emits every change as
+ * an event, so a toggle's result shows the moment the node applies it and no
+ * request of the window's ever waits behind a poll. Shared by every page, so
+ * switching pages neither subscribes twice nor flashes an empty state.
  */
 const status = ref<NodeStatusReply | null>(null)
 const error = ref<NodeError | null>(null)
-let timer: ReturnType<typeof setInterval> | null = null
+let unlisten: UnlistenFn[] = []
 let users = 0
 
 async function refresh() {
@@ -138,19 +140,34 @@ async function refresh() {
   }
 }
 
+async function follow() {
+  unlisten = await Promise.all([
+    listen<NodeStatusReply>("node://status", (event) => {
+      status.value = event.payload
+      error.value = null
+    }),
+    listen<NodeError>("node://down", (event) => {
+      error.value = event.payload
+      status.value = null
+    }),
+  ])
+  // Whatever was pushed before this page was listening.
+  await refresh()
+}
+
+/** Switches whose change the node has not answered yet. */
+const pendingSwitches = ref(new Set<ModuleSwitch>())
+
 export function useNode() {
   onMounted(() => {
     users += 1
-    if (!timer) {
-      void refresh()
-      timer = setInterval(refresh, POLL_MS)
-    }
+    if (users === 1) void follow()
   })
   onBeforeUnmount(() => {
     users -= 1
-    if (users === 0 && timer) {
-      clearInterval(timer)
-      timer = null
+    if (users === 0) {
+      for (const stop of unlisten) stop()
+      unlisten = []
     }
   })
 
@@ -158,11 +175,21 @@ export function useNode() {
 
   async function call<T = Reply>(cmd: string, args?: Record<string, unknown>): Promise<T> {
     try {
-      const reply = await invoke<T>(cmd, args)
-      void refresh()
-      return reply
+      return await invoke<T>(cmd, args)
     } catch (e) {
       throw asNodeError(e)
+    }
+  }
+
+  /** Change one module; only that switch waits for the answer. */
+  async function setModule(module: ModuleSwitch, enabled: boolean): Promise<Reply> {
+    pendingSwitches.value = new Set(pendingSwitches.value).add(module)
+    try {
+      return await call<Reply>("node_set_module", { module, enabled })
+    } finally {
+      const next = new Set(pendingSwitches.value)
+      next.delete(module)
+      pendingSwitches.value = next
     }
   }
 
@@ -171,8 +198,8 @@ export function useNode() {
     error,
     notRunning,
     refresh,
-    setModule: (module: ModuleSwitch, enabled: boolean) =>
-      call<Reply>("node_set_module", { module, enabled }),
+    pendingSwitches,
+    setModule,
     setPosition: (p: Position) => call<Reply>("node_set_position", { x: p.x, y: p.y }),
     pairShow: () => call<Reply>("node_pair_show"),
     pairEnter: (code: string) => call<Reply>("node_pair_enter", { code }),

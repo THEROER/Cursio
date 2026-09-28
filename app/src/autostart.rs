@@ -167,7 +167,9 @@ mod platform {
 
     fn set(value: &str, command: Option<String>) -> Result<(), String> {
         let ok = match &command {
-            Some(command) => reg(&["add", RUN_KEY, "/v", value, "/t", "REG_SZ", "/d", command, "/f"])?,
+            Some(command) => reg(&[
+                "add", RUN_KEY, "/v", value, "/t", "REG_SZ", "/d", command, "/f",
+            ])?,
             None if enabled(value) => reg(&["delete", RUN_KEY, "/v", value, "/f"])?,
             None => true,
         };
@@ -183,7 +185,10 @@ mod platform {
 
     pub fn set_node(on: bool) -> Result<(), String> {
         let exe = crate::node::node_executable();
-        set(NODE_VALUE, on.then(|| format!("\"{}\" mesh", exe.display())))
+        set(
+            NODE_VALUE,
+            on.then(|| format!("\"{}\" mesh", exe.display())),
+        )
     }
 
     pub fn tray_enabled() -> bool {
@@ -192,7 +197,10 @@ mod platform {
 
     pub fn set_tray(on: bool) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        set(TRAY_VALUE, on.then(|| format!("\"{}\" --hidden", exe.display())))
+        set(
+            TRAY_VALUE,
+            on.then(|| format!("\"{}\" --hidden", exe.display())),
+        )
     }
 }
 
@@ -229,20 +237,31 @@ pub fn current() -> Autostart {
 pub mod commands {
     use super::*;
 
+    // Both run `reg.exe` or `systemctl`, which take tens to hundreds of
+    // milliseconds. A synchronous command runs on the thread that draws the
+    // window, and the window froze for exactly that long; these wait on a
+    // blocking-pool thread instead.
+
     #[tauri::command]
-    pub fn autostart_get() -> Autostart {
-        current()
+    pub async fn autostart_get() -> Result<Autostart, String> {
+        tauri::async_runtime::spawn_blocking(current)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     #[tauri::command]
-    pub fn autostart_set(node: bool, tray: bool) -> Result<Autostart, String> {
-        let now = current();
-        if now.node != node {
-            platform::set_node(node)?;
-        }
-        if now.tray != tray {
-            platform::set_tray(tray)?;
-        }
-        Ok(current())
+    pub async fn autostart_set(node: bool, tray: bool) -> Result<Autostart, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            let now = current();
+            if now.node != node {
+                platform::set_node(node)?;
+            }
+            if now.tray != tray {
+                platform::set_tray(tray)?;
+            }
+            Ok(current())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 }
