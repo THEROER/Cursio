@@ -62,6 +62,9 @@ impl ModuleId {
     /// USB device sharing: a device on one machine's port, attached from
     /// another; see [`usb`](crate::usb).
     pub const USB: ModuleId = ModuleId(7);
+    /// Handing new builds of Cursio between machines; see
+    /// [`update`](crate::update).
+    pub const UPDATE: ModuleId = ModuleId(8);
 
     /// Human-readable name, for logs and diagnostics. Unknown ids are rendered
     /// numerically rather than hidden — that is exactly the case worth seeing in
@@ -75,6 +78,7 @@ impl ModuleId {
             ModuleId::FILES => "files",
             ModuleId::SERVICE => "service",
             ModuleId::USB => "usb",
+            ModuleId::UPDATE => "update",
             _ => "unknown",
         }
     }

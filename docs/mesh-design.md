@@ -463,8 +463,17 @@ so the supervisor does not start a second attempt for a peer that already has on
 in flight.
 
 Everything between "there is a socket" and "a session can start" lives in
-`link.rs`: `Hello` → SPAKE2 pairing on first meeting (or the stored key) → Noise
-`NNpsk0` → module negotiation → cursor ownership.
+`link.rs`: preamble → `Hello` → SPAKE2 pairing on first meeting (or the stored
+key) → Noise `NNpsk0` → module negotiation → cursor ownership.
+
+**The preamble is frozen.** Every connection opens with the update lane's
+`Preamble` (`protocol/src/update.rs`), hand-encoded and pinned by tests, which
+carries the sender's `PROTOCOL_VERSION`. Only a peer on the same version is
+sent a `Hello`. A peer on another version still reaches Noise with the pair's
+stored key and then carries the update lane and nothing else — it is how the
+machine that is behind gets the build it needs (`docs/update-design.md`). A
+peer from before v19 opens with its old `Hello`, is recognised by variant 0 and
+its first field, and is told plainly that it has to be updated by hand once.
 
 **Sessions are `!Send`.** The input path shares its injector and cursor via `Rc`
 deliberately, so peer sessions are spawned with `spawn_local` onto a `LocalSet`

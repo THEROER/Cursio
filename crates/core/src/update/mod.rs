@@ -45,6 +45,15 @@ pub enum UpdateError {
     Refused(String),
 }
 
+/// Which build this process is: the installed version it was started from,
+/// or the crate version for a development build under `target/`.
+pub fn running_build() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| layout::InstallLayout::for_user().ok()?.version_of(&exe))
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+}
+
 impl UpdateError {
     pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
         Self::Io {

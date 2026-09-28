@@ -16,6 +16,7 @@ pub mod input;
 pub mod node;
 pub mod paths;
 pub mod service;
+pub mod update;
 pub mod usb;
 pub mod window;
 
@@ -65,8 +66,10 @@ pub use window::{
 /// reports and reads — it is not a module precisely so that it cannot be
 /// negotiated away. v18 added [`Message::Reconfigure`], which lets a module
 /// toggle or a new position reach a running link instead of restarting the
-/// node.
-pub const PROTOCOL_VERSION: u16 = 18;
+/// node. v19 opens every connection with an [`update::Preamble`] and added
+/// [`Message::Update`]: two builds that disagree here still hand each other
+/// new builds over the frozen update lane instead of hanging up.
+pub const PROTOCOL_VERSION: u16 = 19;
 
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
@@ -233,6 +236,14 @@ pub enum Message {
     /// Appended rather than placed beside `Hello`: variants are encoded by
     /// index, and every one after an insertion would change its number.
     Reconfigure(Reconfigure),
+
+    /// One [`update::UpdateMsg`], in the lane's own frozen encoding.
+    ///
+    /// **Index 17, forever.** A build that can no longer hold a session with
+    /// its peer still has to read this, so its place in the enum — and the
+    /// plain byte vector it carries — must mean the same thing to every
+    /// version. Variants are only ever appended after it. See [`update`].
+    Update(Vec<u8>),
 }
 
 /// Payload of [`Message::Hello`].
@@ -379,6 +390,11 @@ impl Message {
             // `Module` envelopes declaring `Priority::Bulk`.)
             Message::Opaque(_) => Priority::Bulk,
 
+            // A 30 MB executable in 256 KiB pieces: it queues behind the
+            // cursor like any file chunk, and nobody is waiting on any one
+            // piece of it.
+            Message::Update(_) => Priority::Bulk,
+
             // Enveloped module traffic ranks itself: the payload is opaque here,
             // so the sending module is the only thing that knows what the frame
             // is. Declared at the send site (see `Message::Module`).
@@ -399,6 +415,7 @@ impl Message {
             Message::Module { module, .. } => Some(*module),
             Message::AudioChunk(_) => Some(ModuleId::AUDIO),
             Message::WindowFrame(_) | Message::WindowInput(_) => Some(ModuleId::WINDOW),
+            Message::Update(_) => Some(ModuleId::UPDATE),
             Message::Hello(_)
             | Message::PairRequest { .. }
             | Message::PairResponse { .. }
@@ -509,6 +526,19 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two variants every version must be able to tell apart without
+    /// decoding anything else: an old peer's greeting, and the update lane.
+    #[test]
+    fn hello_and_update_keep_their_frozen_variant_indices() {
+        let update = Message::Update(vec![0xab]).to_bytes().unwrap();
+        assert_eq!(update, [17, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xab]);
+        let hello = Message::Hello(Hello::bare(PeerId::nil(), "h"))
+            .to_bytes()
+            .unwrap();
+        assert_eq!(hello[..4], [0, 0, 0, 0]);
+        assert_eq!(u16::from_le_bytes([hello[4], hello[5]]), PROTOCOL_VERSION);
+    }
 
     #[test]
     fn hello_roundtrips_through_bytes() {

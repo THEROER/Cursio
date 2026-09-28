@@ -140,6 +140,7 @@ pub(crate) fn message_kind(msg: &Message) -> &'static str {
         Message::WindowFrame(_) => "WindowFrame",
         Message::WindowInput(_) => "WindowInput",
         Message::AudioChunk(_) => "AudioChunk",
+        Message::Update(_) => "Update",
         // The module's own vocabulary is opaque here by design, so this names
         // the module rather than the message inside it.
         Message::Module { module, .. } => match *module {

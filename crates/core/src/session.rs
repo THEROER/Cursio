@@ -3,6 +3,10 @@
 //! Once a [`Transport`] is connected (and, for a first meeting, pairing has
 //! run), a session begins with a [`Hello`] exchange — each side advertises its
 //! protocol version and identity, and a version mismatch is rejected up front.
+//! The greeting is preceded by the update lane's frozen preamble, so a
+//! mismatch is learned from a message every build can read, and ends in
+//! [`SessionError::UpdateOnly`] — a link that can still carry a new build —
+//! rather than in a decode error.
 //! After that the session runs a heartbeat loop so both ends detect a dead link
 //! promptly, until either side sends [`Message::Bye`] or the link drops.
 
@@ -52,8 +56,17 @@ impl PeerHello {
 pub enum SessionError {
     #[error(transparent)]
     Transport(#[from] TransportError),
-    #[error("protocol version mismatch: local {local}, peer {peer}")]
+    /// A peer from before the update lane: it greeted with its old `Hello`
+    /// and cannot read anything newer, so it has to be updated by hand once.
+    #[error(
+        "protocol version mismatch: local {local}, peer {peer}; the peer is too old to be \
+         updated over the mesh — install this version on it by hand once"
+    )]
     VersionMismatch { local: u16, peer: u16 },
+    /// The peer speaks a different session protocol but the same update lane:
+    /// the link can carry builds and nothing else.
+    #[error("peer {} speaks protocol {} (this build {}); only updates can cross", .0.peer_id, .0.protocol_version, PROTOCOL_VERSION)]
+    UpdateOnly(cursio_protocol::update::Preamble),
     #[error("expected Hello, got a different message")]
     UnexpectedMessage,
     #[error("peer ended the session")]
@@ -107,9 +120,71 @@ pub async fn handshake<T: Transport + ?Sized>(
     service: cursio_protocol::ServiceOffer,
     status: cursio_protocol::NodeStatus,
 ) -> Result<PeerHello, SessionError> {
+    handshake_as(
+        PROTOCOL_VERSION,
+        transport,
+        local,
+        device_kind,
+        modules,
+        position,
+        service,
+        status,
+    )
+    .await
+}
+
+/// [`handshake`] claiming `protocol_version`, so a test can stand in for a
+/// build that speaks another one.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn handshake_as<T: Transport + ?Sized>(
+    protocol_version: u16,
+    transport: &mut T,
+    local: &crate::NodeIdentity,
+    device_kind: DeviceKind,
+    modules: &[ModuleAdvert],
+    position: cursio_protocol::Position,
+    service: cursio_protocol::ServiceOffer,
+    status: cursio_protocol::NodeStatus,
+) -> Result<PeerHello, SessionError> {
+    // The preamble goes first and alone, in the frozen lane encoding, so the
+    // peer learns our version from a message no build can fail to read — and
+    // the greeting, whose shape does change, is only ever sent to a peer known
+    // to understand it.
+    let preamble = cursio_protocol::update::Preamble {
+        protocol_version,
+        peer_id: local.peer_id,
+        build: crate::update::running_build(),
+        platform: cursio_protocol::update::this_platform(),
+    };
+    transport
+        .send(&Message::Update(
+            cursio_protocol::update::UpdateMsg::Preamble(preamble).encode(),
+        ))
+        .await?;
+    match transport.recv().await? {
+        Message::Update(bytes) => match cursio_protocol::update::UpdateMsg::decode(&bytes) {
+            Ok(Some(cursio_protocol::update::UpdateMsg::Preamble(peer))) => {
+                if peer.protocol_version != protocol_version {
+                    return Err(SessionError::UpdateOnly(peer));
+                }
+            }
+            _ => return Err(SessionError::UnexpectedMessage),
+        },
+        // A build from before the preamble opens with its greeting, whose
+        // first field has always been the version.
+        Message::Hello(old) => {
+            return Err(SessionError::VersionMismatch {
+                local: protocol_version,
+                peer: old.protocol_version,
+            })
+        }
+        _ => return Err(SessionError::UnexpectedMessage),
+    }
+
     transport
         .send(&Message::Hello(Hello {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version,
             peer_id: local.peer_id,
             display_name: local.display_name.clone(),
             device_kind,
@@ -125,9 +200,9 @@ pub async fn handshake<T: Transport + ?Sized>(
         _ => return Err(SessionError::UnexpectedMessage),
     };
 
-    if hello.protocol_version != PROTOCOL_VERSION {
+    if hello.protocol_version != protocol_version {
         return Err(SessionError::VersionMismatch {
-            local: PROTOCOL_VERSION,
+            local: protocol_version,
             peer: hello.protocol_version,
         });
     }
