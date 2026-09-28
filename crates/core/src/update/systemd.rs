@@ -35,6 +35,7 @@ pub fn own_unit() -> Option<String> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn unit_from_cgroup(cgroup: &str) -> Option<String> {
     // cgroup v2 is the single `0::` line; the unit is its last component.
     let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
