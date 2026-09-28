@@ -196,12 +196,12 @@ impl PipelinePlan {
                         "no DMA-BUF-capable Wayland/GL video sink is installed".into(),
                     ));
                 };
-            return Ok(Self {
+            Ok(Self {
                 codec,
                 decoder,
                 sink,
                 memory: GpuMemory::DmaBuf,
-            });
+            })
         }
 
         #[cfg(target_os = "windows")]
@@ -215,12 +215,12 @@ impl PipelinePlan {
                     "{decoder} and d3d11videosink are required for GPU-resident decoding"
                 )));
             }
-            return Ok(Self {
+            Ok(Self {
                 codec,
                 decoder,
                 sink: "d3d11videosink",
                 memory: GpuMemory::D3d11,
-            });
+            })
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]

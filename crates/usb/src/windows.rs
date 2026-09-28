@@ -70,10 +70,16 @@ pub struct WindowsUsb {
     /// A class cannot change while a device stays plugged in, so the answer is
     /// only re-read when the *set* of devices changes — which is exactly when a
     /// class this does not know about could appear.
-    classes: std::cell::RefCell<Option<(Vec<(u16, u16)>, HashMap<(u16, u16), u8>)>>,
+    classes: std::cell::RefCell<Option<ClassCache>>,
     /// The last listing, and what it was read under. See [`Self::devices`].
     listing: std::cell::RefCell<Option<Listing>>,
 }
+
+/// A USB vendor and product id, the key PnP classes are matched by.
+type VendorProduct = (u16, u16);
+
+/// PnP classes, and the device set they were read for.
+type ClassCache = (Vec<VendorProduct>, HashMap<VendorProduct, u8>);
 
 /// A `usbipd state` answer kept until something could have changed it.
 #[derive(Debug, Clone)]
