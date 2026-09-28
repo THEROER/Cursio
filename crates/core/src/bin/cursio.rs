@@ -2378,11 +2378,22 @@ fn spawn_hotkey_filter(
         // meanwhile every click there is a Ctrl+click and the mouse looks
         // broken. That was the "pressed a key and everything froze" report.
         let mut swallow_until_release = false;
+        // Every change of mode forgets what is held. A hotkey that takes the
+        // cursor back ends capture with Ctrl and Alt still down, and their
+        // releases go to the local desktop — capture never sees them. Kept,
+        // `ctrl` stayed true and the swallow never ended: from then on every
+        // Alt press and release was eaten, so Alt+Tab on the peer arrived as
+        // Tab, until the user happened to press Ctrl again.
+        let mut last_mode = grab.mode();
         while let Some(event) = upstream.recv().await {
-            if !grab.mode().forwards_events() {
+            let mode = grab.mode();
+            if mode != last_mode {
+                last_mode = mode;
                 ctrl = false;
                 alt = false;
                 swallow_until_release = false;
+            }
+            if !mode.forwards_events() {
                 continue;
             }
             if let InputEvent::Key { key, pressed } = event {
@@ -2390,21 +2401,31 @@ fn spawn_hotkey_filter(
                     KEY_LEFTCTRL | KEY_RIGHTCTRL => {
                         ctrl = pressed;
                         // Tail of a fired combo: drop the release, and end the
-                        // swallow once both modifiers are up.
+                        // swallow once both modifiers are up. A press is never
+                        // swallowed — it starts a new combo, and ends the old
+                        // one's tail whatever was missed of it.
                         if swallow_until_release {
-                            if !pressed && !alt {
+                            if pressed {
                                 swallow_until_release = false;
+                            } else {
+                                if !alt {
+                                    swallow_until_release = false;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                     KEY_LEFTALT | KEY_RIGHTALT => {
                         alt = pressed;
                         if swallow_until_release {
-                            if !pressed && !ctrl {
+                            if pressed {
                                 swallow_until_release = false;
+                            } else {
+                                if !ctrl {
+                                    swallow_until_release = false;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                     KEY_G if pressed && ctrl && alt => {
