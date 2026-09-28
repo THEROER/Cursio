@@ -5,5 +5,5 @@
 node_modules/
 .nuxt/
 .output/
-# `nuxt generate` mirrors .output/public here.
-app/ui/dist/
+# `nuxt generate` mirrors .output/public here, as a symlink (so no trailing slash).
+app/ui/dist
