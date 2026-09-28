@@ -19,7 +19,12 @@ launched on.**
 - Route audio **per application**, so each remote app appears here as its own
   named node
 - Mount a peer's disks locally, on demand
+- Use a peer's USB devices as if they were plugged in here (USB/IP)
+- Offer a peer's windows and monitors to Discord, OBS or a browser call here,
+  without drawing them on this desktop
 - Receive iPhone/iPad screen mirroring as an AirPlay target for the whole mesh
+- Update itself: a signed build offered by a machine you trust installs side by
+  side and rolls back if it does not come up
 
 ## What it is not
 
@@ -32,15 +37,30 @@ launched on.**
 
 ## Supported platforms (v0.1)
 
-| | Input | Clipboard | Window host | Window view | Audio | Files | AirPlay |
-|---|---|---|---|---|---|---|---|
-| **Linux** (Wayland) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Windows 11** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **macOS 13+** | ✅ | ✅ | ✅ | ❌ | ❌ | serve only | ✅ |
+| | Input | Clipboard | Window host | Window view | Remote screen | Audio | Files | USB | AirPlay |
+|---|---|---|---|---|---|---|---|---|---|
+| **Linux** (Wayland, X11) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Windows 11** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **macOS 13+** | ✅ | ✅ | ✅ | ❌ | serve only | ❌ | serve only | ❌ | ✅ |
+| **Android** (arm64) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
-A Mac can host a window but cannot yet display a peer's; it serves its own
-volumes but cannot mount a peer's. Wayland support depends on compositor
-security policy and varies between compositors.
+- **Linux**: capture goes through the `InputCapture` portal + libei on
+  Wayland and evdev on X11. Window capture uses the ScreenCast portal, so what
+  works depends on the compositor; drag-to-transfer on GNOME needs the bundled
+  Shell extension. Audio needs PipeWire, file mounts need FUSE, USB needs
+  `usbip-host`. Tested on Ubuntu 24.04 and 25.10: a build runs only against the
+  FFmpeg it was linked with, so each is built separately (`cargo xtask stage
+  ubuntu24`).
+- **Windows**: mounts need WinFsp, USB needs `usbipd-win`, audio endpoints
+  need the bundled driver (`native/cursio-vad`). Cursio asks for UAC at
+  start, since Windows silently drops input injected into elevated windows;
+  declining leaves everything else working.
+- **macOS**: a Mac can host a window but cannot yet display a peer's, and it
+  serves its own volumes but cannot mount a peer's. Input needs the
+  Accessibility permission, window capture the Screen Recording one.
+- **Android**: the mesh core only — pairing, links, node status. It joins
+  the mesh and shows its battery and network to peers; no module has an
+  Android backend yet.
 
 ## Core concepts
 
@@ -107,11 +127,20 @@ Application Support/cursio` on macOS).
 ## CLI
 
 ```
-cursio mesh      # run as a mesh node — this is how everything runs
-cursio peers     # list peers discovered on the LAN, then exit
+cursio mesh            # run as a mesh node — this is how everything runs
+cursio status          # what the running node is doing: peers, modules, latency, problems
+cursio pair [CODE]     # pair through the running node with a one-time code
+cursio forget <NAME>   # remove a paired machine and its key
+cursio peers           # list peers discovered on the LAN, then exit
+cursio config          # print the config `mesh` would run with, and where it lives
+cursio update ...      # install, switch and roll back versions
+cursio portal install  # (Linux) make Cursio the ScreenCast portal for --remote-screen
 ```
 
-Modules are off by default; each flag opts this machine in.
+What `mesh` runs comes from `config.toml` (`cursio config` prints its path);
+every flag overrides the file for that run only, so each module switch comes as
+a pair (`--audio` / `--no-audio`). Settings changed while the node runs apply
+to live links without a restart.
 
 | Flag | Effect |
 |---|---|
@@ -120,6 +149,9 @@ Modules are off by default; each flag opts this machine in.
 | `--clipboard` | Share the clipboard (text, images, other formats) |
 | `--audio` | Share audio per application |
 | `--files` | Share disks both ways; a peer's volumes appear under `~/Cursio/<peer>/` |
+| `--files-share <PATH[:ro]>` | Offer only this root instead of every disk; repeat for several, `:ro` refuses changes |
+| `--usb` | Share this machine's USB devices and use the peers' |
+| `--remote-screen` | Offer peers' windows and monitors to screen-sharing apps here; `--no-screen-host` refuses peers' requests for this machine's |
 | `--pair` | Open the pairing window (run on both machines) |
 | `--pair-addr <HOST:PORT>` | Name the machine to pair with when mDNS will not; also means this side places the call |
 | `--port <n>` | Listening port. Defaults to **46073**, deliberately stable — peers cache the last address to reconnect when mDNS is slow, and a port that changed each restart left that cache pointing at a dead one. Pass `0` for an ephemeral port. |
@@ -184,8 +216,21 @@ triples each build needs:
 cargo xtask build              # release build of supported binaries for this host
 cargo xtask install            # build + copy cursio, clipd, cursio-app to ~/.local/bin
 cargo xtask windows            # cross-compile the .exe(s) from Linux (MSVC)
+cargo xtask macos              # build on a Mac
+cargo xtask android            # the mesh core for arm64 (needs ANDROID_NDK_HOME, cargo-ndk)
+cargo xtask stage ubuntu24     # an Ubuntu 24.04 build, in docker
+cargo xtask publish            # stage host + Windows + Ubuntu 24.04, sign, offer to the mesh
 cargo xtask logs --follow      # print the log dir and tail the current log
 ```
+
+Builds install side by side under a per-user root, with a `current` pointer
+and rollback (`docs/update-design.md`). A machine takes a build from the mesh
+only if it trusts the machine that built it (`cursio update trust-builder`),
+and applies it per `[update] policy = "auto" | "ask" | "never"`.
+
+`cargo xtask deploy` and `cargo xtask live-test` drive a real Windows peer over
+ssh (`docs/live-test.md`). Where that peer is lives in `.env` at the root of the
+checkout, which git ignores: copy `.env.example` and fill it in.
 
 `install` also writes `.desktop` files under `~/.local/share/applications`; add
 `~/.local/bin` to your `PATH` if it isn't already. `clipd` is Linux-only, so
@@ -248,7 +293,9 @@ platform crates → binaries:
 - `crates/window` — window capture, encoding, and surrogate windows
 - `crates/audio` — PipeWire and WASAPI backends
 - `crates/files` — serving volumes and mounting a peer's
+- `crates/usb` — USB/IP export and import, and who holds a device
 - `crates/clipboard-core` — clipboard backends, shared with `clipd`
+- `crates/android` — the JNI library an Android app loads to run a node
 - `crates/airplay` — the AirPlay receiver, deliberately outside the mesh
 - `crates/logging` — console + rotating-file logging shared by every binary
 - `crates/xtask` — build/install/cross-compile automation
@@ -276,10 +323,13 @@ Platform crates are **mechanism**; the matching `*_session.rs` in `core` is
 ## Roadmap
 
 **Done** — encrypted mesh, input proxy, drag-to-edge window transfer,
-per-application audio, clipboard, file sharing, AirPlay receiver.
+per-application audio, clipboard, file sharing, USB sharing, remote screens
+for screen-sharing apps, AirPlay receiver, signed self-update, the mesh core
+on Android.
 
-**Next** — displaying a peer's window on macOS, VideoToolbox encoding, adaptive
-bitrate, compositor integrations.
+**Next** — displaying a peer's window on macOS, macOS audio and mounts,
+Android modules (input, clipboard, files), VideoToolbox encoding, compositor
+integrations.
 
 ## License
 
