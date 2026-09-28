@@ -101,6 +101,19 @@ export interface NodeStatusReply {
   latency: LatencyReading[]
   problems: Problem[]
   pairing: PairingState | null
+  /** Empty (all defaults) from a node older than control v5. */
+  update: UpdateStatus
+}
+
+/** Mirrors `cursio_core::update::agent::UpdateStatus`. */
+export interface UpdateStatus {
+  policy: string
+  channel: string
+  running: string
+  progress: { version: string; from: string; received: number; total: number } | null
+  ready: { version: string; from: string; published_at: number } | null
+  waiting_for: string | null
+  last: string | null
 }
 
 export type Reply =
@@ -210,6 +223,7 @@ export function useNode() {
     pairCancel: () => call<Reply>("node_pair_cancel"),
     pairing: () => call<Reply>("node_pairing"),
     restart: () => call<Reply>("node_restart"),
+    applyUpdate: () => call<Reply>("node_update_apply"),
     start: () => call<void>("node_start"),
   }
 }

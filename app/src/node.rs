@@ -346,6 +346,11 @@ pub mod commands {
         link.request(Command::Restart).await
     }
 
+    #[tauri::command]
+    pub async fn node_update_apply(link: State<'_, NodeLink>) -> Result<Reply, NodeError> {
+        link.request(Command::UpdateApply).await
+    }
+
     /// Off the window's thread: `systemctl` or a process spawn can take a
     /// noticeable moment, and a synchronous command would freeze the window
     /// for it.
