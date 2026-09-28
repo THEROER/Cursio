@@ -6,10 +6,12 @@ hanging a caller, input lagging on the Windows side. Two xtask commands cover
 that: `deploy` gets the same commit onto both machines, `live-test` turns a
 window of both logs into PASS/FAIL numbers.
 
-Defaults name the development pair: this Ubuntu box (Nocturne) and the Windows
-laptop Lightmoon, reached as `ssh -p 2222 theroer@192.168.1.92` into its WSL.
-`--ssh`, `--ssh-port`, `--win-home` and `--peer-name` point both commands at
-another peer.
+The Windows peer is reached by ssh into its WSL. Where it is lives in the
+checkout's `.env` (ignored by git; copy `.env.example`): `CURSIO_PEER_SSH`,
+`CURSIO_PEER_SSH_PORT` (default 22), `CURSIO_PEER_WIN_HOME` and
+`CURSIO_PEER_NAME`. The flags `--ssh`, `--ssh-port`, `--win-home` and
+`--peer-name` override them for one run. Below, `C:\Users\<you>` is that
+`CURSIO_PEER_WIN_HOME`.
 
 ## `cargo xtask deploy`
 
@@ -26,7 +28,7 @@ cargo xtask deploy --windows-only --no-build   # ship the .exe already built
   process is on the previous build and needs a restart.
 - **Windows**: cross-builds (into `$CARGO_TARGET_DIR`, default
   `~/.cache/cursio-win-target`), copies the `.exe` to
-  `C:\Users\thero\Cursio\cursio-<commit>[-dirty]-<sha256:8>.exe`, and checks
+  `C:\Users\<you>\Cursio\cursio-<commit>[-dirty]-<sha256:8>.exe`, and checks
   sha256 on both ends. The content hash is in the name because a running `.exe`
   is locked: two dirty builds of one commit must not collide, and the running
   one can never be overwritten.
@@ -42,7 +44,7 @@ cargo xtask deploy --windows-only --no-build   # ship the .exe already built
   the task runs in the user's session. The script sends Ctrl-C to the old
   daemon's console, waits 8 s, force-stops it if needed, and starts the new
   build with the same arguments. Its log is `deploy-restart.log`. The daemon
-  asks for UAC on start, so the prompt appears on Lightmoon's screen.
+  asks for UAC on start, so the prompt appears on the peer's screen.
 
 The last lines printed say which build runs where.
 
@@ -84,7 +86,7 @@ compositor and the capture portal like a real mouse, so what it measures is what
 the user feels. Without `--yes`, or with the cursor here, it injects nothing and
 input is judged from whatever the user does.
 
-**The file roundtrip** writes 4 MiB to `C:\Users\thero\Cursio\live-test\` through
+**The file roundtrip** writes 4 MiB to `C:\Users\<you>\Cursio\live-test\` through
 the `(C)` mount under `~/Cursio/<peer>/`, syncs, reads it back, compares the
 sha256 on the peer's own disk over ssh, and removes it. The folder is created on
 the peer's side, so the mount only looks up names — it is never listed. Each

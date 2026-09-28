@@ -15,21 +15,22 @@ use clap::Args;
 
 /// Where the Windows peer is and how its paths map into WSL.
 ///
-/// Defaults are the pair this tooling was built against (Lightmoon); every one
-/// is a flag so another peer needs no code change.
+/// Nothing here has a built-in default: every value describes one developer's
+/// LAN, so it comes from a flag or from `CURSIO_PEER_*`, which the checkout's
+/// `.env` supplies (`crate::dotenv`).
 #[derive(Args, Clone, Debug)]
 pub struct Peer {
     /// ssh destination of the Windows peer (lands in its WSL).
-    #[arg(long, default_value = "theroer@192.168.1.92")]
+    #[arg(long, env = "CURSIO_PEER_SSH")]
     pub ssh: String,
     /// ssh port of the Windows peer.
-    #[arg(long, default_value_t = 2222)]
+    #[arg(long, env = "CURSIO_PEER_SSH_PORT", default_value_t = 22)]
     pub ssh_port: u16,
     /// The Windows user's home, as WSL sees it.
-    #[arg(long, default_value = "/mnt/c/Users/thero")]
+    #[arg(long, env = "CURSIO_PEER_WIN_HOME")]
     pub win_home: String,
     /// Name the peer goes by in the mesh (its mount lives at ~/Cursio/<name>).
-    #[arg(long, default_value = "Lightmoon")]
+    #[arg(long, env = "CURSIO_PEER_NAME")]
     pub peer_name: String,
 }
 

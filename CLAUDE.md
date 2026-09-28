@@ -23,7 +23,7 @@ Linux native builds need `OPUS_TARGET=ubuntu-24.04_x86_64` (`cargo xtask` sets i
 
 ```sh
 cargo xtask build | install | macos | windows | android | logs --follow
-cargo xtask deploy [--windows-only|--linux-only] [--no-restart]   # ship to Lightmoon, restart there
+cargo xtask deploy [--windows-only|--linux-only] [--no-restart]   # ship to the Windows peer (.env), restart there
 cargo xtask live-test [--seconds N] [--yes]                       # PASS/FAIL over both real machines
 ```
 

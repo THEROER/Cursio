@@ -21,6 +21,7 @@
 
 mod container;
 mod deploy;
+mod dotenv;
 mod livetest;
 mod logscan;
 mod remote;
@@ -255,6 +256,7 @@ impl BinArg {
 }
 
 fn main() -> Result<()> {
+    dotenv::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env"));
     let cli = Cli::parse();
     match cli.command {
         Command_::Build { target, debug, bin } => build_target(target, !debug, bin),
