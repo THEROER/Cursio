@@ -23,6 +23,11 @@
 //!
 //! Root hubs (`usb1`, `usb2`, …) are devices too, and are excluded — exporting
 //! one hands over every port on the controller.
+//!
+//! So are devices on `vhci-hcd`: those are peers' devices attached here, and
+//! they appear in the same directory as any plugged-in one. Offering them
+//! announced a borrowed phone to the mesh as this machine's own, under the id
+//! its real host already offers it by.
 
 use std::path::{Path, PathBuf};
 
@@ -72,7 +77,7 @@ impl LinuxUsb {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             // Interfaces carry a colon; only whole devices can be exported.
-            if name.contains(':') {
+            if name.contains(':') || is_attached_from_a_peer(&entry.path()) {
                 continue;
             }
             match read_device(&entry.path(), &name) {
@@ -86,6 +91,16 @@ impl LinuxUsb {
         devices.sort_by(|a, b| a.busid.cmp(&b.busid));
         Ok(devices)
     }
+}
+
+/// Whether this entry's link leads under the `vhci-hcd` controller, which is
+/// where every device attached from a peer lives.
+fn is_attached_from_a_peer(entry: &Path) -> bool {
+    std::fs::read_link(entry).is_ok_and(|target| {
+        target
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with("vhci_hcd"))
+    })
 }
 
 /// Read one device directory, or `None` when it is not a device at all.
@@ -423,5 +438,26 @@ mod tests {
         let order: Vec<&str> = devices.iter().map(|d| d.busid.as_str()).collect();
 
         assert_eq!(order, ["1-5", "2-1", "5-4"]);
+    }
+
+    /// A peer's phone attached here sits under `vhci_hcd` and is the peer's
+    /// to offer, not this machine's.
+    #[test]
+    fn a_device_attached_from_a_peer_is_not_offered_as_local() {
+        let fs = FakeSysfs::new();
+        phone(&fs);
+        let borrowed = fs.root().join("platform/vhci_hcd.0/usb7/7-1");
+        std::fs::create_dir_all(&borrowed).expect("vhci dir");
+        for (file, value) in [("idVendor", "2717"), ("idProduct", "ff08")] {
+            std::fs::write(borrowed.join(file), value).expect("attr");
+        }
+        std::os::unix::fs::symlink(&borrowed, fs.root().join("7-1")).expect("link");
+
+        let devices = LinuxUsb::rooted_at(fs.root())
+            .devices()
+            .expect("enumerates");
+        let busids: Vec<&str> = devices.iter().map(|d| d.busid.as_str()).collect();
+
+        assert_eq!(busids, ["1-5"]);
     }
 }

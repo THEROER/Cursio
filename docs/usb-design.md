@@ -286,7 +286,9 @@ Two facts shape the backend:
   binding needs root — a polkit action per bind, not a daemon running as root.
 - The kernel's control surface is **sysfs**, not the `usbip` CLI, whose output
   is formatted for people and has changed between releases. `usbip` reads sysfs
-  itself; so does this.
+  itself; so does this. Devices under `vhci_hcd` are left out of the listing:
+  they are peers' devices attached here, and offering them re-announced a
+  borrowed phone as this machine's own.
 - The kernel already tracks whether an exported device is in use and publishes
   it (`SDEV_ST_AVAILABLE`, `SDEV_ST_USED`, `SDEV_ST_ERROR` in
   `linux/usbip.h`). Lease state is read from there rather than mirrored in a
