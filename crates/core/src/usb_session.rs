@@ -605,7 +605,12 @@ impl SessionModule for UsbEngine {
     fn handle_message(&mut self, msg: &Message) -> bool {
         let decoded: Option<UsbMsg> = match msg.decode_module(ModuleId::USB) {
             Ok(decoded) => {
-                if decoded.is_some() {
+                // Only a device's own stream means a device is in use. The
+                // list, claims and refusals are bookkeeping, and a peer asks
+                // again for a device it was refused every minute — the same
+                // minute a switch waits for quiet — so counting them held an
+                // update back for good on a machine lending nothing at all.
+                if matches!(decoded, Some(UsbMsg::Data { .. })) {
                     crate::update::quiet::note_usb_activity();
                 }
                 decoded
