@@ -329,14 +329,28 @@ pub fn handover(component: &str) -> Option<PathBuf> {
     target.is_file().then_some(target)
 }
 
-/// Start `target` with this process's arguments and return; the caller exits.
+/// Run `target` with this process's arguments in this process's place.
+///
+/// Unix replaces the process image, so the PID a supervisor started is the one
+/// that keeps running. Starting a child and exiting instead looks, to systemd,
+/// like the service ending: it stops the unit and kills the child it just
+/// gained, so a node started through the stable copy never came up. Windows
+/// has no exec; there a detached child is started and the caller exits.
 pub fn hand_over(target: &Path) -> std::io::Result<()> {
     let mut command = std::process::Command::new(target);
     command
         .args(std::env::args_os().skip(1))
         .env(HANDED_OVER_ENV, "1");
-    super::apply::detach(&mut command);
-    command.spawn().map(drop)
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec())
+    }
+    #[cfg(not(unix))]
+    {
+        super::apply::detach(&mut command);
+        command.spawn().map(drop)
+    }
 }
 
 fn platform_root() -> Option<PathBuf> {
