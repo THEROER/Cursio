@@ -28,7 +28,8 @@ launched on.**
 
 ## What it is not
 
-- Not a remote desktop — a window is transferred, not a screen
+- Not a remote desktop — you work on a peer by moving the cursor onto its own
+  screen; windows and screens cross the link only as pictures
 - Not application or process migration — the app never leaves its host
 - Not virtualization
 - Not built for the Internet or NAT traversal (LAN only in v0.x)
@@ -41,7 +42,7 @@ launched on.**
 |---|---|---|---|---|---|---|---|---|---|
 | **Linux** (Wayland, X11) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Windows 11** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **macOS 13+** | ✅ | ✅ | ✅ | ❌ | serve only | ❌ | serve only | ❌ | ✅ |
+| **macOS 13+** | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | serve only | ❌ | ✅ |
 | **Android** (arm64) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 - **Linux**: capture goes through the `InputCapture` portal + libei on
@@ -55,12 +56,13 @@ launched on.**
   need the bundled driver (`native/cursio-vad`). Cursio asks for UAC at
   start, since Windows silently drops input injected into elevated windows;
   declining leaves everything else working.
-- **macOS**: a Mac can host a window but cannot yet display a peer's, and it
-  serves its own volumes but cannot mount a peer's. Input needs the
+- **macOS**: a Mac can host a window but cannot yet display a peer's, refuses
+  peers' remote-screen requests, and serves its own volumes but cannot mount a
+  peer's. Input needs the
   Accessibility permission, window capture the Screen Recording one.
-- **Android**: the mesh core only — pairing, links, node status. It joins
-  the mesh and shows its battery and network to peers; no module has an
-  Android backend yet.
+- **Android**: the mesh core only — it pairs, holds links and appears as a
+  peer. No module has an Android backend yet, and its battery and network are
+  not read yet either (peers see them as unknown, not as zero).
 
 ## Core concepts
 
@@ -80,7 +82,8 @@ event queued mid-file-transfer jumps ahead of that transfer's remaining chunks.
 
 **Input is relative.** Mouse motion crosses the wire as `dx`/`dy`, never as an
 absolute position — absolute positioning teleports the cursor and breaks games
-reading raw input. System shortcuts such as Alt-Tab stay local.
+reading raw input. Keys cross the same way, so while you drive a peer its own
+shortcuts (Alt+Tab included) act there.
 
 **A drag is the only way to start a window transfer.** There is no flag for it,
 so nothing is ever transferred by accident. Receiving stays passive: a peer's
@@ -120,9 +123,13 @@ session. A wrong password yields two *different* keys rather than an error, so a
 explicit key-confirmation step follows; only after it is the peer stored. Later
 runs skip pairing (`peer already trusted`), so a plain `mesh` is enough.
 
+With a node already running, `cursio pair` pairs without a password: it shows a
+one-time code, and `cursio pair <CODE>` (or entering it in the app) on the other
+machine within five minutes completes it.
+
 Identity and trusted peers are persisted under the platform config directory
-(`~/.config/cursio` on Linux, `%APPDATA%\cursio` on Windows, `~/Library/
-Application Support/cursio` on macOS).
+(`~/.config/cursio` on Linux, `%APPDATA%\cursio\cursio\config` on Windows,
+`~/Library/Application Support/dev.cursio.cursio` on macOS).
 
 ## CLI
 
@@ -139,8 +146,9 @@ cursio portal install  # (Linux) make Cursio the ScreenCast portal for --remote-
 
 What `mesh` runs comes from `config.toml` (`cursio config` prints its path);
 every flag overrides the file for that run only, so each module switch comes as
-a pair (`--audio` / `--no-audio`). Settings changed while the node runs apply
-to live links without a restart.
+a pair (`--audio` / `--no-audio`). Settings changed while the node runs are
+renegotiated on the live links; the few that cannot be are reported as waiting
+for the next restart.
 
 | Flag | Effect |
 |---|---|
@@ -185,6 +193,7 @@ decoder; if that host goes away, the rest recompute placement and one takes over
 | `--airplay <MODE>` | `on`/`control` (default) takes part; a profile such as `1440p:30fps` raises the mesh's quality request; `off` steps out of hosting |
 | `--airplay-window` | Show the mirrored screen on *this* machine, even when another hosts the receiver |
 | `--airplay-port <port>` | Change the control port |
+| `--airplay-interface <addr>` | Pin AirPlay's mDNS to the LAN interface with this address |
 | `--share-airplay` | When hosting, offer the mirrored screen to every peer rather than only those asking for a window |
 
 The picture appears wherever you started it: the hosting peer forwards the H.264
@@ -215,6 +224,7 @@ triples each build needs:
 ```sh
 cargo xtask build              # release build of supported binaries for this host
 cargo xtask install            # build + copy cursio, clipd, cursio-app to ~/.local/bin
+cargo xtask run                # build and run `cursio mesh --send-input --clipboard`, restarting on crash
 cargo xtask windows            # cross-compile the .exe(s) from Linux (MSVC)
 cargo xtask macos              # build on a Mac
 cargo xtask android            # the mesh core for arm64 (needs ANDROID_NDK_HOME, cargo-ndk)
@@ -267,7 +277,8 @@ Every binary logs to **both** the console and a rotating file:
 - **Console** (stderr): coloured, `info` by default
 - **File**: plain, `debug` by default, rotated daily, under the platform data
   dir — `~/.local/share/cursio/logs/` on Linux,
-  `%APPDATA%\cursio\cursio\data\logs` on Windows
+  `%APPDATA%\cursio\cursio\data\logs` on Windows,
+  `~/Library/Application Support/dev.cursio.cursio/logs` on macOS
 
 Override the levels:
 
@@ -310,7 +321,8 @@ Platform crates are **mechanism**; the matching `*_session.rs` in `core` is
 `docs/*.md` are the source of truth for their subsystems: [mesh](docs/mesh-design.md),
 [platform](docs/platform-design.md), [input](docs/input-design.md),
 [audio](docs/audio-design.md), [clipboard](docs/clipboard-design.md),
-[window transfer](docs/window-transfer-design.md).
+[window transfer](docs/window-transfer-design.md), [USB](docs/usb-design.md),
+[updates](docs/update-design.md), [live testing](docs/live-test.md).
 
 ## Limitations (v0.x)
 
@@ -328,7 +340,8 @@ for screen-sharing apps, AirPlay receiver, signed self-update, the mesh core
 on Android.
 
 **Next** — displaying a peer's window on macOS, macOS audio and mounts,
-Android modules (input, clipboard, files), VideoToolbox encoding, compositor
+Android modules (input, clipboard, files) and battery/network status,
+VideoToolbox encoding, compositor
 integrations.
 
 ## License
