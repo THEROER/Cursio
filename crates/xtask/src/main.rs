@@ -307,9 +307,7 @@ fn build(release: bool, only: Option<BinArg>, target: Option<&str>) -> Result<()
     if release {
         cmd.arg("--release");
     }
-    for b in &selected {
-        cmd.args(["-p", b.package]);
-    }
+    add_packages(&mut cmd, &selected)?;
     if let Some(t) = target {
         cmd.args(["--target", t]);
     }
@@ -323,6 +321,38 @@ fn build(release: bool, only: Option<BinArg>, target: Option<&str>) -> Result<()
     run(cmd).context("cargo build failed")?;
     println!("✓ built into {}", out_dir(release, target).display());
     Ok(())
+}
+
+/// Name the packages to build, preparing what `cursio-app` embeds.
+///
+/// The app compiles its frontend into the binary, so a stale or missing
+/// `ui/.output/public` ships a stale or empty window: it is regenerated first.
+fn add_packages(cmd: &mut Command, selected: &[&Binary]) -> Result<()> {
+    for b in selected {
+        cmd.args(["-p", b.package]);
+    }
+    if selected.iter().any(|b| b.bin == "cursio-app") {
+        generate_app_ui()?;
+    }
+    Ok(())
+}
+
+/// Build the app's static frontend with bun, as `tauri.conf.json` expects.
+fn generate_app_ui() -> Result<()> {
+    let Some(bun) = which("bun") else {
+        bail!(
+            "bun not found; cursio-app embeds its frontend and bun builds it. \
+             Install it with: curl -fsSL https://bun.sh/install | bash"
+        );
+    };
+    let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/ui");
+    println!("→ generating the cursio-app frontend");
+    let mut install = Command::new(&bun);
+    install.arg("install").current_dir(&ui);
+    run(install).context("bun install in app/ui failed")?;
+    let mut generate = Command::new(&bun);
+    generate.args(["run", "generate"]).current_dir(&ui);
+    run(generate).context("generating the cursio-app frontend failed")
 }
 
 /// The arguments `cursio` gets when the user names none.
@@ -528,9 +558,7 @@ fn windows(release: bool) -> Result<PathBuf> {
     if release {
         cmd.arg("--release");
     }
-    for b in &selected {
-        cmd.args(["-p", b.package]);
-    }
+    add_packages(&mut cmd, &selected)?;
     cmd.args(["--target", WINDOWS_TARGET]);
     // The prebuilt libopus for Windows; without this the crate tries to compile
     // it from source under the cross toolchain.

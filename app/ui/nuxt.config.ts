@@ -20,7 +20,7 @@ export default defineNuxtConfig({
     // own console, so keep Vite's overlay from covering the app.
     server: { strictPort: true },
   },
-  devServer: { host: "127.0.0.1", port: 3000 },
+  devServer: { host: "127.0.0.1", port: 1430 },
   i18n: {
     // No prefixes: this is an app window, not a site — there are no URLs to
     // share and nothing should depend on the locale being in the path.

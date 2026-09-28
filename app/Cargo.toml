@@ -7,6 +7,14 @@ edition.workspace = true
 name = "cursio-app"
 path = "src/main.rs"
 
+[features]
+# Serve the bundled `ui/.output/public` instead of `devUrl`. Default-on because
+# xtask builds with plain cargo: without it Tauri builds in dev mode and the
+# window loads whatever answers on `devUrl` — another project's dev server, if
+# one is running. `tauri dev` switches it off itself.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2.0.0-beta.18" }
 

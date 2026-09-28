@@ -5,7 +5,7 @@
   "build": {
     "beforeDevCommand": "bun run --cwd ui dev",
     "beforeBuildCommand": "bun run --cwd ui generate",
-    "devUrl": "http://127.0.0.1:3000",
+    "devUrl": "http://127.0.0.1:1430",
     "frontendDist": "ui/.output/public"
   },
   "app": {
