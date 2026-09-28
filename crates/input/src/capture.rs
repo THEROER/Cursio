@@ -11,7 +11,7 @@
 //! Pointer motion is captured as **relative** deltas (`REL_X`/`REL_Y`), matching
 //! the injection side and the "relative, not absolute" design requirement.
 //!
-//! ## No edge crossing, and not for want of trying
+//! ## Edge crossing needs the display server
 //!
 //! Every other backend can say where the pointer is: the Wayland portal fires a
 //! barrier, the Windows hook reads the cursor, the macOS tap carries a point.
@@ -21,12 +21,13 @@
 //! applies acceleration and clamps at the edge, so the sum drifts from the real
 //! position within seconds and never comes back.
 //!
-//! Answering it needs the display server. On X11 that is `XQueryPointer` and a
-//! new dependency; deliberately not taken, because the sessions this backend
-//! actually serves are the ones with no compositor to ask. So the edges channel
-//! here is permanently empty and [`crate::spawn_capture`] says so when it picks
-//! this backend, rather than leaving the user with a cursor that stops dead at
-//! the screen edge and nothing in the log.
+//! On an X11 desktop the X server answers it ([`crate::x11_edges`]): motion is
+//! still read here, and each batch of it while this machine holds the cursor
+//! is followed by a `QueryPointer`. This was once left out as a dependency
+//! nobody's session needed; then an old MacBook whose GPU keeps GDM on Xorg
+//! joined the mesh, and the cursor could reach it and never come back. With no
+//! X server either, the edges channel stays silent and
+//! [`crate::spawn_capture`] says so.
 
 use cursio_protocol::{InputEvent, MouseButton};
 use evdev::{Device, EventSummary, KeyCode, RelativeAxisCode};
@@ -44,6 +45,10 @@ use crate::{CaptureHandle, InputError};
 pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (grab, grab_rx) = crate::GrabControl::new();
+    let (edges_tx, edges_rx) = mpsc::unbounded_channel();
+    // Where the pointer is comes from the X server when there is one; without
+    // it this backend cannot see an edge, and the edges channel stays silent.
+    let motion = crate::x11_edges::spawn(edges_tx, grab_rx.clone());
     let mut opened = Vec::new();
 
     // Enumerate paths, but (re)open each via `Device::open` so we drive the
@@ -77,7 +82,7 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
             }
         };
 
-        match start_reader(device, tx.clone(), grab_rx.clone()) {
+        match start_reader(device, tx.clone(), grab_rx.clone(), motion.clone()) {
             Ok(()) => {
                 tracing::info!(device = %name, ?path, "capturing device");
                 opened.push(name);
@@ -100,11 +105,6 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
         ));
     }
 
-    // No edge detection on evdev, and none coming — see the module header. The
-    // sender is dropped here, so the channel is closed rather than merely
-    // quiet, and the forwarder reading it ends instead of parking forever.
-    let (_edges_tx, edges_rx) = tokio::sync::mpsc::unbounded_channel();
-
     Ok(CaptureHandle {
         events: rx,
         edges: edges_rx,
@@ -123,6 +123,8 @@ fn start_reader(
     device: Device,
     tx: mpsc::UnboundedSender<InputEvent>,
     mut grab_rx: tokio::sync::watch::Receiver<crate::InputMode>,
+    // Pointer motion also goes to the X11 edge watcher, when there is one.
+    motion: Option<std::sync::mpsc::Sender<(i32, i32)>>,
 ) -> Result<(), InputError> {
     let mut stream = device.into_event_stream()?;
     tokio::spawn(async move {
@@ -161,6 +163,9 @@ fn start_reader(
                         }
                     };
                     if let Some(neutral) = translate(event) {
+                        if let (Some(motion), InputEvent::PointerMotion { dx, dy }) = (&motion, neutral) {
+                            let _ = motion.send((dx, dy));
+                        }
                         if !grab_rx.borrow().forwards_events() {
                             continue;
                         }

@@ -22,6 +22,8 @@ ashpd = { version = "0.13", features = ["input_capture"] }
 # tokio: async handshake + event stream (handshake_tokio).
 reis = { version = "0.7", features = ["tokio"] }
 futures-util = "0.3"
+# Where the pointer is on an X11 desktop — the one thing evdev cannot say.
+x11rb.workspace = true
 
 # Windows input injection/capture via SendInput + RawInput.
 [target.'cfg(target_os = "windows")'.dependencies]

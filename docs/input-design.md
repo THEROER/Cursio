@@ -133,13 +133,17 @@ call exists rather than a constructor argument:
 | Windows | a bitmask the low-level mouse hook reads; a hook may not lock |
 | macOS | read from the event tap on every event |
 | Wayland | capture is taken down, barriers placed on every armed edge, capture re-armed — a barrier is a D-Bus object living on one edge |
-| evdev | **cannot**: `REL_X`/`REL_Y` is a device, not a desktop |
+| evdev on X11 | the X server is asked where the pointer is (`QueryPointer`) after motion, while this machine holds the cursor; a push outward at a watched edge is a crossing, and the pointer is warped back inside |
+| evdev, no display | **cannot**: `REL_X`/`REL_Y` is a device, not a desktop |
 
-The evdev gap is not an unfinished backend. Summing deltas does not recover the
-pointer position either — the compositor applies acceleration and clamps at the
-edge, so the sum drifts within seconds. Answering it needs the display server,
-and on X11 that means `XQueryPointer` and a dependency; deliberately not taken.
-A non-Wayland Linux session says so at startup and hands over by hotkey.
+evdev alone cannot see an edge: summing deltas does not recover the pointer
+position — the display server applies acceleration and clamps at the edge, so
+the sum drifts within seconds. On X11 the server answers instead
+(`input/src/x11_edges.rs`, x11rb). That was once left out as a dependency no
+session needed, until a 2008 MacBook whose GPU keeps GDM on Xorg joined the mesh
+and the cursor could reach it but never come back. The root window's bounds are
+the desktop's outer edges, as the Windows virtual screen is. With no display
+server at all the session says so at startup and hands over by hotkey.
 
 ## Several peers: one mouse, one hub
 

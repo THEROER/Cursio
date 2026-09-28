@@ -95,3 +95,6 @@ clap = { version = "4", features = ["derive"] }
 hostname = "0.4"
 libc = "0.2"
 windows-sys = "0.61"
+# X11 pointer position for edge crossing under evdev capture. Pure Rust, and
+# already in the tree through the clipboard's arboard.
+x11rb = "0.13"

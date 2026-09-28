@@ -35,6 +35,8 @@ pub mod win_cursor;
 mod win_keymap;
 #[cfg(target_os = "linux")]
 pub mod wl_capture;
+#[cfg(target_os = "linux")]
+mod x11_edges;
 
 #[cfg(target_os = "linux")]
 pub use lin_cursor::LinuxCursor;
@@ -71,8 +73,8 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
 /// On **Wayland** we can't grab `/dev/input` usefully, so we use the
 /// `InputCapture` portal + libei ([`wl_capture`]) — which also gives us edge
 /// crossing. On X11 / no display server we fall back to the evdev backend
-/// ([`capture`]), which cannot detect an edge at all. The caller gets the same
-/// [`CaptureHandle`] either way.
+/// ([`capture`]), which sees edges only by asking the X server where the
+/// pointer is. The caller gets the same [`CaptureHandle`] either way.
 #[cfg(target_os = "linux")]
 pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
@@ -82,15 +84,18 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
         wl_capture::spawn_wayland_capture()
     } else {
         // Stated rather than left to be discovered. evdev reports `REL_X`/
-        // `REL_Y` and nothing else, so "the cursor reached the edge" is not a
-        // question this backend can answer — and a mesh where the cursor simply
-        // stops dead at the screen edge, with nothing in the log, is
-        // indistinguishable from one where the peer is misplaced.
+        // `REL_Y` and nothing else, so without an X server to ask "the cursor
+        // reached the edge" is not a question this backend can answer — and a
+        // mesh where the cursor simply stops dead at the screen edge, with
+        // nothing in the log, is indistinguishable from one where the peer is
+        // misplaced.
         tracing::info!("using evdev for capture");
-        tracing::warn!(
-            "this session is not Wayland: edge crossing is unavailable (evdev has no cursor \
-             position), so Ctrl+Alt+G is the only way to hand the cursor over"
-        );
+        if std::env::var_os("DISPLAY").is_none() {
+            tracing::warn!(
+                "no display server: edge crossing is unavailable (evdev has no cursor \
+                 position), so Ctrl+Alt+G is the only way to hand the cursor over"
+            );
+        }
         capture::spawn_capture()
     }
 }

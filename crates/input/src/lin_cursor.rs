@@ -19,10 +19,9 @@
 //! thread-affine and each window already owns a thread) rather than a call to
 //! add here, so this stays an honest no-op until it exists.
 //!
-//! **X11.** XFixes can hide the pointer globally, which would work — but the
-//! evdev backend that serves X11 sessions cannot detect an edge crossing in the
-//! first place (see [`crate::capture`]), so a machine there hands the cursor
-//! over by hotkey alone and a frozen pointer is the least of it.
+//! **X11.** XFixes can hide the pointer globally, which would work, and is not
+//! wired up yet. The edge watcher (`x11_edges`) already moves the pointer off
+//! the edge it left by, so what stays behind is a visible, frozen pointer.
 //!
 //! What actually happens meanwhile: the pointer stops moving, because local
 //! input is grabbed, and stays visible where it stopped. That is stated once in
@@ -38,7 +37,7 @@ use crate::{CursorControl, InputError};
 enum Server {
     /// Wayland: needs a surface Cursio does not have.
     Wayland,
-    /// X11: XFixes could hide it, but this session cannot cross an edge anyway.
+    /// X11: XFixes could hide it; not wired up yet.
     X11,
     /// Neither detected: treat as unsupported.
     Unknown,
