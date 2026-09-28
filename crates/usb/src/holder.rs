@@ -209,8 +209,10 @@ pub fn windows_hold() -> Option<Option<Holder>> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     // Recent entries only: an old veto for a device since released must not
-    // explain today's refusal.
-    let script = "Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='usbipd';\
+    // explain today's refusal. The provider is `usbipd-win`, not the name of
+    // its executable: filtering on `usbipd` matched nothing, so every hold was
+    // reported to the peer as `no such device`.
+    let script = "Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='usbipd-win';\
                   StartTime=(Get-Date).AddMinutes(-1)} -MaxEvents 20 \
                   -ErrorAction SilentlyContinue | ForEach-Object { $_.Message }";
     let log = Command::new("powershell.exe")

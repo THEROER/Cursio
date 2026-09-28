@@ -340,7 +340,8 @@ Pro, `usbipd` answered the import with a bare non-zero status, and the peer was
 told `no such device` about a phone that was plugged in. The reason is only in
 usbipd's event log — `CR_REMOVE_VETOED: PNP_VetoOutstandingOpen`.
 
-`cursio-usb::holder` reads that log after a refusal (never on the listing path;
+`cursio-usb::holder` reads that log (provider `usbipd-win`; filtering on
+`usbipd` matched nothing and hid every hold) after a refusal (never on the listing path;
 it costs a PowerShell start) and, on an outstanding-open veto, reports
 `HeldLocally` with the likeliest holder among running processes — `adb`,
 `scrcpy`, `fastboot`, Phone Link, in that order of blame. Windows will not name
