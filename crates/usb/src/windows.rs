@@ -273,7 +273,18 @@ impl WindowsUsb {
                 self.exe.display()
             )));
         }
-        let output = Command::new(&self.exe).args(args).output().map_err(|e| {
+        let mut command = Command::new(&self.exe);
+        command.args(args);
+        // `state` is polled for the life of the node. A node started from the
+        // app or at login has no console, so without this every poll opens a
+        // console window of its own and the screen flickers.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = command.output().map_err(|e| {
             UsbBackendError::Enumerate(format!("cannot run {}: {e}", self.exe.display()))
         })?;
         if output.status.success() {
