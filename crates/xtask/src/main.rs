@@ -23,6 +23,7 @@ mod deploy;
 mod livetest;
 mod logscan;
 mod remote;
+mod stage;
 #[cfg(target_os = "linux")]
 mod uinput;
 
@@ -198,6 +199,9 @@ enum Command_ {
     Deploy(deploy::DeployArgs),
     /// Measure the two real machines over a window and print PASS/FAIL.
     LiveTest(livetest::LiveTestArgs),
+    /// Put the node and the app in a versioned directory with a manifest,
+    /// ready for `cursio update install`.
+    Stage(stage::StageArgs),
     /// live-test's child that touches the peer mount under a deadline.
     #[command(hide = true)]
     FileProbe {
@@ -262,6 +266,7 @@ fn main() -> Result<()> {
         Command_::Logs { follow } => logs(follow),
         Command_::Deploy(args) => deploy::deploy(args),
         Command_::LiveTest(args) => livetest::live_test(args),
+        Command_::Stage(args) => stage::stage(args),
         Command_::FileProbe { path, seed, remove } => livetest::file_probe(&path, seed, remove),
     }
 }
