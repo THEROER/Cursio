@@ -206,7 +206,7 @@ impl WindowsUsb {
     ///
     /// Unprivileged, so this is safe to call on every listing. The answer is
     /// kept until Windows reports a device arriving or leaving, this backend
-    /// binds or unbinds one, or [`LISTING_TRUSTED_FOR`] passes.
+    /// binds one, or [`LISTING_TRUSTED_FOR`] passes.
     pub fn devices(&self) -> Result<Vec<LocalDevice>, UsbBackendError> {
         let generation = device_changes();
         if let Some(listing) = self.listing.borrow().as_ref() {
@@ -373,13 +373,6 @@ impl WindowsUsb {
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .is_ok_and(|out| out.status.success())
-    }
-
-    /// Stop sharing.
-    pub fn unbind(&self, busid: &str) {
-        if let Err(e) = self.run(&["unbind", "--busid", busid]) {
-            tracing::warn!(busid, error = %e, "could not unbind on windows");
-        }
     }
 
     /// Run `usbipd` and return its stdout.

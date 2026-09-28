@@ -313,6 +313,12 @@ and `--version` succeed as an ordinary user, while `bind` answers "Access
 denied; this operation requires administrator privileges". Reported, never
 escalated.
 
+A device stays bound once bound. Ending a lend closes the loopback connection,
+and usbipd hands the device back to Windows' own driver by itself; a refused
+lend changes nothing either. Unbinding in either case undid the one consent the
+machine gave, so the next lend asked for UAC again — and an unelevated node
+could not unbind at all, and logged that on every retry.
+
 Absence is a first-class state: `advert()` returns `None` when the driver is
 missing, so the module is not negotiated and the log says why.
 

@@ -1001,9 +1001,11 @@ impl UsbBackend for WindowsUsbBackend {
         })?;
 
         // The device is shared; now open the connection that will carry its
-        // transfers. Loopback only — see `cursio_usb::wintunnel`.
+        // transfers. Loopback only — see `cursio_usb::wintunnel`. A refusal
+        // leaves it shared: `bind` is the machine's standing consent, and
+        // unbinding after every failure would spend another UAC prompt on the
+        // next try — or, unelevated, fail and log that too.
         let tunnel = cursio_usb::WinTunnel::connect(&busid).map_err(|e| {
-            self.usbipd.unbind(&busid);
             tracing::warn!(%device, busid, error = %e, "cannot reach the local usbipd server");
             refusal(&e, &busid, self.offers.label(device))
         })?;
@@ -1020,9 +1022,10 @@ impl UsbBackend for WindowsUsbBackend {
             return;
         };
         // Dropping the stream closes the connection, which is how usbipd
-        // learns the attachment is over.
+        // learns the attachment is over and hands the device back to
+        // Windows' own driver. It stays bound, so the next lend needs no
+        // prompt.
         self.streams.retain(|_, held| held.busid != busid);
-        self.usbipd.unbind(&busid);
     }
 
     fn feed(&mut self, stream: UsbStreamId, bytes: &[u8]) -> Result<(), UsbError> {
