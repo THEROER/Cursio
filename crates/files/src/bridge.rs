@@ -78,7 +78,10 @@ pub const BULK_OP_TIMEOUT: Duration = Duration::from_secs(15);
 /// dispatcher a copy of many small files runs at one file per round trip no
 /// matter how much bandwidth is free. Threads waiting on the network cost a
 /// request buffer each and no CPU, which is why the safe error is to have too
-/// many rather than too few.
+/// many rather than too few. That buffer is `fuser`'s, 16 MiB and zeroed, and
+/// it stays cheap only because the node caps glibc's malloc arenas (see
+/// `limit_malloc_arenas` in the `cursio` binary); without the cap every page
+/// of every one of them was resident.
 ///
 /// Shared by both mount implementations because the reasoning is the same on
 /// each: FUSE and WinFsp differ in how the OS asks, not in what it costs us to

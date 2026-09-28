@@ -575,8 +575,44 @@ fn apply_modifier_map(spec: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Keep glibc to a few malloc arenas, before any thread exists.
+///
+/// glibc gives a thread that finds every arena busy a new one, up to eight per
+/// core, and the first large block in a new arena is carved from that arena's
+/// fresh heap and then cleared with `memset` by `calloc` — outside the main
+/// arena it does not trust fresh memory to be zero. `fuser` allocates a zeroed
+/// 16 MiB request buffer on every mount thread, and a mount runs dozens of
+/// threads (`cursio_files::bridge::mount_threads`), so each buffer landed in
+/// an arena of its own and every page of it became resident: 1.5 GB of zeros
+/// on a node with four peer volumes mounted, measured page by page.
+///
+/// With the arenas capped, a new thread shares an existing one, its buffer
+/// does not fit that arena's top and is served by a fresh `mmap`, which
+/// `calloc` knows is zero and leaves untouched — resident only where a request
+/// actually lands. Measured with sixteen threads each holding one such buffer:
+/// 258 MB by default, 49 MB with four arenas. Four rather than one because the
+/// input, audio and video threads allocate on their hot paths, and one lock
+/// for all of them would trade memory for contention.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    // SAFETY: mallopt only adjusts allocator parameters; called before any
+    // other thread is started, so nothing is allocating concurrently.
+    if unsafe { libc::mallopt(libc::M_ARENA_MAX, 4) } == 0 {
+        eprintln!("warning: glibc refused M_ARENA_MAX; mount threads may hold 16 MiB each");
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    limit_malloc_arenas();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("cannot start the async runtime: {e}"))?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     // The portal backend's screen chooser is this executable in a child
     // process (see `linux_chooser`); it takes no flags a user would type.
     #[cfg(target_os = "linux")]
