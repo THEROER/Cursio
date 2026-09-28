@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { LpAlert, LpButton, LpCard, LpIcon, LpSection } from "@leavepulse/ui"
 import type { Position } from "~/composables/useNode"
 
 const { t } = useI18n()

@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core"
-import { LpButton, LpCard, LpSection, LpSwitch } from "@leavepulse/ui"
 
 const { t } = useI18n()
 const { status, restart } = useNode()

@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { LpAlert, LpBadge, LpButton, LpTabs } from "@leavepulse/ui"
 
 const { t } = useI18n()
 const route = useRoute()

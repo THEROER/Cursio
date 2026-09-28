@@ -5,13 +5,9 @@ import tailwindcss from "@tailwindcss/vite"
 export default defineNuxtConfig({
   ssr: false,
   compatibilityDate: "2026-07-29",
-  // The kit's own Nuxt module (which would auto-register every `Lp*`
-  // component) needs `@nuxt/kit` resolvable from the kit's directory, and the
-  // local checkout we depend on does not carry it — it is a peer dep supplied
-  // by whichever app consumes the kit, and a `file:` dependency resolves from
-  // its real path rather than ours. Components are imported explicitly instead,
-  // which the kit's README documents as the other supported way and which also
-  // keeps the bundle to what this screen actually uses.
+  // `modules/leavepulse-ui` is picked up on its own: it registers every `Lp*`
+  // component and the kit's theme engine, which is what `@leavepulse/ui/nuxt`
+  // does, run with this app's `@nuxt/kit` (its header says why).
   modules: ["@nuxtjs/i18n"],
   css: ["~/assets/css/main.css"],
   vite: {

@@ -1,13 +1,4 @@
 <script setup lang="ts">
-import {
-  LpAlert,
-  LpBadge,
-  LpButton,
-  LpCard,
-  LpFormField,
-  LpPasswordInput,
-} from "@leavepulse/ui"
-
 const { t } = useI18n()
 const { status, linkLost, isConnected, isBusy, connect, click, surface } = useTouchpad()
 
