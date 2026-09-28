@@ -209,9 +209,12 @@ async fn relay(
     }
 }
 
-/// The `cursio` executable: beside this one when installed together, else
-/// whatever `PATH` finds.
+/// The `cursio` executable: the install's stable copy, which always starts the
+/// current version; else beside this one; else whatever `PATH` finds.
 pub fn node_executable() -> PathBuf {
+    if let Some(stable) = cursio_core::update::layout::stable_executable("cursio") {
+        return stable;
+    }
     let name = if cfg!(windows) {
         "cursio.exe"
     } else {
@@ -222,6 +225,15 @@ pub fn node_executable() -> PathBuf {
         .map(|exe| exe.with_file_name(name))
         .filter(|path| path.exists())
         .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// What to register for the app itself: the stable copy when installed, since
+/// this process may be running from a version directory a prune will remove.
+pub fn app_executable() -> std::io::Result<PathBuf> {
+    match cursio_core::update::layout::stable_executable("cursio-app") {
+        Some(stable) => Ok(stable),
+        None => std::env::current_exe(),
+    }
 }
 
 /// Start a node that outlives this app.

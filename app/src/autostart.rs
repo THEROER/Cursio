@@ -120,7 +120,7 @@ mod platform {
     pub fn set_tray(on: bool) -> Result<(), String> {
         let path = desktop_path()?;
         if on {
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let exe = crate::node::app_executable().map_err(|e| e.to_string())?;
             let entry = format!(
                 "[Desktop Entry]\n\
                  Type=Application\n\
@@ -196,7 +196,7 @@ mod platform {
     }
 
     pub fn set_tray(on: bool) -> Result<(), String> {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = crate::node::app_executable().map_err(|e| e.to_string())?;
         set(
             TRAY_VALUE,
             on.then(|| format!("\"{}\" --hidden", exe.display())),

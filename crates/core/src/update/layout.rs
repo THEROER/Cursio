@@ -295,6 +295,17 @@ impl InstallLayout {
     }
 }
 
+/// The path to register for `component` (autostart, a shortcut): the stable
+/// copy at the root, when there is an install with one.
+pub fn stable_executable(component: &str) -> Option<PathBuf> {
+    let layout = InstallLayout::for_user().ok()?;
+    let manifest = layout.manifest(&layout.current()?).ok()?;
+    let path = layout
+        .root()
+        .join(&manifest.components.get(component)?.path);
+    path.is_file().then_some(path)
+}
+
 /// Started as a stable copy, the path to hand over to: current's `component`.
 ///
 /// `None` means "run as you are" — not started from the root, no current

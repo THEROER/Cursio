@@ -32,6 +32,17 @@ fn app_platform() -> &'static str {
 }
 
 fn main() {
+    // Started as the install's stable copy: run the current version instead.
+    if let Some(target) = cursio_core::update::layout::handover("cursio-app") {
+        match cursio_core::update::layout::hand_over(&target) {
+            Ok(()) => return,
+            Err(e) => eprintln!(
+                "could not start {}: {e}; running this copy",
+                target.display()
+            ),
+        }
+    }
+
     // Console (info) + rotating file (debug) logging, shared with the CLI.
     // `_log` must outlive the UI — dropping it flushes the log file.
     let _log = cursio_core::logging::init("cursio-app");
