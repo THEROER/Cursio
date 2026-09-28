@@ -339,10 +339,21 @@ per-application audio, clipboard, file sharing, USB sharing, remote screens
 for screen-sharing apps, AirPlay receiver, signed self-update, the mesh core
 on Android.
 
-**Next** — displaying a peer's window on macOS, macOS audio and mounts,
-Android modules (input, clipboard, files) and battery/network status,
-VideoToolbox encoding, compositor
-integrations.
+**Next** — displaying a peer's window on macOS, macOS audio, Android modules
+(input, clipboard, files) and battery/network status, VideoToolbox encoding,
+compositor integrations.
+
+**Mounting a peer's disks on macOS** — through a localhost NFSv3 server inside
+Cursio, mounted by the system's own NFS client, rather than through FUSE:
+nothing to install, no kernel extension, every macOS version. The FUSE routes
+are all worse today: `fuser` is untested on macOS and lost its mount path in
+macFUSE 5.3; macFUSE's kext needs Reduced Security set from Recovery on Apple
+Silicon; its kext-free FSKit backend exposes no FUSE device fd (only the
+still-changing `MFMount.framework`), mounts only under `/Volumes`, and is
+slower; FUSE-T replaces libfuse rather than exposing an fd, and is free only
+for personal use. First step: confirm a non-root mount of a localhost NFS
+export on a Mac. Fallback if that fails: a `fuser` transport over
+`MFMount.framework`, macOS 26 only.
 
 ## License
 
