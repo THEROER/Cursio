@@ -162,7 +162,11 @@ fn relaunch_as_admin() -> Result<bool, String> {
         lpParameters: PCWSTR(params.as_ptr()),
         // An elevated process cannot share an unelevated console, so the copy
         // always gets a new one; it is shown only if this one had one to show.
-        nShow: if has_console() { SW_SHOWNORMAL.0 } else { SW_HIDE.0 },
+        nShow: if has_console() {
+            SW_SHOWNORMAL.0
+        } else {
+            SW_HIDE.0
+        },
         ..Default::default()
     };
 
