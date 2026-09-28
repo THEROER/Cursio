@@ -14,6 +14,12 @@
 /// Starting the node and the tray at login.
 #[cfg(desktop)]
 mod autostart;
+/// Installed versions and rolling back to the previous one.
+#[cfg(desktop)]
+mod install;
+/// The node's and this app's log, for the window's log drawer.
+#[cfg(desktop)]
+mod logs;
 /// The line to the running node.
 mod node;
 /// Driving a peer's cursor from a touch surface — the phone-as-touchpad half.
@@ -109,6 +115,9 @@ fn main() {
             node::commands::node_start,
             autostart::commands::autostart_get,
             autostart::commands::autostart_set,
+            install::commands::install_status,
+            install::commands::install_rollback,
+            logs::commands::log_tail,
         ]);
 
     #[cfg(mobile)]
