@@ -87,6 +87,59 @@ pub struct Config {
     pub airplay: AirPlayConfig,
     pub input: InputConfig,
     pub files: FilesConfig,
+    pub update: UpdateConfig,
+}
+
+/// How this machine takes new builds that reach it over the mesh. Read again
+/// at every decision, so a change here needs no restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub policy: UpdatePolicy,
+    pub channel: UpdateChannel,
+    /// Machines whose builds this one accepts on the `dev` channel, each
+    /// pinned to the signing key it had when it was trusted.
+    pub trusted_builders: Vec<TrustedBuilder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdatePolicy {
+    /// Install, then switch at the first quiet moment.
+    Auto,
+    /// Install, then wait for the user to say when.
+    Ask,
+    /// Neither fetch nor install; still hand builds on to peers.
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// Only builds signed with a release key.
+    Stable,
+    /// Release builds, plus builds from a trusted builder.
+    Dev,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedBuilder {
+    pub peer: cursio_protocol::PeerId,
+    /// What the machine was called when it was trusted; for the reader only.
+    pub name: String,
+    /// Its Ed25519 public key, hex.
+    pub key: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            policy: UpdatePolicy::Ask,
+            channel: UpdateChannel::Stable,
+            trusted_builders: Vec::new(),
+        }
+    }
 }
 
 /// Which modules this node offers. A module is still negotiated per link; off
@@ -154,6 +207,7 @@ impl Default for Config {
             airplay: AirPlayConfig::default(),
             input: InputConfig::default(),
             files: FilesConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -375,6 +429,21 @@ mod tests {
 
     fn parse(text: &str) -> Config {
         Config::parse(text, Path::new("test.toml")).unwrap()
+    }
+
+    #[test]
+    fn a_machine_asks_before_updating_and_follows_stable_unless_told_otherwise() {
+        let c = parse("");
+        assert_eq!(c.update.policy, UpdatePolicy::Ask);
+        assert_eq!(c.update.channel, UpdateChannel::Stable);
+        let c = parse(
+            "[update]\npolicy = \"auto\"\nchannel = \"dev\"\n\
+             [[update.trusted_builders]]\npeer = \"00000000-0000-0000-0000-000000000000\"\n\
+             name = \"nocturne\"\nkey = \"ab\"\n",
+        );
+        assert_eq!(c.update.policy, UpdatePolicy::Auto);
+        assert_eq!(c.update.channel, UpdateChannel::Dev);
+        assert_eq!(c.update.trusted_builders[0].name, "nocturne");
     }
 
     #[test]

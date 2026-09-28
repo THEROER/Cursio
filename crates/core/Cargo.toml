@@ -49,6 +49,9 @@ cursio-usb = { workspace = true, optional = true }
 zstd = "0.13"
 # Build manifests: every installed file is checked against its sha256.
 sha2.workspace = true
+# Builds arriving from the mesh are signed; a peer being paired is not enough
+# to replace the program.
+ed25519-dalek.workspace = true
 # Clipboard sharing: the platform layer (read/write/watch) the session module
 # drives on a worker thread. Same crate `clipd` uses, so the two compose for
 # free — content received from a peer lands on the local clipboard.

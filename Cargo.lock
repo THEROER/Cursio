@@ -1156,6 +1156,7 @@ dependencies = [
  "cursio-usb",
  "cursio-window",
  "directories",
+ "ed25519-dalek",
  "hostname",
  "libc",
  "rand",

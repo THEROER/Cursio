@@ -16,6 +16,7 @@ pub mod apply;
 pub mod cli;
 pub mod layout;
 pub mod manifest;
+pub mod sign;
 
 use std::path::Path;
 
