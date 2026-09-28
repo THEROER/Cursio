@@ -1782,7 +1782,10 @@ const RESTARTED_ENV: &str = "CURSIO_RESTARTED";
 /// retries its bind while the port is released.
 async fn restart_process(reason: &str) -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let exe = std::env::current_exe()?;
+    let exe = match cursio_core::update::layout::restart_target("cursio") {
+        Some(current) => current,
+        None => std::env::current_exe()?,
+    };
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     tracing::info!(reason, exe = %exe.display(), "restarting");
     #[cfg(unix)]

@@ -329,6 +329,30 @@ pub fn handover(component: &str) -> Option<PathBuf> {
     target.is_file().then_some(target)
 }
 
+/// What an installed node restarting itself should run: current's `component`.
+///
+/// A restart is how a node picks up a version made current while it ran —
+/// the app says so when the two differ. Re-running its own executable instead
+/// started the very version it was leaving, from under `versions/`, however
+/// many times the user pressed restart. `None` for a node not running from
+/// the install (a development build restarts as itself) or when current has
+/// no such component.
+pub fn restart_target(component: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    InstallLayout::for_user()
+        .ok()?
+        .restart_target(&exe, component)
+}
+
+impl InstallLayout {
+    /// [`restart_target`] for a process running `exe`.
+    fn restart_target(&self, exe: &Path, component: &str) -> Option<PathBuf> {
+        self.version_of(exe)?;
+        let target = self.executable(&self.current()?, component).ok()?;
+        target.is_file().then_some(target)
+    }
+}
+
 /// Run `target` with this process's arguments in this process's place.
 ///
 /// Unix replaces the process image, so the PID a supervisor started is the one
@@ -548,6 +572,26 @@ mod tests {
         let mut left = layout.installed();
         left.sort();
         assert_eq!(left, ["1", "2", "3", "5"]);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The app tells the user to restart when current moved under a running
+    /// node; restarting has to land on current, not on the version it left.
+    #[test]
+    fn an_installed_node_restarts_into_current_not_itself() {
+        let base = scratch("restart");
+        let layout = InstallLayout::at(base.join("root"));
+        layout.install(&stage(&base, "1", "one")).unwrap();
+        layout.install(&stage(&base, "2", "two")).unwrap();
+        layout.activate("1").unwrap();
+        let running = layout.executable("1", "cursio").unwrap();
+        layout.activate("2").unwrap();
+        let target = layout.restart_target(&running, "cursio").unwrap();
+        assert_eq!(fs::read_to_string(target).unwrap(), "two");
+        // A build outside the install restarts as itself.
+        assert!(layout
+            .restart_target(&base.join("target/release/cursio"), "cursio")
+            .is_none());
         fs::remove_dir_all(&base).unwrap();
     }
 
