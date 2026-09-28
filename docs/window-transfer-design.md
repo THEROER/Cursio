@@ -221,7 +221,11 @@ What the loop moves today (`frame_pipeline::AdaptiveQuality`):
 
 The backlog is sent-minus-acked counted in frames: the pipeline numbers a
 frame only once the capture queue has taken it, so a refused update never
-reads as one the link failed to carry. An ack no newer than the last, or
+reads as one the link failed to carry. Only frames queued more than 100 ms
+before the ack count (`IN_FLIGHT_GRACE`): encode, wire, decode, paint and the
+ack's return keep four or five frames of a healthy 60 fps stream in flight,
+and counting them cut the bitrate to its floor exactly when motion was
+smoothest. An ack no newer than the last, or
 numbered past anything the capture sent (a leftover of the previous stream),
 is ignored rather than read as the link calming down.
 - **The lossy stream's bitrate** (`BitrateLadder`, 2026-09-27), as a

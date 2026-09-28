@@ -273,6 +273,22 @@ impl ThresholdLadder {
     }
 }
 
+/// How long a frame may take from the queue to the viewer's screen and back
+/// as an ack before it counts as backlog.
+///
+/// Counting every unacked frame read an ordinary 60 fps stream as congested:
+/// encode, the wire, decode, the paint and the ack's return are 50–80 ms
+/// between them, which is four or five frames in flight on a link with room
+/// to spare — past [`BACKLOG_HIGH`] on every ack. The ladders then pulled the
+/// bitrate to its floor precisely when motion was smoothest, and a slower
+/// source with the same latency kept its quality. Measured in time, the same
+/// latency means the same thing at any frame rate.
+const IN_FLIGHT_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Queue times remembered, by `seq` modulo this; a frame whose slot has been
+/// reused is counted as late, which a viewer this far behind is anyway.
+const SENT_TIMES_KEPT: usize = 256;
+
 /// What the ack path keeps between acks, behind one lock.
 #[derive(Debug, Default)]
 struct AckState {
@@ -307,6 +323,10 @@ pub struct AdaptiveQuality {
     /// When the capture thread last encoded video, in milliseconds since
     /// `epoch`; how the ladder tells an idle source from a congested link.
     last_video_ms: std::sync::atomic::AtomicU64,
+    /// When each recent frame was queued: `seq` in the high half, milliseconds
+    /// since `epoch` in the low, in slot `seq % SENT_TIMES_KEPT`. Atomics for
+    /// the same reason as the rest: the capture thread writes one per frame.
+    sent_at: Box<[std::sync::atomic::AtomicU64]>,
     epoch: std::time::Instant,
 }
 
@@ -318,6 +338,9 @@ impl Default for AdaptiveQuality {
             bitrate_pct: std::sync::atomic::AtomicU32::new(BitrateLadder::START_PCT),
             acks: std::sync::Mutex::new(AckState::default()),
             last_video_ms: std::sync::atomic::AtomicU64::new(0),
+            sent_at: (0..SENT_TIMES_KEPT)
+                .map(|_| std::sync::atomic::AtomicU64::new(u64::MAX))
+                .collect(),
             epoch: std::time::Instant::now(),
         }
     }
@@ -335,6 +358,35 @@ impl AdaptiveQuality {
         let ms = self.epoch.elapsed().as_millis() as u64;
         self.last_video_ms
             .store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The capture thread just queued frame `seq`.
+    pub fn note_queued(&self, seq: u32, now: std::time::Instant) {
+        let ms = now.saturating_duration_since(self.epoch).as_millis() as u32;
+        self.sent_at[seq as usize % SENT_TIMES_KEPT].store(
+            (seq as u64) << 32 | ms as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Frames after `acked_seq` up to `sent_seq` the viewer has had
+    /// [`IN_FLIGHT_GRACE`] to show and has not.
+    ///
+    /// A frame with no queue time on record counts as late: nothing but its
+    /// age could excuse it.
+    fn late_frames(&self, acked_seq: u32, sent_seq: u32, now: std::time::Instant) -> u32 {
+        let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u32;
+        let grace = IN_FLIGHT_GRACE.as_millis() as u32;
+        let fresh = (acked_seq.wrapping_add(1)..=sent_seq)
+            .rev()
+            .take(SENT_TIMES_KEPT)
+            .filter(|&seq| {
+                let slot = self.sent_at[seq as usize % SENT_TIMES_KEPT]
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                (slot >> 32) as u32 == seq && now_ms.wrapping_sub(slot as u32) < grace
+            })
+            .count() as u32;
+        (sent_seq - acked_seq) - fresh
     }
 
     /// Whether video went out recently enough for acks to say anything about
@@ -369,7 +421,8 @@ impl AdaptiveQuality {
     /// capture has queued up to `sent_seq`.
     ///
     /// The gap is counted in frames because the pipeline numbers only frames
-    /// it actually queued (see [`CapturePipeline`]). An ack that is not news
+    /// it actually queued (see [`CapturePipeline`]), and only frames older
+    /// than [`IN_FLIGHT_GRACE`] count. An ack that is not news
     /// is ignored: one no newer than an earlier ack says nothing the ladders
     /// have not already acted on, and one newer than anything sent belongs to
     /// a stream numbered before this capture. Neither is a reading of the
@@ -393,7 +446,7 @@ impl AdaptiveQuality {
             return None;
         }
         acks.last_acked = Some(acked_seq);
-        let gap = sent_seq - acked_seq;
+        let gap = self.late_frames(acked_seq, sent_seq, now);
         if let Some(pct) = acks.bitrate.observe(gap, active, now) {
             self.bitrate_pct
                 .store(pct, std::sync::atomic::Ordering::Relaxed);
@@ -823,6 +876,10 @@ impl<S: EncoderSource> CapturePipeline<S> {
         let last = frames.last().map(|f| f.seq);
         try_queue_frames(&self.frames, frames)?;
         if let Some(seq) = last {
+            let now = std::time::Instant::now();
+            for n in self.seq.wrapping_add(1)..=seq {
+                self.quality.note_queued(n, now);
+            }
             self.seq = seq;
             self.last_seq
                 .store(seq, std::sync::atomic::Ordering::Relaxed);
@@ -1267,6 +1324,35 @@ mod differ_tests {
             assert_eq!(ladder.observe(0, later), None);
         }
         assert_eq!(ladder.observe(0, later), Some(ThresholdLadder::MAX_PCT));
+    }
+
+    /// Five frames a 60 fps stream queued in the last 80 ms are what an
+    /// ordinary pipeline has in flight, not a backlog.
+    #[test]
+    fn frames_still_in_flight_are_not_backlog() {
+        let q = AdaptiveQuality::default();
+        let start = std::time::Instant::now();
+        for seq in 1..=6 {
+            q.note_queued(seq, start + std::time::Duration::from_millis(16) * seq);
+        }
+        let now = start + std::time::Duration::from_millis(100);
+        assert_eq!(q.on_ack_at(1, 6, now), None);
+        assert_eq!(
+            q.bitrate_pct.load(std::sync::atomic::Ordering::Relaxed),
+            BitrateLadder::START_PCT
+        );
+    }
+
+    /// The same frames still unshown well past the grace are a backlog.
+    #[test]
+    fn frames_left_unshown_past_the_grace_are_backlog() {
+        let q = AdaptiveQuality::default();
+        let start = std::time::Instant::now();
+        for seq in 1..=6 {
+            q.note_queued(seq, start + std::time::Duration::from_millis(16) * seq);
+        }
+        let now = start + std::time::Duration::from_millis(300);
+        assert_eq!(q.on_ack_at(1, 6, now).map(|(gap, _)| gap), Some(5));
     }
 
     /// An ack that is not news moves nothing: a repeat of the last one, an
