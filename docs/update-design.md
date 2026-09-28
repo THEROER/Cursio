@@ -1,8 +1,9 @@
 # Updating Cursio
 
 How a machine in the mesh gets a new build, switches to it, and gets back off
-it when it is bad. Phase 1 (the local half) is built; phases 2–4 are the
-design they will follow and are **not built yet**.
+it when it is bad. Phase 1 (the local half) and phase 2 (delivery over the
+mesh) are built; phases 3–4 are the design they will follow and are **not
+built yet**.
 
 ## What was wrong with "copy the new exe over"
 
@@ -107,57 +108,86 @@ window flashes up either.
 
 **Stopping in phase 1 is blunt on Windows.** `--stop` sends SIGINT on Unix,
 which the node shuts down cleanly on. Windows has no signal for a process
-without a console, so it terminates the process. Phase 2 replaces this with a
-request over the control socket that lets the node choose its moment.
+without a console, so it terminates the process. A node switching itself
+(phase 2) first waits for a quiet moment, which is what makes that tolerable;
+a stop request over the control socket, letting it tell its peers first, is
+not built.
 
-## Phase 2: delivery over the mesh (not built)
+## Phase 2: delivery over the mesh (built)
 
 The mesh is already a trusted, encrypted channel between exactly the machines
-that need the build. An update should ride it rather than SSH, and should not
-need the internet.
+that need the build, so an update rides it rather than SSH, and needs no
+internet. Code: `protocol/src/update.rs` (the wire), `core/src/update/`
+(`sign`, `store`, `lane`, `agent`, `quiet`).
 
-**Offer, then pull.** A node with a newer build announces it (version, channel,
-per-platform manifest); a peer that wants it pulls the files at `Bulk`
-priority, so a 30 MB executable queues behind the cursor like any file chunk.
-A node offers only builds it holds for the peer's platform — Nocturne cannot
-build a macOS binary, so it offers the Windows one it staged and nothing else.
+**The exchange survives version skew.** A `PROTOCOL_VERSION` mismatch used to
+close the link, which meant precisely the machine that needed an update could
+not hear about it. Now every connection opens with a `Preamble` in the update
+lane's own encoding: magic `CUPD`, a lane byte that is always `1`, a kind byte,
+then fields laid out by hand — integers big-endian, strings as a `u32` length
+and bytes. Tests pin those bytes, and `Message::Update` keeps variant index 17
+while `Message::Hello` keeps 0. Both sides learn each other's version from the
+preamble; equal versions go on to `Hello`, different ones skip it, encrypt with
+the pair's stored key, and carry the lane alone (`lane::run_alone`) until
+neither side has anything left to say. The lane grows by new kinds, which old
+builds skip; an existing kind never changes. The one gap is history: a build
+from before v19 opens with its old `Hello`, is recognised by it, and has to be
+updated by hand once.
 
-**The exchange must survive version skew.** Today a `PROTOCOL_VERSION` mismatch
-closes the link, which means precisely the machine that needs an update cannot
-hear about it. The update exchange is therefore frozen: a tiny vocabulary
-(`have <version> <platform> <manifest digest>`, `want`, chunks) that never
-changes shape, carried when `Hello` versions disagree instead of a hard close.
-A mismatched link carries that and nothing else.
+**Offer, then pull, a window at a time.** A node offers every build it holds
+(`store/<version>/offer` plus the platforms it has in full) when a link comes
+up and again every 30 s. A receiver that wants one asks for 1 MiB of a file at
+a time and gets it in 256 KiB chunks at `Bulk` priority, so a build queues
+behind the cursor like any file chunk and a sender is never more than one
+window ahead. One build is fetched at a time per machine however many peers
+offer it. Received files go to `store/`, are checked against the signed size
+and sha256, and then installed into `versions/` through phase 1's `install`.
+The store keeps them, so the receiver can serve the next machine; a machine
+fetches only its own platform, and relays what it holds.
 
-**Signatures, not trust in whoever sent it.** A manifest is signed; a peer
-verifies before installing. Two keys:
+**Signatures, not trust in whoever sent it.** What is signed is a `Statement`:
+version, channel, publish time (builds are ordered by it — commits do not
+sort), and every platform's files with size and sha256. Ed25519, two kinds of
+key:
 
-- the **release key** (Ed25519), whose public half is compiled into every
-  build — what GitHub releases and the `stable` channel are signed with;
-- a **builder key**: a machine's identity key that the user explicitly marks,
-  on each receiving machine, as allowed to publish to the `dev` channel.
-  `cargo xtask publish` signs with it. Being a paired peer is not enough —
-  pairing grants input and files, not the right to replace the program.
+- **release keys**, compiled into `sign::RELEASE_KEYS` — they sign `stable`.
+  There are none until phase 3, and a stable channel with no key accepts
+  nothing rather than a placeholder;
+- **builder keys**: each publishing machine makes its own
+  (`update-signing.key` beside its identity). A receiver accepts `dev` builds
+  from it only after `cursio update trust-builder <machine>`, which pins the
+  key it signs with and switches that receiver to `dev`. Being paired is not
+  enough — pairing grants input and files, not the right to replace the
+  program. The key of the last build a machine offered is remembered, so
+  trusting it needs no key copied by hand (`--key` gives it explicitly).
 
-**Applying waits for a quiet moment.** A node applies only when:
+A refused build is a `diagnostics` problem naming the reason, and is asked
+again each time it is offered, so trusting the builder afterwards takes effect
+without a restart.
 
-- the cursor is at home (no peer is being driven through this machine),
-- no program has a call outstanding on a mounted peer volume and none of our
-  volumes is being written by a peer (a restart mid-write is how Steam wedged
-  itself on a WinFsp mount),
-- no AirPlay session is running on this node.
+**Installing is not switching.** Under `[update] policy`:
 
-Before the swap it unmounts peer volumes and tells peers it is leaving, so they
-mark it offline rather than waiting for the heartbeat to time out.
+- `ask` (the default) installs, raises "ready to switch", and waits for the
+  app's button or `update_apply` on the control socket;
+- `auto` installs, then switches at the first quiet moment, checked every 15 s;
+- `never` fetches nothing (and still relays what it holds).
 
-**Policy** per machine, in `config.toml`: `update = "auto" | "ask" | "never"`
-and `channel = "stable" | "dev"`. `ask` shows the offer in the app ("0.4.3 from
-Nocturne") with its changelog and a button; `auto` waits for the quiet moment.
+**Quiet** (`quiet::busy`) means: this machine is not driving a peer's screen,
+and no file-sharing or USB message has crossed any link for 60 s — a restart
+mid-write is how Steam wedged itself on a WinFsp mount. Switching hands over to
+phase 1's helper with the node's own arguments; the helper stops the node
+(SIGINT on Unix, which shuts down cleanly; termination on Windows), flips
+`current`, starts the new build with the old one's elevation, and rolls back
+if it does not answer.
 
-**What it replaces.** `cargo xtask deploy` (SSH, scp, a scheduled task, a
-hashed file name per build) becomes `cargo xtask publish`: stage, sign, and
-offer to the mesh. Lightmoon updates itself. `deploy` stays until this works on
-both machines.
+Not done from the original plan: an AirPlay session does not yet hold the
+switch, and the node does not tell its peers it is leaving before the helper
+stops it — they notice at the heartbeat timeout.
+
+**What it replaces.** `cargo xtask publish` stages this machine's build and the
+Windows one as one version, and the staged node signs them into its own store
+(`cursio update publish`), from which the running node offers them. Lightmoon
+updates itself. `cargo xtask deploy` stays until this has run on both machines.
 
 ## Phase 3: public releases (not built)
 

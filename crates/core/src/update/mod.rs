@@ -1,11 +1,12 @@
 //! Installing, switching and rolling back builds of Cursio on one machine.
 //!
-//! Phase 1 of `docs/update-design.md`: the local half. Builds live side by side
-//! under `versions/<version>/`, a `current` pointer names the one that runs,
-//! `previous` names the one to fall back to, and a helper process flips the
-//! pointer and relaunches the node. Nothing here fetches a build — a directory
-//! produced by `cargo xtask stage` is handed to `cursio update install`. Fetching
-//! from a peer or a release is phase 2.
+//! Phase 1 of `docs/update-design.md` is the local half: builds live side by
+//! side under `versions/<version>/`, a `current` pointer names the one that
+//! runs, `previous` names the one to fall back to, and a helper process flips
+//! the pointer and relaunches the node ([`layout`], [`apply`]). Phase 2 fetches
+//! them from peers: signed ([`sign`]), held and served ([`store`]), exchanged
+//! over a link ([`lane`]), and switched to when policy and a quiet moment
+//! allow ([`agent`], [`quiet`]). Fetching from a public release is phase 3.
 //!
 //! Replacing files in place, the way a single loose `cursio.exe` was updated,
 //! is what this replaces: a running executable is locked on Windows, so every

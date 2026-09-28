@@ -5,9 +5,10 @@
 //! SDK, which is a platform client Cursio has no other use for. Keeping the
 //! same shape keeps the two updaters readable side by side.
 //!
-//! A manifest vouches for files; it does not vouch for itself. Until builds are
-//! signed (phase 2 of `docs/update-design.md`) the trust is the trust in
-//! whoever handed over the directory — today, the developer's own `xtask stage`.
+//! A manifest vouches for files; it does not vouch for itself. A build from
+//! the mesh arrives with a signed statement that covers the manifest too
+//! ([`super::sign`]); a directory handed to `cursio update install` is trusted
+//! as far as whoever handed it over — the developer's own `xtask stage`.
 
 use std::collections::BTreeMap;
 use std::fs;

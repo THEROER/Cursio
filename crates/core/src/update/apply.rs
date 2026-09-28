@@ -216,8 +216,10 @@ pub async fn answers_within(timeout: Duration) -> bool {
 ///
 /// Unix: SIGINT, the Ctrl-C the node already shuts down cleanly on — mounts
 /// released, peers told. Windows has no signal to send a process without a
-/// console, so it is terminated; phase 2 replaces this with a request over the
-/// control socket, which lets the node pick its quiet moment.
+/// console, so it is terminated. A node switching itself has already waited
+/// for a quiet moment (`super::quiet`), which is what makes that tolerable; a
+/// request over the control socket would let it also say goodbye, and is not
+/// built.
 fn stop_process(pid: u32) {
     #[cfg(unix)]
     {
