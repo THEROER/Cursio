@@ -122,10 +122,10 @@ pub struct Link {
 /// with nothing to do in between.
 pub async fn identify<T>(mut transport: T, plan: &Handshake<'_>) -> anyhow::Result<Identified<T>>
 where
-    T: Transport,
+    T: Transport + 'static,
 {
     let advertised = advertise(plan.registry, plan.sends_input);
-    let peer = session::handshake(
+    let peer = match session::handshake(
         &mut transport,
         plan.identity,
         session::local_device_kind(),
@@ -134,7 +134,14 @@ where
         plan.service,
         plan.status,
     )
-    .await?;
+    .await
+    {
+        Ok(peer) => peer,
+        Err(SessionError::UpdateOnly(preamble)) => {
+            return Err(carry_updates_only(transport, plan, preamble).await)
+        }
+        Err(e) => return Err(e.into()),
+    };
     // Derived per link, not per process: four machines in a row each border a
     // different neighbour, and a single machine-wide setting can only ever
     // state one of those answers.
@@ -167,6 +174,55 @@ where
         negotiated,
         peer_edge,
     })
+}
+
+/// A peer on another protocol version: no session, but the update lane, so
+/// whichever of the two is behind can still be handed a build.
+///
+/// Encrypted with the pair's stored key like any link — the lane carries
+/// signed builds, so the signature and not the channel is what vouches for
+/// them, but a stranger on the network still learns nothing and can offer
+/// nothing. Always ends in an error: the caller's link is over either way,
+/// and the mesh dials again later, by which time one of the two may have
+/// switched.
+async fn carry_updates_only<T>(
+    transport: T,
+    plan: &Handshake<'_>,
+    preamble: cursio_protocol::update::Preamble,
+) -> anyhow::Error
+where
+    T: Transport + 'static,
+{
+    let mismatch = format!(
+        "peer {} runs build {} speaking protocol {}, this build speaks {}",
+        preamble.peer_id,
+        preamble.build,
+        preamble.protocol_version,
+        cursio_protocol::PROTOCOL_VERSION
+    );
+    let Some(agent) = crate::update::agent::global() else {
+        return anyhow::anyhow!("{mismatch}; updates are not running on this node");
+    };
+    let trusted = match TrustStore::load() {
+        Ok(store) => store.get(&preamble.peer_id).cloned(),
+        Err(e) => return anyhow::anyhow!("{mismatch}; cannot read the trust store: {e}"),
+    };
+    let Some(trusted) = trusted else {
+        return anyhow::anyhow!("{mismatch}; it is not paired with this machine");
+    };
+    let key = match trusted.shared_key() {
+        Ok(key) => key,
+        Err(e) => return anyhow::anyhow!("{mismatch}; its stored key is unreadable: {e}"),
+    };
+    tracing::info!(peer = %trusted.display_name, %mismatch, "carrying only updates on this link");
+    let secure = match EncryptedTransport::establish(transport, &key, plan.role).await {
+        Ok(secure) => secure,
+        Err(e) => return anyhow::anyhow!("{mismatch}; the encrypted channel failed: {e}"),
+    };
+    match crate::update::lane::run_alone(secure, agent, trusted.display_name.clone()).await {
+        Ok(()) => anyhow::anyhow!("{mismatch}; only updates crossed"),
+        Err(e) => anyhow::anyhow!("{mismatch}; the update lane failed: {e}"),
+    }
 }
 
 /// Pair if this is a first meeting, encrypt, and build the agreed modules.

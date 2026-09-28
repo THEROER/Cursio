@@ -604,7 +604,12 @@ impl SessionModule for UsbEngine {
 
     fn handle_message(&mut self, msg: &Message) -> bool {
         let decoded: Option<UsbMsg> = match msg.decode_module(ModuleId::USB) {
-            Ok(decoded) => decoded,
+            Ok(decoded) => {
+                if decoded.is_some() {
+                    crate::update::quiet::note_usb_activity();
+                }
+                decoded
+            }
             Err(e) => {
                 tracing::warn!(peer = %self.peer_name, error = %e, "undecodable usb message");
                 return true;

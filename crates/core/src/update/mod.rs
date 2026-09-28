@@ -12,11 +12,15 @@
 //! update needed a fresh file name, and "which build is running" became a
 //! question nobody could answer.
 
+pub mod agent;
 pub mod apply;
 pub mod cli;
+pub mod lane;
 pub mod layout;
 pub mod manifest;
+pub mod quiet;
 pub mod sign;
+pub mod store;
 
 use std::path::Path;
 

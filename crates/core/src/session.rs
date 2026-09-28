@@ -658,7 +658,7 @@ pub async fn run_session_live<F, G, H>(
     mut captured: Option<&mut tokio::sync::mpsc::UnboundedReceiver<CapturedInput>>,
     mut on_input: F,
     mut commands: Option<&mut tokio::sync::mpsc::UnboundedReceiver<OwnershipCmd>>,
-    mut on_ownership: G,
+    mut report_ownership: G,
     modules: Vec<Box<dyn crate::module::SessionModule>>,
     mut poll_status: H,
     live: Option<crate::reconfigure::LinkLive<'_>>,
@@ -745,6 +745,14 @@ where
 
     // Ownership: is THIS machine the active one (holds the shared cursor)?
     // Peers start in opposite states so exactly one is active from the outset.
+    // A machine driving a peer's screen is not one to restart for an update:
+    // the user's hand is on this mouse. Every report passes through here, so
+    // the mark follows each change without a line at each call site.
+    let mut driving_mark = crate::update::quiet::DrivingMark::default();
+    let mut on_ownership = |ownership: Ownership| {
+        driving_mark.set(ownership.driving);
+        report_ownership(ownership);
+    };
     let mut role = CursorRole::new(cursor.start_active);
     let mut am_active = role.active();
     on_ownership(Ownership {

@@ -2301,6 +2301,7 @@ impl SessionModule for FilesEngine {
     fn handle_message(&mut self, msg: &Message) -> bool {
         match msg.decode_module::<FilesMsg>(ModuleId::FILES) {
             Ok(Some(msg)) => {
+                crate::update::quiet::note_file_activity();
                 if is_request(&msg) {
                     // Disk work: off to a blocking thread, answered later.
                     self.serve(msg);
