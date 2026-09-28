@@ -234,6 +234,29 @@ pub fn current() -> Autostart {
     }
 }
 
+/// Point whatever is switched on at the executables it should name now.
+///
+/// A registration records a path once, and the right path changes: switched
+/// on before the machine had an install, it names wherever that first binary
+/// was — a downloads folder, since emptied into the trash — and at every login
+/// the service manager started that old build, however many versions were
+/// installed after. Rewritten at each app start, it names the install's stable
+/// copy as soon as there is one. Only what is already on is touched; turning
+/// autostart on stays the user's decision.
+pub fn refresh() {
+    let now = current();
+    if now.node {
+        if let Err(error) = platform::set_node(true) {
+            tracing::warn!(%error, "could not update the node's start-at-login entry");
+        }
+    }
+    if now.tray {
+        if let Err(error) = platform::set_tray(true) {
+            tracing::warn!(%error, "could not update the app's start-at-login entry");
+        }
+    }
+}
+
 pub mod commands {
     use super::*;
 

@@ -105,6 +105,8 @@ fn main() {
     let builder = builder
         .setup(move |app| {
             node::follow(app.handle().clone());
+            // `reg.exe` / `systemctl`: off the thread that draws the window.
+            tauri::async_runtime::spawn_blocking(autostart::refresh);
             if let Err(e) = tray::install(app.handle()) {
                 // No tray (GNOME without the AppIndicator extension) must not
                 // leave an app nobody can reach: show the window instead.
