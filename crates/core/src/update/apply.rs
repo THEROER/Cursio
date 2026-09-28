@@ -201,7 +201,7 @@ pub async fn answers_within(timeout: Duration) -> bool {
     };
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
-        if let Ok(mut client) = transport::connect(&endpoint).await {
+        if let Ok((client, _pushes)) = transport::connect(&endpoint).await {
             let ping = tokio::time::timeout(Duration::from_secs(2), client.request(Command::Ping));
             if let Ok(Ok(Reply::Pong { .. })) = ping.await {
                 return true;
