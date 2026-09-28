@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use cursio_protocol::{
-    DeviceKind, Hello, Message, ModuleAdvert, Negotiated, PeerId, PROTOCOL_VERSION,
+    DeviceKind, Hello, Message, ModuleAdvert, ModuleId, Negotiated, PeerId, PROTOCOL_VERSION,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -538,6 +538,45 @@ impl LatencyWindow {
 pub async fn run_session<F, G, H>(
     transport: Box<dyn Transport>,
     cursor: CursorSetup,
+    captured: Option<&mut tokio::sync::mpsc::UnboundedReceiver<CapturedInput>>,
+    on_input: F,
+    commands: Option<&mut tokio::sync::mpsc::UnboundedReceiver<OwnershipCmd>>,
+    on_ownership: G,
+    modules: Vec<Box<dyn crate::module::SessionModule>>,
+    poll_status: H,
+) -> Result<(), SessionError>
+where
+    F: FnMut(cursio_protocol::InputEvent),
+    G: FnMut(Ownership),
+    H: FnMut() -> Option<cursio_protocol::NodeStatus>,
+{
+    run_session_live(
+        transport,
+        cursor,
+        captured,
+        on_input,
+        commands,
+        on_ownership,
+        modules,
+        poll_status,
+        None,
+    )
+    .await
+}
+
+/// [`run_session`] for a link that follows this node's settings while it runs:
+/// a module switched on or off, a new position, input turned off. See
+/// [`crate::reconfigure`].
+///
+/// Input turned off is the one change the loop itself carries out. The cursor
+/// comes home if it was away, the hotkey and edge crossings are ignored, and a
+/// peer handing this machine the dormant side is refused — being dormant with
+/// nothing to forward would leave this machine's own keyboard grabbed and
+/// going nowhere.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_session_live<F, G, H>(
+    transport: Box<dyn Transport>,
+    cursor: CursorSetup,
     // Borrowed, not owned: the capture that feeds these outlives any single
     // session (it holds a portal permission that must not be re-acquired per
     // connection), so a session reads from them and hands them back.
@@ -547,6 +586,7 @@ pub async fn run_session<F, G, H>(
     mut on_ownership: G,
     modules: Vec<Box<dyn crate::module::SessionModule>>,
     mut poll_status: H,
+    live: Option<crate::reconfigure::LinkLive<'_>>,
 ) -> Result<(), SessionError>
 where
     F: FnMut(cursio_protocol::InputEvent),
@@ -576,7 +616,15 @@ where
             }
         }
     }
-    drop(failures_tx);
+    let (mut reconf, mut settings, mut stopped) = match live {
+        Some(live) => {
+            let (reconf, settings, stopped) = crate::reconfigure::Reconf::new(live);
+            (Some(reconf), Some(settings), Some(stopped))
+        }
+        None => (None, None, None),
+    };
+    // Kept only while modules can still be started on this link.
+    let failures_tx = reconf.as_ref().map(|_| failures_tx);
 
     // Liveness: when did we last hear *anything* from the peer? Any inbound
     // message counts, not just heartbeats — module traffic proves the link just
@@ -590,6 +638,7 @@ where
     // that module and forwards only the session's own vocabulary here, so a
     // flood of file or window traffic never sits between two input events.
     let router = module_host::router_for(&hosts);
+    let reader_router = router.clone();
     let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel();
     let reader_heard = last_heard.clone();
     let reader = tokio::spawn(async move {
@@ -598,7 +647,7 @@ where
         // main task observes as the channel closing (a dropped link).
         while let Ok(msg) = rx.recv().await {
             reader_heard.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-            if let Some(msg) = router.route(msg) {
+            if let Some(msg) = reader_router.route(msg) {
                 if inbound_tx.send((msg, std::time::Instant::now())).is_err() {
                     break; // main task gone
                 }
@@ -714,6 +763,54 @@ where
                 tracing::warn!(module = failure.module, error = %failure.error, "module lost the link; ending session");
                 break Err(SessionError::from(failure.error));
             }
+            latest = settings_changed(&mut settings) => {
+                working_since = Some(tokio::time::Instant::now());
+                let (Some(r), Some(failures_tx)) = (reconf.as_mut(), failures_tx.as_ref()) else {
+                    continue;
+                };
+                let was_on = r.input_on();
+                if let Some((msg, restart)) = r.local(&latest) {
+                    tracing::info!("settings changed; telling the peer");
+                    if let Err(e) = tx.send(&msg).await {
+                        break Err(SessionError::from(e));
+                    }
+                    r.reconcile(
+                        &restart,
+                        false,
+                        crate::reconfigure::Hosts {
+                            hosts: &mut hosts,
+                            router: &router,
+                            tx: &tx,
+                            failures: failures_tx,
+                        },
+                    );
+                }
+                if was_on && !r.input_on() && role.driving() {
+                    // Input switched off while it was driving the peer: bring
+                    // the cursor home, since nothing will be forwarded to
+                    // drive it there any more.
+                    role.seize();
+                    am_active = role.active();
+                    tracing::info!("input sharing turned off; the cursor is back on this machine");
+                    on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
+                    if let Err(e) = tx.send(&Message::Grab { active: false }).await {
+                        break Err(SessionError::from(e));
+                    }
+                }
+            }
+            Some(ids) = stopped_maybe(&mut stopped) => {
+                if let (Some(r), Some(failures_tx)) = (reconf.as_mut(), failures_tx.as_ref()) {
+                    r.stopped(
+                        ids,
+                        crate::reconfigure::Hosts {
+                            hosts: &mut hosts,
+                            router: &router,
+                            tx: &tx,
+                            failures: failures_tx,
+                        },
+                    );
+                }
+            }
             cmd = recv_maybe(&mut commands) => {
                 working_since = Some(tokio::time::Instant::now());
                 match cmd {
@@ -730,6 +827,11 @@ where
                     // into — the machine stops responding to its own keyboard,
                     // and the only thing that could give control back is the
                     // peer that was never able to take it.
+                    Some(OwnershipCmd::Toggle | OwnershipCmd::HandoffToPeer { .. })
+                        if !sharing_input(&reconf) =>
+                    {
+                        tracing::debug!("input sharing is off; the cursor stays on this machine");
+                    }
                     Some(OwnershipCmd::Toggle) if !cursor.peer_takes_cursor => {
                         tracing::info!(
                             "ignoring the ownership hotkey: this peer cannot hold the cursor"
@@ -808,7 +910,7 @@ where
                     // what lets a second keyboard stay usable on its own
                     // machine while the first drives across.
                     Some(event) => {
-                        if role.driving() {
+                        if role.driving() && sharing_input(&reconf) {
                             // `captured` is an Option<&mut _>, so reborrow through
                             // it rather than handing over an &mut &mut.
                             if let Err(e) =
@@ -861,6 +963,11 @@ where
                             "peer claimed the cursor but is not a machine that can hold one; ignoring"
                         );
                     }
+                    Some(Message::Grab { active: false }) if !sharing_input(&reconf) => {
+                        tracing::info!(
+                            "peer took the cursor, but input sharing is off here; this machine keeps its own"
+                        );
+                    }
                     Some(Message::Grab { active }) => {
                         // The peer is handing the cursor to us (active=true) or
                         // taking it (active=false). Adopt the state it dictates;
@@ -898,6 +1005,30 @@ where
                     Some(Message::Bye) => {
                         tracing::info!("peer sent Bye; closing session");
                         break Err(SessionError::PeerLeft);
+                    }
+                    Some(Message::Reconfigure(change)) => {
+                        tracing::info!(
+                            modules = change.modules.len(),
+                            position = ?change.position,
+                            restart = ?change.restart,
+                            "peer changed its settings"
+                        );
+                        match (reconf.as_mut(), failures_tx.as_ref()) {
+                            (Some(r), Some(failures_tx)) => {
+                                let restart = r.peer(change);
+                                r.reconcile(
+                                    &restart,
+                                    true,
+                                    crate::reconfigure::Hosts {
+                                        hosts: &mut hosts,
+                                        router: &router,
+                                        tx: &tx,
+                                        failures: failures_tx,
+                                    },
+                                );
+                            }
+                            _ => tracing::debug!("this link follows no settings; keeping what it agreed"),
+                        }
                     }
                     // Module traffic never gets here — the reader routes it — so
                     // this is something neither side's session speaks.
@@ -1119,6 +1250,36 @@ async fn recv_maybe<T>(
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Whether this side forwards its input on the link. A link that follows no
+/// settings always does, as it always has.
+fn sharing_input(reconf: &Option<crate::reconfigure::Reconf<'_>>) -> bool {
+    reconf.as_ref().is_none_or(|r| r.input_on())
+}
+
+/// The next batch of modules whose old instance finished stopping; pending
+/// forever on a link that follows no settings.
+async fn stopped_maybe(
+    channel: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Vec<ModuleId>>>,
+) -> Option<Vec<ModuleId>> {
+    match channel {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when this node's settings change. A node shutting down drops the
+/// sender, which is not a change, so that pends too.
+async fn settings_changed(
+    settings: &mut Option<tokio::sync::watch::Receiver<crate::live::LiveSettings>>,
+) -> crate::live::LiveSettings {
+    if let Some(rx) = settings {
+        if rx.changed().await.is_ok() {
+            return rx.borrow_and_update().clone();
+        }
+    }
+    std::future::pending().await
 }
 
 /// Run the session loop, ignoring any inbound input events.

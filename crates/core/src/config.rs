@@ -16,18 +16,20 @@
 //! which is why the booleans come in `--audio`/`--no-audio` pairs rather than
 //! as one switch that is false when absent.
 //!
-//! A flag stays pinned for the life of the process, including across the
-//! restart a changed file triggers, so the status API reports which fields
-//! are pinned: a toggle in the app that changes nothing is otherwise a bug
-//! report.
+//! A flag stays pinned for the life of the process, so the status API reports
+//! which fields are pinned: a toggle in the app that changes nothing is
+//! otherwise a bug report.
 //!
-//! ## Why a restart and not a live reload
+//! ## Applied live, not by restarting
 //!
-//! Most of these are read once where they are expensive to change: capture
-//! holds a portal permission that must not be re-requested per change, module
-//! factories are negotiated into every open link, the listener owns its port.
-//! Re-running the node from the top is the one reload that is exactly as
-//! correct as a fresh start, and a mesh reconnects in seconds by design.
+//! A changed file is applied to the running node ([`crate::live`]): a module
+//! switched off stops on every link and nothing else does. This used to
+//! restart the process, on the grounds that a fresh start is the one reload
+//! guaranteed correct — but a restart drops every link, unmounts the peer's
+//! disks and, on Windows, asks for elevation again, all for one toggle. The
+//! few settings that really are read once (the port, AirPlay, the
+//! remote-screen portal) are named in the status as waiting for a restart
+//! the user asks for.
 //!
 //! ## The files share policy
 //!
@@ -337,7 +339,7 @@ pub const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 /// config other than `running`.
 ///
 /// Only a change in the *effective* config counts: rewriting the file with
-/// the same content, or changing a field a flag pins, restarts nothing. A
+/// the same content, or changing a field a flag pins, changes nothing. A
 /// file that stops parsing is logged and waited out rather than acted on —
 /// the user is most likely halfway through editing it.
 pub async fn wait_for_change(path: &Path, overrides: &Overrides, running: &Config) -> Config {

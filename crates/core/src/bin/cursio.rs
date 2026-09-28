@@ -30,11 +30,12 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
+use cursio_core::live::Shared;
 use cursio_core::node_status::NodeStatusMonitor;
 use cursio_core::pairing_window::PairingWindow;
 use cursio_core::session::{self};
 use cursio_core::NodeIdentity;
-use cursio_protocol::{Fitness, PeerId, Quality, ServiceId, ServiceOffer};
+use cursio_protocol::{Fitness, ModuleId, PeerId, Quality, ServiceId, ServiceOffer};
 use cursio_transport::discovery;
 use cursio_transport::discovery::DiscoveryConfig;
 use cursio_transport::pairing::{Role, TrustStore};
@@ -626,36 +627,79 @@ async fn main() -> anyhow::Result<()> {
             let MeshArgs {
                 pair,
                 pair_addr,
-                files_share,
+                files_share: files_share_flag,
                 ..
             } = args;
             let pairing = PairingWindow::closed();
-            let running = config.clone();
+            // What a change in the app reaches without a restart: the
+            // switches and settings every link follows, and the options the
+            // factories read when they build a module.
+            let live = cursio_core::live::LiveConfig::new(&config);
+            let screen_host = Shared::new(config.modules.screen_host);
+            let files_share =
+                Shared::new(share_policy(&files_share_flag, config.files.share.clone())?);
+            let render_device = Shared::new(config.audio.render_device.clone());
+            let applier: cursio_core::control::Applier = {
+                let live = live.clone();
+                let screen_host = screen_host.clone();
+                let files_share = files_share.clone();
+                let render_device = render_device.clone();
+                std::sync::Arc::new(move |running, next| {
+                    let mut plan = cursio_core::live::plan(running, next);
+                    if let Some(on) = plan.screen_host {
+                        screen_host.set(on);
+                    }
+                    if plan.files_share_changed {
+                        // A `--files-share` flag replaces the file's policy for
+                        // this run, so the file changing changes nothing.
+                        if files_share_flag.is_empty() {
+                            match share_policy(&files_share_flag, next.files.share.clone()) {
+                                Ok(policy) => files_share.set(policy),
+                                Err(error) => {
+                                    tracing::warn!(%error, "keeping the running share policy");
+                                    plan.restart.retain(|id| *id != ModuleId::FILES);
+                                }
+                            }
+                        } else {
+                            plan.restart.retain(|id| *id != ModuleId::FILES);
+                        }
+                    }
+                    if let Some(device) = &plan.render_device {
+                        render_device.set(device.clone());
+                    }
+                    if let Some(spec) = &plan.mac_modifiers {
+                        if let Err(error) = apply_modifier_map(spec) {
+                            tracing::warn!(%error, "keeping the running modifier map");
+                        }
+                    }
+                    tracing::info!(
+                        switches = ?plan.switches,
+                        position = ?plan.position,
+                        input = ?plan.input,
+                        restart = ?plan.restart,
+                        "config changed; applying it to the running node"
+                    );
+                    live.apply(&plan);
+                })
+            };
             let control = cursio_core::control::NodeState::new(
                 &identity,
                 config_path.clone(),
                 overrides.clone(),
-                running.clone(),
+                config.clone(),
                 pairing.clone(),
+                applier,
             );
             start_control(control.clone());
             let cursio_core::config::Config {
                 port,
-                position: at,
                 modules,
-                audio: audio_config,
                 airplay: airplay_config,
                 input: input_config,
-                files: files_config,
+                ..
             } = config;
             let send_input = modules.input;
-            let audio = modules.audio;
-            let audio_render_device = audio_config.render_device;
-            let clipboard = modules.clipboard;
-            let files = modules.files;
-            let usb = modules.usb;
             let remote_screen = modules.remote_screen;
-            let no_screen_host = !modules.screen_host;
             let share_airplay = airplay_config.share;
             let airplay = airplay_config.mode;
             let airplay_window = airplay_config.window;
@@ -718,14 +762,9 @@ async fn main() -> anyhow::Result<()> {
             // The CLI's only job for modules is to build the registry; from here
             // on nothing names a specific module.
             let modules = module_registry(
-                &AudioOpts {
-                    audio,
-                    audio_render_device,
-                },
-                clipboard,
-                files,
-                share_policy(&files_share, files_config.share)?,
-                usb,
+                render_device,
+                files_share,
+                live.switches(),
                 WindowOpts {
                     airplay: airplay_tap.clone().map(|tap| {
                         cursio_core::window_session::AirPlayShare {
@@ -736,7 +775,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }),
                     remote_screen,
-                    screen_host: !no_screen_host,
+                    screen_host,
                     screen_hub: start_screen_portal(remote_screen),
                 },
                 ServiceSetup {
@@ -766,7 +805,7 @@ async fn main() -> anyhow::Result<()> {
                 identity.clone(),
                 port,
                 send_input,
-                at,
+                live,
                 modules,
                 pairing,
                 offer,
@@ -800,22 +839,36 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await
             };
-            let reason = tokio::select! {
-                result = node => return result,
-                changed = cursio_core::config::wait_for_change(&config_path, &overrides, &running) => {
-                    tracing::info!(
-                        modules = ?changed.modules,
-                        position = ?changed.position,
-                        "config changed; restarting the node to apply it"
-                    );
-                    "config changed"
+            // The file changing under the node — a text editor, a script — is
+            // applied the way a change from the app is. The app's own changes
+            // are applied before its reply and come back through here as no
+            // change at all.
+            let watcher = control.clone();
+            tokio::spawn(async move {
+                loop {
+                    let running = watcher.running();
+                    let next = cursio_core::config::wait_for_change(
+                        watcher.config_path(),
+                        watcher.overrides(),
+                        &running,
+                    )
+                    .await;
+                    let waiting = watcher.apply(next);
+                    if !waiting.is_empty() {
+                        tracing::warn!(
+                            settings = ?waiting,
+                            "these settings changed and apply only after a restart"
+                        );
+                    }
                 }
+            });
+            tokio::select! {
+                result = node => return result,
                 _ = control.restart_requested() => {
                     tracing::info!("restart requested over the control socket");
-                    "asked to"
                 }
             };
-            restart_process(reason).await
+            restart_process("asked to").await
         }
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Portal { action } => portal(action).await,
@@ -875,8 +928,9 @@ struct WindowOpts {
     airplay: Option<cursio_core::window_session::AirPlayShare>,
     /// `--remote-screen`: offer each peer's screen to capture apps here.
     remote_screen: bool,
-    /// `!--no-screen-host`: let peers view this machine's screen.
-    screen_host: bool,
+    /// `!--no-screen-host`: let peers view this machine's screen. Shared, so
+    /// the app can change it on a running node.
+    screen_host: Shared<bool>,
     /// Where the portal backend's requests reach the links (Linux).
     screen_hub: Option<cursio_core::screen_hub::ScreenHub>,
 }
@@ -1312,50 +1366,43 @@ fn prompt_password(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
 
-/// Audio-share options for a session. When `audio` is set, audio runs as a
-/// session module multiplexed onto the same encrypted channel as input: it no
-/// longer replaces input sharing. Symmetric, like everything else in the mesh —
-/// each node captures its own output and plays what it receives.
-#[derive(Clone)]
-struct AudioOpts {
-    audio: bool,
-    /// Windows: render the peer's audio into this output device (by name).
-    audio_render_device: Option<String>,
-}
-
-/// Everything this node can run, assembled once from the CLI flags.
+/// Everything this node can run, assembled once at startup.
 ///
 /// This is the only place that names the concrete modules. Adding one means
 /// adding a factory here — not an `if` in the session path, a `#[cfg]` block, or
 /// another parameter threaded through `run_pairing_and_session`.
+///
+/// Every factory is registered as able to run; whether the user wants it is
+/// `switches`, which the app flips on a running node. A module switched on
+/// later needs its factory to be here already.
 ///
 /// Input is deliberately absent: it is not a `SessionModule` at all, but stays
 /// hard-wired in `run_session` because its ownership/grab/edge logic is
 /// intertwined with the loop state. It is still *advertised* (see
 /// `advertise_with_input`), because the peer needs to know we have it.
 fn module_registry(
-    audio: &AudioOpts,
-    clipboard: bool,
-    files: bool,
-    files_share: cursio_files::SharePolicy,
-    usb: bool,
+    // Windows: render the peer's audio into this output device (by name).
+    render_device: Shared<Option<String>>,
+    files_share: Shared<cursio_files::SharePolicy>,
+    switches: cursio_core::module::ModuleSwitches,
     window: WindowOpts,
     services: ServiceSetup,
 ) -> cursio_core::module::ModuleRegistry {
     // Said once at startup rather than left to a peer that agreed to run audio
     // and then hears nothing: a flag that does nothing has to say so.
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    if audio.audio {
+    if switches.is_on(ModuleId::AUDIO) {
         tracing::warn!("no audio backend on this platform; --audio is not advertised to peers");
     }
 
     cursio_core::module::ModuleRegistry::new()
+        .with_switches(switches)
         .with(Box::new(cursio_core::audio_session::AudioFactory {
-            enabled: audio.audio,
-            render_device: audio.audio_render_device.clone(),
+            enabled: true,
+            render_device,
         }))
         .with(Box::new(cursio_core::clipboard_session::ClipboardFactory {
-            enabled: clipboard,
+            enabled: true,
         }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,
@@ -1377,13 +1424,13 @@ fn module_registry(
         // reach them either — with `--files` accepted and silently doing
         // nothing.
         .with(Box::new(cursio_core::files_session::FilesFactory {
-            enabled: files,
+            enabled: true,
             share: files_share,
         }))
         // Like files, a machine both offers its own ports and attaches a
         // peer's. The factory carries the node-level state every link shares,
         // which is why it is constructed rather than built from fields.
-        .with(Box::new(cursio_core::usb_session::UsbFactory::new(usb)))
+        .with(Box::new(cursio_core::usb_session::UsbFactory::new(true)))
 }
 
 /// Run as a mesh node: listen and dial trusted peers simultaneously, forever.
@@ -1401,7 +1448,7 @@ async fn run_mesh(
     identity: NodeIdentity,
     port: u16,
     send_input: bool,
-    position: cursio_protocol::Position,
+    live: cursio_core::live::LiveConfig,
     modules: cursio_core::module::ModuleRegistry,
     pairing: PairingWindow,
     offer: ServiceOffer,
@@ -1485,7 +1532,7 @@ async fn run_mesh(
                             control.clone(),
                             capture.clone(),
                             status.clone(),
-                            position,
+                            live.clone(),
                             modules.clone(),
                             offer,
                         );
@@ -1556,7 +1603,7 @@ async fn run_mesh(
                                     control.clone(),
                                     capture.clone(),
                                     status.clone(),
-                                    position,
+                                    live.clone(),
                                     modules.clone(),
                                     offer,
                                 );
@@ -1596,7 +1643,7 @@ async fn run_mesh(
                                 control.clone(),
                                 capture.clone(),
                                 status.clone(),
-                                position,
+                                live.clone(),
                                 modules.clone(),
                                 offer,
                             );
@@ -1731,8 +1778,9 @@ fn spawn_peer_session(
     // Machine-wide too, and for the same reason: every link greets with the
     // same reading, and every link should announce the same change.
     status: SharedNodeStatus,
-    // Where this machine stands, from which the edge to each peer is derived.
-    position: cursio_protocol::Position,
+    // What the user has this node set to, followed by the link while it runs:
+    // where the machine stands, which modules and whether input is on.
+    live: cursio_core::live::LiveConfig,
     // Shared rather than cloned: the registry is built once per process and read
     // by every session. `Rc` because sessions are deliberately single-threaded
     // (see the mesh module's threading note).
@@ -1796,7 +1844,7 @@ fn spawn_peer_session(
             false,
             capture_for_session,
             &status,
-            position,
+            &live,
             &modules,
             offer,
             Some(&mut on_identified),
@@ -1863,10 +1911,11 @@ async fn run_pairing_and_session(
     // Machine-wide power/network state: greeted with, then polled by the
     // session loop so a change reaches every peer.
     status: &SharedNodeStatus,
-    // Where this machine stands. The edge to *this* peer is derived from it and
-    // the peer's own position during the handshake — both the cursor handoff
-    // and the window-drag trigger read that answer back off the link.
-    position: cursio_protocol::Position,
+    // Where this machine stands, which modules the user has on, and whether
+    // input is shared — as of the greeting, and followed while the link runs.
+    // The edge to *this* peer is derived from the two positions; both the
+    // cursor handoff and the window-drag trigger read that answer back.
+    live: &cursio_core::live::LiveConfig,
     // Everything this node can run. Built once by the caller; a session takes
     // what negotiation agreed on. Replaces the five per-module flags that used
     // to be threaded through here.
@@ -1878,15 +1927,21 @@ async fn run_pairing_and_session(
     // for every node, so they live in `link` — the app and a phone run this
     // exact sequence rather than a second copy of it.
     let password = pairing.password();
+    // Subscribed before reading, so a change made while the link comes up is
+    // still seen by the session and sent on.
+    let settings = live.subscribe();
+    let greeted = settings.borrow().clone();
+    let can_send_input = capture.is_some();
+    let sends_input = can_send_input && greeted.input;
     let plan = cursio_core::link::Handshake {
         identity: &identity,
         password: &password,
         role,
         registry: modules,
-        position,
+        position: greeted.position,
         service: offer,
         status: status.borrow().current(),
-        sends_input: capture.is_some(),
+        sends_input,
     };
     let identified = cursio_core::link::identify(transport, &plan).await?;
     // Report who this turned out to be before the slower half runs: for an
@@ -1960,7 +2015,52 @@ async fn run_pairing_and_session(
         },
     );
     let mut secure = link.transport;
-    let modules = link.modules;
+    let built = link.modules;
+    let live_link = cursio_core::reconfigure::LinkLive {
+        registry: modules,
+        local: &identity,
+        peer: peer.clone(),
+        advertised: cursio_core::link::advertise(modules, sends_input),
+        position: greeted.position,
+        settings,
+        can_send_input,
+        on_change: {
+            let control = control.clone();
+            let (id, name) = (peer.peer_id, peer.display_name.clone());
+            Box::new(move |state| {
+                if state.edge_changed {
+                    match state.peer_edge {
+                        Some(edge) => {
+                            tracing::info!(peer = %name, ?edge, "this peer now borders another edge");
+                            cursio_input::set_peer_edge(Some(edge));
+                        }
+                        // Passed over for the reason given where the link came
+                        // up: the watched edge is machine-wide, and another
+                        // peer may still border it.
+                        None => {
+                            tracing::info!(peer = %name, "this peer no longer borders any edge")
+                        }
+                    }
+                }
+                control.link_reconfigured(
+                    &id,
+                    state.peer_position,
+                    state
+                        .negotiated
+                        .agreed
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect(),
+                    state
+                        .negotiated
+                        .skipped
+                        .iter()
+                        .map(|(id, why)| (id.to_string(), why.to_string()))
+                        .collect(),
+                );
+            })
+        },
+    };
 
     // Test mode: stream a synthetic mouse pattern to the peer, then finish.
     // Lets us verify remote injection before the capture side exists.
@@ -2019,7 +2119,7 @@ async fn run_pairing_and_session(
     // so a change reaches all of them.
     let status_ref = status.clone();
     let mut status_cursor = status_ref.borrow().cursor();
-    let result = session::run_session(
+    let result = session::run_session_live(
         secure,
         cursor_setup,
         captured,
@@ -2098,8 +2198,9 @@ async fn run_pairing_and_session(
             set_injecting(release_ref.borrow_mut().as_mut(), ownership.active);
             tracing::info!(active = ownership.active, "ownership changed");
         },
-        modules,
+        built,
         move || status_ref.borrow_mut().poll(&mut status_cursor),
+        Some(live_link),
     )
     .await;
 

@@ -145,6 +145,37 @@ pub trait ModuleFactory: Send + Sync {
     fn build(&self, ctx: &SessionCtx) -> anyhow::Result<Box<dyn SessionModule>>;
 }
 
+/// Which modules the user has switched on, readable from every link at once.
+///
+/// Separate from the factories because it changes while they do not: a
+/// factory says whether a module *can* run here, a switch whether the user
+/// *wants* it to, and the app flips switches on a running node. A module with
+/// no entry is on — the service module has no switch at all.
+///
+/// Shared by `Arc` because the control socket writes it from its own task and
+/// links read it wherever they are being brought up; it holds a handful of
+/// booleans and is never held across an await.
+#[derive(Clone, Default)]
+pub struct ModuleSwitches {
+    on: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<ModuleId, bool>>>,
+}
+
+impl ModuleSwitches {
+    pub fn is_on(&self, id: ModuleId) -> bool {
+        self.read().get(&id).copied().unwrap_or(true)
+    }
+
+    /// Answers whether that changed anything.
+    pub fn set(&self, id: ModuleId, on: bool) -> bool {
+        let mut map = self.on.write().unwrap_or_else(|p| p.into_inner());
+        map.insert(id, on) != Some(on)
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, std::collections::HashMap<ModuleId, bool>> {
+        self.on.read().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 /// Everything this node could run, whether or not any given peer wants it.
 ///
 /// Built once per process. `advertise` is what goes in `Hello`; `build_agreed`
@@ -152,6 +183,7 @@ pub trait ModuleFactory: Send + Sync {
 #[derive(Default)]
 pub struct ModuleRegistry {
     factories: Vec<Box<dyn ModuleFactory>>,
+    switches: ModuleSwitches,
 }
 
 impl ModuleRegistry {
@@ -166,9 +198,28 @@ impl ModuleRegistry {
         self
     }
 
-    /// What to advertise in `Hello`: every module actually available here.
+    /// Read the user's switches from `switches` rather than a private set, so
+    /// whoever holds the same handle turns modules on and off.
+    pub fn with_switches(mut self, switches: ModuleSwitches) -> Self {
+        self.switches = switches;
+        self
+    }
+
+    pub fn switches(&self) -> &ModuleSwitches {
+        &self.switches
+    }
+
+    /// What to advertise in `Hello`: every module available here that the
+    /// user has switched on.
+    ///
+    /// A switched-off factory is not even asked: asking can cost something,
+    /// such as the one-time privilege prompt USB sharing raises.
     pub fn advertise(&self) -> Vec<ModuleAdvert> {
-        self.factories.iter().filter_map(|f| f.advert()).collect()
+        self.factories
+            .iter()
+            .filter(|f| self.switches.is_on(f.id()))
+            .filter_map(|f| f.advert())
+            .collect()
     }
 
     /// Build the modules for one session from what negotiation agreed on.
@@ -180,9 +231,17 @@ impl ModuleRegistry {
         negotiated: &Negotiated,
         ctx: &SessionCtx,
     ) -> Vec<Box<dyn SessionModule>> {
+        self.build(&negotiated.agreed, ctx)
+    }
+
+    /// Build the modules named in `ids`, in registration order.
+    ///
+    /// What a running link calls when renegotiation agrees a module it was
+    /// not running; [`Self::build_agreed`] is the same for a link coming up.
+    pub fn build(&self, ids: &[ModuleId], ctx: &SessionCtx) -> Vec<Box<dyn SessionModule>> {
         let mut built = Vec::new();
         for factory in &self.factories {
-            if !negotiated.is_agreed(factory.id()) {
+            if !ids.contains(&factory.id()) {
                 continue;
             }
             match factory.build(ctx) {

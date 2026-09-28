@@ -415,6 +415,7 @@ mod tests {
             Overrides::default(),
             Config::default(),
             PairingWindow::closed(),
+            std::sync::Arc::new(|_: &Config, _: &Config| {}),
         )
     }
 

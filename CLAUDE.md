@@ -230,7 +230,9 @@ This is the second class of thing on the channel — **state and events of a dev
 
 ### Wire compatibility
 
-Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 17) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
+Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 18) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
+
+Settings changes never restart the node: `Message::Reconfigure` renegotiates a running link and `core/src/live.rs` names what can only apply at the next restart (`restart_needed`). See "Changing settings on a running node" in `docs/mesh-design.md`.
 
 ### Native and tooling directories
 

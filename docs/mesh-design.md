@@ -184,12 +184,51 @@ mac_modifiers = "positional"
 ```
 
 Unknown keys are refused rather than ignored — a misspelt module is otherwise a
-module that silently stays off. A running node polls the file every two seconds
-and, when the *effective* config changes, restarts itself from the top (see
-"Control socket" below): capture, the listener and every link's negotiated
-modules are all settled at startup, and a fresh start is the one reload that is
-exactly as correct as the first. Fields a flag pinned stay pinned across that
-restart and are reported as such.
+module that silently stays off. A change is applied to the running node, not by
+restarting it (next section): the control socket applies it before replying,
+and the node polls the file every two seconds for changes made any other way.
+Fields a flag pinned stay pinned and are reported as such.
+
+## Changing settings on a running node
+
+This used to restart the process: capture, the listener and every link's
+negotiated modules are settled at startup, and a fresh start is the one reload
+guaranteed correct. For a toggle in the app that price was wrong — every link
+dropped, the peer's disks unmounted, and on Windows the new process asked for
+elevation again. Now a change lands where it belongs (`core/src/live.rs`,
+`core/src/reconfigure.rs`):
+
+| Setting | Applied |
+|---|---|
+| `modules.clipboard`, `audio`, `files`, `usb` | live: a switch the registry reads when it advertises, then renegotiated on every link |
+| `position` | live: sent to every peer; both sides re-derive the edge between them |
+| `modules.input` off | live: input stops being forwarded and a cursor that was away comes home |
+| `modules.input` on | live when capture exists (input was on at startup); otherwise at the next restart |
+| `modules.screen_host`, `files.share`, `audio.render_device` | live: the module that read it at build time is restarted on both ends of every link |
+| `input.mac_modifiers` | live: the keymap is replaced |
+| `port`, `modules.remote_screen`, `airplay.*` | **restart**: the listener owns the port, the portal backend claims a D-Bus name, the receiver binds and announces at startup |
+
+A running link renegotiates with `Message::Reconfigure` (protocol v18): the
+sender's full advert set and position, plus any modules to restart. Both sides
+recompute `negotiate` from the latest adverts each holds of the other, stop
+what is no longer agreed, and start what now is; input, the cursor and every
+other module carry on. The sender announces *before* it starts anything, at
+control priority, and the reader holds messages for a module that is not
+running yet, because the peer's first message for a new module can be routed
+before the loop has read the announcement. A module being restarted is not
+started again until its old instance has shut down — two files modules would
+mount the peer's volumes twice.
+
+With input off, the loop ignores the hotkey and edge crossings, forwards
+nothing, and refuses a peer handing it the dormant side: dormant with nothing
+to forward would leave this machine's own keyboard grabbed and going nowhere.
+The peer then holds its cursor too, which is what two machines that share no
+input look like.
+
+What is still waiting for a restart is reported as `restart_needed` — in the
+status and in every save reply — measured against the config the process
+started with, so undoing a change takes it off the list. The node never
+restarts unasked; the app offers the `restart` command.
 
 ## Control socket
 
@@ -209,8 +248,9 @@ latency, `diagnostics` problems, the pairing window), `config`, `set_config`,
 `pairing`, `restart`. No pushed events — clients poll `status`.
 
 Changes go through `config.toml` rather than around it, so there is one path
-for every change and the file always says what runs; the reply names any field
-a flag pins. The mesh loop is `!Send`, so it *publishes* a snapshot every sweep
+for every change and the file always says what runs; the change is applied
+before the reply, which names any field a flag pins and any setting that waits
+for a restart. The mesh loop is `!Send`, so it *publishes* a snapshot every sweep
 and each link reports itself up and down; the socket's handler only reads that.
 A second node for the same user finds the socket answering and runs without
 one, rather than being refused — two nodes on one machine on different ports is

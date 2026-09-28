@@ -63,8 +63,10 @@ pub use window::{
 /// [`Hello::service`] so placement and quality are agreed across the mesh. v17
 /// added [`Hello::status`] and [`Message::NodeStatus`], which every node both
 /// reports and reads — it is not a module precisely so that it cannot be
-/// negotiated away.
-pub const PROTOCOL_VERSION: u16 = 17;
+/// negotiated away. v18 added [`Message::Reconfigure`], which lets a module
+/// toggle or a new position reach a running link instead of restarting the
+/// node.
+pub const PROTOCOL_VERSION: u16 = 18;
 
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
@@ -218,6 +220,19 @@ pub enum Message {
     // `ModuleId::CLIPBOARD`, carrying `clipboard::ClipboardMsg`. It was migrated
     // first because it is pure bulk — no per-frame hot path to pay an extra
     // serialize on. See `docs/platform-design.md`.
+    /// The sender's configuration changed and the link stays up: it now
+    /// offers `modules` and stands at `position`.
+    ///
+    /// Everything [`Hello`] settled that a user can change from the app, sent
+    /// again instead of tearing the link down to greet anew. Both sides
+    /// renegotiate from the latest adverts each has of the other, start what
+    /// became agreed, stop what stopped being agreed, and leave the shared
+    /// cursor and every other module exactly as they were. See
+    /// `docs/mesh-design.md`, "Changing settings on a running node".
+    ///
+    /// Appended rather than placed beside `Hello`: variants are encoded by
+    /// index, and every one after an insertion would change its number.
+    Reconfigure(Reconfigure),
 }
 
 /// Payload of [`Message::Hello`].
@@ -262,6 +277,21 @@ pub struct Hello {
     /// [`NodeStatus::unknown`], which reads as "no information" rather than as
     /// a flat battery. See [`node`].
     pub status: NodeStatus,
+}
+
+/// Payload of [`Message::Reconfigure`]: the parts of [`Hello`] a running node
+/// can change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reconfigure {
+    /// Everything the sender now offers, in full — not a delta, so a message
+    /// that crossed another in flight still leaves both sides agreeing.
+    pub modules: Vec<ModuleAdvert>,
+    pub position: Position,
+    /// Modules to stop and start again on both sides even though they stay
+    /// agreed, because a setting they read when built changed. Restarting only
+    /// one side would leave the other mid-conversation with a module that
+    /// forgot it.
+    pub restart: Vec<ModuleId>,
 }
 
 impl Hello {
@@ -323,7 +353,11 @@ impl Message {
             // before the peer acts on stale state — a node announcing it just
             // went critical while queued behind a file transfer has said
             // nothing useful.
-            | Message::NodeStatus(_) => Priority::Control,
+            | Message::NodeStatus(_)
+            // Must reach the peer before the first message of a module it
+            // starts, or that message arrives for a module not yet running
+            // there and is dropped.
+            | Message::Reconfigure(_) => Priority::Control,
 
             // The pointer/keyboard. The one thing that must never feel laggy.
             Message::Input(_) | Message::WindowInput(_) => Priority::Input,
@@ -373,6 +407,7 @@ impl Message {
             | Message::Heartbeat { .. }
             | Message::Bye
             | Message::NodeStatus(_)
+            | Message::Reconfigure(_)
             | Message::Opaque(_)
             | Message::Input(_)
             | Message::Grab { .. }
@@ -552,6 +587,20 @@ mod tests {
         ] {
             assert_eq!(session.module_id(), None, "{session:?} is the session's");
         }
+    }
+
+    /// A reconfiguration is the session's, travels as control, and survives
+    /// the wire whole — a dropped `restart` would leave a module half-rebuilt.
+    #[test]
+    fn a_reconfiguration_roundtrips_as_session_control() {
+        let msg = Message::Reconfigure(Reconfigure {
+            modules: vec![ModuleAdvert::symmetric(ModuleId::FILES, 4)],
+            position: Position::new(-1, 0),
+            restart: vec![ModuleId::WINDOW],
+        });
+        assert_eq!(msg.module_id(), None);
+        assert_eq!(msg.priority(), Priority::Control);
+        assert_eq!(Message::from_bytes(&msg.to_bytes().unwrap()).unwrap(), msg);
     }
 
     /// A stand-in for a module's own enum — the point being that `Message` has

@@ -2476,8 +2476,9 @@ fn sanitize_node(s: &str) -> String {
 pub struct AudioFactory {
     pub enabled: bool,
     /// Windows: render the peer's audio into the output device whose name
-    /// contains this.
-    pub render_device: Option<String>,
+    /// contains this. Shared so a change reaches the next engine built; the
+    /// node restarts the module on every link to make that now.
+    pub render_device: crate::live::Shared<Option<String>>,
 }
 
 /// Whether this build has an audio backend at all.
@@ -2503,7 +2504,7 @@ impl crate::module::ModuleFactory for AudioFactory {
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         Ok(Box::new(AudioEngine::new(
             ctx.local.peer_id,
-            self.render_device.clone(),
+            self.render_device.get(),
             ctx.peer_name().to_string(),
         )))
     }

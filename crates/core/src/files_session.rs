@@ -2357,8 +2357,11 @@ pub struct FilesFactory {
     /// What this machine offers its peers. [`SharePolicy::everything`] is what
     /// sharing meant before there was a policy.
     ///
+    /// Shared so a changed policy reaches the next engine built; the node
+    /// restarts the module on every link to make that now.
+    ///
     /// [`SharePolicy::everything`]: cursio_files::SharePolicy::everything
-    pub share: cursio_files::SharePolicy,
+    pub share: crate::live::Shared<cursio_files::SharePolicy>,
 }
 
 impl crate::module::ModuleFactory for FilesFactory {
@@ -2374,7 +2377,7 @@ impl crate::module::ModuleFactory for FilesFactory {
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         Ok(Box::new(FilesEngine::new(
             ctx.peer_name().to_string(),
-            self.share.clone(),
+            self.share.get(),
         )?))
     }
 }

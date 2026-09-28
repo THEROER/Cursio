@@ -714,8 +714,9 @@ pub struct WindowFactory {
     /// Serve peers' remote-screen views of this machine. On by default and
     /// turned off by `--no-screen-host`; either way the module still
     /// negotiates, so a peer asking gets a refusal with a reason rather than
-    /// silence.
-    pub screen_host: bool,
+    /// silence. Shared so the app can change it; the node restarts the module
+    /// on every link for the change to reach the engines already built.
+    pub screen_host: crate::live::Shared<bool>,
 }
 
 impl WindowFactory {
@@ -730,11 +731,11 @@ impl WindowFactory {
         engine: WindowEngine<C, R>,
         ctx: &crate::module::SessionCtx,
     ) -> WindowEngine<C, R> {
-        let host = if self.screen_host {
+        let host = if self.screen_host.get() {
             screen_sources(&ctx.local.display_name)
         } else {
             ScreenHost::refusing(format!(
-                "{} was started with --no-screen-host",
+                "{} does not let peers view its screen",
                 ctx.local.display_name
             ))
         };

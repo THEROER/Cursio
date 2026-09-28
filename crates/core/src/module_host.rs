@@ -132,6 +132,7 @@ pub(crate) fn message_kind(msg: &Message) -> &'static str {
         Message::Heartbeat { .. } => "Heartbeat",
         Message::Bye => "Bye",
         Message::NodeStatus(_) => "NodeStatus",
+        Message::Reconfigure(_) => "Reconfigure",
         Message::Opaque(_) => "Opaque",
         Message::Input(_) => "Input",
         Message::Grab { .. } => "Grab",
@@ -341,46 +342,99 @@ struct Inbox {
     backlog: Arc<AtomicUsize>,
 }
 
+/// Most messages held for one module that is not running yet.
+///
+/// Enough for a module's opening exchange; a peer streaming into a module this
+/// side never starts cannot grow it past this.
+const PARKED_PER_MODULE: usize = 256;
+
+#[derive(Default)]
+struct Routes {
+    inboxes: HashMap<ModuleId, Inbox>,
+    /// Messages for a module not running here yet, in arrival order.
+    parked: HashMap<ModuleId, Vec<Message>>,
+}
+
 /// The reader's routing table: each module's messages to that module alone.
 ///
-/// Built once per session from the modules that actually run, and owned by the
-/// reader task, which is `Send` and never touches the session loop for module
-/// traffic.
-#[derive(Default)]
+/// Shared between the reader task, which routes, and the session loop, which
+/// adds and removes modules when the link is reconfigured. The lock is held
+/// for one lookup and one channel send; the session takes it only when a
+/// module starts or stops.
+#[derive(Clone, Default)]
 pub(crate) struct Router {
-    inboxes: HashMap<ModuleId, Inbox>,
+    routes: Arc<std::sync::Mutex<Routes>>,
 }
 
 impl Router {
+    fn routes(&self) -> std::sync::MutexGuard<'_, Routes> {
+        self.routes.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Deliver `msg` to its module, or hand it back when it is the session's.
     ///
-    /// A module message for a module not running on this link is dropped with
-    /// a debug line — negotiation agreed it away, so a peer sending it anyway
-    /// is out of step, not a reason to wake the session.
+    /// A message for a module not running here is held, up to a bound. The
+    /// peer starts a module right after announcing it in a reconfiguration,
+    /// and the reader routes its first message before the session loop has
+    /// read the announcement and started the module on this side; dropping it
+    /// lost that module's opening exchange.
     pub(crate) fn route(&self, msg: Message) -> Option<Message> {
         let Some(id) = msg.module_id() else {
             return Some(msg);
         };
-        match self.inboxes.get(&id) {
-            Some(inbox) => {
-                let depth = inbox.backlog.fetch_add(1, Ordering::Relaxed) + 1;
-                if depth == INBOX_BACKLOG_WARN {
-                    tracing::warn!(
-                        module = inbox.name,
-                        depth,
-                        "module is not keeping up with the peer's messages; they are queueing"
-                    );
-                }
-                if inbox.tx.send(msg).is_err() {
-                    inbox.backlog.fetch_sub(1, Ordering::Relaxed);
-                    tracing::debug!(module = inbox.name, "message for a module that has ended");
-                }
-            }
+        let mut routes = self.routes();
+        match routes.inboxes.get(&id) {
+            Some(inbox) => deliver(inbox, msg),
             None => {
-                tracing::debug!(module = %id, kind = message_kind(&msg), "message for a module not running here")
+                let parked = routes.parked.entry(id).or_default();
+                if parked.len() < PARKED_PER_MODULE {
+                    parked.push(msg);
+                } else {
+                    tracing::debug!(module = %id, kind = message_kind(&msg), "message for a module not running here");
+                }
             }
         }
         None
+    }
+
+    /// Start delivering `id`'s messages to `inbox`.
+    ///
+    /// `keep_parked` is whether what arrived before now belongs to it: yes
+    /// when the peer announced the module first, since it sends nothing for a
+    /// module before announcing it; no when this side started it, since then
+    /// anything held is from an instance the peer has since stopped.
+    fn insert(&self, id: ModuleId, inbox: Inbox, keep_parked: bool) {
+        let mut routes = self.routes();
+        let parked = routes.parked.remove(&id).unwrap_or_default();
+        if keep_parked {
+            for msg in parked {
+                deliver(&inbox, msg);
+            }
+        }
+        if routes.inboxes.insert(id, inbox).is_some() {
+            tracing::warn!(module = %id, "two modules claim one id; the later one receives");
+        }
+    }
+
+    fn remove(&self, id: ModuleId) {
+        let mut routes = self.routes();
+        routes.inboxes.remove(&id);
+        routes.parked.remove(&id);
+    }
+}
+
+fn deliver(inbox: &Inbox, msg: Message) {
+    let depth = inbox.backlog.fetch_add(1, Ordering::Relaxed) + 1;
+    if depth == INBOX_BACKLOG_WARN {
+        tracing::warn!(
+            module = inbox.name,
+            depth,
+            "module is not keeping up with the peer's messages; they are queueing"
+        );
+    }
+    if inbox.tx.send(msg).is_err() {
+        inbox.backlog.fetch_sub(1, Ordering::Relaxed);
+        tracing::debug!(module = inbox.name, "message for a module that has ended");
     }
 }
 
@@ -449,13 +503,28 @@ impl ModuleHost {
 
 /// Build the reader's routing table for these hosts.
 pub(crate) fn router_for(hosts: &[ModuleHost]) -> Router {
-    let mut router = Router::default();
+    let router = Router::default();
     for host in hosts {
-        if router.inboxes.insert(host.id, host.inbox.clone()).is_some() {
-            tracing::warn!(module = %host.id, "two modules claim one id; the later one receives");
-        }
+        router.insert(host.id, host.inbox.clone(), false);
     }
     router
+}
+
+impl ModuleHost {
+    pub(crate) fn id(&self) -> ModuleId {
+        self.id
+    }
+
+    /// Route `id`'s messages to this host. See [`Router::insert`] for
+    /// `keep_parked`.
+    pub(crate) fn attach(&self, router: &Router, keep_parked: bool) {
+        router.insert(self.id, self.inbox.clone(), keep_parked);
+    }
+}
+
+/// Stop routing to `id`, and drop whatever was held for it.
+pub(crate) fn detach(router: &Router, id: ModuleId) {
+    router.remove(id);
 }
 
 /// Shut every host down, waiting at most `grace` for all of them together.
@@ -626,9 +695,9 @@ mod tests {
     fn inbound_routing_delivers_each_modules_messages_to_it_alone() {
         let (files, mut files_rx) = inbox("files");
         let (audio, mut audio_rx) = inbox("audio");
-        let mut router = Router::default();
-        router.inboxes.insert(ModuleId::FILES, files);
-        router.inboxes.insert(ModuleId::AUDIO, audio);
+        let router = Router::default();
+        router.insert(ModuleId::FILES, files, false);
+        router.insert(ModuleId::AUDIO, audio, false);
 
         assert!(router.route(envelope(ModuleId::FILES)).is_none());
         assert!(router
@@ -670,11 +739,31 @@ mod tests {
     fn a_routed_message_counts_against_its_modules_backlog() {
         let (files, _rx) = inbox("files");
         let backlog = files.backlog.clone();
-        let mut router = Router::default();
-        router.inboxes.insert(ModuleId::FILES, files);
+        let router = Router::default();
+        router.insert(ModuleId::FILES, files, false);
         router.route(envelope(ModuleId::FILES));
         router.route(envelope(ModuleId::FILES));
         assert_eq!(backlog.load(Ordering::Relaxed), 2);
+    }
+
+    /// A module the peer announced gets what it sent ahead of the announcement
+    /// being read; one this side starts does not inherit a stopped instance's
+    /// leftovers.
+    #[test]
+    fn messages_for_a_module_not_yet_started_wait_for_it_only_when_the_peer_started_it() {
+        let router = Router::default();
+        router.route(envelope(ModuleId::FILES));
+        let (files, mut files_rx) = inbox("files");
+        router.insert(ModuleId::FILES, files, true);
+        assert!(files_rx.try_recv().is_ok(), "the early message was lost");
+
+        router.route(envelope(ModuleId::AUDIO));
+        let (audio, mut audio_rx) = inbox("audio");
+        router.insert(ModuleId::AUDIO, audio, false);
+        assert!(
+            audio_rx.try_recv().is_err(),
+            "a stale message reached a fresh module"
+        );
     }
 
     /// A stall warning has to say which subsystem to look at, and module

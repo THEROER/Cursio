@@ -46,6 +46,8 @@ pub mod identity;
 /// encryption, module negotiation. Shared by the CLI and the app, desktop and
 /// mobile alike.
 pub mod link;
+/// Applying a changed config to running links instead of restarting.
+pub mod live;
 pub mod logging;
 pub mod mesh;
 pub mod metrics;
@@ -61,6 +63,8 @@ pub mod pairing_window;
 pub mod portal_setup;
 /// Raising memory, swap and i/o pressure as a problem while it lasts.
 pub mod pressure;
+/// Renegotiating a running link when either side's settings change.
+pub mod reconfigure;
 pub mod registry;
 /// Remote-screen views: an app or monitor of a peer, offered to
 /// screen-sharing software here without being drawn on this desktop.

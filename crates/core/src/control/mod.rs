@@ -27,11 +27,13 @@
 //!
 //! ## Changing things goes through the config file
 //!
-//! A module toggle or a new grid position is written to `config.toml`, and the
-//! node's own watcher restarts it (see [`crate::config`]). One path for every
-//! change, whoever made it — the app, a text editor, a script — and the file
-//! always says what is running. A field a command-line flag pins cannot be
-//! changed that way, and the reply says so instead of pretending.
+//! A module toggle or a new grid position is written to `config.toml` and
+//! applied to the running node at once (see [`crate::live`]); the node's own
+//! watcher applies the same way when something else — a text editor, a
+//! script — changes the file. One path for every change, and the file always
+//! says what is running. A field a command-line flag pins cannot be changed
+//! that way, and a setting only a restart applies is named in the reply
+//! (`restart_needed`), rather than either pretending or restarting unasked.
 
 pub mod transport;
 
@@ -49,8 +51,9 @@ use crate::metrics::LatencyReading;
 use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWindow};
 
 /// Bumped when a request or reply changes shape, so a stale app says "update
-/// me" rather than misreading a field.
-pub const CONTROL_VERSION: u32 = 1;
+/// me" rather than misreading a field. v2: `restart_needed` in the status and
+/// in every save reply, now that changes apply without a restart.
+pub const CONTROL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
@@ -149,10 +152,12 @@ pub enum Reply {
         effective: Box<Config>,
         pinned: Vec<String>,
     },
-    /// The file was written; the node restarts on its own if that changed
-    /// what runs. `pinned` names fields the change could not reach.
+    /// The file was written and what it changed is already running.
+    /// `pinned` names fields the change could not reach; `restart_needed`
+    /// names settings, this one or earlier, that wait for a restart.
     Saved {
         pinned: Vec<String>,
+        restart_needed: Vec<String>,
     },
     Pairing {
         state: Option<PairingState>,
@@ -173,6 +178,9 @@ pub struct Status {
     /// What this node is configured to offer, after flags.
     pub modules: crate::config::Modules,
     pub pinned: Vec<String>,
+    /// Settings changed since start that only a restart applies, named as in
+    /// the file. Empty when what runs is what the file says.
+    pub restart_needed: Vec<String>,
     pub config_path: PathBuf,
     pub latency: Vec<LatencyReading>,
     pub problems: Vec<Problem>,
@@ -242,10 +250,21 @@ pub struct NodeState {
     inner: Arc<Mutex<Inner>>,
     config_path: PathBuf,
     overrides: Overrides,
-    running: Config,
+    /// What the process started with, against which [`live::restart_needed`]
+    /// measures.
+    ///
+    /// [`live::restart_needed`]: crate::live::restart_needed
+    started: Arc<Config>,
+    running: Arc<Mutex<Config>>,
+    applier: Applier,
     pairing: PairingWindow,
     restart: Arc<tokio::sync::Notify>,
 }
+
+/// Carries a config change into the running node: given what runs and what
+/// should, make it so. Supplied by the binary, which owns the pieces a change
+/// reaches — the switches, the links' settings, the factories' options.
+pub type Applier = Arc<dyn Fn(&Config, &Config) + Send + Sync>;
 
 impl NodeState {
     pub fn new(
@@ -254,6 +273,7 @@ impl NodeState {
         overrides: Overrides,
         running: Config,
         pairing: PairingWindow,
+        applier: Applier,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -269,7 +289,9 @@ impl NodeState {
             })),
             config_path,
             overrides,
-            running,
+            started: Arc::new(running.clone()),
+            running: Arc::new(Mutex::new(running)),
+            applier,
             pairing,
             restart: Arc::new(tokio::sync::Notify::new()),
         }
@@ -277,6 +299,42 @@ impl NodeState {
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn running_config(&self) -> std::sync::MutexGuard<'_, Config> {
+        self.running.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The config the node runs now, after flags.
+    pub fn running(&self) -> Config {
+        self.running_config().clone()
+    }
+
+    /// Apply `next` to the running node, and name what still waits for a
+    /// restart. Applying what already runs changes nothing, so the file
+    /// watcher may repeat a change the control socket already made.
+    pub fn apply(&self, next: Config) -> Vec<String> {
+        let mut running = self.running_config();
+        if *running != next {
+            (self.applier)(&running, &next);
+            self.inner().node.position = next.position;
+            *running = next;
+        }
+        crate::live::restart_needed(&self.started, &running)
+    }
+
+    /// Apply whatever the file now says.
+    pub fn apply_file(&self) -> Result<Vec<String>, crate::config::ConfigError> {
+        let file = Config::load(&self.config_path)?;
+        Ok(self.apply(file.with_overrides(&self.overrides)))
+    }
+
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
+    }
+
+    pub fn overrides(&self) -> &Overrides {
+        &self.overrides
     }
 
     pub fn set_local_status(&self, status: NodeStatus) {
@@ -290,6 +348,23 @@ impl NodeState {
     pub fn link_up(&self, peer: PeerId, name: &str, link: LinkView) {
         crate::metrics::note_peer_status(peer, link.status);
         self.inner().links.insert(peer, (name.to_owned(), link));
+    }
+
+    /// A running link renegotiated: the peer moved, or the modules changed.
+    /// The rest of what the link reported stays, the peer's latest status
+    /// included.
+    pub fn link_reconfigured(
+        &self,
+        peer: &PeerId,
+        position: Position,
+        modules: Vec<String>,
+        skipped: Vec<(String, String)>,
+    ) {
+        if let Some((_, link)) = self.inner().links.get_mut(peer) {
+            link.position = position;
+            link.modules = modules;
+            link.skipped = skipped;
+        }
     }
 
     pub fn link_down(&self, peer: &PeerId) {
@@ -334,11 +409,15 @@ impl NodeState {
             }
         }
         peers.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        let node = inner.node.clone();
+        drop(inner);
+        let running = self.running();
         Status {
             version: CONTROL_VERSION,
-            node: inner.node.clone(),
+            node,
             peers,
-            modules: self.running.modules,
+            modules: running.modules,
+            restart_needed: crate::live::restart_needed(&self.started, &running),
             pinned: self.pinned(),
             config_path: self.config_path.clone(),
             latency: crate::metrics::input_latency(),
@@ -373,6 +452,7 @@ impl NodeState {
                 .filter(|f| pinned.contains(f))
                 .map(|f| (*f).to_owned())
                 .collect(),
+            restart_needed: self.apply(file.with_overrides(&self.overrides)),
         }
     }
 
@@ -397,6 +477,7 @@ impl NodeState {
                 }
                 Reply::Saved {
                     pinned: self.pinned(),
+                    restart_needed: self.apply(config.with_overrides(&self.overrides)),
                 }
             }
             Command::SetModule { module, enabled } => {
@@ -447,6 +528,10 @@ mod tests {
     use super::*;
 
     fn state(dir: &std::path::Path, overrides: Overrides) -> NodeState {
+        state_applying(dir, overrides, Arc::new(|_: &Config, _: &Config| {}))
+    }
+
+    fn state_applying(dir: &std::path::Path, overrides: Overrides, applier: Applier) -> NodeState {
         let identity = crate::NodeIdentity {
             peer_id: PeerId::new_v4(),
             display_name: "desk".into(),
@@ -457,6 +542,7 @@ mod tests {
             overrides,
             Config::default(),
             PairingWindow::closed(),
+            applier,
         )
     }
 
@@ -499,6 +585,7 @@ mod tests {
             id: 9,
             reply: Reply::Saved {
                 pinned: vec!["position".into()],
+                restart_needed: vec!["port".into()],
             },
         };
         let line = serde_json::to_string(&reply).unwrap();
@@ -515,7 +602,7 @@ mod tests {
                 ..Overrides::default()
             },
         );
-        let Reply::Saved { pinned } = node.handle(Command::SetModule {
+        let Reply::Saved { pinned, .. } = node.handle(Command::SetModule {
             module: ModuleSwitch::Usb,
             enabled: true,
         }) else {
@@ -524,13 +611,48 @@ mod tests {
         assert!(pinned.is_empty());
         assert!(Config::load(&dir.join("config.toml")).unwrap().modules.usb);
 
-        let Reply::Saved { pinned } = node.handle(Command::SetModule {
+        let Reply::Saved { pinned, .. } = node.handle(Command::SetModule {
             module: ModuleSwitch::Audio,
             enabled: false,
         }) else {
             panic!("expected saved");
         };
         assert_eq!(pinned, vec!["modules.audio".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_toggle_is_applied_before_the_reply_and_only_a_restart_only_setting_is_named() {
+        let dir = temp_dir("apply");
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let seen = applied.clone();
+        let node = state_applying(
+            &dir,
+            Overrides::default(),
+            Arc::new(move |_: &Config, next: &Config| seen.lock().unwrap().push(next.clone())),
+        );
+        let Reply::Saved { restart_needed, .. } = node.handle(Command::SetModule {
+            module: ModuleSwitch::Files,
+            enabled: false,
+        }) else {
+            panic!("expected saved");
+        };
+        assert!(restart_needed.is_empty());
+        assert!(!applied.lock().unwrap()[0].modules.files);
+        assert!(!node.status().modules.files);
+
+        let Reply::Saved { restart_needed, .. } = node.handle(Command::SetModule {
+            module: ModuleSwitch::RemoteScreen,
+            enabled: true,
+        }) else {
+            panic!("expected saved");
+        };
+        assert_eq!(restart_needed, vec!["modules.remote_screen".to_owned()]);
+        assert_eq!(node.status().restart_needed, restart_needed);
+
+        // The watcher reading the same file again applies nothing twice.
+        node.apply_file().unwrap();
+        assert_eq!(applied.lock().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
