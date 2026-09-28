@@ -302,6 +302,7 @@ impl Agent {
         let exe = super::layout::stable_executable("cursio")
             .or_else(|| std::env::current_exe().ok())
             .ok_or(UpdateError::NoRoot)?;
+        let unit = super::systemd::own_unit();
         let mut args: Vec<std::ffi::OsString> = vec![
             "update".into(),
             "apply".into(),
@@ -310,10 +311,27 @@ impl Agent {
             "--wait-pid".into(),
             std::process::id().to_string().into(),
             "--stop".into(),
-            "--".into(),
         ];
+        if let Some(unit) = &unit {
+            args.extend(["--unit".into(), unit.into()]);
+        }
+        args.push("--".into());
         args.extend(std::env::args_os().skip(1));
-        let mut command = std::process::Command::new(&exe);
+        // Under a unit the helper must leave its cgroup, or stopping the node
+        // takes the helper with it (see `super::systemd`). A scope rather than
+        // a service: the helper re-runs itself from a copy and exits, and a
+        // service would end — killing the copy — when its first process did.
+        let mut command = match &unit {
+            Some(_) => {
+                let mut c = std::process::Command::new("systemd-run");
+                c.args(["--user", "--scope", "--quiet", "--collect"])
+                    .arg(format!("--unit=cursio-update-{}", std::process::id()))
+                    .arg("--")
+                    .arg(&exe);
+                c
+            }
+            None => std::process::Command::new(&exe),
+        };
         command.args(&args);
         super::apply::detach(&mut command);
         command.spawn().map_err(|e| UpdateError::io(&exe, e))?;

@@ -90,6 +90,10 @@ pub struct RunArgs {
     health_timeout: u64,
     #[arg(long, default_value_t = 3)]
     keep: usize,
+    /// The systemd user unit the node runs under: stop and start it through
+    /// `systemctl` instead of a signal and a detached start.
+    #[arg(long)]
+    unit: Option<String>,
     /// What the node is started with; `mesh` when empty. After `--`.
     #[arg(last = true)]
     node_args: Vec<OsString>,
@@ -105,6 +109,7 @@ impl RunArgs {
             relaunch: !self.no_relaunch,
             health_timeout: Duration::from_secs(self.health_timeout),
             keep: self.keep,
+            unit: self.unit.clone(),
         }
     }
 }

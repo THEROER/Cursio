@@ -22,6 +22,7 @@ pub mod manifest;
 pub mod quiet;
 pub mod sign;
 pub mod store;
+pub mod systemd;
 
 use std::path::Path;
 

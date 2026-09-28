@@ -51,6 +51,10 @@ pub struct Plan {
     pub health_timeout: Duration,
     /// Versions kept after a successful switch.
     pub keep: usize,
+    /// The systemd user unit the node runs under. The node is then stopped
+    /// and started through it rather than by signal and spawn — see
+    /// [`super::systemd`].
+    pub unit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,9 +98,20 @@ pub async fn run(layout: &InstallLayout, plan: &Plan) -> Result<Outcome, UpdateE
     layout
         .manifest(&plan.version)?
         .verify(&layout.version_dir(&plan.version))?;
+    if let (Some(unit), true) = (&plan.unit, plan.relaunch) {
+        let stable = super::layout::stable_executable("cursio").ok_or_else(|| {
+            UpdateError::Refused("the install has no stable copy of the node to start".into())
+        })?;
+        super::systemd::check_starts(unit, &stable)?;
+    }
 
+    if let (Some(unit), true) = (&plan.unit, plan.stop) {
+        // Through the unit, not a signal: a signalled exit is one `Restart=`
+        // may answer by starting the node again before the switch.
+        super::systemd::systemctl(&["stop", unit])?;
+    }
     for &pid in &plan.wait_pids {
-        if plan.stop {
+        if plan.stop && plan.unit.is_none() {
             stop_process(pid);
         }
         let exited = tokio::task::spawn_blocking(move || wait_for_exit(pid, EXIT_TIMEOUT))
@@ -117,7 +132,7 @@ pub async fn run(layout: &InstallLayout, plan: &Plan) -> Result<Outcome, UpdateE
     }
 
     if plan.relaunch {
-        launch(&node, &plan.node_args)?;
+        start(&node, plan)?;
         if !answers_within(plan.health_timeout).await {
             let back = rollback_after_failure(layout, plan).await;
             return Err(UpdateError::Refused(format!(
@@ -144,13 +159,22 @@ async fn rollback_after_failure(layout: &InstallLayout, plan: &Plan) -> String {
     let _ = layout.refresh_stable_copies();
     let started = layout
         .executable(&previous, "cursio")
-        .and_then(|exe| launch(&exe, &plan.node_args));
+        .and_then(|exe| start(&exe, plan));
     match started {
         Err(e) => format!("rolled back to {previous}, but could not start it: {e}"),
         Ok(()) if answers_within(plan.health_timeout).await => {
             format!("rolled back to {previous}, which is running")
         }
         Ok(()) => format!("rolled back to {previous}, which did not answer either"),
+    }
+}
+
+/// Start the node the way it was running: through its unit, which starts the
+/// stable copy and so whatever `current` now names, or detached.
+fn start(exe: &Path, plan: &Plan) -> Result<(), UpdateError> {
+    match &plan.unit {
+        Some(unit) => super::systemd::systemctl(&["start", unit]),
+        None => launch(exe, &plan.node_args),
     }
 }
 
@@ -315,6 +339,7 @@ mod tests {
             relaunch: false,
             health_timeout: Duration::from_secs(1),
             keep: 3,
+            unit: None,
         }
     }
 
