@@ -103,7 +103,8 @@ Replace both leaks with functions of the stable `PeerId`:
 A `PeerRegistry` holds every *known* node (from the trust store) plus live
 state: `Online { session } | Offline { last_seen }`. It is the answer to "the
 PC shouldn't forget everything exists": the set of known nodes is durable, and
-only the *connection* state is transient.
+only the *connection* state is transient. The user removing a machine is the
+one thing that takes a node out (see "Removing a machine").
 
 ### 5. N simultaneous sessions
 
@@ -139,6 +140,26 @@ eavesdropper nothing to test guesses against offline; every guess is a live
 handshake. So the window budgets those: three failed key confirmations shut it
 (for a password window too), a code lasts five minutes, and the first
 successful pairing spends it. A dropped socket does not count as a failure.
+
+## Removing a machine
+
+Pairing is the only way in, so removal (`core/src/forget.rs`) undoes what it
+made durable: the trust-store entry with its shared key and cached address,
+and builder trust for updates, which names the machine by id. That half is
+plain files, so `cursio forget <machine>` does it even with no node running.
+With one running it goes through the control socket's `forget`, and the node
+also drops what it holds: the registry entry (the one removal the registry
+makes — a machine that is *away* only ever goes `Offline`), the machine's
+problems, and the link. The link is ended from inside its own session through
+`LiveSettings::forgotten`, the same watch every setting change travels on: it
+sends `Bye` and runs the ordinary teardown, so modules stop and the peer's
+disks unmount exactly as when a link ends any other way. The peer hears a
+goodbye rather than a timeout.
+
+The other machine still trusts this one and keeps dialling. Without the key its
+handshake fails here the way any stranger's does; the node says so once
+(`forget::note_refused_call`) and not every sweep. Pairing the two again, from
+either side, takes the machine off `forgotten` so its new link stays up.
 
 ## Where a machine stands
 
@@ -250,7 +271,8 @@ channel, a build being fetched and how far, one installed and ready, what an
 `auto` switch is waiting for), `config`, `set_config`,
 `set_module`, `set_position`, `pair_show`, `pair_enter`, `pair_cancel`,
 `pairing`, `restart`, `subscribe`, `update_apply` (switch to the ready build
-now; see `docs/update-design.md`). After `subscribe` the node pushes the status
+now; see `docs/update-design.md`), `forget` (remove a machine; see above).
+After `subscribe` the node pushes the status
 with id 0 whenever something in it changes (and checks every 2 s for what
 changes elsewhere — latency, problems), only when it differs from the last
 push. Requests carry ids and any number may be in flight on one connection;

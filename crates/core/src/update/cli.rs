@@ -153,7 +153,7 @@ pub async fn run(action: UpdateAction, config_path: &std::path::Path) -> anyhow:
             Ok(())
         }
         UpdateAction::TrustBuilder { machine, key } => {
-            let (peer, name) = paired(&machine)?;
+            let (peer, name) = crate::forget::resolve(&machine)?;
             let key = match key {
                 Some(key) => key,
                 None => Store::of(&layout).seen_signer(&name).ok_or_else(|| {
@@ -257,17 +257,6 @@ pub async fn run(action: UpdateAction, config_path: &std::path::Path) -> anyhow:
 
 /// A paired machine by name or id: trusting a builder presumes pairing, since
 /// its builds reach this machine only over a link to it or one of its peers.
-fn paired(machine: &str) -> anyhow::Result<(cursio_protocol::PeerId, String)> {
-    let store = cursio_transport::pairing::TrustStore::load()?;
-    let found = store
-        .peers()
-        .find(|p| p.display_name == machine || p.peer_id.to_string() == machine)
-        .map(|p| (p.peer_id, p.display_name.clone()));
-    found.ok_or_else(|| {
-        anyhow::anyhow!("{machine} is not paired with this machine; `cursio peers` lists who is")
-    })
-}
-
 async fn switch(layout: &InstallLayout, plan: Plan) -> anyhow::Result<()> {
     if apply::relocate_if_installed(layout)? {
         return Ok(());

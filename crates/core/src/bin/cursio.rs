@@ -97,6 +97,15 @@ enum Command {
         /// The code shown on the other machine, e.g. `ABCD-EFGH`.
         code: Option<String>,
     },
+    /// Remove a paired machine from this mesh: forget its key, close its link,
+    /// stop accepting its builds. It has to be paired again to come back.
+    ///
+    /// Through the running node when there is one, so the link closes at once;
+    /// otherwise only the files are changed, which is all there is to change.
+    Forget {
+        /// The machine's name or id, as `cursio status` shows it.
+        machine: String,
+    },
     /// List peers discovered on the LAN, then exit.
     Peers {
         #[arg(long, default_value_t = 5)]
@@ -704,6 +713,10 @@ async fn main() -> anyhow::Result<()> {
                 pairing.clone(),
                 applier,
             );
+            {
+                let live = live.clone();
+                control.set_on_forget(std::sync::Arc::new(move |peer| live.forget(peer)));
+            }
             start_control(control.clone());
             let cursio_core::config::Config {
                 port,
@@ -884,6 +897,7 @@ async fn main() -> anyhow::Result<()> {
             };
             restart_process("asked to").await
         }
+        Command::Forget { machine } => forget_machine(&machine, &config_path).await,
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Portal { action } => portal(action).await,
     }
@@ -1581,6 +1595,14 @@ async fn run_mesh(
 
                     // Time to dial whoever is known, offline, and ours to call.
                     _ = sweep.tick() => {
+                        // Before the dial below and the publish, so a machine
+                        // the user just removed is neither called again nor
+                        // shown for one more sweep.
+                        for peer in live.current().forgotten {
+                            if let Some(gone) = registry.borrow_mut().forget(&peer) {
+                                tracing::info!(peer = %gone.display_name, "no longer dialling a removed machine");
+                            }
+                        }
                         publish_mesh(&control, &registry, &status);
                         // A machine that is not trusted yet, while the window is
                         // open. This is what `join` used to be: the mesh only
@@ -1816,6 +1838,7 @@ fn spawn_peer_session(
         let seen = identified.clone();
         let reg_for_cb = registry.clone();
         let pairing_for_cb = pairing.clone();
+        let live_for_cb = live.clone();
         let mut on_identified = move |id: cursio_protocol::PeerId, name: &str| {
             *seen.borrow_mut() = Some(id);
             let mut reg = reg_for_cb.borrow_mut();
@@ -1828,6 +1851,12 @@ fn spawn_peer_session(
                 cursio_core::health::link_restored(id);
             } else if pairing_for_cb.is_open() {
                 tracing::info!(peer = %name, %id, "unknown machine dialled in; pairing it");
+            } else if live_for_cb.is_forgotten(&id) {
+                // It still trusts us and calls every sweep; one line says why
+                // it gets nowhere, the rest would only bury the log.
+                if cursio_core::forget::note_refused_call(id) {
+                    tracing::info!(peer = %name, "a machine removed from this mesh keeps calling; refusing it until it is paired again");
+                }
             } else {
                 tracing::warn!(peer = %name, %id, "untrusted peer dialled in; not admitted");
             }
@@ -1869,6 +1898,9 @@ fn spawn_peer_session(
         let who = *identified.borrow();
         match &result {
             Ok(()) => tracing::info!("peer session ended"),
+            Err(e) if who.is_some_and(|id| live.is_forgotten(&id)) => {
+                tracing::debug!(error = %e, "refused a machine removed from this mesh");
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "peer session ended with error");
                 // Only a peer that was greeted: a stranger refused at the
@@ -1968,6 +2000,7 @@ async fn run_pairing_and_session(
     let stranger = !password.is_empty()
         && TrustStore::load().is_ok_and(|store| store.get(&identified.peer.peer_id).is_none());
     let peer_name = identified.peer.display_name.clone();
+    let peer_id = identified.peer.peer_id;
     let negotiated = identified.negotiated().clone();
     let link = match cursio_core::link::secure(identified, &plan).await {
         Ok(link) => link,
@@ -1991,6 +2024,8 @@ async fn run_pairing_and_session(
     };
     if stranger {
         pairing.note_paired(&peer_name);
+        // Paired again after being removed: its links may stay up now.
+        live.unforget(peer_id);
     }
     // Now that the peer has said where it stands, capture can watch the edge
     // between us. This is what replaced `--peer-edge`: both machines already
@@ -2864,6 +2899,32 @@ async fn print_status(json: bool) -> anyhow::Result<()> {
 ///
 /// Through the node rather than on its own: the pairing is the mesh's own
 /// handshake with the stranger, and only the running node is listening.
+async fn forget_machine(machine: &str, config_path: &std::path::Path) -> anyhow::Result<()> {
+    use cursio_core::control::{Command, Reply};
+    let (peer, _) = cursio_core::forget::resolve(machine)?;
+    let (name, was_builder) = match control_client().await {
+        Ok(client) => match client.request(Command::Forget { peer }).await? {
+            Reply::Forgotten { name, was_builder } => (name, was_builder),
+            Reply::Error { message } => anyhow::bail!("{message}"),
+            other => anyhow::bail!(
+                "the running node does not know how to remove a machine ({other:?}); \
+                 restart it with this version of Cursio"
+            ),
+        },
+        // No node to tell; the durable half is all there is.
+        Err(_) => {
+            let forgotten = cursio_core::forget::forget_on_disk(peer, config_path)?;
+            (forgotten.name, forgotten.was_builder)
+        }
+    };
+    println!("{name} is no longer part of this mesh");
+    if was_builder {
+        println!("its builds are no longer accepted here");
+    }
+    println!("to bring it back, pair the two machines again");
+    Ok(())
+}
+
 async fn pair_with_code(code: Option<String>) -> anyhow::Result<()> {
     use cursio_core::control::{Command, Reply};
     use cursio_core::pairing_window::PairingOutcome;

@@ -142,6 +142,11 @@ impl<'a> Reconf<'a> {
         self.input_on
     }
 
+    /// Whether the user removed this link's peer from the mesh.
+    pub(crate) fn peer_forgotten(&self, settings: &LiveSettings) -> bool {
+        settings.forgotten.contains(&self.peer.peer_id)
+    }
+
     /// This node's settings moved. Answers the message to send the peer —
     /// before anything starts — and the modules to restart, or `None` when
     /// nothing the peer can see changed.

@@ -462,3 +462,79 @@ async fn a_machine_with_input_off_keeps_its_own_cursor_when_the_peer_takes_it() 
     a_task.abort();
     b_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_the_peer_ends_the_link_cleanly_and_the_peer_hears_goodbye() {
+    let (a_t, b_t) = encrypted_pair().await;
+    let (a_id, b_id) = pair_ids();
+    let (a_pos, b_pos) = (Position::new(0, 0), Position::new(1, 0));
+    let (a, a_task) = run_side(
+        a_t,
+        a_id.clone(),
+        greeting(&b_id, b_pos),
+        a_pos,
+        true,
+        false,
+    );
+    let (b, b_task) = run_side(
+        b_t,
+        b_id.clone(),
+        greeting(&a_id, a_pos),
+        b_pos,
+        false,
+        false,
+    );
+    eventually("both files modules up", || {
+        a.census.heard.load(Ordering::SeqCst) == 1 && b.census.heard.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    a.live.forget(b_id.peer_id);
+
+    let a_ended = tokio::time::timeout(Duration::from_secs(10), a_task)
+        .await
+        .expect("the removing side kept its link")
+        .unwrap();
+    assert!(a_ended.is_ok(), "removing ended in an error: {a_ended:?}");
+    let b_ended = tokio::time::timeout(Duration::from_secs(10), b_task)
+        .await
+        .expect("the removed side kept its link")
+        .unwrap();
+    assert!(
+        matches!(b_ended, Err(session::SessionError::PeerLeft)),
+        "the peer did not hear goodbye: {b_ended:?}"
+    );
+    assert_eq!(a.census.alive.load(Ordering::SeqCst), 0);
+    assert_eq!(b.census.alive.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_some_other_machine_leaves_this_link_up() {
+    let (a_t, b_t) = encrypted_pair().await;
+    let (a_id, b_id) = pair_ids();
+    let (a_pos, b_pos) = (Position::new(0, 0), Position::new(1, 0));
+    let (a, a_task) = run_side(
+        a_t,
+        a_id.clone(),
+        greeting(&b_id, b_pos),
+        a_pos,
+        true,
+        false,
+    );
+    let (b, b_task) = run_side(b_t, b_id, greeting(&a_id, a_pos), b_pos, false, false);
+    eventually("both files modules up", || {
+        a.census.heard.load(Ordering::SeqCst) == 1 && b.census.heard.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    a.live.forget(cursio_protocol::PeerId::new_v4());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        !a_task.is_finished() && !b_task.is_finished(),
+        "a link ended for a machine it does not reach"
+    );
+    assert_eq!(a.census.alive.load(Ordering::SeqCst), 1);
+    a_task.abort();
+    b_task.abort();
+}

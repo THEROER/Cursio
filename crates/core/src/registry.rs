@@ -5,7 +5,10 @@
 //! *known* set is durable — it comes from the trust store, so a peer that has
 //! been paired stays known across reboots, power cuts, and its own absence.
 //! Only [`PeerState`] is transient: a node going away changes its state to
-//! `Offline`, it never removes it.
+//! `Offline`, it never removes it. The one removal is the user's own
+//! [`PeerRegistry::forget`], which goes with dropping the peer from the trust
+//! store — a machine that is merely away and one the user sent away must not
+//! look alike, or a reboot would erase the mesh.
 //!
 //! Nothing here is a hub. Every node runs the same registry over the same
 //! durable set, so "who is up" is a local observation each node makes for
@@ -158,6 +161,12 @@ impl PeerRegistry {
         );
     }
 
+    /// Drop a peer the user removed from the mesh, so it is neither dialled
+    /// nor shown. Not for a peer that went away — see [`Self::mark_offline`].
+    pub fn forget(&mut self, peer_id: &PeerId) -> Option<KnownPeer> {
+        self.peers.remove(peer_id)
+    }
+
     pub fn get(&self, peer_id: &PeerId) -> Option<&KnownPeer> {
         self.peers.get(peer_id)
     }
@@ -272,6 +281,23 @@ mod tests {
             reg.dial_candidates().is_empty(),
             "the node would dial itself"
         );
+    }
+
+    #[test]
+    fn a_forgotten_peer_is_neither_known_nor_dialled_nor_readmitted_by_a_sighting() {
+        let mut reg = PeerRegistry::default();
+        let id = peer(5);
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        reg.admit(id, "laptop".into(), Some(addr));
+
+        assert_eq!(
+            reg.forget(&id).map(|p| p.display_name),
+            Some("laptop".into())
+        );
+
+        assert!(!reg.is_known(&id));
+        assert!(reg.dial_candidates().is_empty());
+        assert!(!reg.note_seen(id, "laptop", addr));
     }
 
     /// Untrusted machines announcing themselves must not join the mesh.

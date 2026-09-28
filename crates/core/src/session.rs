@@ -851,6 +851,19 @@ where
                 let (Some(r), Some(failures_tx)) = (reconf.as_mut(), failures_tx.as_ref()) else {
                     continue;
                 };
+                if r.peer_forgotten(&latest) {
+                    // Said rather than just dropped, so the peer ends its side
+                    // as a goodbye instead of timing out and raising a dropped
+                    // link. Teardown below unmounts and stops modules as usual.
+                    tracing::info!("this machine was removed from the mesh; closing the link");
+                    if role.driving() {
+                        role.seize();
+                        am_active = role.active();
+                        on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
+                    }
+                    let _ = tx.send(&Message::Bye).await;
+                    break Ok(());
+                }
                 let was_on = r.input_on();
                 if let Some((msg, restart)) = r.local(&latest) {
                     tracing::info!("settings changed; telling the peer");

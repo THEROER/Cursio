@@ -39,6 +39,9 @@ pub mod elevate;
 #[cfg(feature = "files")]
 pub mod files_session;
 pub mod firewall;
+/// Removing a machine from the mesh: the trust store, builder trust, and what
+/// the running node holds about it.
+pub mod forget;
 /// Link, module and platform problems, each raised and cleared by name.
 pub mod health;
 pub mod identity;

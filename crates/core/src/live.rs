@@ -24,6 +24,12 @@
 //!   when input was on at startup: capture holds a portal permission that is
 //!   deliberately taken once per process.
 //!
+//! - **A machine removed from the mesh** is added to
+//!   [`LiveSettings::forgotten`]; its link, if one is up, says goodbye and
+//!   closes, which shuts its modules down and unmounts its disks the way any
+//!   ending does. The set only grows until a pairing succeeds with the same
+//!   machine again ([`LiveConfig::unforget`]).
+//!
 //! What cannot change live is named by [`restart_needed`]: the listen port
 //! (the listener owns it), the remote-screen portal backend (a D-Bus name
 //! claimed at startup), AirPlay (a receiver bound and announced at startup),
@@ -31,10 +37,10 @@
 //! and every save reply carry that list, so the app can say "restart to
 //! apply" rather than let a toggle silently do nothing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
-use cursio_protocol::{ModuleId, Position};
+use cursio_protocol::{ModuleId, PeerId, Position};
 
 use crate::config::Config;
 pub use crate::module::ModuleSwitches;
@@ -99,6 +105,9 @@ pub struct LiveSettings {
     /// a link that has capture.
     pub input: bool,
     pub restarts: Restarts,
+    /// Machines the user removed from the mesh while this node ran. A link to
+    /// one of them ends itself.
+    pub forgotten: BTreeSet<PeerId>,
 }
 
 /// The node's live settings: switches for the registry, and a watch for the
@@ -120,6 +129,7 @@ impl LiveConfig {
             position: config.position,
             input: config.modules.input,
             restarts: Restarts::default(),
+            forgotten: BTreeSet::new(),
         });
         Self {
             settings: Arc::new(settings),
@@ -137,6 +147,24 @@ impl LiveConfig {
 
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<LiveSettings> {
         self.settings.subscribe()
+    }
+
+    /// End every link to `peer` and keep ending new ones, now that the user
+    /// removed it from the mesh.
+    pub fn forget(&self, peer: PeerId) {
+        self.settings.send_modify(|s| {
+            s.forgotten.insert(peer);
+        });
+    }
+
+    /// `peer` was paired again, so its links may stay up.
+    pub fn unforget(&self, peer: PeerId) {
+        self.settings
+            .send_if_modified(|s| s.forgotten.remove(&peer));
+    }
+
+    pub fn is_forgotten(&self, peer: &PeerId) -> bool {
+        self.settings.borrow().forgotten.contains(peer)
     }
 
     /// Carry out the part of `plan` every node shares. Switches are written

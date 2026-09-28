@@ -57,8 +57,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// in every save reply, now that changes apply without a restart. v3:
 /// `subscribe`, and status pushed with id 0. v4: the node's `pid`, `build`
 /// and `installed_version`, so the app can show and roll back what runs. v5:
-/// `update` in the status and `update_apply`, for builds from the mesh.
-pub const CONTROL_VERSION: u32 = 5;
+/// `update` in the status and `update_apply`, for builds from the mesh. v6:
+/// `forget`, removing a machine from the mesh.
+pub const CONTROL_VERSION: u32 = 6;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -150,6 +151,11 @@ pub enum Command {
     /// Switch to the build from the mesh that is installed and waiting. The
     /// node stops and comes back as that build, or as this one if it fails.
     UpdateApply,
+    /// Remove a paired machine from the mesh: its key, its link, and builder
+    /// trust. It has to be paired again to come back. See [`crate::forget`].
+    Forget {
+        peer: PeerId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -181,6 +187,12 @@ pub enum Reply {
     Subscribed,
     Error {
         message: String,
+    },
+    /// The machine is no longer part of this mesh.
+    Forgotten {
+        name: String,
+        /// It had been trusted to sign builds for this machine.
+        was_builder: bool,
     },
 }
 
@@ -292,7 +304,13 @@ pub struct NodeState {
     /// wakes subscribers. What changes elsewhere — latency, problems — is
     /// caught by their periodic look.
     revision: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Tells the running mesh a machine was removed; set by the binary, which
+    /// owns the links. Without one, removal is the on-disk half alone.
+    on_forget: Arc<Mutex<Option<Forgetter>>>,
 }
+
+/// Carries a removal into the running node. See [`NodeState::set_on_forget`].
+pub type Forgetter = Arc<dyn Fn(PeerId) + Send + Sync>;
 
 /// Carries a config change into the running node: given what runs and what
 /// should, make it so. Supplied by the binary, which owns the pieces a change
@@ -331,6 +349,43 @@ impl NodeState {
             pairing,
             restart: Arc::new(tokio::sync::Notify::new()),
             revision: Arc::new(tokio::sync::watch::channel(0).0),
+            on_forget: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Where [`Command::Forget`] reaches the running mesh: ending the link and
+    /// dropping the registry entry, which only the mesh loop can do.
+    pub fn set_on_forget(&self, forgetter: Forgetter) {
+        *self
+            .on_forget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(forgetter);
+    }
+
+    fn forget(&self, peer: PeerId) -> Reply {
+        let forgotten = match crate::forget::forget_on_disk(peer, &self.config_path) {
+            Ok(forgotten) => forgotten,
+            Err(e) => return error(e),
+        };
+        let forgetter = self
+            .on_forget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(forgetter) = forgetter {
+            forgetter(peer);
+        }
+        {
+            // Out of the status now, not at the mesh's next sweep, so the
+            // window that asked does not show the machine for another moment.
+            let mut inner = self.inner();
+            inner.known.retain(|k| k.id != peer);
+            inner.links.remove(&peer);
+        }
+        self.changed();
+        Reply::Forgotten {
+            name: forgotten.name,
+            was_builder: forgotten.was_builder,
         }
     }
 
@@ -588,6 +643,7 @@ impl NodeState {
                     message: "updates are not running on this node".into(),
                 },
             },
+            Command::Forget { peer } => self.forget(peer),
         }
     }
 
@@ -663,6 +719,9 @@ mod tests {
                 config: Config::default(),
             },
             Command::UpdateApply,
+            Command::Forget {
+                peer: PeerId::from_u128(3),
+            },
         ];
         for (id, command) in commands.into_iter().enumerate() {
             let request = Request {
@@ -682,6 +741,23 @@ mod tests {
         };
         let line = serde_json::to_string(&reply).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), reply);
+    }
+
+    #[test]
+    fn forgetting_a_machine_that_was_never_paired_is_refused_and_leaves_the_mesh_alone() {
+        let dir = temp_dir("forget");
+        let node = state(&dir, Overrides::default());
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let seen = told.clone();
+        node.set_on_forget(Arc::new(move |peer| seen.lock().unwrap().push(peer)));
+
+        let reply = node.handle(Command::Forget {
+            peer: PeerId::new_v4(),
+        });
+
+        assert!(matches!(reply, Reply::Error { .. }), "got {reply:?}");
+        assert!(told.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
