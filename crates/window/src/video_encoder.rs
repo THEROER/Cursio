@@ -219,11 +219,17 @@ pub struct VideoEncoder {
     width: u32,
     height: u32,
     encoder: ffmpeg_next::encoder::Video,
-    /// BGRA → YUV420P conversion. Kept alive across frames: building a scaler
+    /// The caller's BGRA, copied into a frame kept across calls: a fresh 8 MB
+    /// frame per 1080p picture was an allocation on every capture.
+    bgra: ffmpeg_next::frame::Video,
+    /// BGRA → YUV420P conversion and its reused destination, for encoders
+    /// that cannot take BGRA themselves; `None` when the encoder converts on
+    /// its own hardware. Kept alive across frames: building a scaler
     /// allocates and picks a code path, which is wasted work per frame.
-    scaler: ffmpeg_next::software::scaling::Context,
-    /// Reused destination frame, for the same reason.
-    yuv: ffmpeg_next::frame::Video,
+    convert: Option<(
+        ffmpeg_next::software::scaling::Context,
+        ffmpeg_next::frame::Video,
+    )>,
     /// Presentation timestamp, in the encoder's `1/FRAME_RATE` time base. Must
     /// increase monotonically or the encoder rejects the frame.
     pts: i64,
@@ -301,9 +307,21 @@ impl VideoEncoder {
             .video()
             .map_err(|e| WindowError::Backend(format!("{name}: not a video encoder: {e}")))?;
 
+        // NVENC takes BGRA and converts on the GPU, to BT.601 limited range —
+        // measured, and what both viewers' decoders assume — so the lossy
+        // stream skips swscale, which cost 7 ms per 1080p frame on the capture
+        // thread, nearly half a 60 fps budget. Lossless stays on YUV420P: fed
+        // RGB, NVENC's lossless mode codes a different chroma layout than the
+        // stream every viewer is known to decode.
+        let takes_bgra = kind == EncoderKind::Nvenc && matches!(fidelity, Fidelity::Lossy { .. });
+
         enc.set_width(width);
         enc.set_height(height);
-        enc.set_format(ffmpeg_next::format::Pixel::YUV420P);
+        enc.set_format(if takes_bgra {
+            ffmpeg_next::format::Pixel::BGRA
+        } else {
+            ffmpeg_next::format::Pixel::YUV420P
+        });
         enc.set_time_base(ffmpeg_next::Rational(1, FRAME_RATE));
         enc.set_frame_rate(Some(ffmpeg_next::Rational(FRAME_RATE, 1)));
         enc.set_gop(GOP_FRAMES);
@@ -326,19 +344,26 @@ impl VideoEncoder {
             .open_with(opts)
             .map_err(|e| WindowError::Backend(format!("{name}: open failed: {e}")))?;
 
-        // The capture side hands us BGRA; H.264 wants YUV420P. swscale does the
-        // conversion — `Bilinear` is irrelevant here (no rescaling happens,
-        // only a colour-space change) but the parameter is required.
-        let scaler = ffmpeg_next::software::scaling::Context::get(
-            ffmpeg_next::format::Pixel::BGRA,
-            width,
-            height,
-            ffmpeg_next::format::Pixel::YUV420P,
-            width,
-            height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        )
-        .map_err(|e| WindowError::Backend(format!("{name}: scaler: {e}")))?;
+        // Otherwise swscale does the conversion — `Bilinear` is irrelevant here
+        // (no rescaling happens, only a colour-space change) but the parameter
+        // is required.
+        let convert = if takes_bgra {
+            None
+        } else {
+            let scaler = ffmpeg_next::software::scaling::Context::get(
+                ffmpeg_next::format::Pixel::BGRA,
+                width,
+                height,
+                ffmpeg_next::format::Pixel::YUV420P,
+                width,
+                height,
+                ffmpeg_next::software::scaling::Flags::BILINEAR,
+            )
+            .map_err(|e| WindowError::Backend(format!("{name}: scaler: {e}")))?;
+            let yuv =
+                ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+            Some((scaler, yuv))
+        };
 
         Ok(Self {
             kind,
@@ -346,8 +371,8 @@ impl VideoEncoder {
             width,
             height,
             encoder,
-            scaler,
-            yuv: ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height),
+            bgra: ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, width, height),
+            convert,
             pts: 0,
             keyframe: false,
         })
@@ -434,41 +459,41 @@ impl VideoEncoder {
             )));
         }
 
-        // Wrap the caller's BGRA in a frame. FFmpeg aligns each row to
-        // `stride()`, which for BGRA is usually but *not always* `width * 4`,
-        // so copy row by row rather than in one memcpy — the same padding trap
-        // as PipeWire's `chunk.stride`.
-        let mut src = ffmpeg_next::frame::Video::new(
-            ffmpeg_next::format::Pixel::BGRA,
-            self.width,
-            self.height,
-        );
+        // FFmpeg aligns each row to `stride()`, which for BGRA is usually but
+        // *not always* `width * 4`, so copy row by row rather than in one
+        // memcpy — the same padding trap as PipeWire's `chunk.stride`.
         let row_bytes = (self.width as usize) * 4;
-        let stride = src.stride(0);
-        let data = src.data_mut(0);
+        let stride = self.bgra.stride(0);
+        let data = self.bgra.data_mut(0);
         for y in 0..self.height as usize {
             let dst = y * stride;
             let s = y * row_bytes;
             data[dst..dst + row_bytes].copy_from_slice(&bgra[s..s + row_bytes]);
         }
 
-        self.scaler
-            .run(&src, &mut self.yuv)
-            .map_err(|e| WindowError::Backend(format!("BGRA→YUV420P: {e}")))?;
+        let frame = match self.convert.as_mut() {
+            Some((scaler, yuv)) => {
+                scaler
+                    .run(&self.bgra, yuv)
+                    .map_err(|e| WindowError::Backend(format!("BGRA→YUV420P: {e}")))?;
+                yuv
+            }
+            None => &mut self.bgra,
+        };
 
         // PTS must advance monotonically; the encoder rejects a repeat.
-        self.yuv.set_pts(Some(self.pts));
+        frame.set_pts(Some(self.pts));
         self.pts += 1;
-        // `yuv` is reused, so the type must be cleared again after a forced
-        // keyframe or every later frame would be one too.
-        self.yuv.set_kind(if std::mem::take(&mut self.keyframe) {
+        // The frame is reused, so the type must be cleared again after a
+        // forced keyframe or every later frame would be one too.
+        frame.set_kind(if std::mem::take(&mut self.keyframe) {
             ffmpeg_next::picture::Type::I
         } else {
             ffmpeg_next::picture::Type::None
         });
 
         self.encoder
-            .send_frame(&self.yuv)
+            .send_frame(frame)
             .map_err(|e| WindowError::Backend(format!("send_frame: {e}")))?;
 
         self.drain()

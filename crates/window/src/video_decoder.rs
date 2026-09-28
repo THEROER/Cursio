@@ -270,4 +270,40 @@ mod tests {
             "lossless codec changed the colour of {mismatched} pixels"
         );
     }
+
+    /// A lossy NVENC stream is fed BGRA and converted on the GPU, not by
+    /// swscale; its matrix and range must still be the BT.601 limited range
+    /// every viewer decodes with. A BT.709 matrix would shift this orange by
+    /// about eleven luma levels, a full range would crush its darks.
+    #[test]
+    fn a_lossy_stream_keeps_its_colour_whichever_side_converts_it() {
+        ffmpeg_next::init().expect("ffmpeg init");
+        let (w, h) = (320u32, 240u32);
+        let mut enc =
+            VideoEncoder::open(w, h, Fidelity::Lossy { bitrate: 8_000_000 }).expect("encoder");
+        let mut dec = VideoDecoder::open().expect("decoder");
+        let source = [0x50u8, 0x3C, 0xC8, 0xFF].repeat((w as usize) * (h as usize));
+
+        let mut decoded = Vec::new();
+        for _ in 0..4 {
+            for packet in enc.encode(&source).expect("encode") {
+                decoded.extend(dec.decode(&packet).expect("decode"));
+            }
+        }
+        for packet in enc.finish().expect("flush") {
+            decoded.extend(dec.decode(&packet).expect("decode"));
+        }
+
+        let frame = decoded.last().expect("a frame must come back");
+        let centre = ((h as usize / 2) * w as usize + w as usize / 2) * 4;
+        let got = &frame.pixels[centre..centre + 3];
+        for (c, (&got, &want)) in got.iter().zip(&source[..3]).enumerate() {
+            let delta = (got as i32 - want as i32).abs();
+            assert!(
+                delta <= 4,
+                "{:?} encoder moved channel {c} by {delta}",
+                enc.kind()
+            );
+        }
+    }
 }
