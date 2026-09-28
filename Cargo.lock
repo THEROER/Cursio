@@ -1266,6 +1266,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -15,6 +15,12 @@ thiserror.workspace = true
 # parsing that is a different bet from parsing a table meant for a terminal.
 [target.'cfg(target_os = "windows")'.dependencies]
 serde_json.workspace = true
+# CM_Register_Notification: Windows says when a USB device comes or goes, so
+# `usbipd state` is run on a change rather than on a timer.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 

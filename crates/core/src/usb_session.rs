@@ -50,8 +50,9 @@ const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often this machine's own ports are re-read.
 ///
 /// Short enough that plugging a phone in feels immediate, long enough to be
-/// free: on Linux this is two directory reads, and on Windows a `usbipd state`
-/// that takes about a tenth of a second. The pump runs far more often than
+/// free: on Linux this is two directory reads, and on Windows it answers from
+/// the backend's kept listing unless a device arrived or left, so a `usbipd
+/// state` process runs only on a change. The pump runs far more often than
 /// this, so the interval is what keeps the cost off the session loop.
 const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -424,13 +425,11 @@ impl UsbEngine {
 
     /// Notice devices plugged in or unplugged since the last listing.
     ///
-    /// Nothing tells a process that a USB device appeared: udev does on Linux
-    /// and WM_DEVICECHANGE does on Windows, but both need a event loop of
-    /// their own, and neither exists on the other platform. Re-reading the
-    /// device list is two file reads on Linux and one short-lived process on
-    /// Windows — cheap enough that a poll costs less than the machinery to
-    /// avoid it, and the poll is what makes plugging a phone in mid-session
-    /// work at all.
+    /// The poll is what makes plugging a phone in mid-session work at all. On
+    /// Linux it is two file reads, cheaper than a udev monitor. On Windows each
+    /// fresh listing is a process, so the backend asks Windows to report USB
+    /// arrivals (`CM_Register_Notification`) and answers this poll from its
+    /// kept listing until one comes.
     ///
     /// Only a *changed* listing is sent. A machine whose ports do not change —
     /// the common case — puts nothing on the wire however often this runs.

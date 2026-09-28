@@ -71,6 +71,96 @@ pub struct WindowsUsb {
     /// only re-read when the *set* of devices changes — which is exactly when a
     /// class this does not know about could appear.
     classes: std::cell::RefCell<Option<(Vec<(u16, u16)>, HashMap<(u16, u16), u8>)>>,
+    /// The last listing, and what it was read under. See [`Self::devices`].
+    listing: std::cell::RefCell<Option<Listing>>,
+}
+
+/// A `usbipd state` answer kept until something could have changed it.
+#[derive(Debug, Clone)]
+struct Listing {
+    devices: Vec<LocalDevice>,
+    /// [`device_changes`] when it was read.
+    generation: u64,
+    read_at: std::time::Instant,
+}
+
+/// How long a listing is trusted without a device notification.
+///
+/// Notifications cover plugging and unplugging, but not everything `state`
+/// reports: another program binding a device through usbipd changes the answer
+/// with no device arriving. A minute bounds how stale that can get while
+/// keeping the process count to one a minute instead of one every few seconds.
+const LISTING_TRUSTED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A counter Windows advances whenever a USB device arrives or leaves, or
+/// `None` where no notification could be registered (and on other platforms,
+/// where this backend only runs under test).
+///
+/// The listing is polled for the life of the node, and on Windows each poll is
+/// a process. Asking Windows to say when a device appears turns that into one
+/// process per actual change. The registration is process-wide and never
+/// released: it is one per node, lives as long as the node, and the callback
+/// touches nothing but an atomic.
+#[cfg(target_os = "windows")]
+fn device_changes() -> Option<u64> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Register_Notification, CM_NOTIFY_ACTION, CM_NOTIFY_EVENT_DATA, CM_NOTIFY_FILTER,
+        CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE, CR_SUCCESS, HCMNOTIFICATION,
+    };
+
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    static REGISTERED: OnceLock<bool> = OnceLock::new();
+
+    // GUID_DEVINTERFACE_USB_DEVICE: every USB device, hubs' children included.
+    const USB_DEVICE: GUID = GUID::from_u128(0xA5DCBF10_6530_11D2_901F_00C04FB951ED);
+
+    unsafe extern "system" fn changed(
+        _: HCMNOTIFICATION,
+        _: *const core::ffi::c_void,
+        _: CM_NOTIFY_ACTION,
+        _: *const CM_NOTIFY_EVENT_DATA,
+        _: u32,
+    ) -> u32 {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+        0
+    }
+
+    let registered = *REGISTERED.get_or_init(|| {
+        let mut filter = CM_NOTIFY_FILTER {
+            cbSize: std::mem::size_of::<CM_NOTIFY_FILTER>() as u32,
+            FilterType: CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE,
+            ..Default::default()
+        };
+        filter.u.DeviceInterface.ClassGuid = USB_DEVICE;
+        let mut handle: HCMNOTIFICATION = std::ptr::null_mut();
+        // SAFETY: `filter` is initialised for the interface-class variant it
+        // names, the callback is a plain function, and `handle` outlives the
+        // call. The handle is deliberately never unregistered (see above).
+        let result = unsafe {
+            CM_Register_Notification(&filter, std::ptr::null(), Some(changed), &mut handle)
+        };
+        if result != CR_SUCCESS {
+            tracing::warn!(
+                code = result,
+                "windows would not report usb arrivals; re-reading the device list on a timer"
+            );
+        }
+        result == CR_SUCCESS
+    });
+    registered.then(|| GENERATION.load(Ordering::Relaxed))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn device_changes() -> Option<u64> {
+    None
+}
+
+/// Whether a kept listing still answers, given the notification counter now.
+fn listing_is_current(listing: &Listing, generation: Option<u64>) -> bool {
+    generation == Some(listing.generation) && listing.read_at.elapsed() < LISTING_TRUSTED_FOR
 }
 
 impl Default for WindowsUsb {
@@ -84,6 +174,7 @@ impl WindowsUsb {
         Self {
             exe: PathBuf::from(DEFAULT_PATH),
             classes: std::cell::RefCell::new(None),
+            listing: std::cell::RefCell::new(None),
         }
     }
 
@@ -92,6 +183,7 @@ impl WindowsUsb {
         Self {
             exe: exe.into(),
             classes: std::cell::RefCell::new(None),
+            listing: std::cell::RefCell::new(None),
         }
     }
 
@@ -106,8 +198,26 @@ impl WindowsUsb {
 
     /// Devices Windows can see, as `usbipd state` reports them.
     ///
-    /// Unprivileged, so this is safe to call on every listing.
+    /// Unprivileged, so this is safe to call on every listing. The answer is
+    /// kept until Windows reports a device arriving or leaving, this backend
+    /// binds or unbinds one, or [`LISTING_TRUSTED_FOR`] passes.
     pub fn devices(&self) -> Result<Vec<LocalDevice>, UsbBackendError> {
+        let generation = device_changes();
+        if let Some(listing) = self.listing.borrow().as_ref() {
+            if listing_is_current(listing, generation) {
+                return Ok(listing.devices.clone());
+            }
+        }
+        let devices = self.read_devices()?;
+        *self.listing.borrow_mut() = generation.map(|generation| Listing {
+            devices: devices.clone(),
+            generation,
+            read_at: std::time::Instant::now(),
+        });
+        Ok(devices)
+    }
+
+    fn read_devices(&self) -> Result<Vec<LocalDevice>, UsbBackendError> {
         let json = self.run(&["state"])?;
         let mut devices = parse_state(&json)?;
         // `usbipd state` carries no class, and the class is what decides
@@ -175,6 +285,8 @@ impl WindowsUsb {
         use std::os::windows::process::CommandExt;
 
         let devices = self.devices()?;
+        // The elevated shell binds behind `run`'s back.
+        self.listing.borrow_mut().take();
         if devices.is_empty() {
             return Ok(());
         }
@@ -272,6 +384,10 @@ impl WindowsUsb {
                  install it with: winget install usbipd",
                 self.exe.display()
             )));
+        }
+        // Anything but `state` changes what `state` answers.
+        if args.first() != Some(&"state") {
+            self.listing.borrow_mut().take();
         }
         let mut command = Command::new(&self.exe);
         command.args(args);
@@ -555,6 +671,39 @@ pub fn default_exe() -> &'static Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn listing(generation: u64, age: std::time::Duration) -> Listing {
+        Listing {
+            devices: Vec::new(),
+            generation,
+            read_at: std::time::Instant::now() - age,
+        }
+    }
+
+    #[test]
+    fn a_listing_is_reused_until_a_device_arrives_or_leaves() {
+        let kept = listing(4, std::time::Duration::from_secs(1));
+        assert!(listing_is_current(&kept, Some(4)));
+        assert!(!listing_is_current(&kept, Some(5)));
+    }
+
+    #[test]
+    fn a_listing_is_reread_after_a_minute_even_without_notifications() {
+        let kept = listing(4, LISTING_TRUSTED_FOR + std::time::Duration::from_secs(1));
+        assert!(!listing_is_current(&kept, Some(4)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_accepts_the_usb_arrival_registration() {
+        assert!(device_changes().is_some());
+    }
+
+    #[test]
+    fn without_notifications_every_listing_is_read_afresh() {
+        let kept = listing(0, std::time::Duration::ZERO);
+        assert!(!listing_is_current(&kept, None));
+    }
 
     #[test]
     fn pasted_guard_command_blocks_the_same_addresses_as_the_setup_prompt() {
