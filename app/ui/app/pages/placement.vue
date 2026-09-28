@@ -1,65 +1,129 @@
 <script setup lang="ts">
+import type { TopologyEdge, TopologyLane, TopologyNode } from "@leavepulse/ui"
 import type { Position } from "~/composables/useNode"
 
 const { t } = useI18n()
 const { status, setPosition } = useNode()
+const toast = useCursioToast()
 
 /**
  * Where this machine is being moved to, before it is applied. Only this
- * machine's tile moves: each node writes its own `position`, and a peer's
+ * machine's card moves: each node writes its own `position`, and a peer's
  * cell is that peer's to change, from its own app.
  */
 const draft = ref<Position | null>(null)
 const here = computed<Position | null>(() => draft.value ?? status.value?.node.position ?? null)
 
-interface Tile {
-  key: string
+/** One grid cell on the canvas, and where a card sits inside it. */
+const CELL_W = 260
+const CELL_H = 170
+const PAD_X = 20
+const PAD_Y = 40
+
+interface Placed {
+  id: string
   name: string
   at: Position
   self: boolean
+  online: boolean
+  kind?: string
 }
 
-const placed = computed<Tile[]>(() => {
+const placed = computed<Placed[]>(() => {
   const s = status.value
   if (!s || !here.value) return []
-  const tiles: Tile[] = [{ key: s.node.id, name: s.node.name, at: here.value, self: true }]
+  const out: Placed[] = [{ id: s.node.id, name: s.node.name, at: here.value, self: true, online: true }]
   for (const p of s.peers) {
-    if (p.link) tiles.push({ key: p.id, name: p.name, at: p.link.position, self: false })
+    if (p.link) {
+      out.push({
+        id: p.id,
+        name: p.name,
+        at: p.link.position,
+        self: false,
+        online: p.presence === "online",
+        kind: t(`kind.${p.link.device_kind}`),
+      })
+    }
   }
-  return tiles
+  return out
 })
 
 /** Peers whose cell is not known: it rides the greeting, so only while linked. */
 const unplaced = computed(() => status.value?.peers.filter((p) => !p.link) ?? [])
 
-/** The grid shown: every placed tile, plus a ring of empty cells to move into. */
+/** Every placed machine plus a ring of empty cells to move into. */
 const bounds = computed(() => {
-  const xs = placed.value.map((t) => t.at.x)
-  const ys = placed.value.map((t) => t.at.y)
+  const xs = placed.value.map((m) => m.at.x)
+  const ys = placed.value.map((m) => m.at.y)
   if (xs.length === 0) return { x0: -1, x1: 1, y0: -1, y1: 1 }
-  return {
-    x0: Math.min(...xs) - 1,
-    x1: Math.max(...xs) + 1,
-    y0: Math.min(...ys) - 1,
-    y1: Math.max(...ys) + 1,
-  }
+  return { x0: Math.min(...xs) - 1, x1: Math.max(...xs) + 1, y0: Math.min(...ys) - 1, y1: Math.max(...ys) + 1 }
 })
 
-const cells = computed(() => {
-  const out: Position[] = []
-  for (let y = bounds.value.y0; y <= bounds.value.y1; y++)
-    for (let x = bounds.value.x0; x <= bounds.value.x1; x++) out.push({ x, y })
+const lanes = computed<TopologyLane[]>(() => {
+  const out: TopologyLane[] = []
+  for (let y = bounds.value.y0; y <= bounds.value.y1; y++) {
+    for (let x = bounds.value.x0; x <= bounds.value.x1; x++) {
+      out.push({ id: `${x},${y}`, label: `${x}, ${y}`, x: x * CELL_W, y: y * CELL_H, width: CELL_W - 12, height: CELL_H - 12 })
+    }
+  }
   return out
 })
 
-function tilesAt(p: Position) {
-  return placed.value.filter((t) => t.at.x === p.x && t.at.y === p.y)
+/**
+ * Bumped when a drag must be undone — a peer's card, which is not this
+ * machine's to move. The canvas keeps a dragged node where it was dropped
+ * until it is handed positions it has not seen, so the nodes are rebuilt.
+ */
+const revision = ref(0)
+
+const nodes = computed<TopologyNode[]>(() => {
+  void revision.value
+  return placed.value.map((m) => ({
+    id: m.id,
+    position: { x: m.at.x * CELL_W + PAD_X, y: m.at.y * CELL_H + PAD_Y },
+    data: {
+      name: m.name,
+      // The kit's own role keys, so this machine and its peers take different
+      // colours and glyphs; the printed label is `roleLabel`.
+      role: m.self ? "host" : "edge",
+      roleLabel: m.self ? t("placement.thisMachine") : (m.kind ?? t("placement.peer")),
+      online: m.online,
+    },
+  }))
+})
+
+const edges = computed<TopologyEdge[]>(() => {
+  const self = placed.value.find((m) => m.self)
+  if (!self) return []
+  return placed.value
+    .filter((m) => !m.self)
+    .map((m) => ({
+      id: `${self.id}-${m.id}`,
+      source: self.id,
+      target: m.id,
+      kind: t("placement.link"),
+      observed: m.online ? ("applied" as const) : ("pending" as const),
+    }))
+})
+
+function onDragStop({ id, position }: { id: string; position: { x: number; y: number } }) {
+  const self = placed.value.find((m) => m.self)
+  if (!self || id !== self.id) {
+    revision.value += 1
+    toast.info(t("placement.peerNotMine"))
+    return
+  }
+  draft.value = {
+    x: Math.round((position.x - PAD_X) / CELL_W),
+    y: Math.round((position.y - PAD_Y) / CELL_H),
+  }
+  revision.value += 1
 }
 
 const sharing = computed(() => {
   const me = here.value
   if (!me) return []
-  return placed.value.filter((t) => !t.self && t.at.x === me.x && t.at.y === me.y)
+  return placed.value.filter((m) => !m.self && m.at.x === me.x && m.at.y === me.y)
 })
 
 const changed = computed(() => {
@@ -67,96 +131,70 @@ const changed = computed(() => {
   return !!draft.value && !!s && (draft.value.x !== s.node.position.x || draft.value.y !== s.node.position.y)
 })
 
-function moveTo(p: Position) {
-  draft.value = { x: p.x, y: p.y }
-}
-
 function nudge(dx: number, dy: number) {
-  if (here.value) moveTo({ x: here.value.x + dx, y: here.value.y + dy })
-}
-
-function onDragStart(event: DragEvent, tile: Tile) {
-  if (!tile.self || !event.dataTransfer) return
-  event.dataTransfer.effectAllowed = "move"
-  event.dataTransfer.setData("text/plain", "cursio-self")
-}
-
-function onDrop(event: DragEvent, p: Position) {
-  if (event.dataTransfer?.getData("text/plain") === "cursio-self") moveTo(p)
+  if (here.value) draft.value = { x: here.value.x + dx, y: here.value.y + dy }
 }
 
 const applying = ref(false)
-const message = ref("")
 async function apply() {
   if (!draft.value) return
   applying.value = true
-  message.value = ""
   try {
     const reply = await setPosition(draft.value)
-    message.value =
-      reply.reply === "saved" && (reply.pinned as string[]).includes("position")
-        ? t("placement.pinned")
-        : t("placement.applied")
+    if (reply.reply === "saved" && (reply.pinned as string[]).includes("position")) toast.warning(t("placement.pinned"))
+    else toast.success(t("placement.applied"))
     draft.value = null
   } catch (e) {
-    message.value = (e as { message?: string }).message ?? String(e)
+    toast.failure(e, { title: t("placement.failed"), retry: apply })
   } finally {
     applying.value = false
   }
 }
+
+const legendLabels = computed(() => ({
+  network: t("placement.legendLinked"),
+  pending: t("placement.legendPending"),
+}))
 </script>
 
 <template>
   <DesktopShell>
-    <section v-if="status" class="flex flex-col gap-3">
-      <LpSection
-        :title="t('placement.title')"
-        :description="t('placement.description')"
-        icon="lucide:layout-grid"
-      />
-      <LpCard padded>
-        <div
-          class="grid gap-2"
-          :style="{ gridTemplateColumns: `repeat(${bounds.x1 - bounds.x0 + 1}, minmax(0, 7rem))` }"
-        >
-          <div
-            v-for="cell in cells"
-            :key="`${cell.x},${cell.y}`"
-            class="flex aspect-[4/3] flex-col items-stretch justify-center gap-1 rounded-control border border-dashed border-line p-1"
-            @dragover.prevent
-            @drop.prevent="onDrop($event, cell)"
-            @dblclick="moveTo(cell)"
-          >
-            <div
-              v-for="tile in tilesAt(cell)"
-              :key="tile.key"
-              :draggable="tile.self"
-              class="flex min-w-0 items-center gap-1 rounded-control px-2 py-1 text-xs"
-              :class="tile.self ? 'cursor-grab bg-brand text-ink-inverse' : 'bg-surface-soft text-ink'"
-              @dragstart="onDragStart($event, tile)"
-            >
-              <LpIcon :name="tile.self ? 'lucide:monitor' : 'lucide:monitor-smartphone'" :size="14" />
-              <span class="truncate">{{ tile.name }}</span>
-            </div>
-            <span v-if="tilesAt(cell).length === 0" class="text-center text-[10px] text-muted">
-              {{ cell.x }},{{ cell.y }}
-            </span>
-          </div>
-        </div>
+    <section class="flex flex-col gap-4">
+      <LpSection :title="t('placement.title')" :description="t('placement.description')" icon="lucide:layout-grid" />
 
-        <div class="mt-4 flex flex-wrap items-center gap-2">
-          <LpButton variant="soft" size="sm" square :aria-label="t('placement.left')" @click="nudge(-1, 0)">
-            <LpIcon name="lucide:arrow-left" :size="16" />
-          </LpButton>
-          <LpButton variant="soft" size="sm" square :aria-label="t('placement.up')" @click="nudge(0, -1)">
-            <LpIcon name="lucide:arrow-up" :size="16" />
-          </LpButton>
-          <LpButton variant="soft" size="sm" square :aria-label="t('placement.down')" @click="nudge(0, 1)">
-            <LpIcon name="lucide:arrow-down" :size="16" />
-          </LpButton>
-          <LpButton variant="soft" size="sm" square :aria-label="t('placement.right')" @click="nudge(1, 0)">
-            <LpIcon name="lucide:arrow-right" :size="16" />
-          </LpButton>
+      <LpSkeleton v-if="!status" rounded="card" class="h-[26rem]" />
+      <LpCard v-else class="overflow-hidden">
+        <div class="h-[26rem]">
+          <LpTopologyCanvas
+            :nodes="nodes"
+            :edges="edges"
+            :lanes="lanes"
+            :minimap="false"
+            :legend-labels="legendLabels"
+            @node-drag-stop="onDragStop"
+          />
+        </div>
+        <div class="flex flex-wrap items-center gap-2 border-t border-line p-3">
+          <LpTooltip :content="t('placement.left')">
+            <LpButton variant="soft" size="sm" square :aria-label="t('placement.left')" @click="nudge(-1, 0)">
+              <LpIcon name="lucide:arrow-left" :size="16" />
+            </LpButton>
+          </LpTooltip>
+          <LpTooltip :content="t('placement.up')">
+            <LpButton variant="soft" size="sm" square :aria-label="t('placement.up')" @click="nudge(0, -1)">
+              <LpIcon name="lucide:arrow-up" :size="16" />
+            </LpButton>
+          </LpTooltip>
+          <LpTooltip :content="t('placement.down')">
+            <LpButton variant="soft" size="sm" square :aria-label="t('placement.down')" @click="nudge(0, 1)">
+              <LpIcon name="lucide:arrow-down" :size="16" />
+            </LpButton>
+          </LpTooltip>
+          <LpTooltip :content="t('placement.right')">
+            <LpButton variant="soft" size="sm" square :aria-label="t('placement.right')" @click="nudge(1, 0)">
+              <LpIcon name="lucide:arrow-right" :size="16" />
+            </LpButton>
+          </LpTooltip>
           <span class="text-xs text-muted">{{ t("placement.here", { x: here?.x, y: here?.y }) }}</span>
           <div class="ml-auto flex gap-2">
             <LpButton v-if="changed" variant="ghost" size="sm" @click="draft = null">{{ t("placement.reset") }}</LpButton>
@@ -165,13 +203,12 @@ async function apply() {
             </LpButton>
           </div>
         </div>
-        <p v-if="message" class="mt-3 text-xs text-muted">{{ message }}</p>
       </LpCard>
 
-      <LpAlert v-if="sharing.length" variant="warning" class="mt-4">
+      <LpAlert v-if="sharing.length" variant="warning">
         {{ t("placement.sameCell", { names: sharing.map((s) => s.name).join(", ") }) }}
       </LpAlert>
-      <p v-if="unplaced.length" class="mt-4 text-xs text-muted">
+      <p v-if="unplaced.length" class="text-xs text-muted">
         {{ t("placement.unplaced", { names: unplaced.map((p) => p.name).join(", ") }) }}
       </p>
     </section>

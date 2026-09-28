@@ -14,4 +14,5 @@ onBeforeUnmount(() => unlisten?.())
 
 <template>
   <NuxtPage />
+  <LpToaster />
 </template>

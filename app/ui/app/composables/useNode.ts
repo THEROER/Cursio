@@ -87,6 +87,10 @@ export interface NodeStatusReply {
     position: Position
     status: NodeStatus
     started_at: SystemTime
+    /** 0 from a node older than control v4. */
+    pid: number
+    build: string
+    installed_version: string | null
   }
   peers: PeerView[]
   modules: Modules

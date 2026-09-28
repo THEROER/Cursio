@@ -3,17 +3,38 @@ import { toMillis, type PairingOutcome, type PairingState, type Reply } from "~/
 
 const { t } = useI18n()
 const { pairShow, pairEnter, pairCancel, pairing } = useNode()
+const toast = useCursioToast()
 
 const state = ref<PairingState | null>(null)
 const outcome = ref<PairingOutcome | null>(null)
-const error = ref("")
 const code = ref("")
 const now = ref(Date.now())
+const confirmCancel = ref(false)
 
 function take(reply: Reply) {
   if (reply.reply !== "pairing") return
+  const was = state.value
   state.value = (reply.state as PairingState | null) ?? null
-  outcome.value = (reply.last as PairingOutcome | null) ?? null
+  const last = (reply.last as PairingOutcome | null) ?? null
+  // Say how the window closed once, when it closes, not on every poll after.
+  if (was && !state.value && last) announce(last)
+  outcome.value = last
+}
+
+function announce(o: PairingOutcome) {
+  switch (o.outcome) {
+    case "paired":
+      toast.success(t("pair.paired", { peer: o.peer }))
+      break
+    case "expired":
+      toast.warning(t("pair.expired"))
+      break
+    case "too_many_attempts":
+      toast.error(t("pair.tooMany"))
+      break
+    default:
+      toast.info(t("pair.cancelled"))
+  }
 }
 
 // The window closes on its own — used, expired, or too many wrong codes — so
@@ -31,19 +52,23 @@ onMounted(async () => {
     try {
       take(await pairing())
     } catch (e) {
-      error.value = (e as { message?: string }).message ?? String(e)
+      toast.failure(e, { title: t("pair.failed") })
     }
   }, 1000)
 })
 onBeforeUnmount(() => clearInterval(timer))
 
 async function run(action: () => Promise<Reply>) {
-  error.value = ""
   try {
     take(await action())
   } catch (e) {
-    error.value = (e as { message?: string }).message ?? String(e)
+    toast.failure(e, { title: t("pair.failed"), retry: () => run(action) })
   }
+}
+
+async function cancel() {
+  await run(pairCancel)
+  confirmCancel.value = false
 }
 
 const remaining = computed(() => {
@@ -51,50 +76,40 @@ const remaining = computed(() => {
   const left = Math.max(0, Math.round((toMillis(state.value.expires_at) - now.value) / 1000))
   return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`
 })
-
-const outcomeText = computed(() => {
-  const o = outcome.value
-  if (!o || state.value) return ""
-  switch (o.outcome) {
-    case "paired":
-      return t("pair.paired", { peer: o.peer })
-    case "expired":
-      return t("pair.expired")
-    case "too_many_attempts":
-      return t("pair.tooMany")
-    default:
-      return t("pair.cancelled")
-  }
-})
 </script>
 
 <template>
   <DesktopShell>
-    <section class="flex flex-col gap-3">
+    <section class="flex flex-col gap-4">
       <LpSection :title="t('pair.title')" :description="t('pair.description')" icon="lucide:link" />
-      <div v-if="state" class="flex flex-col gap-4">
-        <LpCard padded class="flex flex-col items-center gap-3 text-center">
-          <template v-if="state.code">
-            <p class="text-sm text-muted">{{ t("pair.showThis") }}</p>
+
+      <LpCard v-if="state" padded class="flex flex-col items-center gap-3 text-center">
+        <template v-if="state.code">
+          <p class="text-sm text-muted">{{ t("pair.showThis") }}</p>
+          <LpTooltip :content="t('pair.copyHint')">
             <p class="font-mono text-4xl font-semibold tracking-[0.2em] select-all">{{ state.code }}</p>
-          </template>
-          <p v-else class="text-sm">{{ t("pair.waiting") }}</p>
-          <p class="text-xs text-muted">{{ t("pair.expiresIn", { time: remaining }) }}</p>
-          <p v-if="state.failed_attempts" class="text-xs text-danger">
-            {{ t("pair.failedAttempts", { n: state.failed_attempts }) }}
-          </p>
-          <LpButton variant="ghost" size="sm" @click="run(pairCancel)">{{ t("pair.cancel") }}</LpButton>
-        </LpCard>
-      </div>
+          </LpTooltip>
+        </template>
+        <p v-else class="text-sm">{{ t("pair.waiting") }}</p>
+        <LpBadge tone="brand">{{ t("pair.expiresIn", { time: remaining }) }}</LpBadge>
+        <LpBadge v-if="state.failed_attempts" tone="danger">
+          {{ t("pair.failedAttempts", { n: state.failed_attempts }) }}
+        </LpBadge>
+        <LpButton variant="ghost" size="sm" @click="confirmCancel = true">{{ t("pair.cancel") }}</LpButton>
+      </LpCard>
 
       <div v-else class="grid grid-cols-1 gap-4 md:grid-cols-2">
         <LpCard padded class="flex flex-col gap-3">
-          <h3 class="text-sm font-semibold">{{ t("pair.showTitle") }}</h3>
+          <h3 class="flex items-center gap-2 text-sm font-semibold">
+            <LpIcon name="lucide:qr-code" :size="16" class="text-brand" />{{ t("pair.showTitle") }}
+          </h3>
           <p class="text-xs text-muted">{{ t("pair.showHint") }}</p>
           <LpButton variant="solid" class="mt-auto" @click="run(pairShow)">{{ t("pair.show") }}</LpButton>
         </LpCard>
         <LpCard padded class="flex flex-col gap-3">
-          <h3 class="text-sm font-semibold">{{ t("pair.enterTitle") }}</h3>
+          <h3 class="flex items-center gap-2 text-sm font-semibold">
+            <LpIcon name="lucide:keyboard" :size="16" class="text-brand" />{{ t("pair.enterTitle") }}
+          </h3>
           <p class="text-xs text-muted">{{ t("pair.enterHint") }}</p>
           <form class="flex flex-col gap-3" @submit.prevent="run(() => pairEnter(code))">
             <LpOtpInput v-model="code" :length="8" alphanumeric />
@@ -103,11 +118,18 @@ const outcomeText = computed(() => {
         </LpCard>
       </div>
 
-      <LpAlert v-if="outcomeText" :variant="outcome?.outcome === 'paired' ? 'success' : 'warning'" class="mt-4">
-        {{ outcomeText }}
-      </LpAlert>
-      <LpAlert v-if="error" variant="danger" class="mt-4">{{ error }}</LpAlert>
-      <p class="mt-4 text-xs text-muted">{{ t("pair.cli") }}</p>
+      <LpCodeBlock :model-value="t('pair.cliCommands')" lang="bash" :title="t('pair.cli')" />
     </section>
+
+    <LpConfirmDialog
+      v-model:open="confirmCancel"
+      danger
+      icon="lucide:link-2-off"
+      :title="t('pair.cancelTitle')"
+      :description="t('pair.cancelBody')"
+      :confirm-label="t('pair.cancel')"
+      :cancel-label="t('pair.keepOpen')"
+      @confirm="cancel"
+    />
   </DesktopShell>
 </template>

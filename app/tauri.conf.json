@@ -15,8 +15,11 @@
         "fullscreen": false,
         "resizable": true,
         "title": "Cursio",
-        "width": 960,
+        "width": 1040,
         "height": 720,
+        "minWidth": 760,
+        "minHeight": 520,
+        "decorations": false,
         "visible": false
       }
     ],

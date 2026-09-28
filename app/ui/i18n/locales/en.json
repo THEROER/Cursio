@@ -17,17 +17,91 @@
     "notRunningTitle": "The Cursio node is not running on this machine",
     "notRunningBody": "Nothing is shared until it runs. Start it here, or run `cursio mesh` in a terminal.",
     "start": "Start node",
-    "starting": "Starting…"
+    "starting": "Starting…",
+    "startRequested": "Starting the node; this window follows it once it answers.",
+    "startFailed": "The node did not start"
+  },
+  "common": {
+    "cancel": "Cancel",
+    "working": "Working…"
+  },
+  "toast": {
+    "failed": "Something went wrong",
+    "retry": "Try again",
+    "copy": "Copy details",
+    "copied": "Copied"
+  },
+  "window": {
+    "minimize": "Minimize",
+    "maximize": "Maximize",
+    "close": "Close to the tray",
+    "failed": "The window did not respond"
   },
   "stats": {
     "peers": "Peers online",
-    "latency": "Input latency p50 / p99",
-    "latencyHint": "Last 30 s of pointer and key events",
+    "peersHint": "Paired machines connected right now",
+    "latency": "Input latency p99",
+    "latencyP50": "p50 {p50} ms",
+    "latencyHint": "The slower of wire-to-injection and capture-to-send, over the last 30 s",
+    "latencyTrend": "Input latency p99 since this window opened",
     "noLatency": "No input measured yet",
-    "problems": "Problems"
+    "problems": "Problems",
+    "problemsHint": "What the node found wrong on this machine, each with its fix"
   },
   "problems": {
-    "title": "Problems"
+    "title": "Problems",
+    "none": "Nothing wrong on this machine",
+    "noneHint": "The node raises a problem here the moment it finds one.",
+    "markAllRead": "Mark all as seen",
+    "markRead": "Mark as seen",
+    "markUnread": "Mark as not seen",
+    "open": "Show"
+  },
+  "severity": {
+    "Info": "Info",
+    "Warning": "Warning",
+    "Error": "Error"
+  },
+  "logs": {
+    "title": "Logs",
+    "toggle": "Show logs (Ctrl L)",
+    "node": "Node",
+    "app": "This app",
+    "filter": "Filter lines",
+    "empty": "Nothing logged yet"
+  },
+  "update": {
+    "title": "Version",
+    "unversioned": "build {build}, not installed",
+    "meshLater": "Updates arrive with `cursio update`; delivery over the mesh is not built yet.",
+    "drift": "The node runs {running}, but the install points at {current}; restart the node to switch.",
+    "noInstall": "No versioned install on this machine",
+    "noInstallHint": "Builds staged with `cargo xtask stage --install` appear here.",
+    "current": "current",
+    "previous": "previous",
+    "rollback": "Roll back",
+    "rollbackTitle": "Go back to {version}?",
+    "rollbackBody": "The node stops, the previous version starts in its place, and links reconnect in a few seconds. If it does not come up, the current version is started again.",
+    "rollingBack": "Rolling back to {version}; the node restarts.",
+    "rollbackFailed": "Could not roll back"
+  },
+  "palette": {
+    "open": "Commands (Ctrl K)",
+    "placeholder": "Type a command…",
+    "empty": "No matching command",
+    "recent": "Recent",
+    "results": "Commands",
+    "go": "Go to",
+    "node": "Node",
+    "toggleModule": "Turn a module on or off",
+    "moduleSearch": "Which module?",
+    "on": "On",
+    "off": "Off",
+    "navigate": "move",
+    "select": "run",
+    "close": "close",
+    "back": "back",
+    "searching": "Searching…"
   },
   "modules": {
     "title": "What this machine shares",
@@ -49,7 +123,8 @@
     "flag": "set by a flag",
     "pinned": "Saved, but a command-line flag overrides it until the node is started without that flag.",
     "appliedNote": "Changes are written to {path} and take effect at once; links stay up.",
-    "restartNeeded": "Waiting for a restart to apply: {fields}"
+    "restartNeeded": "Waiting for a restart to apply: {fields}",
+    "toggleFailed": "The module was not switched"
   },
   "peers": {
     "title": "Peers",
@@ -81,7 +156,10 @@
     "unknownNetwork": "Unrecognised link",
     "cannotSay": "Cannot say",
     "skipped": "{module} off on this link: {why}",
-    "noLink": "Not connected in this session, so its position and status are unknown."
+    "noLink": "Not connected in this session, so its position and status are unknown.",
+    "uptime": "Connection",
+    "uptimeStart": "10 min ago",
+    "uptimeEnd": "now"
   },
   "placement": {
     "title": "Arrange machines",
@@ -96,7 +174,14 @@
     "applied": "Saved; peers see the new position at once.",
     "pinned": "Saved, but --at on the command line overrides it until the node is started without it.",
     "sameCell": "Same cell as {names}: machines in one cell border nothing, so the cursor will not cross between them.",
-    "unplaced": "Not shown until they connect: {names}"
+    "unplaced": "Not shown until they connect: {names}",
+    "failed": "The position was not saved",
+    "thisMachine": "This machine",
+    "peer": "Peer",
+    "link": "linked",
+    "legendLinked": "Connected",
+    "legendPending": "Reconnecting",
+    "peerNotMine": "A peer's place is set on that machine, in its own Cursio app."
   },
   "pair": {
     "title": "Pair a machine",
@@ -116,7 +201,13 @@
     "expired": "The code expired before it was used. Show a new one.",
     "tooMany": "Too many wrong codes, so pairing was closed. Show a new code.",
     "cancelled": "Pairing cancelled.",
-    "cli": "From a terminal: `cursio pair` shows a code, `cursio pair ABCD-EFGH` enters one."
+    "cli": "From a terminal",
+    "cliCommands": "cursio pair            # show a code here\ncursio pair ABCD-EFGH  # enter one from the other machine",
+    "failed": "Pairing did not go through",
+    "copyHint": "Select to copy",
+    "cancelTitle": "Close the pairing window?",
+    "cancelBody": "The code stops working at once; the other machine has to start again with a new one.",
+    "keepOpen": "Keep it open"
   },
   "settings": {
     "autostartTitle": "Start at login",
@@ -125,11 +216,22 @@
     "autostartNodeHint": "Linux: a systemd user service. Windows: the Run key; the node asks for administrator rights as it does from a terminal.",
     "autostartTray": "Show the tray icon",
     "autostartTrayHint": "Starts this app hidden, in the notification area.",
+    "autostartFailed": "Start at login was not changed",
+    "saved": "Saved",
+    "themeTitle": "Theme",
+    "themeDescription": "Kept on this machine for this app.",
     "nodeTitle": "Node",
-    "configAt": "Config file: {path}",
+    "configFile": "Config file",
     "pinned": "Fixed by command-line flags: {fields}",
+    "build": "Build",
+    "installedVersion": "Installed version",
+    "notInstalled": "not from an install",
+    "pid": "Process",
     "restart": "Restart node",
-    "restarting": "Restarting; peers reconnect in a few seconds."
+    "restarting": "Restarting; peers reconnect in a few seconds.",
+    "restartFailed": "The node was not restarted",
+    "restartTitle": "Restart the node?",
+    "restartBody": "Every link drops for a few seconds and peers' disks unmount while it comes back. Only needed for settings marked as waiting for a restart."
   },
   "connection": {
     "password": "Pairing password",
