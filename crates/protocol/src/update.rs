@@ -334,7 +334,10 @@ impl Statement {
     }
 }
 
-/// This build's platform name, as a [`Preamble`] and a [`Statement`] spell it.
+/// The `<os>-<arch>` part of this build's platform name, as a [`Preamble`] and
+/// a [`Statement`] spell it. A Linux node adds the FFmpeg it links against
+/// (`cursio_core::update::platform`); a build is only a platform's if it runs
+/// there, and the OS and architecture alone do not say that.
 pub fn this_platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }

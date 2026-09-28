@@ -155,7 +155,7 @@ pub async fn handshake_as<T: Transport + ?Sized>(
         protocol_version,
         peer_id: local.peer_id,
         build: crate::update::running_build(),
-        platform: cursio_protocol::update::this_platform(),
+        platform: crate::update::platform(),
     };
     transport
         .send(&Message::Update(

@@ -365,17 +365,15 @@ pub fn start(config_path: std::path::PathBuf) {
             return;
         }
     };
-    let agent = install(Agent::new(
-        layout,
-        cursio_protocol::update::this_platform(),
-        move || match crate::config::Config::load(&config_path) {
+    let agent = install(Agent::new(layout, super::platform(), move || {
+        match crate::config::Config::load(&config_path) {
             Ok(config) => config.update,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot read the config; updates fall back to asking");
                 UpdateConfig::default()
             }
-        },
-    ));
+        }
+    }));
     watch(agent);
 }
 

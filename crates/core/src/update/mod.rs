@@ -51,6 +51,17 @@ pub enum UpdateError {
     Refused(String),
 }
 
+/// The platform this build takes updates for: `<os>-<arch>`, and on Linux the
+/// FFmpeg it was linked against (`linux-x86_64-av59`) — see `build.rs` for why
+/// two Linux machines are not one platform.
+pub fn platform() -> String {
+    let base = cursio_protocol::update::this_platform();
+    match option_env!("CURSIO_PLATFORM_ABI") {
+        Some(abi) => format!("{base}-{abi}"),
+        None => base,
+    }
+}
+
 /// Which build this process is: the installed version it was started from,
 /// or the crate version for a development build under `target/`.
 pub fn running_build() -> String {

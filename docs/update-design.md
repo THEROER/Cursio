@@ -145,6 +145,21 @@ and sha256, and then installed into `versions/` through phase 1's `install`.
 The store keeps them, so the receiver can serve the next machine; a machine
 fetches only its own platform, and relays what it holds.
 
+**A platform is where a build runs, not just an OS.** On Windows it is
+`windows-x86_64`. On Linux the node links the system's FFmpeg by soname, and
+that soname follows FFmpeg's major version: a build from Ubuntu 25.10
+(`libavutil.so.59`) does not start on 24.04 (`.so.58`). Named plain
+`linux-x86_64`, the 24.04 machine took the newer build, failed the health check
+and rolled back, and did so again at every offer. So a Linux platform carries
+the FFmpeg major it links — `linux-x86_64-av59`, `linux-x86_64-av58` — read by
+`crates/core/build.rs` from the same `pkg-config` the FFmpeg bindings use, and
+by `xtask` the same way when it names what it staged. `cargo xtask publish` on a
+Linux host builds the 24.04 variant in a container
+(`crates/xtask/docker/ubuntu-24.04.Dockerfile`, `cargo xtask stage ubuntu24`)
+and signs it into the same version, so one publish reaches both. A build
+without the window module links no FFmpeg and keeps the plain name. Nodes from
+before the split call themselves `linux-x86_64` and are updated by hand once.
+
 **Signatures, not trust in whoever sent it.** What is signed is a `Statement`:
 version, channel, publish time (builds are ordered by it — commits do not
 sort), and every platform's files with size and sha256. Ed25519, two kinds of
