@@ -241,7 +241,9 @@ clients rejected. Whoever reaches it can open a pairing window, so it is kept
 exactly as private as the trust store.
 
 Newline-delimited JSON, `{"id":1,"cmd":"status"}` → `{"id":1,"reply":"status",…}`.
-Commands: `ping`, `status` (node, peers with presence/position/`NodeStatus`/
+Commands: `ping`, `status` (node — with its `pid`, crate `build` and the
+`installed_version` it runs from, so the app can show and roll back what runs —
+peers with presence/position/`NodeStatus`/
 negotiated and skipped modules, configured modules, what flags pin, input
 latency, `diagnostics` problems, the pairing window), `config`, `set_config`,
 `set_module`, `set_position`, `pair_show`, `pair_enter`, `pair_cancel`,

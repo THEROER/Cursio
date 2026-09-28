@@ -55,8 +55,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// Bumped when a request or reply changes shape, so a stale app says "update
 /// me" rather than misreading a field. v2: `restart_needed` in the status and
 /// in every save reply, now that changes apply without a restart. v3:
-/// `subscribe`, and status pushed with id 0.
-pub const CONTROL_VERSION: u32 = 3;
+/// `subscribe`, and status pushed with id 0. v4: the node's `pid`, `build`
+/// and `installed_version`, so the app can show and roll back what runs.
+pub const CONTROL_VERSION: u32 = 4;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -204,6 +205,17 @@ pub struct NodeView {
     pub position: Position,
     pub status: NodeStatus,
     pub started_at: SystemTime,
+    /// The node's process, for an update or rollback to wait on and stop.
+    /// Defaulted (0) from a v3 node, so a newer app still reads its status.
+    #[serde(default)]
+    pub pid: u32,
+    /// The build's crate version, whatever it was installed as.
+    #[serde(default)]
+    pub build: String,
+    /// The install version this process runs from (`versions/<v>/`), or
+    /// `None` for a build started from anywhere else (a checkout, a copy).
+    #[serde(default)]
+    pub installed_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +309,9 @@ impl NodeState {
                     position: running.position,
                     status: NodeStatus::unknown(),
                     started_at: SystemTime::now(),
+                    pid: std::process::id(),
+                    build: env!("CARGO_PKG_VERSION").to_owned(),
+                    installed_version: running_install_version(),
                 },
                 known: Vec::new(),
                 links: BTreeMap::new(),
@@ -570,6 +585,15 @@ fn error(e: impl std::fmt::Display) -> Reply {
     }
 }
 
+/// Which installed version this process is, read off its own path: a stable
+/// copy has already handed over to `versions/<v>/`, so the path names it.
+fn running_install_version() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    crate::update::layout::InstallLayout::for_user()
+        .ok()?
+        .version_of(&exe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,6 +782,17 @@ mod tests {
         );
         node.link_down(&fresh);
         assert_eq!(node.status().peers.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_names_the_process_and_build_an_update_would_replace() {
+        let dir = temp_dir("build");
+        let node = state(&dir, Overrides::default()).status().node;
+        assert_eq!(node.pid, std::process::id());
+        assert_eq!(node.build, env!("CARGO_PKG_VERSION"));
+        // A test binary lives in target/, not in an install's versions/.
+        assert_eq!(node.installed_version, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
