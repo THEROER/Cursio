@@ -34,7 +34,11 @@ cargo xtask stage [host|windows] [--install]         # versioned build dir + man
 cursio update install <dir> [--activate] | status | prune --keep N
 cursio update apply --version V --wait-pid PID [--stop] [-- mesh ...]   # switch, health-check, roll back on failure
 cursio update rollback --wait-pid PID [--stop]
+cargo xtask publish [--host-only] [--no-build]       # stage host + windows, sign, offer to the mesh (dev)
+cursio update key | trust-builder <machine> [--key K] | untrust-builder <machine>
 ```
+
+Builds cross the mesh signed: a receiving machine takes `dev` builds only from a builder it trusted, applies them per `[update] policy = "auto" | "ask" | "never"`, and `auto` switches only at a quiet moment (`core/src/update/quiet.rs`).
 
 Anything registered outside (autostart, the app's "start node") names the root's stable `cursio`/`cursio-app`, which hand over to the current version; never register a `versions/<v>/` path.
 

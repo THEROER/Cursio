@@ -202,6 +202,9 @@ enum Command_ {
     /// Put the node and the app in a versioned directory with a manifest,
     /// ready for `cursio update install`.
     Stage(stage::StageArgs),
+    /// Stage this machine's and the Windows build, sign them, and let the
+    /// running nodes offer them to the mesh on the `dev` channel.
+    Publish(stage::PublishArgs),
     /// live-test's child that touches the peer mount under a deadline.
     #[command(hide = true)]
     FileProbe {
@@ -267,6 +270,7 @@ fn main() -> Result<()> {
         Command_::Deploy(args) => deploy::deploy(args),
         Command_::LiveTest(args) => livetest::live_test(args),
         Command_::Stage(args) => stage::stage(args),
+        Command_::Publish(args) => stage::publish(args),
         Command_::FileProbe { path, seed, remove } => livetest::file_probe(&path, seed, remove),
     }
 }
