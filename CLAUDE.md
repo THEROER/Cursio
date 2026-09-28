@@ -27,6 +27,17 @@ cargo xtask deploy [--windows-only|--linux-only] [--no-restart]   # ship to Ligh
 cargo xtask live-test [--seconds N] [--yes]                       # PASS/FAIL over both real machines
 ```
 
+Builds install side by side under a per-user root, with a `current` pointer and rollback (`docs/update-design.md`):
+
+```sh
+cargo xtask stage [host|windows] [--install]         # versioned build dir + manifest.json
+cursio update install <dir> [--activate] | status | prune --keep N
+cursio update apply --version V --wait-pid PID [--stop] [-- mesh ...]   # switch, health-check, roll back on failure
+cursio update rollback --wait-pid PID [--stop]
+```
+
+Anything registered outside (autostart, the app's "start node") names the root's stable `cursio`/`cursio-app`, which hand over to the current version; never register a `versions/<v>/` path.
+
 `deploy` and `live-test` are described in `docs/live-test.md`. `deploy` never deletes a Windows `.exe` it did not name itself, and never stops the Linux daemon (it tells you to restart your `cargo xtask run`). `live-test` injects pointer motion only with `--yes`, and touches the peer mount only by exact path from a child process with a deadline.
 
 `cargo xtask android` cross-builds **the mesh core only** for arm64 (`cursio-core --lib --no-default-features`), needing `ANDROID_NDK_HOME` and `cargo install cargo-ndk`. See "Android" below for why that is the whole core and not a subset of it.
