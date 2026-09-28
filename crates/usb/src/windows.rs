@@ -319,6 +319,46 @@ pub const LOOPBACK_GUARD: &str = "Cursio - usbipd from this machine only";
 const NOT_LOOPBACK: &str = "0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255,\
                             ::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
 
+/// Add [`LOOPBACK_GUARD`] from a process that already holds administrator
+/// rights — an elevated node — so closing the port costs no prompt at all.
+#[cfg(target_os = "windows")]
+pub fn close_to_network() -> Result<(), UsbBackendError> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={LOOPBACK_GUARD}"),
+            "dir=in",
+            "action=block",
+            "protocol=TCP",
+            "localport=3240",
+            &format!("remoteip={NOT_LOOPBACK}"),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| UsbBackendError::Enumerate(format!("cannot run netsh: {e}")))?;
+    match output.status.success() {
+        true => Ok(()),
+        // netsh reports its failures on stdout.
+        false => Err(UsbBackendError::Enumerate(format!(
+            "netsh could not add the usbipd firewall rule: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        ))),
+    }
+}
+
+/// `netsh` command a user can paste to add [`LOOPBACK_GUARD`] by hand.
+pub fn close_to_network_command() -> String {
+    format!(
+        "netsh advfirewall firewall add rule name=\"{LOOPBACK_GUARD}\" dir=in action=block \
+         protocol=TCP localport=3240 remoteip={NOT_LOOPBACK}"
+    )
+}
+
 /// The PowerShell step that adds [`LOOPBACK_GUARD`] unless it is there.
 ///
 /// Idempotent by checking first rather than deleting and re-adding, so a run
@@ -515,6 +555,14 @@ pub fn default_exe() -> &'static Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_guard_command_blocks_the_same_addresses_as_the_setup_prompt() {
+        let command = close_to_network_command();
+        assert!(command.contains(&format!("remoteip={NOT_LOOPBACK}")));
+        assert!(command.contains(LOOPBACK_GUARD));
+        assert!(guard_script().contains(NOT_LOOPBACK));
+    }
 
     /// Real output from `usbipd state` on the peer (usbipd-win 5.3.0), so the
     /// parser is tested against the format that actually ships rather than one

@@ -1105,6 +1105,22 @@ fn report_usbipd_exposure() {
         crate::diagnostics::clear(ID);
         return;
     }
+    // A node that elevated at startup can close the port itself; telling the
+    // user to paste a command into an administrator shell would be asking
+    // them to do what this process has the rights to do.
+    if crate::elevate::is_elevated() {
+        match cursio_usb::windows::close_to_network() {
+            Ok(()) => {
+                tracing::info!(
+                    rule = cursio_usb::windows::LOOPBACK_GUARD,
+                    "closed usbipd's port to the network"
+                );
+                crate::diagnostics::clear(ID);
+                return;
+            }
+            Err(e) => tracing::warn!(error = %e, "could not close usbipd's port to the network"),
+        }
+    }
     crate::diagnostics::raise(crate::diagnostics::Problem {
         id: ID.into(),
         severity: crate::diagnostics::Severity::Warning,
@@ -1112,10 +1128,8 @@ fn report_usbipd_exposure() {
                   reaches it can take a shared device"
             .into(),
         hint: Some(format!(
-            "the next usb setup prompt closes it; to do it now, in an administrator shell: \
-             netsh advfirewall firewall add rule name=\"{}\" dir=in action=block \
-             protocol=TCP localport=3240 remoteip=0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255",
-            cursio_usb::windows::LOOPBACK_GUARD
+            "the next usb setup prompt closes it; to do it now, in an administrator shell: {}",
+            cursio_usb::windows::close_to_network_command()
         )),
         since: std::time::SystemTime::now(),
     });

@@ -90,8 +90,15 @@ pub fn ensure_elevated() -> Elevation {
     }
 }
 
+/// Whether this process holds administrator rights, so work that would
+/// otherwise need its own UAC prompt can simply be done.
+#[cfg(not(target_os = "windows"))]
+pub fn is_elevated() -> bool {
+    false
+}
+
 #[cfg(target_os = "windows")]
-fn is_elevated() -> bool {
+pub fn is_elevated() -> bool {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
