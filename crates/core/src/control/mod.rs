@@ -21,9 +21,11 @@
 //! ## Wire format
 //!
 //! One JSON object per line, each way. A request carries an `id` the reply
-//! echoes, so a client may pipeline. There are no pushed events: status is a
-//! few hundred bytes and a UI that polls it every second or two is simpler
-//! than a subscription protocol, and cannot fall behind.
+//! echoes, so a client may have several in flight on one connection and match
+//! each answer to its question. After [`Command::Subscribe`] the node also
+//! pushes the status, with id 0, whenever it changes — the LeavePulse
+//! launcher's arrangement. Polling was simpler, but a UI that waits on its own
+//! poll queues every click behind it, and shows a toggle's result a poll late.
 //!
 //! ## Changing things goes through the config file
 //!
@@ -52,8 +54,12 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 
 /// Bumped when a request or reply changes shape, so a stale app says "update
 /// me" rather than misreading a field. v2: `restart_needed` in the status and
-/// in every save reply, now that changes apply without a restart.
-pub const CONTROL_VERSION: u32 = 2;
+/// in every save reply, now that changes apply without a restart. v3:
+/// `subscribe`, and status pushed with id 0.
+pub const CONTROL_VERSION: u32 = 3;
+
+/// The id a pushed message carries. Requests number from 1.
+pub const PUSH_ID: u64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
@@ -137,6 +143,8 @@ pub enum Command {
     Pairing,
     /// Restart the node from the top, re-reading everything.
     Restart,
+    /// Push the status on this connection whenever it changes, starting now.
+    Subscribe,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -164,6 +172,8 @@ pub enum Reply {
         last: Option<PairingOutcome>,
     },
     Done,
+    /// Status will now be pushed on this connection.
+    Subscribed,
     Error {
         message: String,
     },
@@ -259,6 +269,10 @@ pub struct NodeState {
     applier: Applier,
     pairing: PairingWindow,
     restart: Arc<tokio::sync::Notify>,
+    /// Bumped whenever something a status shows changed here, which is what
+    /// wakes subscribers. What changes elsewhere — latency, problems — is
+    /// caught by their periodic look.
+    revision: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 /// Carries a config change into the running node: given what runs and what
@@ -294,7 +308,17 @@ impl NodeState {
             applier,
             pairing,
             restart: Arc::new(tokio::sync::Notify::new()),
+            revision: Arc::new(tokio::sync::watch::channel(0).0),
         }
+    }
+
+    fn changed(&self) {
+        self.revision.send_modify(|r| *r = r.wrapping_add(1));
+    }
+
+    /// Resolves each time something a status shows changes.
+    pub fn revisions(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision.subscribe()
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -319,6 +343,7 @@ impl NodeState {
             (self.applier)(&running, &next);
             self.inner().node.position = next.position;
             *running = next;
+            self.changed();
         }
         crate::live::restart_needed(&self.started, &running)
     }
@@ -337,17 +362,31 @@ impl NodeState {
         &self.overrides
     }
 
+    /// Published every sweep, so a subscriber is woken only when it differs.
     pub fn set_local_status(&self, status: NodeStatus) {
-        self.inner().node.status = status;
+        let moved = std::mem::replace(&mut self.inner().node.status, status) != status;
+        if moved {
+            self.changed();
+        }
     }
 
+    /// Published every sweep, so a subscriber is woken only when it differs.
     pub fn set_known(&self, known: Vec<KnownPeerView>) {
-        self.inner().known = known;
+        let moved = {
+            let mut inner = self.inner();
+            let moved = inner.known != known;
+            inner.known = known;
+            moved
+        };
+        if moved {
+            self.changed();
+        }
     }
 
     pub fn link_up(&self, peer: PeerId, name: &str, link: LinkView) {
         crate::metrics::note_peer_status(peer, link.status);
         self.inner().links.insert(peer, (name.to_owned(), link));
+        self.changed();
     }
 
     /// A running link renegotiated: the peer moved, or the modules changed.
@@ -365,10 +404,12 @@ impl NodeState {
             link.modules = modules;
             link.skipped = skipped;
         }
+        self.changed();
     }
 
     pub fn link_down(&self, peer: &PeerId) {
         self.inner().links.remove(peer);
+        self.changed();
     }
 
     /// Resolves when a client asked for a restart.
@@ -488,17 +529,20 @@ impl NodeState {
             }
             Command::PairShow => {
                 self.pairing.open_shown_code();
+                self.changed();
                 self.pairing_reply()
             }
             Command::PairEnter { code } => match PairingCode::parse(&code) {
                 Ok(code) => {
                     self.pairing.open_entered_code(&code, None);
+                    self.changed();
                     self.pairing_reply()
                 }
                 Err(e) => error(e),
             },
             Command::PairCancel => {
                 self.pairing.cancel();
+                self.changed();
                 self.pairing_reply()
             }
             Command::Pairing => self.pairing_reply(),
@@ -506,6 +550,9 @@ impl NodeState {
                 self.restart.notify_one();
                 Reply::Done
             }
+            // The connection, not the node, keeps subscriptions; see
+            // `transport::serve_connection`.
+            Command::Subscribe => Reply::Subscribed,
         }
     }
 

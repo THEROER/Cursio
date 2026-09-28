@@ -7,11 +7,9 @@
 //! clicks on the icon itself, only menu choices, so everything is in the menu
 //! and the left click merely opens the window where clicks do arrive.
 //!
-//! The menu is refreshed from the node's status every couple of seconds —
-//! the same poll the status window does — so a toggle flipped in the window,
-//! in `config.toml` or by another machine's restart shows here too.
-
-use std::time::Duration;
+//! The menu is redrawn each time the node pushes a changed status, so a toggle
+//! flipped in the window, in `config.toml` or from the other machine shows
+//! here at once.
 
 use cursio_core::control::{ModuleSwitch, Presence, Status};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
@@ -20,15 +18,25 @@ use tauri::{AppHandle, Emitter, Manager, Wry};
 
 use crate::node::NodeLink;
 
-const POLL: Duration = Duration::from_secs(2);
-
 const SWITCHES: [(ModuleSwitch, &str, &str); 6] = [
-    (ModuleSwitch::Input, "module.input", "Share keyboard and mouse"),
-    (ModuleSwitch::Clipboard, "module.clipboard", "Share clipboard"),
+    (
+        ModuleSwitch::Input,
+        "module.input",
+        "Share keyboard and mouse",
+    ),
+    (
+        ModuleSwitch::Clipboard,
+        "module.clipboard",
+        "Share clipboard",
+    ),
     (ModuleSwitch::Audio, "module.audio", "Share audio"),
     (ModuleSwitch::Files, "module.files", "Share disks"),
     (ModuleSwitch::Usb, "module.usb", "Share USB devices"),
-    (ModuleSwitch::RemoteScreen, "module.remote_screen", "Peers' screens for screen sharing"),
+    (
+        ModuleSwitch::RemoteScreen,
+        "module.remote_screen",
+        "Peers' screens for screen sharing",
+    ),
 ];
 
 struct Items {
@@ -56,12 +64,19 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
     let switches: Vec<(ModuleSwitch, CheckMenuItem<Wry>)> = SWITCHES
         .iter()
         .map(|(switch, id, label)| {
-            CheckMenuItem::with_id(app, *id, *label, false, false, None::<&str>).map(|i| (*switch, i))
+            CheckMenuItem::with_id(app, *id, *label, false, false, None::<&str>)
+                .map(|i| (*switch, i))
         })
         .collect::<tauri::Result<_>>()?;
     let start = MenuItem::with_id(app, "start", "Start the node", false, None::<&str>)?;
     let status = MenuItem::with_id(app, "open.status", "Open status…", true, None::<&str>)?;
-    let placement = MenuItem::with_id(app, "open.placement", "Arrange machines…", true, None::<&str>)?;
+    let placement = MenuItem::with_id(
+        app,
+        "open.placement",
+        "Arrange machines…",
+        true,
+        None::<&str>,
+    )?;
     let pair = MenuItem::with_id(app, "open.pair", "Pair a machine…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
@@ -140,12 +155,14 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
 
-    let app = app.clone();
+    let mut latest = app.state::<NodeLink>().watch();
     tauri::async_runtime::spawn(async move {
         loop {
-            let status = app.state::<NodeLink>().status().await;
-            refresh(&items, status.ok());
-            tokio::time::sleep(POLL).await;
+            let status = latest.borrow_and_update().clone().and_then(Result::ok);
+            refresh(&items, status);
+            if latest.changed().await.is_err() {
+                break;
+            }
         }
     });
     Ok(())
@@ -168,7 +185,9 @@ pub fn summary(status: &Status) -> String {
 fn refresh(items: &Items, status: Option<Status>) {
     let Some(status) = status else {
         let _ = items.summary.set_text("Cursio — node not running");
-        let _ = items.problems.set_text("Start it here or with `cursio mesh`");
+        let _ = items
+            .problems
+            .set_text("Start it here or with `cursio mesh`");
         let _ = items.start.set_enabled(true);
         for (_, item) in &items.switches {
             let _ = item.set_enabled(false);

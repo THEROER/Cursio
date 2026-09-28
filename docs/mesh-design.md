@@ -245,7 +245,14 @@ Commands: `ping`, `status` (node, peers with presence/position/`NodeStatus`/
 negotiated and skipped modules, configured modules, what flags pin, input
 latency, `diagnostics` problems, the pairing window), `config`, `set_config`,
 `set_module`, `set_position`, `pair_show`, `pair_enter`, `pair_cancel`,
-`pairing`, `restart`. No pushed events — clients poll `status`.
+`pairing`, `restart`, `subscribe`. After `subscribe` the node pushes the status
+with id 0 whenever something in it changes (and checks every 2 s for what
+changes elsewhere — latency, problems), only when it differs from the last
+push. Requests carry ids and any number may be in flight on one connection;
+`transport::Client` matches replies back and hands pushes to a channel — the
+LeavePulse launcher's daemon client. The app keeps one subscribed connection,
+re-emits pushes as Tauri events, and gives every request a deadline, so the
+window never waits on a node that stopped answering or behind another request.
 
 Changes go through `config.toml` rather than around it, so there is one path
 for every change and the file always says what runs; the change is applied

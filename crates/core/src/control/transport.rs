@@ -44,8 +44,6 @@ pub enum ControlError {
     NotRunning(String),
     #[error("{0} is not private to this user; remove it or set XDG_RUNTIME_DIR")]
     NotPrivate(String),
-    #[error("reply {got} does not answer request {sent}")]
-    Mismatch { sent: u64, got: u64 },
 }
 
 /// The control endpoint for this user.
@@ -125,67 +123,222 @@ pub async fn write_json<W: AsyncWrite + Unpin, T: serde::Serialize>(
     Ok(())
 }
 
-/// Answer requests on one connection until the client goes away.
+/// How often a subscribed connection looks at the status even when nothing
+/// here said it changed: latency, problems and pairing expiry move on their
+/// own.
+const PUSH_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Answer requests on one connection until the client goes away, and push the
+/// status after it subscribes.
+///
+/// Lines are read on a task of their own, because a half-read line cannot be
+/// abandoned when a push wins the race and picked up again later. A push is
+/// sent only when the status differs from the last one pushed, so an idle
+/// node sends nothing.
 ///
 /// A malformed line gets an error reply with id 0 rather than a dropped
 /// connection, so a client with a newer command than this node knows learns
 /// why it was not understood.
 pub async fn serve_connection<S>(stream: S, state: super::NodeState) -> Result<(), ControlError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (read, mut write) = tokio::io::split(stream);
-    let mut read = BufReader::new(read);
-    while let Some(line) = read_line(&mut read).await? {
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => Response {
-                id: request.id,
-                reply: state.handle(request.command),
-            },
-            Err(e) => Response {
-                id: 0,
-                reply: Reply::Error {
-                    message: format!("request not understood: {e}"),
-                },
-            },
-        };
-        write_json(&mut write, &response).await?;
+    let (lines_tx, mut lines) = tokio::sync::mpsc::channel(16);
+    let reader = tokio::spawn(async move {
+        let mut read = BufReader::new(read);
+        loop {
+            let line = read_line(&mut read).await;
+            let end = !matches!(line, Ok(Some(_)));
+            if lines_tx.send(line).await.is_err() || end {
+                break;
+            }
+        }
+    });
+
+    let mut revisions = state.revisions();
+    let mut refresh = tokio::time::interval(PUSH_REFRESH);
+    let mut subscribed = false;
+    let mut last_pushed: Option<super::Status> = None;
+    let result = loop {
+        tokio::select! {
+            line = lines.recv() => {
+                let line = match line {
+                    Some(Ok(Some(line))) => line,
+                    Some(Ok(None)) | None => break Ok(()),
+                    Some(Err(e)) => break Err(e),
+                };
+                let response = match serde_json::from_str::<Request>(&line) {
+                    Ok(request) => {
+                        subscribed |= request.command == Command::Subscribe;
+                        Response {
+                            id: request.id,
+                            reply: state.handle(request.command),
+                        }
+                    }
+                    Err(e) => Response {
+                        id: 0,
+                        reply: Reply::Error {
+                            message: format!("request not understood: {e}"),
+                        },
+                    },
+                };
+                if let Err(e) = write_json(&mut write, &response).await {
+                    break Err(e);
+                }
+                if subscribed {
+                    if let Err(e) = push(&mut write, &state, &mut last_pushed).await {
+                        break Err(e);
+                    }
+                }
+            }
+            changed = revisions.changed(), if subscribed => {
+                if changed.is_err() {
+                    break Ok(());
+                }
+                if let Err(e) = push(&mut write, &state, &mut last_pushed).await {
+                    break Err(e);
+                }
+            }
+            _ = refresh.tick(), if subscribed => {
+                if let Err(e) = push(&mut write, &state, &mut last_pushed).await {
+                    break Err(e);
+                }
+            }
+        }
+    };
+    reader.abort();
+    result
+}
+
+/// Push the status if it differs from what this connection last received.
+async fn push<W: AsyncWrite + Unpin>(
+    write: &mut W,
+    state: &super::NodeState,
+    last: &mut Option<super::Status>,
+) -> Result<(), ControlError> {
+    let status = state.status();
+    if last.as_ref() == Some(&status) {
+        return Ok(());
     }
+    write_json(
+        write,
+        &Response {
+            id: super::PUSH_ID,
+            reply: Reply::Status(Box::new(status.clone())),
+        },
+    )
+    .await?;
+    *last = Some(status);
     Ok(())
 }
 
-/// A connection to a running node.
-pub struct Client<S> {
-    read: BufReader<tokio::io::ReadHalf<S>>,
-    write: tokio::io::WriteHalf<S>,
-    next_id: u64,
+type Pending = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Reply>>>,
+>;
+
+/// A connection to a running node, shared by whoever needs it.
+///
+/// Requests go out through one writer task and replies are matched back by
+/// id, so any number may be in flight: a status request never waits behind a
+/// slow one. Pushes (id 0) arrive on the receiver [`Client::start`] returns.
+/// Cheap to clone — the LeavePulse launcher's daemon client, in this
+/// vocabulary.
+#[derive(Clone)]
+pub struct Client {
+    next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pending: Pending,
+    writer: tokio::sync::mpsc::Sender<Request>,
 }
 
-impl<S: AsyncRead + AsyncWrite> Client<S> {
-    pub fn new(stream: S) -> Self {
-        let (read, write) = tokio::io::split(stream);
-        Self {
-            read: BufReader::new(read),
-            write,
-            next_id: 1,
-        }
+impl Client {
+    /// Start the reader and writer tasks for `stream`. The receiver yields
+    /// what the node pushes, and closes when the connection does.
+    pub fn start<S>(stream: S) -> (Self, tokio::sync::mpsc::Receiver<Reply>)
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (read, mut write) = tokio::io::split(stream);
+        let (writer, mut outgoing) = tokio::sync::mpsc::channel::<Request>(64);
+        let (pushes_tx, pushes) = tokio::sync::mpsc::channel(64);
+        let pending: Pending = std::sync::Arc::default();
+
+        let waiting = pending.clone();
+        tokio::spawn(async move {
+            let mut read = BufReader::new(read);
+            while let Ok(Some(line)) = read_line(&mut read).await {
+                let Ok(response) = serde_json::from_str::<Response>(&line) else {
+                    tracing::debug!("unreadable line from the node; skipping it");
+                    continue;
+                };
+                if response.id == super::PUSH_ID {
+                    if let Reply::Error { message } = &response.reply {
+                        tracing::debug!(%message, "the node could not read a request");
+                        continue;
+                    }
+                    // A full channel means nobody is reading pushes; dropping
+                    // one loses nothing the next push will not carry.
+                    let _ = pushes_tx.try_send(response.reply);
+                    continue;
+                }
+                let waiter = waiting
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&response.id);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(response.reply);
+                }
+            }
+            // Every request still waiting learns the connection is gone.
+            waiting.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        });
+        tokio::spawn(async move {
+            while let Some(request) = outgoing.recv().await {
+                if write_json(&mut write, &request).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        (
+            Self {
+                next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                pending,
+                writer,
+            },
+            pushes,
+        )
     }
 
-    pub async fn request(&mut self, command: Command) -> Result<Reply, ControlError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        write_json(&mut self.write, &Request { id, command }).await?;
-        let line = read_line(&mut self.read)
-            .await?
-            .ok_or(ControlError::Closed)?;
-        let response: Response = serde_json::from_str(&line)?;
-        if response.id != id {
-            return Err(ControlError::Mismatch {
-                sent: id,
-                got: response.id,
-            });
+    /// False once the connection has broken.
+    pub fn is_connected(&self) -> bool {
+        !self.writer.is_closed()
+    }
+
+    pub async fn request(&self, command: Command) -> Result<Reply, ControlError> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, tx);
+        if self.writer.send(Request { id, command }).await.is_err() {
+            self.forget(id);
+            return Err(ControlError::Closed);
         }
-        Ok(response.reply)
+        rx.await.map_err(|_| {
+            self.forget(id);
+            ControlError::Closed
+        })
+    }
+
+    fn forget(&self, id: u64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
     }
 }
 
@@ -196,7 +349,9 @@ pub type Stream = tokio::net::windows::named_pipe::NamedPipeClient;
 
 /// Connect to the node at `endpoint`.
 #[cfg(any(unix, windows))]
-pub async fn connect(endpoint: &Path) -> Result<Client<Stream>, ControlError> {
+pub async fn connect(
+    endpoint: &Path,
+) -> Result<(Client, tokio::sync::mpsc::Receiver<Reply>), ControlError> {
     let not_running = |_| ControlError::NotRunning(endpoint.display().to_string());
     #[cfg(unix)]
     let stream = tokio::net::UnixStream::connect(endpoint)
@@ -206,7 +361,7 @@ pub async fn connect(endpoint: &Path) -> Result<Client<Stream>, ControlError> {
     let stream = tokio::net::windows::named_pipe::ClientOptions::new()
         .open(endpoint.as_os_str())
         .map_err(not_running)?;
-    Ok(Client::new(stream))
+    Ok(Client::start(stream))
 }
 
 /// Serve the control socket until the process ends. Each connection is its
@@ -424,7 +579,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cursio-ctl-mem-{}", std::process::id()));
         let (client_side, server_side) = tokio::io::duplex(4096);
         tokio::spawn(serve_connection(server_side, node(&dir)));
-        let mut client = Client::new(client_side);
+        let (client, _pushes) = Client::start(client_side);
         assert_eq!(
             client.request(Command::Ping).await.unwrap(),
             Reply::Pong {
@@ -435,6 +590,59 @@ mod tests {
             panic!("expected status");
         };
         assert_eq!(status.node.name, "desk");
+    }
+
+    /// Several requests in flight on one connection each get their own
+    /// answer, whichever order they were sent in.
+    #[tokio::test]
+    async fn concurrent_requests_on_one_connection_each_get_their_own_reply() {
+        let dir = std::env::temp_dir().join(format!("cursio-ctl-many-{}", std::process::id()));
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(serve_connection(server_side, node(&dir)));
+        let (client, _pushes) = Client::start(client_side);
+        let (ping, status) = tokio::join!(
+            client.request(Command::Ping),
+            client.request(Command::Status)
+        );
+        assert!(matches!(ping.unwrap(), Reply::Pong { .. }));
+        assert!(matches!(status.unwrap(), Reply::Status(_)));
+    }
+
+    /// A subscriber is sent the status at once and again when something it
+    /// shows changes — and nothing when nothing did.
+    #[tokio::test]
+    async fn a_subscriber_is_pushed_the_status_when_it_changes() {
+        let dir = std::env::temp_dir().join(format!("cursio-ctl-push-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let state = node(&dir);
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(serve_connection(server_side, state.clone()));
+        let (client, mut pushes) = Client::start(client_side);
+        assert_eq!(
+            client.request(Command::Subscribe).await.unwrap(),
+            Reply::Subscribed
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), pushes.recv())
+            .await
+            .expect("no initial push")
+            .unwrap();
+        assert!(matches!(first, Reply::Status(_)));
+
+        state.set_known(vec![super::super::KnownPeerView {
+            id: cursio_protocol::PeerId::new_v4(),
+            name: "laptop".into(),
+            presence: super::super::Presence::Offline,
+        }]);
+        let Reply::Status(status) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), pushes.recv())
+                .await
+                .expect("the change was not pushed")
+                .unwrap()
+        else {
+            panic!("expected status");
+        };
+        assert_eq!(status.peers.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -497,7 +705,7 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
 
-        let mut client = connect(&path).await.unwrap();
+        let (client, _pushes) = connect(&path).await.unwrap();
         assert!(matches!(
             client.request(Command::Ping).await.unwrap(),
             Reply::Pong { .. }

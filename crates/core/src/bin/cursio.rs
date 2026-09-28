@@ -2768,11 +2768,10 @@ fn inject(
     }
 }
 
-async fn control_client(
-) -> anyhow::Result<cursio_core::control::transport::Client<cursio_core::control::transport::Stream>>
-{
+async fn control_client() -> anyhow::Result<cursio_core::control::transport::Client> {
     let endpoint = cursio_core::control::transport::endpoint()?;
-    Ok(cursio_core::control::transport::connect(&endpoint).await?)
+    let (client, _pushes) = cursio_core::control::transport::connect(&endpoint).await?;
+    Ok(client)
 }
 
 async fn print_status(json: bool) -> anyhow::Result<()> {
@@ -2834,6 +2833,12 @@ async fn print_status(json: bool) -> anyhow::Result<()> {
             println!("  {hint}");
         }
     }
+    if !status.restart_needed.is_empty() {
+        println!(
+            "waiting for a restart: {}",
+            status.restart_needed.join(", ")
+        );
+    }
     if !status.pinned.is_empty() {
         println!("pinned by flags: {}", status.pinned.join(", "));
     }
@@ -2847,7 +2852,7 @@ async fn print_status(json: bool) -> anyhow::Result<()> {
 async fn pair_with_code(code: Option<String>) -> anyhow::Result<()> {
     use cursio_core::control::{Command, Reply};
     use cursio_core::pairing_window::PairingOutcome;
-    let mut client = control_client().await?;
+    let client = control_client().await?;
     let command = match code {
         Some(code) => Command::PairEnter { code },
         None => Command::PairShow,

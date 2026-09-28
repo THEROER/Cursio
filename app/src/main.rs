@@ -59,6 +59,7 @@ fn main() {
     #[cfg(desktop)]
     let builder = builder
         .setup(move |app| {
+            node::follow(app.handle().clone());
             if let Err(e) = tray::install(app.handle()) {
                 // No tray (GNOME without the AppIndicator extension) must not
                 // leave an app nobody can reach: show the window instead.
