@@ -75,6 +75,8 @@ pub mod remote_screen;
 pub mod screen_hub;
 pub mod service_session;
 pub mod session;
+/// Versions side by side, a `current` pointer, and the helper that switches it.
+pub mod update;
 #[cfg(feature = "usb")]
 pub mod usb_node;
 #[cfg(feature = "usb")]

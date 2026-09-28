@@ -47,6 +47,8 @@ cursio-files = { workspace = true, optional = true }
 cursio-usb = { workspace = true, optional = true }
 # Compresses file chunks when it pays; see files_session::pack.
 zstd = "0.13"
+# Build manifests: every installed file is checked against its sha256.
+sha2.workspace = true
 # Clipboard sharing: the platform layer (read/write/watch) the session module
 # drives on a worker thread. Same crate `clipd` uses, so the two compose for
 # free — content received from a peer lands on the local clipboard.

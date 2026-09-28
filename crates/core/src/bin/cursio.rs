@@ -78,6 +78,11 @@ enum Command {
     Mesh(MeshArgs),
     /// Print the config `cursio mesh` would run with, and where it is read from.
     Config,
+    /// Install, switch and roll back versions of Cursio on this machine.
+    Update {
+        #[command(subcommand)]
+        action: cursio_core::update::cli::UpdateAction,
+    },
     /// Ask the running node what it is doing: peers, modules, latency, problems.
     Status {
         /// Print the raw control reply instead of a summary.
@@ -568,6 +573,11 @@ async fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some(cursio_window::linux_chooser::CHOOSER_ARG) {
         std::process::exit(cursio_window::linux_chooser::run_chooser_process());
     }
+    // Started as the install's stable copy: run the current version instead.
+    if let Some(target) = cursio_core::update::layout::handover("cursio") {
+        cursio_core::update::layout::hand_over(&target)?;
+        return Ok(());
+    }
     let cli = Cli::parse();
 
     // Console (info) + rotating file (debug) logging. `_log` must live for the
@@ -603,6 +613,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match cli.command {
+        Command::Update { action } => cursio_core::update::cli::run(action).await,
         Command::Config => {
             let config = cursio_core::config::Config::load(&config_path)?;
             let origin = match config_path.exists() {
