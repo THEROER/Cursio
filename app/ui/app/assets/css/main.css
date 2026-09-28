@@ -5,6 +5,9 @@
 /* Skin the browser's own scrollbars to match. Must come after the tokens — it
    reads --color-brand from them. */
 @import "@leavepulse/ui/scrollbar.css";
+/* Vue Flow's base styles for the Arrange grid. Without them its container has
+   no size, so the canvas measures zero and draws no machines at all. */
+@import "@leavepulse/ui/canvas.css";
 
 /* The touch surface owns every gesture that lands on it. Without this the
    browser claims drags for panning and pinches for zoom, and the pointer on
