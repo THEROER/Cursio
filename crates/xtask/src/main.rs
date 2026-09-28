@@ -345,7 +345,19 @@ fn generate_app_ui() -> Result<()> {
              Install it with: curl -fsSL https://bun.sh/install | bash"
         );
     };
-    let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/ui");
+    // Where `cargo run` says this checkout is, not where the binary was built:
+    // a target dir shared between checkouts (`CARGO_TARGET_DIR`) can hand one
+    // checkout an xtask compiled in another, whose baked-in path may be gone.
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let ui = manifest_dir.join("../../app/ui");
+    if !ui.is_dir() {
+        bail!(
+            "no app frontend at {}; run this from the Cursio checkout",
+            ui.display()
+        );
+    }
     println!("→ generating the cursio-app frontend");
     let mut install = Command::new(&bun);
     install.arg("install").current_dir(&ui);
