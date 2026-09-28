@@ -45,6 +45,8 @@ pub mod forget;
 /// Link, module and platform problems, each raised and cleared by name.
 pub mod health;
 pub mod identity;
+/// Which peer this machine's one mouse and keyboard reach, across all links.
+pub mod input_hub;
 /// Bringing a link up to the point a session can start: handshake, pairing,
 /// encryption, module negotiation. Shared by the CLI and the app, desktop and
 /// mobile alike.

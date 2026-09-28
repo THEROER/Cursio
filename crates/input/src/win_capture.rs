@@ -74,11 +74,6 @@ const MODE_DORMANT: usize = 2;
 /// thread, from [`apply_mode`].
 static HOOK_MODE: AtomicUsize = AtomicUsize::new(MODE_IDLE);
 
-/// Which of our edges borders the peer, for edge-crossing, encoded for the hook:
-/// `0` = none (edge-crossing off), `1` = Left, `2` = Right, `3` = Top,
-/// `4` = Bottom. See [`edge_to_code`]/[`code_to_edge`].
-static PEER_EDGE: AtomicUsize = AtomicUsize::new(0);
-
 /// Set once we've emitted an EdgeCrossing, so a cursor parked in the jump zone
 /// doesn't fire a storm of crossings. Cleared when the cursor leaves the zone.
 static IN_JUMP_ZONE: AtomicBool = AtomicBool::new(false);
@@ -125,22 +120,15 @@ type Ready = std::sync::mpsc::Sender<Result<u32, String>>;
 /// care which backend produced the events. Blocks until the capture thread has
 /// either come up or failed to, so a setup error surfaces here rather than
 /// silently producing no events.
+///
+/// The edge-crossing watch runs in the low-level mouse hook (kept installed
+/// while Active, like Deskflow's jump-zone hook) and reads the edges armed by
+/// [`crate::set_watched_edges`], so a cursor shoved off any of them fires an
+/// [`EdgeCrossing`]; with none armed, nothing fires.
 pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
-    spawn_capture_with_edge(None)
-}
-
-/// Start capture, optionally enabling edge-crossing detection on `peer_edge`
-/// (the edge that borders the peer). With `None`, no crossings are emitted —
-/// same as [`spawn_capture`]. The edge-crossing watch runs in the low-level
-/// mouse hook (kept installed while Active, like Deskflow's jump-zone hook), so
-/// a cursor shoved off `peer_edge` fires an [`EdgeCrossing`].
-pub fn spawn_capture_with_edge(peer_edge: Option<Edge>) -> Result<CaptureHandle, InputError> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (edges_tx, edges_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
-
-    // Seed the peer edge for the hook before the thread starts watching.
-    PEER_EDGE.store(edge_to_code(peer_edge), Ordering::SeqCst);
 
     let tx_for_thread = tx.clone();
     let edges_for_thread = edges_tx.clone();
@@ -474,37 +462,6 @@ fn push(event: InputEvent) {
     });
 }
 
-/// Encode an optional peer [`Edge`] into the [`PEER_EDGE`] code the hook reads.
-/// Point the jump-zone watch at a different edge while capture is running.
-///
-/// Set from [`crate::set_peer_edge`] once the peer's position is known, which
-/// is after the hooks are installed. An atomic store because the hook reads it,
-/// and a hook cannot take a lock.
-pub(crate) fn set_watched_edge(edge: Option<Edge>) {
-    PEER_EDGE.store(edge_to_code(edge), Ordering::SeqCst);
-}
-
-fn edge_to_code(edge: Option<Edge>) -> usize {
-    match edge {
-        None => 0,
-        Some(Edge::Left) => 1,
-        Some(Edge::Right) => 2,
-        Some(Edge::Top) => 3,
-        Some(Edge::Bottom) => 4,
-    }
-}
-
-/// Decode a [`PEER_EDGE`] code back into an [`Edge`] (`0` = none).
-fn code_to_edge(code: usize) -> Option<Edge> {
-    match code {
-        1 => Some(Edge::Left),
-        2 => Some(Edge::Right),
-        3 => Some(Edge::Top),
-        4 => Some(Edge::Bottom),
-        _ => None,
-    }
-}
-
 /// Encode an [`crate::InputMode`] as the [`HOOK_MODE`] code: Idle=0, Active=1,
 /// Dormant=2.
 fn mode_to_code(mode: crate::InputMode) -> usize {
@@ -676,15 +633,17 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 }
 
 /// Check whether the cursor at `pt` (absolute virtual-desktop coords) has hit
-/// the jump zone of the configured peer edge, and if so emit one
-/// [`EdgeCrossing`] with the normalized position along that edge. Debounced via
-/// [`IN_JUMP_ZONE`] so parking on the edge fires exactly once until the cursor
-/// leaves the zone.
+/// the jump zone of any watched edge, and if so emit one [`EdgeCrossing`] with
+/// the normalized position along that edge. Debounced via [`IN_JUMP_ZONE`] so
+/// parking on the edge fires exactly once until the cursor leaves the zone.
 fn check_jump_zone(pt: POINT) {
-    let edge = match code_to_edge(PEER_EDGE.load(Ordering::SeqCst)) {
-        Some(e) => e,
-        None => return, // edge-crossing disabled
-    };
+    let watched = crate::watched_edges();
+    // Sampled even with nothing armed, so the first move after an edge is
+    // armed measures its step from where the pointer really was.
+    let prev = LAST_POS.with(|last| last.replace(Some(pt)));
+    if watched.is_empty() {
+        return;
+    }
 
     // Virtual-desktop bounds (spans all monitors). SAFETY: GetSystemMetrics has
     // no preconditions.
@@ -702,28 +661,29 @@ fn check_jump_zone(pt: POINT) {
 
     // 1px jump zone at the true outer edge, matching Deskflow's getJumpZoneSize.
     const ZONE: i32 = 1;
-    let (in_zone, pos_norm) = match edge {
-        Edge::Left => (pt.x <= vx + ZONE, frac(pt.y - vy, vh)),
-        Edge::Right => (pt.x >= vx + vw - 1 - ZONE, frac(pt.y - vy, vh)),
-        Edge::Top => (pt.y <= vy + ZONE, frac(pt.x - vx, vw)),
-        Edge::Bottom => (pt.y >= vy + vh - 1 - ZONE, frac(pt.x - vx, vw)),
-    };
+    // In a corner two watched edges can both be hit; the first in `EdgeSet`
+    // order wins, which is arbitrary but stable, and moving along the edge a
+    // pixel settles it.
+    let hit = watched.iter().find_map(|edge| {
+        let (in_zone, pos_norm) = match edge {
+            Edge::Left => (pt.x <= vx + ZONE, frac(pt.y - vy, vh)),
+            Edge::Right => (pt.x >= vx + vw - 1 - ZONE, frac(pt.y - vy, vh)),
+            Edge::Top => (pt.y <= vy + ZONE, frac(pt.x - vx, vw)),
+            Edge::Bottom => (pt.y >= vy + vh - 1 - ZONE, frac(pt.x - vx, vw)),
+        };
+        in_zone.then_some((edge, pos_norm))
+    });
 
-    // How far the cursor moved since the last hook call, along the axis that
-    // matters for this edge. A deliberate cross is a person pushing into the
-    // edge; a fast flick — aiming in a game, say — covers hundreds of pixels in
-    // one step and should NOT hand the machine away mid-play.
-    let step = LAST_POS.with(|last| {
-        let prev = last.get();
-        last.set(Some(pt));
-        match prev {
+    if let Some((edge, pos_norm)) = hit {
+        // How far the cursor moved since the last hook call, along the axis
+        // that matters for this edge. A deliberate cross is a person pushing
+        // into the edge; a fast flick — aiming in a game, say — covers hundreds
+        // of pixels in one step and should NOT hand the machine away mid-play.
+        let step = match prev {
             Some(p) if edge.is_horizontal() => (pt.y - p.y).abs(),
             Some(p) => (pt.x - p.x).abs(),
             None => 0,
-        }
-    });
-
-    if in_zone {
+        };
         if step > MAX_CROSS_STEP {
             // Treat the flick as "already in the zone" so it can't fire, and so
             // the user has to leave and re-approach the edge to cross on purpose.
@@ -733,6 +693,7 @@ fn check_jump_zone(pt: POINT) {
         }
         // Fire once per entry into the zone.
         if !IN_JUMP_ZONE.swap(true, Ordering::SeqCst) {
+            crate::note_crossed(edge);
             EDGE_SENDER.with(|s| {
                 if let Some(tx) = s.borrow().as_ref() {
                     let _ = tx.send(crate::EdgeCrossing { edge, pos_norm });
@@ -749,11 +710,11 @@ fn check_jump_zone(pt: POINT) {
 /// Deskflow's jump-zone inset.
 const EDGE_NUDGE_PX: i32 = 12;
 
-/// Move the cursor inward, away from the peer-facing edge, by
-/// [`EDGE_NUDGE_PX`]. No-op when edge-crossing is disabled or the position can't
-/// be read.
+/// Move the cursor inward, away from the edge it last left by, by
+/// [`EDGE_NUDGE_PX`]. No-op when no edge is known or the position can't be
+/// read.
 fn nudge_off_edge() {
-    let Some(edge) = code_to_edge(PEER_EDGE.load(Ordering::SeqCst)) else {
+    let Some(edge) = crate::last_crossed_edge() else {
         return;
     };
     let mut pt = POINT { x: 0, y: 0 };

@@ -40,7 +40,7 @@ pub use files::{
     Chunk, FileError, FileHandle, FileKind, FileMeta, FileReqId, FilesMsg, OpenMode, Volume,
 };
 pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
-pub use input::{neighbour_across, Edge, InputEvent, MouseButton, Position};
+pub use input::{neighbour_across, Edge, EdgeSet, InputEvent, MouseButton, Position};
 pub use node::{NetworkKind, NodeStatus, PowerSource};
 pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{

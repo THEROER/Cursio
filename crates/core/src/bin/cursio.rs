@@ -30,6 +30,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use cursio_airplay::crypto::AppleCryptoProvider;
 use cursio_airplay::{Receiver, ReceiverConfig, Resolution, VideoProfile};
+use cursio_core::input_hub::{InputHub, MachineInput, Placement};
 use cursio_core::live::Shared;
 use cursio_core::node_status::NodeStatusMonitor;
 use cursio_core::pairing_window::PairingWindow;
@@ -1809,8 +1810,8 @@ fn spawn_peer_session(
     pairing: PairingWindow,
     control: cursio_core::control::NodeState,
     // Shared with every other mesh session: capture is one machine-wide
-    // resource (one portal permission, one grab), so sessions take turns on it
-    // rather than each building their own. See [`PersistentCapture`].
+    // resource (one portal permission, one grab), so sessions all attach to
+    // it rather than each building their own. See [`PersistentCapture`].
     capture: SharedCapture,
     // Machine-wide too, and for the same reason: every link greets with the
     // same reading, and every link should announce the same change.
@@ -1862,17 +1863,6 @@ fn spawn_peer_session(
             }
         };
 
-        // Take the machine-wide capture for as long as this session runs. If
-        // another peer session already holds it, `try_borrow_mut` fails and this
-        // one runs without local input rather than panicking — there is only one
-        // keyboard and mouse, so only one peer can be driven at a time.
-        let mut borrowed = capture.try_borrow_mut().ok();
-        let mut capture_for_session = borrowed.as_mut().and_then(|slot| slot.as_mut());
-        if let Some(capture) = capture_for_session.as_mut() {
-            while capture.events.try_recv().is_ok() {}
-            while capture.commands.try_recv().is_ok() {}
-        }
-
         // Whichever way the call went, the password only matters on a first
         // meeting: `link::establish` uses the trust store when it has an entry
         // and reaches for this when it does not. Both roles get it because
@@ -1886,7 +1876,7 @@ fn spawn_peer_session(
             &control,
             role,
             false,
-            capture_for_session,
+            capture.as_ref().as_ref(),
             &status,
             &live,
             &modules,
@@ -1952,9 +1942,9 @@ async fn run_pairing_and_session(
     control: &cursio_core::control::NodeState,
     role: Role,
     test_input: bool,
-    // Capture is created ONCE by the caller and lent to each peer session — see
-    // [`PersistentCapture`] for why it must not be rebuilt per connection.
-    capture: Option<&mut PersistentCapture>,
+    // Capture is created ONCE by the caller and shared by every peer session —
+    // see [`PersistentCapture`] for why it must not be rebuilt per connection.
+    capture: Option<&PersistentCapture>,
     // Machine-wide power/network state: greeted with, then polled by the
     // session loop so a change reaches every peer.
     status: &SharedNodeStatus,
@@ -2027,27 +2017,31 @@ async fn run_pairing_and_session(
         // Paired again after being removed: its links may stay up now.
         live.unforget(peer_id);
     }
-    // Now that the peer has said where it stands, capture can watch the edge
-    // between us. This is what replaced `--peer-edge`: both machines already
-    // know, and the flag only existed because the barrier had to be armed
-    // before anyone had spoken.
-    //
-    // A peer that borders no edge is passed over rather than applied. The
-    // watched edge is machine-wide — one mouse, one way out — so writing
-    // `None` for one peer takes the barrier down for *every* peer, and the
-    // last machine to connect decided the answer for all of them. Live, a
-    // third node started with only `--files` and placed at the same grid
-    // position as this one arrived after the neighbour and unwatched its edge:
-    // the cursor stopped crossing to a machine that was still there, still
-    // bordering, and still expecting it.
-    //
-    // A node that has no edge to offer has nothing to say about where the
-    // cursor leaves by, and silence is the honest answer.
-    if link.peer_edge.is_some() {
-        cursio_input::set_peer_edge(link.peer_edge);
-    }
-
     let peer = link.peer;
+
+    // Now that the peer has said where it stands, capture can watch the edge
+    // between us, alongside every other peer's. This is what replaced
+    // `--peer-edge`: both machines already know, and the flag only existed
+    // because the barrier had to be armed before anyone had spoken. From here
+    // this session hears only the input and handoffs that concern its peer.
+    let alone = capture.is_none_or(|c| !c.hub.machine().linked);
+    let hub_link = capture.map(|capture| {
+        let placement = Placement {
+            edge: link.peer_edge,
+            distance: greeted.position.distance_to(peer.position),
+            takes_cursor: peer.device_kind.takes_cursor(),
+        };
+        let (ports, machine) = capture.hub.attach(peer.peer_id, placement);
+        capture.apply(machine);
+        HubLink {
+            capture,
+            token: ports.token,
+            events: ports.events,
+            commands: ports.commands,
+        }
+    });
+    let token = hub_link.as_ref().map(|l| l.token);
+    let hub = capture.map(|c| c.hub.clone());
     control.link_up(
         peer.peer_id,
         &peer.display_name,
@@ -2077,20 +2071,27 @@ async fn run_pairing_and_session(
         on_change: {
             let control = control.clone();
             let (id, name) = (peer.peer_id, peer.display_name.clone());
+            let takes_cursor = peer.device_kind.takes_cursor();
             Box::new(move |state| {
                 if state.edge_changed {
                     match state.peer_edge {
                         Some(edge) => {
-                            tracing::info!(peer = %name, ?edge, "this peer now borders another edge");
-                            cursio_input::set_peer_edge(Some(edge));
+                            tracing::info!(peer = %name, ?edge, "this peer now borders another edge")
                         }
-                        // Passed over for the reason given where the link came
-                        // up: the watched edge is machine-wide, and another
-                        // peer may still border it.
                         None => {
                             tracing::info!(peer = %name, "this peer no longer borders any edge")
                         }
                     }
+                }
+                // Distance can change with the edge staying put, and it decides
+                // which of two peers beyond one edge the cursor reaches.
+                if let (Some(hub), Some(token)) = (hub.as_ref(), token) {
+                    let placement = Placement {
+                        edge: state.peer_edge,
+                        distance: state.position.distance_to(state.peer_position),
+                        takes_cursor,
+                    };
+                    cursio_input::set_watched_edges(hub.place(token, placement).edges);
                 }
                 control.link_reconfigured(
                     &id,
@@ -2130,29 +2131,29 @@ async fn run_pairing_and_session(
     // Both run on this single-threaded async context, never concurrently.
     let injector = std::rc::Rc::new(std::cell::RefCell::new(make_injector()));
 
-    // Optionally capture this machine's real mouse/keyboard. When capturing we
-    // also get a grab control (freeze local input while we drive the peer) and
-    // we watch the captured stream for the ownership hotkey.
+    // This machine's real mouse/keyboard, as the hub routes them to this link.
     // The hotkey filter and edge-crossing forwarder are already running inside
-    // the persistent capture, so a session just borrows their outputs.
-    let (captured, grab, commands) = match capture {
-        Some(cap) => (
-            Some(&mut cap.events),
-            Some(cap.grab.clone()),
-            Some(&mut cap.commands),
-        ),
-        None => (None, None, None),
+    // the persistent capture.
+    let mut hub_link = hub_link;
+    let (captured, commands) = match hub_link.as_mut() {
+        Some(l) => (Some(&mut l.events), Some(&mut l.commands)),
+        None => (None, None),
     };
-
-    // Cursor control: hide our own cursor while we're dormant.
-    // Shared for the same reason as the injector: the ownership closure needs it,
-    // and so does the cleanup after the session ends.
-    let cursor = std::rc::Rc::new(std::cell::RefCell::new(make_cursor()));
 
     // Who starts with the shared cursor was settled while the link came up —
     // see `CursorSetup`, which weighs what sort of machine the peer is before
     // falling back to comparing ids.
-    let cursor_setup = link.cursor;
+    //
+    // That comparison knows only this link. With another peer already linked,
+    // losing it would start this machine driving the newcomer: the cursor would
+    // leave the screen the user is working on because a machine switched on.
+    // So only a first link may start that way; a later one starts with the
+    // cursor held here, which the peer — which either agrees or also holds its
+    // own — cannot turn into both sides streaming to each other.
+    let mut cursor_setup = link.cursor;
+    if !alone && cursor_setup.peer_takes_cursor {
+        cursor_setup.start_active = true;
+    }
 
     tracing::info!(
         start_active = cursor_setup.start_active,
@@ -2162,8 +2163,6 @@ async fn run_pairing_and_session(
     );
     let inject_ref = injector.clone();
     let release_ref = injector.clone();
-    let grab_ref = grab.clone();
-    let cursor_ref = cursor.clone();
     // Level with the reading the greeting carried, so this link announces only
     // what changes from here — and shares the monitor with every other session,
     // so a change reaches all of them.
@@ -2192,17 +2191,20 @@ async fn run_pairing_and_session(
                 // ungrabbed-but-armed) so nothing can re-capture, and show the
                 // cursor. The hotkey path already set Idle directly; do it again
                 // idempotently in case this arrives first.
-                if let Some(g) = grab_ref.as_ref() {
-                    g.set_mode(cursio_input::InputMode::Idle);
+                if let (Some(c), Some(token)) = (capture, token) {
+                    c.hub.note_driving(token, false);
+                    // `Idle` deliberately still observes edges on macOS so the
+                    // initially non-owning machine can start a handoff. Panic is
+                    // different: it promises that barriers are DOWN. Every edge
+                    // stays down until a link changes, otherwise a mouse still
+                    // moving toward the edge immediately hands control away
+                    // again (the repeated PANIC -> crossing loop in the logs).
+                    cursio_input::set_watched_edges(c.hub.disarm().edges);
+                    c.grab.set_mode(cursio_input::InputMode::Idle);
+                    if c.hidden.replace(false) {
+                        set_cursor_hidden(c.cursor.borrow_mut().as_mut(), false);
+                    }
                 }
-                // `Idle` deliberately still observes edges on macOS so the
-                // initially non-owning machine can start a handoff. Panic is
-                // different: it promises that barriers are DOWN. Forget the
-                // edge until the next handshake restores it, otherwise a mouse
-                // still moving toward the edge immediately hands control away
-                // again (the repeated PANIC -> crossing loop in the logs).
-                cursio_input::set_peer_edge(None);
-                set_cursor_hidden(cursor_ref.borrow_mut().as_mut(), false);
                 set_injecting(release_ref.borrow_mut().as_mut(), true);
                 tracing::warn!("panic recovery: input returned to this machine, barriers down");
                 return;
@@ -2218,31 +2220,31 @@ async fn run_pairing_and_session(
             // one that drove neither. Which side the user is sitting at is not
             // knowable here and does not need to be — an unheld cursor is
             // driven from wherever the hand is.
-            let dormant = !ownership.active;
-            if let Some(g) = grab_ref.as_ref() {
-                g.set_mode(if ownership.active {
-                    cursio_input::InputMode::Active
-                } else {
-                    cursio_input::InputMode::Dormant
-                });
-            }
+            //
+            // Which of the two this *machine* is in is the hub's answer, not
+            // this link's: another link may be driving its peer while this one
+            // holds nothing, and each writing its own view over the grab left
+            // it saying whatever the last report said.
+            //
             // Cursor visibility before the injector, and both before the log
             // line. On macOS showing the cursor also warps it back from the
             // corner it was parked in, and the injector re-seeds its shadow
             // position from the real pointer the moment it goes active — in the
             // other order it seeds from the parking corner, and the peer's next
             // movement teleports the pointer there.
-            set_cursor_hidden(cursor_ref.borrow_mut().as_mut(), dormant);
-            // The cursor just left across the peer-facing edge, so this
-            // machine's own pointer is pinned against it — a `pos_norm` of
-            // exactly 0.0 or 0.9989 in the log is that. Left there, the next
-            // small movement is outward and reads as another crossing, and two
-            // handoffs with no return between them leave this machine believing
-            // it drives a peer the user is not sitting at. Windows already does
-            // this from its hook; macOS had no equivalent.
-            if !ownership.active {
-                if let Some(c) = cursor_ref.borrow_mut().as_mut() {
-                    c.nudge_off_peer_edge();
+            if let (Some(c), Some(token)) = (capture, token) {
+                c.apply(c.hub.note_driving(token, ownership.driving));
+                // The cursor just left across the peer-facing edge, so this
+                // machine's own pointer is pinned against it — a `pos_norm` of
+                // exactly 0.0 or 0.9989 in the log is that. Left there, the next
+                // small movement is outward and reads as another crossing, and
+                // two handoffs with no return between them leave this machine
+                // believing it drives a peer the user is not sitting at. Windows
+                // already does this from its hook; macOS had no equivalent.
+                if !ownership.active {
+                    if let Some(cursor) = c.cursor.borrow_mut().as_mut() {
+                        cursor.nudge_off_peer_edge();
+                    }
                 }
             }
             set_injecting(release_ref.borrow_mut().as_mut(), ownership.active);
@@ -2279,12 +2281,10 @@ async fn run_pairing_and_session(
     // re-acquire it — the permission re-prompt and reconnect hang this design
     // exists to avoid.
     //
-    // `Idle` is the right resting state: no grab, no barriers, backend alive and
-    // ready for the next peer.
-    if let Some(g) = grab.as_ref() {
-        g.set_mode(cursio_input::InputMode::Idle);
-    }
-    set_cursor_hidden(cursor.borrow_mut().as_mut(), false);
+    // What it rests in is decided by the peers still linked: with none, `Idle`
+    // — no grab, no barriers, backend alive and ready for the next peer; with
+    // others, whatever they need, minus this peer's edge.
+    drop(hub_link);
 
     match result {
         Ok(()) | Err(session::SessionError::PeerLeft) => {
@@ -2308,10 +2308,9 @@ const KEY_G: u16 = 34;
 /// this machine no matter the session state (evdev `KEY_ESC` = 1).
 const KEY_ESC: u16 = 1;
 
-/// Spawn a task that relays captured events to a new channel, but watches for
-/// the ownership hotkey (**Ctrl+Alt+G**) and emits an [`OwnershipCmd`] instead
-/// of forwarding the trigger key. Returns the downstream event receiver the
-/// session should consume.
+/// Spawn a task that hands captured events to the hub, but watches for the
+/// ownership hotkey (**Ctrl+Alt+G**) and emits an [`OwnershipCmd`] instead of
+/// forwarding the trigger key. The hub decides which session each one reaches.
 ///
 /// Combo (not a double-tap) so it can't fire by accident and doesn't depend on
 /// tap timing. Modifier keys are still forwarded to the peer (they're needed in
@@ -2320,12 +2319,11 @@ const KEY_ESC: u16 = 1;
 /// session ignores a redundant one, so we don't track remote state here.
 fn spawn_hotkey_filter(
     mut upstream: tokio::sync::mpsc::UnboundedReceiver<cursio_protocol::InputEvent>,
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<session::OwnershipCmd>,
+    hub: InputHub,
     grab: cursio_input::GrabControl,
-) -> tokio::sync::mpsc::UnboundedReceiver<session::CapturedInput> {
+) {
     use cursio_protocol::InputEvent;
 
-    let (down_tx, down_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         // Track whether each modifier side is currently held.
         let mut ctrl = false;
@@ -2375,7 +2373,7 @@ fn spawn_hotkey_filter(
                         // The session decides direction (only the active side
                         // hands off), so we just send a Toggle.
                         tracing::info!("ownership hotkey (Ctrl+Alt+G)");
-                        let _ = cmd_tx.send(session::OwnershipCmd::Toggle);
+                        hub.route_command(session::OwnershipCmd::Toggle);
                         // Swallow the modifier releases too — see the flag's
                         // declaration for why the peer would otherwise be stuck
                         // holding Ctrl+Alt.
@@ -2387,60 +2385,41 @@ fn spawn_hotkey_filter(
                         // waiting on the session. Dropping to Idle here ungrabs
                         // local input and (on Wayland) tears the portal barriers
                         // down, so this machine is usable even if the peer/link
-                        // is wedged. Also ask the session to flip ownership +
-                        // restore the cursor, which works if it's still alive.
+                        // is wedged. Also ask every session to flip ownership +
+                        // restore the cursor, which works if they're still alive.
                         tracing::warn!("PANIC hotkey (Ctrl+Alt+Esc): releasing locally");
                         grab.set_mode(cursio_input::InputMode::Idle);
-                        let _ = cmd_tx.send(session::OwnershipCmd::Panic);
+                        cursio_input::set_watched_edges(hub.panic().edges);
                         swallow_until_release = true;
                         continue; // don't forward Esc to the peer
                     }
                     _ => {}
                 }
             }
-            if down_tx.send(session::CapturedInput::from(event)).is_err() {
-                break; // session gone
-            }
+            hub.route_event(session::CapturedInput::from(event));
         }
     });
-    down_rx
 }
 
 /// Spawn a task that turns capture-reported edge crossings into ownership
-/// handoffs on the session's command channel — but **only** for crossings on
-/// `peer_edge`, the edge that actually borders the peer. A crossing on any other
-/// edge (a screen edge with no peer beyond it) is dropped, so the cursor just
-/// stops there as usual.
+/// handoffs, each to the session of the peer beyond the crossed edge. A
+/// crossing with no peer beyond it is dropped by the hub, so the cursor just
+/// stops there as usual — though capture arms only edges that border a peer,
+/// so that is a peer that left between the crossing and now.
 ///
 /// This is where the screen topology lives; the session stays topology-agnostic
-/// (it only sees "hand off to the peer"). Until a peer has greeted us there is
-/// no edge to match against, so crossings are ignored entirely (the receiver
-/// still drains so the channel doesn't back up). Shares `cmd_tx` with the
-/// hotkey filter: both are just ways to ask for the same handoff.
+/// (it only sees "hand off to the peer").
 fn spawn_edge_handoff(
     mut edges: tokio::sync::mpsc::UnboundedReceiver<cursio_input::EdgeCrossing>,
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<session::OwnershipCmd>,
+    hub: InputHub,
 ) {
     tokio::spawn(async move {
         while let Some(crossing) = edges.recv().await {
-            // Read now, not captured when this task started. The edge is
-            // learned from the peer's position in its greeting, which is after
-            // this forwarder exists — comparing against the command-line flag
-            // meant every crossing was discarded the moment `--peer-edge`
-            // stopped being required.
-            match cursio_input::peer_edge() {
-                Some(edge) if edge == crossing.edge => {
-                    tracing::info!(?edge, pos = crossing.pos_norm, "edge crossing toward peer");
-                    let cmd = session::OwnershipCmd::HandoffToPeer {
-                        edge: crossing.edge,
-                        pos_norm: crossing.pos_norm,
-                    };
-                    if cmd_tx.send(cmd).is_err() {
-                        break; // session gone
-                    }
-                }
-                _ => tracing::trace!(?crossing, "edge crossing away from peer; ignoring"),
-            }
+            tracing::info!(edge = ?crossing.edge, pos = crossing.pos_norm, "edge crossing toward peer");
+            hub.route_command(session::OwnershipCmd::HandoffToPeer {
+                edge: crossing.edge,
+                pos_norm: crossing.pos_norm,
+            });
         }
     });
 }
@@ -2623,15 +2602,67 @@ fn set_cursor_hidden(cursor: Option<&mut Box<dyn cursio_input::CursorControl>>, 
 /// and edge-crossing stopped working until the process was restarted.
 ///
 /// So the capture task, the hotkey filter and the edge-crossing forwarder all
-/// live here, outliving individual sessions. Each session borrows the two
-/// receivers for as long as it runs.
+/// live here, outliving individual sessions. They feed the [`InputHub`], and
+/// every session attaches to it for as long as it runs — all of them at once,
+/// each reached only by what concerns its own peer.
 struct PersistentCapture {
-    /// Captured input events, hotkey presses already filtered out.
-    events: tokio::sync::mpsc::UnboundedReceiver<session::CapturedInput>,
-    /// Ownership requests, from either the hotkey or an edge crossing.
-    commands: tokio::sync::mpsc::UnboundedReceiver<session::OwnershipCmd>,
+    /// Which session each captured event and ownership request reaches.
+    hub: InputHub,
     /// Freeze/release local input.
     grab: cursio_input::GrabControl,
+    /// Hides this machine's pointer while it drives a peer. One per machine,
+    /// like the pointer: two sessions each holding one wrote over each other,
+    /// and macOS counts hides, so two hides needed two shows.
+    cursor: std::cell::RefCell<Option<Box<dyn cursio_input::CursorControl>>>,
+    /// Whether the pointer is hidden now, so a session reporting a change that
+    /// changes nothing machine-wide does not hide or show it again.
+    hidden: std::cell::Cell<bool>,
+}
+
+/// One session's attachment to the hub, and its two ports.
+///
+/// Dropping it detaches — on every way out of a session, an error included —
+/// and puts grab, barriers and pointer back in line with the links that
+/// remain. A session that left without detaching would keep its edge armed and
+/// could keep receiving this machine's input.
+struct HubLink<'c> {
+    capture: &'c PersistentCapture,
+    token: cursio_core::input_hub::LinkToken,
+    events: tokio::sync::mpsc::UnboundedReceiver<session::CapturedInput>,
+    commands: tokio::sync::mpsc::UnboundedReceiver<session::OwnershipCmd>,
+}
+
+impl Drop for HubLink<'_> {
+    fn drop(&mut self) {
+        self.capture.apply(self.capture.hub.detach(self.token));
+    }
+}
+
+impl PersistentCapture {
+    /// Bring grab, barriers and pointer in line with what the hub says this
+    /// machine's input is doing.
+    ///
+    /// Each is written only when it changes. Every session reports its own
+    /// ownership, and most reports change nothing machine-wide; setting the
+    /// grab mode again is not free — on Wayland re-entering Active releases
+    /// the portal grab and nudges the pointer.
+    fn apply(&self, machine: MachineInput) {
+        cursio_input::set_watched_edges(machine.edges);
+        let mode = if machine.driving {
+            cursio_input::InputMode::Dormant
+        } else if machine.linked {
+            cursio_input::InputMode::Active
+        } else {
+            cursio_input::InputMode::Idle
+        };
+        if self.grab.mode() != mode {
+            self.grab.set_mode(mode);
+        }
+        if self.hidden.get() != machine.driving {
+            self.hidden.set(machine.driving);
+            set_cursor_hidden(self.cursor.borrow_mut().as_mut(), machine.driving);
+        }
+    }
 }
 
 /// Everything a node needs before it can talk to anyone: a bound listener, an
@@ -2717,12 +2748,11 @@ async fn start_node(
     // asked a single time and survives peers coming and going. See
     // [`PersistentCapture`].
     //
-    // It is started without an edge on purpose. Which edge borders a peer is a
+    // It is started without edges on purpose. Which edge borders a peer is a
     // per-link answer derived from the two `--at` positions, and no peer has
-    // said hello yet; each backend is pointed at one later through
-    // [`cursio_input::set_peer_edge`].
-    let capture: SharedCapture =
-        std::rc::Rc::new(std::cell::RefCell::new(make_persistent_capture(send_input)));
+    // said hello yet; the hub arms them as links come up, through
+    // [`cursio_input::set_watched_edges`].
+    let capture: SharedCapture = std::rc::Rc::new(make_persistent_capture(send_input));
 
     // Read once here rather than per link, for the same reason capture is
     // built once: the answer is machine-wide. The first reading rides every
@@ -2741,13 +2771,12 @@ async fn start_node(
 
 /// Capture shared between concurrent mesh sessions.
 ///
-/// `Rc<RefCell<_>>` rather than a lock because mesh runs single-threaded on a
-/// `LocalSet`. `None` inside means capture is unavailable/disabled. A session
-/// borrows it only while it runs; since exactly one session can hold the borrow
-/// at a time, a second concurrent peer simply runs without local input — which
-/// is the right semantics anyway, as there is only one physical keyboard and
-/// mouse to give away.
-type SharedCapture = std::rc::Rc<std::cell::RefCell<Option<PersistentCapture>>>;
+/// `Rc` rather than a lock because mesh runs single-threaded on a `LocalSet`.
+/// `None` inside means capture is unavailable/disabled. Every session uses it
+/// at once: which of them a keystroke or a crossing reaches is the hub's
+/// decision, not a question of who borrowed capture first. Lending it whole to
+/// the first session left every other peer without local input.
+type SharedCapture = std::rc::Rc<Option<PersistentCapture>>;
 
 /// Bring up input capture for the whole process lifetime.
 ///
@@ -2761,17 +2790,17 @@ fn make_persistent_capture(enabled: bool) -> Option<PersistentCapture> {
     let handle = make_capture()?;
     let grab = handle.grab.clone();
 
-    // Both forwarders are permanent too: they own the raw receivers and feed the
-    // two channels a session consumes. One shared command channel, because the
-    // hotkey and an edge crossing are just two ways to ask for the same handoff.
-    let (cmd_tx, commands) = tokio::sync::mpsc::unbounded_channel();
-    let events = spawn_hotkey_filter(handle.events, cmd_tx.clone(), grab.clone());
-    spawn_edge_handoff(handle.edges, cmd_tx);
+    // Both forwarders are permanent too: they own the raw receivers and hand
+    // what they read to the hub, which passes each to the session it concerns.
+    let hub = InputHub::new();
+    spawn_hotkey_filter(handle.events, hub.clone(), grab.clone());
+    spawn_edge_handoff(handle.edges, hub.clone());
 
     Some(PersistentCapture {
-        events,
-        commands,
+        hub,
         grab,
+        cursor: std::cell::RefCell::new(make_cursor()),
+        hidden: std::cell::Cell::new(false),
     })
 }
 

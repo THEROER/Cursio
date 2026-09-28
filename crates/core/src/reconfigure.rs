@@ -57,6 +57,8 @@ pub struct LinkLive<'a> {
 #[derive(Debug, Clone)]
 pub struct LinkState {
     pub negotiated: Negotiated,
+    /// Where this machine stands, which a settings change can move too.
+    pub position: Position,
     pub peer_position: Position,
     /// Which of this machine's edges borders the peer now.
     pub peer_edge: Option<Edge>,
@@ -197,6 +199,7 @@ impl<'a> Reconf<'a> {
         self.peer_edge = edge;
         (self.on_change)(&LinkState {
             negotiated,
+            position: self.position,
             peer_position: self.peer.position,
             peer_edge: edge,
             edge_changed,

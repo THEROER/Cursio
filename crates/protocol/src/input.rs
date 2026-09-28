@@ -118,7 +118,7 @@ impl Position {
     /// Manhattan distance, because movement here is along edges rather than
     /// through space: two cells right is two crossings whatever the diagonal
     /// measures.
-    fn distance_to(self, peer: Position) -> u32 {
+    pub fn distance_to(self, peer: Position) -> u32 {
         self.x.abs_diff(peer.x) + self.y.abs_diff(peer.y)
     }
 }
@@ -158,6 +158,66 @@ impl Edge {
     /// vertical edge it's a y-fraction.
     pub fn is_horizontal(self) -> bool {
         matches!(self, Edge::Top | Edge::Bottom)
+    }
+}
+
+/// The edges of this machine that border some peer.
+///
+/// A machine with a neighbour to the right and another below watches both,
+/// and each edge leads somewhere different — which one is the business of
+/// whoever routes the crossing, not of capture. Capture only needs to know
+/// which edges to arm, and a set is what lets one mouse leave in more than one
+/// direction. Never on the wire; a bitmask so a hook that may not lock can
+/// read it from an atomic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct EdgeSet(u8);
+
+impl EdgeSet {
+    pub const EMPTY: EdgeSet = EdgeSet(0);
+
+    fn bit(edge: Edge) -> u8 {
+        match edge {
+            Edge::Left => 1,
+            Edge::Right => 2,
+            Edge::Top => 4,
+            Edge::Bottom => 8,
+        }
+    }
+
+    pub fn with(self, edge: Edge) -> EdgeSet {
+        EdgeSet(self.0 | Self::bit(edge))
+    }
+
+    pub fn contains(self, edge: Edge) -> bool {
+        self.0 & Self::bit(edge) != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The edges in a fixed order, so barriers are placed the same way each
+    /// time and a log line reads the same for the same set.
+    pub fn iter(self) -> impl Iterator<Item = Edge> {
+        [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+            .into_iter()
+            .filter(move |edge| self.contains(*edge))
+    }
+
+    /// The raw mask, for storing in an atomic.
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Back from [`Self::bits`]; bits no edge uses are dropped.
+    pub fn from_bits(bits: u8) -> EdgeSet {
+        EdgeSet(bits & 0b1111)
+    }
+}
+
+impl FromIterator<Edge> for EdgeSet {
+    fn from_iter<I: IntoIterator<Item = Edge>>(edges: I) -> Self {
+        edges.into_iter().fold(EdgeSet::EMPTY, EdgeSet::with)
     }
 }
 
@@ -227,5 +287,21 @@ mod position_tests {
         let peers = [("right", Position::new(1, 0))];
         assert_eq!(neighbour_across(own, Edge::Left, &peers), None);
         assert_eq!(neighbour_across::<&str>(own, Edge::Right, &[]), None);
+    }
+
+    #[test]
+    fn an_edge_set_holds_each_edge_once_and_survives_its_bits() {
+        let set: EdgeSet = [Edge::Bottom, Edge::Right, Edge::Bottom]
+            .into_iter()
+            .collect();
+        assert!(set.contains(Edge::Right) && set.contains(Edge::Bottom));
+        assert!(!set.contains(Edge::Left) && !set.contains(Edge::Top));
+        assert_eq!(
+            set.iter().collect::<Vec<_>>(),
+            vec![Edge::Right, Edge::Bottom]
+        );
+        assert_eq!(EdgeSet::from_bits(set.bits()), set);
+        assert!(EdgeSet::EMPTY.is_empty());
+        assert_eq!(EdgeSet::from_bits(0xF0), EdgeSet::EMPTY);
     }
 }

@@ -79,7 +79,10 @@ impl CursorControl for MacCursor {
         // SAFETY: the display id is a documented constant meaning "every
         // display"; the call takes no pointers.
         let status = unsafe { CGDisplayHideCursor(NULL_DISPLAY) };
-        warp_to(parking_spot(Bounds::of_all_displays(), crate::peer_edge()));
+        warp_to(parking_spot(
+            Bounds::of_all_displays(),
+            crate::last_crossed_edge(),
+        ));
         if status != 0 {
             return Err(InputError::Unavailable(format!(
                 "macOS refused to hide the cursor (CGError {status}); it is parked in a corner \
@@ -102,7 +105,12 @@ impl CursorControl for MacCursor {
         // travel from the corner.
         if let Some(point) = self.resume_at.take() {
             let bounds = Bounds::of_all_displays();
-            warp_to(bounds.clamp(off_edge(point, bounds, crate::peer_edge(), EDGE_INSET)));
+            warp_to(bounds.clamp(off_edge(
+                point,
+                bounds,
+                crate::last_crossed_edge(),
+                EDGE_INSET,
+            )));
         }
         // SAFETY: as above.
         let status = unsafe { CGDisplayShowCursor(NULL_DISPLAY) };
@@ -122,7 +130,7 @@ impl CursorControl for MacCursor {
     /// the pointer off the edge it was just shoved through, and it sat there
     /// waiting to fire a second crossing.
     fn nudge_off_peer_edge(&mut self) {
-        let Some(edge) = crate::peer_edge() else {
+        let Some(edge) = crate::last_crossed_edge() else {
             return;
         };
         let bounds = Bounds::of_all_displays();

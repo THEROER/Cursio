@@ -56,9 +56,9 @@ pub(crate) const INJECTED_TAG: i64 = 0x0C_09_50_10;
 
 /// Start capturing this Mac's keyboard and mouse.
 ///
-/// Nothing about the peer is needed here: the tap reads the watched edge from
-/// [`crate::peer_edge`] on every event, so it follows a peer that greets us
-/// long after the tap is running.
+/// Nothing about the peers is needed here: the tap reads the watched edges
+/// from [`crate::watched_edges`] on every event, so it follows a peer that
+/// greets us long after the tap is running.
 pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (edges_tx, edges) = tokio::sync::mpsc::unbounded_channel::<EdgeCrossing>();
@@ -186,11 +186,12 @@ impl TapState {
     /// `event` must be a live `CGEventRef`.
     unsafe fn check_edge(&mut self, event: *mut c_void, dx: i32, dy: i32) {
         // Read per event rather than captured at startup: the answer comes
-        // from the peer's position in its greeting, which arrives after this
+        // from each peer's position in its greeting, which arrives after this
         // tap already exists.
-        let Some(edge) = crate::peer_edge() else {
+        let watched = crate::watched_edges();
+        if watched.is_empty() {
             return;
-        };
+        }
         // Active is `forwarding && !grabbed`: Dormant forwards and grabs, Idle
         // does neither.
         let holds_cursor =
@@ -201,30 +202,39 @@ impl TapState {
         // SAFETY: the caller guarantees a live event.
         let at = unsafe { CGEventGetLocation(event) };
 
+        // In a corner two watched edges can both be touched; the one being
+        // pushed through is the one that counts.
+        let bounds = self.bounds;
+        let mut touching = watched
+            .iter()
+            .filter(|edge| match edge {
+                cursio_protocol::Edge::Left => at.x <= bounds.min_x + EDGE_ZONE,
+                cursio_protocol::Edge::Right => at.x >= bounds.max_x - 1.0 - EDGE_ZONE,
+                cursio_protocol::Edge::Top => at.y <= bounds.min_y + EDGE_ZONE,
+                cursio_protocol::Edge::Bottom => at.y >= bounds.max_y - 1.0 - EDGE_ZONE,
+            })
+            .peekable();
+        if touching.peek().is_none() {
+            self.crossed = false;
+            return;
+        }
         // Pushed outwards, not merely resting. A cursor sits against an edge
         // constantly — every time the user throws the mouse at a menu — and
         // treating that as a request to leave would hand the machine away by
         // accident several times a minute.
-        let outwards = match edge {
+        let Some(edge) = touching.find(|edge| match edge {
             cursio_protocol::Edge::Left => dx < 0,
             cursio_protocol::Edge::Right => dx > 0,
             cursio_protocol::Edge::Top => dy < 0,
             cursio_protocol::Edge::Bottom => dy > 0,
-        };
-        let at_edge = match edge {
-            cursio_protocol::Edge::Left => at.x <= self.bounds.min_x + EDGE_ZONE,
-            cursio_protocol::Edge::Right => at.x >= self.bounds.max_x - 1.0 - EDGE_ZONE,
-            cursio_protocol::Edge::Top => at.y <= self.bounds.min_y + EDGE_ZONE,
-            cursio_protocol::Edge::Bottom => at.y >= self.bounds.max_y - 1.0 - EDGE_ZONE,
-        };
-        if !at_edge {
-            self.crossed = false;
+        }) else {
             return;
-        }
-        if !outwards || self.crossed {
+        };
+        if self.crossed {
             return;
         }
         self.crossed = true;
+        crate::note_crossed(edge);
 
         // Where along the edge, as a fraction: the peer uses it to bring the
         // cursor in at the same height it left at, rather than in a corner.

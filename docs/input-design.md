@@ -123,15 +123,16 @@ so a machine going away lets the one behind it become the neighbour.
 Positions ride in `Hello`, so **the edge is derived per link**, during the
 handshake, from the two positions. That is seconds after capture starts — one
 portal permission, one set of hooks, for the life of the process — so capture
-comes up watching nothing and is pointed at an edge afterwards by
-`set_peer_edge`. Each backend follows that differently, and the difference is
-the whole reason the call exists rather than a constructor argument:
+comes up watching nothing and is handed the edges afterwards by
+`set_watched_edges`: every edge that borders some peer, as an `EdgeSet`. Each
+backend follows that differently, and the difference is the whole reason the
+call exists rather than a constructor argument:
 
-| backend | how it follows the edge |
+| backend | how it follows the edges |
 | --- | --- |
-| Windows | an atomic the low-level mouse hook reads; a hook may not lock |
+| Windows | a bitmask the low-level mouse hook reads; a hook may not lock |
 | macOS | read from the event tap on every event |
-| Wayland | capture is taken down, a new barrier placed, capture re-armed — a barrier is a D-Bus object living on one edge |
+| Wayland | capture is taken down, barriers placed on every armed edge, capture re-armed — a barrier is a D-Bus object living on one edge |
 | evdev | **cannot**: `REL_X`/`REL_Y` is a device, not a desktop |
 
 The evdev gap is not an unfinished backend. Summing deltas does not recover the
@@ -140,9 +141,46 @@ edge, so the sum drifts within seconds. Answering it needs the display server,
 and on X11 that means `XQueryPointer` and a dependency; deliberately not taken.
 A non-Wayland Linux session says so at startup and hands over by hotkey.
 
-Several peers still mean one watched edge, because there is one physical mouse
-and the backends each hold a single edge. Arming a *set* is the change that
-would let one machine border two peers at once.
+## Several peers: one mouse, one hub
+
+A machine with a neighbour to the right and another below has one mouse and
+two ways out. Capture used to be lent whole to the first peer session, so every
+later peer ran without local input, and the single watched edge belonged to
+whichever peer greeted last — pushing down sent the cursor right, and right
+stopped working at all.
+
+`core/src/input_hub.rs` is what knows more than one peer exists. Capture's
+forwarders hand everything to it, and it passes each thing to exactly one
+session:
+
+- **an edge crossing** to the nearest peer beyond that edge that can hold a
+  cursor (`neighbour_across`, with distances taken when each link came up and
+  whenever a position changes);
+- **captured input** to the peer this machine is streaming to — only ever one,
+  even when two sessions each believe they drive;
+- **the hotkey** to the peer being driven (which is how the cursor comes back),
+  else to the peer it last went to, else to the first linked;
+- **panic** to every session.
+
+Ownership itself is unchanged: each link still runs the two-machine
+`CursorRole` exchange, and no wire vocabulary was added. What moved is what was
+always machine-wide and was being written by each session in turn — the grab
+mode, the armed edges and the hidden pointer. The hub recomputes them on every
+report (`MachineInput`) and they are written only when they change, since
+re-entering Active on Wayland releases the portal grab and nudges the pointer.
+
+The start of a link is settled by comparing ids, which knows only that link. A
+machine that already has a peer therefore never starts a new link as the side
+that drives: otherwise the cursor would leave the screen the user is working on
+because another machine switched on. Only the first link keeps the id rule.
+
+With several edges armed there is no longer one "peer edge" to pull a returning
+pointer away from or to park furthest from; the backends use the edge the
+cursor last left by.
+
+A peer that cannot hold a cursor (a phone used as a touchpad) arms no edge,
+wherever it was placed: on Wayland a barrier with nobody to hand to would still
+grab the user's input.
 
 ## Where a peer's modifiers land on a Mac
 

@@ -46,7 +46,7 @@ use ashpd::desktop::input_capture::{
     Activated, ActivatedBarrier, Barrier, BarrierID, BarrierPosition, Capabilities,
     CreateSessionOptions, InputCapture,
 };
-use cursio_protocol::{Edge, InputEvent, MouseButton};
+use cursio_protocol::{Edge, EdgeSet, InputEvent, MouseButton};
 use futures_util::StreamExt;
 use reis::{
     ei::{self, button::ButtonState, keyboard::KeyState},
@@ -80,30 +80,30 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-/// The edge the barriers are currently placed on, shared with the capture
+/// The edges the barriers are currently placed on, shared with the capture
 /// thread.
 ///
 /// A `watch` rather than an atomic: unlike the Windows hook, which reads its
-/// edge from inside a callback that may not block, the change here has to *do*
-/// something — three D-Bus round trips — so the capture loop needs to be woken,
-/// not polled. Lives in a static because [`crate::set_peer_edge`] is called
-/// from the session, which holds no handle to this backend.
-fn watched_edge() -> &'static tokio::sync::watch::Sender<Option<Edge>> {
-    static EDGE: std::sync::OnceLock<tokio::sync::watch::Sender<Option<Edge>>> =
+/// edges from inside a callback that may not block, the change here has to
+/// *do* something — three D-Bus round trips — so the capture loop needs to be
+/// woken, not polled. Lives in a static because [`crate::set_watched_edges`]
+/// is called from the node, which holds no handle to this backend.
+fn watched_edges() -> &'static tokio::sync::watch::Sender<EdgeSet> {
+    static EDGES: std::sync::OnceLock<tokio::sync::watch::Sender<EdgeSet>> =
         std::sync::OnceLock::new();
-    EDGE.get_or_init(|| tokio::sync::watch::channel(None).0)
+    EDGES.get_or_init(|| tokio::sync::watch::channel(EdgeSet::EMPTY).0)
 }
 
-/// Move the barriers to a different edge while capture is running.
+/// Move the barriers to a different set of edges while capture is running.
 ///
-/// Set from [`crate::set_peer_edge`] once the peer's position is known, which
-/// is seconds after the portal session exists. `None` takes every barrier down,
+/// Set from [`crate::set_watched_edges`] as peers greet us, which is seconds
+/// after the portal session exists. An empty set takes every barrier down,
 /// leaving edge crossing off.
-pub(crate) fn set_watched_edge(edge: Option<Edge>) {
+pub(crate) fn set_watched_edges(edges: EdgeSet) {
     // `send_replace` rather than `send`: the capture thread may not have
     // subscribed yet (or may have ended), and neither is an error here — the
     // value is what matters, and a later subscriber reads it as its initial.
-    watched_edge().send_replace(edge);
+    watched_edges().send_replace(edges);
 }
 
 /// evdev `BTN_*` codes we forward as pointer buttons (libei reports button codes
@@ -131,11 +131,11 @@ pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
 
     // Subscribed before the thread starts, so an edge set while the portal
     // handshake is still running wakes the loop rather than being missed. On a
-    // first run the shared value is `None` and the first barriers go up when a
+    // first run the shared value is empty and the first barriers go up when a
     // peer greets us; on a capture restarted mid-mesh it already holds the
-    // right edge.
-    let edge_rx = watched_edge().subscribe();
-    let peer_edge = *edge_rx.borrow();
+    // right edges.
+    let edge_rx = watched_edges().subscribe();
+    let edges = *edge_rx.borrow();
 
     std::thread::Builder::new()
         .name("cursio-wayland".into())
@@ -152,7 +152,7 @@ pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                match setup_portal(peer_edge).await {
+                match setup_portal(edges).await {
                     Ok(portal) => {
                         let _ = ready_tx.send(Ok(()));
                         capture_loop(portal, tx, edges_tx, grab_rx, edge_rx).await;
@@ -200,7 +200,7 @@ struct Portal {
 /// Open the InputCapture portal session, connect libei, and place outer-edge
 /// barriers. Returns the pieces the capture loop drives. Runs on the Wayland
 /// thread's LocalSet.
-async fn setup_portal(peer_edge: Option<Edge>) -> Result<Portal, String> {
+async fn setup_portal(edges: EdgeSet) -> Result<Portal, String> {
     let ic = InputCapture::new()
         .await
         .map_err(|e| format!("open InputCapture portal: {e}"))?;
@@ -228,7 +228,7 @@ async fn setup_portal(peer_edge: Option<Edge>) -> Result<Portal, String> {
 
     // Barriers on the OUTER edges only — the portal rejects internal seams.
     let (rects, zone_set) = read_zones(&ic, &session).await?;
-    let barrier_info = place_barriers(&ic, &session, &rects, zone_set, peer_edge).await;
+    let barrier_info = place_barriers(&ic, &session, &rects, zone_set, edges).await;
 
     Ok(Portal {
         ic,
@@ -271,8 +271,8 @@ async fn read_zones(
     Ok((rects, zones.zone_set()))
 }
 
-/// Put barriers on `peer_edge` of every region and report the id map needed to
-/// attribute an activation back to an edge.
+/// Put barriers on each of `edges` of every region and report the id map
+/// needed to attribute an activation back to an edge.
 ///
 /// Best-effort by design: a rejected barrier is one that fell on an internal
 /// seam between two monitors, which is normal on a multi-monitor desktop and
@@ -282,10 +282,10 @@ async fn place_barriers(
     session: &ashpd::desktop::Session<InputCapture>,
     rects: &[Rect],
     zone_set: u32,
-    peer_edge: Option<Edge>,
+    edges: EdgeSet,
 ) -> HashMap<u32, BarrierInfo> {
-    let (barriers, barrier_info) = outer_edge_barriers(rects, peer_edge);
-    tracing::info!(count = barriers.len(), ?peer_edge, "placing edge barriers");
+    let (barriers, barrier_info) = outer_edge_barriers(rects, edges);
+    tracing::info!(count = barriers.len(), edges = ?edges.iter().collect::<Vec<_>>(), "placing edge barriers");
     match ic
         .set_pointer_barriers(session, &barriers, zone_set, Default::default())
         .await
@@ -379,7 +379,7 @@ async fn replace_barriers(
     session: &ashpd::desktop::Session<InputCapture>,
     rects: &[Rect],
     zone_set: u32,
-    peer_edge: Option<Edge>,
+    edges: EdgeSet,
     state: &mut CaptureState,
 ) -> HashMap<u32, BarrierInfo> {
     let was_enabled = state.enabled;
@@ -389,7 +389,7 @@ async fn replace_barriers(
         state.released();
     }
 
-    let info = place_barriers(ic, session, rects, zone_set, peer_edge).await;
+    let info = place_barriers(ic, session, rects, zone_set, edges).await;
 
     // Only re-arm if it was armed. Coming back enabled from an Idle session
     // would put barriers up with no peer to hand anything to, and a barrier
@@ -417,19 +417,6 @@ struct BarrierInfo {
     length: i32,
 }
 
-/// Build barriers on ONLY the `peer_edge` side of the desktop — the edge that
-/// borders the peer. A barrier on any other edge is actively harmful: crossing
-/// it would still make the portal *grab* input (locking the user), even though
-/// the session then filters that crossing out as "no peer there". So we arm
-/// exactly the edge we're willing to hand off across, and every other edge stays
-/// a normal wall the cursor just stops at.
-///
-/// With `peer_edge = None`, no barriers are placed at all (edge-crossing off).
-///
-/// One barrier is emitted per region on that edge; for a multi-monitor desktop
-/// the portal rejects the ones that fall on an internal seam (harmless, logged),
-/// leaving the barrier on the true outer edge. Returns the id -> [`BarrierInfo`]
-/// map used to recover the edge + normalized position on activation.
 /// Whether `edge` of this region faces off the desktop rather than another
 /// monitor.
 ///
@@ -461,18 +448,31 @@ fn is_outer_edge(rect: Rect, edge: Edge, rects: &[Rect]) -> bool {
     })
 }
 
+/// Build barriers on ONLY the `edges` sides of the desktop — the edges that
+/// border a peer. A barrier on any other edge is actively harmful: crossing it
+/// would still make the portal *grab* input (locking the user), even though
+/// nothing then takes the crossing because no peer is there. So we arm exactly
+/// the edges we're willing to hand off across, and every other edge stays a
+/// normal wall the cursor just stops at.
+///
+/// With no edges, no barriers are placed at all (edge-crossing off).
+///
+/// Only outer edges get one (see [`is_outer_edge`]); every barrier remembers
+/// its own edge, so an activation says which way the cursor left. Returns the
+/// id -> [`BarrierInfo`] map used to recover the edge + normalized position on
+/// activation.
 fn outer_edge_barriers(
     rects: &[Rect],
-    peer_edge: Option<Edge>,
+    edges: EdgeSet,
 ) -> (Vec<Barrier>, HashMap<u32, BarrierInfo>) {
     let mut barriers = Vec::new();
     let mut info = HashMap::new();
-    let Some(peer_edge) = peer_edge else {
-        return (barriers, info); // edge-crossing disabled: no barriers
-    };
     let mut next_id = 1u32;
 
-    for &(x, y, w, h) in rects {
+    for (peer_edge, &(x, y, w, h)) in edges
+        .iter()
+        .flat_map(|edge| rects.iter().map(move |rect| (edge, rect)))
+    {
         // Outer edges only, as the name says. A barrier on the seam between two
         // of this desktop's own monitors is one the portal rejects — it logged
         // `some barriers were rejected` on every start of a two-monitor
@@ -512,7 +512,7 @@ async fn capture_loop(
     tx: mpsc::UnboundedSender<InputEvent>,
     edges_tx: mpsc::UnboundedSender<crate::EdgeCrossing>,
     mut grab_rx: tokio::sync::watch::Receiver<crate::InputMode>,
-    mut edge_rx: tokio::sync::watch::Receiver<Option<Edge>>,
+    mut edge_rx: tokio::sync::watch::Receiver<EdgeSet>,
 ) {
     use crate::InputMode;
 
@@ -525,10 +525,10 @@ async fn capture_loop(
         mut rects,
         mut zone_set,
     } = portal;
-    // The edge the barriers currently sit on. Read from the shared value rather
-    // than from a parameter: it may already have moved while the portal
+    // The edges the barriers currently sit on. Read from the shared value
+    // rather than from a parameter: it may already have moved while the portal
     // handshake was running.
-    let mut peer_edge = *edge_rx.borrow_and_update();
+    let mut edges = *edge_rx.borrow_and_update();
 
     let mut activated = match ic.receive_activated().await {
         Ok(s) => s,
@@ -615,7 +615,7 @@ async fn capture_loop(
                     if state.captured || state.enabled {
                         let _ = ic.disable(&session, Default::default()).await;
                         state.released();
-                        nudge_off_edge(&tx, peer_edge);
+                        nudge_off_edge(&tx, crate::last_crossed_edge());
                         if let Err(e) = ic.enable(&session, Default::default()).await {
                             tracing::warn!(error = %e, "re-arm after takeback failed");
                             state.enabled = false;
@@ -642,7 +642,7 @@ async fn capture_loop(
                 }
             }
 
-            // The peer whose edge we watch has changed — normally because one
+            // The edges bordering a peer have changed — normally because one
             // greeted us for the first time, seconds after capture came up.
             // Everything about the barriers is stale, including the id map an
             // activation is attributed through, so all of it is rebuilt.
@@ -652,10 +652,10 @@ async fn capture_loop(
                 // tearing capture down over it.
                 if changed.is_ok() {
                     let wanted = *edge_rx.borrow_and_update();
-                    if wanted != peer_edge {
-                        peer_edge = wanted;
+                    if wanted != edges {
+                        edges = wanted;
                         barrier_info = replace_barriers(
-                            &ic, &session, &rects, zone_set, peer_edge, &mut state,
+                            &ic, &session, &rects, zone_set, edges, &mut state,
                         )
                         .await;
                     }
@@ -675,7 +675,7 @@ async fn capture_loop(
                         rects = new_rects;
                         zone_set = new_set;
                         barrier_info = replace_barriers(
-                            &ic, &session, &rects, zone_set, peer_edge, &mut state,
+                            &ic, &session, &rects, zone_set, edges, &mut state,
                         )
                         .await;
                     }
@@ -715,6 +715,7 @@ async fn capture_loop(
                         if !owns_cursor {
                             tracing::debug!("barrier fired while dormant; not a crossing (peer owns the cursor)");
                         } else if let Some(crossing) = crossing_from(&a, &barrier_info) {
+                            crate::note_crossed(crossing.edge);
                             let _ = edges_tx.send(crossing);
                         }
                     }
@@ -758,7 +759,9 @@ async fn capture_loop(
                 let options = ashpd::desktop::input_capture::ReleaseOptions::default()
                     .set_activation_id(state.activation_id)
                     .set_cursor_position(
-                        state.activated_at.map(|at| inside_edge(at, peer_edge)),
+                        state
+                            .activated_at
+                            .map(|at| inside_edge(at, crate::last_crossed_edge())),
                     );
                 if let Err(e) = ic.release(&session, options).await {
                     // Without a release the grab is still held, and the dead-man
@@ -991,6 +994,10 @@ fn handle_ei_event(
 mod tests {
     use super::*;
 
+    fn only(edge: Edge) -> EdgeSet {
+        EdgeSet::EMPTY.with(edge)
+    }
+
     #[test]
     fn sub_pixel_motion_accumulates_instead_of_vanishing() {
         // A slow drag straight up: each step is well under a pixel, which plain
@@ -1038,7 +1045,7 @@ mod tests {
     /// hand side, spanning the full height.
     #[test]
     fn a_barrier_lands_on_the_edge_that_borders_the_peer() {
-        let (barriers, info) = outer_edge_barriers(&[(0, 0, 1920, 1080)], Some(Edge::Right));
+        let (barriers, info) = outer_edge_barriers(&[(0, 0, 1920, 1080)], only(Edge::Right));
         assert_eq!(barriers.len(), 1);
         assert_eq!(barriers[0].position().as_tuple(), (1920, 0, 1920, 1079));
         let bi = info.values().next().unwrap();
@@ -1046,12 +1053,28 @@ mod tests {
         assert_eq!((bi.origin, bi.length), (0, 1080));
     }
 
+    /// A peer to the right and another below: both edges are armed at once,
+    /// and each barrier remembers which one it is, so a crossing says which
+    /// way — and so to whom — the cursor left.
+    #[test]
+    fn two_neighbours_arm_two_edges_that_each_name_themselves() {
+        let edges: EdgeSet = [Edge::Right, Edge::Bottom].into_iter().collect();
+        let (barriers, info) = outer_edge_barriers(&[(0, 0, 1920, 1080)], edges);
+        assert_eq!(barriers.len(), 2);
+        let mut placed: Vec<Edge> = info.values().map(|bi| bi.edge).collect();
+        placed.sort_by_key(|edge| format!("{edge:?}"));
+        assert_eq!(placed, vec![Edge::Bottom, Edge::Right]);
+        let lines: Vec<_> = barriers.iter().map(|b| b.position().as_tuple()).collect();
+        assert!(lines.contains(&(1920, 0, 1920, 1079)));
+        assert!(lines.contains(&(0, 1080, 1919, 1080)));
+    }
+
     /// Every other edge stays an ordinary wall. A barrier there would still
     /// make the portal grab input when the cursor hit it — locking the user out
     /// for a crossing the session then discards as "no peer that way".
     #[test]
     fn no_barrier_is_placed_without_an_edge_to_watch() {
-        let (barriers, info) = outer_edge_barriers(&[(0, 0, 1920, 1080)], None);
+        let (barriers, info) = outer_edge_barriers(&[(0, 0, 1920, 1080)], EdgeSet::EMPTY);
         assert!(barriers.is_empty());
         assert!(info.is_empty());
     }
@@ -1066,7 +1089,7 @@ mod tests {
     #[test]
     fn a_seam_between_two_monitors_gets_no_barrier() {
         let desktop = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
-        let (barriers, info) = outer_edge_barriers(&desktop, Some(Edge::Right));
+        let (barriers, info) = outer_edge_barriers(&desktop, only(Edge::Right));
         assert_eq!(barriers.len(), 1, "the seam must not be offered");
         assert_eq!(info.len(), 1);
         let line = barriers[0].position().as_tuple().0;
@@ -1083,7 +1106,7 @@ mod tests {
     #[test]
     fn a_partly_covered_edge_keeps_its_barrier() {
         let desktop = [(0, 0, 2560, 1440), (2560, 0, 1920, 1080)];
-        let (barriers, _) = outer_edge_barriers(&desktop, Some(Edge::Right));
+        let (barriers, _) = outer_edge_barriers(&desktop, only(Edge::Right));
         let lines: Vec<i32> = barriers.iter().map(|b| b.position().as_tuple().0).collect();
         assert!(
             lines.contains(&2560),
@@ -1097,7 +1120,7 @@ mod tests {
     #[test]
     fn a_seam_on_another_axis_does_not_suppress_a_barrier() {
         let desktop = [(0, 0, 1920, 1080), (0, 1080, 1920, 1080)];
-        let (barriers, _) = outer_edge_barriers(&desktop, Some(Edge::Right));
+        let (barriers, _) = outer_edge_barriers(&desktop, only(Edge::Right));
         assert_eq!(barriers.len(), 2, "both right edges face off the desktop");
     }
 
@@ -1106,9 +1129,9 @@ mod tests {
     #[test]
     fn a_horizontal_edge_spans_the_width_and_a_vertical_one_the_height() {
         let screen = [(0, 0, 1920, 1080)];
-        let (_, top) = outer_edge_barriers(&screen, Some(Edge::Top));
+        let (_, top) = outer_edge_barriers(&screen, only(Edge::Top));
         assert_eq!(top.values().next().unwrap().length, 1920);
-        let (_, left) = outer_edge_barriers(&screen, Some(Edge::Left));
+        let (_, left) = outer_edge_barriers(&screen, only(Edge::Left));
         assert_eq!(left.values().next().unwrap().length, 1080);
     }
 
@@ -1117,7 +1140,7 @@ mod tests {
     /// crossing halfway down it reports a position off the end of the edge.
     #[test]
     fn an_offset_monitor_normalizes_against_its_own_span() {
-        let (_, info) = outer_edge_barriers(&[(1920, 200, 2560, 1440)], Some(Edge::Right));
+        let (_, info) = outer_edge_barriers(&[(1920, 200, 2560, 1440)], only(Edge::Right));
         let bi = *info.values().next().unwrap();
         assert_eq!((bi.origin, bi.length), (200, 1440));
     }

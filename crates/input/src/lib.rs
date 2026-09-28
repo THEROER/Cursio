@@ -9,7 +9,7 @@
 //! (SendInput) without changing callers. See `docs/input-design.md` for the
 //! behaviour model (Mouse-Without-Borders, but relative motion).
 
-use cursio_protocol::InputEvent;
+use cursio_protocol::{EdgeSet, InputEvent};
 
 #[cfg(target_os = "linux")]
 pub mod capture;
@@ -53,10 +53,10 @@ pub use win_cursor::WinCursor;
 
 /// Start Windows RawInput capture. Same signature as the other platforms so
 /// callers stay platform-agnostic; the jump-zone watch lives in the mouse hook
-/// and is pointed at an edge by [`set_peer_edge`].
+/// and reads the edges armed by [`set_watched_edges`].
 #[cfg(target_os = "windows")]
 pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
-    win_capture::spawn_capture_with_edge(peer_edge())
+    win_capture::spawn_capture()
 }
 
 /// Start macOS capture through a `CGEventTap`. The tap reads the watched edge
@@ -95,55 +95,73 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     }
 }
 
-/// Which of this machine's edges borders the peer the cursor would leave to.
+/// Which of this machine's edges border a peer.
 ///
 /// Machine-wide rather than per session, and settable after capture has
 /// started, because those are the two facts that decide where it lives. There
-/// is one physical mouse, so there is one edge it can leave by; and the answer
-/// comes from the peer's position in the greeting, which arrives seconds
-/// *after* the barrier has to exist. Passing it at construction meant the user
-/// had to state on the command line something both machines already knew.
+/// is one physical mouse, and the answer comes from each peer's position in
+/// its greeting, which arrives seconds *after* the barrier has to exist.
 ///
-/// Encoded as a number so the capture backends — which read it from a signal
-/// handler, a Win32 hook and a `CFRunLoop` callback — can do so without a lock.
-static PEER_EDGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// A set, not one edge: with a machine to the right and another below, the
+/// mouse leaves both ways, and holding a single edge meant the last peer to
+/// connect took the other one away. Which peer a crossing reaches is decided by
+/// whoever receives the [`EdgeCrossing`]; capture only arms the edges.
+///
+/// A bitmask ([`EdgeSet::bits`]) so the capture backends — which read it from
+/// a Win32 hook and a `CFRunLoop` callback — can do so without a lock.
+static WATCHED_EDGES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Tell capture which edge borders the peer. `None` turns edge crossing off.
+/// The edge the cursor last left this machine by, as an [`EdgeSet`] of one.
 ///
-/// Callers with several peers must not pass `None` for one of them: this is
-/// machine-wide, so it would take the barrier down for all of them. See the
-/// call in `run_pairing_and_session` in the `cursio` binary.
-pub fn set_peer_edge(edge: Option<cursio_protocol::Edge>) {
-    let code = match edge {
-        None => 0,
-        Some(cursio_protocol::Edge::Left) => 1,
-        Some(cursio_protocol::Edge::Right) => 2,
-        Some(cursio_protocol::Edge::Top) => 3,
-        Some(cursio_protocol::Edge::Bottom) => 4,
-    };
-    if PEER_EDGE.swap(code, std::sync::atomic::Ordering::SeqCst) != code {
-        tracing::info!(?edge, "watching this edge for a crossing toward the peer");
+/// Where a pointer coming home is pulled away from, and where it is parked
+/// furthest from: with several edges armed, "the peer edge" no longer names
+/// one, and the one that matters is the one just crossed.
+static LAST_CROSSED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tell capture which edges border a peer. An empty set turns edge crossing
+/// off.
+pub fn set_watched_edges(edges: EdgeSet) {
+    let before = WATCHED_EDGES.swap(edges.bits(), std::sync::atomic::Ordering::SeqCst);
+    if before != edges.bits() {
+        tracing::info!(edges = ?edges.iter().collect::<Vec<_>>(), "watching these edges for a crossing toward a peer");
     }
-    // The Windows hook keeps its own copy, because it is read from inside a
-    // low-level hook where nothing may allocate or lock and the module's own
-    // static is what that code already reaches for.
-    #[cfg(target_os = "windows")]
-    win_capture::set_watched_edge(edge);
     // Wayland does not read this value, it acts on it: a barrier is a D-Bus
     // object placed on one edge, so moving the watch means taking capture down
     // and putting a new list up. Harmless when the evdev backend is the one
     // running — nobody is listening.
     #[cfg(target_os = "linux")]
-    wl_capture::set_watched_edge(edge);
+    wl_capture::set_watched_edges(edges);
 }
 
-/// Which edge capture is watching, if any.
-pub fn peer_edge() -> Option<cursio_protocol::Edge> {
-    match PEER_EDGE.load(std::sync::atomic::Ordering::SeqCst) {
-        1 => Some(cursio_protocol::Edge::Left),
-        2 => Some(cursio_protocol::Edge::Right),
-        3 => Some(cursio_protocol::Edge::Top),
-        4 => Some(cursio_protocol::Edge::Bottom),
+/// Which edges capture is watching.
+pub fn watched_edges() -> EdgeSet {
+    EdgeSet::from_bits(WATCHED_EDGES.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Record the edge a backend just reported a crossing on.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
+pub(crate) fn note_crossed(edge: cursio_protocol::Edge) {
+    LAST_CROSSED.store(
+        EdgeSet::EMPTY.with(edge).bits(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// The edge the cursor last left by, or — before any crossing — the only
+/// watched edge, if there is exactly one.
+pub fn last_crossed_edge() -> Option<cursio_protocol::Edge> {
+    let crossed = EdgeSet::from_bits(LAST_CROSSED.load(std::sync::atomic::Ordering::SeqCst));
+    let pick = if crossed.is_empty() {
+        watched_edges()
+    } else {
+        crossed
+    };
+    let mut edges = pick.iter();
+    match (edges.next(), edges.next()) {
+        (Some(edge), None) => Some(edge),
         _ => None,
     }
 }
