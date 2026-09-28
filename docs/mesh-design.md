@@ -245,9 +245,12 @@ Commands: `ping`, `status` (node — with its `pid`, crate `build` and the
 `installed_version` it runs from, so the app can show and roll back what runs —
 peers with presence/position/`NodeStatus`/
 negotiated and skipped modules, configured modules, what flags pin, input
-latency, `diagnostics` problems, the pairing window), `config`, `set_config`,
+latency, `diagnostics` problems, the pairing window, and `update`: policy,
+channel, a build being fetched and how far, one installed and ready, what an
+`auto` switch is waiting for), `config`, `set_config`,
 `set_module`, `set_position`, `pair_show`, `pair_enter`, `pair_cancel`,
-`pairing`, `restart`, `subscribe`. After `subscribe` the node pushes the status
+`pairing`, `restart`, `subscribe`, `update_apply` (switch to the ready build
+now; see `docs/update-design.md`). After `subscribe` the node pushes the status
 with id 0 whenever something in it changes (and checks every 2 s for what
 changes elsewhere — latency, problems), only when it differs from the last
 push. Requests carry ids and any number may be in flight on one connection;

@@ -56,8 +56,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// me" rather than misreading a field. v2: `restart_needed` in the status and
 /// in every save reply, now that changes apply without a restart. v3:
 /// `subscribe`, and status pushed with id 0. v4: the node's `pid`, `build`
-/// and `installed_version`, so the app can show and roll back what runs.
-pub const CONTROL_VERSION: u32 = 4;
+/// and `installed_version`, so the app can show and roll back what runs. v5:
+/// `update` in the status and `update_apply`, for builds from the mesh.
+pub const CONTROL_VERSION: u32 = 5;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -146,6 +147,9 @@ pub enum Command {
     Restart,
     /// Push the status on this connection whenever it changes, starting now.
     Subscribe,
+    /// Switch to the build from the mesh that is installed and waiting. The
+    /// node stops and comes back as that build, or as this one if it fails.
+    UpdateApply,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -196,6 +200,9 @@ pub struct Status {
     pub latency: Vec<LatencyReading>,
     pub problems: Vec<Problem>,
     pub pairing: Option<PairingState>,
+    /// Builds arriving over the mesh. Defaulted from a v4 node.
+    #[serde(default)]
+    pub update: crate::update::agent::UpdateStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -479,6 +486,7 @@ impl NodeState {
             latency: crate::metrics::input_latency(),
             problems: crate::diagnostics::snapshot(),
             pairing: self.pairing.state(),
+            update: crate::update::agent::status(),
         }
     }
 
@@ -568,6 +576,18 @@ impl NodeState {
             // The connection, not the node, keeps subscriptions; see
             // `transport::serve_connection`.
             Command::Subscribe => Reply::Subscribed,
+            Command::UpdateApply => match crate::update::agent::global() {
+                Some(agent) => match agent.apply_ready() {
+                    Ok(_) => {
+                        self.changed();
+                        Reply::Done
+                    }
+                    Err(e) => error(e),
+                },
+                None => Reply::Error {
+                    message: "updates are not running on this node".into(),
+                },
+            },
         }
     }
 
@@ -642,6 +662,7 @@ mod tests {
             Command::SetConfig {
                 config: Config::default(),
             },
+            Command::UpdateApply,
         ];
         for (id, command) in commands.into_iter().enumerate() {
             let request = Request {
@@ -793,6 +814,17 @@ mod tests {
         assert_eq!(node.build, env!("CARGO_PKG_VERSION"));
         // A test binary lives in target/, not in an install's versions/.
         assert_eq!(node.installed_version, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_status_from_a_node_without_update_state_still_reads() {
+        let dir = temp_dir("v4");
+        let status = state(&dir, Overrides::default()).status();
+        let mut json = serde_json::to_value(&status).unwrap();
+        json.as_object_mut().unwrap().remove("update");
+        let read: Status = serde_json::from_value(json).unwrap();
+        assert_eq!(read.update, crate::update::agent::UpdateStatus::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

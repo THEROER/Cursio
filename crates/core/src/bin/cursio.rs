@@ -635,6 +635,9 @@ async fn main() -> anyhow::Result<()> {
                 pinned_by_flags = ?overrides.pinned(),
                 "config"
             );
+            // Before the registry: the update module advertises only once
+            // there is an agent to hand builds to.
+            cursio_core::update::agent::start(config_path.clone());
             let MeshArgs {
                 pair,
                 pair_addr,
@@ -1442,6 +1445,7 @@ fn module_registry(
         // peer's. The factory carries the node-level state every link shares,
         // which is why it is constructed rather than built from fields.
         .with(Box::new(cursio_core::usb_session::UsbFactory::new(true)))
+        .with(Box::new(cursio_core::update::lane::UpdateFactory))
 }
 
 /// Run as a mesh node: listen and dial trusted peers simultaneously, forever.
