@@ -37,7 +37,35 @@ fn app_platform() -> &'static str {
     }
 }
 
+/// Steer WebKitGTK away from the renderer paths that crash it, before any
+/// thread exists and before Tauri creates the webview.
+///
+/// Taken from the LeavePulse launcher, which met the same crashes first: on
+/// Wayland the DMABUF renderer takes the web process down, so it is off there
+/// and X11 keeps the GPU path. Anything the user exported is honoured, so
+/// `WEBKIT_DISABLE_DMABUF_RENDERER=0` brings it back.
+#[cfg(target_os = "linux")]
+fn tune_webkitgtk_renderer() {
+    fn set_if_unset(key: &str, value: &str) {
+        if std::env::var_os(key).is_none() {
+            // SAFETY: called first thing in `main`, before any thread is
+            // started, so nothing can be reading the environment concurrently.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland"));
+
+    set_if_unset("WEBKIT_FORCE_COMPOSITING_MODE", "1");
+    if wayland {
+        set_if_unset("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    tune_webkitgtk_renderer();
+
     // Started as the install's stable copy: run the current version instead.
     if let Some(target) = cursio_core::update::layout::handover("cursio-app") {
         match cursio_core::update::layout::hand_over(&target) {
