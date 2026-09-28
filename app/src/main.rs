@@ -141,6 +141,7 @@ fn main() {
             node::commands::node_pairing,
             node::commands::node_restart,
             node::commands::node_update_apply,
+            node::commands::node_forget,
             node::commands::node_start,
             autostart::commands::autostart_get,
             autostart::commands::autostart_set,

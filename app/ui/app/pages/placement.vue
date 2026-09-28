@@ -1,10 +1,30 @@
 <script setup lang="ts">
-import type { TopologyEdge, TopologyLane, TopologyNode } from "@leavepulse/ui"
-import type { Position } from "~/composables/useNode"
+import type { ContextMenuItemDef, TopologyEdge, TopologyLane, TopologyNode } from "@leavepulse/ui"
+import type { PeerView, Position } from "~/composables/useNode"
+import type { PeerRef } from "~/composables/usePeerMenu"
 
 const { t } = useI18n()
 const { status, setPosition } = useNode()
 const toast = useCursioToast()
+const peerMenu = usePeerMenu()
+
+function peerRef(p: PeerView): PeerRef {
+  return { id: p.id, name: p.name, presence: p.presence }
+}
+
+/**
+ * The machine the canvas was right-clicked on. The canvas names the node
+ * before the menu opens, so the menu is resolved per click; this machine's own
+ * card and the empty grid have no actions and open nothing.
+ */
+const menuPeer = ref<PeerRef | null>(null)
+function onNodeContextMenu({ id }: { id: string }) {
+  const peer = status.value?.peers.find((p) => p.id === id)
+  menuPeer.value = peer ? peerRef(peer) : null
+}
+const canvasMenu = computed<ContextMenuItemDef[]>(() =>
+  menuPeer.value ? peerMenu.items(menuPeer.value) : [],
+)
 
 /**
  * Where this machine is being moved to, before it is applied. Only this
@@ -164,16 +184,19 @@ const legendLabels = computed(() => ({
 
       <LpSkeleton v-if="!status" rounded="card" class="h-[26rem]" />
       <LpCard v-else class="overflow-hidden">
-        <div class="h-[26rem]">
-          <LpTopologyCanvas
-            :nodes="nodes"
-            :edges="edges"
-            :lanes="lanes"
-            :minimap="false"
-            :legend-labels="legendLabels"
-            @node-drag-stop="onDragStop"
-          />
-        </div>
+        <LpContextMenu always :items="canvasMenu">
+          <div class="h-[26rem]" @contextmenu.capture="menuPeer = null">
+            <LpTopologyCanvas
+              :nodes="nodes"
+              :edges="edges"
+              :lanes="lanes"
+              :minimap="false"
+              :legend-labels="legendLabels"
+              @node-drag-stop="onDragStop"
+              @node-contextmenu="onNodeContextMenu"
+            />
+          </div>
+        </LpContextMenu>
         <div class="flex flex-wrap items-center gap-2 border-t border-line p-3">
           <LpTooltip :content="t('placement.left')">
             <LpButton variant="soft" size="sm" square :aria-label="t('placement.left')" @click="nudge(-1, 0)">
@@ -208,9 +231,17 @@ const legendLabels = computed(() => ({
       <LpAlert v-if="sharing.length" variant="warning">
         {{ t("placement.sameCell", { names: sharing.map((s) => s.name).join(", ") }) }}
       </LpAlert>
-      <p v-if="unplaced.length" class="text-xs text-muted">
-        {{ t("placement.unplaced", { names: unplaced.map((p) => p.name).join(", ") }) }}
-      </p>
+      <div v-if="unplaced.length" class="flex flex-col gap-2">
+        <p class="text-xs text-muted">{{ t("placement.unplacedTitle") }}</p>
+        <div class="flex flex-wrap gap-2">
+          <PeerMenu v-for="p in unplaced" :key="p.id" :peer="peerRef(p)">
+            <div class="flex items-center gap-1 rounded-control border border-line py-0.5 pl-3 pr-1 text-sm">
+              <span>{{ p.name }}</span>
+              <PeerMenuButton :peer="peerRef(p)" />
+            </div>
+          </PeerMenu>
+        </div>
+      </div>
     </section>
   </DesktopShell>
 </template>

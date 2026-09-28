@@ -351,6 +351,16 @@ pub mod commands {
         link.request(Command::UpdateApply).await
     }
 
+    /// `peer` as the status carries it: the id, not the name, since two
+    /// machines may share a name and only one is meant.
+    #[tauri::command]
+    pub async fn node_forget(link: State<'_, NodeLink>, peer: String) -> Result<Reply, NodeError> {
+        let peer = peer
+            .parse()
+            .map_err(|e| NodeError::failed(format!("`{peer}` is not a machine id: {e}")))?;
+        link.request(Command::Forget { peer }).await
+    }
+
     /// Off the window's thread: `systemctl` or a process spawn can take a
     /// noticeable moment, and a synchronous command would freeze the window
     /// for it.

@@ -3,13 +3,11 @@ import { invoke } from "@tauri-apps/api/core"
 import type { LogLine } from "@leavepulse/ui"
 
 const { t } = useI18n()
-const { logsOpen } = useChrome()
+// Shared, so a peer's "show in logs" can open this already narrowed to it.
+const { logsOpen, logsSource: source, logsFilter: filter } = useChrome()
 
-type Source = "node" | "app"
-const source = ref<Source>("node")
 const lines = ref<LogLine[]>([])
 const error = ref("")
-const filter = ref("")
 
 /** Read while the drawer is open, at the pace a person reads a tailing log. */
 const REFRESH_MS = 2000

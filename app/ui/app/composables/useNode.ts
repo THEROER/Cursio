@@ -120,6 +120,7 @@ export type Reply =
   | { reply: "saved"; pinned: string[]; restart_needed: string[] }
   | { reply: "pairing"; state: PairingState | null; last: PairingOutcome | null }
   | { reply: "done" }
+  | { reply: "forgotten"; name: string; was_builder: boolean }
   | { reply: string; [key: string]: unknown }
 
 /** What the Rust side reports when a request fails. Mirrors `node::NodeError`. */
@@ -224,6 +225,7 @@ export function useNode() {
     pairing: () => call<Reply>("node_pairing"),
     restart: () => call<Reply>("node_restart"),
     applyUpdate: () => call<Reply>("node_update_apply"),
+    forget: (peer: string) => call<Reply>("node_forget", { peer }),
     start: () => call<void>("node_start"),
   }
 }

@@ -190,42 +190,49 @@ const kindIcon = {
           :description="t('peers.noneHint')"
         />
         <div v-else class="grid grid-cols-1 gap-3 md:grid-cols-2">
-          <LpCard v-for="peer in status.peers" :key="peer.id" padded class="flex flex-col gap-3">
-            <div class="flex items-center gap-2">
-              <LpIcon
-                :name="peer.link ? kindIcon[peer.link.device_kind] : 'lucide:monitor-smartphone'"
-                :size="18"
-                class="shrink-0 text-muted"
-              />
-              <p class="min-w-0 flex-1 truncate font-medium">{{ peer.name }}</p>
-              <LpBadge :tone="presenceTone(peer)" dot size="sm">{{ t(`presence.${peer.presence}`) }}</LpBadge>
-            </div>
-            <LpUptimeBar
-              :segments="uptime(peer.id)"
-              :title="t('peer.uptime')"
-              :start-label="t('peer.uptimeStart')"
-              :end-label="t('peer.uptimeEnd')"
-            />
-            <template v-if="peer.link">
-              <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                <dt class="text-muted">{{ t("peer.position") }}</dt>
-                <dd>{{ peer.link.position.x }}, {{ peer.link.position.y }}</dd>
-                <dt class="text-muted">{{ t("peer.kind") }}</dt>
-                <dd>{{ t(`kind.${peer.link.device_kind}`) }}</dd>
-                <dt class="text-muted">{{ t("peer.battery") }}</dt>
-                <dd>{{ battery(peer.link.status) ?? t("peer.cannotSay") }}</dd>
-                <dt class="text-muted">{{ t("peer.network") }}</dt>
-                <dd>{{ network(peer.link.status) ?? t("peer.cannotSay") }}</dd>
-              </dl>
-              <div class="flex flex-wrap gap-1">
-                <LpBadge v-for="m in peer.link.modules" :key="m" size="sm" tone="brand">{{ m }}</LpBadge>
-                <LpTooltip v-for="[m, why] in peer.link.skipped" :key="m" :content="why">
-                  <LpBadge size="sm" tone="outline" class="line-through">{{ m }}</LpBadge>
-                </LpTooltip>
+          <PeerMenu
+            v-for="peer in status.peers"
+            :key="peer.id"
+            :peer="{ id: peer.id, name: peer.name, presence: peer.presence }"
+          >
+            <LpCard padded class="flex flex-col gap-3">
+              <div class="flex items-center gap-2">
+                <LpIcon
+                  :name="peer.link ? kindIcon[peer.link.device_kind] : 'lucide:monitor-smartphone'"
+                  :size="18"
+                  class="shrink-0 text-muted"
+                />
+                <p class="min-w-0 flex-1 truncate font-medium">{{ peer.name }}</p>
+                <LpBadge :tone="presenceTone(peer)" dot size="sm">{{ t(`presence.${peer.presence}`) }}</LpBadge>
+                <PeerMenuButton :peer="{ id: peer.id, name: peer.name, presence: peer.presence }" />
               </div>
-            </template>
-            <p v-else class="text-xs text-muted">{{ t("peer.noLink") }}</p>
-          </LpCard>
+              <LpUptimeBar
+                :segments="uptime(peer.id)"
+                :title="t('peer.uptime')"
+                :start-label="t('peer.uptimeStart')"
+                :end-label="t('peer.uptimeEnd')"
+              />
+              <template v-if="peer.link">
+                <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                  <dt class="text-muted">{{ t("peer.position") }}</dt>
+                  <dd>{{ peer.link.position.x }}, {{ peer.link.position.y }}</dd>
+                  <dt class="text-muted">{{ t("peer.kind") }}</dt>
+                  <dd>{{ t(`kind.${peer.link.device_kind}`) }}</dd>
+                  <dt class="text-muted">{{ t("peer.battery") }}</dt>
+                  <dd>{{ battery(peer.link.status) ?? t("peer.cannotSay") }}</dd>
+                  <dt class="text-muted">{{ t("peer.network") }}</dt>
+                  <dd>{{ network(peer.link.status) ?? t("peer.cannotSay") }}</dd>
+                </dl>
+                <div class="flex flex-wrap gap-1">
+                  <LpBadge v-for="m in peer.link.modules" :key="m" size="sm" tone="brand">{{ m }}</LpBadge>
+                  <LpTooltip v-for="[m, why] in peer.link.skipped" :key="m" :content="why">
+                    <LpBadge size="sm" tone="outline" class="line-through">{{ m }}</LpBadge>
+                  </LpTooltip>
+                </div>
+              </template>
+              <p v-else class="text-xs text-muted">{{ t("peer.noLink") }}</p>
+            </LpCard>
+          </PeerMenu>
         </div>
       </section>
     </div>

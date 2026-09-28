@@ -169,6 +169,20 @@
     "uptimeStart": "10 min ago",
     "uptimeEnd": "now"
   },
+  "peerMenu": {
+    "open": "Actions for {name}",
+    "showInLogs": "Show in logs",
+    "copyId": "Copy id",
+    "idCopied": "{name}'s id copied",
+    "pairAgain": "Pair again…",
+    "remove": "Remove from this mesh…",
+    "removeTitle": "Remove {name} from this mesh?",
+    "removeBody": "This machine forgets {name}: its key, its link and, if it was one, its trust as a builder of updates. Shared disks, audio and input with it stop now. {name} keeps calling but is refused; to bring it back, pair the two machines again.",
+    "removeConfirm": "Remove",
+    "removed": "{name} removed",
+    "removedHint": "Remove this machine on {name} too, or pair again to bring it back.",
+    "removeFailed": "Could not remove {name}"
+  },
   "placement": {
     "title": "Arrange machines",
     "description": "Drag this machine to the cell it sits in. The cursor crosses to whichever machine is next in that direction.",
@@ -182,7 +196,7 @@
     "applied": "Saved; peers see the new position at once.",
     "pinned": "Saved, but --at on the command line overrides it until the node is started without it.",
     "sameCell": "Same cell as {names}: machines in one cell border nothing, so the cursor will not cross between them.",
-    "unplaced": "Not shown until they connect: {names}",
+    "unplacedTitle": "Not on the grid until they connect",
     "failed": "The position was not saved",
     "thisMachine": "This machine",
     "peer": "Peer",

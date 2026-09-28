@@ -121,6 +121,7 @@ async function startNode() {
     <template #overlays>
       <LogsDrawer />
       <AppCommands />
+      <PeerForgetDialog />
     </template>
   </LpAppShell>
 </template>
