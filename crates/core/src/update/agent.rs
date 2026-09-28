@@ -80,8 +80,10 @@ pub struct Agent {
 #[derive(Default)]
 struct State {
     fetching: Option<String>,
-    /// Versions refused or failed here; not tried again this run.
+    /// Versions that failed here; not tried again this run.
     given_up: HashSet<String>,
+    /// Versions whose refusal has been reported.
+    reported: HashSet<String>,
     status: UpdateStatus,
 }
 
@@ -156,8 +158,13 @@ impl Agent {
                 let version = cursio_protocol::update::Statement::from_bytes(&offer.statement)
                     .map(|s| s.version)
                     .unwrap_or_default();
+                if matches!(refusal, super::sign::Refusal::Untrusted { .. }) {
+                    self.store.note_signer(from, &offer.signer);
+                }
+                // Reported once, but asked again every time: trusting the
+                // builder afterwards has to work without a restart.
                 let mut state = self.state();
-                if state.given_up.insert(version.clone()) {
+                if state.reported.insert(version.clone()) {
                     tracing::warn!(%from, %version, %refusal, "refused a build offered over the mesh");
                     diagnostics::raise(Problem {
                         id: REFUSED.into(),

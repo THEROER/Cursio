@@ -613,7 +613,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match cli.command {
-        Command::Update { action } => cursio_core::update::cli::run(action).await,
+        Command::Update { action } => cursio_core::update::cli::run(action, &config_path).await,
         Command::Config => {
             let config = cursio_core::config::Config::load(&config_path)?;
             let origin = match config_path.exists() {

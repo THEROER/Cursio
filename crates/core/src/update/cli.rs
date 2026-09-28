@@ -6,9 +6,14 @@ use std::time::Duration;
 
 use clap::Subcommand;
 
+use cursio_protocol::update::Channel;
+
 use super::apply::{self, Plan};
 use super::layout::InstallLayout;
 use super::manifest::Manifest;
+use super::sign::{self, BuilderKey};
+use super::store::Store;
+use crate::config::{Config, TrustedBuilder, UpdateChannel};
 
 #[derive(Debug, Subcommand)]
 pub enum UpdateAction {
@@ -44,6 +49,28 @@ pub enum UpdateAction {
         #[arg(long, default_value_t = 3)]
         keep: usize,
     },
+    /// Sign staged builds with this machine's key and hand them to the mesh
+    /// on the `dev` channel. `cargo xtask publish` runs this.
+    Publish {
+        /// `PLATFORM=DIR`, e.g. `windows-x86_64=target/stage/…`. Repeatable;
+        /// every directory must be the same build.
+        #[arg(long = "build", value_name = "PLATFORM=DIR", required = true)]
+        builds: Vec<String>,
+    },
+    /// Print this machine's build-signing key, making it on first use.
+    Key,
+    /// Accept `dev` builds signed by this paired machine. Pins the key it
+    /// signs with now; switches this machine to the `dev` channel.
+    TrustBuilder {
+        /// The machine's name or id, as `cursio peers` shows it.
+        machine: String,
+        /// Its key, from `cursio update key` there. Without it, the key of
+        /// the last build that machine offered here is used.
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Stop accepting builds from this machine.
+    UntrustBuilder { machine: String },
 }
 
 #[derive(Debug, clap::Args)]
@@ -82,9 +109,95 @@ impl RunArgs {
     }
 }
 
-pub async fn run(action: UpdateAction) -> anyhow::Result<()> {
+pub async fn run(action: UpdateAction, config_path: &std::path::Path) -> anyhow::Result<()> {
     let layout = InstallLayout::for_user()?;
     match action {
+        UpdateAction::Publish { builds } => {
+            let builds = builds
+                .iter()
+                .map(|b| {
+                    let (platform, dir) = b.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`{b}` is not PLATFORM=DIR, e.g. linux-x86_64=target/stage/v"
+                        )
+                    })?;
+                    Ok((platform.to_owned(), PathBuf::from(dir)))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let key = BuilderKey::load_or_create()?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let store = Store::of(&layout);
+            let statement = store.publish(&key, Channel::Dev, &builds, now)?;
+            let platforms: Vec<&str> = builds.iter().map(|(p, _)| p.as_str()).collect();
+            println!(
+                "published {} for {} on the dev channel, signed by {}",
+                statement.version,
+                platforms.join(", "),
+                sign::short_key(&key.public())
+            );
+            println!(
+                "a running node offers it to its peers within {} s",
+                super::lane::REOFFER.as_secs()
+            );
+            for gone in store.prune(3) {
+                println!("stopped holding {gone}");
+            }
+            Ok(())
+        }
+        UpdateAction::Key => {
+            let key = BuilderKey::load_or_create()?;
+            println!("{}", sign::hex(&key.public()));
+            Ok(())
+        }
+        UpdateAction::TrustBuilder { machine, key } => {
+            let (peer, name) = paired(&machine)?;
+            let key = match key {
+                Some(key) => key,
+                None => Store::of(&layout).seen_signer(&name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no build from {name} has reached this machine yet; run \
+                         `cursio update key` on {name} and pass it with --key"
+                    )
+                })?,
+            };
+            sign::parse_hex::<32>(&key)
+                .ok_or_else(|| anyhow::anyhow!("`{key}` is not a 64-character hex key"))?;
+            let mut config = Config::load(config_path)?;
+            config.update.trusted_builders.retain(|b| b.peer != peer);
+            config.update.trusted_builders.push(TrustedBuilder {
+                peer,
+                name: name.clone(),
+                key: key.clone(),
+            });
+            let switched = config.update.channel != UpdateChannel::Dev;
+            config.update.channel = UpdateChannel::Dev;
+            config.save(config_path)?;
+            println!(
+                "builds from {name} signed by {} are now accepted here",
+                &key[..12]
+            );
+            if switched {
+                println!("this machine now follows the dev channel");
+            }
+            Ok(())
+        }
+        UpdateAction::UntrustBuilder { machine } => {
+            let mut config = Config::load(config_path)?;
+            let before = config.update.trusted_builders.len();
+            config
+                .update
+                .trusted_builders
+                .retain(|b| b.name != machine && b.peer.to_string() != machine);
+            if config.update.trusted_builders.len() == before {
+                anyhow::bail!("{machine} is not a trusted builder here");
+            }
+            config.save(config_path)?;
+            println!("builds from {machine} are no longer accepted here");
+            Ok(())
+        }
         UpdateAction::Status => {
             println!("install root: {}", layout.root().display());
             let current = layout.current();
@@ -140,6 +253,19 @@ pub async fn run(action: UpdateAction) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// A paired machine by name or id: trusting a builder presumes pairing, since
+/// its builds reach this machine only over a link to it or one of its peers.
+fn paired(machine: &str) -> anyhow::Result<(cursio_protocol::PeerId, String)> {
+    let store = cursio_transport::pairing::TrustStore::load()?;
+    let found = store
+        .peers()
+        .find(|p| p.display_name == machine || p.peer_id.to_string() == machine)
+        .map(|p| (p.peer_id, p.display_name.clone()));
+    found.ok_or_else(|| {
+        anyhow::anyhow!("{machine} is not paired with this machine; `cursio peers` lists who is")
+    })
 }
 
 async fn switch(layout: &InstallLayout, plan: Plan) -> anyhow::Result<()> {

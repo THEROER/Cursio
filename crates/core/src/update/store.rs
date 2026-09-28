@@ -33,6 +33,7 @@ use super::UpdateError;
 
 const OFFER_FILE: &str = "offer";
 const COMPLETE_MARK: &str = ".complete";
+const SEEN_SIGNERS: &str = "seen-signers.json";
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -270,6 +271,34 @@ impl Store {
         Ok(dir)
     }
 
+    /// Remember which key a machine signed an offered build with, so trusting
+    /// it later needs no key copied by hand. Only ever a suggestion: the key
+    /// is pinned when the user says so, not when it is seen.
+    pub fn note_signer(&self, machine: &str, key: &[u8; 32]) {
+        let mut seen = self.seen_signers();
+        if seen.get(machine).map(String::as_str) == Some(super::sign::hex(key).as_str()) {
+            return;
+        }
+        seen.insert(machine.to_owned(), super::sign::hex(key));
+        let path = self.root.join(SEEN_SIGNERS);
+        let written = fs::create_dir_all(&self.root)
+            .and_then(|()| fs::write(&path, serde_json::to_vec_pretty(&seen).unwrap_or_default()));
+        if let Err(e) = written {
+            tracing::debug!(error = %e, "could not remember a builder's key");
+        }
+    }
+
+    pub fn seen_signer(&self, machine: &str) -> Option<String> {
+        self.seen_signers().remove(machine)
+    }
+
+    fn seen_signers(&self) -> std::collections::BTreeMap<String, String> {
+        fs::read(self.root.join(SEEN_SIGNERS))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
     /// Delete held builds past the newest `keep`.
     pub fn prune(&self, keep: usize) -> Vec<String> {
         let mut gone = Vec::new();
@@ -355,6 +384,21 @@ mod tests {
             .read("0.1.0+a", "linux-x86_64", "offer", 0, 10)
             .is_err());
         assert!(store.read("0.1.0+a", "..", "cursio", 0, 10).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_key_a_machine_last_signed_with_is_remembered_by_its_name() {
+        let root = scratch("seen");
+        let store = Store::at(root.join("store"));
+        assert_eq!(store.seen_signer("nocturne"), None);
+        store.note_signer("nocturne", &[1; 32]);
+        store.note_signer("nocturne", &[2; 32]);
+        assert_eq!(
+            store.seen_signer("nocturne"),
+            Some(crate::update::sign::hex(&[2; 32]))
+        );
+        assert!(store.held().is_empty(), "the record is not taken for a build");
         fs::remove_dir_all(&root).unwrap();
     }
 

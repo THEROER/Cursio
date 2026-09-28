@@ -28,7 +28,7 @@ pub const WINDOW: u32 = 4 * CHUNK as u32;
 /// The most a sender answers for one request, whatever it asked.
 const MAX_WANT: u32 = 4 * WINDOW;
 /// How often a lane looks for builds it has not offered yet.
-const REOFFER: Duration = Duration::from_secs(30);
+pub const REOFFER: Duration = Duration::from_secs(30);
 
 pub struct Lane {
     agent: Arc<Agent>,
