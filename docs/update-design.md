@@ -188,6 +188,8 @@ without a restart.
 - `never` fetches nothing (and still relays what it holds).
 
 **Quiet** (`quiet::busy`) means: this machine is not driving a peer's screen,
+no peer's input has been injected here for 60 s (a peer driving *this* screen
+is the user working here, and a switch would throw the cursor back mid-word),
 and no file-sharing or USB message has crossed any link for 60 s — a restart
 mid-write is how Steam wedged itself on a WinFsp mount. Switching hands over to
 phase 1's helper with the node's own arguments; the helper stops the node

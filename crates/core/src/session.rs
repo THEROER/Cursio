@@ -1038,6 +1038,7 @@ where
                         // Inject only while active (we hold the cursor).
                         if am_active {
                             let batch = drain_received_input(event, read_at, &mut inbound_rx, &mut held_back);
+                            crate::update::quiet::note_input_activity();
                             for (event, read_at) in batch {
                                 tracing::trace!(?event, "peer input");
                                 let started = std::time::Instant::now();

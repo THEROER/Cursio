@@ -6,6 +6,10 @@
 //!
 //! - this machine is driving a peer's screen — the user's hand is on this
 //!   mouse, and the cursor over there would freeze mid-move;
+//! - a peer is driving *this* machine — the user is working here with the
+//!   other machine's mouse and keyboard, and a switch throws the cursor back
+//!   there mid-sentence. Not holding the cursor elsewhere says nothing about
+//!   whether anyone is at this screen;
 //! - a peer's disk is in use through a mount, or ours through theirs — a
 //!   restart in the middle of a write is how Steam once wedged itself on a
 //!   WinFsp volume badly enough to need a reboot;
@@ -19,13 +23,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// How long file or USB traffic keeps a machine from being quiet after it
-/// stops. Long enough to cover the gap between a program's reads.
+/// How long file, USB or a peer's input keeps a machine from being quiet after
+/// it stops. Long enough to cover the gap between a program's reads, or a pause
+/// to read what was just typed.
 pub const SETTLE: Duration = Duration::from_secs(60);
 
 static DRIVING: AtomicUsize = AtomicUsize::new(0);
 static LAST_FILES: AtomicU64 = AtomicU64::new(0);
 static LAST_USB: AtomicU64 = AtomicU64::new(0);
+static LAST_INPUT: AtomicU64 = AtomicU64::new(0);
 
 fn epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -45,6 +51,11 @@ pub fn note_file_activity() {
 /// A USB message crossed the link just now.
 pub fn note_usb_activity() {
     LAST_USB.store(now_ms(), Ordering::Relaxed);
+}
+
+/// A peer's input was injected here just now.
+pub fn note_input_activity() {
+    LAST_INPUT.store(now_ms(), Ordering::Relaxed);
 }
 
 /// Held by one session: counts it among those driving a peer while it is.
@@ -75,6 +86,7 @@ struct Activity {
     driving: usize,
     last_files: u64,
     last_usb: u64,
+    last_input: u64,
 }
 
 /// Why now is not a quiet moment, or `None` when it is.
@@ -84,6 +96,7 @@ pub fn busy() -> Option<String> {
             driving: DRIVING.load(Ordering::Relaxed),
             last_files: LAST_FILES.load(Ordering::Relaxed),
             last_usb: LAST_USB.load(Ordering::Relaxed),
+            last_input: LAST_INPUT.load(Ordering::Relaxed),
         },
         now_ms(),
     )
@@ -94,6 +107,9 @@ fn judge(activity: Activity, now: u64) -> Option<String> {
     let recent = |at: u64| at != 0 && now.saturating_sub(at) < settle;
     if activity.driving > 0 {
         return Some("the cursor is on another machine".into());
+    }
+    if recent(activity.last_input) {
+        return Some("a peer's mouse and keyboard are in use here".into());
     }
     if recent(activity.last_files) {
         return Some("a shared disk is in use".into());
@@ -140,6 +156,17 @@ mod tests {
         };
         assert!(judge(usb, 1500).unwrap().contains("USB"));
         assert_eq!(judge(usb, 1000 + settle), None);
+    }
+
+    #[test]
+    fn being_driven_by_a_peer_holds_the_switch_until_it_settles() {
+        let settle = SETTLE.as_millis() as u64;
+        let driven = Activity {
+            last_input: 1000,
+            ..Activity::default()
+        };
+        assert!(judge(driven, 1500).unwrap().contains("in use here"));
+        assert_eq!(judge(driven, 1000 + settle), None);
     }
 
     #[test]
