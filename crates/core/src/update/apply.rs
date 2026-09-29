@@ -226,14 +226,13 @@ pub fn detach(command: &mut std::process::Command) {
 
 /// Keep this process's descriptors out of whatever it execs next.
 ///
-/// Rust opens its own files close-on-exec, but the libraries under the modules
-/// do not all do so: fuser's `/dev/fuse`, PipeWire's and zbus' eventfds. Every
-/// restart replaces the image in place, so each of those outlived the process
-/// that owned it, unreferenced and never closed, and a node restarted a few
-/// dozen times in a day reached its 1024-descriptor limit — every file request
-/// then failed with EMFILE and the peers lost their mounts. An inherited
-/// `/dev/fuse` also keeps its old mount's connection alive with nobody serving
-/// it, which is a hang for anything that touches the mount.
+/// Rust opens its own files close-on-exec, but nothing guarantees that the C
+/// libraries under the modules (FUSE, PipeWire, D-Bus) do. A restart replaces
+/// the image in place, so any descriptor one of them left inheritable would
+/// outlive the process that owned it, unreferenced and never closed, and add
+/// up across restarts. An inherited `/dev/fuse` is the worst of them: it keeps
+/// its old mount's connection alive with nobody serving it, which is a hang
+/// for anything that touches the mount.
 #[cfg(unix)]
 pub fn close_inherited_on_exec() {
     close_on_exec_above_stderr(open_max());
