@@ -368,6 +368,7 @@ pub fn hand_over(target: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        super::apply::close_inherited_on_exec();
         Err(command.exec())
     }
     #[cfg(not(unix))]

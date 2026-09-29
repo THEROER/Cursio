@@ -204,6 +204,16 @@ pub fn detach(command: &mut std::process::Command) {
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        let limit = open_max();
+        // SAFETY: the hook runs between fork and exec, where only
+        // async-signal-safe calls are allowed; it makes nothing but `fcntl`
+        // and `close_range` system calls, and the limit is read before fork.
+        unsafe {
+            command.pre_exec(move || {
+                close_on_exec_above_stderr(limit);
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {
@@ -211,6 +221,65 @@ pub fn detach(command: &mut std::process::Command) {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+}
+
+/// Keep this process's descriptors out of whatever it execs next.
+///
+/// Rust opens its own files close-on-exec, but the libraries under the modules
+/// do not all do so: fuser's `/dev/fuse`, PipeWire's and zbus' eventfds. Every
+/// restart replaces the image in place, so each of those outlived the process
+/// that owned it, unreferenced and never closed, and a node restarted a few
+/// dozen times in a day reached its 1024-descriptor limit — every file request
+/// then failed with EMFILE and the peers lost their mounts. An inherited
+/// `/dev/fuse` also keeps its old mount's connection alive with nobody serving
+/// it, which is a hang for anything that touches the mount.
+#[cfg(unix)]
+pub fn close_inherited_on_exec() {
+    close_on_exec_above_stderr(open_max());
+}
+
+#[cfg(unix)]
+fn open_max() -> libc::c_int {
+    // SAFETY: sysconf has no preconditions.
+    let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    // A huge hard limit would make the fallback loop take seconds; nothing
+    // this process opens reaches that far.
+    match max {
+        n if n > 0 => n.min(1 << 16) as libc::c_int,
+        _ => 1024,
+    }
+}
+
+/// Async-signal-safe: only system calls, no allocation.
+#[cfg(unix)]
+fn close_on_exec_above_stderr(limit: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // Linux 5.11+; older kernels answer ENOSYS and take the loop below.
+        // SAFETY: only changes flags on this process's own descriptors.
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if done == 0 {
+            return;
+        }
+    }
+    for fd in 3..limit {
+        // SAFETY: F_GETFD/F_SETFD on a descriptor number; a closed one only
+        // answers EBADF.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
     }
 }
 
@@ -312,6 +381,20 @@ mod tests {
     use super::*;
     use crate::update::manifest::Manifest;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_library_descriptor_does_not_survive_the_next_exec() {
+        use std::os::fd::AsRawFd;
+        let pipe = std::io::pipe().unwrap();
+        let fd = pipe.0.as_raw_fd();
+        // SAFETY: F_GETFD/F_SETFD on a descriptor this test owns.
+        let cloexec = || unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0;
+        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+        assert!(!cloexec(), "stands in for a descriptor a library opened");
+        close_inherited_on_exec();
+        assert!(cloexec());
+    }
 
     fn layout_with(versions: &[&str], name: &str) -> (std::path::PathBuf, InstallLayout) {
         let base = std::env::temp_dir().join(format!("cursio-apply-{name}-{}", std::process::id()));

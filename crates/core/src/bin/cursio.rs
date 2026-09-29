@@ -1791,10 +1791,13 @@ const RESTARTED_ENV: &str = "CURSIO_RESTARTED";
 /// cleared by the next start, as after a crash.
 ///
 /// Unix replaces the process image: same PID, so a supervisor (`cargo xtask
-/// run`, systemd) sees one continuous process, and the listener's descriptor
-/// is close-on-exec so the port is free at once. Windows has no exec: a child
-/// is started with the same arguments and this process exits; the child
-/// retries its bind while the port is released.
+/// run`, systemd) sees one continuous process. Every descriptor is made
+/// close-on-exec first — the listener's, so the port is free at once, and the
+/// ones libraries opened without it, which would otherwise pile up across
+/// restarts (see `update::apply::close_inherited_on_exec`).
+///
+/// Windows has no exec: a child is started with the same arguments and this
+/// process exits; the child retries its bind while the port is released.
 async fn restart_process(reason: &str) -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
     let exe = match cursio_core::update::layout::restart_target("cursio") {
@@ -1806,6 +1809,7 @@ async fn restart_process(reason: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        cursio_core::update::apply::close_inherited_on_exec();
         let error = std::process::Command::new(&exe)
             .args(&args)
             .env(RESTARTED_ENV, "1")
