@@ -1673,12 +1673,12 @@ fn run_request(server: &std::sync::Mutex<FileServer>, msg: FilesMsg) -> Option<F
             // Opened outside the lock — on Windows an open can wait on another
             // process's sharing lock or an antivirus scan — and handed a handle
             // under it afterwards.
-            let r = ns().open(&volume, &path, mode).map(|(file, size)| {
+            let r = ns().open(&volume, &path, mode).and_then(|(file, size)| {
                 let handle = server
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .adopt(file, mode.write);
-                (handle, size)
+                    .adopt(file, mode.write)?;
+                Ok((handle, size))
             });
             answer(
                 req,

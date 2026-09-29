@@ -31,7 +31,21 @@ pub struct FileServer {
     ns: std::sync::Arc<Namespace>,
     open: HashMap<FileHandle, OpenFile>,
     next_handle: FileHandle,
+    /// How many handles the peer may hold at once; see [`MAX_OPEN_HANDLES`].
+    max_open: usize,
 }
+
+/// The most files one peer may hold open here at a time.
+///
+/// Every handle is a descriptor of this process, which also serves the mesh,
+/// the audio and the peers' mounts from the same table. A peer that opened
+/// without closing — whatever the reason on its side — used to take the node to
+/// its limit, and then everything failed with EMFILE: every other file request,
+/// the volume scan (so the peer unmounted every drive), new connections. Past
+/// this the peer's open is refused and nothing else is touched. Far above what
+/// a real workload holds at once — a game download keeps a few hundred — and
+/// far below the limit the node raises itself to at start.
+pub const MAX_OPEN_HANDLES: usize = 4096;
 
 /// What the peer may address, and everything that works on a path alone.
 ///
@@ -94,6 +108,7 @@ impl FileServer {
             }),
             open: HashMap::new(),
             next_handle: 1,
+            max_open: MAX_OPEN_HANDLES,
         }
     }
 
@@ -180,11 +195,19 @@ impl FileServer {
         mode: OpenMode,
     ) -> Result<(FileHandle, u64), FileError> {
         let (file, size) = self.ns.open(volume, path, mode)?;
-        Ok((self.adopt(file, mode.write), size))
+        Ok((self.adopt(file, mode.write)?, size))
     }
 
-    /// Give a file opened through [`Namespace::open`] a handle.
-    pub fn adopt(&mut self, file: File, writable: bool) -> FileHandle {
+    /// Give a file opened through [`Namespace::open`] a handle, or refuse it
+    /// once the peer holds [`MAX_OPEN_HANDLES`] — the file is closed again on
+    /// the way out.
+    pub fn adopt(&mut self, file: File, writable: bool) -> Result<FileHandle, FileError> {
+        if self.open.len() >= self.max_open {
+            return Err(FileError::Io(format!(
+                "the peer already holds {} files open here; close some first",
+                self.open.len()
+            )));
+        }
         let handle = self.next_handle;
         self.next_handle += 1;
         self.open.insert(
@@ -194,7 +217,7 @@ impl FileServer {
                 writable,
             },
         );
-        handle
+        Ok(handle)
     }
 
     pub fn mkdir(&self, volume: &str, path: &str) -> Result<(), FileError> {
@@ -1513,6 +1536,30 @@ mod tests {
             first, second,
             "a handle still held by the peer must not be handed out again"
         );
+    }
+
+    #[test]
+    fn a_peer_holding_too_many_files_is_refused_until_it_closes_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.txt"), b"a").expect("seed");
+        let mut srv = server_on(tmp.path());
+        srv.max_open = 2;
+
+        let first = srv
+            .open("T:", "a.txt", OpenMode::read_only())
+            .expect("opens");
+        srv.open("T:", "a.txt", OpenMode::read_only())
+            .expect("opens");
+        assert!(matches!(
+            srv.open("T:", "a.txt", OpenMode::read_only()),
+            Err(FileError::Io(_))
+        ));
+        // Everything that needs no descriptor still works meanwhile.
+        srv.stat("T:", "a.txt").expect("stats");
+
+        srv.close(first.0);
+        srv.open("T:", "a.txt", OpenMode::read_only())
+            .expect("a closed handle makes room");
     }
 
     /// Disk work must not hold the server's lock.
