@@ -398,7 +398,10 @@ mod tests {
             store.seen_signer("nocturne"),
             Some(crate::update::sign::hex(&[2; 32]))
         );
-        assert!(store.held().is_empty(), "the record is not taken for a build");
+        assert!(
+            store.held().is_empty(),
+            "the record is not taken for a build"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
