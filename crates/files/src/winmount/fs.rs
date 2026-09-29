@@ -31,9 +31,27 @@ const SECTORS_PER_CLUSTER: u16 = 1;
 
 /// An open file, as WinFsp sees it.
 pub struct FileCtx {
-    /// The peer's handle, absent for a directory — WinFsp opens those too, but
-    /// there is nothing on the far side to hold open.
-    remote: Option<cursio_protocol::FileHandle>,
+    /// The peer's handle, held only while this file's data is in use.
+    ///
+    /// Every open of the peer's file is a descriptor on the peer, and Windows
+    /// opens far more than it reads: a `stat` is an open, a query and a close,
+    /// so `git status`, Explorer, the indexer and Defender each opened every
+    /// file they looked at. And the close that would release it is `Close`,
+    /// which Windows sends when the last reference to the file object goes —
+    /// arbitrarily later than the application's own `CloseHandle`, which
+    /// arrives as `cleanup`. Holding a peer handle from `open` to `close` let
+    /// one walk of a shared tree take the peer to its descriptor limit, after
+    /// which every file request failed with EMFILE and the drive went away.
+    ///
+    /// So a handle is taken only when data is wanted — at `open` if the caller
+    /// asked for data access, else at the first read or write — and given back
+    /// at `cleanup`. A paging read after cleanup (an executable mapped from the
+    /// drive) takes a fresh one. Always `None` for a directory: there is
+    /// nothing on the far side to hold open.
+    remote: Mutex<Option<cursio_protocol::FileHandle>>,
+    /// What a handle for this file is opened with, create flags removed: the
+    /// file already exists by the time one is taken lazily.
+    mode: OpenMode,
     volume: String,
     path: String,
     is_dir: bool,
@@ -211,6 +229,69 @@ impl RemoteFs {
                 Err(e)
             }
             None => Ok(()),
+        }
+    }
+
+    /// The peer's handle for this file, taken now if it is not held.
+    fn remote(&self, context: &FileCtx) -> Result<cursio_protocol::FileHandle, FileError> {
+        if context.is_dir {
+            return Err(FileError::WrongKind);
+        }
+        let mut held = context.remote.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(handle) = *held {
+            return Ok(handle);
+        }
+        let (handle, _) = self
+            .peer
+            .open(&context.volume, &context.path, context.mode)?;
+        *held = Some(handle);
+        Ok(handle)
+    }
+
+    /// Run `op` against the peer's handle, taking a fresh one once if the one
+    /// it had was released under it.
+    ///
+    /// A paging read can arrive while `cleanup` gives the handle back — it was
+    /// read out of the context just before. Failing it is not an option: for a
+    /// mapped executable that read is a page fault, and an error there kills
+    /// the process that faulted.
+    fn with_remote<T>(
+        &self,
+        context: &FileCtx,
+        op: impl Fn(cursio_protocol::FileHandle) -> Result<T, FileError>,
+    ) -> Result<T, FileError> {
+        let handle = self.remote(context)?;
+        match op(handle) {
+            Err(FileError::BadHandle) => {
+                {
+                    let mut held = context.remote.lock().unwrap_or_else(|p| p.into_inner());
+                    if *held == Some(handle) {
+                        *held = None;
+                    }
+                }
+                op(self.remote(context)?)
+            }
+            other => other,
+        }
+    }
+
+    /// Give the peer's handle back, once every write sent through it has
+    /// landed.
+    fn release_remote(&self, context: &FileCtx) {
+        if context.is_dir {
+            return;
+        }
+        // A failure here has nowhere to go — neither `cleanup` nor `close`
+        // returns anything — but `settle_writes` logs it, and `flush` and the
+        // next `write` both report it while the application can still act.
+        let _ = self.settle_writes(context, "release");
+        let taken = context
+            .remote
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(handle) = taken {
+            self.peer.close(handle);
         }
     }
 }
@@ -449,20 +530,26 @@ impl FileSystemContext for RemoteFs {
         fill_info_at(file_info.as_mut(), &meta, &volume, &path);
         set_normalized_name(file_info, file_name);
 
-        // A directory has nothing to open on the far side; only files do.
-        let (remote, size) = if is_dir {
-            (None, 0)
-        } else {
-            let mode = access_to_mode(granted_access);
-            let (handle, size) = self
-                .peer
-                .open(&volume, &path, mode)
-                .map_err(|e| to_ntstatus(&e))?;
-            (Some(handle), size)
+        // A directory has nothing to open on the far side; only files do, and
+        // only when their data is wanted — see [`FileCtx::remote`]. Taken here
+        // when it is, so an open the peer refuses (no permission, a read-only
+        // volume asked for writing) fails at `CreateFile`, where the
+        // application looks for that answer.
+        let mode = access_to_mode(granted_access);
+        let (remote, size) = match !is_dir && wants_data(granted_access) {
+            true => {
+                let (handle, size) = self
+                    .peer
+                    .open(&volume, &path, mode)
+                    .map_err(|e| to_ntstatus(&e))?;
+                (Some(handle), size)
+            }
+            false => (None, meta.size),
         };
 
         Ok(FileCtx {
-            remote,
+            remote: Mutex::new(remote),
+            mode,
             volume,
             path,
             is_dir,
@@ -489,9 +576,7 @@ impl FileSystemContext for RemoteFs {
                 tracing::warn!(path = %context.path, error = ?e, "a write failed before close");
             }
         }
-        if let Some(remote) = context.remote {
-            self.peer.close(remote);
-        }
+        self.release_remote(&context);
     }
 
     fn read(
@@ -501,16 +586,13 @@ impl FileSystemContext for RemoteFs {
         offset: u64,
     ) -> winfsp::Result<u32> {
         let _call = crate::inflight::shared().enter("read");
-        let Some(remote) = context.remote else {
-            return Err(to_ntstatus(&FileError::WrongKind));
-        };
         // Through the read-ahead buffer: Windows asks in whatever size the
         // application chose, often 4 KiB, and each of those was a round trip.
         // One fetch now serves every read that lands inside it.
         let bytes = context
             .ahead
             .read(offset, buffer.len(), |at, len| {
-                self.peer.read(remote, at, len)
+                self.with_remote(context, |remote| self.peer.read(remote, at, len))
             })
             .map_err(|e| to_ntstatus(&e))?;
         let n = bytes.len().min(buffer.len());
@@ -528,9 +610,7 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
         let _call = crate::inflight::shared().enter("write");
-        let Some(remote) = context.remote else {
-            return Err(to_ntstatus(&FileError::WrongKind));
-        };
+        let remote = self.remote(context).map_err(|e| to_ntstatus(&e))?;
         // Pipelined: this write is sent now and its answer collected later,
         // while the answer being waited on here belongs to a write already a
         // window behind. Nothing is acknowledged before the peer has stored it
@@ -738,9 +818,7 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let _call = crate::inflight::shared().enter("overwrite");
-        let Some(remote) = context.remote else {
-            return Err(to_ntstatus(&FileError::WrongKind));
-        };
+        let remote = self.remote(context).map_err(|e| to_ntstatus(&e))?;
         self.settle_writes(context, "overwrite")
             .map_err(|e| to_ntstatus(&e))?;
         self.peer.truncate(remote, 0).map_err(|e| to_ntstatus(&e))?;
@@ -985,9 +1063,7 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let _call = crate::inflight::shared().enter("set_file_size");
-        let Some(remote) = context.remote else {
-            return Err(to_ntstatus(&FileError::WrongKind));
-        };
+        let remote = self.remote(context).map_err(|e| to_ntstatus(&e))?;
         // Writes still in flight must land before the resize, not after it: a
         // `Truncate` goes to the wire directly while a write is compressed on
         // a worker first, so an earlier write could otherwise arrive later and
@@ -1039,7 +1115,8 @@ impl FileSystemContext for RemoteFs {
             fill_info(file_info.as_mut(), &meta);
             set_normalized_name(file_info, file_name);
             return Ok(FileCtx {
-                remote: None,
+                remote: Mutex::new(None),
+                mode: access_to_mode(0),
                 volume,
                 path,
                 is_dir: true,
@@ -1074,7 +1151,11 @@ impl FileSystemContext for RemoteFs {
         fill_info(file_info.as_mut(), &meta);
         set_normalized_name(file_info, file_name);
         Ok(FileCtx {
-            remote: Some(remote),
+            remote: Mutex::new(Some(remote)),
+            mode: OpenMode {
+                create: false,
+                ..mode
+            },
             volume,
             path,
             is_dir: false,
@@ -1113,6 +1194,9 @@ impl FileSystemContext for RemoteFs {
 
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
         let _call = crate::inflight::shared().enter("cleanup");
+        // The application's last handle is gone. Give the peer's back now, not
+        // at `close`: see [`FileCtx::remote`].
+        self.release_remote(context);
         // WinFsp signals a delete through cleanup rather than a separate call.
         const FSP_CLEANUP_DELETE: u32 = 0x01;
         if flags & FSP_CLEANUP_DELETE != 0 {
@@ -1165,6 +1249,20 @@ impl RemoteFs {
         }
         Ok(entries)
     }
+}
+
+/// Whether an open was granted access to the file's contents, rather than only
+/// to its name, attributes or security.
+///
+/// A `stat` — `GetFileAttributesEx`, Node's `fs.stat`, git's index refresh —
+/// opens with `FILE_READ_ATTRIBUTES` alone, and that is most of what arrives
+/// here; none of it needs the peer's file open.
+fn wants_data(access: u32) -> bool {
+    const FILE_READ_DATA: u32 = 0x0001;
+    const FILE_WRITE_DATA: u32 = 0x0002;
+    const FILE_APPEND_DATA: u32 = 0x0004;
+    const FILE_EXECUTE: u32 = 0x0020;
+    access & (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_EXECUTE) != 0
 }
 
 /// Translate Windows' granted access into the peer's open mode.
@@ -1515,7 +1613,28 @@ pub fn mount(
 
 #[cfg(test)]
 mod tests {
-    use super::matches_pattern;
+    use super::{matches_pattern, wants_data};
+
+    #[test]
+    fn a_stat_open_does_not_take_a_handle_on_the_peer() {
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const DELETE: u32 = 0x0001_0000;
+        assert!(!wants_data(FILE_READ_ATTRIBUTES | SYNCHRONIZE));
+        assert!(!wants_data(READ_CONTROL | FILE_READ_ATTRIBUTES));
+        assert!(!wants_data(DELETE | SYNCHRONIZE));
+    }
+
+    #[test]
+    fn reading_writing_or_running_a_file_takes_a_handle_at_open() {
+        const FILE_GENERIC_READ: u32 = 0x0012_0089;
+        const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
+        const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
+        assert!(wants_data(FILE_GENERIC_READ));
+        assert!(wants_data(FILE_GENERIC_WRITE));
+        assert!(wants_data(FILE_GENERIC_EXECUTE));
+    }
 
     #[test]
     fn a_bare_star_matches_everything() {

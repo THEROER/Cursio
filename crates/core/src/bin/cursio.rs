@@ -617,9 +617,56 @@ fn limit_malloc_arenas() {
     }
 }
 
+/// Lift the open-descriptor limit from the soft default to the hard one.
+///
+/// A node's descriptors scale with what it serves, not with what it does: each
+/// peer volume mounted here runs up to 64 FUSE threads, each with its own
+/// `/dev/fuse` clone and the eventfd/epoll pair of its loop, so two peers'
+/// volumes alone take ~700 of the 1024 a desktop session hands out. Every file
+/// a peer holds open on *our* disks costs one more, and a program walking a
+/// shared volume used the remaining ~300 in minutes: from then on every file
+/// request failed with EMFILE and the peer's mounts went away. The hard limit
+/// (524288 under systemd) is what the kernel will actually allow; the soft
+/// 1024 exists for programs still using `select`, which nothing here does.
+#[cfg(unix)]
+fn raise_descriptor_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read and write a struct we own.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            eprintln!("warning: cannot read the open-file limit; serving shared disks may run out of descriptors");
+            return;
+        }
+        if limit.rlim_cur >= limit.rlim_max {
+            return;
+        }
+        // macOS reports an unlimited hard limit it then refuses above
+        // OPEN_MAX (10240, `sys/syslimits.h`; the libc crate does not carry it).
+        #[cfg(target_os = "macos")]
+        let target = limit.rlim_max.min(10240);
+        #[cfg(not(target_os = "macos"))]
+        let target = limit.rlim_max;
+        let raised = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: limit.rlim_max,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) != 0 {
+            eprintln!(
+                "warning: cannot raise the open-file limit above {}; serving shared disks may run out of descriptors",
+                limit.rlim_cur
+            );
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     limit_malloc_arenas();
+    #[cfg(unix)]
+    raise_descriptor_limit();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
