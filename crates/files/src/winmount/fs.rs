@@ -45,10 +45,19 @@ pub struct FileCtx {
     ///
     /// So a handle is taken only when data is wanted — at `open` if the caller
     /// asked for data access, else at the first read or write — and given back
-    /// at `cleanup`. A paging read after cleanup (an executable mapped from the
-    /// drive) takes a fresh one. Always `None` for a directory: there is
-    /// nothing on the far side to hold open.
+    /// at `cleanup`. Always `None` for a directory: there is nothing on the
+    /// far side to hold open.
     remote: Mutex<Option<cursio_protocol::FileHandle>>,
+    /// Set at `cleanup`: from then on nothing may hold a handle here.
+    ///
+    /// A file mapped into memory keeps being read after its last handle is
+    /// closed — a page fault is a read — and `close` does not follow until the
+    /// memory manager drops the mapping's section, which it keeps cached long
+    /// after the process that mapped it has exited. Git maps every file it
+    /// hashes, so re-taking a held handle for those reads left one `git status`
+    /// holding 303 descriptors on the peer indefinitely. After cleanup each
+    /// read or write opens the peer's file for itself and closes it again.
+    cleaned: std::sync::atomic::AtomicBool,
     /// What a handle for this file is opened with, create flags removed: the
     /// file already exists by the time one is taken lazily.
     mode: OpenMode,
@@ -232,20 +241,38 @@ impl RemoteFs {
         }
     }
 
-    /// The peer's handle for this file, taken now if it is not held.
-    fn remote(&self, context: &FileCtx) -> Result<cursio_protocol::FileHandle, FileError> {
+    /// The peer's handle for one operation on this file.
+    ///
+    /// Before `cleanup` it is the handle the context holds, taken now if it
+    /// is not held yet. After, it is opened for this operation alone and
+    /// closed when the lease drops — see [`FileCtx::cleaned`].
+    fn remote(&self, context: &FileCtx) -> Result<Lease<'_>, FileError> {
         if context.is_dir {
             return Err(FileError::WrongKind);
         }
+        // Read under the lock `release_remote` takes after setting it: a
+        // handle stored here is then either taken by that release or never
+        // stored at all.
         let mut held = context.remote.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(handle) = *held {
-            return Ok(handle);
+        let transient = context.cleaned.load(std::sync::atomic::Ordering::SeqCst);
+        if let (Some(handle), false) = (*held, transient) {
+            return Ok(Lease {
+                fs: self,
+                handle,
+                transient,
+            });
         }
         let (handle, _) = self
             .peer
             .open(&context.volume, &context.path, context.mode)?;
-        *held = Some(handle);
-        Ok(handle)
+        if !transient {
+            *held = Some(handle);
+        }
+        Ok(Lease {
+            fs: self,
+            handle,
+            transient,
+        })
     }
 
     /// Run `op` against the peer's handle, taking a fresh one once if the one
@@ -260,16 +287,17 @@ impl RemoteFs {
         context: &FileCtx,
         op: impl Fn(cursio_protocol::FileHandle) -> Result<T, FileError>,
     ) -> Result<T, FileError> {
-        let handle = self.remote(context)?;
-        match op(handle) {
-            Err(FileError::BadHandle) => {
+        let lease = self.remote(context)?;
+        match op(lease.handle) {
+            Err(FileError::BadHandle) if !lease.transient => {
                 {
                     let mut held = context.remote.lock().unwrap_or_else(|p| p.into_inner());
-                    if *held == Some(handle) {
+                    if *held == Some(lease.handle) {
                         *held = None;
                     }
                 }
-                op(self.remote(context)?)
+                drop(lease);
+                op(self.remote(context)?.handle)
             }
             other => other,
         }
@@ -292,6 +320,26 @@ impl RemoteFs {
             .take();
         if let Some(handle) = taken {
             self.peer.close(handle);
+        }
+    }
+}
+
+/// The peer's handle, lent for one operation.
+///
+/// A transient one was opened for that operation alone and is closed when the
+/// lease drops. The close goes out after the operation's own request on the
+/// same link, and the peer finishes the writes a close follows before closing
+/// (`files_session`), so a pipelined write through it still lands.
+struct Lease<'a> {
+    fs: &'a RemoteFs,
+    handle: cursio_protocol::FileHandle,
+    transient: bool,
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if self.transient {
+            self.fs.peer.close(self.handle);
         }
     }
 }
@@ -557,6 +605,7 @@ impl FileSystemContext for RemoteFs {
             ahead: crate::readahead::ReadAhead::new(),
             writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
             opener: self.caller(),
+            cleaned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -610,7 +659,8 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
         let _call = crate::inflight::shared().enter("write");
-        let remote = self.remote(context).map_err(|e| to_ntstatus(&e))?;
+        let lease = self.remote(context).map_err(|e| to_ntstatus(&e))?;
+        let remote = lease.handle;
         // Pipelined: this write is sent now and its answer collected later,
         // while the answer being waited on here belongs to a write already a
         // window behind. Nothing is acknowledged before the peer has stored it
@@ -818,7 +868,8 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let _call = crate::inflight::shared().enter("overwrite");
-        let remote = self.remote(context).map_err(|e| to_ntstatus(&e))?;
+        let lease = self.remote(context).map_err(|e| to_ntstatus(&e))?;
+        let remote = lease.handle;
         self.settle_writes(context, "overwrite")
             .map_err(|e| to_ntstatus(&e))?;
         self.peer.truncate(remote, 0).map_err(|e| to_ntstatus(&e))?;
@@ -1063,7 +1114,8 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         let _call = crate::inflight::shared().enter("set_file_size");
-        let remote = self.remote(context).map_err(|e| to_ntstatus(&e))?;
+        let lease = self.remote(context).map_err(|e| to_ntstatus(&e))?;
+        let remote = lease.handle;
         // Writes still in flight must land before the resize, not after it: a
         // `Truncate` goes to the wire directly while a write is compressed on
         // a worker first, so an earlier write could otherwise arrive later and
@@ -1124,6 +1176,7 @@ impl FileSystemContext for RemoteFs {
                 ahead: crate::readahead::ReadAhead::new(),
                 writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
                 opener: self.caller(),
+                cleaned: std::sync::atomic::AtomicBool::new(false),
             });
         }
 
@@ -1163,6 +1216,7 @@ impl FileSystemContext for RemoteFs {
             ahead: crate::readahead::ReadAhead::new(),
             writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
             opener: self.caller(),
+            cleaned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1195,7 +1249,11 @@ impl FileSystemContext for RemoteFs {
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
         let _call = crate::inflight::shared().enter("cleanup");
         // The application's last handle is gone. Give the peer's back now, not
-        // at `close`: see [`FileCtx::remote`].
+        // at `close`: see [`FileCtx::remote`]. Marked first, so a read racing
+        // this release cannot store a handle after it has been taken.
+        context
+            .cleaned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.release_remote(context);
         // WinFsp signals a delete through cleanup rather than a separate call.
         const FSP_CLEANUP_DELETE: u32 = 0x01;
