@@ -13,12 +13,19 @@
 //! at a time. A settings change restarted the node, the next request waited
 //! out the reconnect, and the window's own status poll queued behind it — the
 //! page froze for as long as that took.
+//!
+//! On a phone the node is in this process (`cursio_android`), so there is no
+//! socket: a command goes straight to its `NodeState::handle`, and the status
+//! follows its revisions. The events and errors the window sees are the same.
 
+#[cfg(desktop)]
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(desktop)]
 use cursio_core::control::transport::{self, Client};
 use cursio_core::control::{Command, ModuleSwitch, Reply, Status};
+#[cfg(desktop)]
 use cursio_protocol::Position;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -30,6 +37,7 @@ pub const DOWN_EVENT: &str = "node://down";
 
 /// Longest a request may take before the UI is told so. A node answers in
 /// microseconds; this is only for one that is wedged or going away.
+#[cfg(desktop)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How soon to look for a node again once it has gone.
@@ -63,6 +71,7 @@ pub type Latest = Option<Result<Status, NodeError>>;
 pub struct NodeLink {
     /// The follower's connection, shared by requests. The lock is held only
     /// to clone or replace it, never across a request.
+    #[cfg(desktop)]
     client: std::sync::Mutex<Option<Client>>,
     latest: tokio::sync::watch::Sender<Latest>,
 }
@@ -70,6 +79,7 @@ pub struct NodeLink {
 impl Default for NodeLink {
     fn default() -> Self {
         Self {
+            #[cfg(desktop)]
             client: std::sync::Mutex::new(None),
             latest: tokio::sync::watch::channel(None).0,
         }
@@ -77,6 +87,7 @@ impl Default for NodeLink {
 }
 
 impl NodeLink {
+    #[cfg(desktop)]
     fn connected(&self) -> Option<Client> {
         self.client
             .lock()
@@ -85,6 +96,7 @@ impl NodeLink {
             .filter(Client::is_connected)
     }
 
+    #[cfg(desktop)]
     fn set_client(&self, client: Option<Client>) {
         *self.client.lock().unwrap_or_else(|p| p.into_inner()) = client;
     }
@@ -100,12 +112,14 @@ impl NodeLink {
 
     /// Follows every change the node pushes. For the tray, which has no
     /// window to receive events.
+    #[cfg(desktop)]
     pub fn watch(&self) -> tokio::sync::watch::Receiver<Latest> {
         self.latest.subscribe()
     }
 
     /// Send one command on the shared connection, or on a fresh one while the
     /// follower is between connections, within [`REQUEST_TIMEOUT`].
+    #[cfg(desktop)]
     pub async fn request(&self, command: Command) -> Result<Reply, NodeError> {
         let client = match self.connected() {
             Some(client) => client,
@@ -124,6 +138,20 @@ impl NodeLink {
         }
     }
 
+    /// Hand one command to the node in this process. Off the async runtime,
+    /// since a config change writes the file before it answers.
+    #[cfg(mobile)]
+    pub async fn request(&self, command: Command) -> Result<Reply, NodeError> {
+        let state = in_process()?;
+        let reply = tauri::async_runtime::spawn_blocking(move || state.handle(command))
+            .await
+            .map_err(NodeError::failed)?;
+        match reply {
+            Reply::Error { message } => Err(NodeError::Failed { message }),
+            reply => Ok(reply),
+        }
+    }
+
     /// The status as last pushed, or asked for when nothing has been yet.
     pub async fn status(&self) -> Result<Status, NodeError> {
         if let Some(latest) = self.latest.borrow().clone() {
@@ -136,6 +164,51 @@ impl NodeLink {
     }
 }
 
+/// The node in this process, once the service has started it.
+#[cfg(mobile)]
+fn in_process() -> Result<cursio_core::control::NodeState, NodeError> {
+    cursio_android::control().ok_or_else(|| NodeError::NotRunning {
+        message: "Cursio is not running on this phone".into(),
+    })
+}
+
+/// How often a phone's status is re-read without a change to wake it: latency
+/// and problems change without bumping the node's revision, as on a desktop,
+/// where the socket's periodic push covers them.
+#[cfg(mobile)]
+const STATUS_REFRESH: Duration = Duration::from_secs(1);
+
+/// Follow the node in this process for the life of the app, turning its
+/// changes into the same events a desktop's socket pushes become.
+#[cfg(mobile)]
+pub fn follow(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let state = match in_process() {
+                Ok(state) => state,
+                Err(error) => {
+                    if app.state::<NodeLink>().publish(Err(error.clone())) {
+                        let _ = app.emit(DOWN_EVENT, &error);
+                    }
+                    tokio::time::sleep(RECONNECT).await;
+                    continue;
+                }
+            };
+            let mut revisions = state.revisions();
+            // Until the node goes away: the service stopping it drops the slot,
+            // which is what `in_process` reads.
+            while cursio_android::is_running() {
+                let status = state.status();
+                if app.state::<NodeLink>().publish(Ok(status.clone())) {
+                    let _ = app.emit(STATUS_EVENT, &status);
+                }
+                let _ = tokio::time::timeout(STATUS_REFRESH, revisions.changed()).await;
+            }
+        }
+    });
+}
+
+#[cfg(desktop)]
 async fn connect() -> Result<(Client, tokio::sync::mpsc::Receiver<Reply>), NodeError> {
     let endpoint = transport::endpoint().map_err(NodeError::failed)?;
     transport::connect(&endpoint)
@@ -150,6 +223,7 @@ async fn connect() -> Result<(Client, tokio::sync::mpsc::Receiver<Reply>), NodeE
 ///
 /// A node that is not running, or goes away, is looked for again every
 /// [`RECONNECT`]; the window hears [`DOWN_EVENT`] once, not once a second.
+#[cfg(desktop)]
 pub fn follow(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -172,6 +246,7 @@ pub fn follow(app: AppHandle) {
 
 /// Subscribe on `client` and emit each pushed status until the connection
 /// ends; answers why it ended.
+#[cfg(desktop)]
 async fn relay(
     app: &AppHandle,
     client: &Client,
@@ -211,6 +286,7 @@ async fn relay(
 
 /// The `cursio` executable: the install's stable copy, which always starts the
 /// current version; else beside this one; else whatever `PATH` finds.
+#[cfg(desktop)]
 pub fn node_executable() -> PathBuf {
     if let Some(stable) = cursio_core::update::layout::stable_executable("cursio") {
         return stable;
@@ -229,6 +305,7 @@ pub fn node_executable() -> PathBuf {
 
 /// What to register for the app itself: the stable copy when installed, since
 /// this process may be running from a version directory a prune will remove.
+#[cfg(desktop)]
 pub fn app_executable() -> std::io::Result<PathBuf> {
     match cursio_core::update::layout::stable_executable("cursio-app") {
         Some(stable) => Ok(stable),
@@ -241,6 +318,7 @@ pub fn app_executable() -> std::io::Result<PathBuf> {
 /// Through the service manager when autostart installed a unit, so there is
 /// one node and one place that owns it; otherwise detached from this process
 /// so closing the window does not take the mesh down with it.
+#[cfg(desktop)]
 pub fn start_node() -> Result<(), NodeError> {
     #[cfg(target_os = "linux")]
     if crate::autostart::node_unit_installed() {
@@ -306,6 +384,9 @@ pub mod commands {
         link.request(Command::SetModule { module, enabled }).await
     }
 
+    /// Desktop only: a phone never takes the cursor, so it has no place in the
+    /// layout to move.
+    #[cfg(desktop)]
     #[tauri::command]
     pub async fn node_set_position(
         link: State<'_, NodeLink>,
@@ -375,11 +456,16 @@ pub mod commands {
         link.request(Command::Pairing).await
     }
 
+    /// Desktop only: restarting re-executes the `cursio` process, and a phone's
+    /// node is this app's process.
+    #[cfg(desktop)]
     #[tauri::command]
     pub async fn node_restart(link: State<'_, NodeLink>) -> Result<Reply, NodeError> {
         link.request(Command::Restart).await
     }
 
+    /// Desktop only: a phone is updated by installing the app.
+    #[cfg(desktop)]
     #[tauri::command]
     pub async fn node_update_apply(link: State<'_, NodeLink>) -> Result<Reply, NodeError> {
         link.request(Command::UpdateApply).await
@@ -395,13 +481,38 @@ pub mod commands {
         link.request(Command::Forget { peer }).await
     }
 
+    /// The listener's volume on one peer stream playing here.
+    #[tauri::command]
+    pub async fn node_set_stream_volume(
+        link: State<'_, NodeLink>,
+        stream: u32,
+        volume: f32,
+        muted: bool,
+    ) -> Result<Reply, NodeError> {
+        link.request(Command::SetStreamVolume {
+            stream,
+            volume,
+            muted,
+        })
+        .await
+    }
+
     /// Off the window's thread: `systemctl` or a process spawn can take a
     /// noticeable moment, and a synchronous command would freeze the window
     /// for it.
+    #[cfg(desktop)]
     #[tauri::command]
     pub async fn node_start() -> Result<(), NodeError> {
         tauri::async_runtime::spawn_blocking(start_node)
             .await
             .map_err(NodeError::failed)?
+    }
+
+    /// On a phone the node belongs to the foreground service, not the window:
+    /// starting it means starting the service, which outlives this Activity.
+    #[cfg(mobile)]
+    #[tauri::command]
+    pub async fn node_start(app: AppHandle) -> Result<(), NodeError> {
+        crate::mobile::start_service(&app).map_err(NodeError::failed)
     }
 }

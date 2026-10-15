@@ -1,9 +1,9 @@
 //! The node itself: one thread, one runtime, one mesh.
 //!
-//! Kotlin gets a handle it can start, stop and ask about. Everything the handle
-//! wraps runs on a thread this module owns, because the session layer is
-//! `!Send` by design (see `mesh.rs`) and a JVM thread is the wrong place to put
-//! a Tokio runtime anyway — Android reuses and parks those, and a runtime
+//! The app gets a handle it can start, stop and ask about. Everything the
+//! handle wraps runs on a thread this module owns, because the session layer
+//! is `!Send` by design (see `mesh.rs`) and a JVM thread is the wrong place to
+//! put a Tokio runtime anyway — Android reuses and parks those, and a runtime
 //! parked mid-session is a link the peer sees as dead.
 //!
 //! The phone is a full mesh member: it listens, dials the peers it trusts,
@@ -13,10 +13,17 @@
 //! sessions carry no input of their own; the modules it runs are the ones with
 //! an Android backend, which today is audio.
 //!
+//! It publishes into the same [`NodeState`] the desktop's control socket
+//! serves, so the Cursio app draws a phone with the code that draws a
+//! desktop: peers, links, pairing, settings and stream volumes all answer the
+//! same [`Command`](cursio_core::control::Command)s. The app runs in this
+//! process and calls [`NodeState::handle`] directly; there is no socket to
+//! open on a phone, where the temp directory a desktop uses is not writable.
+//!
 //! The loop below is deliberately smaller than the CLI's `run_mesh` rather than
-//! a copy of it: everything that loop adds — capture, the control socket,
-//! AirPlay placement, self-update — is a desktop duty. The steps both share
-//! live in `cursio-core`, which is what keeps the two from drifting.
+//! a copy of it: everything that loop adds — capture, AirPlay placement,
+//! self-update — is a desktop duty. The steps both share live in
+//! `cursio-core`, which is what keeps the two from drifting.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -26,118 +33,45 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cursio_core::audio_gate::MicGate;
-use cursio_core::audio_session::{AudioFactory, LocalMixer};
+use cursio_core::audio_session::AudioFactory;
+use cursio_core::config::{Config, Overrides};
+use cursio_core::control::{KnownPeerView, LinkView, NodeState, Presence};
 use cursio_core::live::Shared as LiveShared;
 use cursio_core::mesh::SharedRegistry;
 use cursio_core::module::ModuleRegistry;
 use cursio_core::node_status::NodeStatusMonitor;
-use cursio_core::pairing_window::{PairingCode, PairingOutcome, PairingWindow};
+use cursio_core::pairing_window::PairingWindow;
 use cursio_core::registry::PeerState;
 use cursio_core::NodeIdentity;
 use cursio_protocol::{PeerId, Position, ServiceOffer};
 use cursio_transport::discovery;
 use cursio_transport::pairing::{Role, TrustStore};
 use cursio_transport::tcp::{TcpListenerHandle, TcpTransport};
-use serde::Serialize;
 
 /// Where the phone stands in the layout. It never takes the cursor
 /// (`DeviceKind::Phone`), so no edge of it is ever crossed; the position only
 /// has to be one no desktop is likely to claim.
 const PHONE_POSITION: Position = Position::new(0, 1);
 
-/// What the node can say about itself, read from arbitrary JVM threads.
-///
-/// Everything here is behind its own lock and updated from the node thread,
-/// because the reader is a UI poll or a notification refresh and must never
-/// wait on the session loop.
+/// What the notification line reads, from arbitrary JVM threads.
+#[derive(Default)]
 struct Shared {
     /// The address the listener actually bound, once it has.
     bound: Mutex<Option<SocketAddr>>,
-    /// This node as peers see it: display name and peer id.
-    me: Mutex<Option<(String, String)>>,
-    /// Peers seen on the LAN, by display name, for the notification line.
+    /// Peers seen on the LAN, by display name.
     seen: Mutex<Vec<String>>,
-    /// The known-peer set as of the last sweep, for the app.
-    peers: Mutex<Vec<PeerView>>,
-    /// The modules each linked peer agreed to.
-    modules: Mutex<HashMap<PeerId, Vec<String>>>,
     /// Cleared to ask the node thread to wind down.
     running: AtomicBool,
-    pairing: PairingWindow,
-    mixer: LocalMixer,
-    mic_gate: LiveShared<MicGate>,
-    /// `mic_gate` as the user spelled it, to hand back to the app.
-    mic_gate_text: Mutex<String>,
-}
-
-impl Default for Shared {
-    fn default() -> Self {
-        Self {
-            bound: Mutex::new(None),
-            me: Mutex::new(None),
-            seen: Mutex::new(Vec::new()),
-            peers: Mutex::new(Vec::new()),
-            modules: Mutex::new(HashMap::new()),
-            running: AtomicBool::new(false),
-            pairing: PairingWindow::closed(),
-            mixer: LocalMixer::default(),
-            mic_gate: LiveShared::new(MicGate::Auto),
-            mic_gate_text: Mutex::new("auto".into()),
-        }
-    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
-struct PeerView {
-    id: String,
-    name: String,
-    presence: &'static str,
-    modules: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct PairingView {
-    kind: &'static str,
-    code: Option<String>,
-    expires_in_s: u64,
-}
-
-#[derive(Serialize)]
-struct AudioView {
-    mic_gate: String,
-    streams: Vec<StreamView>,
-}
-
-#[derive(Serialize)]
-struct StreamView {
-    id: u32,
-    peer: String,
-    name: String,
-    direction: &'static str,
-    volume: f32,
-    muted: bool,
-    playing: bool,
-}
-
-#[derive(Serialize)]
-struct StatusView {
-    running: bool,
-    name: Option<String>,
-    peer_id: Option<String>,
-    bound: Option<String>,
-    peers: Vec<PeerView>,
-    pairing: Option<PairingView>,
-    last_pairing: Option<PairingOutcome>,
-    audio: AudioView,
-}
-
-/// A running node, owned by the JNI layer.
+/// A running node.
 pub struct NodeHandle {
     shared: Arc<Shared>,
+    control: NodeState,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -147,21 +81,60 @@ impl NodeHandle {
     /// Returns once the thread is spawned, not once the listener is bound:
     /// binding can fail (a port in use, no network yet) and a service that
     /// waited for it would block Android's `onStartCommand` past its deadline.
-    pub fn start(display_name: String, port: u16, mic_gate: &str) -> anyhow::Result<Self> {
+    pub fn start(display_name: String, port: u16) -> anyhow::Result<Self> {
+        let mut identity = NodeIdentity::load_or_create()?;
+        // The phone's name is the user's, not the hostname: Android's hostname
+        // is a meaningless `localhost` on most devices, and this is the label
+        // every peer shows for this machine.
+        if !display_name.is_empty() {
+            identity.display_name = display_name;
+        }
+        let config_path = cursio_core::config::default_path()?;
+        let config = Config::load(&config_path)?;
+        let mic_gate = LiveShared::new(MicGate::from_config(config.audio.mic_gate.as_deref())?);
+
+        let applier: cursio_core::control::Applier = {
+            let mic_gate = mic_gate.clone();
+            Arc::new(move |running: &Config, next: &Config| {
+                let plan = cursio_core::live::plan(running, next);
+                if let Some(gate) = &plan.mic_gate {
+                    match MicGate::from_config(gate.as_deref()) {
+                        Ok(gate) => mic_gate.set(gate),
+                        Err(error) => tracing::warn!(%error, "keeping the running mic gate"),
+                    }
+                }
+            })
+        };
+        // One window, shared: the app opens it through `control`, the mesh
+        // loop reads it to decide whom to pair with.
+        let pairing = PairingWindow::closed();
+        let control = NodeState::new(
+            &identity,
+            config_path,
+            Overrides::default(),
+            config,
+            pairing.clone(),
+            applier,
+        );
+
         let shared = Arc::new(Shared::default());
         shared.running.store(true, Ordering::SeqCst);
-        if let Err(e) = set_mic_gate(&shared, mic_gate) {
-            tracing::warn!(error = %e, "keeping the automatic mic gate");
-        }
-
-        let thread_shared = Arc::clone(&shared);
+        let node = Node {
+            shared: Arc::clone(&shared),
+            control: control.clone(),
+            pairing,
+            identity,
+            mic_gate,
+            port,
+        };
         let thread = std::thread::Builder::new()
             .name("cursio-node".into())
-            .spawn(move || run(thread_shared, display_name, port))
+            .spawn(move || run(node))
             .map_err(|e| anyhow::anyhow!("cannot spawn the node thread: {e}"))?;
 
         Ok(Self {
             shared,
+            control,
             thread: Some(thread),
         })
     }
@@ -179,108 +152,48 @@ impl NodeHandle {
         tracing::info!("node stopped");
     }
 
+    /// What the app talks to: the same state a desktop's control socket serves.
+    pub fn control(&self) -> NodeState {
+        self.control.clone()
+    }
+
     /// One line describing what the node can see, for the service notification.
     pub fn status_line(&self) -> String {
         let bound = *lock(&self.shared.bound);
-        let online: Vec<String> = lock(&self.shared.peers)
-            .iter()
-            .filter(|p| p.presence == "online")
-            .map(|p| p.name.clone())
+        let online: Vec<String> = self
+            .control
+            .status()
+            .peers
+            .into_iter()
+            .filter(|p| p.presence == Presence::Online)
+            .map(|p| p.name)
             .collect();
         let seen = lock(&self.shared.seen);
-        match (bound, online.len()) {
-            (None, _) => "starting".to_string(),
-            (Some(_), 1) => format!("connected to {}", online[0]),
-            (Some(_), n) if n > 1 => format!("connected to {}", online.join(", ")),
-            (Some(addr), _) if seen.is_empty() => format!("listening on {addr}"),
-            (Some(addr), _) => format!("listening on {addr} · sees {}", seen.join(", ")),
-        }
-    }
-
-    /// Everything the app shows, as JSON.
-    pub fn status_json(&self) -> String {
-        let shared = &self.shared;
-        let me = lock(&shared.me).clone();
-        let pairing = shared.pairing.state().map(|s| PairingView {
-            kind: match s.kind {
-                cursio_core::pairing_window::PairingKind::ShownCode => "shown_code",
-                cursio_core::pairing_window::PairingKind::EnteredCode => "entered_code",
-                cursio_core::pairing_window::PairingKind::Password => "password",
-            },
-            code: s.code,
-            expires_in_s: s
-                .expires_at
-                .duration_since(std::time::SystemTime::now())
-                .map_or(0, |d| d.as_secs()),
-        });
-        let view = StatusView {
-            running: shared.running.load(Ordering::SeqCst),
-            name: me.as_ref().map(|(name, _)| name.clone()),
-            peer_id: me.map(|(_, id)| id),
-            bound: lock(&shared.bound).map(|a| a.to_string()),
-            peers: lock(&shared.peers).clone(),
-            pairing,
-            last_pairing: shared.pairing.last_outcome(),
-            audio: AudioView {
-                mic_gate: lock(&shared.mic_gate_text).clone(),
-                streams: shared
-                    .mixer
-                    .streams()
-                    .into_iter()
-                    .map(|s| StreamView {
-                        id: s.id,
-                        peer: s.peer,
-                        name: s.name,
-                        direction: "in",
-                        volume: s.volume,
-                        muted: s.muted,
-                        playing: true,
-                    })
-                    .collect(),
-            },
-        };
-        serde_json::to_string(&view).unwrap_or_else(|_| "{}".into())
-    }
-
-    /// Open the pairing window with a code read off another machine.
-    pub fn enter_code(&self, code: &str) -> anyhow::Result<()> {
-        let code = PairingCode::parse(code).map_err(|e| anyhow::anyhow!("{e}"))?;
-        self.shared.pairing.open_entered_code(&code, None);
-        tracing::info!("pairing window open with an entered code");
-        Ok(())
-    }
-
-    /// Open the pairing window with a fresh code for this phone to show.
-    pub fn show_code(&self) -> String {
-        let state = self.shared.pairing.open_shown_code();
-        tracing::info!("pairing window open with a shown code");
-        state.code.unwrap_or_default()
-    }
-
-    pub fn cancel_pairing(&self) {
-        self.shared.pairing.cancel();
-    }
-
-    /// Set one playing stream's volume and mute here.
-    pub fn set_stream_volume(&self, id: u32, volume: f32, muted: bool) -> bool {
-        self.shared.mixer.set(id, volume, muted)
-    }
-
-    pub fn set_mic_gate(&self, value: &str) -> anyhow::Result<()> {
-        set_mic_gate(&self.shared, value)
+        status_line(bound, &online, &seen)
     }
 }
 
-fn set_mic_gate(shared: &Shared, value: &str) -> anyhow::Result<()> {
-    let gate: MicGate = value.parse()?;
-    shared.mic_gate.set(gate);
-    *lock(&shared.mic_gate_text) = value.trim().to_owned();
-    tracing::info!(?gate, "mic gate set");
-    Ok(())
+fn status_line(bound: Option<SocketAddr>, online: &[String], seen: &[String]) -> String {
+    match bound {
+        None => "starting".to_string(),
+        Some(_) if !online.is_empty() => format!("connected to {}", online.join(", ")),
+        Some(addr) if seen.is_empty() => format!("listening on {addr}"),
+        Some(addr) => format!("listening on {addr} · sees {}", seen.join(", ")),
+    }
+}
+
+/// Everything the node thread is handed.
+struct Node {
+    shared: Arc<Shared>,
+    control: NodeState,
+    pairing: PairingWindow,
+    identity: NodeIdentity,
+    mic_gate: LiveShared<MicGate>,
+    port: u16,
 }
 
 /// The node thread: a current-thread runtime and the mesh's own `LocalSet`.
-fn run(shared: Arc<Shared>, display_name: String, port: u16) {
+fn run(node: Node) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -294,8 +207,9 @@ fn run(shared: Arc<Shared>, display_name: String, port: u16) {
 
     // Sessions share state via `Rc` deliberately, so they are spawned onto a
     // `LocalSet` rather than the multi-thread scheduler.
+    let shared = Arc::clone(&node.shared);
     let local = tokio::task::LocalSet::new();
-    if let Err(e) = local.block_on(&runtime, serve(Arc::clone(&shared), display_name, port)) {
+    if let Err(e) = local.block_on(&runtime, serve(node)) {
         tracing::error!(error = %e, "node stopped with an error");
     }
     shared.running.store(false, Ordering::SeqCst);
@@ -307,19 +221,20 @@ struct NodeCtx {
     registry: SharedRegistry,
     modules: ModuleRegistry,
     status: RefCell<NodeStatusMonitor>,
-    shared: Arc<Shared>,
+    control: NodeState,
+    pairing: PairingWindow,
 }
 
 /// Listen, announce, dial, and run a session per link until asked to stop.
-async fn serve(shared: Arc<Shared>, display_name: String, port: u16) -> anyhow::Result<()> {
-    let mut identity = NodeIdentity::load_or_create()?;
-    // The phone's name is the user's, not the hostname: Android's hostname is
-    // a meaningless `localhost` on most devices, and this is the label every
-    // peer shows for this machine.
-    if !display_name.is_empty() && identity.display_name != display_name {
-        identity.display_name = display_name;
-    }
-    *lock(&shared.me) = Some((identity.display_name.clone(), identity.peer_id.to_string()));
+async fn serve(node: Node) -> anyhow::Result<()> {
+    let Node {
+        shared,
+        control,
+        pairing,
+        identity,
+        mic_gate,
+        port,
+    } = node;
     tracing::info!(id = %identity.peer_id, name = %identity.display_name, "node identity");
 
     let listener = TcpListenerHandle::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
@@ -349,8 +264,8 @@ async fn serve(shared: Arc<Shared>, display_name: String, port: u16) -> anyhow::
     let modules = ModuleRegistry::new().with(Box::new(AudioFactory {
         enabled: true,
         render_device: LiveShared::new(None),
-        mic_gate: shared.mic_gate.clone(),
-        mixer: shared.mixer.clone(),
+        mic_gate,
+        mixer: control.mixer(),
     }));
     for advert in modules.advertise() {
         tracing::info!(module = %advert.id, version = advert.version, "module available");
@@ -377,7 +292,8 @@ async fn serve(shared: Arc<Shared>, display_name: String, port: u16) -> anyhow::
         registry,
         modules,
         status: RefCell::new(NodeStatusMonitor::new()),
-        shared,
+        control,
+        pairing,
     });
 
     // Machines seen announcing themselves that this node does not trust yet,
@@ -386,7 +302,7 @@ async fn serve(shared: Arc<Shared>, display_name: String, port: u16) -> anyhow::
     let mut strangers: HashMap<PeerId, (String, SocketAddr)> = HashMap::new();
     let mut sweep = tokio::time::interval(cursio_core::mesh::sweep_interval());
     loop {
-        if !ctx.shared.running.load(Ordering::SeqCst) {
+        if !shared.running.load(Ordering::SeqCst) {
             tracing::info!("stop requested");
             return Ok(());
         }
@@ -405,9 +321,9 @@ async fn serve(shared: Arc<Shared>, display_name: String, port: u16) -> anyhow::
             },
 
             Some(peer) = seen_rx.recv() => {
-                note_seen(&ctx.registry, &ctx.shared, &peer);
+                note_seen(&ctx.registry, &shared, &peer);
                 let known = ctx.registry.borrow().is_known(&peer.peer_id);
-                if !known && ctx.shared.pairing.is_open()
+                if !known && ctx.pairing.is_open()
                     && strangers.insert(peer.peer_id, (peer.display_name.clone(), peer.addr)).is_none()
                 {
                     tracing::info!(peer = %peer.display_name, addr = %peer.addr, "unpaired machine found while pairing");
@@ -415,8 +331,8 @@ async fn serve(shared: Arc<Shared>, display_name: String, port: u16) -> anyhow::
             }
 
             _ = sweep.tick() => {
-                publish_peers(&ctx);
-                if ctx.shared.pairing.is_open() {
+                publish(&ctx);
+                if ctx.pairing.is_open() {
                     for (peer_id, (name, addr)) in std::mem::take(&mut strangers) {
                         if !cursio_core::registry::should_dial(self_id, peer_id) {
                             continue;
@@ -463,7 +379,7 @@ fn spawn_session(transport: TcpTransport, ctx: Rc<NodeCtx>, role: Role, expected
             ctx.registry.borrow_mut().set_state(id, PeerState::Online);
         }
         let addr = transport.peer_addr();
-        let who = Rc::new(std::cell::Cell::new(expected));
+        let who = std::cell::Cell::new(expected);
         let result = run_link(transport, &ctx, role, addr, &who).await;
         match &result {
             Ok(()) => tracing::info!("peer session ended"),
@@ -471,9 +387,9 @@ fn spawn_session(transport: TcpTransport, ctx: Rc<NodeCtx>, role: Role, expected
         }
         if let Some(id) = who.get() {
             ctx.registry.borrow_mut().mark_offline(id);
-            lock(&ctx.shared.modules).remove(&id);
+            ctx.control.link_down(&id);
         }
-        publish_peers(&ctx);
+        publish(&ctx);
     });
 }
 
@@ -485,7 +401,7 @@ async fn run_link(
     addr: SocketAddr,
     who: &std::cell::Cell<Option<PeerId>>,
 ) -> anyhow::Result<()> {
-    let password = ctx.shared.pairing.password();
+    let password = ctx.pairing.password();
     let plan = cursio_core::link::Handshake {
         identity: &ctx.identity,
         password: &password,
@@ -499,13 +415,14 @@ async fn run_link(
     let identified = cursio_core::link::identify(transport, &plan).await?;
     let peer_id = identified.peer.peer_id;
     let peer_name = identified.peer.display_name.clone();
+    let negotiated = identified.negotiated().clone();
     who.set(Some(peer_id));
     if ctx.registry.borrow().is_known(&peer_id) {
         ctx.registry
             .borrow_mut()
             .set_state(peer_id, PeerState::Online);
         tracing::info!(peer = %peer_name, "peer online");
-    } else if ctx.shared.pairing.is_open() {
+    } else if ctx.pairing.is_open() {
         tracing::info!(peer = %peer_name, "unknown machine; pairing it");
     } else {
         tracing::warn!(peer = %peer_name, "untrusted machine; not admitted");
@@ -525,13 +442,13 @@ async fn run_link(
                     )
                 )
             {
-                ctx.shared.pairing.note_failure();
+                ctx.pairing.note_failure();
             }
             return Err(error);
         }
     };
     if stranger {
-        ctx.shared.pairing.note_paired(&peer_name);
+        ctx.pairing.note_paired(&peer_name);
         // The desktop waits for the next restart or for the peer to call; a
         // phone the user just paired should show and dial the machine at once.
         ctx.registry
@@ -542,11 +459,24 @@ async fn run_link(
             .set_state(peer_id, PeerState::Online);
         tracing::info!(peer = %peer_name, "paired");
     }
-    lock(&ctx.shared.modules).insert(
-        peer_id,
-        link.modules.iter().map(|m| m.id().to_string()).collect(),
+    let peer = link.peer.clone();
+    ctx.control.link_up(
+        peer.peer_id,
+        &peer.display_name,
+        LinkView {
+            position: peer.position,
+            device_kind: peer.device_kind,
+            status: peer.status,
+            modules: negotiated.agreed.iter().map(|id| id.to_string()).collect(),
+            skipped: negotiated
+                .skipped
+                .iter()
+                .map(|(id, why)| (id.to_string(), why.to_string()))
+                .collect(),
+            since: std::time::SystemTime::now(),
+        },
     );
-    publish_peers(ctx);
+    publish(ctx);
 
     let mut status_cursor = ctx.status.borrow().cursor();
     let result = cursio_core::session::run_session_live(
@@ -567,28 +497,27 @@ async fn run_link(
     }
 }
 
-/// Copy the known-peer set out for the app.
-fn publish_peers(ctx: &NodeCtx) {
-    let modules = lock(&ctx.shared.modules);
-    let peers = ctx
-        .registry
-        .borrow()
-        .all()
-        .map(|peer| PeerView {
-            id: peer.peer_id.to_string(),
-            name: peer.display_name.clone(),
-            presence: match peer.state {
-                PeerState::Online => "online",
-                PeerState::Connecting => "connecting",
-                PeerState::Offline { .. } => "offline",
-            },
-            modules: modules.get(&peer.peer_id).cloned().unwrap_or_default(),
-        })
-        .collect();
-    *lock(&ctx.shared.peers) = peers;
+/// Hand the control state what the mesh loop knows.
+fn publish(ctx: &NodeCtx) {
+    ctx.control.set_local_status(ctx.status.borrow().current());
+    ctx.control.set_known(
+        ctx.registry
+            .borrow()
+            .all()
+            .map(|peer| KnownPeerView {
+                id: peer.peer_id,
+                name: peer.display_name.clone(),
+                presence: match peer.state {
+                    PeerState::Online => Presence::Online,
+                    PeerState::Connecting => Presence::Connecting,
+                    PeerState::Offline { .. } => Presence::Offline,
+                },
+            })
+            .collect(),
+    );
 }
 
-/// Record a sighting, and keep the notification's peer list current.
+/// Record a sighting, and keep the notification's list current.
 fn note_seen(registry: &SharedRegistry, shared: &Shared, peer: &discovery::DiscoveredPeer) {
     let known = registry
         .borrow_mut()
@@ -609,46 +538,31 @@ fn note_seen(registry: &SharedRegistry, shared: &Shared, peer: &discovery::Disco
 mod tests {
     use super::*;
 
-    fn handle(bound: Option<&str>, seen: &[&str], online: &[&str]) -> NodeHandle {
-        let shared = Arc::new(Shared::default());
-        *lock(&shared.bound) = bound.map(|b| b.parse().expect("addr"));
-        *lock(&shared.seen) = seen.iter().map(|s| (*s).to_string()).collect();
-        *lock(&shared.peers) = online
-            .iter()
-            .map(|name| PeerView {
-                id: String::new(),
-                name: (*name).to_string(),
-                presence: "online",
-                modules: vec!["audio".into()],
-            })
-            .collect();
-        NodeHandle {
-            shared,
-            thread: None,
-        }
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
     }
 
     /// The notification is the only place a phone user sees whether this is
-    /// working, so "no address yet" must read as starting rather than as a node
-    /// that is up and sees nobody.
+    /// working without opening the app, so "no address yet" must read as
+    /// starting rather than as a node that is up and sees nobody.
     #[test]
     fn an_unbound_node_reads_as_starting_not_as_alone() {
-        assert_eq!(handle(None, &["Lightmoon"], &[]).status_line(), "starting");
+        assert_eq!(status_line(None, &[], &names(&["Lightmoon"])), "starting");
     }
 
     #[test]
     fn a_linked_peer_outranks_what_the_lan_shows() {
-        let addr = Some("192.168.1.7:46073");
+        let addr = Some("192.168.1.7:46073".parse().expect("addr"));
         assert_eq!(
-            handle(addr, &[], &[]).status_line(),
+            status_line(addr, &[], &[]),
             "listening on 192.168.1.7:46073"
         );
         assert_eq!(
-            handle(addr, &["Nocturne"], &[]).status_line(),
+            status_line(addr, &[], &names(&["Nocturne"])),
             "listening on 192.168.1.7:46073 · sees Nocturne"
         );
         assert_eq!(
-            handle(addr, &["Nocturne"], &["Nocturne"]).status_line(),
+            status_line(addr, &names(&["Nocturne"]), &names(&["Nocturne"])),
             "connected to Nocturne"
         );
     }
@@ -668,25 +582,5 @@ mod tests {
             note_seen(&registry, &shared, &peer);
         }
         assert_eq!(lock(&shared.seen).len(), 1);
-    }
-
-    #[test]
-    fn status_json_carries_what_the_app_reads() {
-        let node = handle(Some("192.168.1.7:46073"), &[], &["Nocturne"]);
-        let json: serde_json::Value = serde_json::from_str(&node.status_json()).expect("json");
-        assert_eq!(json["bound"], "192.168.1.7:46073");
-        assert_eq!(json["peers"][0]["name"], "Nocturne");
-        assert_eq!(json["peers"][0]["presence"], "online");
-        assert_eq!(json["audio"]["mic_gate"], "auto");
-        assert!(json["pairing"].is_null());
-    }
-
-    #[test]
-    fn a_mistyped_mic_gate_is_refused_and_the_old_one_kept() {
-        let node = handle(None, &[], &[]);
-        assert!(node.set_mic_gate("loud").is_err());
-        assert_eq!(*lock(&node.shared.mic_gate_text), "auto");
-        node.set_mic_gate("-55").expect("valid level");
-        assert_eq!(node.shared.mic_gate.get(), MicGate::Fixed(-55.0));
     }
 }
