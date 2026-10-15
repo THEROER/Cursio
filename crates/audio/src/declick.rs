@@ -41,6 +41,7 @@ impl Declick {
     }
 
     /// Whether the last frame this produced was silence.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub(crate) fn is_silent(&self) -> bool {
         self.gain == 0.0
     }

@@ -30,7 +30,9 @@
 /// Opus compression for the wire format — used on every platform.
 pub mod codec;
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "android")]
+pub mod android_backend;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 mod declick;
 #[cfg(target_os = "linux")]
 pub mod pipewire_backend;
@@ -148,7 +150,11 @@ pub fn list_output_devices() -> Result<Vec<OutputDevice>, AudioError> {
     {
         wasapi_backend::list_output_devices()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        android_backend::list_output_devices()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
     {
         Err(AudioError::Unsupported)
     }
@@ -168,7 +174,11 @@ pub fn list_input_devices() -> Result<Vec<OutputDevice>, AudioError> {
     {
         wasapi_backend::list_input_devices()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        android_backend::list_input_devices()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
     {
         Err(AudioError::Unsupported)
     }
@@ -230,6 +240,8 @@ pub struct Capture {
     inner: pipewire_backend::PwSource,
     #[cfg(target_os = "windows")]
     inner: WindowsCapture,
+    #[cfg(target_os = "android")]
+    inner: android_backend::AndroidSource,
 }
 
 /// Windows has two capture backends: WASAPI (loopback / process loopback) and
@@ -398,7 +410,14 @@ impl Capture {
                 inner: WindowsCapture::Wasapi(wasapi_backend::WasapiSource::mic_tap(id, target)?),
             })
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        // One input to address; the system picks which microphone it is.
+        #[cfg(target_os = "android")]
+        {
+            Ok(Capture {
+                inner: android_backend::AndroidSource::mic_tap(id)?,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
         {
             Err(AudioError::Unsupported)
         }
@@ -406,11 +425,11 @@ impl Capture {
 
     /// The stream advertisement to send before any chunk.
     pub fn advertisements(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta> {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
         {
             self.inner.advertisements()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
         {
             unreachable!("unsupported platforms cannot construct Capture")
         }
@@ -418,11 +437,11 @@ impl Capture {
 
     /// Captured audio chunks.
     pub fn chunks(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioChunk> {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
         {
             self.inner.chunks()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
         {
             unreachable!("unsupported platforms cannot construct Capture")
         }
@@ -438,6 +457,8 @@ pub struct Playback {
     inner: pipewire_backend::PwSink,
     #[cfg(target_os = "windows")]
     inner: wasapi_backend::WasapiSink,
+    #[cfg(target_os = "android")]
+    inner: android_backend::AndroidSink,
 }
 
 impl Playback {
@@ -472,7 +493,14 @@ impl Playback {
             };
             Ok(Playback { inner })
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        // Whatever the system routes media to; there is no device to pick.
+        #[cfg(target_os = "android")]
+        {
+            Ok(Playback {
+                inner: android_backend::AndroidSink::open(id, node_name)?,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
         {
             Err(AudioError::Unsupported)
         }
@@ -510,11 +538,11 @@ impl Playback {
 
     /// Enqueue one inbound chunk for playback.
     pub fn play(&self, chunk: &AudioChunk) -> Result<(), AudioError> {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
         {
             self.inner.play(chunk)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
         {
             let _ = chunk;
             Err(AudioError::Unsupported)
@@ -551,7 +579,7 @@ impl Playback {
     /// both backends, so it never disturbs the real-time playback thread.
     #[allow(unused_variables)]
     pub fn set_gain(&self, gain: f32) {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
         self.inner.set_gain(gain);
     }
 }

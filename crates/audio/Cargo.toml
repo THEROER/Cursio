@@ -10,10 +10,24 @@ tracing.workspace = true
 # Stream/chunk channels between platform backends and the session are tokio mpsc
 # on every platform, same as cursio-input's CaptureHandle and cursio-window.
 tokio = { workspace = true }
+
 # Opus, for compressing the audio wire format. Raw f32 is ~3 Mbit/s per stream,
 # which saturates the link that input also shares — Opus carries it at ~100
 # kbit/s. Used in restricted-low-delay mode (see `codec.rs`): latency first.
+[target.'cfg(not(target_os = "android"))'.dependencies]
 shiguredo_opus = "2026.1.0"
+
+# Android: AAudio for playback and the microphone, and libopus built from the
+# copy `audiopus_sys` bundles. `shiguredo_opus` cannot serve here: its prebuilt
+# path has no Android archive and its source build drives cmake through its own
+# wrapper, which knows no Android toolchain. `audiopus_sys` goes through the
+# `cmake` crate, which hands CMake the NDK (`cargo xtask android` sets
+# `ANDROID_NDK_ROOT` for it).
+[target.'cfg(target_os = "android")'.dependencies]
+audiopus_sys = { version = "0.2", features = ["static"] }
+# API 28 for the input preset (the echo canceller) and the stream usage; the
+# app's minSdk matches it.
+ndk = { version = "0.9", features = ["audio", "api-level-28"] }
 
 # Linux audio via PipeWire: per-node capture (incl. per-app streams), null-sink
 # virtual output, and playback nodes. `pipewire` is the official Rust binding;

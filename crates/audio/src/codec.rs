@@ -43,7 +43,11 @@
 
 use std::os::raw::{c_int, c_uchar};
 
+#[cfg(not(target_os = "android"))]
 use shiguredo_opus::{Decoder, DecoderConfig};
+// Named only for the library it links; the declarations in `ffi` are the API.
+#[cfg(target_os = "android")]
+use audiopus_sys as _;
 
 use crate::AudioError;
 
@@ -61,6 +65,46 @@ mod ffi {
     pub const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
     pub const OPUS_GET_BITRATE_REQUEST: c_int = 4003;
 
+    /// Opaque libopus decoder state.
+    #[cfg(target_os = "android")]
+    #[repr(C)]
+    pub struct OpusDecoder {
+        _private: [u8; 0],
+    }
+
+    // On Android libopus comes from `audiopus_sys` under its own names; every
+    // other platform links the copy `shiguredo_opus` built and renamed.
+    #[cfg(target_os = "android")]
+    extern "C" {
+        pub fn opus_encoder_create(
+            fs: i32,
+            channels: c_int,
+            application: c_int,
+            error: *mut c_int,
+        ) -> *mut OpusEncoder;
+        pub fn opus_encoder_ctl(st: *mut OpusEncoder, request: c_int, ...) -> c_int;
+        pub fn opus_encode_float(
+            st: *mut OpusEncoder,
+            pcm: *const f32,
+            frame_size: c_int,
+            data: *mut c_uchar,
+            max_data_bytes: i32,
+        ) -> i32;
+        pub fn opus_encoder_destroy(st: *mut OpusEncoder);
+        pub fn opus_decoder_create(fs: i32, channels: c_int, error: *mut c_int)
+            -> *mut OpusDecoder;
+        pub fn opus_decode_float(
+            st: *mut OpusDecoder,
+            data: *const c_uchar,
+            len: i32,
+            pcm: *mut f32,
+            frame_size: c_int,
+            decode_fec: c_int,
+        ) -> c_int;
+        pub fn opus_decoder_destroy(st: *mut OpusDecoder);
+    }
+
+    #[cfg(not(target_os = "android"))]
     extern "C" {
         #[link_name = "shiguredo_opus_encoder_create"]
         pub fn opus_encoder_create(
@@ -241,10 +285,12 @@ impl Drop for OpusEncoder {
 }
 
 /// Decodes Opus packets back into the wire format.
+#[cfg(not(target_os = "android"))]
 pub struct OpusDecoder {
     decoder: Decoder,
 }
 
+#[cfg(not(target_os = "android"))]
 impl OpusDecoder {
     pub fn new() -> Result<Self, AudioError> {
         let decoder = Decoder::new(DecoderConfig::new(48_000, 2))
@@ -259,6 +305,71 @@ impl OpusDecoder {
             .decode_f32(packet)
             .map_err(|e| AudioError::Backend(format!("opus decode: {e}")))?;
         Ok(samples.iter().flat_map(|s| s.to_le_bytes()).collect())
+    }
+}
+
+/// Decodes Opus packets back into the wire format.
+#[cfg(target_os = "android")]
+pub struct OpusDecoder {
+    /// Owned libopus state: created in `new`, destroyed in `drop`, never null
+    /// in between.
+    decoder: *mut ffi::OpusDecoder,
+    pcm: Vec<f32>,
+}
+
+// SAFETY: as for the encoder — no thread affinity, every use through `&mut self`.
+#[cfg(target_os = "android")]
+unsafe impl Send for OpusDecoder {}
+
+/// Most samples per channel one packet can decode to: 120 ms at 48 kHz.
+#[cfg(target_os = "android")]
+const MAX_DECODED_SAMPLES: usize = 5760;
+
+#[cfg(target_os = "android")]
+impl OpusDecoder {
+    pub fn new() -> Result<Self, AudioError> {
+        let mut error: c_int = ffi::OPUS_OK;
+        // SAFETY: plain constructor call; the result is checked before use.
+        let decoder = unsafe { ffi::opus_decoder_create(48_000, 2, &mut error) };
+        if error != ffi::OPUS_OK || decoder.is_null() {
+            return Err(AudioError::Backend(format!(
+                "opus decoder: opus_decoder_create failed with code {error}"
+            )));
+        }
+        Ok(Self {
+            decoder,
+            pcm: vec![0.0; MAX_DECODED_SAMPLES * 2],
+        })
+    }
+
+    /// Decode one packet into raw wire bytes (48 kHz stereo f32 LE).
+    pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<u8>, AudioError> {
+        // SAFETY: `self.decoder` is live; `self.pcm` holds room for
+        // MAX_DECODED_SAMPLES stereo frames, the frame size passed.
+        let frames = unsafe {
+            ffi::opus_decode_float(
+                self.decoder,
+                packet.as_ptr(),
+                packet.len() as i32,
+                self.pcm.as_mut_ptr(),
+                MAX_DECODED_SAMPLES as c_int,
+                0,
+            )
+        };
+        let frames = usize::try_from(frames)
+            .map_err(|_| AudioError::Backend(format!("opus decode: failed with code {frames}")))?;
+        Ok(self.pcm[..frames * 2]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect())
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for OpusDecoder {
+    fn drop(&mut self) {
+        // SAFETY: created by `opus_decoder_create` and destroyed only here.
+        unsafe { ffi::opus_decoder_destroy(self.decoder) }
     }
 }
 
