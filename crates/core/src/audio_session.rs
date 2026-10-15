@@ -302,6 +302,10 @@ pub struct AudioEngine {
     mic_gate: crate::live::Shared<MicGate>,
     /// The mic gate the last health line reported, so a change is logged once.
     mic_gate_logged: Option<MicGate>,
+    /// The listener's own volume per stream playing here. See [`LocalMixer`].
+    mixer: LocalMixer,
+    /// The mixer generation last applied, so a change is applied once.
+    mixer_seen: u64,
     /// Chunks deferred because a single pump ran out of send budget.
     over_budget: u64,
     /// Chunks discarded as a stale backlog before they were ever encoded.
@@ -406,6 +410,7 @@ impl AudioEngine {
         local_id: PeerId,
         render_device: Option<String>,
         mic_gate: crate::live::Shared<MicGate>,
+        mixer: LocalMixer,
         peer_name: String,
     ) -> Self {
         let id_base = id_base_for(local_id);
@@ -458,6 +463,8 @@ impl AudioEngine {
             gates: HashMap::new(),
             mic_gate,
             mic_gate_logged: None,
+            mixer,
+            mixer_seen: 0,
             unwanted_streams: std::collections::HashSet::new(),
             demand_sent: HashMap::new(),
             unwanted_dropped: 0,
@@ -628,6 +635,15 @@ impl SessionModule for AudioEngine {
         // that came up since the last pump is usable for the rest of this one.
         self.collect_opened_intent_sinks();
         self.collect_opened_playbacks();
+
+        let generation = self.mixer.generation();
+        if generation != self.mixer_seen {
+            self.mixer_seen = generation;
+            let ids: Vec<u32> = self.playbacks.keys().copied().collect();
+            for id in ids {
+                self.apply_gain(id);
+            }
+        }
 
         // Turn Intent-Sink membership into per-app Remote Streams: apps funnelled
         // into a peer device's Intent Sink get tapped and shipped, tagged to render
@@ -923,6 +939,7 @@ impl SessionModule for AudioEngine {
                 // Receiver-side rate-control/gain state for this stream — clear it
                 // so a reused id never inherits a stale gain or ack cadence.
                 self.gains.remove(&id);
+                self.mixer.remove(id);
                 self.recv_seq.remove(&id);
                 self.demand_sent.remove(&id);
                 self.unwanted_streams.remove(&id);
@@ -1708,12 +1725,17 @@ impl AudioEngine {
             }
             match opened.result {
                 Ok(p) => {
-                    // Apply any gain that arrived while the node was coming up,
-                    // so a knob turned during the open is not lost.
-                    if let Some(&g) = self.gains.get(&opened.id) {
-                        p.set_gain(g);
-                    }
+                    let name = self
+                        .pending_labels
+                        .get(&opened.id)
+                        .cloned()
+                        .or_else(|| self.inbound_targets.get(&opened.id).cloned())
+                        .unwrap_or_else(|| format!("stream {}", opened.id));
+                    self.mixer.add(opened.id, &self.peer_name, &name);
                     self.playbacks.insert(opened.id, p);
+                    // Any gain that arrived while the node was coming up, so a
+                    // knob turned during the open is not lost.
+                    self.apply_gain(opened.id);
                 }
                 Err(e) => {
                     // Complain ONCE per stream: chunks arrive at ~200/s, and a
@@ -2041,9 +2063,18 @@ impl AudioEngine {
     fn on_gain(&mut self, id: u32, gain: f32) {
         tracing::info!(id, gain, "peer set stream gain");
         self.gains.insert(id, gain);
-        if let Some(p) = self.playbacks.get(&id) {
-            p.set_gain(gain);
-        }
+        self.apply_gain(id);
+    }
+
+    /// Set a playback's gain from both knobs that govern it: the owner's
+    /// (`AudioGain`, kept in `gains`) and this machine's listener's (the
+    /// [`LocalMixer`]). Multiplied, so neither overrides the other.
+    fn apply_gain(&self, id: u32) {
+        let Some(p) = self.playbacks.get(&id) else {
+            return;
+        };
+        let owner = self.gains.get(&id).copied().unwrap_or(1.0);
+        p.set_gain(owner * self.mixer.level(id));
     }
 
     /// The peer acked the newest chunk it has played for one of our streams.
@@ -2498,7 +2529,94 @@ pub struct AudioFactory {
     pub render_device: crate::live::Shared<Option<String>>,
     /// How this machine's microphones are gated. Read live by every engine.
     pub mic_gate: crate::live::Shared<MicGate>,
+    /// The listener's volumes, shared by every link's engine.
+    pub mixer: LocalMixer,
 }
+
+/// The streams playing on this machine as a local UI shows them, and the
+/// volume and mute that UI set on each.
+///
+/// The owner of a stream already has a knob for it (`AudioGain`, driven from
+/// the owner's side); this is the listener's, for a machine whose own mixer
+/// cannot reach a peer's stream by name — a phone, where every stream Cursio
+/// plays is one app to the system and the volume rocker moves all of them.
+/// Shared by every link's engine, read and set by whatever draws the UI.
+#[derive(Clone, Default)]
+pub struct LocalMixer(std::sync::Arc<std::sync::Mutex<MixerState>>);
+
+#[derive(Default)]
+struct MixerState {
+    streams: std::collections::BTreeMap<u32, MixerStream>,
+    generation: u64,
+}
+
+/// One stream playing here.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MixerStream {
+    pub id: u32,
+    pub peer: String,
+    pub name: String,
+    /// Linear, 1.0 = as sent.
+    pub volume: f32,
+    pub muted: bool,
+}
+
+impl LocalMixer {
+    fn state(&self) -> std::sync::MutexGuard<'_, MixerState> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn streams(&self) -> Vec<MixerStream> {
+        self.state().streams.values().cloned().collect()
+    }
+
+    /// Set one stream's volume and mute. False if no such stream plays here.
+    pub fn set(&self, id: u32, volume: f32, muted: bool) -> bool {
+        let mut state = self.state();
+        let Some(stream) = state.streams.get_mut(&id) else {
+            return false;
+        };
+        stream.volume = volume.clamp(0.0, MAX_LOCAL_VOLUME);
+        stream.muted = muted;
+        state.generation += 1;
+        true
+    }
+
+    /// A stream started playing. A playback reopened on another device keeps
+    /// the volume it had.
+    fn add(&self, id: u32, peer: &str, name: &str) {
+        self.state()
+            .streams
+            .entry(id)
+            .or_insert_with(|| MixerStream {
+                id,
+                peer: peer.to_owned(),
+                name: name.to_owned(),
+                volume: 1.0,
+                muted: false,
+            });
+    }
+
+    fn remove(&self, id: u32) {
+        self.state().streams.remove(&id);
+    }
+
+    /// The factor this stream's audio is scaled by here.
+    fn level(&self, id: u32) -> f32 {
+        self.state()
+            .streams
+            .get(&id)
+            .map_or(1.0, |s| if s.muted { 0.0 } else { s.volume })
+    }
+
+    fn generation(&self) -> u64 {
+        self.state().generation
+    }
+}
+
+/// Loudest a listener may set a stream: half again over what was sent, enough
+/// for a quiet source without inviting clipping.
+const MAX_LOCAL_VOLUME: f32 = 1.5;
 
 /// Whether this build has an audio backend at all.
 ///
@@ -2525,6 +2643,7 @@ impl crate::module::ModuleFactory for AudioFactory {
             ctx.local.peer_id,
             self.render_device.get(),
             self.mic_gate.clone(),
+            self.mixer.clone(),
             ctx.peer_name().to_string(),
         )))
     }
@@ -2695,6 +2814,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_local_mixer_scales_mutes_and_refuses_unknown_streams() {
+        let mixer = LocalMixer::default();
+        assert!(!mixer.set(7, 0.5, false), "nothing plays as stream 7 yet");
+        mixer.add(7, "Nocturne", "Firefox");
+        assert_eq!(mixer.level(7), 1.0);
+        let before = mixer.generation();
+        assert!(mixer.set(7, 0.5, false));
+        assert_eq!(mixer.level(7), 0.5);
+        assert_ne!(
+            mixer.generation(),
+            before,
+            "a change must be seen by engines"
+        );
+        assert!(mixer.set(7, 0.5, true));
+        assert_eq!(mixer.level(7), 0.0);
+        assert!(mixer.set(7, 9.0, false));
+        assert_eq!(mixer.level(7), MAX_LOCAL_VOLUME);
+    }
+
+    #[test]
+    fn a_reopened_playback_keeps_its_local_volume() {
+        let mixer = LocalMixer::default();
+        mixer.add(7, "Nocturne", "Firefox");
+        mixer.set(7, 0.3, false);
+        mixer.add(7, "Nocturne", "Firefox");
+        assert_eq!(mixer.level(7), 0.3);
+        mixer.remove(7);
+        assert_eq!(mixer.level(7), 1.0);
+        assert!(mixer.streams().is_empty());
+    }
+
     /// A sustained backlog must lower the bitrate; a caught-up link must raise it;
     /// a mid-range gap must hold. This is the degrade-not-buffer rule in numbers.
     #[test]
@@ -2837,6 +2988,7 @@ mod tests {
             PeerId::new_v4(),
             None,
             crate::live::Shared::new(MicGate::Auto),
+            LocalMixer::default(),
             "peer".into(),
         )
     }

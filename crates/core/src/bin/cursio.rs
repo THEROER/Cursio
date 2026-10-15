@@ -1545,6 +1545,7 @@ fn module_registry(
             enabled: true,
             render_device,
             mic_gate,
+            mixer: cursio_core::audio_session::LocalMixer::default(),
         }))
         .with(Box::new(cursio_core::clipboard_session::ClipboardFactory {
             enabled: true,
