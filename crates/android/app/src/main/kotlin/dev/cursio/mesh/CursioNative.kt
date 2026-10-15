@@ -64,4 +64,33 @@ object CursioNative {
 
     /** One line for the service notification: what this node can see. */
     external fun nativeStatusLine(): String
+
+    /**
+     * Open the pairing window with a code shown on another machine
+     * (e.g. "ABCD-EFGH"). Returns "" on success, else a human-readable error.
+     */
+    external fun nativeEnterCode(code: String): String
+
+    /**
+     * Open the pairing window with a fresh code for this phone to show.
+     * Returns the code, or "" if the node is not running.
+     */
+    external fun nativeShowCode(): String
+
+    external fun nativeCancelPairing(): Boolean
+
+    /** A JSON snapshot of the node; [NodeStatus.parse] reads it. */
+    external fun nativeStatusJson(): String
+
+    /**
+     * Local playback volume (0.0–1.5) and mute of one stream.
+     * Returns false if the stream is unknown.
+     */
+    external fun nativeSetStreamVolume(id: Int, volume: Float, muted: Boolean): Boolean
+
+    /**
+     * Gate for this phone's microphone: "auto", "off" or a dBFS level such as
+     * "-55". Returns "" on success, else an error.
+     */
+    external fun nativeSetMicGate(value: String): String
 }

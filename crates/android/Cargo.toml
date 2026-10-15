@@ -14,14 +14,15 @@ name = "cursio_android"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# The mesh core with every platform module off: this crate exists to prove the
-# core runs on a phone, and each module needs an Android backend before its
-# feature means anything here.
+# The mesh core with only the modules that have an Android backend: audio
+# (AAudio). Every other module needs one before its feature means anything here.
 # By path rather than `workspace = true`: a workspace dependency carries its
 # own `default-features`, and a `default-features = false` next to it is
 # ignored — which silently pulled PipeWire, FUSE and an AirPlay receiver into a
 # phone build. Naming the path here is what actually turns them off.
-cursio-core = { path = "../core", default-features = false }
+cursio-core = { path = "../core", default-features = false, features = ["audio"] }
+serde.workspace = true
+serde_json.workspace = true
 cursio-protocol.workspace = true
 cursio-transport.workspace = true
 cursio-log.workspace = true

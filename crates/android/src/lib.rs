@@ -35,7 +35,7 @@
 use std::sync::Mutex;
 
 use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jint, JNI_FALSE, JNI_TRUE};
+use jni::sys::{jboolean, jfloat, jint, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
 mod node;
@@ -49,6 +49,11 @@ use node::NodeHandle;
 /// listener and announce a second copy of this machine on the LAN. One slot
 /// makes the second start a no-op that says so.
 static NODE: Mutex<Option<NodeHandle>> = Mutex::new(None);
+
+/// The mic gate the app last chose, kept across a stopped node so the next
+/// start applies it — the app restores its saved choice before or after
+/// starting, depending on how the service came up.
+static MIC_GATE: Mutex<String> = Mutex::new(String::new());
 
 /// Point Cursio at the directory Android gave this app, and start logging.
 ///
@@ -106,7 +111,13 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeStart(
             return Ok(JNI_FALSE);
         }
         let port = u16::try_from(port).unwrap_or(0);
-        *slot = Some(NodeHandle::start(name, port)?);
+        let gate = MIC_GATE.lock().expect("mic gate lock").clone();
+        let gate = if gate.is_empty() {
+            "auto".to_owned()
+        } else {
+            gate
+        };
+        *slot = Some(NodeHandle::start(name, port, &gate)?);
         Ok(JNI_TRUE)
     })
 }
@@ -196,6 +207,152 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeStatusLine<'a>(
     })
     .unwrap_or_else(|_| "unavailable".to_string());
     env.new_string(line).unwrap_or_else(|_| JString::default())
+}
+
+/// Open the pairing window with a code shown on another machine.
+///
+/// Returns "" on success, else the reason, for the app to show beside the
+/// field — a typo in a code is not an exception.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeEnterCode<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    code: JString<'a>,
+) -> JString<'a> {
+    let reply = guard(&mut env, String::new(), |env| {
+        let code: String = env.get_string(&code)?.into();
+        Ok(match NODE.lock().expect("node lock").as_ref() {
+            Some(node) => match node.enter_code(&code) {
+                Ok(()) => String::new(),
+                Err(e) => e.to_string(),
+            },
+            None => "Cursio is not running".to_owned(),
+        })
+    });
+    new_string(&env, reply)
+}
+
+/// Open the pairing window with a fresh code for this phone to show; "" when
+/// no node is running.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeShowCode<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+) -> JString<'a> {
+    let code = guard(&mut env, String::new(), |_env| {
+        Ok(NODE
+            .lock()
+            .expect("node lock")
+            .as_ref()
+            .map(|node| node.show_code())
+            .unwrap_or_default())
+    });
+    new_string(&env, code)
+}
+
+/// Close the pairing window.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeCancelPairing(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    guard(&mut env, JNI_FALSE, |_env| {
+        Ok(match NODE.lock().expect("node lock").as_ref() {
+            Some(node) => {
+                node.cancel_pairing();
+                JNI_TRUE
+            }
+            None => JNI_FALSE,
+        })
+    })
+}
+
+/// Everything the app shows, as JSON; `{"running":false}` when stopped.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeStatusJson<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+) -> JString<'a> {
+    let json = guard(&mut env, String::from("{\"running\":false}"), |_env| {
+        Ok(match NODE.lock().expect("node lock").as_ref() {
+            Some(node) => node.status_json(),
+            None => "{\"running\":false}".to_owned(),
+        })
+    });
+    new_string(&env, json)
+}
+
+/// Set one incoming stream's volume (0.0–1.5) and mute on this phone.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeSetStreamVolume(
+    mut env: JNIEnv,
+    _class: JClass,
+    id: jint,
+    volume: jfloat,
+    muted: jboolean,
+) -> jboolean {
+    guard(&mut env, JNI_FALSE, |_env| {
+        let set = NODE
+            .lock()
+            .expect("node lock")
+            .as_ref()
+            .is_some_and(|node| node.set_stream_volume(id as u32, volume, muted != JNI_FALSE));
+        Ok(if set { JNI_TRUE } else { JNI_FALSE })
+    })
+}
+
+/// Set how this phone's microphone is gated: "auto", "off" or a dBFS level.
+/// Returns "" on success, else why the value was refused.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeSetMicGate<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    value: JString<'a>,
+) -> JString<'a> {
+    let reply = guard(&mut env, String::new(), |env| {
+        let value: String = env.get_string(&value)?.into();
+        if let Err(e) = value.parse::<cursio_core::audio_gate::MicGate>() {
+            return Ok(e.to_string());
+        }
+        *MIC_GATE.lock().expect("mic gate lock") = value.clone();
+        Ok(match NODE.lock().expect("node lock").as_ref() {
+            Some(node) => node
+                .set_mic_gate(&value)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default(),
+            None => String::new(),
+        })
+    });
+    new_string(&env, reply)
+}
+
+fn new_string<'a>(env: &JNIEnv<'a>, value: String) -> JString<'a> {
+    env.new_string(value).unwrap_or_else(|_| JString::default())
 }
 
 /// Run `body`, turning any failure into a Java exception and `fallback`.

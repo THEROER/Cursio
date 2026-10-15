@@ -636,10 +636,10 @@ const ANDROID_LIB: &str = "libcursio_android.so";
 
 /// Minimum Android API level this builds against.
 ///
-/// 26 (Oreo) is where the notification channels and foreground-service model
-/// the mesh needs actually exist. Nothing here targets older, and raising it
-/// costs devices rather than buying anything.
-const ANDROID_API: &str = "26";
+/// 28 (Pie): the foreground-service model the mesh needs exists from 26, and
+/// audio needs AAudio's input presets — the echo canceller that keeps a phone
+/// playing the PC's sound from sending it straight back — which arrive in 28.
+const ANDROID_API: &str = "28";
 
 /// Build the JNI bridge as a shared library a phone can load.
 ///
@@ -697,12 +697,18 @@ fn android(release: bool) -> Result<()> {
     if release {
         cmd.arg("--release");
     }
-    // The bridge crate, which pulls in `cursio-core` with its platform
-    // features already off. Turning one on without an Android backend behind
-    // it does not fail at the feature — it fails deep inside PipeWire, FUSE or
-    // libopus, which is a much worse error to read.
+    // The bridge crate, which pulls in `cursio-core` with only the modules
+    // that have an Android backend. Turning another on does not fail at the
+    // feature — it fails deep inside PipeWire or FUSE, which is a much worse
+    // error to read.
     cmd.args(["-p", "cursio-android"]);
     cmd.env("ANDROID_NDK_HOME", &ndk);
+    // libopus is built by CMake, whose own Android support finds the NDK only
+    // through ANDROID_NDK_ROOT ("Neither the NDK or a standalone toolchain was
+    // found" otherwise), and whose default Makefile generator `cmake-rs` cannot
+    // locate a make for under this toolchain.
+    cmd.env("ANDROID_NDK_ROOT", &ndk);
+    cmd.env("CMAKE_GENERATOR", "Ninja");
     run(cmd)?;
 
     let built = PathBuf::from("target")
@@ -727,7 +733,7 @@ fn android(release: bool) -> Result<()> {
 
     println!("✓ {}", staged.display());
     println!(
-        "  Gradle: jniLibs.srcDirs += \"{}\"; Kotlin sources in crates/android/java.",
+        "  the app in crates/android/app packages {} — build it with ./gradlew assembleDebug there",
         staged_dir.parent().unwrap_or(&staged_dir).display()
     );
     Ok(())
