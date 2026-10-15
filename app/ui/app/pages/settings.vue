@@ -4,6 +4,7 @@ import type { Reply } from "~/composables/useNode"
 
 const { t } = useI18n()
 const { status, restart, config, setMicGate } = useNode()
+const { isMobile, ready } = usePlatform()
 const toast = useCursioToast()
 
 type GateMode = "auto" | "fixed" | "off"
@@ -82,6 +83,9 @@ const autostart = ref<Autostart | null>(null)
 const busy = ref(false)
 
 onMounted(async () => {
+  // A phone's node is started by its foreground service, at boot or by the
+  // app; there is no login item to read, and the command does not exist there.
+  if ((await ready()) === "mobile") return
   try {
     autostart.value = await invoke<Autostart>("autostart_get")
   } catch (e) {
@@ -163,7 +167,14 @@ async function restartNode() {
         </LpCard>
       </section>
 
-      <section class="flex flex-col gap-3">
+      <section v-if="status" class="flex flex-col gap-3">
+        <LpSection :title="t('streams.title')" :description="t('streams.description')" icon="lucide:volume-2" />
+        <LpCard padded>
+          <PlayingStreams />
+        </LpCard>
+      </section>
+
+      <section v-if="!isMobile" class="flex flex-col gap-3">
         <LpSection
           :title="t('settings.autostartTitle')"
           :description="t('settings.autostartDescription')"
@@ -211,13 +222,15 @@ async function restartNode() {
             <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
               <dt class="text-muted">{{ t("settings.build") }}</dt>
               <dd class="font-mono">{{ status.node.build || "—" }}</dd>
-              <dt class="text-muted">{{ t("settings.installedVersion") }}</dt>
-              <dd class="font-mono">{{ status.node.installed_version ?? t("settings.notInstalled") }}</dd>
-              <dt class="text-muted">{{ t("settings.pid") }}</dt>
-              <dd class="font-mono">{{ status.node.pid || "—" }}</dd>
+              <template v-if="!isMobile">
+                <dt class="text-muted">{{ t("settings.installedVersion") }}</dt>
+                <dd class="font-mono">{{ status.node.installed_version ?? t("settings.notInstalled") }}</dd>
+                <dt class="text-muted">{{ t("settings.pid") }}</dt>
+                <dd class="font-mono">{{ status.node.pid || "—" }}</dd>
+              </template>
             </dl>
           </template>
-          <div>
+          <div v-if="!isMobile">
             <LpButton variant="soft" size="sm" :disabled="!status" @click="confirmRestart = true">
               <LpIcon name="lucide:rotate-cw" :size="14" />
               {{ t("settings.restart") }}

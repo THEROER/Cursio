@@ -23,14 +23,19 @@ export function usePeerMenu() {
   const toast = useCursioToast()
   const { showInLogs } = useChrome()
   const { forget } = useNode()
+  const { isMobile } = usePlatform()
 
   function items(peer: PeerRef): ContextMenuItemDef[] {
-    const list: ContextMenuItemDef[] = [
-      {
+    const list: ContextMenuItemDef[] = []
+    // A phone has no log drawer: the node's log is logcat's there.
+    if (!isMobile.value) {
+      list.push({
         label: t("peerMenu.showInLogs"),
         icon: "lucide:scroll-text",
         onSelect: () => showInLogs(peer.name),
-      },
+      })
+    }
+    list.push(
       {
         label: t("peerMenu.copyId"),
         icon: "lucide:copy",
@@ -39,7 +44,7 @@ export function usePeerMenu() {
           toast.success(t("peerMenu.idCopied", { name: peer.name }))
         },
       },
-    ]
+    )
     // A machine that never comes online may be one the other side removed;
     // pairing again is then the way back, not waiting.
     if (peer.presence === "offline") {

@@ -4,7 +4,8 @@ import type { SidebarItem } from "@leavepulse/ui"
 /**
  * The desktop window's frame: the kit's app shell with its rail, the window's
  * own title bar, and the overlays every page shares (log drawer, command
- * palette, confirmations).
+ * palette, confirmations). On a phone every page gets `MobileShell` instead,
+ * so a page names one shell and never asks which platform it runs on.
  *
  * The page title and the empty stretch of the bar carry
  * `data-tauri-drag-region`: with the system title bar gone, that is where the
@@ -18,9 +19,9 @@ defineProps<{
 
 const { t } = useI18n()
 const route = useRoute()
-const { status, error, notRunning, start } = useNode()
+const { status, notRunning } = useNode()
 const { logsOpen, paletteOpen } = useChrome()
-const toast = useCursioToast()
+const { isMobile } = usePlatform()
 
 const items = computed<SidebarItem[]>(() => [
   { id: "/", label: t("nav.status"), icon: "lucide:activity", badge: status.value?.problems.length || undefined },
@@ -35,24 +36,14 @@ const title = computed(() => {
   )
   return match?.label ?? t("app.title")
 })
-
-const starting = ref(false)
-async function startNode() {
-  starting.value = true
-  try {
-    await start()
-    toast.success(t("node.startRequested"))
-  } catch (e) {
-    toast.failure(e, { title: t("node.startFailed"), retry: startNode })
-  } finally {
-    // The node takes a moment to open its socket; the pushed status says when.
-    setTimeout(() => (starting.value = false), 3000)
-  }
-}
 </script>
 
 <template>
+  <MobileShell v-if="isMobile" :full-bleed="fullBleed">
+    <slot />
+  </MobileShell>
   <LpAppShell
+    v-else
     :items="items"
     :path="route.path"
     :full-bleed="fullBleed"
@@ -107,15 +98,7 @@ async function startNode() {
       <WindowControls />
     </template>
 
-    <LpAlert v-if="notRunning" variant="warning" :title="t('node.notRunningTitle')" class="mb-4">
-      <p class="text-sm">{{ t("node.notRunningBody") }}</p>
-      <div class="mt-3">
-        <LpButton variant="solid" size="sm" :disabled="starting" @click="startNode">
-          {{ starting ? t("node.starting") : t("node.start") }}
-        </LpButton>
-      </div>
-    </LpAlert>
-    <LpAlert v-else-if="error" variant="danger" class="mb-4">{{ error.message }}</LpAlert>
+    <NodeDownAlert />
     <slot />
 
     <template #overlays>

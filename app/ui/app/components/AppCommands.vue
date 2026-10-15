@@ -22,6 +22,9 @@ const { items: peerMenu } = usePeerMenu()
 const { battery, network } = useMachineText()
 const theme = useTheme()
 const toast = useCursioToast()
+// A phone's build registers none of the daemon's commands (logs, restart,
+// updates, placement), so the palette there must not offer them at all.
+const { isMobile } = usePlatform()
 
 const confirmRestart = ref(false)
 const confirmUpdate = ref(false)
@@ -68,12 +71,27 @@ async function toggle(module: ModuleSwitch) {
   }
 }
 
-const PAGES = [
+interface Page {
+  path: string
+  label: string
+  icon: string
+  lead: string
+  keywords: string[]
+  only?: "desktop" | "mobile"
+}
+
+const ALL_PAGES: Page[] = [
   { path: "/", label: "nav.status", icon: "lucide:activity", lead: "palette.pageStatus", keywords: ["peers", "latency"] },
-  { path: "/placement", label: "nav.placement", icon: "lucide:layout-grid", lead: "placement.description", keywords: ["position", "grid"] },
+  { path: "/placement", label: "nav.placement", icon: "lucide:layout-grid", lead: "placement.description", keywords: ["position", "grid"], only: "desktop" },
   { path: "/pair", label: "nav.pair", icon: "lucide:link", lead: "pair.description", keywords: ["code"] },
-  { path: "/settings", label: "nav.settings", icon: "lucide:settings", lead: "palette.pageSettings", keywords: ["autostart", "version"] },
+  { path: "/touchpad", label: "nav.touchpad", icon: "lucide:mouse-pointer-click", lead: "app.subtitle", keywords: ["mouse", "pointer"], only: "mobile" },
+  { path: "/settings", label: "nav.settings", icon: "lucide:settings", lead: "palette.pageSettings", keywords: ["autostart", "version", "volume"] },
 ]
+
+const PAGES = computed(() => {
+  const here = isMobile.value ? "mobile" : "desktop"
+  return ALL_PAGES.filter((p) => !p.only || p.only === here)
+})
 
 const SEVERITY_ICON = { Info: "lucide:info", Warning: "lucide:triangle-alert", Error: "lucide:octagon-alert" } as const
 
@@ -143,7 +161,7 @@ const commands = computed<Command[]>(() => {
   const go = t("palette.go")
   const node = t("palette.node")
   const s = status.value
-  const list: Command[] = PAGES.map((p) => ({
+  const list: Command[] = PAGES.value.map((p) => ({
     id: `page:${p.path}`,
     group: go,
     label: t(p.label),
@@ -179,33 +197,37 @@ const commands = computed<Command[]>(() => {
     })
   }
 
-  list.push({
-    id: "logs",
-    group: node,
-    label: t("logs.title"),
-    icon: "lucide:scroll-text",
-    shortcut: "Ctrl L",
-    onSelect: () => { logsOpen.value = true },
-  })
-  list.push({
-    id: "log-search",
-    group: node,
-    label: t("palette.searchLogs", { query: "{query}" }),
-    modeLabel: t("palette.logsMode"),
-    icon: "lucide:text-search",
-    prefix: "/",
-    fallback: true,
-    carryQuery: true,
-    remember: false,
-    noPreview: true,
-    childPlaceholder: t("palette.logSearch"),
-    children: searchLog,
-  })
+  const desktop = !isMobile.value
+
+  if (desktop) {
+    list.push({
+      id: "logs",
+      group: node,
+      label: t("logs.title"),
+      icon: "lucide:scroll-text",
+      shortcut: "Ctrl L",
+      onSelect: () => { logsOpen.value = true },
+    })
+    list.push({
+      id: "log-search",
+      group: node,
+      label: t("palette.searchLogs", { query: "{query}" }),
+      modeLabel: t("palette.logsMode"),
+      icon: "lucide:text-search",
+      prefix: "/",
+      fallback: true,
+      carryQuery: true,
+      remember: false,
+      noPreview: true,
+      childPlaceholder: t("palette.logSearch"),
+      children: searchLog,
+    })
+  }
 
   if (notRunning.value) {
     list.push({ id: "start", group: node, label: t("node.start"), icon: "lucide:play", onSelect: () => void startNode() })
   } else if (s) {
-    if (s.update.ready) {
+    if (desktop && s.update.ready) {
       list.push({
         id: "update",
         group: node,
@@ -220,7 +242,7 @@ const commands = computed<Command[]>(() => {
       group: node,
       label: t("settings.restart"),
       icon: "lucide:rotate-cw",
-      hidden: s.restart_needed.length === 0,
+      hidden: !desktop || s.restart_needed.length === 0,
       onSelect: () => { confirmRestart.value = true },
     })
     list.push({
@@ -274,7 +296,7 @@ function previewOf(command: Command): Preview | null {
   const s = status.value
   switch (kind) {
     case "page": {
-      const page = PAGES.find((p) => p.path === key)
+      const page = PAGES.value.find((p) => p.path === key)
       return page ? { kind, path: page.path, lead: page.lead } : null
     }
     case "peer": {
@@ -374,9 +396,9 @@ function swatches(set: TokenSet): string[] {
   return [c.ink, c.brand, c.action, c.accent, c.danger]
 }
 
-useHotkeys(() => [
-  { key: "l", code: "KeyL", ctrl: true, handler: () => { logsOpen.value = !logsOpen.value } },
-])
+useHotkeys(() =>
+  isMobile.value ? [] : [{ key: "l", code: "KeyL", ctrl: true, handler: () => { logsOpen.value = !logsOpen.value } }],
+)
 
 const labels = computed(() => ({
   navigate: t("palette.navigate"),

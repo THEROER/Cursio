@@ -3,6 +3,7 @@ import { toMillis, type PairingOutcome, type PairingState, type Reply } from "~/
 
 const { t } = useI18n()
 const { pairShow, pairEnter, pairCancel, pairing } = useNode()
+const { isMobile } = usePlatform()
 const toast = useCursioToast()
 
 const state = ref<PairingState | null>(null)
@@ -112,13 +113,20 @@ const remaining = computed(() => {
           </h3>
           <p class="text-xs text-muted">{{ t("pair.enterHint") }}</p>
           <form class="flex flex-col gap-3" @submit.prevent="run(() => pairEnter(code))">
-            <LpOtpInput v-model="code" :length="8" alphanumeric />
+            <!-- Eight medium cells are wider than a phone held upright. -->
+            <LpOtpInput
+              v-model="code"
+              :length="8"
+              alphanumeric
+              :size="isMobile ? 'sm' : 'md'"
+              :class="isMobile ? 'gap-1' : ''"
+            />
             <LpButton type="submit" variant="solid" :disabled="code.length < 8">{{ t("pair.enter") }}</LpButton>
           </form>
         </LpCard>
       </div>
 
-      <LpCodeBlock :model-value="t('pair.cliCommands')" lang="bash" :title="t('pair.cli')" />
+      <LpCodeBlock v-if="!isMobile" :model-value="t('pair.cliCommands')" lang="bash" :title="t('pair.cli')" />
     </section>
 
     <LpConfirmDialog

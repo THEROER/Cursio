@@ -8,7 +8,9 @@
     "status": "Status",
     "placement": "Arrange",
     "pair": "Pair",
-    "settings": "Settings"
+    "settings": "Settings",
+    "touchpad": "Touchpad",
+    "label": "Pages"
   },
   "node": {
     "running": "Node running",
@@ -19,7 +21,11 @@
     "start": "Start node",
     "starting": "Starting…",
     "startRequested": "Starting the node; this window follows it once it answers.",
-    "startFailed": "The node did not start"
+    "startFailed": "The node did not start",
+    "runningShort": "Running",
+    "stoppedShort": "Stopped",
+    "notRunningTitlePhone": "Cursio is not running on this phone",
+    "notRunningBodyPhone": "Other machines cannot reach this phone until it runs. Starting it keeps it running in the background, with a notification saying so."
   },
   "common": {
     "cancel": "Cancel",
@@ -170,7 +176,37 @@
     "pinned": "Saved, but a command-line flag overrides it until the node is started without that flag.",
     "appliedNote": "Changes are written to {path} and take effect at once; links stay up.",
     "restartNeeded": "Waiting for a restart to apply: {fields}",
-    "toggleFailed": "The module was not switched"
+    "toggleFailed": "The module was not switched",
+    "restartPhone": "They apply the next time Cursio starts on this phone, such as after a reboot."
+  },
+  "streams": {
+    "title": "Playing here",
+    "description": "Sound from other machines, at the volume you want it on this one. The sender and other listeners are not affected.",
+    "none": "Nothing is playing from other machines",
+    "noneHint": "An app's sound shows up here while a peer sends it to this machine.",
+    "from": "from {peer}",
+    "volume": "Volume of {name}",
+    "mute": "Mute",
+    "unmute": "Unmute",
+    "failed": "The volume of {name} was not changed"
+  },
+  "phone": {
+    "title": "Finish setting up this phone",
+    "description": "Android stops background apps unless they are allowed to stay. Cursio needs these to keep the phone reachable.",
+    "thisPhone": "This phone",
+    "notifications": "Notifications",
+    "notificationsHint": "Android shows a running background service as a notification; without it, the service is stopped.",
+    "microphone": "Microphone",
+    "microphoneHint": "Lets other machines use this phone's microphone.",
+    "battery": "No battery restrictions",
+    "batteryHint": "Keeps links up while the screen is off.",
+    "autostart": "Autostart",
+    "autostartHint": "This phone also stops apps that are not on its own Autostart list. Allow Cursio there; Android cannot tell the app whether you did.",
+    "autostartDone": "I've allowed it",
+    "openSettings": "Open settings",
+    "allow": "Allow",
+    "granted": "Allowed",
+    "requestFailed": "The system screen did not open"
   },
   "peers": {
     "title": "Peers",

@@ -1,16 +1,11 @@
 <script setup lang="ts">
-import { invoke } from "@tauri-apps/api/core"
 import type { ModuleSwitch, PeerView } from "~/composables/useNode"
 
 const { t } = useI18n()
 const { status, error, setModule, pendingSwitches, restart } = useNode()
 const { latency: latencyHistory, uptime } = useHistory()
+const { isMobile } = usePlatform()
 const toast = useCursioToast()
-
-// A phone has no node to show: its face is the touchpad.
-onMounted(async () => {
-  if ((await invoke<string>("app_platform")) === "mobile") void navigateTo("/touchpad")
-})
 
 const online = computed(() => status.value?.peers.filter((p) => p.presence === "online").length ?? 0)
 
@@ -61,8 +56,26 @@ function presenceTone(p: PeerView) {
       <LpSkeleton rounded="card" class="h-64" />
     </div>
 
-    <div v-else-if="status" class="flex flex-col gap-6">
-      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+    <div v-if="isMobile" class="mb-6 empty:hidden"><PhoneSetupCard /></div>
+
+    <div v-if="status" class="flex flex-col gap-6">
+      <LpCard v-if="isMobile" padded class="flex flex-col gap-3">
+        <div class="flex items-center gap-2">
+          <LpIcon name="lucide:smartphone" :size="18" class="shrink-0 text-brand" />
+          <p class="min-w-0 flex-1 truncate font-medium">{{ status.node.name }}</p>
+          <LpBadge tone="brand" size="sm">{{ t("phone.thisPhone") }}</LpBadge>
+        </div>
+        <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+          <dt class="text-muted">{{ t("peer.battery") }}</dt>
+          <dd>{{ battery(status.node.status) ?? t("peer.cannotSay") }}</dd>
+          <dt class="text-muted">{{ t("peer.network") }}</dt>
+          <dd>{{ network(status.node.status) ?? t("peer.cannotSay") }}</dd>
+          <dt class="text-muted">{{ t("stats.peers") }}</dt>
+          <dd>{{ online }} / {{ status.peers.length }}</dd>
+        </dl>
+      </LpCard>
+
+      <div v-else class="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <LpTooltip :content="t('stats.peersHint')">
           <LpStat
             :label="t('stats.peers')"
@@ -133,7 +146,8 @@ function presenceTone(p: PeerView) {
           variant="warning"
           :title="t('modules.restartNeeded', { fields: status.restart_needed.join(', ') })"
         >
-          <LpButton variant="soft" size="sm" @click="confirmRestart = true">{{ t("settings.restart") }}</LpButton>
+          <LpButton v-if="!isMobile" variant="soft" size="sm" @click="confirmRestart = true">{{ t("settings.restart") }}</LpButton>
+          <p v-else class="text-sm">{{ t("modules.restartPhone") }}</p>
         </LpAlert>
       </section>
 

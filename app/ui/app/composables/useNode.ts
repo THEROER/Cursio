@@ -103,7 +103,23 @@ export interface NodeStatusReply {
   pairing: PairingState | null
   /** Empty (all defaults) from a node older than control v5. */
   update: UpdateStatus
+  /** Peer streams playing on this machine. The app's own core defaults it from an older node. */
+  streams: PlayingStream[]
 }
+
+/** Mirrors `cursio_core::mixer::MixerStream`: the listener's own say on one stream. */
+export interface PlayingStream {
+  id: number
+  /** The machine it comes from, by name. */
+  peer: string
+  name: string
+  /** Linear, 1 is as sent, up to `MAX_STREAM_VOLUME`. */
+  volume: number
+  muted: boolean
+}
+
+/** `cursio_core::mixer::MAX_LOCAL_VOLUME`: the node refuses anything louder. */
+export const MAX_STREAM_VOLUME = 1.5
 
 /** Mirrors `cursio_core::update::agent::UpdateStatus`. */
 export interface UpdateStatus {
@@ -228,6 +244,8 @@ export function useNode() {
     setPosition: (p: Position) => call<Reply>("node_set_position", { x: p.x, y: p.y }),
     config: () => call<Reply>("node_config"),
     setMicGate: (value: string) => call<Reply>("node_set_mic_gate", { value }),
+    setStreamVolume: (stream: number, volume: number, muted: boolean) =>
+      call<Reply>("node_set_stream_volume", { stream, volume, muted }),
     pairShow: () => call<Reply>("node_pair_show"),
     pairEnter: (code: string) => call<Reply>("node_pair_enter", { code }),
     pairCancel: () => call<Reply>("node_pair_cancel"),

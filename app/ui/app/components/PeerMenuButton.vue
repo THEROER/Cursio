@@ -9,6 +9,7 @@ import type { PeerRef } from "~/composables/usePeerMenu"
 const props = defineProps<{ peer: PeerRef }>()
 const { t } = useI18n()
 const { items } = usePeerMenu()
+const { isMobile } = usePlatform()
 </script>
 
 <template>
@@ -16,7 +17,7 @@ const { items } = usePeerMenu()
     <template #trigger>
       <LpButton
         variant="muted"
-        size="sm"
+        :size="isMobile ? 'md' : 'sm'"
         square
         :aria-label="t('peerMenu.open', { name: props.peer.name })"
         @click.stop
