@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core"
-import type { ModuleSwitch, NodeStatus, PeerView } from "~/composables/useNode"
+import type { ModuleSwitch, PeerView } from "~/composables/useNode"
 
 const { t } = useI18n()
 const { status, error, setModule, pendingSwitches, restart } = useNode()
@@ -14,23 +14,7 @@ onMounted(async () => {
 
 const online = computed(() => status.value?.peers.filter((p) => p.presence === "online").length ?? 0)
 
-/** The slower of the two measured paths is the one the hand feels. */
-const latency = computed(() => {
-  const readings = status.value?.latency ?? []
-  if (readings.length === 0) return null
-  const worst = readings.reduce((a, b) => (b.p99_us > a.p99_us ? b : a))
-  return { p50: worst.p50_us / 1000, p99: worst.p99_us / 1000 }
-})
-
-const switches: { key: ModuleSwitch; label: string; hint: string; icon: string }[] = [
-  { key: "input", label: "modules.input", hint: "modules.inputHint", icon: "lucide:mouse-pointer-2" },
-  { key: "clipboard", label: "modules.clipboard", hint: "modules.clipboardHint", icon: "lucide:clipboard" },
-  { key: "audio", label: "modules.audio", hint: "modules.audioHint", icon: "lucide:volume-2" },
-  { key: "files", label: "modules.files", hint: "modules.filesHint", icon: "lucide:hard-drive" },
-  { key: "usb", label: "modules.usb", hint: "modules.usbHint", icon: "lucide:usb" },
-  { key: "remote_screen", label: "modules.remoteScreen", hint: "modules.remoteScreenHint", icon: "lucide:cast" },
-  { key: "screen_host", label: "modules.screenHost", hint: "modules.screenHostHint", icon: "lucide:monitor-up" },
-]
+const latency = computed(() => worstLatency(status.value?.latency ?? []))
 
 async function toggle(key: ModuleSwitch, enabled: boolean) {
   try {
@@ -60,38 +44,11 @@ function isPinned(key: ModuleSwitch) {
   return status.value?.pinned.includes(`modules.${key}`) ?? false
 }
 
-function battery(s: NodeStatus): string | null {
-  if (s.battery_percent === null) return null
-  const power = s.power === "Charging" ? t("peer.charging") : s.power === "Mains" ? t("peer.plugged") : ""
-  return `${s.battery_percent}%${power ? ` · ${power}` : ""}`
-}
-
-function network(s: NodeStatus): string | null {
-  switch (s.network) {
-    case "Wired":
-      return t("peer.wired")
-    case "Wifi":
-      return s.signal_dbm !== null ? `${t("peer.wifi")} ${s.signal_dbm} dBm` : t("peer.wifi")
-    case "Cellular":
-      return t("peer.cellular")
-    case "Unknown":
-      return t("peer.unknownNetwork")
-    default:
-      return null
-  }
-}
+const { battery, network } = useMachineText()
 
 function presenceTone(p: PeerView) {
   return p.presence === "online" ? "success" : p.presence === "connecting" ? "brand" : "neutral"
 }
-
-const kindIcon = {
-  Desktop: "lucide:monitor",
-  Laptop: "lucide:laptop",
-  Phone: "lucide:smartphone",
-  Tablet: "lucide:tablet",
-  Headless: "lucide:server",
-} as const
 </script>
 
 <template>
@@ -150,7 +107,7 @@ const kindIcon = {
         <LpSection :title="t('modules.title')" :description="t('modules.description')" icon="lucide:blocks" />
         <LpCard padded>
           <ul class="flex flex-col divide-y divide-line">
-            <li v-for="s in switches" :key="s.key" class="flex items-center gap-4 py-3 first:pt-0 last:pb-0">
+            <li v-for="s in MODULES" :key="s.key" class="flex items-center gap-4 py-3 first:pt-0 last:pb-0">
               <LpIcon :name="s.icon" :size="18" class="shrink-0 text-muted" />
               <div class="min-w-0 flex-1">
                 <p class="flex items-center gap-2 text-sm font-medium">
@@ -198,7 +155,7 @@ const kindIcon = {
             <LpCard padded class="flex flex-col gap-3">
               <div class="flex items-center gap-2">
                 <LpIcon
-                  :name="peer.link ? kindIcon[peer.link.device_kind] : 'lucide:monitor-smartphone'"
+                  :name="peer.link ? KIND_ICON[peer.link.device_kind] : UNKNOWN_KIND_ICON"
                   :size="18"
                   class="shrink-0 text-muted"
                 />

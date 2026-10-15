@@ -8,7 +8,7 @@
         "@iconify-json/lucide": "^1.2.120",
         "@iconify/vue": "^5.0.1",
         "@internationalized/date": "^3.12.2",
-        "@leavepulse/ui": "^0.36.1",
+        "@leavepulse/ui": "^0.49.1",
         "@nuxtjs/i18n": "^10.5.0",
         "@tailwindcss/vite": "^4.3.3",
         "@tauri-apps/api": "^2.11.1",
@@ -238,7 +238,7 @@
 
     "@kwsites/promise-deferred": ["@kwsites/promise-deferred@1.1.1", "", {}, "sha512-GaHYm+c0O9MjZRu0ongGBRbinu8gVAMd2UZjji6jVmqKtZluZnptXGWhz1E8j8D2HJ3f/yMxKAUC0b+57wncIw=="],
 
-    "@leavepulse/ui": ["@leavepulse/ui@0.36.1", "", { "dependencies": { "@vue-flow/background": "^1.3.2", "@vue-flow/controls": "^1.1.3", "@vue-flow/core": "^1.48.2", "@vue-flow/minimap": "^1.5.4", "vaul-vue": "^0.4.1" }, "peerDependencies": { "@iconify-json/lucide": "^1.2.0", "@iconify/vue": "^5.0.0", "@internationalized/date": "^3.5.0", "@nuxt/kit": "^3.0.0 || ^4.0.0", "@vueuse/core": "^12.0.0 || ^13.0.0 || ^14.0.0", "motion-v": "^2.2.0", "reka-ui": "^2.9.0", "tailwind-variants": "^3.0.0", "tailwindcss": "^4.0.0", "vue": "^3.5.0" }, "optionalPeers": ["@nuxt/kit"] }, "sha512-O7hgyq6HT4i6hQfhazFOw7LGYhVPkwxp4WqrX/uYK6u5lthmNnBZzE4/Jih9zaSAo0s+7PKDUoE1FslG1/as0g=="],
+    "@leavepulse/ui": ["@leavepulse/ui@0.49.1", "", { "dependencies": { "@vue-flow/background": "^1.3.2", "@vue-flow/controls": "^1.1.3", "@vue-flow/core": "^1.48.2", "@vue-flow/minimap": "^1.5.4", "libphonenumber-js": "^1.12.0", "vaul-vue": "^0.4.1" }, "peerDependencies": { "@iconify-json/lucide": "^1.2.0", "@iconify/vue": "^5.0.0", "@internationalized/date": "^3.5.0", "@nuxt/kit": "^3.0.0 || ^4.0.0", "motion-v": "^2.2.0", "reka-ui": "^2.9.0", "tailwind-variants": "^3.0.0", "tailwindcss": "^4.0.0", "vue": "^3.5.0" }, "optionalPeers": ["@nuxt/kit"] }, "sha512-Rzvf5BX+4GJHLRJTozkagdzgckHALSIUPBf5+FZXwe5wa+8KDUESYtBHJzAhP//ELCkZw1WQU2uVkguEHVphSA=="],
 
     "@mapbox/node-pre-gyp": ["@mapbox/node-pre-gyp@2.0.3", "", { "dependencies": { "consola": "^3.2.3", "detect-libc": "^2.0.0", "https-proxy-agent": "^7.0.5", "node-fetch": "^2.6.7", "nopt": "^8.0.0", "semver": "^7.5.3", "tar": "^7.4.0" }, "bin": { "node-pre-gyp": "bin/node-pre-gyp" } }, "sha512-uwPAhccfFJlsfCxMYTwOdVfOz3xqyj8xYL3zJj8f0pb30tLohnnFPhLuqp4/qoEz8sNxe4SESZedcBojRefIzg=="],
 
@@ -1055,6 +1055,8 @@
     "lazystream": ["lazystream@1.0.1", "", { "dependencies": { "readable-stream": "^2.0.5" } }, "sha512-b94GiNHQNy6JNTrt5w6zNyffMrNkXZb3KTkCZJb2V1xaEGCk093vkZ2jk3tpaeP33/OiXC+WvK9AxUebnf5nbw=="],
 
     "levn": ["levn@0.4.1", "", { "dependencies": { "prelude-ls": "^1.2.1", "type-check": "~0.4.0" } }, "sha512-+bT2uH4E5LGE7h/n3evcS/sQlJXCpIp6ym8OWJ5eV6+67Dsql/LaaT7qJBAt2rzfoa/5QBGBhxDix1dMt2kQKQ=="],
+
+    "libphonenumber-js": ["libphonenumber-js@1.13.15", "", {}, "sha512-AHdhEQeDFEJ4GKDAQ9AwxChy+v2kUILUB3TGQRpkXMkWePjXTU/WQEzWVQoIx/Gz8fE73Wr5SEuZCy2vk8jrMQ=="],
 
     "lightningcss": ["lightningcss@1.32.0", "", { "dependencies": { "detect-libc": "^2.0.3" }, "optionalDependencies": { "lightningcss-android-arm64": "1.32.0", "lightningcss-darwin-arm64": "1.32.0", "lightningcss-darwin-x64": "1.32.0", "lightningcss-freebsd-x64": "1.32.0", "lightningcss-linux-arm-gnueabihf": "1.32.0", "lightningcss-linux-arm64-gnu": "1.32.0", "lightningcss-linux-arm64-musl": "1.32.0", "lightningcss-linux-x64-gnu": "1.32.0", "lightningcss-linux-x64-musl": "1.32.0", "lightningcss-win32-arm64-msvc": "1.32.0", "lightningcss-win32-x64-msvc": "1.32.0" } }, "sha512-NXYBzinNrblfraPGyrbPoD19C1h9lfI/1mzgWYvXUTe414Gz/X1FD2XBZSZM7rRTrMA8JL3OtAaGifrIKhQ5yQ=="],
 
