@@ -116,8 +116,15 @@ export interface UpdateStatus {
   last: string | null
 }
 
+/** The part of `cursio_core::config::Config` the app reads. */
+export interface NodeConfig {
+  audio: { render_device: string | null; mic_gate: string | null }
+  [key: string]: unknown
+}
+
 export type Reply =
   | { reply: "saved"; pinned: string[]; restart_needed: string[] }
+  | { reply: "config"; path: string; file: NodeConfig; effective: NodeConfig; pinned: string[] }
   | { reply: "pairing"; state: PairingState | null; last: PairingOutcome | null }
   | { reply: "done" }
   | { reply: "forgotten"; name: string; was_builder: boolean }
@@ -219,6 +226,8 @@ export function useNode() {
     pendingSwitches,
     setModule,
     setPosition: (p: Position) => call<Reply>("node_set_position", { x: p.x, y: p.y }),
+    config: () => call<Reply>("node_config"),
+    setMicGate: (value: string) => call<Reply>("node_set_mic_gate", { value }),
     pairShow: () => call<Reply>("node_pair_show"),
     pairEnter: (code: string) => call<Reply>("node_pair_enter", { code }),
     pairCancel: () => call<Reply>("node_pair_cancel"),

@@ -1,9 +1,77 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core"
+import type { Reply } from "~/composables/useNode"
 
 const { t } = useI18n()
-const { status, restart } = useNode()
+const { status, restart, config, setMicGate } = useNode()
 const toast = useCursioToast()
+
+type GateMode = "auto" | "fixed" | "off"
+const GATE_MIN = -80
+const GATE_MAX = -20
+
+/** `null` until the node's config has been read. */
+const gateMode = ref<GateMode | null>(null)
+const gateLevel = ref(-55)
+const gatePinned = ref(false)
+const gateBusy = ref(false)
+
+const gateModes = computed(() => [
+  { value: "auto", label: t("settings.micGateAuto") },
+  { value: "fixed", label: t("settings.micGateFixed") },
+  { value: "off", label: t("settings.micGateOff") },
+])
+
+/** Reads the effective value, so a flag pinning it shows what is running. */
+async function loadMicGate() {
+  try {
+    const reply = await config()
+    if (reply.reply !== "config") return
+    const { effective, pinned } = reply as Extract<Reply, { reply: "config" }>
+    const value = effective.audio.mic_gate?.trim() ?? "auto"
+    gatePinned.value = pinned.includes("audio.mic_gate")
+    if (value === "auto" || value === "off") {
+      gateMode.value = value
+      return
+    }
+    const db = Number.parseFloat(value)
+    gateMode.value = "fixed"
+    if (Number.isFinite(db)) gateLevel.value = Math.round(Math.min(GATE_MAX, Math.max(GATE_MIN, db)))
+  } catch (e) {
+    toast.failure(e, { title: t("settings.micGateFailed") })
+  }
+}
+
+watch(
+  () => !!status.value,
+  (up) => {
+    if (up && gateMode.value === null) void loadMicGate()
+  },
+  { immediate: true },
+)
+
+async function saveMicGate() {
+  const value = gateMode.value === "fixed" ? String(gateLevel.value) : gateMode.value
+  if (!value) return
+  gateBusy.value = true
+  try {
+    const reply = await setMicGate(value)
+    if (reply.reply === "saved" && (reply.pinned as string[]).includes("audio.mic_gate")) {
+      toast.warning(t("settings.micGatePinned"))
+    } else {
+      toast.success(t("settings.saved"))
+    }
+  } catch (e) {
+    toast.failure(e, { title: t("settings.micGateFailed"), retry: saveMicGate })
+  } finally {
+    gateBusy.value = false
+  }
+}
+
+function setGateMode(mode: string) {
+  gateMode.value = mode as GateMode
+  void saveMicGate()
+}
 
 interface Autostart {
   node: boolean
@@ -56,6 +124,42 @@ async function restartNode() {
         <LpSection :title="t('settings.themeTitle')" :description="t('settings.themeDescription')" icon="lucide:palette" />
         <LpCard padded>
           <LpThemeSwitcher variant="swatch" show-label :aria-label="t('settings.themeTitle')" />
+        </LpCard>
+      </section>
+
+      <section v-if="status" class="flex flex-col gap-3">
+        <LpSection :title="t('settings.audioTitle')" icon="lucide:mic" />
+        <LpSkeleton v-if="!gateMode" rounded="card" class="h-24" />
+        <LpCard v-else padded class="flex flex-col gap-3">
+          <div class="flex flex-wrap items-center gap-4">
+            <div class="min-w-0 flex-1">
+              <p class="text-sm font-medium">{{ t("settings.micGate") }}</p>
+              <p class="text-xs text-muted">{{ t("settings.micGateHint") }}</p>
+            </div>
+            <LpSegmented
+              :model-value="gateMode"
+              :options="gateModes"
+              :disabled="gateBusy"
+              size="sm"
+              @update:model-value="setGateMode"
+            />
+          </div>
+          <div v-if="gateMode === 'fixed'" class="flex items-center gap-4">
+            <LpSlider
+              v-model="gateLevel"
+              :min="GATE_MIN"
+              :max="GATE_MAX"
+              :step="1"
+              :disabled="gateBusy"
+              :aria-label="t('settings.micGateLevel')"
+              class="flex-1"
+              @change="saveMicGate"
+            />
+            <span class="w-20 text-right font-mono text-xs tabular-nums">
+              {{ t("settings.micGateDb", { db: gateLevel }) }}
+            </span>
+          </div>
+          <p v-if="gatePinned" class="text-xs text-muted">{{ t("settings.micGatePinned") }}</p>
         </LpCard>
       </section>
 

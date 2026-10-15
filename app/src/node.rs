@@ -318,6 +318,40 @@ pub mod commands {
         .await
     }
 
+    /// The node has no command for one audio field, so this edits the file as
+    /// written (not the effective config, which would bake flags into it) and
+    /// hands the whole of it back. `value` is what the file takes: `auto`,
+    /// `off` or a level in dBFS.
+    ///
+    /// Checked here because the node does not check it on save: a running
+    /// node only declines to apply a bad value, but the file keeps it and the
+    /// next start fails on it. The rule is `audio_gate::MicGate`'s, which the
+    /// app cannot call — it lives behind the core's `audio` feature.
+    #[tauri::command]
+    pub async fn node_set_mic_gate(
+        link: State<'_, NodeLink>,
+        value: String,
+    ) -> Result<Reply, NodeError> {
+        let level_ok = value
+            .parse::<f32>()
+            .is_ok_and(|db| (-100.0..=0.0).contains(&db));
+        if !matches!(value.as_str(), "auto" | "off") && !level_ok {
+            return Err(NodeError::failed(format!(
+                "mic gate {value:?} is not \"auto\", \"off\" or a level in dBFS between -100 and 0"
+            )));
+        }
+        let mut config = match link.request(Command::Config).await? {
+            Reply::Config { file, .. } => *file,
+            other => {
+                return Err(NodeError::failed(format!(
+                    "the node answered a config request with {other:?}"
+                )));
+            }
+        };
+        config.audio.mic_gate = Some(value);
+        link.request(Command::SetConfig { config }).await
+    }
+
     #[tauri::command]
     pub async fn node_pair_show(link: State<'_, NodeLink>) -> Result<Reply, NodeError> {
         link.request(Command::PairShow).await

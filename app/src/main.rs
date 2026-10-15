@@ -137,6 +137,7 @@ fn main() {
             node::commands::node_config,
             node::commands::node_set_module,
             node::commands::node_set_position,
+            node::commands::node_set_mic_gate,
             node::commands::node_pair_show,
             node::commands::node_pair_enter,
             node::commands::node_pair_cancel,
