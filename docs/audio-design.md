@@ -113,6 +113,23 @@ playback clock causes crackle or growing lag.
 - **Clock:** the receiver resamples to its own device clock to absorb drift
   (details are a backend concern; the protocol carries timestamps/seq to make it
   possible).
+- **Silence gate:** the sender drops chunks nobody would hear
+  (`core/src/audio_gate.rs`), because an idle mirror pumping full-rate silence
+  is link capacity the cursor shares. Two questions, two answers:
+  - *application/device streams* ask "is the source idle?" — a fixed -60 dBFS
+    peak, just above the dither floor; an adaptive threshold would chop the
+    quiet passages of music;
+  - *microphones* ask "is someone speaking?" — `audio.mic_gate` (`--mic-gate`):
+    `auto` (default) tracks the mic's own noise floor (slow rise, fast fall)
+    and opens 9 dB above it, bounded to -72…-42 dBFS RMS; a number such as
+    `-55` fixes the RMS threshold; `off` sends everything while something on
+    the peer records from the mic. It applies live, without a restart, and the
+    health line logs the floor and threshold every 30 s.
+
+  Both hold the gate open for 1 s after the last sound. Judging each few-ms
+  chunk alone dropped word decays and the gaps between syllables, each of which
+  the receiver played as an underrun — speech was heard chopped, and a quiet
+  voice on a mic set low sat under -60 dBFS for whole words.
 
 ## Wire protocol
 

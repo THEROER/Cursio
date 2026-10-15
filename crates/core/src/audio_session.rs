@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use cursio_protocol::{AudioMsg, Message, ModuleId, PeerId};
 use cursio_transport::{TransportError, TransportTx};
 
+use crate::audio_gate::{Gate, GateKind, MicGate};
 use crate::module::SessionModule;
 
 /// Put one audio *control* message on the wire, enveloped for this module.
@@ -294,6 +295,13 @@ pub struct AudioEngine {
     unwanted_dropped: u64,
     /// Chunks skipped because they carried only silence.
     silent_dropped: u64,
+    /// Each outbound stream's silence gate. See [`crate::audio_gate`].
+    gates: HashMap<u32, Gate>,
+    /// How this machine's microphones are gated; read every pump, so a
+    /// change in the app applies without restarting the module.
+    mic_gate: crate::live::Shared<MicGate>,
+    /// The mic gate the last health line reported, so a change is logged once.
+    mic_gate_logged: Option<MicGate>,
     /// Chunks deferred because a single pump ran out of send budget.
     over_budget: u64,
     /// Chunks discarded as a stale backlog before they were ever encoded.
@@ -394,7 +402,12 @@ impl AudioEngine {
     ///
     /// `local_id` is *this* node's stable [`PeerId`]; it namespaces the stream
     /// ids we allocate.
-    pub fn new(local_id: PeerId, render_device: Option<String>, peer_name: String) -> Self {
+    pub fn new(
+        local_id: PeerId,
+        render_device: Option<String>,
+        mic_gate: crate::live::Shared<MicGate>,
+        peer_name: String,
+    ) -> Self {
         let id_base = id_base_for(local_id);
         let (tap_ready_tx, tap_ready_rx) = tokio::sync::mpsc::unbounded_channel();
         let (intent_sink_ready_tx, intent_sink_ready_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -442,6 +455,9 @@ impl AudioEngine {
             sent: 0,
             played: 0,
             silent_dropped: 0,
+            gates: HashMap::new(),
+            mic_gate,
+            mic_gate_logged: None,
             unwanted_streams: std::collections::HashSet::new(),
             demand_sent: HashMap::new(),
             unwanted_dropped: 0,
@@ -643,11 +659,16 @@ impl SessionModule for AudioEngine {
         // `routed_apps` holds `(stream_id, Capture)` — the per-app Remote Streams
         // born from Intent-Sink membership. Pump them alongside our mic taps.
         // (Device Intent Sinks carry no audio; they only observe membership.)
+        let mic_kind = GateKind::Mic(self.mic_gate.get());
         let routed = self
             .routed_apps
             .iter_mut()
-            .map(|(_, (sid, cap))| (&*sid, cap));
-        for (id, cap) in routed.chain(self.mic_captures.iter_mut()) {
+            .map(|(_, (sid, cap))| (&*sid, cap, GateKind::Program));
+        let mics = self
+            .mic_captures
+            .iter_mut()
+            .map(|(id, cap)| (id, cap, mic_kind));
+        for (id, cap, gate_kind) in routed.chain(mics) {
             // Stop as soon as the budget is gone, leaving the rest queued for
             // the next pump rather than discarding it. Dropping audible chunks
             // to stay under budget is itself heard as broken audio — the budget
@@ -714,8 +735,14 @@ impl SessionModule for AudioEngine {
                 // silence. Sending it wastes the link and — because input rides
                 // the same channel — is felt directly as mouse lag. Nothing is
                 // lost by dropping it: silence reconstructs as silence, and the
-                // receiver already fills gaps with silence on underrun.
-                if is_silent(&chunk.data) {
+                // receiver already fills gaps with silence on underrun. What
+                // counts as silence differs for a microphone; see `audio_gate`.
+                if !self
+                    .gates
+                    .entry(*id)
+                    .or_default()
+                    .admit(gate_kind, &chunk.data)
+                {
                     self.silent_dropped += 1;
                     continue;
                 }
@@ -1102,6 +1129,25 @@ impl AudioEngine {
             streams = self.playbacks.len(),
             "audio health"
         );
+
+        // The automatic threshold is invisible otherwise, and it is the first
+        // thing to look at when a peer says this mic cuts out.
+        let mode = self.mic_gate.get();
+        for id in self.mic_captures.keys() {
+            if let Some(gate) = self.gates.get(id) {
+                tracing::info!(
+                    id,
+                    ?mode,
+                    floor_dbfs = gate.floor_db(),
+                    auto_threshold_dbfs = gate.auto_threshold(),
+                    "mic gate"
+                );
+            }
+        }
+        if self.mic_gate_logged != Some(mode) {
+            self.mic_gate_logged = Some(mode);
+            tracing::info!(?mode, "microphones gated");
+        }
     }
 
     /// Turn Intent-Sink membership into per-app Remote Streams.
@@ -1433,6 +1479,7 @@ impl AudioEngine {
         // rather than inheriting a throttled encoder.
         self.encoders.remove(&stream_id);
         self.pending_packets.remove(&stream_id);
+        self.gates.remove(&stream_id);
         self.unacked.remove(&stream_id);
         self.sent_since_adapt.remove(&stream_id);
         self.caught_up_streak.remove(&stream_id);
@@ -2383,25 +2430,6 @@ fn drain_stale(
     dropped
 }
 
-/// Below this absolute sample value a chunk counts as silence.
-///
-/// Not exactly zero: a real capture path picks up dither and denormal noise, so
-/// an idle device rarely produces bit-perfect zeros.
-///
-/// **-60 dBFS**, and the exact value matters. It used to be 3.0e-5 (~-90 dBFS),
-/// which sits *below* one LSB of 16-bit audio (3.052e-5) — so a single flickering
-/// low bit, which is exactly what idle VoiceMeeter/VB-Cable endpoints produce,
-/// counted as sound. Measured effect: 477000 chunks sent versus 731 recognised
-/// as silent, i.e. the check was doing nothing while ~15 idle mirrors each
-/// pumped a full-rate stream. That flooded the send budget (over_budget=15241),
-/// and since input shares the channel it was heard as stuttering, crackling
-/// audio and felt as laggy input.
-///
-/// -60 dBFS is the conventional idle threshold for this job (snapcast uses a
-/// dBFS threshold the same way): far below anything audible in program material,
-/// yet a comfortable ~30 dB above the dither floor, so idle really reads as idle.
-const SILENCE_THRESHOLD: f32 = 1.0e-3;
-
 /// Decide a stream's next Opus bitrate from its current rate and its sent-vs-
 /// acked backlog (in chunks).
 ///
@@ -2418,17 +2446,6 @@ fn next_bitrate(current: u32, gap: u32) -> u32 {
     } else {
         current
     }
-}
-
-/// Is this chunk (f32 little-endian samples) inaudible?
-///
-/// Used to skip sending idle streams. Mis-classifying real audio as silence
-/// would drop it, so the threshold is deliberately conservative.
-fn is_silent(data: &[u8]) -> bool {
-    data.as_chunks::<4>()
-        .0
-        .iter()
-        .all(|b| f32::from_le_bytes(*b).abs() < SILENCE_THRESHOLD)
 }
 
 /// Width of one node's stream-id range. A node allocates devices at
@@ -2479,6 +2496,8 @@ pub struct AudioFactory {
     /// contains this. Shared so a change reaches the next engine built; the
     /// node restarts the module on every link to make that now.
     pub render_device: crate::live::Shared<Option<String>>,
+    /// How this machine's microphones are gated. Read live by every engine.
+    pub mic_gate: crate::live::Shared<MicGate>,
 }
 
 /// Whether this build has an audio backend at all.
@@ -2505,6 +2524,7 @@ impl crate::module::ModuleFactory for AudioFactory {
         Ok(Box::new(AudioEngine::new(
             ctx.local.peer_id,
             self.render_device.get(),
+            self.mic_gate.clone(),
             ctx.peer_name().to_string(),
         )))
     }
@@ -2675,51 +2695,6 @@ mod tests {
         }
     }
 
-    /// The silence threshold must sit ABOVE one LSB of 16-bit audio.
-    ///
-    /// Regression guard: it was once 3.0e-5, just *below* an s16 LSB (3.052e-5),
-    /// so a single flickering low bit — what idle virtual cables emit all day —
-    /// read as sound. Every idle mirror then streamed at full rate, exhausted the
-    /// send budget, and the audio the user actually wanted arrived stuttering.
-    #[test]
-    fn silence_threshold_is_above_the_16_bit_noise_floor() {
-        const S16_LSB: f32 = 1.0 / 32768.0;
-        const {
-            assert!(
-                SILENCE_THRESHOLD > S16_LSB,
-                "silence threshold must exceed one s16 LSB"
-            );
-        }
-    }
-
-    /// ...and still well below anything a listener would call audible, so real
-    /// quiet passages are never dropped.
-    #[test]
-    fn silence_threshold_still_passes_quiet_audio() {
-        // -50 dBFS: quiet, but unmistakably programme material.
-        let quiet = 10f32.powf(-50.0 / 20.0);
-        assert!(
-            quiet > SILENCE_THRESHOLD,
-            "quiet audio at -50 dBFS ({quiet:e}) must not be classified as silence"
-        );
-    }
-
-    #[test]
-    fn is_silent_detects_idle_and_active_streams() {
-        // A buffer of s16 dither-level noise: idle.
-        let lsb = (1.0f32 / 32768.0).to_le_bytes();
-        let idle: Vec<u8> = lsb.iter().cycle().take(4 * 64).copied().collect();
-        assert!(is_silent(&idle), "one-LSB noise should count as silence");
-
-        // Real audio anywhere in the buffer means the whole chunk is audible.
-        let mut active = idle.clone();
-        active[..4].copy_from_slice(&0.5f32.to_le_bytes());
-        assert!(
-            !is_silent(&active),
-            "a loud sample must mark the chunk as audio"
-        );
-    }
-
     /// A sustained backlog must lower the bitrate; a caught-up link must raise it;
     /// a mid-range gap must hold. This is the degrade-not-buffer rule in numbers.
     #[test]
@@ -2858,7 +2833,12 @@ mod tests {
     }
 
     fn engine() -> AudioEngine {
-        AudioEngine::new(PeerId::new_v4(), None, "peer".into())
+        AudioEngine::new(
+            PeerId::new_v4(),
+            None,
+            crate::live::Shared::new(MicGate::Auto),
+            "peer".into(),
+        )
     }
 
     fn route(id: u32, device: Option<&str>) -> cursio_protocol::RouteEntry {

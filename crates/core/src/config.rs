@@ -66,6 +66,8 @@ pub enum ConfigError {
     },
     #[error("cannot serialize the config: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error("{0}")]
+    Invalid(String),
 }
 
 /// The default listening port. Stable rather than ephemeral: peers cache the
@@ -164,6 +166,10 @@ pub struct Modules {
 pub struct AudioConfig {
     /// Windows: render peers' audio into the output whose name contains this.
     pub render_device: Option<String>,
+    /// What a peer recording from this machine's microphones hears: `auto`
+    /// (follow the mic's noise floor, the default), `off`, or a level in dBFS
+    /// such as `-55`. See `audio_gate::MicGate`.
+    pub mic_gate: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +325,9 @@ impl Config {
         if o.audio_render_device.is_some() {
             self.audio.render_device = o.audio_render_device.clone();
         }
+        if o.audio_mic_gate.is_some() {
+            self.audio.mic_gate = o.audio_mic_gate.clone();
+        }
         set(&mut self.airplay.mode, &o.airplay_mode);
         set(&mut self.airplay.window, &o.airplay_window);
         set(&mut self.airplay.share, &o.airplay_share);
@@ -347,6 +356,7 @@ pub struct Overrides {
     pub remote_screen: Option<bool>,
     pub screen_host: Option<bool>,
     pub audio_render_device: Option<String>,
+    pub audio_mic_gate: Option<String>,
     pub airplay_mode: Option<String>,
     pub airplay_window: Option<bool>,
     pub airplay_share: Option<bool>,
@@ -358,7 +368,7 @@ pub struct Overrides {
 impl Overrides {
     /// The config fields a flag holds fixed, named as they are in the file.
     pub fn pinned(&self) -> Vec<&'static str> {
-        let fields: [(&'static str, bool); 16] = [
+        let fields: [(&'static str, bool); 17] = [
             ("port", self.port.is_some()),
             ("position", self.position.is_some()),
             ("modules.input", self.input.is_some()),
@@ -369,6 +379,7 @@ impl Overrides {
             ("modules.remote_screen", self.remote_screen.is_some()),
             ("modules.screen_host", self.screen_host.is_some()),
             ("audio.render_device", self.audio_render_device.is_some()),
+            ("audio.mic_gate", self.audio_mic_gate.is_some()),
             ("airplay.mode", self.airplay_mode.is_some()),
             ("airplay.window", self.airplay_window.is_some()),
             ("airplay.share", self.airplay_share.is_some()),

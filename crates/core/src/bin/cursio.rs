@@ -167,6 +167,10 @@ struct MeshArgs {
     /// (Windows only; ignored elsewhere, with a line in the log saying so).
     #[arg(long)]
     audio_render_device: Option<String>,
+    /// What a peer recording from this machine's microphones hears: `auto`
+    /// (follow the mic's noise floor), `off`, or a level in dBFS such as -55.
+    #[arg(long, allow_hyphen_values = true)]
+    mic_gate: Option<String>,
     /// Share the clipboard with peers (text, images, and other formats).
     #[arg(long, overrides_with = "no_clipboard")]
     clipboard: bool,
@@ -320,6 +324,7 @@ impl MeshArgs {
             remote_screen: switch(self.remote_screen, self.no_remote_screen),
             screen_host: switch(self.screen_host, self.no_screen_host),
             audio_render_device: self.audio_render_device.clone(),
+            audio_mic_gate: self.mic_gate.clone(),
             airplay_mode: self.airplay.clone(),
             airplay_window: switch(self.airplay_window, self.no_airplay_window),
             airplay_share: switch(self.share_airplay, self.no_share_airplay),
@@ -761,11 +766,15 @@ async fn run() -> anyhow::Result<()> {
             let files_share =
                 Shared::new(share_policy(&files_share_flag, config.files.share.clone())?);
             let render_device = Shared::new(config.audio.render_device.clone());
+            let mic_gate = Shared::new(cursio_core::audio_gate::MicGate::from_config(
+                config.audio.mic_gate.as_deref(),
+            )?);
             let applier: cursio_core::control::Applier = {
                 let live = live.clone();
                 let screen_host = screen_host.clone();
                 let files_share = files_share.clone();
                 let render_device = render_device.clone();
+                let mic_gate = mic_gate.clone();
                 std::sync::Arc::new(move |running, next| {
                     let mut plan = cursio_core::live::plan(running, next);
                     if let Some(on) = plan.screen_host {
@@ -788,6 +797,12 @@ async fn run() -> anyhow::Result<()> {
                     }
                     if let Some(device) = &plan.render_device {
                         render_device.set(device.clone());
+                    }
+                    if let Some(gate) = &plan.mic_gate {
+                        match cursio_core::audio_gate::MicGate::from_config(gate.as_deref()) {
+                            Ok(gate) => mic_gate.set(gate),
+                            Err(error) => tracing::warn!(%error, "keeping the running mic gate"),
+                        }
                     }
                     if let Some(spec) = &plan.mac_modifiers {
                         if let Err(error) = apply_modifier_map(spec) {
@@ -889,6 +904,7 @@ async fn run() -> anyhow::Result<()> {
             // on nothing names a specific module.
             let modules = module_registry(
                 render_device,
+                mic_gate,
                 files_share,
                 live.switches(),
                 WindowOpts {
@@ -1510,6 +1526,7 @@ fn prompt_password(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
 fn module_registry(
     // Windows: render the peer's audio into this output device (by name).
     render_device: Shared<Option<String>>,
+    mic_gate: Shared<cursio_core::audio_gate::MicGate>,
     files_share: Shared<cursio_files::SharePolicy>,
     switches: cursio_core::module::ModuleSwitches,
     window: WindowOpts,
@@ -1527,6 +1544,7 @@ fn module_registry(
         .with(Box::new(cursio_core::audio_session::AudioFactory {
             enabled: true,
             render_device,
+            mic_gate,
         }))
         .with(Box::new(cursio_core::clipboard_session::ClipboardFactory {
             enabled: true,

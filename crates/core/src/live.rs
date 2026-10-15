@@ -216,6 +216,8 @@ pub struct Plan {
     pub files_share_changed: bool,
     pub render_device: Option<Option<String>>,
     pub mac_modifiers: Option<String>,
+    /// Read by a running audio module on every pump, so it needs no restart.
+    pub mic_gate: Option<Option<String>>,
 }
 
 /// What applying `next` over `running` takes.
@@ -246,6 +248,9 @@ pub fn plan(running: &Config, next: &Config) -> Plan {
     }
     if running.input.mac_modifiers != next.input.mac_modifiers {
         plan.mac_modifiers = Some(next.input.mac_modifiers.clone());
+    }
+    if running.audio.mic_gate != next.audio.mic_gate {
+        plan.mic_gate = Some(next.audio.mic_gate.clone());
     }
     plan
 }
@@ -314,6 +319,17 @@ mod tests {
         let plan = plan(&running, &next);
         assert_eq!(plan.restart, vec![ModuleId::WINDOW, ModuleId::AUDIO]);
         assert_eq!(plan.render_device, Some(Some("Speakers".into())));
+    }
+
+    #[test]
+    fn the_mic_gate_changes_without_restarting_audio() {
+        let running = Config::default();
+        let mut next = running.clone();
+        next.audio.mic_gate = Some("-55".into());
+        let plan = plan(&running, &next);
+        assert!(plan.restart.is_empty());
+        assert_eq!(plan.mic_gate, Some(Some("-55".into())));
+        assert!(restart_needed(&running, &next).is_empty());
     }
 
     #[test]

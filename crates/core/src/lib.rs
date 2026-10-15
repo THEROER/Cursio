@@ -21,6 +21,8 @@
 #[cfg(feature = "airplay")]
 pub mod airplay_window;
 #[cfg(feature = "audio")]
+pub mod audio_gate;
+#[cfg(feature = "audio")]
 pub mod audio_session;
 pub mod clipboard_session;
 /// What `cursio mesh` runs, read from `config.toml` and overridden by flags.
