@@ -58,8 +58,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// `subscribe`, and status pushed with id 0. v4: the node's `pid`, `build`
 /// and `installed_version`, so the app can show and roll back what runs. v5:
 /// `update` in the status and `update_apply`, for builds from the mesh. v6:
-/// `forget`, removing a machine from the mesh.
-pub const CONTROL_VERSION: u32 = 6;
+/// `forget`, removing a machine from the mesh. v7: `streams` in the status and
+/// `set_stream_volume`, the listener's volume on each peer stream.
+pub const CONTROL_VERSION: u32 = 7;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -156,6 +157,17 @@ pub enum Command {
     Forget {
         peer: PeerId,
     },
+    /// Set the listener's volume (linear, up to [`MAX_LOCAL_VOLUME`]) and
+    /// mute on one peer stream playing here. See [`crate::mixer`].
+    ///
+    /// [`MAX_LOCAL_VOLUME`]: crate::mixer::MAX_LOCAL_VOLUME
+    SetStreamVolume {
+        // Not `id`: a command is flattened into its `Request`, whose own `id`
+        // would collide with it on the wire.
+        stream: u32,
+        volume: f32,
+        muted: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -215,6 +227,10 @@ pub struct Status {
     /// Builds arriving over the mesh. Defaulted from a v4 node.
     #[serde(default)]
     pub update: crate::update::agent::UpdateStatus,
+    /// Peer streams playing here, with the listener's volume on each.
+    /// Defaulted from a v6 node.
+    #[serde(default)]
+    pub streams: Vec<crate::mixer::MixerStream>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -307,6 +323,9 @@ pub struct NodeState {
     /// Tells the running mesh a machine was removed; set by the binary, which
     /// owns the links. Without one, removal is the on-disk half alone.
     on_forget: Arc<Mutex<Option<Forgetter>>>,
+    /// The listener's per-stream volumes; the same one the audio factory
+    /// hands every engine. See [`NodeState::mixer`].
+    mixer: crate::mixer::LocalMixer,
 }
 
 /// Carries a removal into the running node. See [`NodeState::set_on_forget`].
@@ -350,6 +369,7 @@ impl NodeState {
             restart: Arc::new(tokio::sync::Notify::new()),
             revision: Arc::new(tokio::sync::watch::channel(0).0),
             on_forget: Arc::new(Mutex::new(None)),
+            mixer: crate::mixer::LocalMixer::default(),
         }
     }
 
@@ -391,6 +411,12 @@ impl NodeState {
 
     fn changed(&self) {
         self.revision.send_modify(|r| *r = r.wrapping_add(1));
+    }
+
+    /// The listener's per-stream volumes, for the audio factory to share
+    /// with every engine, so what the socket sets is what plays.
+    pub fn mixer(&self) -> crate::mixer::LocalMixer {
+        self.mixer.clone()
     }
 
     /// Resolves each time something a status shows changes.
@@ -542,6 +568,7 @@ impl NodeState {
             problems: crate::diagnostics::snapshot(),
             pairing: self.pairing.state(),
             update: crate::update::agent::status(),
+            streams: self.mixer.streams(),
         }
     }
 
@@ -644,6 +671,18 @@ impl NodeState {
                 },
             },
             Command::Forget { peer } => self.forget(peer),
+            Command::SetStreamVolume {
+                stream,
+                volume,
+                muted,
+            } => {
+                if self.mixer.set(stream, volume, muted) {
+                    self.changed();
+                    Reply::Done
+                } else {
+                    error(format!("no stream {stream} is playing here"))
+                }
+            }
         }
     }
 
@@ -722,6 +761,11 @@ mod tests {
             Command::Forget {
                 peer: PeerId::from_u128(3),
             },
+            Command::SetStreamVolume {
+                stream: 4,
+                volume: 0.5,
+                muted: true,
+            },
         ];
         for (id, command) in commands.into_iter().enumerate() {
             let request = Request {
@@ -741,6 +785,30 @@ mod tests {
         };
         let line = serde_json::to_string(&reply).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), reply);
+    }
+
+    #[test]
+    fn a_stream_volume_reaches_the_engines_mixer_and_the_status() {
+        let dir = temp_dir("volume");
+        let node = state(&dir, Overrides::default());
+        let refused = node.handle(Command::SetStreamVolume {
+            stream: 7,
+            volume: 0.5,
+            muted: false,
+        });
+        assert!(matches!(refused, Reply::Error { .. }), "got {refused:?}");
+
+        let engines = node.mixer();
+        engines.add(7, "Nocturne", "Firefox");
+        let reply = node.handle(Command::SetStreamVolume {
+            stream: 7,
+            volume: 0.5,
+            muted: false,
+        });
+        assert_eq!(reply, Reply::Done);
+        assert_eq!(engines.level(7), 0.5);
+        assert_eq!(node.status().streams[0].volume, 0.5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

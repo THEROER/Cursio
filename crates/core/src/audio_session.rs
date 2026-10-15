@@ -17,6 +17,7 @@ use cursio_protocol::{AudioMsg, Message, ModuleId, PeerId};
 use cursio_transport::{TransportError, TransportTx};
 
 use crate::audio_gate::{Gate, GateKind, MicGate};
+pub use crate::mixer::LocalMixer;
 use crate::module::SessionModule;
 
 /// Put one audio *control* message on the wire, enveloped for this module.
@@ -2533,91 +2534,6 @@ pub struct AudioFactory {
     pub mixer: LocalMixer,
 }
 
-/// The streams playing on this machine as a local UI shows them, and the
-/// volume and mute that UI set on each.
-///
-/// The owner of a stream already has a knob for it (`AudioGain`, driven from
-/// the owner's side); this is the listener's, for a machine whose own mixer
-/// cannot reach a peer's stream by name — a phone, where every stream Cursio
-/// plays is one app to the system and the volume rocker moves all of them.
-/// Shared by every link's engine, read and set by whatever draws the UI.
-#[derive(Clone, Default)]
-pub struct LocalMixer(std::sync::Arc<std::sync::Mutex<MixerState>>);
-
-#[derive(Default)]
-struct MixerState {
-    streams: std::collections::BTreeMap<u32, MixerStream>,
-    generation: u64,
-}
-
-/// One stream playing here.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct MixerStream {
-    pub id: u32,
-    pub peer: String,
-    pub name: String,
-    /// Linear, 1.0 = as sent.
-    pub volume: f32,
-    pub muted: bool,
-}
-
-impl LocalMixer {
-    fn state(&self) -> std::sync::MutexGuard<'_, MixerState> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    pub fn streams(&self) -> Vec<MixerStream> {
-        self.state().streams.values().cloned().collect()
-    }
-
-    /// Set one stream's volume and mute. False if no such stream plays here.
-    pub fn set(&self, id: u32, volume: f32, muted: bool) -> bool {
-        let mut state = self.state();
-        let Some(stream) = state.streams.get_mut(&id) else {
-            return false;
-        };
-        stream.volume = volume.clamp(0.0, MAX_LOCAL_VOLUME);
-        stream.muted = muted;
-        state.generation += 1;
-        true
-    }
-
-    /// A stream started playing. A playback reopened on another device keeps
-    /// the volume it had.
-    fn add(&self, id: u32, peer: &str, name: &str) {
-        self.state()
-            .streams
-            .entry(id)
-            .or_insert_with(|| MixerStream {
-                id,
-                peer: peer.to_owned(),
-                name: name.to_owned(),
-                volume: 1.0,
-                muted: false,
-            });
-    }
-
-    fn remove(&self, id: u32) {
-        self.state().streams.remove(&id);
-    }
-
-    /// The factor this stream's audio is scaled by here.
-    fn level(&self, id: u32) -> f32 {
-        self.state()
-            .streams
-            .get(&id)
-            .map_or(1.0, |s| if s.muted { 0.0 } else { s.volume })
-    }
-
-    fn generation(&self) -> u64 {
-        self.state().generation
-    }
-}
-
-/// Loudest a listener may set a stream: half again over what was sent, enough
-/// for a quiet source without inviting clipping.
-const MAX_LOCAL_VOLUME: f32 = 1.5;
-
 /// Whether this build has an audio backend at all.
 ///
 /// Unlike files — where serving is portable and only mounting needs the OS —
@@ -2812,38 +2728,6 @@ mod tests {
             assert!(base >= ID_RANGE, "range started at or below zero: {base}");
             assert_eq!(base % ID_RANGE, 0, "ranges should be aligned: {base}");
         }
-    }
-
-    #[test]
-    fn the_local_mixer_scales_mutes_and_refuses_unknown_streams() {
-        let mixer = LocalMixer::default();
-        assert!(!mixer.set(7, 0.5, false), "nothing plays as stream 7 yet");
-        mixer.add(7, "Nocturne", "Firefox");
-        assert_eq!(mixer.level(7), 1.0);
-        let before = mixer.generation();
-        assert!(mixer.set(7, 0.5, false));
-        assert_eq!(mixer.level(7), 0.5);
-        assert_ne!(
-            mixer.generation(),
-            before,
-            "a change must be seen by engines"
-        );
-        assert!(mixer.set(7, 0.5, true));
-        assert_eq!(mixer.level(7), 0.0);
-        assert!(mixer.set(7, 9.0, false));
-        assert_eq!(mixer.level(7), MAX_LOCAL_VOLUME);
-    }
-
-    #[test]
-    fn a_reopened_playback_keeps_its_local_volume() {
-        let mixer = LocalMixer::default();
-        mixer.add(7, "Nocturne", "Firefox");
-        mixer.set(7, 0.3, false);
-        mixer.add(7, "Nocturne", "Firefox");
-        assert_eq!(mixer.level(7), 0.3);
-        mixer.remove(7);
-        assert_eq!(mixer.level(7), 1.0);
-        assert!(mixer.streams().is_empty());
     }
 
     /// A sustained backlog must lower the bitrate; a caught-up link must raise it;

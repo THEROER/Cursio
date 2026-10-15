@@ -58,6 +58,7 @@ pub mod live;
 pub mod logging;
 pub mod mesh;
 pub mod metrics;
+pub mod mixer;
 pub mod module;
 /// Running each session module on a thread of its own, off the loop the
 /// shared cursor rides.

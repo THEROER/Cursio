@@ -905,6 +905,7 @@ async fn run() -> anyhow::Result<()> {
             let modules = module_registry(
                 render_device,
                 mic_gate,
+                control.mixer(),
                 files_share,
                 live.switches(),
                 WindowOpts {
@@ -1527,6 +1528,7 @@ fn module_registry(
     // Windows: render the peer's audio into this output device (by name).
     render_device: Shared<Option<String>>,
     mic_gate: Shared<cursio_core::audio_gate::MicGate>,
+    mixer: cursio_core::mixer::LocalMixer,
     files_share: Shared<cursio_files::SharePolicy>,
     switches: cursio_core::module::ModuleSwitches,
     window: WindowOpts,
@@ -1545,7 +1547,7 @@ fn module_registry(
             enabled: true,
             render_device,
             mic_gate,
-            mixer: cursio_core::audio_session::LocalMixer::default(),
+            mixer,
         }))
         .with(Box::new(cursio_core::clipboard_session::ClipboardFactory {
             enabled: true,
