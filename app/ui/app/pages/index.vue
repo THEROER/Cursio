@@ -120,7 +120,7 @@ function presenceTone(p: PeerView) {
         <LpSection :title="t('modules.title')" :description="t('modules.description')" icon="lucide:blocks" />
         <LpCard padded>
           <ul class="flex flex-col divide-y divide-line">
-            <li v-for="s in MODULES" :key="s.key" class="flex items-center gap-4 py-3 first:pt-0 last:pb-0">
+            <li v-for="s in offeredModules(status.available)" :key="s.key" class="flex items-center gap-4 py-3 first:pt-0 last:pb-0">
               <LpIcon :name="s.icon" :size="18" class="shrink-0 text-muted" />
               <div class="min-w-0 flex-1">
                 <p class="flex items-center gap-2 text-sm font-medium">

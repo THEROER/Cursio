@@ -21,6 +21,28 @@ export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 export const mobileRequest = (what: PhoneGrant) => invoke<PhoneSetup>("mobile_request", { what })
 
 /**
+ * Bring the phone's node down and up again. Links greet peers only when they
+ * come up, so a change such as a new name reaches them through this.
+ */
+export const mobileRestart = () => invoke<void>("mobile_restart")
+
+/** A peer's output device the phone's sound can play on. Mirrors the app's audio target. */
+export interface PhoneAudioTarget {
+  key: number
+  name: string
+  /** The phone's sound goes here now. */
+  routed: boolean
+}
+
+export const phoneAudioTargets = () => invoke<PhoneAudioTarget[]>("phone_audio_targets")
+
+/**
+ * Send everything the phone plays to `target`, or stop with `null`. Resolves
+ * only after Android's capture consent; rejects with its reason when declined.
+ */
+export const phoneAudioRoute = (target: number | null) => invoke<void>("phone_audio_route", { target })
+
+/**
  * The user's own word that autostart is allowed, kept because the phone
  * cannot report it: without this the hint would stay on the home page forever.
  */

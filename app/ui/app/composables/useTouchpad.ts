@@ -3,12 +3,13 @@ import { invoke } from "@tauri-apps/api/core"
 /**
  * What the Rust side reports about the link. Mirrors `touchpad::Status`.
  */
-export type TouchpadStatus =
-  | { state: "idle" }
-  | { state: "searching" }
-  | { state: "connecting"; peer: string }
-  | { state: "connected"; peer: string }
-  | { state: "failed"; reason: string }
+export type TouchpadStatus = { state: "idle" } | { state: "connected"; peer: string }
+
+/** A machine the touchpad can drive: a peer with a live link. Mirrors `touchpad::Target`. */
+export interface TouchpadTarget {
+  id: string
+  name: string
+}
 
 export type MouseButtonName = "left" | "middle" | "right"
 
@@ -43,11 +44,19 @@ export function useTouchpad() {
   const status = ref<TouchpadStatus>({ state: "idle" })
   /** Set when an event had nowhere to go, so the UI can stop pretending. */
   const linkLost = ref(false)
+  const targets = ref<TouchpadTarget[]>([])
+  /** The id last pointed at; the status names the peer only by name. */
+  const drivenId = ref<string | null>(null)
+  const connecting = ref(false)
+  /** Why the last pick did not take, in the node's words. */
+  const connectError = ref<string | null>(null)
 
   const isConnected = computed(() => status.value.state === "connected")
-  const isBusy = computed(
-    () => status.value.state === "searching" || status.value.state === "connecting",
-  )
+  const driven = computed(() => {
+    const s = status.value
+    if (s.state !== "connected") return null
+    return targets.value.find((t) => t.id === drivenId.value) ?? targets.value.find((t) => t.name === s.peer) ?? null
+  })
 
   let pendingX = 0
   let pendingY = 0
@@ -139,25 +148,55 @@ export function useTouchpad() {
     delivered(ok)
   }
 
-  async function connect(password: string) {
-    linkLost.value = false
-    status.value = { state: "searching" }
-    await call("touchpad_connect", { password })
+  /** Point the touchpad at `peer` (an id), or at the only linked machine. */
+  async function connect(peer?: string) {
+    connecting.value = true
+    try {
+      await invoke("touchpad_connect", peer ? { peer } : {})
+      drivenId.value = peer ?? (targets.value.length === 1 ? targets.value[0]!.id : null)
+      connectError.value = null
+      linkLost.value = false
+    } catch (error) {
+      connectError.value = String(error)
+    } finally {
+      connecting.value = false
+      await refreshStatus()
+    }
+  }
+
+  async function refreshTargets() {
+    const next = await call<TouchpadTarget[]>("touchpad_targets")
+    if (!next) return
+    targets.value = next
+    // One machine leaves nothing to choose, so asking would only add a tap
+    // before every use. With several, guessing would drive whichever the user
+    // was not looking at.
+    if (status.value.state === "idle" && next.length === 1 && !connecting.value) await connect()
   }
 
   async function refreshStatus() {
     const next = await call<TouchpadStatus>("touchpad_status")
-    if (next) {
-      status.value = next
-      if (next.state === "connected") linkLost.value = false
-    }
+    if (!next) return
+    const was = status.value.state
+    status.value = next
+    if (next.state === "connected") linkLost.value = false
+    else drivenId.value = null
+    if (was !== next.state) void refreshTargets()
   }
+
+  // A link coming or going is what changes the targets, and the node pushes
+  // its status on exactly that.
+  const { status: node } = useNode()
+  watch(
+    () => node.value?.peers.map((p) => `${p.id}:${p.presence}:${p.name}`).join(),
+    () => void refreshTargets(),
+  )
 
   // Polled rather than pushed: the status changes a handful of times per link,
   // and an event channel for that is more machinery than it earns.
   let timer: ReturnType<typeof setInterval> | undefined
   onMounted(() => {
-    void refreshStatus()
+    void refreshStatus().then(refreshTargets)
     timer = setInterval(refreshStatus, 500)
   })
   onBeforeUnmount(() => clearInterval(timer))
@@ -166,8 +205,12 @@ export function useTouchpad() {
     status,
     linkLost,
     isConnected,
-    isBusy,
+    targets,
+    driven,
+    connecting,
+    connectError,
     connect,
+    refreshTargets,
     click,
     surface: {
       onPointerdown: onPointerDown,

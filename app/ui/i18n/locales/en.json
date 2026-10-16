@@ -337,24 +337,44 @@
     "restarting": "Restarting; peers reconnect in a few seconds.",
     "restartFailed": "The node was not restarted",
     "restartTitle": "Restart the node?",
-    "restartBody": "Every link drops for a few seconds and peers' disks unmount while it comes back. Only needed for settings marked as waiting for a restart."
+    "restartBody": "Every link drops for a few seconds and peers' disks unmount while it comes back. Only needed for settings marked as waiting for a restart.",
+    "nameTitle": "This machine's name",
+    "nameDescription": "What other machines in the mesh call this one.",
+    "nameLabel": "Name",
+    "rename": "Rename",
+    "nameEmpty": "A name cannot be empty",
+    "nameTooLong": "A name is at most {max} characters",
+    "renamed": "Renamed. Peers see the new name after the node restarts.",
+    "renamedPhone": "Renamed. Cursio is restarting on this phone so peers see the new name.",
+    "renameFailed": "The name was not changed",
+    "namePhoneHint": "Renaming restarts Cursio on this phone; its links drop for a few seconds.",
+    "nameWaits": "Peers still see the old name until the node restarts."
   },
-  "connection": {
-    "password": "Pairing password",
-    "passwordHint": "Only needed the first time these two devices meet",
-    "connect": "Connect",
-    "connecting": "Connecting",
-    "disconnected": "Not connected",
-    "searching": "Looking for a computer on this network",
-    "connectingTo": "Connecting to {peer}",
-    "connectedTo": "Connected to {peer}",
-    "failed": "Connection failed"
+  "phoneAudio": {
+    "title": "Phone audio → computer",
+    "description": "Play what this phone plays on one of your machines' outputs.",
+    "device": "Output device",
+    "off": "Off — play on this phone",
+    "playingOn": "Playing on {device}",
+    "none": "No connected machine offers an output device.",
+    "limits": "Android lets apps capture media and game sound only from apps that allow it. Calls and notifications are never captured.",
+    "routed": "This phone's sound now plays on the computer",
+    "stopped": "This phone's sound plays here again",
+    "routeFailed": "The phone's sound was not redirected",
+    "listFailed": "The output devices could not be read"
+  },
+  "touchpad": {
+    "driving": "Driving {peer}",
+    "notDriving": "Not driving a machine",
+    "target": "Machine to drive",
+    "choose": "Choose a machine"
   },
   "pad": {
-    "idle": "Connect to start controlling your computer",
+    "idle": "Choose a machine above to start controlling it",
+    "noTargets": "No paired machine is connected to this phone. Pair one, or check that it is running.",
     "ready": "Slide a finger to move the pointer",
     "hints": "Tap to click · Two fingers to scroll",
-    "lost": "The link is gone — connect again"
+    "lost": "That machine's link is gone; the pad picks it up again when it comes back"
   },
   "buttons": {
     "left": "Left",

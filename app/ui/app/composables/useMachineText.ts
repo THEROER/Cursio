@@ -18,6 +18,17 @@ export const MODULES: ModuleMeta[] = [
   { key: "screen_host", label: "modules.screenHost", hint: "modules.screenHostHint", icon: "lucide:monitor-up" },
 ]
 
+/**
+ * The switches worth offering on this machine. A switch the build cannot act
+ * on only writes a config line nothing reads, which reads to the user as a
+ * module that is on and does nothing. An empty `available` is a node older
+ * than control v8, which never said, so everything stays on offer.
+ */
+export function offeredModules(available: ModuleSwitch[] | undefined): ModuleMeta[] {
+  if (!available?.length) return MODULES
+  return MODULES.filter((m) => available.includes(m.key))
+}
+
 export const KIND_ICON: Record<LinkView["device_kind"], string> = {
   Desktop: "lucide:monitor",
   Laptop: "lucide:laptop",

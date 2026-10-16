@@ -94,6 +94,11 @@ export interface NodeStatusReply {
   }
   peers: PeerView[]
   modules: Modules
+  /**
+   * The switches this build can act on. Empty from a node older than control
+   * v8, which said nothing about it.
+   */
+  available: ModuleSwitch[]
   pinned: string[]
   /** Settings changed since the node started that only a restart applies. */
   restart_needed: string[]
@@ -242,6 +247,7 @@ export function useNode() {
     pendingSwitches,
     setModule,
     setPosition: (p: Position) => call<Reply>("node_set_position", { x: p.x, y: p.y }),
+    setName: (name: string) => call<Reply>("node_set_name", { name }),
     config: () => call<Reply>("node_config"),
     setMicGate: (value: string) => call<Reply>("node_set_mic_gate", { value }),
     setStreamVolume: (stream: number, volume: number, muted: boolean) =>

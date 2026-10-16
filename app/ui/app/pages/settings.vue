@@ -3,9 +3,56 @@ import { invoke } from "@tauri-apps/api/core"
 import type { Reply } from "~/composables/useNode"
 
 const { t } = useI18n()
-const { status, restart, config, setMicGate } = useNode()
+const { status, restart, config, setMicGate, setName } = useNode()
 const { isMobile, ready } = usePlatform()
 const toast = useCursioToast()
+
+/** `identity::MAX_NAME_CHARS`; the node refuses anything longer. */
+const NAME_MAX = 40
+
+const nameDraft = ref("")
+const nameBusy = ref(false)
+
+// Follows the node's name, so a rename from elsewhere (the CLI, a restart)
+// shows; it never changes while the user types, so their draft survives.
+watch(
+  () => status.value?.node.name,
+  (name) => {
+    if (name !== undefined) nameDraft.value = name
+  },
+  { immediate: true },
+)
+
+const nameTrimmed = computed(() => nameDraft.value.trim())
+/** Counted in characters, as the node counts, not UTF-16 units. */
+const nameError = computed(() => {
+  if (!nameTrimmed.value) return t("settings.nameEmpty")
+  if ([...nameTrimmed.value].length > NAME_MAX) return t("settings.nameTooLong", { max: NAME_MAX })
+  return undefined
+})
+const nameChanged = computed(() => !!status.value && nameTrimmed.value !== status.value.node.name)
+const nameWaitsForRestart = computed(() => !isMobile.value && !!status.value?.restart_needed.includes("name"))
+
+async function saveName() {
+  if (!nameChanged.value || nameError.value) return
+  nameBusy.value = true
+  try {
+    await setName(nameTrimmed.value)
+    if (isMobile.value) {
+      // The phone's links greet peers with the name only when they come up,
+      // and nothing here is costly to bring back, so it restarts at once
+      // rather than leaving peers on the old name until the next reboot.
+      await mobileRestart()
+      toast.success(t("settings.renamedPhone"))
+    } else {
+      toast.success(t("settings.renamed"))
+    }
+  } catch (e) {
+    toast.failure(e, { title: t("settings.renameFailed"), retry: saveName })
+  } finally {
+    nameBusy.value = false
+  }
+}
 
 type GateMode = "auto" | "fixed" | "off"
 const GATE_MIN = -80
@@ -124,6 +171,28 @@ async function restartNode() {
 <template>
   <DesktopShell>
     <div class="flex flex-col gap-6">
+      <section v-if="status" class="flex flex-col gap-3">
+        <LpSection :title="t('settings.nameTitle')" :description="t('settings.nameDescription')" icon="lucide:tag" />
+        <LpCard padded class="flex flex-col gap-3">
+          <form class="flex flex-wrap items-end gap-3" @submit.prevent="saveName">
+            <LpInput
+              v-model="nameDraft"
+              :label="t('settings.nameLabel')"
+              :error="nameChanged ? nameError : undefined"
+              :disabled="nameBusy"
+              class="min-w-0 flex-1 basis-56"
+            />
+            <LpButton type="submit" variant="solid" :disabled="!nameChanged || !!nameError || nameBusy">
+              {{ nameBusy ? t("common.working") : t("settings.rename") }}
+            </LpButton>
+          </form>
+          <p v-if="isMobile" class="text-xs text-muted">{{ t("settings.namePhoneHint") }}</p>
+          <LpAlert v-else-if="nameWaitsForRestart" variant="warning" :title="t('settings.nameWaits')">
+            <LpButton variant="soft" size="sm" @click="confirmRestart = true">{{ t("settings.restart") }}</LpButton>
+          </LpAlert>
+        </LpCard>
+      </section>
+
       <section class="flex flex-col gap-3">
         <LpSection :title="t('settings.themeTitle')" :description="t('settings.themeDescription')" icon="lucide:palette" />
         <LpCard padded>
@@ -165,6 +234,11 @@ async function restartNode() {
           </div>
           <p v-if="gatePinned" class="text-xs text-muted">{{ t("settings.micGatePinned") }}</p>
         </LpCard>
+      </section>
+
+      <section v-if="status && isMobile" class="flex flex-col gap-3">
+        <LpSection :title="t('phoneAudio.title')" :description="t('phoneAudio.description')" icon="lucide:speaker" />
+        <PhoneAudioCard />
       </section>
 
       <section v-if="status" class="flex flex-col gap-3">

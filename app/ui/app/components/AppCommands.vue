@@ -255,7 +255,7 @@ const commands = computed<Command[]>(() => {
       modeLabel: t("palette.modulesMode"),
       childPlaceholder: t("palette.moduleSearch"),
       noPreview: true,
-      children: MODULES.map((m) => ({
+      children: offeredModules(s.available).map((m) => ({
         id: `module:${m.key}`,
         label: t(m.label),
         description: s.modules[m.key] ? t("palette.on") : t("palette.off"),
