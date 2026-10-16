@@ -187,6 +187,7 @@ pub fn run() {
             node::commands::node_start,
             mobile::commands::mobile_setup,
             mobile::commands::mobile_request,
+            mobile::commands::mobile_restart,
         ]);
 
     builder

@@ -80,6 +80,21 @@ pub fn start_service(app: &AppHandle) -> Result<(), String> {
 pub mod commands {
     use super::*;
 
+    /// Bring the node down and up again, so its links greet peers with what
+    /// changed — a new name, most often. The service does it, since the node
+    /// is the service's.
+    #[tauri::command]
+    pub async fn mobile_restart(app: AppHandle) -> Result<(), String> {
+        let plugin = plugin(&app)?;
+        tauri::async_runtime::spawn_blocking(move || {
+            plugin.run_mobile_plugin::<serde_json::Value>("restartService", ())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map(drop)
+        .map_err(|e| e.to_string())
+    }
+
     #[tauri::command]
     pub async fn mobile_setup(app: AppHandle) -> Result<Setup, String> {
         let plugin = plugin(&app)?;
