@@ -944,6 +944,11 @@ async fn run() -> anyhow::Result<()> {
                     },
                 },
             );
+            // Every desktop has an input backend; the rest follow the build.
+            control.set_available(cursio_core::control::ModuleSwitch::available(
+                &modules.available(),
+                true,
+            ));
             let mesh = run_mesh(
                 identity.clone(),
                 port,

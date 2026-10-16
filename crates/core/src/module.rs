@@ -135,6 +135,13 @@ pub trait ModuleFactory: Send + Sync {
     /// where a module's `#[cfg]` belongs, rather than in `main`.
     fn advert(&self) -> Option<ModuleAdvert>;
 
+    /// Whether this platform has a backend for the module at all, answered
+    /// without the cost `advert` may carry. A window offers a switch only for
+    /// what is supported; a factory with no platform split keeps the default.
+    fn supported(&self) -> bool {
+        true
+    }
+
     /// Construct the module for one session.
     ///
     /// Called only when negotiation agreed on this module's id, so an
@@ -219,6 +226,17 @@ impl ModuleRegistry {
             .iter()
             .filter(|f| self.switches.is_on(f.id()))
             .filter_map(|f| f.advert())
+            .collect()
+    }
+
+    /// Every module this build could run here, switched on or not — what a
+    /// window may offer a switch for. Asks [`ModuleFactory::supported`], never
+    /// `advert`, for the cost reason above.
+    pub fn available(&self) -> Vec<ModuleId> {
+        self.factories
+            .iter()
+            .filter(|f| f.supported())
+            .map(|f| f.id())
             .collect()
     }
 

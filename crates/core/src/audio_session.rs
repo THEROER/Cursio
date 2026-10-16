@@ -2553,6 +2553,10 @@ impl crate::module::ModuleFactory for AudioFactory {
         ModuleId::AUDIO
     }
 
+    fn supported(&self) -> bool {
+        SUPPORTED
+    }
+
     fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
         (self.enabled && SUPPORTED)
             .then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::AUDIO, VERSION))

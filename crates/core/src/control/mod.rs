@@ -59,8 +59,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// and `installed_version`, so the app can show and roll back what runs. v5:
 /// `update` in the status and `update_apply`, for builds from the mesh. v6:
 /// `forget`, removing a machine from the mesh. v7: `streams` in the status and
-/// `set_stream_volume`, the listener's volume on each peer stream.
-pub const CONTROL_VERSION: u32 = 7;
+/// `set_stream_volume`, the listener's volume on each peer stream. v8:
+/// `set_name`, and `available` in the status.
+pub const CONTROL_VERSION: u32 = 8;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -93,6 +94,31 @@ pub enum ModuleSwitch {
 }
 
 impl ModuleSwitch {
+    /// The switches a node built from `modules` can act on. Input is not a
+    /// registry module, so whether it can is the caller's to say; one window
+    /// module answers for both screen switches.
+    pub fn available(modules: &[cursio_protocol::ModuleId], input: bool) -> Vec<Self> {
+        use cursio_protocol::ModuleId;
+        let mut switches = Vec::new();
+        if input {
+            switches.push(Self::Input);
+        }
+        for (id, switch) in [
+            (ModuleId::CLIPBOARD, Self::Clipboard),
+            (ModuleId::AUDIO, Self::Audio),
+            (ModuleId::FILES, Self::Files),
+            (ModuleId::USB, Self::Usb),
+        ] {
+            if modules.contains(&id) {
+                switches.push(switch);
+            }
+        }
+        if modules.contains(&ModuleId::WINDOW) {
+            switches.extend([Self::RemoteScreen, Self::ScreenHost]);
+        }
+        switches
+    }
+
     fn field(self) -> &'static str {
         match self {
             Self::Input => "modules.input",
@@ -161,6 +187,11 @@ pub enum Command {
     /// mute on one peer stream playing here. See [`crate::mixer`].
     ///
     /// [`MAX_LOCAL_VOLUME`]: crate::mixer::MAX_LOCAL_VOLUME
+    /// Rename this machine. Saved at once; peers see it once their links are
+    /// brought up again, so the status names `name` until a restart.
+    SetName {
+        name: String,
+    },
     SetStreamVolume {
         // Not `id`: a command is flattened into its `Request`, whose own `id`
         // would collide with it on the wire.
@@ -216,6 +247,11 @@ pub struct Status {
     pub peers: Vec<PeerView>,
     /// What this node is configured to offer, after flags.
     pub modules: crate::config::Modules,
+    /// The switches this build can act on; the rest name modules it has no
+    /// backend for, which a window should not offer. Empty from a v7 node,
+    /// which means "unknown", not "none".
+    #[serde(default)]
+    pub available: Vec<ModuleSwitch>,
     pub pinned: Vec<String>,
     /// Settings changed since start that only a restart applies, named as in
     /// the file. Empty when what runs is what the file says.
@@ -295,6 +331,10 @@ struct Inner {
     node: NodeView,
     known: Vec<KnownPeerView>,
     links: BTreeMap<PeerId, (String, LinkView)>,
+    /// The name this process greets peers with, while it differs from the
+    /// saved one: links carry a name from their greeting.
+    greeted_as: Option<String>,
+    available: Vec<ModuleSwitch>,
 }
 
 /// The daemon's state as the control socket sees it.
@@ -359,6 +399,8 @@ impl NodeState {
                 },
                 known: Vec::new(),
                 links: BTreeMap::new(),
+                greeted_as: None,
+                available: Vec::new(),
             })),
             config_path,
             overrides,
@@ -411,6 +453,32 @@ impl NodeState {
 
     fn changed(&self) {
         self.revision.send_modify(|r| *r = r.wrapping_add(1));
+    }
+
+    /// Which module switches this build can act on. Set once by whoever built
+    /// the module registry, which is the only place that knows.
+    pub fn set_available(&self, available: Vec<ModuleSwitch>) {
+        self.inner().available = available;
+        self.changed();
+    }
+
+    fn rename(&self, name: &str) -> Reply {
+        let mut identity = match crate::NodeIdentity::load_or_create() {
+            Ok(identity) => identity,
+            Err(e) => return error(e),
+        };
+        if let Err(e) = identity.rename(name) {
+            return error(e);
+        }
+        {
+            let mut inner = self.inner();
+            if inner.greeted_as.is_none() {
+                inner.greeted_as = Some(inner.node.name.clone());
+            }
+            inner.node.name = identity.display_name;
+        }
+        self.changed();
+        Reply::Done
     }
 
     /// The listener's per-stream volumes, for the audio factory to share
@@ -554,14 +622,24 @@ impl NodeState {
         }
         peers.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         let node = inner.node.clone();
+        let renamed = inner
+            .greeted_as
+            .as_ref()
+            .is_some_and(|greeted| *greeted != node.name);
+        let available = inner.available.clone();
         drop(inner);
         let running = self.running();
+        let mut restart_needed = crate::live::restart_needed(&self.started, &running);
+        if renamed {
+            restart_needed.push("name".to_owned());
+        }
         Status {
             version: CONTROL_VERSION,
             node,
             peers,
             modules: running.modules,
-            restart_needed: crate::live::restart_needed(&self.started, &running),
+            available,
+            restart_needed,
             pinned: self.pinned(),
             config_path: self.config_path.clone(),
             latency: crate::metrics::input_latency(),
@@ -671,6 +749,7 @@ impl NodeState {
                 },
             },
             Command::Forget { peer } => self.forget(peer),
+            Command::SetName { name } => self.rename(&name),
             Command::SetStreamVolume {
                 stream,
                 volume,

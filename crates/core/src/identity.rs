@@ -38,6 +38,22 @@ impl NodeIdentity {
         }
     }
 
+    /// Change the name peers show for this machine and keep it.
+    ///
+    /// Peers learn a name from the greeting, so links already up keep the old
+    /// one until they are brought up again.
+    pub fn rename(&mut self, name: &str) -> anyhow::Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("a machine's name cannot be empty");
+        }
+        if name.chars().count() > MAX_NAME_CHARS {
+            anyhow::bail!("a machine's name is at most {MAX_NAME_CHARS} characters");
+        }
+        self.display_name = name.to_owned();
+        self.save()
+    }
+
     fn save(&self) -> anyhow::Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
@@ -58,6 +74,17 @@ impl NodeIdentity {
             .ok_or_else(|| anyhow::anyhow!("cannot resolve config directory"))?;
         Ok(dirs.config_dir().join("identity.json"))
     }
+}
+
+/// Longest name a machine may take. mDNS labels stop at 63 bytes, and a name
+/// longer than this is one no peer list or notification shows whole anyway.
+const MAX_NAME_CHARS: usize = 40;
+
+/// Whether this name is one the node chose for itself rather than the user —
+/// what a phone replaces with its own name, since Android's hostname is a
+/// meaningless `localhost`.
+pub fn is_default_name(name: &str) -> bool {
+    name == default_display_name() || name == "localhost" || name == "cursio-node"
 }
 
 /// Best-effort hostname, falling back to a generic label.
