@@ -2538,11 +2538,15 @@ pub struct AudioFactory {
 ///
 /// Unlike files — where serving is portable and only mounting needs the OS —
 /// both halves of audio are the platform's: PipeWire on Linux, WASAPI plus the
-/// virtual device on Windows, and nothing on macOS yet. Advertising it anyway
-/// is the exact failure module negotiation exists to prevent: the peer agrees
-/// to run audio, then every device enumeration comes back empty and every
-/// inbound stream is refused one warning at a time.
-const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "windows"));
+/// virtual device on Windows, AAudio on Android, and nothing on macOS yet.
+/// Advertising it anyway is the exact failure module negotiation exists to
+/// prevent: the peer agrees to run audio, then every device enumeration comes
+/// back empty and every inbound stream is refused one warning at a time.
+const SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "android"
+));
 
 impl crate::module::ModuleFactory for AudioFactory {
     fn id(&self) -> ModuleId {
