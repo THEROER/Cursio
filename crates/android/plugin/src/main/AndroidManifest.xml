@@ -20,6 +20,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Capturing what the phone plays for a peer rides a MediaProjection,
+         which Android 14+ lets only a mediaProjection-typed service hold. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- Since Android 13 the ongoing notification a foreground service shows
          is itself permission-gated. Denied, the service still runs. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -47,7 +50,7 @@
         <service
             android:name="dev.cursio.mesh.MeshService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice|mediaPlayback|microphone" />
+            android:foregroundServiceType="connectedDevice|mediaPlayback|microphone|mediaProjection" />
 
         <receiver
             android:name="dev.cursio.mesh.BootReceiver"

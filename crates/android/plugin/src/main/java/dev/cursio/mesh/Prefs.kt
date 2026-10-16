@@ -2,23 +2,16 @@ package dev.cursio.mesh
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.os.Build
 
 /** What the user chose, kept across restarts of the app and the phone. */
 object Prefs {
     private const val FILE = "cursio"
-    private const val KEY_NAME = "display_name"
     private const val KEY_WANTED = "wanted_running"
     private const val KEY_ASKED_MICROPHONE = "asked_microphone"
     private const val KEY_OPENED_AUTOSTART = "opened_autostart"
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-
-    fun displayName(context: Context): String =
-        prefs(context).getString(KEY_NAME, null)?.takeIf { it.isNotBlank() } ?: defaultName()
-
-    private fun defaultName(): String = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android"
 
     /**
      * Whether the user last left the node running. This, not whether the

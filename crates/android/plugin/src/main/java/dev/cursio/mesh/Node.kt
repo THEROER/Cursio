@@ -1,6 +1,8 @@
 package dev.cursio.mesh
 
 import android.content.Context
+import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -37,7 +39,7 @@ object Node {
     private var initialized = false
 
     @Volatile
-    private var runningName: String? = null
+    private var reportUnavailable = false
 
     /** Load the library and point it at this install's private directory. */
     @Synchronized
@@ -59,23 +61,33 @@ object Node {
 
     fun statusLine(): String = if (isRunning()) CursioNative.nativeStatusLine() else loadError ?: "starting"
 
-    /**
-     * Start the node as [name], or restart it if it is running under another
-     * name. Peers learn the name in `Hello`, so a rename only reaches them
-     * through a new link.
-     */
-    fun startOrRename(context: Context, name: String) {
+    /** Start the node unless it is already running. */
+    fun start(context: Context) {
         val app = context.applicationContext
         lifecycle.execute {
-            if (!init(app)) return@execute
-            if (CursioNative.nativeIsRunning()) {
-                if (runningName == name) return@execute
-                CursioNative.nativeStop()
+            if (!init(app) || CursioNative.nativeIsRunning()) return@execute
+            startNow(app)
+        }
+    }
+
+    /**
+     * Stop a running node and start it again, then call [done] with null or
+     * the reason it failed. Peers learn the name in `Hello`, so a rename only
+     * reaches them through new links. A node that is not running stays down:
+     * starting one here would put it outside the foreground service.
+     */
+    fun restart(context: Context, done: (String?) -> Unit) {
+        val app = context.applicationContext
+        lifecycle.execute {
+            val error = when {
+                !init(app) -> loadError ?: "the native node is not available"
+                !CursioNative.nativeIsRunning() -> null
+                else -> {
+                    CursioNative.nativeStop()
+                    if (startNow(app)) null else "the node did not start again"
+                }
             }
-            if (CursioNative.nativeStart(name, 0)) {
-                runningName = name
-                Log.i(TAG, "node started as \"$name\"")
-            }
+            done(error)
         }
     }
 
@@ -83,7 +95,44 @@ object Node {
         lifecycle.execute {
             if (!initialized) return@execute
             CursioNative.nativeStop()
-            runningName = null
         }
     }
+
+    /**
+     * Pass a reading on to the node. Ignored until [init] has succeeded:
+     * before that the library may not load at all, and [init] is where that
+     * failure is caught and named.
+     */
+    fun reportStatus(battery: Int, power: String, network: String, signalDbm: Int) {
+        if (!initialized || reportUnavailable) return
+        try {
+            CursioNative.nativeReportStatus(battery, power, network, signalDbm)
+        } catch (e: UnsatisfiedLinkError) {
+            // A library older than this Kotlin: the node runs without a
+            // reading, which is what it shows peers anyway, so say it once.
+            reportUnavailable = true
+            Log.w(TAG, "this native library cannot take a device status", e)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "the node refused a device status", e)
+        }
+    }
+
+    private fun startNow(app: Context): Boolean {
+        val name = deviceName(app)
+        return try {
+            CursioNative.nativeStart(name, 0).also { if (it) Log.i(TAG, "node started (default name \"$name\")") }
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "starting the node failed", e)
+            false
+        }
+    }
+
+    /**
+     * The name the user gave this phone in its own settings, which is what
+     * they will look for on a peer; the model is all that is left without one.
+     */
+    private fun deviceName(context: Context): String =
+        Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)?.takeIf { it.isNotBlank() }
+            ?: Build.MODEL?.takeIf { it.isNotBlank() }
+            ?: "Android"
 }

@@ -44,8 +44,10 @@ object CursioNative {
      * Returns false when a node is already running — the ordinary case when
      * Android restarts a service that was never really gone.
      *
-     * @param displayName what peers show for this phone. Android's hostname is
-     *   a meaningless `localhost` on most devices, so a name is passed in.
+     * @param displayName the name a node with none of its own starts under.
+     *   Android's hostname is a meaningless `localhost` on most devices, so
+     *   one is passed in; once the identity file holds a name the user chose,
+     *   that name wins and this one is ignored.
      * @param port 0 to let the OS choose.
      */
     external fun nativeStart(displayName: String, port: Int): Boolean
@@ -63,4 +65,25 @@ object CursioNative {
 
     /** One line for the service notification: what this node can see. */
     external fun nativeStatusLine(): String
+
+    /**
+     * Hand the node this phone's power and network reading.
+     *
+     * Every argument has an "cannot say" value, and it must be used rather
+     * than zero: a 0% battery or a 0 dBm signal is a reading, and peers would
+     * treat the phone as about to vanish.
+     *
+     * @param battery percent, or -1 when unknown.
+     * @param power `"battery"`, `"charging"`, `"mains"`, or `""` when unknown.
+     * @param network `"wifi"`, `"cellular"`, `"wired"`, `"unknown"` (connected
+     *   over something else), or `""` when there is no connection.
+     * @param signalDbm Wi-Fi RSSI, or [Int.MIN_VALUE] when unknown.
+     */
+    external fun nativeReportStatus(battery: Int, power: String, network: String, signalDbm: Int): Boolean
+
+    /**
+     * Hand the node the first [len] samples of [samples]: what this phone is
+     * playing, interleaved stereo f32 at 48 kHz, for the peer it is routed to.
+     */
+    external fun nativePushPlayback(samples: FloatArray, len: Int)
 }

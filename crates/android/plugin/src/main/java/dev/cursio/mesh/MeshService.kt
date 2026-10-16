@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.media.projection.MediaProjectionManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
@@ -18,6 +19,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.ServiceCompat
+import androidx.core.content.IntentCompat
 
 /**
  * What keeps the node alive on a phone.
@@ -46,6 +48,11 @@ import androidx.core.app.ServiceCompat
  * then upgrades the running service in place. Claimed while visible, the
  * microphone stays usable after the user leaves the app.
  *
+ * `mediaProjection` is held only while the phone's playback is being captured
+ * for a peer (`PlaybackCapture`), and dropped when that stops: Android shows a
+ * "sharing your screen" indicator for as long as it is held, and its consent
+ * is single-use, so a sticky restart could never reclaim it anyway.
+ *
  * ## Battery optimisation is a separate ask
  *
  * The foreground service is what prevents Doze from freezing this process.
@@ -61,6 +68,8 @@ class MeshService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLocks: List<WifiManager.WifiLock> = emptyList()
+    private lateinit var deviceStatus: DeviceStatus
+    private var capture: PlaybackCapture? = null
 
     /** Keeps the notification's status line current while the service runs. */
     private val refresh = object : Runnable {
@@ -77,6 +86,8 @@ class MeshService : Service() {
         // this directory, and reading them first would resolve them against a
         // path that does not exist.
         Node.init(this)
+        deviceStatus = DeviceStatus(this).also { it.start() }
+        instance = this
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -92,16 +103,24 @@ class MeshService : Service() {
         // nothing that can block belongs before this line. A null intent is a
         // sticky restart, which happens in the background by definition.
         val fromForeground = intent?.getBooleanExtra(EXTRA_FROM_FOREGROUND, false) ?: false
-        if (!enterForeground(fromForeground)) {
+        val capturing = intent?.action == ACTION_CAPTURE
+        if (!enterForeground(fromForeground, projection = capturing || capture != null)) {
+            takePendingCapture()?.invoke("Android refused to keep the Cursio service in the foreground")
             stopSelf()
             return START_NOT_STICKY
         }
 
         acquireLocks()
-        Node.startOrRename(this, Prefs.displayName(this))
+        Node.start(this)
 
         handler.removeCallbacks(refresh)
         handler.postDelayed(refresh, REFRESH_INTERVAL_MS)
+
+        if (capturing) {
+            val error = beginCapture(intent!!)
+            if (error != null) Log.w(TAG, "playback capture did not start: $error")
+            takePendingCapture()?.invoke(error)
+        }
 
         // START_STICKY: if the system reclaims this process under memory
         // pressure, bring it back. A mesh node that stays gone until the user
@@ -116,12 +135,24 @@ class MeshService : Service() {
      * `IllegalStateException` (`ForegroundServiceStartNotAllowedException`) for
      * a background start; both mean "less", not "nothing".
      */
-    private fun enterForeground(fromForeground: Boolean): Boolean {
+    private fun enterForeground(fromForeground: Boolean, projection: Boolean = capture != null): Boolean {
         // What the service already holds is asked for again, so a start that
-        // may claim less (a rename, a sticky restart) does not quietly drop the
-        // microphone the window claimed earlier.
+        // may claim less (a sticky restart) does not quietly drop the
+        // microphone the window claimed earlier. The projection type is the
+        // exception: it is held exactly while a capture needs it, and the
+        // fallbacks without it leave the caller to see it missing.
+        val extra = if (projection) projectionType() else 0
+        val held = activeTypes and projectionType().inv()
         val allowed = wantedTypes(fromForeground)
-        for (types in listOf(allowed or activeTypes, allowed, baseType()).distinct()) {
+        val candidates = listOf(
+            allowed or held or extra,
+            allowed or extra,
+            baseType() or extra,
+            allowed or held,
+            allowed,
+            baseType(),
+        )
+        for (types in candidates.distinct()) {
             try {
                 ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), types)
                 activeTypes = types
@@ -147,6 +178,60 @@ class MeshService : Service() {
         }
         return types
     }
+
+    /**
+     * Start capturing what the phone plays, from the consent the window
+     * obtained, or say why not. The service must already hold the projection
+     * type: Android 14 refuses `getMediaProjection` to a service without it.
+     */
+    private fun beginCapture(intent: Intent): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "capturing playback needs Android 10 or later"
+        if (!micGranted(this)) return "Android captures playback only for an app allowed to use the microphone"
+        if (activeTypes and projectionType() == 0) return "Android refused the screen-capture service type"
+        val data = IntentCompat.getParcelableExtra(intent, EXTRA_PROJECTION, Intent::class.java)
+            ?: return "the screen-capture consent was missing"
+        val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+
+        // A consent is good for one projection, so a capture already running
+        // gives way to the one the user just approved.
+        capture?.stop()
+        capture = null
+
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        val error = try {
+            val projection = manager.getMediaProjection(code, data)
+            if (projection == null) {
+                "Android did not accept the screen-capture consent"
+            } else {
+                var started: PlaybackCapture? = null
+                started = PlaybackCapture.start(projection, handler) {
+                    if (capture != null && capture === started) endCapture(fromForeground = false)
+                }
+                capture = started
+                null
+            }
+        } catch (e: SecurityException) {
+            "Android refused the projection: ${e.message}"
+        } catch (e: RuntimeException) {
+            "capturing playback failed: ${e.message ?: e.javaClass.simpleName}"
+        }
+        if (error != null) enterForeground(fromForeground = true, projection = false)
+        return error
+    }
+
+    /** Stop capturing playback and give up the projection type it needed. */
+    private fun endCapture(fromForeground: Boolean) {
+        capture?.stop()
+        capture = null
+        if (activeTypes and projectionType() != 0) enterForeground(fromForeground, projection = false)
+    }
+
+    private fun projectionType(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        } else {
+            0
+        }
 
     private fun baseType(): Int =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -217,6 +302,11 @@ class MeshService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacks(refresh)
+        deviceStatus.stop()
+        capture?.stop()
+        capture = null
+        takePendingCapture()?.invoke("the Cursio service stopped")
+        instance = null
         activeTypes = 0
         // Queued on the lifecycle thread, which blocks until the listener is
         // closed; a start that follows is queued behind it and so binds a
@@ -288,6 +378,9 @@ class MeshService : Service() {
 
         private const val ACTION_STOP = "dev.cursio.mesh.STOP"
         private const val EXTRA_FROM_FOREGROUND = "dev.cursio.mesh.FROM_FOREGROUND"
+        private const val ACTION_CAPTURE = "dev.cursio.mesh.CAPTURE_PLAYBACK"
+        private const val EXTRA_RESULT_CODE = "dev.cursio.mesh.RESULT_CODE"
+        private const val EXTRA_PROJECTION = "dev.cursio.mesh.PROJECTION"
 
         /** The foreground types the running service holds; 0 when it is not running. */
         @Volatile
@@ -303,8 +396,8 @@ class MeshService : Service() {
             context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
         /**
-         * Start the node, or bring a running one up to date with the stored
-         * name and the types this caller may claim.
+         * Start the node, or widen a running one to the types this caller
+         * may claim.
          *
          * @param fromForeground true only from the visible window: it is what
          *   allows the microphone type, and claiming it from anywhere else is
@@ -318,6 +411,47 @@ class MeshService : Service() {
 
         fun stop(context: Context) {
             context.stopService(Intent(context, MeshService::class.java))
+        }
+
+        private val main = Handler(Looper.getMainLooper())
+
+        /** Touched only on the main thread, like every service callback. */
+        private var instance: MeshService? = null
+
+        private var pendingCapture: ((String?) -> Unit)? = null
+
+        private fun takePendingCapture(): ((String?) -> Unit)? = pendingCapture.also { pendingCapture = null }
+
+        /**
+         * Capture what the phone plays, from a projection consent the window
+         * just obtained; [done] gets null once audio is flowing, or the reason
+         * it is not. Must run on the main thread and from the visible window:
+         * the projection type is claimed by this start.
+         *
+         * @throws IllegalStateException when Android refuses the start.
+         */
+        fun startPlaybackCapture(context: Context, resultCode: Int, data: Intent, done: (String?) -> Unit) {
+            takePendingCapture()?.invoke("a newer request to share playback replaced this one")
+            pendingCapture = done
+            val intent = Intent(context, MeshService::class.java)
+                .setAction(ACTION_CAPTURE)
+                .putExtra(EXTRA_FROM_FOREGROUND, true)
+                .putExtra(EXTRA_RESULT_CODE, resultCode)
+                .putExtra(EXTRA_PROJECTION, data)
+            try {
+                context.startForegroundService(intent)
+            } catch (e: IllegalStateException) {
+                pendingCapture = null
+                throw e
+            }
+        }
+
+        /** Stop capturing playback, then call [done] on the main thread. */
+        fun stopPlaybackCapture(done: () -> Unit) {
+            main.post {
+                instance?.endCapture(fromForeground = true)
+                done()
+            }
         }
     }
 }

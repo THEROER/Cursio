@@ -5,6 +5,8 @@ import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionConfig
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.util.Log
 import androidx.activity.result.ActivityResult
@@ -52,6 +54,72 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         } else {
             invoke.reject("Android refused to start the Cursio service")
         }
+    }
+
+    /** Restart a running node so its links greet peers with what changed, a new name most often. */
+    @Command
+    fun restartService(invoke: Invoke) {
+        Node.restart(activity) { error ->
+            if (error == null) invoke.resolve() else invoke.reject(error)
+        }
+    }
+
+    /**
+     * Ask the user to let Cursio capture what the phone plays, and resolve
+     * once audio is flowing. Asked every time: a consent starts exactly one
+     * projection.
+     */
+    @Command
+    fun startPlaybackCapture(invoke: Invoke) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            invoke.reject("sharing this phone's playback needs Android 10 or later")
+            return
+        }
+        if (!MeshService.micGranted(activity)) {
+            invoke.reject("allow Cursio the microphone first: Android captures playback only under that permission")
+            return
+        }
+        if (!Prefs.wantedRunning(activity)) {
+            invoke.reject("start Cursio before sharing this phone's playback")
+            return
+        }
+        val manager = activity.getSystemService(MediaProjectionManager::class.java)
+        // Without a config Android 14+ also offers sharing a single app; what
+        // a peer should hear is everything the phone plays, so the whole
+        // display is the only choice offered.
+        val consent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            manager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+        } else {
+            manager.createScreenCaptureIntent()
+        }
+        try {
+            startActivityForResult(invoke, consent, "projectionAnswered")
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "no screen-capture consent dialog", e)
+            invoke.reject("this phone has no screen-capture consent dialog")
+        }
+    }
+
+    @ActivityCallback
+    private fun projectionAnswered(invoke: Invoke, result: ActivityResult) {
+        val data = result.data
+        if (result.resultCode != Activity.RESULT_OK || data == null) {
+            invoke.reject("sharing this phone's playback was declined")
+            return
+        }
+        try {
+            MeshService.startPlaybackCapture(activity, result.resultCode, data) { error ->
+                if (error == null) invoke.resolve() else invoke.reject(error)
+            }
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "starting playback capture was refused", e)
+            invoke.reject("Android refused to start capturing playback")
+        }
+    }
+
+    @Command
+    fun stopPlaybackCapture(invoke: Invoke) {
+        MeshService.stopPlaybackCapture { invoke.resolve() }
     }
 
     @Command
