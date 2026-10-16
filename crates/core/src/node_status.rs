@@ -379,6 +379,13 @@ pub fn report(
     network: Option<cursio_protocol::NetworkKind>,
     signal_dbm: Option<i16>,
 ) {
+    tracing::info!(
+        ?battery,
+        ?source,
+        ?network,
+        ?signal_dbm,
+        "the app reported power and network"
+    );
     *platform::REPORTED.lock().unwrap_or_else(|p| p.into_inner()) = platform::Reported {
         battery: battery.map(|b| b.min(100)),
         source,

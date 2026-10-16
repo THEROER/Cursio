@@ -635,6 +635,7 @@ where
         modules,
         poll_status,
         None,
+        None,
     )
     .await
 }
@@ -662,6 +663,9 @@ pub async fn run_session_live<F, G, H>(
     modules: Vec<Box<dyn crate::module::SessionModule>>,
     mut poll_status: H,
     live: Option<crate::reconfigure::LinkLive<'_>>,
+    // Who is on the other end, so what it later reports about its power and
+    // network replaces what its greeting said wherever the node shows it.
+    peer: Option<PeerId>,
 ) -> Result<(), SessionError>
 where
     F: FnMut(cursio_protocol::InputEvent),
@@ -1027,12 +1031,15 @@ where
                 };
                 match incoming {
                     Some(Message::Heartbeat { nonce }) => tracing::trace!(nonce, "peer heartbeat"),
-                    // The peer's power or network changed. Logged rather than
-                    // acted on: nothing routes by it yet, and a peer whose
-                    // battery is draining is exactly the thing a user later
-                    // finds in a log asking why a transfer moved.
+                    // The peer's power or network changed. Nothing routes by it
+                    // yet, but the window shows it: only the greeting's reading
+                    // used to be kept, so a network a phone reported a moment
+                    // after connecting never appeared.
                     Some(Message::NodeStatus(status)) => {
                         tracing::info!(%status, "peer status changed");
+                        if let Some(peer) = peer {
+                            crate::metrics::note_peer_status(peer, status);
+                        }
                     }
                     Some(Message::Input(event)) => {
                         // Inject only while active (we hold the cursor).

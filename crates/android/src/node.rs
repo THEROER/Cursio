@@ -557,6 +557,7 @@ async fn run_link(
         link.modules,
         || ctx.status.borrow_mut().poll(&mut status_cursor),
         None,
+        Some(peer.peer_id),
     )
     .await;
     lock(&ctx.shared.inputs).remove(&peer.peer_id);

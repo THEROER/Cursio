@@ -2384,6 +2384,7 @@ async fn run_pairing_and_session(
         built,
         move || status_ref.borrow_mut().poll(&mut status_cursor),
         Some(live_link),
+        Some(peer_id),
     )
     .await;
 

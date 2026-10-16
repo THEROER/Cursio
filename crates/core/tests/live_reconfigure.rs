@@ -207,6 +207,7 @@ fn run_side(
             built,
             || None,
             Some(link),
+            None,
         )
         .await
     });
