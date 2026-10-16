@@ -160,11 +160,199 @@ fn disconnect_reporter(wake: std_mpsc::Sender<Wake>) -> ndk::audio::AudioStreamE
     })
 }
 
-/// This phone's microphone, recorded for a peer.
+/// The one "application" a phone can route to a peer device: everything it
+/// plays. Android lets an app capture other apps' playback only as a whole
+/// mix (AudioPlaybackCapture), so there is no per-app list to offer.
+pub const PHONE_PLAYBACK_NODE: u32 = 1;
+pub const PHONE_PLAYBACK_NAME: &str = "Phone";
+
+/// This phone's microphone or its playback, recorded for a peer.
 pub struct AndroidSource {
     adverts_rx: tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta>,
     chunks_rx: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
-    wake: std_mpsc::Sender<Wake>,
+    /// The microphone's owning thread; `None` for the playback tap, which the
+    /// JVM feeds and which therefore has no stream of its own to own.
+    wake: Option<std_mpsc::Sender<Wake>>,
+    /// Set for the playback tap, so dropping it stops what the JVM pushes
+    /// from reaching a receiver nobody reads.
+    playback: Option<AudioStreamId>,
+}
+
+/// Where the JVM's captured playback goes: the open playback tap, if any.
+struct PlaybackSink {
+    id: AudioStreamId,
+    chunks: tokio::sync::mpsc::UnboundedSender<AudioChunk>,
+    seq: u32,
+    frames: u64,
+}
+
+static PLAYBACK: std::sync::Mutex<Option<PlaybackSink>> = std::sync::Mutex::new(None);
+
+/// Hand in a block of what this phone is playing, as interleaved stereo f32 at
+/// 48 kHz — the JVM's AudioPlaybackCapture output. Dropped when no peer device
+/// is routed to, so capture can run ahead of the route without piling up.
+pub fn push_playback(samples: &[f32]) {
+    let mut slot = PLAYBACK.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(sink) = slot.as_mut() else {
+        return;
+    };
+    let frames = (samples.len() / CHANNELS) as u64;
+    let data = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let chunk = AudioChunk {
+        id: sink.id,
+        seq: sink.seq,
+        timestamp: sink.frames,
+        data,
+    };
+    sink.seq = sink.seq.wrapping_add(1);
+    sink.frames += frames;
+    if sink.chunks.send(chunk).is_err() {
+        *slot = None;
+    }
+}
+
+impl AndroidSource {
+    /// What this phone plays, as the stream routed to a peer device.
+    pub fn playback_tap(id: AudioStreamId) -> Result<Self, AudioError> {
+        let (adverts_tx, adverts_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (chunks_tx, chunks_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = adverts_tx.send(AudioStreamMeta {
+            id,
+            role: StreamRole::Playback,
+            app_name: Some(PHONE_PLAYBACK_NAME.into()),
+            device: None,
+            format: wire_format(),
+            codec: AudioCodec::RawPcm,
+        });
+        *PLAYBACK.lock().unwrap_or_else(|p| p.into_inner()) = Some(PlaybackSink {
+            id,
+            chunks: chunks_tx,
+            seq: 0,
+            frames: 0,
+        });
+        Ok(Self {
+            adverts_rx,
+            chunks_rx,
+            wake: None,
+            playback: Some(id),
+        })
+    }
+}
+
+/// A peer device this phone can send its playback to — one per device a
+/// linked peer advertised. The phone's version of a desktop's Intent Sink:
+/// there is no system mixer to route an app into a device here, so the user
+/// picks one in the app and [`route_playback`] turns that choice into the same
+/// membership events a PipeWire Intent Sink produces.
+pub struct AndroidIntentSink {
+    key: u64,
+    events_rx: tokio::sync::mpsc::UnboundedReceiver<crate::IntentSinkEvent>,
+}
+
+struct SinkEntry {
+    key: u64,
+    description: String,
+    events: tokio::sync::mpsc::UnboundedSender<crate::IntentSinkEvent>,
+}
+
+#[derive(Default)]
+struct Sinks {
+    entries: Vec<SinkEntry>,
+    routed: Option<u64>,
+    next_key: u64,
+}
+
+static SINKS: std::sync::Mutex<Sinks> = std::sync::Mutex::new(Sinks {
+    entries: Vec::new(),
+    routed: None,
+    next_key: 1,
+});
+
+fn sinks() -> std::sync::MutexGuard<'static, Sinks> {
+    SINKS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// A device the phone's playback can be sent to, for the app to list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackTarget {
+    pub key: u64,
+    /// As peers' devices are labelled everywhere: `Cursio(<peer>): <device>`.
+    pub name: String,
+    pub routed: bool,
+}
+
+pub fn playback_targets() -> Vec<PlaybackTarget> {
+    let sinks = sinks();
+    sinks
+        .entries
+        .iter()
+        .map(|e| PlaybackTarget {
+            key: e.key,
+            name: e.description.clone(),
+            routed: sinks.routed == Some(e.key),
+        })
+        .collect()
+}
+
+/// Send this phone's playback to one device, or to none.
+pub fn route_playback(target: Option<u64>) -> Result<(), AudioError> {
+    let mut sinks = sinks();
+    if let Some(key) = target {
+        if !sinks.entries.iter().any(|e| e.key == key) {
+            return Err(AudioError::StreamGone(format!("playback target {key}")));
+        }
+    }
+    if sinks.routed == target {
+        return Ok(());
+    }
+    if let Some(old) = sinks.routed.take() {
+        if let Some(entry) = sinks.entries.iter().find(|e| e.key == old) {
+            let _ = entry.events.send(crate::IntentSinkEvent::Left {
+                app_node_id: PHONE_PLAYBACK_NODE,
+            });
+        }
+    }
+    if let Some(key) = target {
+        if let Some(entry) = sinks.entries.iter().find(|e| e.key == key) {
+            let _ = entry.events.send(crate::IntentSinkEvent::Joined {
+                app_node_id: PHONE_PLAYBACK_NODE,
+                app_name: PHONE_PLAYBACK_NAME.into(),
+            });
+        }
+        sinks.routed = Some(key);
+    }
+    Ok(())
+}
+
+impl AndroidIntentSink {
+    pub fn create(description: String) -> Self {
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sinks = sinks();
+        let key = sinks.next_key;
+        sinks.next_key += 1;
+        sinks.entries.push(SinkEntry {
+            key,
+            description,
+            events,
+        });
+        Self { key, events_rx }
+    }
+
+    pub fn events(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<crate::IntentSinkEvent> {
+        &mut self.events_rx
+    }
+}
+
+/// The peer's link went away: the device is no longer a target, and a route
+/// to it ends rather than pointing at nothing.
+impl Drop for AndroidIntentSink {
+    fn drop(&mut self) {
+        let mut sinks = sinks();
+        sinks.entries.retain(|e| e.key != self.key);
+        if sinks.routed == Some(self.key) {
+            sinks.routed = None;
+        }
+    }
 }
 
 impl AndroidSource {
@@ -249,7 +437,8 @@ impl AndroidSource {
         Ok(Self {
             adverts_rx,
             chunks_rx,
-            wake,
+            wake: Some(wake),
+            playback: None,
         })
     }
 
@@ -264,7 +453,15 @@ impl AndroidSource {
 
 impl Drop for AndroidSource {
     fn drop(&mut self) {
-        let _ = self.wake.send(Wake::Stop);
+        if let Some(wake) = &self.wake {
+            let _ = wake.send(Wake::Stop);
+        }
+        if let Some(id) = self.playback {
+            let mut slot = PLAYBACK.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.as_ref().is_some_and(|sink| sink.id == id) {
+                *slot = None;
+            }
+        }
     }
 }
 

@@ -382,7 +382,18 @@ impl Capture {
                 )?),
             })
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        // The phone's whole playback is its one routable "application"; see
+        // `android_backend::PHONE_PLAYBACK_NODE`.
+        #[cfg(target_os = "android")]
+        {
+            if stream_id != android_backend::PHONE_PLAYBACK_NODE.to_string() {
+                return Err(AudioError::StreamGone(format!("app stream {stream_id}")));
+            }
+            Ok(Capture {
+                inner: android_backend::AndroidSource::playback_tap(id)?,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
         {
             Err(AudioError::Unsupported)
         }
@@ -608,16 +619,20 @@ pub enum IntentSinkEvent {
 pub struct IntentSink {
     #[cfg(target_os = "linux")]
     inner: pipewire_backend::PwIntentSink,
-    // On non-Linux platforms `create` always errors, so this is never constructed;
-    // the empty receiver only exists so `events()` compiles uniformly.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "android")]
+    inner: android_backend::AndroidIntentSink,
+    // Elsewhere `create` always errors, so this is never constructed; the
+    // empty receiver only exists so `events()` compiles uniformly.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     _events_rx: tokio::sync::mpsc::UnboundedReceiver<IntentSinkEvent>,
 }
 
 impl IntentSink {
     /// Create an Intent Sink for a peer device, named `name`/`description`. On
-    /// Linux this publishes a silent `Audio/Sink`; other platforms report
-    /// [`AudioError::Unsupported`] until their backend grows a routing observer.
+    /// Linux this publishes a silent `Audio/Sink`; on Android it is a target
+    /// the app lists for the phone's playback (no system mixer routes apps
+    /// there); other platforms report [`AudioError::Unsupported`] until their
+    /// backend grows a routing observer.
     #[allow(unused_variables)]
     pub fn create(
         id: AudioStreamId,
@@ -630,20 +645,25 @@ impl IntentSink {
                 inner: pipewire_backend::PwIntentSink::create(id, name, description)?,
             })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "android")]
+        {
+            Ok(IntentSink {
+                inner: android_backend::AndroidIntentSink::create(description),
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             Err(AudioError::Unsupported)
         }
     }
 
-    /// Membership changes: apps joining/leaving this Intent Sink. On non-Linux
-    /// platforms an Intent Sink is never created, so this receiver stays empty.
+    /// Membership changes: apps joining/leaving this Intent Sink.
     pub fn events(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<IntentSinkEvent> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             self.inner.events()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             &mut self._events_rx
         }

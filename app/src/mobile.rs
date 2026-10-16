@@ -77,8 +77,56 @@ pub fn start_service(app: &AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// A peer device the phone's playback can be sent to.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaybackTarget {
+    pub key: u64,
+    pub name: String,
+    pub routed: bool,
+}
+
 pub mod commands {
     use super::*;
+
+    #[tauri::command]
+    pub fn phone_audio_targets() -> Vec<PlaybackTarget> {
+        cursio_android::playback_targets()
+            .into_iter()
+            .map(|t| PlaybackTarget {
+                key: t.key,
+                name: t.name,
+                routed: t.routed,
+            })
+            .collect()
+    }
+
+    /// Send what this phone plays to one peer device, or stop with `None`.
+    ///
+    /// Capture comes first: Android asks the user to allow it (MediaProjection)
+    /// every time, and a route set before that answer would open a stream with
+    /// nothing in it. Stopping goes the other way round, so the peer hears the
+    /// stream end rather than fall silent.
+    #[tauri::command]
+    pub async fn phone_audio_route(app: AppHandle, target: Option<u64>) -> Result<(), String> {
+        let plugin = plugin(&app)?;
+        tauri::async_runtime::spawn_blocking(move || match target {
+            Some(key) => {
+                plugin
+                    .run_mobile_plugin::<serde_json::Value>("startPlaybackCapture", ())
+                    .map_err(|e| e.to_string())?;
+                cursio_android::route_playback(Some(key)).map_err(|e| e.to_string())
+            }
+            None => {
+                cursio_android::route_playback(None).map_err(|e| e.to_string())?;
+                plugin
+                    .run_mobile_plugin::<serde_json::Value>("stopPlaybackCapture", ())
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
 
     /// Bring the node down and up again, so its links greet peers with what
     /// changed — a new name, most often. The service does it, since the node

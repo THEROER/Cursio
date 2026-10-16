@@ -188,6 +188,8 @@ pub fn run() {
             mobile::commands::mobile_setup,
             mobile::commands::mobile_request,
             mobile::commands::mobile_restart,
+            mobile::commands::phone_audio_targets,
+            mobile::commands::phone_audio_route,
         ]);
 
     builder

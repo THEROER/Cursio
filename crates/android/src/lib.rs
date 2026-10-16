@@ -122,6 +122,10 @@ pub fn input_to(
     slot().as_ref().and_then(|node| node.input_to(peer))
 }
 
+/// Peer devices this phone's playback can be sent to.
+#[cfg(target_os = "android")]
+pub use cursio_audio::android_backend::{playback_targets, route_playback, PlaybackTarget};
+
 /// One line for the service notification.
 pub fn status_line() -> String {
     slot()
@@ -247,6 +251,30 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeReportStatus(
             i16::try_from(signal_dbm).ok(),
         );
         Ok(JNI_TRUE)
+    })
+}
+
+/// Hand in `len` samples of what this phone is playing — interleaved stereo
+/// f32 at 48 kHz from AudioPlaybackCapture — for the peer device it is routed
+/// to.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativePushPlayback(
+    mut env: JNIEnv,
+    _class: JClass,
+    samples: jni::objects::JFloatArray,
+    len: jint,
+) {
+    guard(&mut env, (), |env| {
+        let len = usize::try_from(len).unwrap_or(0);
+        let mut buf = vec![0f32; len];
+        env.get_float_array_region(&samples, 0, &mut buf)?;
+        cursio_audio::android_backend::push_playback(&buf);
+        Ok(())
     })
 }
 
