@@ -22,7 +22,7 @@ default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
-tauri-build = { version = "2.0.0-beta.18" }
+tauri-build = { version = "2.0.0-beta.18", features = [] }
 
 [dependencies]
 # The mesh core and the control client, none of the platform modules: the app

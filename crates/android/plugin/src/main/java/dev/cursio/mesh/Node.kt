@@ -1,13 +1,12 @@
 package dev.cursio.mesh
 
 import android.content.Context
-import android.os.Build
 import android.util.Log
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * The one way Kotlin reaches the native node.
+ * The one way the service reaches the native node.
  *
  * Starting and stopping run on a single process-wide thread. `nativeStop`
  * blocks until the listener is closed, and on the main thread that is an ANR
@@ -19,15 +18,15 @@ import java.util.concurrent.Executors
 object Node {
     private const val TAG = "Cursio"
 
-    val lifecycle: ExecutorService = Executors.newSingleThreadExecutor { r ->
+    private val lifecycle: ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "cursio-node-lifecycle")
     }
 
     /**
      * Why the native library could not be used, or null if it can.
      *
-     * Kept rather than rethrown so the Activity can say what is wrong. Without
-     * it, a missing or mismatched `.so` is a crash on launch with nothing on
+     * Kept rather than rethrown so the notification can say what is wrong.
+     * Without it, a missing or mismatched `.so` is a crash with nothing on
      * screen naming the cause.
      */
     @Volatile
@@ -36,6 +35,9 @@ object Node {
 
     @Volatile
     private var initialized = false
+
+    @Volatile
+    private var runningName: String? = null
 
     /** Load the library and point it at this install's private directory. */
     @Synchronized
@@ -48,32 +50,14 @@ object Node {
             initialized
         } catch (e: LinkageError) {
             loadError = "native library unusable: ${e.message ?: e.javaClass.simpleName}"
-            Log.e(TAG, "loading libcursio_android failed", e)
+            Log.e(TAG, "loading libcursio_app_lib failed", e)
             false
         }
     }
 
-    /**
-     * Run a native call that may be missing from an older build of the
-     * library. JNI resolves each method lazily, so a `.so` built before a
-     * method existed loads fine and fails only when that method is called;
-     * this turns that into a message instead of a crash.
-     */
-    inline fun <T> call(name: String, fallback: T, block: () -> T): T = try {
-        block()
-    } catch (e: UnsatisfiedLinkError) {
-        Log.w("Cursio", "native $name is missing from this build of the library", e)
-        fallback
-    }
+    fun isRunning(): Boolean = initialized && CursioNative.nativeIsRunning()
 
-    fun isRunning(): Boolean = initialized && call("nativeIsRunning", false) {
-        CursioNative.nativeIsRunning()
-    }
-
-    fun statusJson(): String? =
-        if (!initialized) null else call("nativeStatusJson", null as String?) {
-            CursioNative.nativeStatusJson()
-        }
+    fun statusLine(): String = if (isRunning()) CursioNative.nativeStatusLine() else loadError ?: "starting"
 
     /**
      * Start the node as [name], or restart it if it is running under another
@@ -92,11 +76,6 @@ object Node {
                 runningName = name
                 Log.i(TAG, "node started as \"$name\"")
             }
-            // A gate the user chose is theirs, not this run's: the node starts
-            // at its own default, so the stored choice is applied every time.
-            val gate = Prefs.micGate(app)
-            val err = call("nativeSetMicGate", "") { CursioNative.nativeSetMicGate(gate) }
-            if (err.isNotEmpty()) Log.w(TAG, "applying mic gate \"$gate\" failed: $err")
         }
     }
 
@@ -107,9 +86,4 @@ object Node {
             runningName = null
         }
     }
-
-    @Volatile
-    private var runningName: String? = null
-
-    fun defaultName(): String = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android"
 }

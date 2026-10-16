@@ -15,7 +15,7 @@ import android.util.Log
  *
  * The start is a background one, so the service claims only what a boot
  * receiver may (no `microphone`, and on Android 15+ no `mediaPlayback`); the
- * Activity widens it the next time the user opens the app.
+ * app's window widens it the next time the user opens it.
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {

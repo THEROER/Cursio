@@ -13,9 +13,8 @@
 //! - `live-test` — measure both real machines over a window; PASS/FAIL table.
 //!   Both are described in `docs/live-test.md`.
 //!
-//! - `android` — cross-compile the mesh core for arm64 (needs the NDK and
-//!   cargo-ndk). The core only: the platform modules each need an Android
-//!   backend before they can be switched on.
+//! - `android` — build the phone app (the Tauri app in `app/`, carrying the
+//!   node) as an arm64 APK. Needs the SDK, the NDK and bun.
 //!
 //! Run `cargo xtask <cmd> --help` for flags.
 
@@ -185,7 +184,7 @@ enum Command_ {
     },
     /// Build the supported macOS binaries. Alias for `build macos`.
     Macos,
-    /// Cross-compile the mesh core for Android (arm64). Needs the NDK.
+    /// Build the phone app as an arm64 APK. Needs the SDK, the NDK and bun.
     Android {
         /// Build without optimizations.
         #[arg(long)]
@@ -358,13 +357,7 @@ fn generate_app_ui() -> Result<()> {
              Install it with: curl -fsSL https://bun.sh/install | bash"
         );
     };
-    // Where `cargo run` says this checkout is, not where the binary was built:
-    // a target dir shared between checkouts (`CARGO_TARGET_DIR`) can hand one
-    // checkout an xtask compiled in another, whose baked-in path may be gone.
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    let ui = manifest_dir.join("../../app/ui");
+    let ui = checkout_dir().join("app/ui");
     if !ui.is_dir() {
         bail!(
             "no app frontend at {}; run this from the Cursio checkout",
@@ -378,6 +371,22 @@ fn generate_app_ui() -> Result<()> {
     let mut generate = Command::new(&bun);
     generate.args(["run", "generate"]).current_dir(&ui);
     run(generate).context("generating the cursio-app frontend failed")
+}
+
+/// The Cursio checkout this xtask was started in.
+///
+/// Where `cargo run` says this checkout is, not where the binary was built: a
+/// target dir shared between checkouts (`CARGO_TARGET_DIR`) can hand one
+/// checkout an xtask compiled in another, whose baked-in path may be gone.
+fn checkout_dir() -> PathBuf {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    // `crates/xtask` → the checkout.
+    manifest_dir
+        .ancestors()
+        .nth(2)
+        .map_or_else(|| manifest_dir.join("../.."), Path::to_path_buf)
 }
 
 /// The arguments `cursio` gets when the user names none.
@@ -628,42 +637,46 @@ fn macos() -> Result<()> {
 /// Rust target for 64-bit Android, the only ABI worth shipping to a phone.
 const ANDROID_TARGET: &str = "aarch64-linux-android";
 
-/// The NDK's name for that ABI, which is what `cargo-ndk` and Gradle use.
-const ANDROID_ABI: &str = "arm64-v8a";
+/// The Tauri CLI's name for that target.
+const ANDROID_TAURI_TARGET: &str = "aarch64";
 
-/// The shared library the JVM opens with `System.loadLibrary("cursio_android")`.
-const ANDROID_LIB: &str = "libcursio_android.so";
-
-/// Minimum Android API level this builds against.
+/// Build the phone app: the Tauri app in `app/` as an arm64 APK.
 ///
-/// 28 (Pie): the foreground-service model the mesh needs exists from 26, and
-/// audio needs AAudio's input presets — the echo canceller that keeps a phone
-/// playing the PC's sound from sending it straight back — which arrive in 28.
-const ANDROID_API: &str = "28";
-
-/// Build the JNI bridge as a shared library a phone can load.
+/// The app's library carries the node (`crates/android`, linked in for
+/// `target_os = "android"`) and its JNI natives, and the Kotlin half — the
+/// foreground service, boot receiver and permissions — is the Gradle library
+/// in `crates/android/plugin`, which `app/build.rs` hands to the generated
+/// project in `app/gen/android`.
 ///
-/// Produces `libcursio_android.so` and stages it where Gradle expects native
-/// libraries (`jniLibs/<abi>/`), so an Android project consumes the output
-/// directly rather than each build reinventing the copy.
+/// The minimum API level is `bundle.android.minSdkVersion` in
+/// `app/tauri.conf.json`, which the CLI also passes to the NDK's clang: 28
+/// (Pie), because audio needs AAudio's input presets — the echo canceller that
+/// keeps a phone playing the PC's sound from sending it straight back.
 ///
-/// What crosses is the *core only* — `cursio-core` with no default features.
-/// That is not a limitation of the build but a statement about the layering:
-/// identity, link, session, mesh, registry and node status depend on no
-/// platform crate, so they reach Android untouched. The platform modules do
-/// not follow automatically; each needs an Android backend before its feature
-/// means anything here (PipeWire, FUSE and an AirPlay receiver do not exist on
-/// a phone).
+/// What crosses is the mesh core plus the modules with an Android backend
+/// (audio). Turning another on does not fail at the feature — it fails deep
+/// inside PipeWire or FUSE, which is a much worse error to read.
 fn android(release: bool) -> Result<()> {
     ensure_rust_target(ANDROID_TARGET)?;
 
-    which("cargo-ndk").with_context(|| {
-        "cargo-ndk not found. Install it with:\n  \
-         cargo install cargo-ndk\n\
-         (it points the NDK's clang, ar and sysroot at the right API level; \
-         without it cmake and cc guess a toolchain that does not exist)"
-            .to_string()
-    })?;
+    let Some(bun) = which("bun") else {
+        bail!(
+            "bun not found; the Tauri CLI and the app's frontend both run on it. \
+             Install it with: curl -fsSL https://bun.sh/install | bash"
+        );
+    };
+
+    // Gradle finds the SDK only through these; the NDK alone is not enough to
+    // package an APK.
+    let sdk = ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
+        .iter()
+        .find_map(|k| std::env::var_os(k).map(PathBuf::from))
+        .with_context(|| {
+            "ANDROID_HOME is not set.\n\
+             Install the SDK through Android Studio (or its command-line tools), then:\n  \
+             export ANDROID_HOME=$HOME/Android/Sdk"
+                .to_string()
+        })?;
 
     // The NDK ships its own clang and sysroot; nothing here can be built with
     // the host's. Both spellings are in circulation — Android Studio sets the
@@ -686,22 +699,36 @@ fn android(release: bool) -> Result<()> {
         );
     }
 
-    let profile = if release { "release" } else { "debug" };
-    println!("→ building the mesh core for Android {ANDROID_ABI} ({profile})");
-
-    let mut cmd = cargo();
-    cmd.arg("ndk");
-    cmd.args(["-t", ANDROID_ABI]);
-    cmd.args(["--platform", ANDROID_API]);
-    cmd.arg("build");
-    if release {
-        cmd.arg("--release");
+    let app = checkout_dir().join("app");
+    if !app.join("gen/android").is_dir() {
+        bail!(
+            "no Android project at {}; run this from the Cursio checkout",
+            app.join("gen/android").display()
+        );
     }
-    // The bridge crate, which pulls in `cursio-core` with only the modules
-    // that have an Android backend. Turning another on does not fail at the
-    // feature — it fails deep inside PipeWire or FUSE, which is a much worse
-    // error to read.
-    cmd.args(["-p", "cursio-android"]);
+
+    // The CLI is the app's own devDependency: `bun x tauri` without it would
+    // fetch the unrelated npm package named `tauri`. The frontend's packages
+    // are installed too, since the CLI generates it as `beforeBuildCommand`.
+    for dir in [app.clone(), app.join("ui")] {
+        let mut install = Command::new(&bun);
+        install.arg("install").current_dir(&dir);
+        run(install).with_context(|| format!("bun install in {} failed", dir.display()))?;
+    }
+
+    let profile = if release { "release" } else { "debug" };
+    println!("→ building the Android app for {ANDROID_TARGET} ({profile})");
+
+    let mut cmd = Command::new(&bun);
+    cmd.args(["run", "tauri", "android", "build", "--apk"]);
+    cmd.args(["--target", ANDROID_TAURI_TARGET]);
+    if !release {
+        cmd.arg("--debug");
+    }
+    cmd.current_dir(&app);
+    cmd.env("ANDROID_HOME", &sdk);
+    // The Tauri CLI reads NDK_HOME; cargo's build scripts read the other two.
+    cmd.env("NDK_HOME", &ndk);
     cmd.env("ANDROID_NDK_HOME", &ndk);
     // libopus is built by CMake, whose own Android support finds the NDK only
     // through ANDROID_NDK_ROOT ("Neither the NDK or a standalone toolchain was
@@ -711,31 +738,18 @@ fn android(release: bool) -> Result<()> {
     cmd.env("CMAKE_GENERATOR", "Ninja");
     run(cmd)?;
 
-    let built = PathBuf::from("target")
-        .join(ANDROID_TARGET)
+    let apk = app
+        .join("gen/android/app/build/outputs/apk/universal")
         .join(profile)
-        .join(ANDROID_LIB);
-    if !built.is_file() {
+        .join(format!("app-universal-{profile}.apk"));
+    if !apk.is_file() {
         bail!(
             "the build reported success but {} is missing",
-            built.display()
+            apk.display()
         );
     }
-
-    // Staged under the ABI name Gradle looks for, so an Android project points
-    // `jniLibs.srcDirs` at one directory and gets whatever was last built.
-    let staged_dir = PathBuf::from("target/android/jniLibs").join(ANDROID_ABI);
-    std::fs::create_dir_all(&staged_dir)
-        .with_context(|| format!("creating {}", staged_dir.display()))?;
-    let staged = staged_dir.join(ANDROID_LIB);
-    std::fs::copy(&built, &staged)
-        .with_context(|| format!("copying {} to {}", built.display(), staged.display()))?;
-
-    println!("✓ {}", staged.display());
-    println!(
-        "  the app in crates/android/app packages {} — build it with ./gradlew assembleDebug there",
-        staged_dir.parent().unwrap_or(&staged_dir).display()
-    );
+    println!("✓ {}", apk.display());
+    println!("  install it with: adb install -r {}", apk.display());
     Ok(())
 }
 

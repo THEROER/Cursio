@@ -41,8 +41,8 @@ import androidx.core.app.ServiceCompat
  * everywhere. A `microphone` service started while the app is not in the
  * foreground throws (Android 14), and since Android 15 a `BOOT_COMPLETED`
  * receiver may not start `mediaPlayback` either. So a start from boot or a
- * sticky restart claims what it may, and the Activity, once visible, starts the
- * service again from the foreground; `startForeground` with the wider mask
+ * sticky restart claims what it may, and the app's window, once visible, starts
+ * the service again from the foreground (`MeshPlugin`); `startForeground` with the wider mask
  * then upgrades the running service in place. Claimed while visible, the
  * microphone stays usable after the user leaves the app.
  *
@@ -119,7 +119,7 @@ class MeshService : Service() {
     private fun enterForeground(fromForeground: Boolean): Boolean {
         // What the service already holds is asked for again, so a start that
         // may claim less (a rename, a sticky restart) does not quietly drop the
-        // microphone the Activity claimed earlier.
+        // microphone the window claimed earlier.
         val allowed = wantedTypes(fromForeground)
         for (types in listOf(allowed or activeTypes, allowed, baseType()).distinct()) {
             try {
@@ -230,17 +230,18 @@ class MeshService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun buildNotification(): Notification {
-        val status = if (Node.isRunning()) {
-            Node.call("nativeStatusLine", "running") { CursioNative.nativeStatusLine() }
-        } else {
-            Node.loadError ?: "starting"
+        // The Activity is Tauri's, generated into the app under the app's own
+        // package, which this library cannot name; the launcher entry finds it.
+        val launch = packageManager.getLaunchIntentForPackage(packageName)
+            ?.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val open = launch?.let {
+            PendingIntent.getActivity(
+                this,
+                0,
+                it,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
         }
-        val open = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
         val stop = PendingIntent.getService(
             this,
             1,
@@ -249,7 +250,7 @@ class MeshService : Service() {
         )
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Cursio")
-            .setContentText(status)
+            .setContentText(Node.statusLine())
             .setSmallIcon(R.drawable.ic_notify)
             .setContentIntent(open)
             .setOngoing(true)
@@ -305,7 +306,7 @@ class MeshService : Service() {
          * Start the node, or bring a running one up to date with the stored
          * name and the types this caller may claim.
          *
-         * @param fromForeground true only from a visible Activity: it is what
+         * @param fromForeground true only from the visible window: it is what
          *   allows the microphone type, and claiming it from anywhere else is
          *   an exception, not a no-op.
          */

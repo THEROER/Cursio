@@ -34,7 +34,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
 }
 
 /// What the phone still needs from the user for the node to keep running and
-/// to carry audio. Each field is `true` once granted.
+/// to carry audio. The first three are `true` once granted; the last is a
+/// hint, not a grant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Setup {
@@ -42,8 +43,9 @@ pub struct Setup {
     pub microphone: bool,
     /// Exempt from battery optimisation.
     pub battery: bool,
-    /// Whether this phone's maker kills background apps unless told not to in
-    /// a setting of its own (HyperOS "Autostart"), which no API can read.
+    /// `true` while the user should still be sent to a maker's own setting
+    /// that keeps background apps alive (HyperOS "Autostart"). No API can
+    /// read that setting, so this turns false once the screen has been opened.
     pub autostart_setting: bool,
 }
 
@@ -80,17 +82,26 @@ pub mod commands {
 
     #[tauri::command]
     pub async fn mobile_setup(app: AppHandle) -> Result<Setup, String> {
-        plugin(&app)?
-            .run_mobile_plugin("setup", ())
+        let plugin = plugin(&app)?;
+        tauri::async_runtime::spawn_blocking(move || plugin.run_mobile_plugin("setup", ()))
+            .await
+            .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())
     }
 
-    /// Ask for one grant. Resolves once the system dialog or settings screen
-    /// has been shown; the next [`mobile_setup`] says whether it was given.
+    /// Ask for one grant. Resolves once the user is back from the system
+    /// dialog or settings screen, with what is granted now.
+    ///
+    /// `run_mobile_plugin` waits for that, which can be minutes in a settings
+    /// screen, so it waits on a blocking thread rather than an async worker.
     #[tauri::command]
     pub async fn mobile_request(app: AppHandle, what: Grant) -> Result<Setup, String> {
-        plugin(&app)?
-            .run_mobile_plugin("request", GrantArgs { what })
-            .map_err(|e| e.to_string())
+        let plugin = plugin(&app)?;
+        tauri::async_runtime::spawn_blocking(move || {
+            plugin.run_mobile_plugin("request", GrantArgs { what })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
     }
 }

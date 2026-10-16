@@ -10,14 +10,18 @@ package dev.cursio.mesh
  * the Rust export breaks the link at *call* time rather than at build time.
  *
  * The node itself lives in Rust: its own thread, its own Tokio runtime, the
- * same `cursio-core` every desktop peer runs. Kotlin starts it, stops it, and
- * asks what it can see. Nothing here holds a socket or parses a message —
- * putting the session loop on the JVM would expose a handshake to garbage
- * collection pauses and would mean reimplementing what `mesh.rs` already does.
+ * same `cursio-core` every desktop peer runs. Kotlin only starts it, stops it,
+ * and asks for a status line; the window reaches the node through Tauri
+ * commands, not through here.
  */
 object CursioNative {
     init {
-        System.loadLibrary("cursio_android")
+        // The Tauri app's own library, not a separate one: `cursio-android` is
+        // linked into it so the window and the node share one process image
+        // and one copy of the mesh core. The service may run with no Activity
+        // at all (after boot), so it loads the library itself; a second
+        // `loadLibrary` from the Activity is a no-op.
+        System.loadLibrary("cursio_app_lib")
     }
 
     /**
@@ -41,8 +45,7 @@ object CursioNative {
      * Android restarts a service that was never really gone.
      *
      * @param displayName what peers show for this phone. Android's hostname is
-     *   a meaningless `localhost` on most devices, so the user's name for it is
-     *   passed in instead.
+     *   a meaningless `localhost` on most devices, so a name is passed in.
      * @param port 0 to let the OS choose.
      */
     external fun nativeStart(displayName: String, port: Int): Boolean
@@ -56,41 +59,8 @@ object CursioNative {
      */
     external fun nativeStop(): Boolean
 
-    /** Whether a node is running right now. */
     external fun nativeIsRunning(): Boolean
-
-    /** This node's stable peer id, or an empty string if it cannot be read. */
-    external fun nativePeerId(): String
 
     /** One line for the service notification: what this node can see. */
     external fun nativeStatusLine(): String
-
-    /**
-     * Open the pairing window with a code shown on another machine
-     * (e.g. "ABCD-EFGH"). Returns "" on success, else a human-readable error.
-     */
-    external fun nativeEnterCode(code: String): String
-
-    /**
-     * Open the pairing window with a fresh code for this phone to show.
-     * Returns the code, or "" if the node is not running.
-     */
-    external fun nativeShowCode(): String
-
-    external fun nativeCancelPairing(): Boolean
-
-    /** A JSON snapshot of the node; [NodeStatus.parse] reads it. */
-    external fun nativeStatusJson(): String
-
-    /**
-     * Local playback volume (0.0–1.5) and mute of one stream.
-     * Returns false if the stream is unknown.
-     */
-    external fun nativeSetStreamVolume(id: Int, volume: Float, muted: Boolean): Boolean
-
-    /**
-     * Gate for this phone's microphone: "auto", "off" or a dBFS level such as
-     * "-55". Returns "" on success, else an error.
-     */
-    external fun nativeSetMicGate(value: String): String
 }

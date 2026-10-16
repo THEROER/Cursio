@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Merged into the Tauri app's manifest. Everything the phone's node needs
+     lives here rather than in app/gen/android, which `tauri android init`
+     regenerates. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The mesh is LAN-only by design, but Android gates local sockets and
+         mDNS behind the ordinary network permissions all the same. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- mDNS is multicast, which Android does not deliver to an app that has
+         not asked for it: without this the phone announces itself and hears
+         nobody, which looks exactly like a firewall problem on the peer. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Since Android 14 the generic permission is not enough; the specific
+         type must be declared too, and it must match the service's own. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Since Android 13 the ongoing notification a foreground service shows
+         is itself permission-gated. Denied, the service still runs. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- The phone's microphone, sent to a peer. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- The echo canceller and communication routing the audio backend asks
+         for are audio-settings changes. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Wake and Wi-Fi locks; see MeshService.acquireLocks for why each. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Lets the app ask for the exemption in one system dialog instead of
+         sending the user through the battery settings list to find it. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- No backup: the files directory holds this node's identity and trust
+         store, and restoring them onto another phone would make two devices
+         answer as one peer. -->
+    <application android:allowBackup="false">
+
+        <!-- One service, every type it may ever hold. Which of them a given
+             start claims is decided in MeshService.wantedTypes, because the
+             platform allows different ones from boot and from the foreground. -->
+        <service
+            android:name="dev.cursio.mesh.MeshService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice|mediaPlayback|microphone" />
+
+        <receiver
+            android:name="dev.cursio.mesh.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

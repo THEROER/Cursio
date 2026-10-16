@@ -3,15 +3,12 @@ name = "cursio-android"
 version.workspace = true
 edition.workspace = true
 
-# A C-ABI shared library, because that is the only thing Android's
-# `System.loadLibrary` can open. Nothing links this from Rust; the consumer is
-# the JVM.
+# Linked into the Tauri app's `cursio_app_lib`, the one shared library the
+# phone app loads: its JNI exports reach the JVM from there, so this crate is
+# not a library of its own on the device.
 [lib]
 name = "cursio_android"
-# `rlib` alongside so the crate's own tests link against it — a bare `cdylib`
-# cannot be test-compiled, and the node's behaviour is worth testing on the
-# host rather than only on a phone.
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 # The mesh core with only the modules that have an Android backend: audio
