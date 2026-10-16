@@ -327,7 +327,67 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// Android: the app reports, this answers what it last heard.
+///
+/// An app cannot read a phone's power or radio state from Rust — SELinux keeps
+/// an untrusted app out of `/sys/class/power_supply`, and Wi-Fi signal lives
+/// behind `WifiManager` — so the JVM side reads `BatteryManager` and
+/// `ConnectivityManager` and hands the values in through [`report`]. Until the
+/// first report everything is `None`, which is the truth: nothing is known yet.
+#[cfg(target_os = "android")]
+mod platform {
+    use std::sync::Mutex;
+
+    use cursio_protocol::{NetworkKind, PowerSource};
+
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct Reported {
+        pub battery: Option<u8>,
+        pub source: Option<PowerSource>,
+        pub network: Option<NetworkKind>,
+        pub signal_dbm: Option<i16>,
+    }
+
+    pub(super) static REPORTED: Mutex<Reported> = Mutex::new(Reported {
+        battery: None,
+        source: None,
+        network: None,
+        signal_dbm: None,
+    });
+
+    fn reported() -> Reported {
+        *REPORTED.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn power() -> (Option<u8>, Option<PowerSource>) {
+        let r = reported();
+        (r.battery, r.source)
+    }
+
+    pub fn network() -> (Option<NetworkKind>, Option<i16>) {
+        let r = reported();
+        (r.network, r.signal_dbm)
+    }
+}
+
+/// What the Android app read from `BatteryManager` and `ConnectivityManager`;
+/// each `None` is something it could not say. The next poll sends it on.
+#[cfg(target_os = "android")]
+pub fn report(
+    battery: Option<u8>,
+    source: Option<cursio_protocol::PowerSource>,
+    network: Option<cursio_protocol::NetworkKind>,
+    signal_dbm: Option<i16>,
+) {
+    *platform::REPORTED.lock().unwrap_or_else(|p| p.into_inner()) = platform::Reported {
+        battery: battery.map(|b| b.min(100)),
+        source,
+        network,
+        signal_dbm,
+    };
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 mod platform {
     use cursio_protocol::{NetworkKind, PowerSource};
 

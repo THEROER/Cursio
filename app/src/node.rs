@@ -481,6 +481,16 @@ pub mod commands {
         link.request(Command::Forget { peer }).await
     }
 
+    /// Rename this machine. Saved at once; links take it when they next come
+    /// up, so the status lists `name` among what waits for a restart.
+    #[tauri::command]
+    pub async fn node_set_name(
+        link: State<'_, NodeLink>,
+        name: String,
+    ) -> Result<Reply, NodeError> {
+        link.request(Command::SetName { name }).await
+    }
+
     /// The listener's volume on one peer stream playing here.
     #[tauri::command]
     pub async fn node_set_stream_volume(

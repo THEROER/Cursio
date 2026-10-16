@@ -23,14 +23,11 @@
 //!
 //! What stays with the caller is what differs between nodes: what to do with
 //! inbound input, whether there is anything to capture, and what to show the
-//! user. [`Link::run_as_input_source`] is the one arrangement general enough to
-//! belong here, because it is the whole of what a touchpad does.
+//! user — a phone's touchpad, for one, is only a writer on its session's
+//! capture channel.
 
-use std::sync::mpsc;
-use std::time::Duration;
-
-use cursio_protocol::{ModuleAdvert, ModuleId, PeerId};
-use cursio_transport::discovery::{self, DiscoveredPeer};
+use cursio_protocol::{ModuleAdvert, ModuleId};
+use cursio_transport::discovery;
 use cursio_transport::pairing::{self, Role, TrustStore};
 use cursio_transport::{EncryptedTransport, Transport};
 
@@ -300,50 +297,6 @@ where
     })
 }
 
-/// Bring a link all the way up, for callers with nothing to do in between.
-pub async fn establish<T>(transport: T, plan: Handshake<'_>) -> anyhow::Result<Link>
-where
-    T: Transport + 'static,
-{
-    let identified = identify(transport, &plan).await?;
-    secure(identified, &plan).await
-}
-
-impl Link {
-    /// Run this link as a device that only *produces* input — a phone acting as
-    /// a touchpad, and anything else with no screen for the cursor to enter.
-    ///
-    /// The whole arrangement follows from staying dormant, which
-    /// [`CursorSetup::negotiate`] guarantees for such a device: a dormant
-    /// session forwards everything on its capture channel to the peer, so
-    /// feeding `input` from a touch surface *is* the touchpad. There is nothing
-    /// to inject here and no ownership to hand around, so both of those
-    /// callbacks are empty rather than absent — the session still reports state
-    /// changes, they simply have nothing to change.
-    pub async fn run_as_input_source(
-        self,
-        input: &mut tokio::sync::mpsc::UnboundedReceiver<session::CapturedInput>,
-        poll_status: impl FnMut() -> Option<cursio_protocol::NodeStatus>,
-    ) -> Result<(), SessionError> {
-        debug_assert!(
-            !self.cursor.start_active,
-            "an input source must stay dormant, or its events act locally instead of \
-             reaching the peer"
-        );
-        session::run_session(
-            self.transport,
-            self.cursor,
-            Some(input),
-            |_| {},
-            None,
-            |_| {},
-            self.modules,
-            poll_status,
-        )
-        .await
-    }
-}
-
 /// What this node offers on a link.
 ///
 /// Input is appended by hand because it is not a registry module; everything
@@ -374,22 +327,6 @@ pub fn discovery_config() -> discovery::DiscoveryConfig {
             discovery::DiscoveryConfig::default()
         }
     }
-}
-
-/// Browse until one peer is found or the timeout elapses.
-///
-/// Browsing is blocking and lives on its own thread; the caller gets an async
-/// wait for the first answer. Good enough for "connect me to whatever is
-/// there", which is what a phone's first screen needs.
-pub async fn discover_one(self_id: PeerId, timeout: Duration) -> Option<DiscoveredPeer> {
-    let cfg = discovery_config();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = discovery::browse_with(self_id, &cfg, |peer| {
-            let _ = tx.send(peer);
-        });
-    });
-    rx.recv_timeout(timeout).ok()
 }
 
 #[cfg(test)]

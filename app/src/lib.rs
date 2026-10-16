@@ -25,7 +25,8 @@ mod logs;
 mod mobile;
 /// The line to the running node.
 mod node;
-/// Driving a peer's cursor from a touch surface — the phone-as-touchpad half.
+/// Driving a peer's cursor from a phone's touch surface.
+#[cfg(mobile)]
 mod touchpad;
 #[cfg(desktop)]
 mod tray;
@@ -105,9 +106,7 @@ pub fn run() {
         (log, std::env::args().any(|a| a == "--hidden"))
     };
 
-    let builder = tauri::Builder::default()
-        .manage(touchpad::Touchpad::default())
-        .manage(node::NodeLink::default());
+    let builder = tauri::Builder::default().manage(node::NodeLink::default());
 
     #[cfg(desktop)]
     let builder = builder
@@ -136,15 +135,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_platform,
-            touchpad::commands::touchpad_status,
-            touchpad::commands::touchpad_connect,
-            touchpad::commands::touchpad_motion,
-            touchpad::commands::touchpad_button,
-            touchpad::commands::touchpad_scroll,
             node::commands::node_status,
             node::commands::node_config,
             node::commands::node_set_module,
             node::commands::node_set_position,
+            node::commands::node_set_name,
             node::commands::node_set_mic_gate,
             node::commands::node_set_stream_volume,
             node::commands::node_pair_show,
@@ -164,6 +159,7 @@ pub fn run() {
 
     #[cfg(mobile)]
     let builder = builder
+        .manage(touchpad::Touchpad::default())
         .plugin(mobile::init())
         .setup(|app| {
             node::follow(app.handle().clone());
@@ -172,6 +168,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_platform,
             touchpad::commands::touchpad_status,
+            touchpad::commands::touchpad_targets,
             touchpad::commands::touchpad_connect,
             touchpad::commands::touchpad_motion,
             touchpad::commands::touchpad_button,
@@ -179,6 +176,7 @@ pub fn run() {
             node::commands::node_status,
             node::commands::node_config,
             node::commands::node_set_module,
+            node::commands::node_set_name,
             node::commands::node_set_mic_gate,
             node::commands::node_set_stream_volume,
             node::commands::node_pair_show,

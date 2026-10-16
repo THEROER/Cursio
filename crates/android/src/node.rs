@@ -35,18 +35,20 @@ use std::sync::{Arc, Mutex};
 use cursio_core::audio_gate::MicGate;
 use cursio_core::audio_session::AudioFactory;
 use cursio_core::config::{Config, Overrides};
-use cursio_core::control::{KnownPeerView, LinkView, NodeState, Presence};
+use cursio_core::control::{KnownPeerView, LinkView, ModuleSwitch, NodeState, Presence};
 use cursio_core::live::Shared as LiveShared;
 use cursio_core::mesh::SharedRegistry;
 use cursio_core::module::ModuleRegistry;
 use cursio_core::node_status::NodeStatusMonitor;
 use cursio_core::pairing_window::PairingWindow;
 use cursio_core::registry::PeerState;
+use cursio_core::session::CapturedInput;
 use cursio_core::NodeIdentity;
 use cursio_protocol::{PeerId, Position, ServiceOffer};
 use cursio_transport::discovery;
 use cursio_transport::pairing::{Role, TrustStore};
 use cursio_transport::tcp::{TcpListenerHandle, TcpTransport};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Where the phone stands in the layout. It never takes the cursor
 /// (`DeviceKind::Phone`), so no edge of it is ever crossed; the position only
@@ -62,6 +64,10 @@ struct Shared {
     seen: Mutex<Vec<String>>,
     /// Cleared to ask the node thread to wind down.
     running: AtomicBool,
+    /// Each live link's input channel, by peer: what the touchpad writes to.
+    /// A phone never holds the cursor, so its session forwards everything on
+    /// this channel to the peer — a touch surface needs nothing more.
+    inputs: Mutex<HashMap<PeerId, (String, UnboundedSender<CapturedInput>)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -83,11 +89,15 @@ impl NodeHandle {
     /// waited for it would block Android's `onStartCommand` past its deadline.
     pub fn start(display_name: String, port: u16) -> anyhow::Result<Self> {
         let mut identity = NodeIdentity::load_or_create()?;
-        // The phone's name is the user's, not the hostname: Android's hostname
-        // is a meaningless `localhost` on most devices, and this is the label
-        // every peer shows for this machine.
-        if !display_name.is_empty() {
-            identity.display_name = display_name;
+        // Android's hostname is a meaningless `localhost` on most devices, so a
+        // phone that has never been named takes the one the app passes (the
+        // device's own name). Only then: once the user renames it, the saved
+        // name is the answer, and overwriting it at every start was why the
+        // phone could not be renamed.
+        if !display_name.is_empty()
+            && cursio_core::identity::is_default_name(&identity.display_name)
+        {
+            identity.rename(&display_name)?;
         }
         let config_path = cursio_core::config::default_path()?;
         let config = Config::load(&config_path)?;
@@ -157,6 +167,25 @@ impl NodeHandle {
         self.control.clone()
     }
 
+    /// The peers a touchpad can drive right now — every live link — by id
+    /// and name.
+    pub fn input_targets(&self) -> Vec<(PeerId, String)> {
+        let mut targets: Vec<_> = lock(&self.shared.inputs)
+            .iter()
+            .map(|(id, (name, _))| (*id, name.clone()))
+            .collect();
+        targets.sort_by(|a, b| a.1.cmp(&b.1));
+        targets
+    }
+
+    /// A channel into one peer's session, for the touchpad. `None` when that
+    /// peer has no live link.
+    pub fn input_to(&self, peer: &PeerId) -> Option<UnboundedSender<CapturedInput>> {
+        lock(&self.shared.inputs)
+            .get(peer)
+            .map(|(_, tx)| tx.clone())
+    }
+
     /// One line describing what the node can see, for the service notification.
     pub fn status_line(&self) -> String {
         let bound = *lock(&self.shared.bound);
@@ -223,6 +252,7 @@ struct NodeCtx {
     status: RefCell<NodeStatusMonitor>,
     control: NodeState,
     pairing: PairingWindow,
+    shared: Arc<Shared>,
 }
 
 /// Listen, announce, dial, and run a session per link until asked to stop.
@@ -270,6 +300,8 @@ async fn serve(node: Node) -> anyhow::Result<()> {
     for advert in modules.advertise() {
         tracing::info!(module = %advert.id, version = advert.version, "module available");
     }
+    // Input too: the touchpad drives a peer's cursor through the links.
+    control.set_available(ModuleSwitch::available(&modules.available(), true));
 
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
     let self_id = identity.peer_id;
@@ -294,6 +326,7 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         status: RefCell::new(NodeStatusMonitor::new()),
         control,
         pairing,
+        shared: Arc::clone(&shared),
     });
 
     // Machines seen announcing themselves that this node does not trust yet.
@@ -438,7 +471,9 @@ async fn run_link(
         position: PHONE_POSITION,
         service: ServiceOffer::none(),
         status: ctx.status.borrow().current(),
-        sends_input: false,
+        // The touchpad: a phone has no capture, but its touch surface is input
+        // for whichever peer it is pointed at.
+        sends_input: true,
     };
     let identified = cursio_core::link::identify(transport, &plan).await?;
     let peer_id = identified.peer.peer_id;
@@ -506,11 +541,16 @@ async fn run_link(
     );
     publish(ctx);
 
+    // A phone never takes the cursor, so `CursorSetup` leaves this side
+    // dormant for the life of the link, and a dormant session forwards its
+    // capture channel to the peer: the touchpad is just a writer on it.
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    lock(&ctx.shared.inputs).insert(peer.peer_id, (peer.display_name.clone(), input_tx));
     let mut status_cursor = ctx.status.borrow().cursor();
     let result = cursio_core::session::run_session_live(
         link.transport,
         link.cursor,
-        None,
+        Some(&mut input_rx),
         |_event| {},
         None,
         |_ownership| {},
@@ -519,6 +559,7 @@ async fn run_link(
         None,
     )
     .await;
+    lock(&ctx.shared.inputs).remove(&peer.peer_id);
     match result {
         Ok(()) | Err(cursio_core::session::SessionError::PeerLeft) => Ok(()),
         Err(e) => Err(e.into()),

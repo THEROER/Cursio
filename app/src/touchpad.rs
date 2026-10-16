@@ -1,15 +1,17 @@
-//! Driving a peer's cursor from a touch surface.
+//! Driving a peer's cursor from a phone's touch surface.
 //!
-//! The whole feature is a channel. A dormant session forwards everything on its
-//! capture channel to the peer ([`Link::run_as_input_source`]), and a device
-//! that cannot hold the cursor is dormant for the life of the link — so the
-//! touch surface simply pushes [`InputEvent`]s into that channel and the peer's
-//! pointer moves. There is no touch vocabulary on the wire and none is needed:
-//! a touchpad produces *relative* motion, which is exactly what
-//! [`InputEvent::PointerMotion`] carries.
+//! The whole feature is a channel. A phone never takes the cursor, so its
+//! session with each peer stays dormant for the life of the link, and a
+//! dormant session forwards everything on its capture channel to the peer —
+//! so the touch surface simply pushes [`InputEvent`]s into the session of the
+//! machine it is pointed at, and that machine's pointer moves. There is no
+//! touch vocabulary on the wire and none is needed: a touchpad produces
+//! *relative* motion, which is exactly what [`InputEvent::PointerMotion`]
+//! carries.
 //!
-//! What lives here is the small amount of translation between a browser's
-//! pointer events and that vocabulary, plus the task that holds the link up.
+//! It used to bring up a link of its own, with a password, beside the node's.
+//! On a phone the node already holds a paired session with every machine, so
+//! that second link asked the user for what the pairing had settled.
 //!
 //! ## Why the UI sends deltas rather than positions
 //!
@@ -19,41 +21,32 @@
 //! at what scale — and that is a question a touchpad never has to ask.
 
 use std::sync::Mutex;
-use std::time::Duration;
 
-use cursio_core::link::{self, Link};
-use cursio_core::module::ModuleRegistry;
-use cursio_core::session::{CapturedInput, SessionError};
-use cursio_core::NodeIdentity;
+use cursio_core::session::CapturedInput;
 use cursio_protocol::{InputEvent, MouseButton};
-use cursio_transport::pairing::Role;
-use cursio_transport::TcpTransport;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 
-/// How long to browse the LAN before giving up on finding a peer.
-///
-/// Long enough for mDNS to answer on a busy network, short enough that a user
-/// staring at a phone screen learns something went wrong rather than wondering
-/// whether it is still trying.
-const DISCOVER_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// What the UI is told about the link, so the screen can say something true
-/// rather than pretending every tap landed.
+/// What the UI is told, so the screen can say something true rather than
+/// pretending every tap landed.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum Status {
     Idle,
-    Searching,
-    Connecting { peer: String },
     Connected { peer: String },
-    Failed { reason: String },
+}
+
+/// A machine the touchpad can drive.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Target {
+    pub id: String,
+    pub name: String,
 }
 
 /// Shared state behind the Tauri commands.
 pub struct Touchpad {
-    /// Events on their way to the peer. Present only while a link is up: with
-    /// no session there is nothing to send to, and quietly buffering strokes
-    /// that will never arrive is worse than dropping them.
+    /// The driven peer's session channel. Present only while that link is up:
+    /// quietly buffering strokes that will never arrive is worse than dropping
+    /// them.
     events: Mutex<Option<UnboundedSender<CapturedInput>>>,
     status: Mutex<Status>,
 }
@@ -77,25 +70,26 @@ impl Touchpad {
         *self.status.lock().expect("touchpad status") = status;
     }
 
-    /// Hand an event to the live session, if there is one.
+    /// Hand an event to the driven peer's session, if it is still up.
     ///
     /// Returns whether it went anywhere, which is what lets the UI stop
     /// pretending: a surface that swallows strokes into a dead link looks
-    /// identical to one whose peer has frozen.
+    /// identical to one whose peer has frozen. A link that has ended is
+    /// let go of here, so the UI learns it on the next stroke.
     fn send(&self, event: InputEvent) -> bool {
-        let guard = self.events.lock().expect("touchpad channel");
-        match guard.as_ref() {
-            Some(tx) => tx.send(CapturedInput::from(event)).is_ok(),
-            None => false,
+        let mut guard = self.events.lock().expect("touchpad channel");
+        let sent = guard
+            .as_ref()
+            .is_some_and(|tx| tx.send(CapturedInput::from(event)).is_ok());
+        if !sent && guard.take().is_some() {
+            drop(guard);
+            self.set_status(Status::Idle);
         }
+        sent
     }
 
     fn attach(&self, tx: UnboundedSender<CapturedInput>) {
         *self.events.lock().expect("touchpad channel") = Some(tx);
-    }
-
-    fn detach(&self) {
-        *self.events.lock().expect("touchpad channel") = None;
     }
 }
 
@@ -115,75 +109,8 @@ pub fn button_named(name: &str) -> Option<MouseButton> {
     }
 }
 
-/// Find a peer, bring the link up, and run this device as its input source
-/// until the session ends.
-async fn run_link(
-    identity: NodeIdentity,
-    password: String,
-    mut events: UnboundedReceiver<CapturedInput>,
-    report: impl Fn(Status),
-) -> anyhow::Result<()> {
-    report(Status::Searching);
-    let peer = link::discover_one(identity.peer_id, DISCOVER_TIMEOUT)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no peer found on this network"))?;
-    report(Status::Connecting {
-        peer: peer.display_name.clone(),
-    });
-
-    let transport = TcpTransport::connect(peer.addr).await?;
-    // A touchpad runs no modules: it has no disks to share, no audio to carry
-    // and no windows to move. It advertises input and nothing else, so the peer
-    // does not stand up half a session for a device that cannot use it.
-    let registry = ModuleRegistry::new();
-    let link = link::establish(
-        transport,
-        link::Handshake {
-            identity: &identity,
-            password: &password,
-            // We dialled, so we lead both handshakes.
-            role: Role::Initiator,
-            registry: &registry,
-            // A touchpad has no screen for the cursor to enter, so it never
-            // becomes anyone's neighbour and its own coordinates are never
-            // consulted — the peer keeps the cursor for the life of the link.
-            position: cursio_protocol::Position::new(0, 0),
-            // Nothing this device could host: no decoder, no display.
-            service: cursio_protocol::ServiceOffer::none(),
-            // A touchpad is a phone or tablet, so its power state is exactly
-            // the kind a peer wants to know — but this build reads nothing
-            // about the device it runs on, and inventing a value would have
-            // the peer treat an unknown battery as a full one.
-            status: cursio_protocol::NodeStatus::unknown(),
-            sends_input: true,
-        },
-    )
-    .await?;
-
-    if link.cursor.start_active {
-        // Refusing rather than carrying on: an input source that is somehow
-        // active would inject its own events locally instead of sending them,
-        // and the user would be left tapping at a surface that moves nothing.
-        anyhow::bail!(
-            "this device was handed the shared cursor, which it cannot hold; \
-             the peer is running an older build"
-        );
-    }
-
-    report(Status::Connected {
-        peer: link.peer.display_name.clone(),
-    });
-    // Nothing here watches the battery or the network, so this link never
-    // reports a change after its greeting.
-    match Link::run_as_input_source(link, &mut events, || None).await {
-        // The peer hanging up is how a session normally ends.
-        Ok(()) | Err(SessionError::PeerLeft) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Tauri commands. Thin by design: everything they do is push an event or start
-/// the task above.
+/// Tauri commands. Thin by design: everything they do is push an event or
+/// pick the session to push into.
 pub mod commands {
     use super::*;
     use tauri::State;
@@ -191,6 +118,41 @@ pub mod commands {
     #[tauri::command]
     pub fn touchpad_status(pad: State<'_, Touchpad>) -> Status {
         pad.status()
+    }
+
+    /// The machines the touchpad can drive: every peer with a live link.
+    #[tauri::command]
+    pub fn touchpad_targets() -> Vec<Target> {
+        cursio_android::input_targets()
+            .into_iter()
+            .map(|(id, name)| Target {
+                id: id.to_string(),
+                name,
+            })
+            .collect()
+    }
+
+    /// Point the touchpad at one linked peer — `peer` by id, or the only one
+    /// when there is a single link.
+    #[tauri::command]
+    pub fn touchpad_connect(pad: State<'_, Touchpad>, peer: Option<String>) -> Result<(), String> {
+        let targets = cursio_android::input_targets();
+        let (id, name) = match peer {
+            Some(peer) => targets
+                .into_iter()
+                .find(|(id, _)| id.to_string() == peer)
+                .ok_or_else(|| "that machine is not connected to this phone".to_string())?,
+            None => match targets.as_slice() {
+                [only] => only.clone(),
+                [] => return Err("no paired machine is connected to this phone".into()),
+                _ => return Err("choose which machine to drive".into()),
+            },
+        };
+        let tx = cursio_android::input_to(&id)
+            .ok_or_else(|| format!("{name} is no longer connected"))?;
+        pad.attach(tx);
+        pad.set_status(Status::Connected { peer: name });
+        Ok(())
     }
 
     /// Relative motion, already accumulated by the UI over one frame.
@@ -220,45 +182,6 @@ pub mod commands {
         }
         pad.send(InputEvent::PointerScroll { dx, dy })
     }
-
-    /// Start looking for a peer and drive it until the link ends.
-    ///
-    /// The password is only used on a first meeting; once the two machines are
-    /// paired the trust store answers instead and it is ignored.
-    #[tauri::command]
-    pub async fn touchpad_connect(
-        app: tauri::AppHandle,
-        pad: State<'_, Touchpad>,
-        password: String,
-    ) -> Result<(), String> {
-        let identity = NodeIdentity::load_or_create().map_err(|e| e.to_string())?;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        pad.attach(tx);
-
-        // The task outlives this command, so it reports through the app handle
-        // rather than the borrowed state.
-        let handle = app.clone();
-        tokio::spawn(async move {
-            let report = |status: Status| {
-                use tauri::Manager;
-                let pad = handle.state::<Touchpad>();
-                pad.set_status(status);
-            };
-            let outcome = run_link(identity, password, rx, &report).await;
-            use tauri::Manager;
-            let pad = handle.state::<Touchpad>();
-            match outcome {
-                Ok(()) => pad.set_status(Status::Idle),
-                Err(e) => pad.set_status(Status::Failed {
-                    reason: e.to_string(),
-                }),
-            }
-            // Nothing to send to any more; further taps are refused rather
-            // than queued into a channel nobody is reading.
-            pad.detach();
-        });
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -277,7 +200,7 @@ mod tests {
         assert_eq!(button_named("thumb"), None);
     }
 
-    /// With no link up, events must be refused rather than buffered.
+    /// With no link chosen, events must be refused rather than buffered.
     ///
     /// A queue that fills while nothing is connected replays a burst of stale
     /// motion the moment a session starts — the pointer jumps somewhere the
@@ -288,12 +211,14 @@ mod tests {
         assert!(!pad.send(InputEvent::PointerMotion { dx: 5, dy: 5 }));
     }
 
-    /// And accepted once there is somewhere to send them.
     #[test]
-    fn events_reach_a_live_session() {
+    fn events_reach_a_live_session_and_a_dead_one_is_let_go() {
         let pad = Touchpad::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         pad.attach(tx);
+        pad.set_status(Status::Connected {
+            peer: "Nocturne".into(),
+        });
 
         assert!(pad.send(InputEvent::PointerMotion { dx: 3, dy: -2 }));
         assert_eq!(
@@ -301,9 +226,8 @@ mod tests {
             InputEvent::PointerMotion { dx: 3, dy: -2 }
         );
 
-        // A session that ends stops accepting, rather than filling a channel
-        // whose reader is gone.
-        pad.detach();
+        drop(rx);
         assert!(!pad.send(InputEvent::PointerMotion { dx: 1, dy: 1 }));
+        assert!(matches!(pad.status(), Status::Idle));
     }
 }

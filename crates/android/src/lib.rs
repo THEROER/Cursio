@@ -107,6 +107,21 @@ pub fn control() -> Option<NodeState> {
     slot().as_ref().map(NodeHandle::control)
 }
 
+/// The peers the touchpad can drive: every live link, by id and name.
+pub fn input_targets() -> Vec<(cursio_protocol::PeerId, String)> {
+    slot()
+        .as_ref()
+        .map(NodeHandle::input_targets)
+        .unwrap_or_default()
+}
+
+/// A channel into one peer's session for the touchpad's events.
+pub fn input_to(
+    peer: &cursio_protocol::PeerId,
+) -> Option<tokio::sync::mpsc::UnboundedSender<cursio_core::session::CapturedInput>> {
+    slot().as_ref().and_then(|node| node.input_to(peer))
+}
+
 /// One line for the service notification.
 pub fn status_line() -> String {
     slot()
@@ -187,6 +202,52 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeStatusLine<'a>(
         |_env| Ok(status_line()),
     );
     env.new_string(line).unwrap_or_else(|_| JString::default())
+}
+
+/// Hand in this phone's power and network state, which only the JVM can read.
+///
+/// `battery` is a percentage or -1; `power` is `battery`, `charging`, `mains`
+/// or empty; `network` is `wifi`, `cellular`, `wired`, `unknown` or empty (no
+/// connection); `signal_dbm` is the Wi-Fi RSSI or `Int.MIN_VALUE`. Anything
+/// the caller could not read is passed as its "unknown" and arrives at peers
+/// as "cannot say", never as a zero.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeReportStatus(
+    mut env: JNIEnv,
+    _class: JClass,
+    battery: jint,
+    power: JString,
+    network: JString,
+    signal_dbm: jint,
+) -> jboolean {
+    use cursio_protocol::{NetworkKind, PowerSource};
+    guard(&mut env, JNI_FALSE, |env| {
+        let power: String = env.get_string(&power)?.into();
+        let network: String = env.get_string(&network)?.into();
+        cursio_core::node_status::report(
+            u8::try_from(battery).ok(),
+            match power.as_str() {
+                "battery" => Some(PowerSource::Battery),
+                "charging" => Some(PowerSource::Charging),
+                "mains" => Some(PowerSource::Mains),
+                _ => None,
+            },
+            match network.as_str() {
+                "wifi" => Some(NetworkKind::Wifi),
+                "cellular" => Some(NetworkKind::Cellular),
+                "wired" => Some(NetworkKind::Wired),
+                "unknown" => Some(NetworkKind::Unknown),
+                _ => None,
+            },
+            i16::try_from(signal_dbm).ok(),
+        );
+        Ok(JNI_TRUE)
+    })
 }
 
 /// Run `body`, turning any failure into a Java exception and `fallback`.
