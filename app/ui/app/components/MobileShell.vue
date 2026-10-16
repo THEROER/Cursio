@@ -54,11 +54,11 @@ const title = computed(() => items.value.find((i) => isActive(i.path))?.label ??
     <main v-if="fullBleed" class="cursio-mobile__sides flex min-h-0 flex-1 flex-col overflow-hidden">
       <slot />
     </main>
-    <main v-else class="cursio-mobile__sides min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain">
-      <div class="px-4 py-4">
+    <main v-else class="cursio-mobile__sides min-h-0 flex-1">
+      <LpScrollArea class="h-full" content-class="px-4 py-4">
         <NodeDownAlert />
         <slot />
-      </div>
+      </LpScrollArea>
     </main>
 
     <nav class="cursio-mobile__tabs shrink-0 border-t border-line bg-surface" :aria-label="t('nav.label')">
