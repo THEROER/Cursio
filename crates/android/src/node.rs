@@ -296,10 +296,17 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         pairing,
     });
 
-    // Machines seen announcing themselves that this node does not trust yet,
-    // kept only while a pairing window is open. Emptied by the sweep that
-    // dials them, so a refusal is retried on the next sighting, not hammered.
-    let mut strangers: HashMap<PeerId, (String, SocketAddr)> = HashMap::new();
+    // Machines seen announcing themselves that this node does not trust yet.
+    //
+    // Kept from every sighting, not only those made while a window is open:
+    // mDNS reports a machine once when it appears, so a computer already on
+    // the LAN when the user typed its code was never heard of again, and the
+    // phone never called it. The desktop that showed the code does not call
+    // either — it, too, saw the phone before its window opened — so the phone
+    // calls every stranger while its window is open, whatever `should_dial`
+    // would say. A machine that is not pairing just hangs up, which is not
+    // counted against the code.
+    let mut strangers: HashMap<PeerId, Stranger> = HashMap::new();
     let mut sweep = tokio::time::interval(cursio_core::mesh::sweep_interval());
     loop {
         if !shared.running.load(Ordering::SeqCst) {
@@ -322,28 +329,36 @@ async fn serve(node: Node) -> anyhow::Result<()> {
 
             Some(peer) = seen_rx.recv() => {
                 note_seen(&ctx.registry, &shared, &peer);
-                let known = ctx.registry.borrow().is_known(&peer.peer_id);
-                if !known && ctx.pairing.is_open()
-                    && strangers.insert(peer.peer_id, (peer.display_name.clone(), peer.addr)).is_none()
-                {
-                    tracing::info!(peer = %peer.display_name, addr = %peer.addr, "unpaired machine found while pairing");
+                if !ctx.registry.borrow().is_known(&peer.peer_id) {
+                    strangers.insert(peer.peer_id, Stranger {
+                        name: peer.display_name.clone(),
+                        addr: peer.addr,
+                        called: None,
+                    });
                 }
             }
 
             _ = sweep.tick() => {
                 publish(&ctx);
+                strangers.retain(|id, _| !ctx.registry.borrow().is_known(id));
                 if ctx.pairing.is_open() {
-                    for (peer_id, (name, addr)) in std::mem::take(&mut strangers) {
-                        if !cursio_core::registry::should_dial(self_id, peer_id) {
+                    let now = std::time::Instant::now();
+                    for stranger in strangers.values_mut() {
+                        if stranger.called.is_some_and(|at| now.duration_since(at) < STRANGER_RECALL) {
                             continue;
                         }
-                        match TcpTransport::connect(addr).await {
+                        stranger.called = Some(now);
+                        match TcpTransport::connect(stranger.addr).await {
                             Ok(t) => {
-                                tracing::info!(peer = %name, %addr, "dialled an unpaired machine to pair with it");
+                                tracing::info!(peer = %stranger.name, addr = %stranger.addr, "dialled an unpaired machine to pair with it");
                                 spawn_session(t, Rc::clone(&ctx), Role::Initiator, None);
                             }
-                            Err(e) => tracing::warn!(peer = %name, error = %e, "could not reach the machine to pair with"),
+                            Err(e) => tracing::warn!(peer = %stranger.name, error = %e, "could not reach the machine to pair with"),
                         }
+                    }
+                } else {
+                    for stranger in strangers.values_mut() {
+                        stranger.called = None;
                     }
                 }
                 for target in cursio_core::mesh::next_dial_targets(self_id, &ctx.registry) {
@@ -365,6 +380,19 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         }
     }
 }
+
+/// A machine on the LAN this phone has not paired with.
+struct Stranger {
+    name: String,
+    addr: SocketAddr,
+    /// When it was last called during the open window.
+    called: Option<std::time::Instant>,
+}
+
+/// How long a stranger that did not pair is left before being called again
+/// while the window stays open: long enough not to hammer a machine that is
+/// not pairing, short enough that one that opens its window is reached soon.
+const STRANGER_RECALL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often the loop wakes to notice a stop request.
 ///
