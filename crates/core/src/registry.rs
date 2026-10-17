@@ -43,6 +43,13 @@ pub struct KnownPeer {
     /// sighting, because a rebooted machine can come back on a new address.
     pub addr: Option<SocketAddr>,
     pub state: PeerState,
+    /// When discovery last reported it in this process. `None` for a peer
+    /// known only from the trust store.
+    pub seen_at: Option<Instant>,
+    /// Since when this node has been leaving the dial to the peer
+    /// ([`should_dial`]) while the peer stayed down. See
+    /// [`crate::mesh::next_dial_targets`].
+    pub yielding_since: Option<Instant>,
 }
 
 impl KnownPeer {
@@ -88,6 +95,8 @@ impl PeerRegistry {
                         // `note_seen`; until then this is our best known address.
                         addr: t.last_addr,
                         state: PeerState::Offline { since: None },
+                        seen_at: None,
+                        yielding_since: None,
                     },
                 )
             })
@@ -117,6 +126,7 @@ impl PeerRegistry {
                 // Always refresh the address: this is how a peer that came back
                 // on a different IP becomes reachable again.
                 peer.addr = Some(addr);
+                peer.seen_at = Some(Instant::now());
                 if peer.display_name != display_name {
                     peer.display_name = display_name.to_string();
                 }
@@ -138,6 +148,8 @@ impl PeerRegistry {
             display_name: display_name.clone(),
             addr,
             state: PeerState::Offline { since: None },
+            seen_at: None,
+            yielding_since: None,
         });
         entry.display_name = display_name;
         if addr.is_some() {
@@ -147,8 +159,18 @@ impl PeerRegistry {
 
     pub fn set_state(&mut self, peer_id: PeerId, state: PeerState) {
         if let Some(peer) = self.peers.get_mut(&peer_id) {
+            if matches!(state, PeerState::Online) {
+                peer.yielding_since = None;
+            }
             peer.state = state;
         }
+    }
+
+    /// Note that this node is leaving the dial to `peer_id`, and answer since
+    /// when it has been.
+    pub fn yielding(&mut self, peer_id: PeerId, now: Instant) -> Option<Instant> {
+        let peer = self.peers.get_mut(&peer_id)?;
+        Some(*peer.yielding_since.get_or_insert(now))
     }
 
     /// Mark a peer offline as of now.

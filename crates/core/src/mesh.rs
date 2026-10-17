@@ -23,7 +23,7 @@
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cursio_protocol::PeerId;
 use cursio_transport::pairing::TrustStore;
@@ -65,15 +65,46 @@ pub struct DialTarget {
 /// Peers chosen here are moved to `Connecting` immediately, so a slow dial isn't
 /// started twice by the next sweep.
 pub fn next_dial_targets(local_id: PeerId, registry: &SharedRegistry) -> Vec<DialTarget> {
+    next_dial_targets_at(local_id, registry, Instant::now())
+}
+
+/// How long a node leaves the dial to the peer [`should_dial`] picked before
+/// placing it itself.
+///
+/// The rule assumes the two hear each other. They need not: a phone sharing
+/// its connection hears the laptop on its hotspot, while its own announcements
+/// never reach that laptop (measured on HyperOS: multicast from the hotspot's
+/// owner to its clients is dropped, the other way passes). The laptop then
+/// keeps dialling the address it remembered, and the phone keeps waiting for
+/// it — nobody calls. So a node that has *heard* the peer in this run and
+/// still sees it down after this long dials anyway. Several sweeps long, so a
+/// peer that can dial has done so first and the pair does not open two links.
+///
+/// [`should_dial`]: crate::registry::should_dial
+const YIELD_GRACE: Duration = Duration::from_secs(10);
+
+fn next_dial_targets_at(
+    local_id: PeerId,
+    registry: &SharedRegistry,
+    now: Instant,
+) -> Vec<DialTarget> {
     let mut reg = registry.borrow_mut();
     let candidates = reg.dial_candidates();
     let mut targets = Vec::new();
     for peer in candidates {
         let Some(addr) = peer.addr else { continue };
         if !crate::registry::should_dial(local_id, peer.peer_id) {
-            // The other side dials this pair; we wait for it to arrive.
-            tracing::trace!(peer = %peer.display_name, "yielding dial to the peer");
-            continue;
+            let since = reg.yielding(peer.peer_id, now).unwrap_or(now);
+            let heard = peer.seen_at.is_some();
+            if !heard || now.duration_since(since) < YIELD_GRACE {
+                tracing::trace!(peer = %peer.display_name, "yielding dial to the peer");
+                continue;
+            }
+            tracing::info!(
+                peer = %peer.display_name,
+                %addr,
+                "the peer has not called although it is up; calling it instead"
+            );
         }
         reg.set_state(peer.peer_id, PeerState::Connecting);
         targets.push(DialTarget {
@@ -118,6 +149,43 @@ mod tests {
             next_dial_targets(high, &reg2).is_empty(),
             "high id should wait for the inbound connection"
         );
+    }
+
+    /// The node that waits calls after all once it has heard the peer and the
+    /// peer has not called — the hotspot that hears its client but is never
+    /// heard by it.
+    #[test]
+    fn a_waiting_node_that_hears_the_peer_calls_after_the_grace() {
+        let (low, high) = (PeerId::from_u128(1), PeerId::from_u128(2));
+        let addr: SocketAddr = "10.83.118.56:40711".parse().unwrap();
+        let mut reg = PeerRegistry::default();
+        reg.admit(low, "low".into(), None);
+        reg.note_seen(low, "low", addr);
+        let reg = shared(reg);
+
+        let start = Instant::now();
+        assert!(next_dial_targets_at(high, &reg, start).is_empty());
+        assert!(next_dial_targets_at(high, &reg, start + YIELD_GRACE / 2).is_empty());
+        let late = next_dial_targets_at(high, &reg, start + YIELD_GRACE);
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].addr, addr);
+    }
+
+    /// An address remembered from an earlier run is not reason enough: both
+    /// sides would call one another's stale addresses.
+    #[test]
+    fn a_waiting_node_that_never_heard_the_peer_keeps_waiting() {
+        let (low, high) = (PeerId::from_u128(1), PeerId::from_u128(2));
+        let mut reg = PeerRegistry::default();
+        reg.admit(
+            low,
+            "low".into(),
+            Some("192.168.1.18:41217".parse().unwrap()),
+        );
+        let reg = shared(reg);
+        let start = Instant::now();
+        assert!(next_dial_targets_at(high, &reg, start).is_empty());
+        assert!(next_dial_targets_at(high, &reg, start + YIELD_GRACE * 3).is_empty());
     }
 
     /// A dial in flight must not be started again by the next sweep.
