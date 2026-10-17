@@ -188,6 +188,31 @@ struct PlaybackSink {
 
 static PLAYBACK: std::sync::Mutex<Option<PlaybackSink>> = std::sync::Mutex::new(None);
 
+/// How loud this phone's playback is sent, linear, as `f32` bits.
+///
+/// Playback capture taps the mix before the phone's own volume, so what
+/// reached a peer was always full scale whatever the rocker said — loud enough
+/// to hurt through speakers set for a quieter source. This is the phone's knob
+/// for it; the listener's own volume still multiplies on the far side.
+static PLAYBACK_VOLUME: AtomicU32 = AtomicU32::new(0x3f80_0000);
+
+/// The loudest the send volume goes: as captured, never boosted, since a
+/// boost on top of a full-scale mix only clips.
+pub const MAX_PLAYBACK_VOLUME: f32 = 1.0;
+
+pub fn set_playback_volume(volume: f32) {
+    let volume = if volume.is_finite() {
+        volume.clamp(0.0, MAX_PLAYBACK_VOLUME)
+    } else {
+        MAX_PLAYBACK_VOLUME
+    };
+    PLAYBACK_VOLUME.store(volume.to_bits(), Ordering::Relaxed);
+}
+
+pub fn playback_volume() -> f32 {
+    f32::from_bits(PLAYBACK_VOLUME.load(Ordering::Relaxed))
+}
+
 /// Hand in a block of what this phone is playing, as interleaved stereo f32 at
 /// 48 kHz — the JVM's AudioPlaybackCapture output. Dropped when no peer device
 /// is routed to, so capture can run ahead of the route without piling up.
@@ -197,7 +222,11 @@ pub fn push_playback(samples: &[f32]) {
         return;
     };
     let frames = (samples.len() / CHANNELS) as u64;
-    let data = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let volume = playback_volume();
+    let data = samples
+        .iter()
+        .flat_map(|s| (s * volume).to_le_bytes())
+        .collect();
     let chunk = AudioChunk {
         id: sink.id,
         seq: sink.seq,
@@ -259,14 +288,35 @@ struct SinkEntry {
 struct Sinks {
     entries: Vec<SinkEntry>,
     routed: Option<u64>,
+    /// The device the user chose, by name, kept while its peer is away.
+    ///
+    /// A key names one link's device and dies with the link, so a route that
+    /// remembered only the key was gone for good the first time the laptop
+    /// slept or the phone left the room. The name outlives both: the phone
+    /// plays on itself while the device is away and goes back to it when it
+    /// returns.
+    wanted: Option<String>,
     next_key: u64,
 }
 
 static SINKS: std::sync::Mutex<Sinks> = std::sync::Mutex::new(Sinks {
     entries: Vec::new(),
     routed: None,
+    wanted: None,
     next_key: 1,
 });
+
+impl Sinks {
+    fn join(&mut self, key: u64) {
+        if let Some(entry) = self.entries.iter().find(|e| e.key == key) {
+            let _ = entry.events.send(crate::IntentSinkEvent::Joined {
+                app_node_id: PHONE_PLAYBACK_NODE,
+                app_name: PHONE_PLAYBACK_NAME.into(),
+            });
+            self.routed = Some(key);
+        }
+    }
+}
 
 fn sinks() -> std::sync::MutexGuard<'static, Sinks> {
     SINKS.lock().unwrap_or_else(|p| p.into_inner())
@@ -294,6 +344,17 @@ pub fn playback_targets() -> Vec<PlaybackTarget> {
         .collect()
 }
 
+/// The device this phone's sound is meant for while it is away, by name: what
+/// the app shows instead of a route that silently stopped.
+pub fn awaited_playback() -> Option<String> {
+    let sinks = sinks();
+    sinks
+        .routed
+        .is_none()
+        .then(|| sinks.wanted.clone())
+        .flatten()
+}
+
 /// Send this phone's playback to one device, or to none.
 pub fn route_playback(target: Option<u64>) -> Result<(), AudioError> {
     let mut sinks = sinks();
@@ -301,6 +362,11 @@ pub fn route_playback(target: Option<u64>) -> Result<(), AudioError> {
         if !sinks.entries.iter().any(|e| e.key == key) {
             return Err(AudioError::StreamGone(format!("playback target {key}")));
         }
+    }
+    if target.is_none() {
+        // Stopping also forgets a device that is away right now, or it would
+        // take the sound back the moment its peer returned.
+        sinks.wanted = None;
     }
     if sinks.routed == target {
         return Ok(());
@@ -312,14 +378,15 @@ pub fn route_playback(target: Option<u64>) -> Result<(), AudioError> {
             });
         }
     }
+    sinks.wanted = target.and_then(|key| {
+        sinks
+            .entries
+            .iter()
+            .find(|e| e.key == key)
+            .map(|e| e.description.clone())
+    });
     if let Some(key) = target {
-        if let Some(entry) = sinks.entries.iter().find(|e| e.key == key) {
-            let _ = entry.events.send(crate::IntentSinkEvent::Joined {
-                app_node_id: PHONE_PLAYBACK_NODE,
-                app_name: PHONE_PLAYBACK_NAME.into(),
-            });
-        }
-        sinks.routed = Some(key);
+        sinks.join(key);
     }
     Ok(())
 }
@@ -330,11 +397,20 @@ impl AndroidIntentSink {
         let mut sinks = sinks();
         let key = sinks.next_key;
         sinks.next_key += 1;
+        let returning =
+            sinks.routed.is_none() && sinks.wanted.as_deref() == Some(description.as_str());
         sinks.entries.push(SinkEntry {
             key,
             description,
             events,
         });
+        if returning {
+            tracing::info!(
+                key,
+                "the chosen device is back; sending this phone's sound to it again"
+            );
+            sinks.join(key);
+        }
         Self { key, events_rx }
     }
 
@@ -344,7 +420,8 @@ impl AndroidIntentSink {
 }
 
 /// The peer's link went away: the device is no longer a target, and a route
-/// to it ends rather than pointing at nothing.
+/// to it ends rather than pointing at nothing. Its name stays wanted, so the
+/// route comes back with the device.
 impl Drop for AndroidIntentSink {
     fn drop(&mut self) {
         let mut sinks = sinks();

@@ -38,6 +38,8 @@ use jni::sys::{jboolean, jint, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
 mod node;
+#[cfg(target_os = "android")]
+mod phone_audio;
 
 use node::NodeHandle;
 
@@ -68,6 +70,8 @@ pub fn init(files_dir: &str) -> anyhow::Result<()> {
     // identical.
     cursio_log::set_log_dir(std::path::Path::new(files_dir).join("data").join("logs"));
     init_logcat();
+    #[cfg(target_os = "android")]
+    phone_audio::restore();
     tracing::info!(dir = %files_dir, "cursio native initialised");
     Ok(())
 }
@@ -125,6 +129,8 @@ pub fn input_to(
 /// Peer devices this phone's playback can be sent to.
 #[cfg(target_os = "android")]
 pub use cursio_audio::android_backend::{playback_targets, route_playback, PlaybackTarget};
+#[cfg(target_os = "android")]
+pub use phone_audio::{awaited_playback, playback_volume, set_playback_volume};
 
 /// One line for the service notification.
 pub fn status_line() -> String {

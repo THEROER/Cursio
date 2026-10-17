@@ -361,7 +361,10 @@
     "routed": "This phone's sound now plays on the computer",
     "stopped": "This phone's sound plays here again",
     "routeFailed": "The phone's sound was not redirected",
-    "listFailed": "The output devices could not be read"
+    "listFailed": "The output devices could not be read",
+    "volume": "Volume on the computer",
+    "volumeFailed": "The volume was not changed",
+    "awaited": "{device} is not connected right now. The sound plays on this phone and goes back to it when it returns."
   },
   "touchpad": {
     "driving": "Driving {peer}",

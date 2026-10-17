@@ -3,7 +3,7 @@
  * Where the phone's own sound plays: one of the peers' output devices, or
  * nowhere but the phone. Phone only — the commands exist only there.
  */
-import type { PhoneAudioTarget } from "~/composables/usePhone"
+import type { PhoneAudioState, PhoneAudioTarget } from "~/composables/usePhone"
 
 const OFF = "off"
 
@@ -13,13 +13,26 @@ const toast = useCursioToast()
 
 /** `null` until the first answer, so the card does not flash "no devices". */
 const targets = ref<PhoneAudioTarget[] | null>(null)
+const state = ref<PhoneAudioState | null>(null)
 const busy = ref(false)
 
 async function refresh() {
   try {
-    targets.value = await phoneAudioTargets()
+    ;[targets.value, state.value] = await Promise.all([phoneAudioTargets(), phoneAudioState()])
   } catch (e) {
     toast.failure(e, { title: t("phoneAudio.listFailed") })
+  }
+}
+
+const percent = computed(() => Math.round((state.value?.volume ?? 1) * 100))
+
+/** Applied while dragging: the point is to hear the level change, not guess it. */
+async function setVolume(value: number) {
+  if (state.value) state.value.volume = value / 100
+  try {
+    await phoneAudioVolume(value / 100)
+  } catch (e) {
+    toast.failure(e, { title: t("phoneAudio.volumeFailed") })
   }
 }
 
@@ -80,7 +93,24 @@ onBeforeUnmount(() => {
       />
     </LpFormField>
     <p v-if="active" class="text-xs">{{ t("phoneAudio.playingOn", { device: active.name }) }}</p>
+    <LpAlert v-else-if="state?.awaited" variant="warning">
+      {{ t("phoneAudio.awaited", { device: state.awaited }) }}
+    </LpAlert>
     <p v-else-if="targets.length === 0" class="text-xs text-muted">{{ t("phoneAudio.none") }}</p>
+    <LpFormField :label="t('phoneAudio.volume')">
+      <div class="flex items-center gap-4">
+        <LpSlider
+          :model-value="percent"
+          :min="0"
+          :max="100"
+          :step="1"
+          :aria-label="t('phoneAudio.volume')"
+          class="flex-1 py-3"
+          @update:model-value="setVolume"
+        />
+        <span class="w-12 shrink-0 text-right font-mono text-xs tabular-nums">{{ percent }}%</span>
+      </div>
+    </LpFormField>
     <p class="text-xs text-muted">{{ t("phoneAudio.limits") }}</p>
   </LpCard>
 </template>

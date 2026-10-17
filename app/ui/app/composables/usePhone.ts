@@ -42,6 +42,17 @@ export const phoneAudioTargets = () => invoke<PhoneAudioTarget[]>("phone_audio_t
  */
 export const phoneAudioRoute = (target: number | null) => invoke<void>("phone_audio_route", { target })
 
+/** Mirrors the app's `PhoneAudioState`. */
+export interface PhoneAudioState {
+  /** How loud the phone's sound reaches the computer, 0 to 1. */
+  volume: number
+  /** The chosen device, while its machine is away. */
+  awaited: string | null
+}
+
+export const phoneAudioState = () => invoke<PhoneAudioState>("phone_audio_state")
+export const phoneAudioVolume = (volume: number) => invoke<void>("phone_audio_volume", { volume })
+
 /**
  * The user's own word that autostart is allowed, kept because the phone
  * cannot report it: without this the hint would stay on the home page forever.
