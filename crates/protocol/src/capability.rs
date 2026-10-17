@@ -65,6 +65,9 @@ impl ModuleId {
     /// Handing new builds of Cursio between machines; see
     /// [`update`](crate::update).
     pub const UPDATE: ModuleId = ModuleId(8);
+    /// Sending a link, text or file to another machine to open, paste or
+    /// keep; see [`share`](crate::share).
+    pub const SHARE: ModuleId = ModuleId(9);
 
     /// Human-readable name, for logs and diagnostics. Unknown ids are rendered
     /// numerically rather than hidden — that is exactly the case worth seeing in
@@ -79,6 +82,7 @@ impl ModuleId {
             ModuleId::SERVICE => "service",
             ModuleId::USB => "usb",
             ModuleId::UPDATE => "update",
+            ModuleId::SHARE => "share",
             _ => "unknown",
         }
     }

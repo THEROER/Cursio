@@ -64,6 +64,7 @@ pub mod module;
 /// shared cursor rides.
 pub(crate) mod module_host;
 pub mod node_status;
+pub mod opener;
 /// Who may pair right now, with what secret, and for how long.
 pub mod pairing_window;
 /// Installing Cursio as this user's ScreenCast portal backend.
@@ -83,6 +84,8 @@ pub mod remote_screen;
 pub mod screen_hub;
 pub mod service_session;
 pub mod session;
+pub mod share_session;
+pub mod share_sink;
 /// Versions side by side, a `current` pointer, and the helper that switches it.
 pub mod update;
 #[cfg(feature = "usb")]

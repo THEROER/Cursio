@@ -16,6 +16,7 @@ pub mod input;
 pub mod node;
 pub mod paths;
 pub mod service;
+pub mod share;
 pub mod update;
 pub mod usb;
 pub mod window;

@@ -1557,6 +1557,9 @@ fn module_registry(
         .with(Box::new(cursio_core::clipboard_session::ClipboardFactory {
             enabled: true,
         }))
+        .with(Box::new(cursio_core::share_session::ShareFactory {
+            sink: cursio_core::share_sink::DesktopSink::shared(),
+        }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,
             reasons: services.reasons,
