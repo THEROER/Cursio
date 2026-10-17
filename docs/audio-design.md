@@ -110,6 +110,15 @@ playback clock causes crackle or growing lag.
   sender track fill/RTT and adjust Opus bitrate under pressure. The rule is the
   same — **drop/degrade rather than buffer unboundedly** — but audio keeps a
   *small* jitter buffer on purpose, unlike video which favors freshness.
+
+  Small means small in steady state, not merely bounded. Every playback
+  backend starts after a 40 ms prefill, caps the backlog at 200 ms, and once a
+  playing stream's backlog passes 100 ms skips back to 40 ms, crossfaded
+  (`declick::settle_backlog`): after a Wi-Fi stall and burst, audio arrives as
+  fast as it plays, so a backlog left alone is a delay kept for the rest of the
+  stream. WASAPI also writes only 40 ms ahead of the device rather than filling
+  its 200 ms endpoint buffer, which, kept full with keep-alive, put every
+  arriving sample 200 ms behind.
 - **Clock:** the receiver resamples to its own device clock to absorb drift
   (details are a backend concern; the protocol carries timestamps/seq to make it
   possible).

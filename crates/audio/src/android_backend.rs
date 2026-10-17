@@ -600,6 +600,15 @@ impl AndroidSink {
                         let excess = excess - excess % BYTES_PER_FRAME;
                         crate::declick::skip_crossfaded(&mut jitter, excess, CHANNELS, fade);
                     }
+                    if started {
+                        crate::declick::settle_backlog(
+                            &mut jitter,
+                            BYTES_PER_FRAME,
+                            SAMPLE_RATE as usize,
+                            CHANNELS,
+                            fade,
+                        );
+                    }
                     if !started && jitter.len() >= JITTER_PREFILL_BYTES {
                         started = true;
                     }

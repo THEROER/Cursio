@@ -2051,6 +2051,15 @@ fn run_playback_loop(
                         );
                     }
                 }
+                if started.get() {
+                    crate::declick::settle_backlog(
+                        &mut jb,
+                        BYTES_PER_FRAME,
+                        SAMPLE_RATE as usize,
+                        CHANNELS as usize,
+                        fade,
+                    );
+                }
                 if !started.get() && jb.len() >= JITTER_PREFILL_BYTES {
                     started.set(true);
                     // Log every start, not just the first: a stream that keeps

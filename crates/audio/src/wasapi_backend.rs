@@ -925,6 +925,17 @@ const RENDER_PREFILL_BYTES: usize = 4 * 480 * 8;
 /// OLDEST audio is dropped: live audio wants freshness, not completeness.
 const RENDER_MAX_BYTES: usize = 48_000 / 5 * 8;
 
+/// How far ahead of the device the render loop writes, in milliseconds.
+///
+/// The endpoint buffer is 200 ms so a stalled loop does not underrun, but
+/// writing all of it every pass kept it full — with keep-alive when nothing
+/// arrived — so every sample that did arrive queued behind 200 ms already
+/// written: the bulk of the delay between a phone and Voicemeeter. Only this
+/// much is kept queued instead. Not less: the loop sleeps 5 ms but Windows'
+/// default timer wakes it up to ~16 ms late, and the device must not run dry
+/// in between.
+const RENDER_AHEAD_MS: u32 = 40;
+
 /// A running WASAPI render node (the **sink** side).
 ///
 /// Inbound [`AudioChunk`]s are pushed into a shared byte queue drained by the
@@ -1515,13 +1526,23 @@ fn run_render_loop(
                     );
                 }
             }
+            if started {
+                crate::declick::settle_backlog(
+                    &mut jitter,
+                    frame_bytes,
+                    mix.nSamplesPerSec as usize,
+                    channels,
+                    fade,
+                );
+            }
             if !started && jitter.len() >= RENDER_PREFILL_BYTES {
                 started = true;
             }
 
-            // Fill the device's currently-free space.
+            // Top the device up to RENDER_AHEAD_MS, not to its whole buffer.
             let padding = client.GetCurrentPadding().unwrap_or(0);
-            let mut free_frames = buffer_frames.saturating_sub(padding);
+            let ahead = (mix.nSamplesPerSec * RENDER_AHEAD_MS / 1000).min(buffer_frames);
+            let mut free_frames = ahead.saturating_sub(padding);
             if stopping {
                 // Only the fade-out itself is still written; anything after it
                 // would just delay the stop.

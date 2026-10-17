@@ -77,6 +77,42 @@ impl Declick {
     }
 }
 
+/// Backlog, in milliseconds, past which a playing stream catches up to
+/// [`SETTLE_TO_MS`].
+///
+/// Each backend's hard ceiling only stops the backlog growing. A Wi-Fi stall
+/// followed by a burst leaves 150 ms queued, and since audio then arrives
+/// exactly as fast as it plays, those 150 ms stay for the rest of the stream:
+/// the delay only ever went up. Skipping back down costs one soft, crossfaded
+/// glitch once, instead of the lag for good.
+const SETTLE_MS: usize = 100;
+/// What a backlog is cut back to: the prefill every backend starts with.
+const SETTLE_TO_MS: usize = 40;
+
+/// Catch a playing stream's backlog up if it has drifted past [`SETTLE_MS`].
+/// `frame_bytes` and `rate` describe what `buf` holds. Returns what was
+/// dropped, in bytes.
+pub(crate) fn settle_backlog(
+    buf: &mut VecDeque<u8>,
+    frame_bytes: usize,
+    rate: usize,
+    channels: usize,
+    fade_frames: usize,
+) -> usize {
+    let ms = rate * frame_bytes / 1000;
+    if frame_bytes == 0 || buf.len() <= SETTLE_MS * ms {
+        return 0;
+    }
+    let mut excess = buf.len() - SETTLE_TO_MS * ms;
+    excess -= excess % frame_bytes;
+    skip_crossfaded(buf, excess, channels, fade_frames);
+    tracing::debug!(
+        dropped_bytes = excess,
+        "playback backlog past its settle point; caught up to keep latency low"
+    );
+    excess
+}
+
 /// Drop the first `skip` bytes of `buf`, crossfading the audio that would
 /// have played next into the audio that now plays instead.
 ///
@@ -156,6 +192,23 @@ mod tests {
 
         assert_eq!(samples(&first), vec![0.25, 0.5]);
         assert_eq!(samples(&second), vec![0.75, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_backlog_past_the_settle_point_is_cut_back_to_the_prefill() {
+        // 1 kHz mono f32: 4 bytes a frame, 4 bytes a millisecond.
+        let mut buf: VecDeque<u8> = bytes(&[0.5; 150]).into_iter().collect();
+        let dropped = settle_backlog(&mut buf, 4, 1000, 1, 2);
+        assert_eq!(dropped, 110 * 4);
+        assert_eq!(buf.len(), 40 * 4);
+
+        let mut short: VecDeque<u8> = bytes(&[0.5; 90]).into_iter().collect();
+        assert_eq!(
+            settle_backlog(&mut short, 4, 1000, 1, 2),
+            0,
+            "below the settle point"
+        );
+        assert_eq!(short.len(), 90 * 4);
     }
 
     #[test]
