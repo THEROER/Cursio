@@ -776,8 +776,32 @@ fn walk_hint(pid: u32) -> String {
 /// A live mount of the peer's volumes, whichever OS is presenting them.
 #[cfg(target_os = "linux")]
 type Mount = cursio_files::mount::MountHandle;
+/// On Windows a drive is mounted here only when the node runs unelevated;
+/// elevated, the helper holds it, in the session Explorer runs in (see
+/// [`crate::mount_helper`]).
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
-type Mount = cursio_files::winmount::MountHandle;
+enum Mount {
+    Here {
+        _drive: cursio_files::winmount::MountHandle,
+    },
+    Helper(crate::mount_helper::RelayedMount),
+}
+
+/// Whether a mount is still standing. Only a relayed one can fall on its own
+/// — its helper exits, or refuses — and is then dropped so the retry mounts it
+/// again.
+#[cfg(target_os = "linux")]
+fn mount_is_alive(_mount: &Mount) -> bool {
+    true
+}
+
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
+fn mount_is_alive(mount: &Mount) -> bool {
+    match mount {
+        Mount::Here { .. } => true,
+        Mount::Helper(relayed) => relayed.is_alive(),
+    }
+}
 
 /// Uninhabited where no mount implementation exists, so `Option<Mount>` is
 /// always `None` and every path that reads it stays compiled and honest.
@@ -810,7 +834,20 @@ fn mount_one_volume(peer: PeerLink, peer_name: &str, volume: &Volume) -> anyhow:
 
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 fn mount_one_volume(peer: PeerLink, peer_name: &str, volume: &Volume) -> anyhow::Result<Mount> {
+    if crate::elevate::is_elevated() {
+        match crate::mount_helper::mount(peer.clone(), peer_name, &volume.id, &volume.label) {
+            Ok(relayed) => return Ok(Mount::Helper(relayed)),
+            Err(e) => tracing::warn!(
+                peer = %peer_name,
+                volume = %volume.id,
+                error = %format!("{e:#}"),
+                "cannot start the drive helper; mounting here, where Explorer will not show the \
+                 drive (it stays reachable by its \\\\cursio\\ path)"
+            ),
+        }
+    }
     cursio_files::winmount::mount(peer, peer_name, &volume.id, &volume.label)
+        .map(|drive| Mount::Here { _drive: drive })
 }
 
 /// One request we sent that has not been answered yet.
@@ -1206,12 +1243,12 @@ impl FilesEngine {
         // mount point.
         let live: std::collections::HashSet<&str> =
             self.peer_volumes.iter().map(|v| v.id.as_str()).collect();
-        self.volume_mounts.retain(|id, _| {
+        self.volume_mounts.retain(|id, mount| {
             let keep = live.contains(id.as_str());
             if !keep {
                 tracing::info!(peer = %self.peer_name, volume = %id, "peer volume went away; unmounting");
             }
-            keep
+            keep && mount_is_alive(mount)
         });
 
         // Arrived: one mount each. Anything still missing is retried, since a

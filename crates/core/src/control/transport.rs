@@ -451,7 +451,7 @@ mod unix {
 }
 
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use std::path::Path;
 
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -506,7 +506,7 @@ mod windows {
         }
     }
 
-    pub(super) fn create(endpoint: &Path, first: bool) -> Result<NamedPipeServer, ControlError> {
+    pub(crate) fn create(endpoint: &Path, first: bool) -> Result<NamedPipeServer, ControlError> {
         // Protected DACL: this user and SYSTEM, full access; nobody else. The
         // medium no-write-up label lets an unelevated client in when the node
         // itself is elevated.

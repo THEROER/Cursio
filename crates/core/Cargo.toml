@@ -113,6 +113,9 @@ windows = { version = "0.61", features = [
     # GlobalMemoryStatusEx — commit charge against its limit, for the pressure
     # monitor; see pressure.rs.
     "Win32_System_SystemInformation",
+    # GetNamedPipeServerProcessId — the drive helper's pipe is checked to be
+    # served by the helper this node started; see mount_helper.rs.
+    "Win32_System_Pipes",
 ] }
 
 [dev-dependencies]

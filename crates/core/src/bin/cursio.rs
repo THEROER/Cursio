@@ -134,6 +134,14 @@ enum Command {
         #[command(subcommand)]
         action: PortalAction,
     },
+    /// Hold a peer's drives for an elevated node, in the session Explorer runs
+    /// in (Windows). Started by the node itself.
+    #[command(name = "mount-helper", hide = true)]
+    MountHelper {
+        /// The node's process id; the helper exits with it.
+        #[arg(long)]
+        parent: u32,
+    },
 }
 
 /// `cursio mesh`'s flags. Each is an override of `config.toml`: absent means
@@ -709,6 +717,12 @@ async fn run() -> anyhow::Result<()> {
     }
     let cli = Cli::parse();
 
+    // Its own log file: the node is writing `cursio`'s at the same moment.
+    if let Command::MountHelper { parent } = cli.command {
+        let _log = cursio_core::logging::init_with_verbosity("cursio-mount-helper", cli.verbose);
+        return cursio_core::mount_helper::run_helper(parent).await;
+    }
+
     // Console (info) + rotating file (debug) logging. `_log` must live for the
     // whole run — dropping it flushes and stops the file writer. See
     // `cursio_core::logging` for the filters and log-file location.
@@ -1043,6 +1057,7 @@ async fn run() -> anyhow::Result<()> {
         } => send_share(&target, &to, copy, save).await,
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Portal { action } => portal(action).await,
+        Command::MountHelper { .. } => unreachable!("handled before the node starts"),
     }
 }
 

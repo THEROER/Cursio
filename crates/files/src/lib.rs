@@ -27,6 +27,8 @@ pub mod mount;
 /// A per-file read buffer that fetches ahead while access stays sequential, so
 /// many small reads share one round trip.
 pub mod readahead;
+/// A mount presented by another process, answered from this one's session.
+pub mod relay;
 pub mod server;
 /// Which roots a peer may reach, each read-only or read-write.
 pub mod share;
@@ -53,6 +55,10 @@ pub enum FilesError {
     /// A `--files-share` root (or its config equivalent) cannot be used.
     #[error("invalid share root: {0}")]
     ShareRoot(String),
+    /// The stream to the process presenting a mount broke or carried
+    /// something unreadable; see [`relay`].
+    #[error("mount relay: {0}")]
+    Relay(String),
 }
 
 /// Directory name a volume is presented under, on either mount.

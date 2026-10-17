@@ -1197,6 +1197,7 @@ name = "cursio-files"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "cursio-protocol",
  "fuser",
  "libc",

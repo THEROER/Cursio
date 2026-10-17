@@ -1612,22 +1612,16 @@ pub fn mount(
     // report the choice back. Passing the UNC path instead is refused outright,
     // as mount points with three or more backslashes come back as
     // `STATUS_NETWORK_ACCESS_DENIED`.
-    // KNOWN LIMITATION — the letter is invisible while cursio runs elevated.
+    // A letter belongs to the logon session that defines it. UAC gives an
+    // administrator two linked sessions, so a drive mounted from the elevated
+    // one is genuine — an elevated process lists `C: Y: Z:` — but absent from
+    // Explorer, which runs in the other and sees only `C:`. An elevated node
+    // therefore does not call this itself: it relays the mount to an
+    // unelevated helper (`cursio_files::relay`, `cursio_core::mount_helper`),
+    // and this runs there. The UNC path (`\\cursio\<peer>`) reaches the
+    // drive from either session, which is what remains when the helper cannot
+    // be started.
     //
-    // Cursio elevates itself so injected input can reach administrator-owned
-    // windows. UAC gives such a user two linked logon sessions, and the symbolic
-    // links that make up drive letters belong to one session, never both. The
-    // drive mounted here is genuine and works — an elevated process listing
-    // drives sees `C: Y: Z:` — but Explorer runs unelevated and sees only `C:`.
-    //
-    // Reaching it by its UNC path (`\\cursio\<peer>`) works from either session
-    // and is unaffected, which is why the mount is still worth making.
-    //
-    // Two ways out, neither free: Microsoft's `EnableLinkedConnections` policy
-    // mirrors the links into both sessions but is machine-wide and weakens the
-    // boundary UAC draws; or the mount moves into an unelevated helper process,
-    // which means forwarding every filesystem operation across a process
-    // boundary. See `docs/files-design.md`.
     // Refused rather than folded in with another volume: there are 26 letters
     // for every disk on the machine and every peer's, and a volume quietly
     // sharing a letter with another is the ambiguity this change removes.

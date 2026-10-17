@@ -10,6 +10,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 # The share policy is plain data a config file carries; see share.rs.
 serde.workspace = true
+# Frames between the node and the process presenting a mount; see relay.rs.
+bincode.workspace = true
 # Only for the channel the mount uses to reach the async session; no filesystem
 # work runs on the runtime (see mount::bridge).
 tokio = { workspace = true }
