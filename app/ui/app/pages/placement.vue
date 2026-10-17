@@ -54,7 +54,7 @@ const placed = computed<Placed[]>(() => {
   if (!s || !here.value) return []
   const out: Placed[] = [{ id: s.node.id, name: s.node.name, at: here.value, self: true, online: true }]
   for (const p of s.peers) {
-    if (p.link) {
+    if (p.link && takesCursor(p.link.device_kind)) {
       out.push({
         id: p.id,
         name: p.name,

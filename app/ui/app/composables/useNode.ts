@@ -29,6 +29,15 @@ export interface LinkView {
   since: SystemTime
 }
 
+/**
+ * Whether a machine of this kind has a screen the shared cursor can enter.
+ * Mirrors `DeviceKind::takes_cursor`: a phone only ever drives a cursor, so
+ * its grid cell borders nothing and showing one invites placing it.
+ */
+export function takesCursor(kind: LinkView["device_kind"]): boolean {
+  return kind === "Desktop" || kind === "Laptop"
+}
+
 export interface PeerView {
   id: string
   name: string

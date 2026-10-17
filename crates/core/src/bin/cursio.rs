@@ -3050,13 +3050,20 @@ async fn print_status(json: bool) -> anyhow::Result<()> {
             Presence::Offline => "offline",
         };
         match &peer.link {
-            Some(link) => println!(
-                "  {:<16} {presence:<10} at {:<6} {}  modules: {}",
-                peer.name,
-                at(link.position),
-                link.status,
-                link.modules.join(", ")
-            ),
+            Some(link) => {
+                // A phone's cell borders nothing; its kind is what to know.
+                let place = if link.device_kind.takes_cursor() {
+                    format!("at {}", at(link.position))
+                } else {
+                    format!("{:?}", link.device_kind).to_lowercase()
+                };
+                println!(
+                    "  {:<16} {presence:<10} {place:<9} {}  modules: {}",
+                    peer.name,
+                    link.status,
+                    link.modules.join(", ")
+                )
+            }
             None => println!("  {:<16} {presence}", peer.name),
         }
     }

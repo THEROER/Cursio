@@ -329,8 +329,10 @@ function peerFacts(p: PeerView): PaletteFact[] {
   const facts: PaletteFact[] = [{ icon: "lucide:radio", label: t("palette.presence"), value: t(`presence.${p.presence}`) }]
   const link = p.link
   if (!link) return facts
+  if (takesCursor(link.device_kind)) {
+    facts.push({ icon: "lucide:layout-grid", label: t("peer.position"), value: `${link.position.x}, ${link.position.y}`, mono: true })
+  }
   facts.push(
-    { icon: "lucide:layout-grid", label: t("peer.position"), value: `${link.position.x}, ${link.position.y}`, mono: true },
     { icon: "lucide:battery", label: t("peer.battery"), value: battery(link.status) ?? cannotSay.value },
     { icon: "lucide:wifi", label: t("peer.network"), value: network(link.status) ?? cannotSay.value },
     {
@@ -363,7 +365,11 @@ function pageFacts(path: string): PaletteFact[] {
     case "/placement":
       return [
         { icon: "lucide:locate", label: t("palette.thisMachine"), value: `${s.node.position.x}, ${s.node.position.y}`, mono: true },
-        { icon: "lucide:layout-grid", label: t("palette.placedPeers"), value: s.peers.filter((p) => p.link).length },
+        {
+          icon: "lucide:layout-grid",
+          label: t("palette.placedPeers"),
+          value: s.peers.filter((p) => p.link && takesCursor(p.link.device_kind)).length,
+        },
       ]
     case "/pair":
       return s.pairing?.code ? [{ icon: "lucide:key-round", label: t("palette.pairingCode"), value: s.pairing.code, mono: true }] : []

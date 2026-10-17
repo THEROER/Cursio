@@ -185,8 +185,10 @@ function presenceTone(p: PeerView) {
               />
               <template v-if="peer.link">
                 <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                  <dt class="text-muted">{{ t("peer.position") }}</dt>
-                  <dd>{{ peer.link.position.x }}, {{ peer.link.position.y }}</dd>
+                  <template v-if="takesCursor(peer.link.device_kind)">
+                    <dt class="text-muted">{{ t("peer.position") }}</dt>
+                    <dd>{{ peer.link.position.x }}, {{ peer.link.position.y }}</dd>
+                  </template>
                   <dt class="text-muted">{{ t("peer.kind") }}</dt>
                   <dd>{{ t(`kind.${peer.link.device_kind}`) }}</dd>
                   <dt class="text-muted">{{ t("peer.battery") }}</dt>
