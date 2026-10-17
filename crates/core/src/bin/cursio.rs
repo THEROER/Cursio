@@ -1552,6 +1552,19 @@ fn prompt_password(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
 
+/// How this desktop shows a phone's notifications, where it can.
+#[cfg(target_os = "linux")]
+fn notify_display() -> Option<std::sync::Arc<dyn cursio_core::notify_hub::NotifyDisplay>> {
+    cursio_core::notify_display::FdoDisplay::start()
+        .map(|d| d as std::sync::Arc<dyn cursio_core::notify_hub::NotifyDisplay>)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn notify_display() -> Option<std::sync::Arc<dyn cursio_core::notify_hub::NotifyDisplay>> {
+    tracing::info!("a phone's notifications are not shown on this platform yet");
+    None
+}
+
 /// Everything this node can run, assembled once at startup.
 ///
 /// This is the only place that names the concrete modules. Adding one means
@@ -1596,6 +1609,10 @@ fn module_registry(
         }))
         .with(Box::new(cursio_core::share_session::ShareFactory {
             sink: cursio_core::share_sink::DesktopSink::shared(),
+        }))
+        .with(Box::new(cursio_core::notify_session::NotifyFactory {
+            display: notify_display(),
+            actor: None,
         }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,

@@ -104,4 +104,37 @@ object CursioNative {
     @JvmStatic
     fun onShare(from: String, kind: String, text: String, path: String, name: String, mime: String, action: String): String =
         ShareReceiver.act(from, kind, text, path, name, mime, action)
+
+    /**
+     * A notification was posted on this phone; see [CursioNotificationListener].
+     * [kind] is `call`, `message` or `other`; [actionReplies] says which of
+     * [actionTitles] take text.
+     */
+    external fun nativeNotificationPosted(
+        key: String,
+        appId: String,
+        appName: String,
+        title: String,
+        text: String,
+        icon: ByteArray?,
+        whenMs: Long,
+        kind: String,
+        actionTitles: Array<String>,
+        actionReplies: BooleanArray,
+    )
+
+    /** A notification on this phone went away. */
+    external fun nativeNotificationRemoved(key: String)
+
+    /**
+     * A desktop's user pressed button [action] of notification [key], typing
+     * [reply] into it if it takes text. Called by the node, on its own thread.
+     */
+    @JvmStatic
+    fun onNotificationInvoke(key: String, action: Int, reply: String?) =
+        CursioNotificationListener.invoke(key, action, reply)
+
+    /** A desktop's user closed notification [key]: dismiss it here too. */
+    @JvmStatic
+    fun onNotificationDismiss(key: String) = CursioNotificationListener.dismiss(key)
 }

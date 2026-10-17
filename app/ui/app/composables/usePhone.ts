@@ -11,9 +11,11 @@ export interface PhoneSetup {
    * "granted": it only says the phone has one worth visiting.
    */
   autostartSetting: boolean
+  /** The phone's notifications may be shown on the machine the user is at. */
+  notificationAccess: boolean
 }
 
-export type PhoneGrant = "notifications" | "microphone" | "battery" | "autostart"
+export type PhoneGrant = "notifications" | "microphone" | "battery" | "autostart" | "notificationAccess"
 
 export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 
@@ -121,7 +123,13 @@ export function usePhone() {
   const missing = computed(() => {
     const s = setup.value
     if (!s) return false
-    return !s.notifications || !s.microphone || !s.battery || (s.autostartSetting && !autostartDone.value)
+    return (
+      !s.notifications ||
+      !s.microphone ||
+      !s.battery ||
+      !s.notificationAccess ||
+      (s.autostartSetting && !autostartDone.value)
+    )
   })
 
   return { setup, failure, missing, autostartDone, refresh, request, markAutostartDone }

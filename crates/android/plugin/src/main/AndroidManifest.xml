@@ -73,6 +73,20 @@
             </intent-filter>
         </activity>
 
+        <!-- This phone's notifications, for the desktop the user is at. Runs
+             only once the user grants notification access in the system's
+             settings; the system binds it, so it is exported to the system
+             alone through the permission. -->
+        <service
+            android:name="dev.cursio.mesh.CursioNotificationListener"
+            android:exported="true"
+            android:label="Cursio"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <receiver
             android:name="dev.cursio.mesh.BootReceiver"
             android:exported="true">

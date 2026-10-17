@@ -3,13 +3,16 @@ package dev.cursio.mesh
 import android.Manifest
 import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.result.ActivityResult
+import androidx.core.app.NotificationManagerCompat
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.Permission
@@ -144,6 +147,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
                 Prefs.setOpenedAutostart(activity)
                 launchFirst(invoke, PowerSetup.autostartIntents(activity))
             }
+            NOTIFICATION_ACCESS -> launchFirst(invoke, notificationAccessIntents())
             else -> invoke.reject("unknown grant \"$what\"")
         }
     }
@@ -227,7 +231,29 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         // No API reads the HyperOS grant, so once the user has been sent to
         // the screen it is no longer offered.
         state.put("autostartSetting", PowerSetup.hasXiaomiAutostart() && !Prefs.openedAutostart(activity))
+        state.put(
+            "notificationAccess",
+            NotificationManagerCompat.getEnabledListenerPackages(activity).contains(activity.packageName),
+        )
         return state
+    }
+
+    /**
+     * Cursio's own switch where Android 11 has one, the list of every app's
+     * otherwise. HyperOS also refuses to bind the listener until Autostart is
+     * allowed, which is the row above this one.
+     */
+    private fun notificationAccessIntents(): List<Intent> {
+        val listener = ComponentName(activity, CursioNotificationListener::class.java)
+        val detail = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            listOf(
+                Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS)
+                    .putExtra(Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME, listener.flattenToString()),
+            )
+        } else {
+            emptyList()
+        }
+        return detail + Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
     }
 
     companion object {
@@ -236,5 +262,6 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         const val MICROPHONE = "microphone"
         const val BATTERY = "battery"
         const val AUTOSTART = "autostart"
+        const val NOTIFICATION_ACCESS = "notificationAccess"
     }
 }

@@ -14,6 +14,7 @@ pub mod files;
 pub mod frame;
 pub mod input;
 pub mod node;
+pub mod notify;
 pub mod paths;
 pub mod service;
 pub mod share;

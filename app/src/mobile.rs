@@ -47,6 +47,8 @@ pub struct Setup {
     /// that keeps background apps alive (HyperOS "Autostart"). No API can
     /// read that setting, so this turns false once the screen has been opened.
     pub autostart_setting: bool,
+    /// This phone's notifications may be read and shown on a desktop.
+    pub notification_access: bool,
 }
 
 /// One of the things [`Setup`] lists, for the user to grant.
@@ -57,6 +59,7 @@ pub enum Grant {
     Microphone,
     Battery,
     Autostart,
+    NotificationAccess,
 }
 
 #[derive(Serialize)]

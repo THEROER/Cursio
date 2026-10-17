@@ -37,7 +37,9 @@ use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jint, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
+mod jvm;
 mod node;
+mod notify;
 #[cfg(target_os = "android")]
 mod phone_audio;
 mod share;
@@ -152,8 +154,82 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeInit(
     guard(&mut env, JNI_FALSE, |env| {
         let dir: String = env.get_string(&files_dir)?.into();
         init(&dir)?;
-        share::remember(env)?;
+        jvm::remember(env)?;
         Ok(JNI_TRUE)
+    })
+}
+
+/// One notification posted on this phone, for the desktop the user is at.
+///
+/// `icon` is a PNG or null; `kind` is `call`, `message` or anything else;
+/// `action_titles` and `action_replies` are the notification's buttons in
+/// order, the second saying which take text.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeNotificationPosted(
+    mut env: JNIEnv,
+    _this: JObject,
+    key: JString,
+    app_id: JString,
+    app_name: JString,
+    title: JString,
+    text: JString,
+    icon: jni::objects::JByteArray,
+    when_ms: jni::sys::jlong,
+    kind: JString,
+    action_titles: jni::objects::JObjectArray,
+    action_replies: jni::objects::JBooleanArray,
+) {
+    guard(&mut env, (), |env| {
+        let mut read = |s: &JString| -> anyhow::Result<String> { Ok(env.get_string(s)?.into()) };
+        let (key, app_id, app_name, title, text, kind) = (
+            read(&key)?,
+            read(&app_id)?,
+            read(&app_name)?,
+            read(&title)?,
+            read(&text)?,
+            read(&kind)?,
+        );
+        let icon = if icon.is_null() {
+            None
+        } else {
+            Some(env.convert_byte_array(&icon)?)
+        };
+        let count = env.get_array_length(&action_titles)?;
+        let mut replies = vec![0u8; usize::try_from(count).unwrap_or(0)];
+        env.get_boolean_array_region(&action_replies, 0, &mut replies)?;
+        let mut actions = Vec::new();
+        for i in 0..count {
+            let title: JString = env.get_object_array_element(&action_titles, i)?.into();
+            let title: String = env.get_string(&title)?.into();
+            actions.push((title, replies[i as usize] != 0));
+        }
+        cursio_core::notify_hub::hub().post(notify::notification(
+            key, app_id, app_name, title, text, icon, when_ms, &kind, actions,
+        ));
+        Ok(())
+    })
+}
+
+/// A notification on this phone went away: dismissed, read, or withdrawn.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeNotificationRemoved(
+    mut env: JNIEnv,
+    _this: JObject,
+    key: JString,
+) {
+    guard(&mut env, (), |env| {
+        let key: String = env.get_string(&key)?.into();
+        cursio_core::notify_hub::hub().remove(&key);
+        Ok(())
     })
 }
 

@@ -44,6 +44,8 @@ clipboard-core = { path = "crates/clipboard-core" }
 async-trait = "0.1.92"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+# Session-bus calls: desktop notifications and Mutter's idle time.
+zbus = "5"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

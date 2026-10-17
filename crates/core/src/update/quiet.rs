@@ -58,6 +58,12 @@ pub fn note_input_activity() {
     LAST_INPUT.store(now_ms(), Ordering::Relaxed);
 }
 
+/// Whether any session is driving a peer right now: the user's hand is on this
+/// machine's mouse, and their eyes on the other screen.
+pub fn driving() -> bool {
+    DRIVING.load(Ordering::Relaxed) > 0
+}
+
 /// Held by one session: counts it among those driving a peer while it is.
 #[derive(Default)]
 pub struct DrivingMark(bool);

@@ -66,12 +66,21 @@ pub(crate) mod module_host;
 /// The unelevated process that keeps a peer's drives where Explorer sees them.
 pub mod mount_helper;
 pub mod node_status;
+/// A phone's notifications shown through this desktop's notification server.
+#[cfg(target_os = "linux")]
+pub mod notify_display;
+/// Where a phone's notifications enter the mesh and a desktop's answers leave.
+pub mod notify_hub;
+/// The notification module on one link.
+pub mod notify_session;
 pub mod opener;
 /// Who may pair right now, with what secret, and for how long.
 pub mod pairing_window;
 /// Installing Cursio as this user's ScreenCast portal backend.
 #[cfg(all(target_os = "linux", feature = "window"))]
 pub mod portal_setup;
+/// Whether the user is at this machine: where a phone's notification goes.
+pub mod presence;
 /// Raising memory, swap and i/o pressure as a problem while it lasts.
 pub mod pressure;
 /// Renegotiating a running link when either side's settings change.
@@ -86,6 +95,9 @@ pub mod remote_screen;
 pub mod screen_hub;
 pub mod service_session;
 pub mod session;
+/// The session bus, from a thread outside the runtime.
+#[cfg(target_os = "linux")]
+pub mod session_bus;
 pub mod share_session;
 pub mod share_sink;
 /// Versions side by side, a `current` pointer, and the helper that switches it.

@@ -200,6 +200,8 @@
     "microphoneHint": "Lets other machines use this phone's microphone.",
     "battery": "No battery restrictions",
     "batteryHint": "Keeps links up while the screen is off.",
+    "notificationAccess": "Notifications on your computer",
+    "notificationAccessHint": "Shows this phone's notifications on the computer you are at, with their buttons and replies.",
     "autostart": "Autostart",
     "autostartHint": "This phone also stops apps that are not on its own Autostart list. Allow Cursio there; Android cannot tell the app whether you did.",
     "autostartDone": "I've allowed it",

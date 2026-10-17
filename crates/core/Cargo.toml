@@ -87,6 +87,11 @@ libc.workspace = true
 [target.'cfg(not(unix))'.dependencies]
 rpassword = "7"
 
+# A phone's notifications shown through the desktop's own notification server,
+# and the user's idle time from Mutter; see notify_display.rs and presence.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # Self-elevation at startup: without admin rights, Windows' UIPI silently drops
 # injected input aimed at higher-integrity windows (an elevated console, Task
@@ -116,6 +121,8 @@ windows = { version = "0.61", features = [
     # GetNamedPipeServerProcessId — the drive helper's pipe is checked to be
     # served by the helper this node started; see mount_helper.rs.
     "Win32_System_Pipes",
+    # GetLastInputInfo — whether the user is at this machine; see presence.rs.
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [dev-dependencies]

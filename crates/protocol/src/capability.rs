@@ -68,6 +68,9 @@ impl ModuleId {
     /// Sending a link, text or file to another machine to open, paste or
     /// keep; see [`share`](crate::share).
     pub const SHARE: ModuleId = ModuleId(9);
+    /// A phone's notifications, shown on the machine the user is at; see
+    /// [`notify`](crate::notify).
+    pub const NOTIFY: ModuleId = ModuleId(10);
 
     /// Human-readable name, for logs and diagnostics. Unknown ids are rendered
     /// numerically rather than hidden — that is exactly the case worth seeing in
@@ -83,6 +86,7 @@ impl ModuleId {
             ModuleId::USB => "usb",
             ModuleId::UPDATE => "update",
             ModuleId::SHARE => "share",
+            ModuleId::NOTIFY => "notify",
             _ => "unknown",
         }
     }
