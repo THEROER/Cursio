@@ -218,13 +218,15 @@ impl InputHub {
         self.routes().machine()
     }
 
-    /// Pass one captured event to the session driving a peer, if any. With
-    /// none it acts locally, which capture has already let it do.
-    pub fn route_event(&self, event: CapturedInput) {
+    /// Pass one captured event to the session driving a peer, if any, and say
+    /// whether one took it. With none it acts locally, which capture has
+    /// already let it do; input a peer sent here has not, so its session
+    /// injects it only when this returns false.
+    pub fn route_event(&self, event: CapturedInput) -> bool {
         let routes = self.routes();
-        if let Some(link) = routes.driven() {
-            let _ = link.events.send(event);
-        }
+        routes
+            .driven()
+            .is_some_and(|link| link.events.send(event).is_ok())
     }
 
     /// Pass an ownership request to the one session it concerns.
@@ -374,12 +376,15 @@ mod tests {
         let (mut first, _) = hub.attach(peer(1), at(Edge::Right, 1));
         let (mut second, _) = hub.attach(peer(2), at(Edge::Bottom, 1));
 
-        hub.route_event(motion());
+        assert!(
+            !hub.route_event(motion()),
+            "nothing driven: the input stays here"
+        );
         assert!(first.events.try_recv().is_err() && second.events.try_recv().is_err());
 
         hub.note_driving(first.token, true);
         hub.note_driving(second.token, true);
-        hub.route_event(motion());
+        assert!(hub.route_event(motion()), "a driven peer takes it");
         assert!(second.events.try_recv().is_ok());
         assert!(first.events.try_recv().is_err());
 

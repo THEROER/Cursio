@@ -186,6 +186,15 @@ A peer that cannot hold a cursor (a phone used as a touchpad) arms no edge,
 wherever it was placed: on Wayland a barrier with nobody to hand to would still
 grab the user's input.
 
+Its input is one more mouse on the machine it drives, so it follows that
+machine's cursor. Its motion reaches the edges as injected motion does (the
+Windows hook watches injected moves, a Wayland barrier stops a uinput pointer),
+and the crossing goes through the hub like any other. From then on the hub
+routes what the phone sends to the machine being driven, exactly as it routes
+the local mouse; it is injected locally only while no peer is driven. A phone
+paired with one machine therefore reaches every machine beyond its edges, and
+the cursor comes back by the same edge it left by.
+
 ## Where a peer's modifiers land on a Mac
 
 A Mac's shortcuts live on Command; a PC keyboard has Control, Alt and a Windows

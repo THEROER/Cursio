@@ -2294,6 +2294,7 @@ async fn run_pairing_and_session(
     );
     let inject_ref = injector.clone();
     let release_ref = injector.clone();
+    let relay = capture.map(|c| c.hub.clone());
     // Level with the reading the greeting carried, so this link announces only
     // what changes from here — and shares the monitor with every other session,
     // so a change reaches all of them.
@@ -2303,7 +2304,19 @@ async fn run_pairing_and_session(
         secure,
         cursor_setup,
         captured,
-        move |event| inject(inject_ref.borrow_mut().as_mut(), event),
+        move |event| {
+            // A peer moving the cursor held here — a phone used as a touchpad —
+            // is one more mouse on this machine, so it follows the cursor the
+            // way the local one does: across an edge to the machine beyond.
+            // Once this machine drives another, injecting here would move a
+            // pointer that is parked against the edge and hidden.
+            let relayed = relay
+                .as_ref()
+                .is_some_and(|hub| hub.route_event(session::CapturedInput::from(event)));
+            if !relayed {
+                inject(inject_ref.borrow_mut().as_mut(), event);
+            }
+        },
         commands,
         move |ownership| {
             // Whatever the peer was holding down stops being ours to finish the
