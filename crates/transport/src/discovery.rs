@@ -6,6 +6,7 @@
 //! system daemon, so this works identically on Ubuntu and Windows.
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use cursio_protocol::PeerId;
 use mdns_sd::{IfKind, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -31,13 +32,39 @@ pub struct DiscoveryConfig {
     /// address). When known, this is the most reliable option: everything else
     /// is disabled. Typically the address of the Wi-Fi/Ethernet LAN interface.
     pub pin_interface_addr: Option<IpAddr>,
+    /// Use every LAN interface, and keep following them as they come and go.
+    /// See [`DiscoveryConfig::lan`].
+    pub follow_lan: bool,
 }
+
+/// How often a following daemon looks for LAN interfaces that appeared or
+/// went away. A hotspot switched on is reachable this long after.
+const LAN_FOLLOW_INTERVAL: Duration = Duration::from_secs(5);
 
 impl DiscoveryConfig {
     /// Pin discovery to the interface owning `addr` (the LAN interface).
     pub fn pinned_to(addr: IpAddr) -> Self {
         Self {
             pin_interface_addr: Some(addr),
+            follow_lan: false,
+        }
+    }
+
+    /// Every LAN interface this machine has, now and later.
+    ///
+    /// Pinning to one address chosen at start-up was right for a desktop with
+    /// one network and a VPN beside it, and wrong for everything that moves: a
+    /// phone sharing its connection is the LAN for the laptop on its hotspot,
+    /// but that interface appears after the node starts and was never
+    /// enabled; and the one address announced was the one picked at start, so
+    /// a laptop that did hear the phone was handed an address it could not
+    /// reach. So all LAN interfaces are enabled, each announces its own
+    /// address, and a thread keeps the set current. VPNs, bridges and mobile
+    /// data stay off exactly as before — see [`lan_interface_addrs`].
+    pub fn lan() -> Self {
+        Self {
+            pin_interface_addr: None,
+            follow_lan: true,
         }
     }
 
@@ -57,6 +84,20 @@ impl DiscoveryConfig {
         daemon
             .disable_interface(IfKind::IPv6)
             .map_err(|e| TransportError::Other(e.to_string()))?;
+
+        if self.follow_lan {
+            daemon
+                .disable_interface(IfKind::All)
+                .map_err(|e| TransportError::Other(e.to_string()))?;
+            let now = lan_interface_addrs();
+            for addr in &now {
+                daemon
+                    .enable_interface(IfKind::Addr(*addr))
+                    .map_err(|e| TransportError::Other(e.to_string()))?;
+            }
+            follow_lan_interfaces(daemon.clone(), now);
+            return Ok(daemon);
+        }
 
         match self.pin_interface_addr {
             Some(addr) => {
@@ -132,10 +173,7 @@ fn virtual_interface_addrs() -> Vec<IpAddr> {
 /// keeps us on the Wi-Fi/Ethernet interface on such hosts; when it's ambiguous,
 /// pin explicitly via [`DiscoveryConfig::pinned_to`].
 pub fn guess_lan_ipv4() -> Option<IpAddr> {
-    let candidates: Vec<IpAddr> = local_interface_addrs()
-        .into_iter()
-        .filter(|a| a.is_ipv4() && !is_virtual_addr(a))
-        .collect();
+    let candidates = lan_interface_addrs();
 
     // Rank: 192.168/16 (0) < 10/8 (1) < other (2). Lowest wins.
     fn rank(addr: &IpAddr) -> u8 {
@@ -155,6 +193,111 @@ pub fn guess_lan_ipv4() -> Option<IpAddr> {
     }
 
     candidates.into_iter().min_by_key(rank)
+}
+
+/// Every address this machine has on a LAN: IPv4, not loopback, and neither
+/// in a virtual range ([`is_virtual_addr`]) nor on an interface whose name
+/// says it is a tunnel, a bridge or mobile data ([`is_off_lan_interface`]).
+pub fn lan_interface_addrs() -> Vec<IpAddr> {
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces
+            .into_iter()
+            .filter(|i| !i.is_loopback() && !is_off_lan_interface(&i.name))
+            .map(|i| i.ip())
+            .filter(|a| a.is_ipv4() && !is_virtual_addr(a))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not enumerate interfaces; discovery sees no LAN");
+            Vec::new()
+        }
+    }
+}
+
+/// Whether an interface's name marks it as something other than a LAN.
+///
+/// Address ranges cannot tell these apart: WireGuard and a phone's mobile
+/// data both commonly sit in `10.0.0.0/8`, where real LANs live too. Their
+/// names can. Mobile data matters most here: a phone sharing its connection
+/// has the hotspot and the carrier's network at once, and multicast toward the
+/// carrier finds nobody. Windows names interfaces by what they are, so the
+/// match is on a fragment of the friendly name there.
+pub fn is_off_lan_interface(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        // Mobile data: Qualcomm, MediaTek, the 464XLAT shim, modems, iOS.
+        "rmnet",
+        "rev_rmnet",
+        "ccmni",
+        "v4-",
+        "clat",
+        "wwan",
+        "ppp",
+        "pdp_ip",
+        // Tunnels and VPNs.
+        "wg",
+        "tun",
+        "tap",
+        "utun",
+        "ipsec",
+        "tailscale",
+        "zt",
+        // Bridges and containers.
+        "docker",
+        "br-",
+        "veth",
+        "virbr",
+        "vboxnet",
+        "vmnet",
+        "lxc",
+        "lxd",
+        "cni",
+        "flannel",
+    ];
+    const FRAGMENTS: &[&str] = &[
+        "vethernet",
+        "virtualbox",
+        "vmware",
+        "tailscale",
+        "wireguard",
+        "zerotier",
+        "hamachi",
+        "openvpn",
+        "tap-windows",
+        "npcap",
+        "loopback",
+    ];
+    let lower = name.to_ascii_lowercase();
+    PREFIXES.iter().any(|p| lower.starts_with(p)) || FRAGMENTS.iter().any(|f| lower.contains(f))
+}
+
+/// Keep `daemon` on the LAN interfaces this machine has, as they change.
+///
+/// mdns-sd re-reads the machine's interfaces by itself, but an interface that
+/// appears after `disable_interface(All)` stays disabled — which is the whole
+/// point of that rule for VPNs, and exactly wrong for a hotspot. So this adds
+/// rules as interfaces come and go. Ends when the daemon has shut down.
+fn follow_lan_interfaces(daemon: ServiceDaemon, mut enabled: Vec<IpAddr>) {
+    let spawned = std::thread::Builder::new()
+        .name("mdns-follow-lan".into())
+        .spawn(move || loop {
+            std::thread::sleep(LAN_FOLLOW_INTERVAL);
+            let now = lan_interface_addrs();
+            for addr in now.iter().filter(|a| !enabled.contains(a)) {
+                tracing::info!(%addr, "a LAN interface appeared; discovery now uses it");
+                if daemon.enable_interface(IfKind::Addr(*addr)).is_err() {
+                    return;
+                }
+            }
+            for addr in enabled.iter().filter(|a| !now.contains(a)) {
+                tracing::info!(%addr, "a LAN interface went away");
+                if daemon.disable_interface(IfKind::Addr(*addr)).is_err() {
+                    return;
+                }
+            }
+            enabled = now;
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "cannot follow LAN interfaces; discovery stays on the ones it started with");
+    }
 }
 
 /// All non-loopback local interface addresses. Best-effort: an enumeration
@@ -400,6 +543,55 @@ mod tests {
         assert!(!is_virtual_addr(&v4(192, 168, 1, 21)));
         assert!(!is_virtual_addr(&v4(192, 168, 0, 5)));
         assert!(!is_virtual_addr(&v4(10, 0, 0, 4)));
+    }
+
+    #[test]
+    fn a_phones_hotspot_is_lan_and_its_mobile_data_is_not() {
+        for hotspot in ["wlan1", "swlan0", "ap0", "softap0", "wlan0"] {
+            assert!(!is_off_lan_interface(hotspot), "{hotspot}");
+        }
+        for mobile in [
+            "rmnet_data0",
+            "rmnet16",
+            "ccmni1",
+            "v4-rmnet_data0",
+            "clat4",
+            "wwan0",
+        ] {
+            assert!(is_off_lan_interface(mobile), "{mobile}");
+        }
+    }
+
+    #[test]
+    fn tunnels_and_bridges_are_not_lan_on_either_naming() {
+        for name in [
+            "wg0",
+            "tun0",
+            "tailscale0",
+            "docker0",
+            "br-3f2a",
+            "virbr0",
+            "veth12ab",
+        ] {
+            assert!(is_off_lan_interface(name), "{name}");
+        }
+        for name in [
+            "vEthernet (WSL)",
+            "Tailscale",
+            "VirtualBox Host-Only Network",
+            "OpenVPN TAP-Windows6",
+        ] {
+            assert!(is_off_lan_interface(name), "{name}");
+        }
+        for name in [
+            "Wi-Fi",
+            "Ethernet",
+            "Local Area Connection* 10",
+            "enp5s0",
+            "wlp3s0",
+        ] {
+            assert!(!is_off_lan_interface(name), "{name}");
+        }
     }
 
     #[test]

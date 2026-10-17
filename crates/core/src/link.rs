@@ -317,16 +317,13 @@ pub fn advertise(registry: &ModuleRegistry, sends_input: bool) -> Vec<ModuleAdve
 /// multicast off interfaces that reject it. Falls back to the default
 /// (auto-exclude known-virtual ranges) if no LAN address is detected.
 pub fn discovery_config() -> discovery::DiscoveryConfig {
-    match discovery::guess_lan_ipv4() {
-        Some(addr) => {
-            tracing::info!(%addr, "pinning discovery to LAN interface");
-            discovery::DiscoveryConfig::pinned_to(addr)
-        }
-        None => {
-            tracing::warn!("could not detect a LAN interface; using default discovery config");
-            discovery::DiscoveryConfig::default()
-        }
+    let lan = discovery::lan_interface_addrs();
+    if lan.is_empty() {
+        tracing::info!("no LAN interface yet; discovery starts using one as soon as it appears");
+    } else {
+        tracing::info!(addrs = ?lan, "discovery on the LAN interfaces");
     }
+    discovery::DiscoveryConfig::lan()
 }
 
 #[cfg(test)]
