@@ -16,6 +16,7 @@ use evdev::{
     RelativeAxisCode, RelativeAxisEvent,
 };
 
+use crate::uinput_touchpad::VirtualTouchpad;
 use crate::wheel::WheelRemainder;
 use crate::{InputError, InputInjector};
 
@@ -67,6 +68,9 @@ pub struct UinputInjector {
     /// the latter depend on that.
     wheel_x: WheelRemainder,
     wheel_y: WheelRemainder,
+    /// Where a peer's gestures are played back. Optional: without it the
+    /// pointer and keyboard still work, and a gesture says why it did nothing.
+    touchpad: Option<VirtualTouchpad>,
 }
 
 impl UinputInjector {
@@ -128,6 +132,13 @@ impl UinputInjector {
 
         tracing::info!(device = KEYBOARD_NAME, "virtual keyboard created");
 
+        // Made now rather than on the first gesture: the compositor takes a
+        // moment to enumerate a new device, and the gesture that created it
+        // would be over before it was seen.
+        let touchpad = VirtualTouchpad::new()
+            .inspect_err(|e| tracing::warn!(error = %e, "no virtual touchpad; a peer's gestures will do nothing"))
+            .ok();
+
         Ok(Self {
             pointer,
             keyboard,
@@ -135,6 +146,7 @@ impl UinputInjector {
             held: std::collections::HashSet::new(),
             wheel_x: WheelRemainder::default(),
             wheel_y: WheelRemainder::default(),
+            touchpad,
         })
     }
 
@@ -238,6 +250,12 @@ impl InputInjector for UinputInjector {
                 );
                 result
             }
+            InputEvent::GestureSwipe { .. } | InputEvent::GesturePinch { .. } => {
+                match self.touchpad.as_mut() {
+                    Some(pad) => pad.play(event),
+                    None => Ok(()),
+                }
+            }
         }
     }
 
@@ -250,6 +268,11 @@ impl InputInjector for UinputInjector {
     }
 
     fn release_all(&mut self) -> Result<(), InputError> {
+        if let Some(pad) = self.touchpad.as_mut() {
+            if let Err(e) = pad.lift() {
+                tracing::warn!(error = %e, "failed to lift the virtual touchpad's fingers");
+            }
+        }
         if self.held.is_empty() {
             return Ok(());
         }

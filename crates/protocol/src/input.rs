@@ -38,10 +38,55 @@ pub enum InputEvent {
     /// keycode (see `KEY_*` in `linux/input-event-codes.h`); both sides agree
     /// on this namespace and map to/from their own platform as needed.
     Key { key: u16, pressed: bool },
+
+    /// Several fingers moving together on a touch surface, as libinput and
+    /// Wayland's pointer-gestures describe a swipe. `dx`/`dy` are this
+    /// update's centroid motion in [`PointerMotion`](Self::PointerMotion)
+    /// units; `fingers` is three or more (two is a scroll).
+    ///
+    /// The gesture, not the contacts: what a receiver can do with one differs
+    /// by platform. Linux replays it on a virtual touchpad so the desktop's own
+    /// gestures run — a workspace follows the fingers — while Windows and
+    /// macOS publish no way to inject a touchpad gesture and take the shortcut
+    /// it stands for instead.
+    GestureSwipe {
+        phase: GesturePhase,
+        fingers: u8,
+        dx: i32,
+        dy: i32,
+    },
+
+    /// Two or more fingers spreading, pinching or turning. `scale` is the
+    /// distance between them relative to the gesture's start, in
+    /// [`GESTURE_SCALE_ONE`]ths; `rotation` is this update's turn in
+    /// hundredths of a degree, clockwise; `dx`/`dy` the centroid's motion.
+    GesturePinch {
+        phase: GesturePhase,
+        fingers: u8,
+        scale: i32,
+        rotation: i32,
+        dx: i32,
+        dy: i32,
+    },
+}
+
+/// Where a gesture is in its life. Every gesture that begins ends — with
+/// `End` when the fingers lift, `Cancel` when it is abandoned — or the
+/// receiver is left holding virtual fingers down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GesturePhase {
+    Begin,
+    Update,
+    End,
+    Cancel,
 }
 
 /// One wheel notch in [`InputEvent::PointerScroll`] units.
 pub const SCROLL_NOTCH: i32 = 120;
+
+/// A [`InputEvent::GesturePinch`] scale of 1.0: the fingers as far apart as
+/// when the gesture began.
+pub const GESTURE_SCALE_ONE: i32 = 65_536;
 
 /// Mouse buttons Cursio recognises. Buttons beyond these (thumb clusters past
 /// the usual two, tilt-wheel clicks) are dropped rather than guessed at.

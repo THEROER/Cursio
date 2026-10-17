@@ -13,6 +13,8 @@ use cursio_protocol::{EdgeSet, InputEvent};
 
 #[cfg(target_os = "linux")]
 pub mod capture;
+#[cfg(any(target_os = "windows", test))]
+mod gesture_shortcut;
 #[cfg(target_os = "linux")]
 pub mod lin_cursor;
 #[cfg(target_os = "macos")]
@@ -25,6 +27,8 @@ pub mod mac_cursor;
 pub mod mac_keymap;
 #[cfg(target_os = "linux")]
 pub mod uinput;
+#[cfg(target_os = "linux")]
+mod uinput_touchpad;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod wheel;
 #[cfg(target_os = "windows")]

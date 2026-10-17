@@ -21,8 +21,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 // WindowsAndMessaging, not KeyboardAndMouse alongside the MOUSEEVENTF_* flags.
 use windows_sys::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
-use crate::win_keymap::evdev_to_scancode;
+use crate::gesture_shortcut::{GestureAction, GestureShortcuts};
+use crate::win_keymap::{evdev_to_scancode, swipe_chord, ZOOM_MODIFIER};
 use crate::{InputError, InputInjector};
+use cursio_protocol::SCROLL_NOTCH;
 
 /// Sentinel we stamp into every injected event's `dwExtraInfo` /
 /// `ExtraInformation`. The RawInput capture side ([`crate::win_capture`]) reads
@@ -41,6 +43,8 @@ pub struct WinInjector {
     /// Counts injected motion events, purely so the motion log can be sampled
     /// instead of firing on every event.
     motion_seq: u64,
+    /// A peer's gesture in progress, replayed as the shortcut it stands for.
+    gestures: GestureShortcuts,
 }
 
 impl WinInjector {
@@ -53,7 +57,44 @@ impl WinInjector {
             held_keys: std::collections::HashSet::new(),
             held_buttons: std::collections::HashSet::new(),
             motion_seq: 0,
+            gestures: GestureShortcuts::default(),
         })
+    }
+
+    /// Press `keys` in order and release them in reverse, as a person does.
+    fn chord(&mut self, keys: &[u16]) -> Result<(), InputError> {
+        for &key in keys {
+            self.inject(InputEvent::Key { key, pressed: true })?;
+        }
+        for &key in keys.iter().rev() {
+            self.inject(InputEvent::Key {
+                key,
+                pressed: false,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn gesture(&mut self, action: GestureAction) -> Result<(), InputError> {
+        tracing::debug!(?action, "replaying a peer's gesture as its shortcut");
+        match action {
+            GestureAction::Swipe { fingers, direction } => match swipe_chord(fingers, direction) {
+                Some(keys) => self.chord(keys),
+                None => Ok(()),
+            },
+            GestureAction::Zoom { steps } => {
+                self.inject(InputEvent::Key {
+                    key: ZOOM_MODIFIER,
+                    pressed: true,
+                })?;
+                let wheel = self.send_mouse(MOUSEEVENTF_WHEEL, 0, 0, steps * SCROLL_NOTCH);
+                self.inject(InputEvent::Key {
+                    key: ZOOM_MODIFIER,
+                    pressed: false,
+                })?;
+                wheel
+            }
+        }
     }
 
     /// Send one prepared mouse input. Returns an error if the OS rejected it.
@@ -227,6 +268,12 @@ impl InputInjector for WinInjector {
                         tracing::trace!(key, "unmapped evdev key; dropping");
                         Ok(())
                     }
+                }
+            }
+            InputEvent::GestureSwipe { .. } | InputEvent::GesturePinch { .. } => {
+                match self.gestures.feed(event) {
+                    Some(action) => self.gesture(action),
+                    None => Ok(()),
                 }
             }
         }

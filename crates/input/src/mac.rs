@@ -274,6 +274,18 @@ impl InputInjector for MacInjector {
                     Ok(())
                 }
             },
+            // macOS publishes no way to post a trackpad gesture, and the
+            // shortcuts that stand in for one on Windows have not been chosen
+            // and tried on a Mac. Said once rather than guessed at.
+            InputEvent::GestureSwipe { .. } | InputEvent::GesturePinch { .. } => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        "a peer's touchpad gesture arrived; this Mac does not replay gestures yet"
+                    );
+                });
+                Ok(())
+            }
         }
     }
 

@@ -17,6 +17,8 @@
 //! arrive from RawInput with the `RI_KEY_E0` flag and a set-1 make code that
 //! collides with a non-extended key; those are handled explicitly.
 
+use crate::gesture_shortcut::Direction;
+
 /// Translate a RawInput keyboard event to an evdev keycode.
 ///
 /// `make_code` is the set-1 scancode from `RAWKEYBOARD::MakeCode`; `e0` is true
@@ -30,6 +32,26 @@ pub fn scancode_to_evdev(make_code: u16, e0: bool) -> Option<u16> {
         return e0_scancode_to_evdev(make_code);
     }
     base_scancode_to_evdev(make_code)
+}
+
+/// The modifier Windows zooms with when held over the wheel.
+pub(crate) const ZOOM_MODIFIER: u16 = KEY_LEFTCTRL;
+
+/// The shortcut Windows binds a touchpad swipe to by default, as evdev keys to
+/// press in order and release in reverse — what a peer's swipe is replayed as,
+/// since the gesture itself cannot be injected. Content follows the fingers,
+/// as on the touchpad: four fingers sliding left bring in the desktop on the
+/// right. `None` for a swipe Windows gives no meaning to.
+pub(crate) fn swipe_chord(fingers: u8, direction: Direction) -> Option<&'static [u16]> {
+    Some(match (fingers, direction) {
+        (3 | 4, Direction::Up) => &[KEY_LEFTMETA, KEY_TAB],
+        (3 | 4, Direction::Down) => &[KEY_LEFTMETA, KEY_D],
+        (3, Direction::Left) => &[KEY_LEFTALT, KEY_LEFTSHIFT, KEY_TAB],
+        (3, Direction::Right) => &[KEY_LEFTALT, KEY_TAB],
+        (4, Direction::Left) => &[KEY_LEFTMETA, KEY_LEFTCTRL, KEY_RIGHT],
+        (4, Direction::Right) => &[KEY_LEFTMETA, KEY_LEFTCTRL, KEY_LEFT],
+        _ => return None,
+    })
 }
 
 /// Translate an evdev keycode to what Windows injection needs: a set-1 scancode

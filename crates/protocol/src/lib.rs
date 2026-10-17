@@ -40,7 +40,10 @@ pub use files::{
     Chunk, FileError, FileHandle, FileKind, FileMeta, FileReqId, FilesMsg, OpenMode, Volume,
 };
 pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
-pub use input::{neighbour_across, Edge, EdgeSet, InputEvent, MouseButton, Position, SCROLL_NOTCH};
+pub use input::{
+    neighbour_across, Edge, EdgeSet, GesturePhase, InputEvent, MouseButton, Position,
+    GESTURE_SCALE_ONE, SCROLL_NOTCH,
+};
 pub use node::{NetworkKind, NodeStatus, PowerSource};
 pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{
@@ -70,8 +73,9 @@ pub use window::{
 /// [`Message::Update`]: two builds that disagree here still hand each other
 /// new builds over the frozen update lane instead of hanging up. v20 carries
 /// [`InputEvent::PointerScroll`] in [`input::SCROLL_NOTCH`]ths of a notch, so a
-/// touchpad's fractional scrolling survives the trip.
-pub const PROTOCOL_VERSION: u16 = 20;
+/// touchpad's fractional scrolling survives the trip. v21 added
+/// [`InputEvent::GestureSwipe`] and [`InputEvent::GesturePinch`].
+pub const PROTOCOL_VERSION: u16 = 21;
 
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
