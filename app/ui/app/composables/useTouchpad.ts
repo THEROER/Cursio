@@ -137,7 +137,7 @@ export function useTouchpad() {
       // fingers moving down scroll up (positive on the wire), and fingers
       // moving right scroll left.
       scrollX -= (dx / SCROLL_STEP) * SCROLL_NOTCH
-      scrollY -= (dy / SCROLL_STEP) * SCROLL_NOTCH
+      scrollY += (dy / SCROLL_STEP) * SCROLL_NOTCH
       queueFlush()
       return
     }
