@@ -25,8 +25,8 @@ fn main() {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW,
-        RegisterClassW, SetWindowsHookExW, UnhookWindowsHookEx, HWND_MESSAGE, LLMHF_INJECTED,
-        MSG, MSLLHOOKSTRUCT, PM_REMOVE, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, WH_MOUSE_LL, WM_INPUT,
+        RegisterClassW, SetWindowsHookExW, UnhookWindowsHookEx, HWND_MESSAGE, LLMHF_INJECTED, MSG,
+        MSLLHOOKSTRUCT, PM_REMOVE, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, WH_MOUSE_LL, WM_INPUT,
         WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WNDCLASSW,
     };
 
@@ -37,7 +37,11 @@ fn main() {
             let delta = (info.mouseData >> 16) as i16;
             println!(
                 "hook {} delta={delta} injected={} extra={:#x}",
-                if wparam as u32 == WM_MOUSEWHEEL { "wheel" } else { "hwheel" },
+                if wparam as u32 == WM_MOUSEWHEEL {
+                    "wheel"
+                } else {
+                    "hwheel"
+                },
                 info.flags & LLMHF_INJECTED != 0,
                 info.dwExtraInfo,
             );
@@ -46,7 +50,12 @@ fn main() {
         unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
     }
 
-    unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
         if msg == WM_INPUT {
             // SAFETY: a zeroed RAWINPUT is a valid buffer for GetRawInputData.
             let mut raw: RAWINPUT = unsafe { zeroed() };
@@ -74,7 +83,11 @@ fn main() {
                 if flags & (RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL) != 0 {
                     println!(
                         "raw  {} delta={data} device={:?} extra={:#x}",
-                        if flags & RI_MOUSE_WHEEL != 0 { "wheel" } else { "hwheel" },
+                        if flags & RI_MOUSE_WHEEL != 0 {
+                            "wheel"
+                        } else {
+                            "hwheel"
+                        },
                         raw.header.hDevice,
                         mouse.ulExtraInformation,
                     );
