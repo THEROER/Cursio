@@ -398,8 +398,9 @@ async fn serve(node: Node) -> anyhow::Result<()> {
                         stranger.called = None;
                     }
                 }
-                for target in cursio_core::mesh::next_dial_targets(self_id, &ctx.registry) {
-                    match TcpTransport::connect(target.addr).await {
+                let targets = cursio_core::mesh::next_dial_targets(self_id, &ctx.registry);
+                for (target, dialled) in cursio_core::mesh::dial(targets).await {
+                    match dialled {
                         Ok(t) => {
                             tracing::info!(peer = %target.display_name, addr = %target.addr, "dialled peer");
                             if let Ok(mut store) = TrustStore::load() {

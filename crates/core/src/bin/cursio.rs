@@ -1811,8 +1811,9 @@ async fn run_mesh(
                                 );
                             }
                         }
-                        for target in cursio_core::mesh::next_dial_targets(self_id, &registry) {
-                            let transport = match TcpTransport::connect(target.addr).await {
+                        let targets = cursio_core::mesh::next_dial_targets(self_id, &registry);
+                        for (target, dialled) in cursio_core::mesh::dial(targets).await {
+                            let transport = match dialled {
                                 Ok(t) => t,
                                 Err(e) => {
                                     tracing::debug!(

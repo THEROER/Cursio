@@ -116,6 +116,36 @@ fn next_dial_targets_at(
     targets
 }
 
+/// Dial every target of one sweep at once, answering each with its outcome.
+///
+/// The sweep runs in the node's own loop, the one that also accepts peers
+/// dialling in. Dialled one after another, a few addresses that no longer
+/// lead anywhere held that loop for their timeouts end to end, and a peer
+/// whose call had already connected waited 50 s to be accepted. Together they
+/// cost one timeout at most.
+pub async fn dial(
+    targets: Vec<DialTarget>,
+) -> Vec<(
+    DialTarget,
+    Result<cursio_transport::tcp::TcpTransport, cursio_transport::TransportError>,
+)> {
+    let mut dials = tokio::task::JoinSet::new();
+    for target in targets {
+        dials.spawn(async move {
+            let dialled = cursio_transport::tcp::TcpTransport::connect(target.addr).await;
+            (target, dialled)
+        });
+    }
+    let mut done = Vec::new();
+    while let Some(joined) = dials.join_next().await {
+        match joined {
+            Ok(outcome) => done.push(outcome),
+            Err(e) => tracing::warn!(error = %e, "a dial task failed"),
+        }
+    }
+    done
+}
+
 /// How long to wait between dial sweeps.
 pub fn sweep_interval() -> Duration {
     DIAL_SWEEP_INTERVAL

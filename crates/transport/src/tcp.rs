@@ -18,6 +18,15 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::{Transport, TransportError, TransportRx, TransportTx};
 
+/// How long a dial may wait for the peer to answer.
+///
+/// The OS waits minutes for a SYN nobody acknowledges, and an address that
+/// stopped being on this network — the home LAN, dialled from a phone's
+/// hotspot whose traffic leaves over mobile data — is exactly that. A peer on
+/// the same LAN answers in milliseconds; three seconds is far above that and
+/// short enough that a sweep of stale addresses does not hold up the node.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// A message-oriented link over a single TCP connection.
 pub struct TcpTransport {
     stream: TcpStream,
@@ -29,7 +38,18 @@ pub struct TcpTransport {
 impl TcpTransport {
     /// Dial `addr` and wrap the resulting connection.
     pub async fn connect(addr: SocketAddr) -> Result<Self, TransportError> {
-        Self::from_stream(TcpStream::connect(addr).await?)
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "no answer from {addr} within {}s",
+                        CONNECT_TIMEOUT.as_secs()
+                    ),
+                )
+            })??;
+        Self::from_stream(stream)
     }
 
     /// Wrap an already-accepted connection (server side).
