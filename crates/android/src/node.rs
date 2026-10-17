@@ -544,8 +544,14 @@ async fn run_link(
     // A phone never takes the cursor, so `CursorSetup` leaves this side
     // dormant for the life of the link, and a dormant session forwards its
     // capture channel to the peer: the touchpad is just a writer on it.
+    //
+    // Offered to the touchpad only when the peer has a cursor to move. Another
+    // phone has none — it injects nothing — so listing it made a target whose
+    // strokes went nowhere.
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
-    lock(&ctx.shared.inputs).insert(peer.peer_id, (peer.display_name.clone(), input_tx));
+    if link.cursor.peer_takes_cursor {
+        lock(&ctx.shared.inputs).insert(peer.peer_id, (peer.display_name.clone(), input_tx));
+    }
     let mut status_cursor = ctx.status.borrow().cursor();
     let result = cursio_core::session::run_session_live(
         link.transport,
