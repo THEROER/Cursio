@@ -25,7 +25,7 @@ mod service;
 mod store;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -159,7 +159,7 @@ fn default_data_dir() -> Result<PathBuf> {
 /// system. X11 clipboard content is served by the process that copied it, so it
 /// vanishes when that application exits; a history holding a lazy reference
 /// would find the bytes gone precisely when the user reaches for them.
-fn daemon(dir: &PathBuf, max_items: usize, max_bytes: u64) -> Result<()> {
+fn daemon(dir: &Path, max_items: usize, max_bytes: u64) -> Result<()> {
     use adw::prelude::*;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -182,7 +182,7 @@ fn daemon(dir: &PathBuf, max_items: usize, max_bytes: u64) -> Result<()> {
         .build();
 
     let store = Rc::new(RefCell::new(store));
-    let data_dir = dir.clone();
+    let data_dir = dir.to_path_buf();
 
     app.connect_activate(move |app| {
         // Keep the process alive with no window on screen. GTK quits once the
@@ -316,7 +316,7 @@ fn spawn_ipc(popup: ui::Popup) -> Result<()> {
     Ok(())
 }
 
-fn list(dir: &PathBuf, limit: usize, search: Option<&str>) -> Result<()> {
+fn list(dir: &Path, limit: usize, search: Option<&str>) -> Result<()> {
     let store = Store::open(dir)?;
     let items = match search {
         Some(needle) => store.search(needle, limit)?,
@@ -346,7 +346,7 @@ fn list(dir: &PathBuf, limit: usize, search: Option<&str>) -> Result<()> {
 /// makes the hotkey feel instant (see [`ipc`]). With `--with`, or when no
 /// daemon is running, it falls back to driving an external picker in this
 /// process, so `clipd pick` still works in a bare session.
-fn pick(dir: &PathBuf, with: Option<&str>, limit: usize) -> Result<()> {
+fn pick(dir: &Path,with: Option<&str>, limit: usize) -> Result<()> {
     if with.is_none() {
         match ipc::send(ipc::Request::Toggle) {
             Ok(_) => return Ok(()),
@@ -367,7 +367,7 @@ fn pick(dir: &PathBuf, with: Option<&str>, limit: usize) -> Result<()> {
     }
 }
 
-fn copy(dir: &PathBuf, id: i64) -> Result<()> {
+fn copy(dir: &Path, id: i64) -> Result<()> {
     let store = Store::open(dir)?;
     let content = store
         .load(id)
@@ -386,7 +386,7 @@ fn copy(dir: &PathBuf, id: i64) -> Result<()> {
     Ok(())
 }
 
-fn status(dir: &PathBuf) -> Result<()> {
+fn status(dir: &Path) -> Result<()> {
     let store = Store::open(dir)?;
     let (count, bytes) = store.stats()?;
     println!("history:  {}", dir.display());

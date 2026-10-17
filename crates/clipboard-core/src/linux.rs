@@ -459,8 +459,7 @@ mod tests {
             width,
             height,
             bytes: std::borrow::Cow::Owned(
-                std::iter::repeat([0u8, 128, 255, 255])
-                    .take(width * height)
+                std::iter::repeat_n([0u8, 128, 255, 255], width * height)
                     .flatten()
                     .collect(),
             ),

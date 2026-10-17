@@ -75,7 +75,7 @@ impl InFlightBudget {
     fn take(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (n < WINDOW).then_some(n + 1)
             })
             .is_ok()
@@ -86,7 +86,7 @@ impl InFlightBudget {
         use std::sync::atomic::Ordering;
         let _ = self
             .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 }
 

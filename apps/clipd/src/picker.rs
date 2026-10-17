@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn menu_lines_carry_the_id_and_marker() {
-        let items = vec![item(3, "hello"), {
+        let items = [item(3, "hello"), {
             let mut pinned = item(4, "kept");
             pinned.pinned = true;
             pinned
