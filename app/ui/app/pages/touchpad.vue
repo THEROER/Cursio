@@ -39,30 +39,40 @@ const buttons: { name: "left" | "middle" | "right"; label: string }[] = [
 
 <template>
   <DesktopShell full-bleed>
-    <div class="flex h-full min-h-0 flex-1 flex-col gap-4 p-4">
-      <header class="flex items-center gap-3">
-        <p class="min-w-0 truncate text-xs text-muted">{{ t("app.subtitle") }}</p>
-        <LpBadge :tone="isConnected ? 'success' : 'neutral'" dot class="ml-auto shrink-0">{{ statusLabel }}</LpBadge>
-      </header>
+    <!-- A turned phone is too short for the column — the pad shrank to nothing
+         and the buttons fell off the bottom of a page that cannot scroll, since
+         the pad owns every stroke. So the pad takes the left and the controls
+         stack on the right instead. -->
+    <div
+      class="flex h-full min-h-0 flex-1 flex-col gap-4 p-4 phone-landscape:grid phone-landscape:grid-cols-[minmax(0,1fr)_15rem] phone-landscape:grid-rows-[auto_minmax(0,1fr)_auto] phone-landscape:gap-3 phone-landscape:py-3"
+    >
+      <div class="flex flex-col gap-4 phone-landscape:col-start-2 phone-landscape:row-start-1 phone-landscape:gap-3">
+        <header class="flex items-center gap-3">
+          <p class="min-w-0 truncate text-xs text-muted phone-landscape:hidden">{{ t("app.subtitle") }}</p>
+          <LpBadge :tone="isConnected ? 'success' : 'neutral'" dot class="ml-auto shrink-0 phone-landscape:ml-0">
+            {{ statusLabel }}
+          </LpBadge>
+        </header>
 
-      <!-- With one machine there is nothing to pick: it is driven as soon as
-           its link is up, and the badge already names it. -->
-      <LpFormField v-if="targets.length > 1" :label="t('touchpad.target')">
-        <LpSelect
-          :model-value="driven?.id"
-          :options="targetOptions"
-          :placeholder="t('touchpad.choose')"
-          :disabled="connecting"
-          @update:model-value="pick"
-        />
-      </LpFormField>
+        <!-- With one machine there is nothing to pick: it is driven as soon as
+             its link is up, and the badge already names it. -->
+        <LpFormField v-if="targets.length > 1" :label="t('touchpad.target')">
+          <LpSelect
+            :model-value="driven?.id"
+            :options="targetOptions"
+            :placeholder="t('touchpad.choose')"
+            :disabled="connecting"
+            @update:model-value="pick"
+          />
+        </LpFormField>
 
-      <LpAlert v-if="connectError" variant="danger">{{ connectError }}</LpAlert>
+        <LpAlert v-if="connectError" variant="danger">{{ connectError }}</LpAlert>
+      </div>
 
       <!-- The surface itself. Not a kit component: nothing in a form kit models a
            raw gesture target, and every pixel of it is the control. -->
       <LpCard
-        class="cursio-pad flex min-h-40 flex-1 select-none items-center justify-center text-center"
+        class="cursio-pad flex min-h-40 flex-1 select-none items-center justify-center text-center phone-landscape:col-start-1 phone-landscape:row-span-3 phone-landscape:row-start-1 phone-landscape:min-h-0"
         :variant="isConnected ? 'raised' : 'flat'"
         v-on="surface"
       >
@@ -72,23 +82,25 @@ const buttons: { name: "left" | "middle" | "right"; label: string }[] = [
         </div>
       </LpCard>
 
-      <div class="grid grid-cols-3 gap-2">
-        <LpButton
-          v-for="button in buttons"
-          :key="button.name"
-          variant="soft"
-          size="lg"
-          :disabled="!isConnected"
-          @click="click(button.name)"
-        >
-          {{ t(button.label) }}
+      <div class="flex flex-col gap-4 phone-landscape:col-start-2 phone-landscape:row-start-3 phone-landscape:gap-3">
+        <div class="grid grid-cols-3 gap-2">
+          <LpButton
+            v-for="button in buttons"
+            :key="button.name"
+            variant="soft"
+            size="lg"
+            :disabled="!isConnected"
+            @click="click(button.name)"
+          >
+            {{ t(button.label) }}
+          </LpButton>
+        </div>
+
+        <LpButton variant="outline" block :disabled="!isConnected" @click="full = true">
+          <LpIcon name="lucide:maximize" :size="16" />
+          {{ t("pad.fullScreen") }}
         </LpButton>
       </div>
-
-      <LpButton variant="outline" block :disabled="!isConnected" @click="full = true">
-        <LpIcon name="lucide:maximize" :size="16" />
-        {{ t("pad.fullScreen") }}
-      </LpButton>
     </div>
 
     <Teleport to="body">

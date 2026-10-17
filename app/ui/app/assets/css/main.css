@@ -9,6 +9,10 @@
    no size, so the canvas measures zero and draws no machines at all. */
 @import "@leavepulse/ui/canvas.css";
 
+/* A phone on its side: wide but short. Plain `landscape:` would also match
+   every desktop window, which has room for the portrait layout. */
+@custom-variant phone-landscape (@media (orientation: landscape) and (max-height: 32rem));
+
 /* The touch surface owns every gesture that lands on it. Without this the
    browser claims drags for panning and pinches for zoom, and the pointer on
    the other machine stutters or stops entirely mid-stroke. */
