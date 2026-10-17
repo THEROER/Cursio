@@ -119,6 +119,52 @@ impl ShareOutbox {
 /// this machine, a link when it is a web address, otherwise text. Returns once
 /// it is on its way; the receiver's answer is logged.
 pub fn share(peer: &str, target: &str, action: ShareAction) -> Result<(), String> {
+    if Path::new(target).is_file() {
+        let path = Path::new(target);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "shared file".into());
+        return share_file(peer, path, name, None, action);
+    }
+    share_text(peer, target, action)
+}
+
+/// Send text to `peer`, as a link when it is a web address.
+pub fn share_text(peer: &str, text: &str, action: ShareAction) -> Result<(), String> {
+    if text.len() > cursio_protocol::share::MAX_INLINE_TEXT {
+        return Err("that is too long to send as text; save it to a file and send the file".into());
+    }
+    let content = if openable_url(text) {
+        ShareContent::Url(text.trim().to_string())
+    } else {
+        ShareContent::Text(text.to_string())
+    };
+    send_to(peer, content, None, action)
+}
+
+/// Send the file at `path` to `peer` under `name` — which a phone needs, since
+/// what it shares is first copied to a private file with a name of its own.
+pub fn share_file(
+    peer: &str,
+    path: &Path,
+    name: String,
+    mime: Option<String>,
+    action: ShareAction,
+) -> Result<(), String> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+        .len();
+    let content = ShareContent::File { name, size, mime };
+    send_to(peer, content, Some(path.to_path_buf()), action)
+}
+
+fn send_to(
+    peer: &str,
+    content: ShareContent,
+    path: Option<PathBuf>,
+    action: ShareAction,
+) -> Result<(), String> {
     let targets = outbox().targets();
     let (id, _) = targets
         .iter()
@@ -134,30 +180,6 @@ pub fn share(peer: &str, target: &str, action: ShareAction) -> Result<(), String
                 }
             )
         })?;
-    let path = Path::new(target);
-    let (content, path) = if path.is_file() {
-        let size = std::fs::metadata(path)
-            .map_err(|e| format!("cannot read {target}: {e}"))?
-            .len();
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "shared file".into());
-        (
-            ShareContent::File {
-                name,
-                size,
-                mime: None,
-            },
-            Some(path.to_path_buf()),
-        )
-    } else if target.len() > cursio_protocol::share::MAX_INLINE_TEXT {
-        return Err("that is too long to send as text; save it to a file and send the file".into());
-    } else if openable_url(target) {
-        (ShareContent::Url(target.trim().to_string()), None)
-    } else {
-        (ShareContent::Text(target.to_string()), None)
-    };
     outbox().send(
         id,
         Outgoing {

@@ -52,6 +52,27 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice|mediaPlayback|microphone|mediaProjection" />
 
+        <!-- "Share → Cursio" in every app's share sheet. Translucent so the
+             machine picker sits over the app the user is in. -->
+        <activity
+            android:name="dev.cursio.mesh.ShareActivity"
+            android:exported="true"
+            android:label="Cursio"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
         <receiver
             android:name="dev.cursio.mesh.BootReceiver"
             android:exported="true">

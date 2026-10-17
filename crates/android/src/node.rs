@@ -291,12 +291,16 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         tracing::info!(peer = %peer.display_name, id = %peer.peer_id, "known peer");
     }
 
-    let modules = ModuleRegistry::new().with(Box::new(AudioFactory {
-        enabled: true,
-        render_device: LiveShared::new(None),
-        mic_gate,
-        mixer: control.mixer(),
-    }));
+    let modules = ModuleRegistry::new()
+        .with(Box::new(AudioFactory {
+            enabled: true,
+            render_device: LiveShared::new(None),
+            mic_gate,
+            mixer: control.mixer(),
+        }))
+        .with(Box::new(cursio_core::share_session::ShareFactory {
+            sink: crate::share::AndroidSink::shared(),
+        }));
     for advert in modules.advertise() {
         tracing::info!(module = %advert.id, version = advert.version, "module available");
     }

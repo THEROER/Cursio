@@ -86,4 +86,22 @@ object CursioNative {
      * playing, interleaved stereo f32 at 48 kHz, for the peer it is routed to.
      */
     external fun nativePushPlayback(samples: FloatArray, len: Int)
+
+    /** The machines a share can go to, as `[[id, name], …]` JSON. */
+    external fun nativeShareTargets(): String
+
+    /**
+     * Send to [peer]: [text] when [path] is empty, otherwise the file at [path]
+     * (a private copy) under [name]. [action] is `open`, `copy` or `save`.
+     * Answers `""` once it is on its way, otherwise why it is not.
+     */
+    external fun nativeShare(peer: String, text: String, path: String, name: String, mime: String, action: String): String
+
+    /**
+     * A machine shared something to this phone. Called by the node, on its
+     * own thread; answers what was done, see [ShareReceiver].
+     */
+    @JvmStatic
+    fun onShare(from: String, kind: String, text: String, path: String, name: String, mime: String, action: String): String =
+        ShareReceiver.act(from, kind, text, path, name, mime, action)
 }

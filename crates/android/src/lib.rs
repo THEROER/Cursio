@@ -40,6 +40,7 @@ use jni::JNIEnv;
 mod node;
 #[cfg(target_os = "android")]
 mod phone_audio;
+mod share;
 
 use node::NodeHandle;
 
@@ -145,14 +146,63 @@ pub fn status_line() -> String {
 #[no_mangle]
 pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeInit(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
     files_dir: JString,
 ) -> jboolean {
     guard(&mut env, JNI_FALSE, |env| {
         let dir: String = env.get_string(&files_dir)?.into();
         init(&dir)?;
+        share::remember(env, &class)?;
         Ok(JNI_TRUE)
     })
+}
+
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeShareTargets<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+) -> JString<'a> {
+    let json = guard(&mut env, "[]".to_string(), |_env| Ok(share::targets_json()));
+    env.new_string(json).unwrap_or_else(|_| JString::default())
+}
+
+/// Send what the share sheet handed over; answers `""` when it is on its way,
+/// otherwise why not.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeShare<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    peer: JString<'a>,
+    text: JString<'a>,
+    path: JString<'a>,
+    name: JString<'a>,
+    mime: JString<'a>,
+    action: JString<'a>,
+) -> JString<'a> {
+    let answer = guard(&mut env, "the phone's node failed".to_string(), |env| {
+        let mut read = |s: &JString| -> anyhow::Result<String> { Ok(env.get_string(s)?.into()) };
+        let (peer, text, path, name, mime, action) = (
+            read(&peer)?,
+            read(&text)?,
+            read(&path)?,
+            read(&name)?,
+            read(&mime)?,
+            read(&action)?,
+        );
+        Ok(share::send(&peer, &text, &path, &name, &mime, &action)
+            .err()
+            .unwrap_or_default())
+    });
+    env.new_string(answer)
+        .unwrap_or_else(|_| JString::default())
 }
 
 /// # Safety
