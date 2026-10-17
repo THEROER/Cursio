@@ -212,11 +212,13 @@ export function useTouchpad() {
     connect,
     refreshTargets,
     click,
+    // Bare event names: `v-on="object"` adds the `on` itself, so `onPointerdown`
+    // here would listen for an event called "onPointerdown", which never fires.
     surface: {
-      onPointerdown: onPointerDown,
-      onPointermove: onPointerMove,
-      onPointerup: onPointerUp,
-      onPointercancel: onPointerUp,
+      pointerdown: onPointerDown,
+      pointermove: onPointerMove,
+      pointerup: onPointerUp,
+      pointercancel: onPointerUp,
     },
   }
 }
