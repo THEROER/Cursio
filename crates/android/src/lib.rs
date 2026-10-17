@@ -33,7 +33,7 @@
 use std::sync::Mutex;
 
 use cursio_core::control::NodeState;
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jint, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
@@ -146,13 +146,13 @@ pub fn status_line() -> String {
 #[no_mangle]
 pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeInit(
     mut env: JNIEnv,
-    class: JClass,
+    _this: JObject,
     files_dir: JString,
 ) -> jboolean {
     guard(&mut env, JNI_FALSE, |env| {
         let dir: String = env.get_string(&files_dir)?.into();
         init(&dir)?;
-        share::remember(env, &class)?;
+        share::remember(env)?;
         Ok(JNI_TRUE)
     })
 }
