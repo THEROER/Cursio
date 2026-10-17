@@ -8,7 +8,7 @@ cursio-protocol.workspace = true
 
 tokio.workspace = true
 futures.workspace = true
-async-trait = "0.1"
+async-trait.workspace = true
 
 mdns-sd.workspace = true
 if-addrs = "0.13"
