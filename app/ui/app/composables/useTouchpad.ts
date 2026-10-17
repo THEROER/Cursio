@@ -67,6 +67,8 @@ export function useTouchpad() {
   const touches = new Map<number, { x: number; y: number }>()
   let pressStarted = 0
   let pressTravel = 0
+  /** Most fingers down at once in this gesture: one tapping is a left click, two a right. */
+  let gestureFingers = 0
 
   async function call<T>(command: string, args?: Record<string, unknown>): Promise<T | null> {
     try {
@@ -104,7 +106,9 @@ export function useTouchpad() {
     if (touches.size === 1) {
       pressStarted = performance.now()
       pressTravel = 0
+      gestureFingers = 0
     }
+    gestureFingers = Math.max(gestureFingers, touches.size)
   }
 
   function onPointerMove(event: PointerEvent) {
@@ -135,17 +139,45 @@ export function useTouchpad() {
   }
 
   async function onPointerUp(event: PointerEvent) {
-    const wasSingle = touches.size === 1
-    touches.delete(event.pointerId)
-    if (!wasSingle) return
+    if (!touches.delete(event.pointerId) || touches.size > 0) return
+    // Judged when the last finger lifts, so a two-finger tap whose fingers
+    // leave a few milliseconds apart is still one right click, not a scroll.
     const quick = performance.now() - pressStarted < TAP_MS
-    if (quick && pressTravel < TAP_SLOP) await click("left")
+    if (!quick || pressTravel >= TAP_SLOP * gestureFingers) return
+    if (gestureFingers === 1) await click("left")
+    else if (gestureFingers === 2) await click("right")
+  }
+
+  async function press(button: MouseButtonName, pressed: boolean) {
+    delivered(await call<boolean>("touchpad_button", { button, pressed }))
   }
 
   async function click(button: MouseButtonName) {
-    const ok = await call<boolean>("touchpad_button", { button, pressed: true })
-    await call<boolean>("touchpad_button", { button, pressed: false })
-    delivered(ok)
+    await press(button, true)
+    await press(button, false)
+  }
+
+  /**
+   * A clickpad's button area: held, not tapped. Pressing there and moving a
+   * second finger on the surface is a drag, which a tap-to-click cannot do.
+   */
+  function zone(button: MouseButtonName) {
+    let down: number | null = null
+    const release = (event: PointerEvent) => {
+      if (event.pointerId !== down) return
+      down = null
+      void press(button, false)
+    }
+    return {
+      pointerdown: (event: PointerEvent) => {
+        if (down !== null) return
+        ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+        down = event.pointerId
+        void press(button, true)
+      },
+      pointerup: release,
+      pointercancel: release,
+    }
   }
 
   /** Point the touchpad at `peer` (an id), or at the only linked machine. */
@@ -212,6 +244,7 @@ export function useTouchpad() {
     connect,
     refreshTargets,
     click,
+    zone,
     // Bare event names: `v-on="object"` adds the `on` itself, so `onPointerdown`
     // here would listen for an event called "onPointerdown", which never fires.
     surface: {

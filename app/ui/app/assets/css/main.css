@@ -18,3 +18,10 @@
   user-select: none;
   -webkit-touch-callout: none;
 }
+
+/* Edge to edge on a phone, so the pad clears the status bar, a camera cutout
+   and the gesture strip rather than losing strokes under them. */
+.cursio-pad-full {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}

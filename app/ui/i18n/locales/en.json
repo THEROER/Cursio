@@ -373,7 +373,10 @@
     "idle": "Choose a machine above to start controlling it",
     "noTargets": "No paired machine is connected to this phone. Pair one, or check that it is running.",
     "ready": "Slide a finger to move the pointer",
-    "hints": "Tap to click · Two fingers to scroll",
+    "hints": "Tap to click · Two-finger tap to right-click · Two fingers to scroll",
+    "fullHints": "Tap to click · Two-finger tap to right-click · Two fingers to scroll · Hold a button below and slide to drag",
+    "fullScreen": "Full-screen touchpad",
+    "exitFullScreen": "Leave the full-screen touchpad",
     "lost": "That machine's link is gone; the pad picks it up again when it comes back"
   },
   "buttons": {
