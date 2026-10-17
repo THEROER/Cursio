@@ -195,11 +195,20 @@ fn translate(event: evdev::InputEvent) -> Option<InputEvent> {
         EventSummary::RelativeAxis(_, RelativeAxisCode::REL_Y, v) => {
             Some(InputEvent::PointerMotion { dx: 0, dy: v })
         }
+        // Whole notches only. A high-resolution wheel reports both axes for one
+        // movement, and with no per-device state here taking `_HI_RES` as well
+        // would scroll twice.
         EventSummary::RelativeAxis(_, RelativeAxisCode::REL_WHEEL, v) => {
-            Some(InputEvent::PointerScroll { dx: 0, dy: v })
+            Some(InputEvent::PointerScroll {
+                dx: 0,
+                dy: v * cursio_protocol::SCROLL_NOTCH,
+            })
         }
         EventSummary::RelativeAxis(_, RelativeAxisCode::REL_HWHEEL, v) => {
-            Some(InputEvent::PointerScroll { dx: v, dy: 0 })
+            Some(InputEvent::PointerScroll {
+                dx: v * cursio_protocol::SCROLL_NOTCH,
+                dy: 0,
+            })
         }
         EventSummary::Key(_, code, value) => {
             // value: 0 = release, 1 = press, 2 = autorepeat. Treat repeat as

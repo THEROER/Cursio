@@ -29,8 +29,13 @@ const SENSITIVITY = 1.8
 const TAP_MS = 220
 const TAP_SLOP = 12
 
-/** Pixels of two-finger travel per scroll notch — trackpad feel, not mouse wheel. */
+/**
+ * Pixels of two-finger travel per wheel notch — trackpad feel, not mouse wheel.
+ * The wire counts scroll in 120ths of a notch, so it goes out as the fraction
+ * travelled rather than waiting for a whole notch.
+ */
 const SCROLL_STEP = 28
+const SCROLL_NOTCH = 120
 
 /**
  * Drives a peer's pointer from a touch surface.
@@ -61,7 +66,8 @@ export function useTouchpad() {
   let pendingX = 0
   let pendingY = 0
   let flushQueued = false
-  let scrollRemainder = 0
+  let scrollX = 0
+  let scrollY = 0
 
   /** Active pointers, so a second finger switches the gesture to scrolling. */
   const touches = new Map<number, { x: number; y: number }>()
@@ -93,10 +99,14 @@ export function useTouchpad() {
       flushQueued = false
       const dx = Math.trunc(pendingX)
       const dy = Math.trunc(pendingY)
-      if (dx === 0 && dy === 0) return
+      const sx = Math.trunc(scrollX)
+      const sy = Math.trunc(scrollY)
       pendingX -= dx
       pendingY -= dy
-      delivered(await call<boolean>("touchpad_motion", { dx, dy }))
+      scrollX -= sx
+      scrollY -= sy
+      if (dx !== 0 || dy !== 0) delivered(await call<boolean>("touchpad_motion", { dx, dy }))
+      if (sx !== 0 || sy !== 0) delivered(await call<boolean>("touchpad_scroll", { dx: sx, dy: sy }))
     })
   }
 
@@ -123,13 +133,12 @@ export function useTouchpad() {
       // Only the first pointer drives the scroll, or two fingers contribute the
       // same movement twice and the page flies past.
       if (event.pointerId !== touches.keys().next().value) return
-      scrollRemainder += dy
-      const notches = Math.trunc(scrollRemainder / SCROLL_STEP)
-      if (notches !== 0) {
-        scrollRemainder -= notches * SCROLL_STEP
-        // Positive dy is downward on screen; a scroll notch is positive upward.
-        void call("touchpad_scroll", { dx: 0, dy: -notches })
-      }
+      // Content follows the fingers, as on a phone and a laptop's touchpad:
+      // fingers moving down scroll up (positive on the wire), and fingers
+      // moving right scroll left.
+      scrollX -= (dx / SCROLL_STEP) * SCROLL_NOTCH
+      scrollY -= (dy / SCROLL_STEP) * SCROLL_NOTCH
+      queueFlush()
       return
     }
 

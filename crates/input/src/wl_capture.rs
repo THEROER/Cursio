@@ -562,6 +562,7 @@ async fn capture_loop(
     // Sub-pixel motion carried between libei events, so small moves aren't lost
     // to rounding (see [`MotionRemainder`]).
     let mut remainder = MotionRemainder::default();
+    let mut scroll = ScrollFrame::default();
     loop {
         tokio::select! {
             // Mode changed: arm/disarm the portal to match.
@@ -727,7 +728,7 @@ async fn capture_loop(
             ev = event_stream.next() => {
                 match ev {
                     Some(Ok(event)) => {
-                        handle_ei_event(event, &tx, &context, &mut remainder);
+                        handle_ei_event(event, &tx, &context, &mut remainder, &mut scroll);
                         // Real activity: push the dead-man deadline forward so an
                         // in-use session is never force-released mid-work.
                         if state.captured {
@@ -906,6 +907,44 @@ impl MotionRemainder {
     }
 }
 
+/// Neutral scroll units per logical pixel of libei's smooth scroll: ten pixels
+/// to a notch, the step a desktop toolkit scrolls one wheel click by.
+const SCROLL_PER_PIXEL: f32 = cursio_protocol::SCROLL_NOTCH as f32 / 10.0;
+
+/// Smooth scroll from libei, held until its frame ends.
+///
+/// A touchpad has no notches, so its two-finger scroll arrives only as smooth
+/// deltas — which used to be dropped, leaving it unable to scroll a peer. A
+/// compositor may describe one wheel click both ways in the same frame, so a
+/// frame that carried a discrete step drops its delta rather than scroll twice.
+#[derive(Default)]
+struct ScrollFrame {
+    pending: MotionRemainder,
+    dx: i32,
+    dy: i32,
+    discrete: bool,
+}
+
+impl ScrollFrame {
+    fn delta(&mut self, dx: f32, dy: f32) {
+        let (x, y) = self
+            .pending
+            .take(dx * SCROLL_PER_PIXEL, dy * SCROLL_PER_PIXEL);
+        self.dx += x;
+        self.dy += y;
+    }
+
+    /// The frame is over: what it scrolled, if a delta is all it carried.
+    fn finish(&mut self) -> Option<InputEvent> {
+        let (dx, dy, discrete) = (self.dx, self.dy, self.discrete);
+        self.dx = 0;
+        self.dy = 0;
+        self.discrete = false;
+        // libei's vertical axis points down; the neutral one points up.
+        (!discrete && (dx != 0 || dy != 0)).then_some(InputEvent::PointerScroll { dx, dy: -dy })
+    }
+}
+
 /// Translate one libei event to a neutral [`InputEvent`] and forward it (binding
 /// seat capabilities the first time a seat appears).
 fn handle_ei_event(
@@ -913,6 +952,7 @@ fn handle_ei_event(
     tx: &mpsc::UnboundedSender<InputEvent>,
     context: &ei::Context,
     remainder: &mut MotionRemainder,
+    scroll: &mut ScrollFrame,
 ) {
     let neutral = match event {
         EiEvent::SeatAdded(seat) => {
@@ -981,17 +1021,26 @@ fn handle_ei_event(
             }
         }
         EiEvent::ScrollDiscrete(s) => {
-            // libei discrete scroll is in 120-unit steps; convert to notches.
+            // libei discrete scroll is in 120-unit steps, the neutral unit.
             // libei's vertical axis points down (positive = scroll down) while
             // the neutral event follows evdev REL_WHEEL (positive = up), so dy
             // flips. Horizontal agrees (positive = right) and is passed as-is.
-            let dx = s.discrete_dx / 120;
-            let dy = -s.discrete_dy / 120;
+            scroll.discrete = true;
+            let dx = s.discrete_dx;
+            let dy = -s.discrete_dy;
             if dx == 0 && dy == 0 {
                 return;
             }
             InputEvent::PointerScroll { dx, dy }
         }
+        EiEvent::ScrollDelta(s) => {
+            scroll.delta(s.dx, s.dy);
+            return;
+        }
+        EiEvent::Frame(_) => match scroll.finish() {
+            Some(event) => event,
+            None => return,
+        },
         _ => return,
     };
     let _ = tx.send(neutral);
@@ -1150,6 +1199,26 @@ mod tests {
         let (_, info) = outer_edge_barriers(&[(1920, 200, 2560, 1440)], only(Edge::Right));
         let bi = *info.values().next().unwrap();
         assert_eq!((bi.origin, bi.length), (200, 1440));
+    }
+
+    #[test]
+    fn a_touchpads_smooth_scroll_reaches_the_peer_flipped_upward() {
+        let mut frame = ScrollFrame::default();
+        frame.delta(0.0, 5.0);
+        assert_eq!(
+            frame.finish(),
+            Some(InputEvent::PointerScroll { dx: 0, dy: -60 }),
+            "five pixels down is half a notch down"
+        );
+        assert_eq!(frame.finish(), None, "a frame is reported once");
+    }
+
+    #[test]
+    fn a_wheel_click_described_both_ways_scrolls_once() {
+        let mut frame = ScrollFrame::default();
+        frame.delta(0.0, 10.0);
+        frame.discrete = true;
+        assert_eq!(frame.finish(), None);
     }
 
     #[test]

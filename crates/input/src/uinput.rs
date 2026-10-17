@@ -16,6 +16,7 @@ use evdev::{
     RelativeAxisCode, RelativeAxisEvent,
 };
 
+use crate::wheel::WheelRemainder;
 use crate::{InputError, InputInjector};
 
 /// The name the virtual pointer advertises to the OS. Shows up in
@@ -60,6 +61,12 @@ pub struct UinputInjector {
     /// evdev keycodes currently held down via us (keyboard keys and mouse
     /// buttons), so we can release them if the session ends mid-press.
     held: std::collections::HashSet<u16>,
+    /// Scroll not yet worth a whole `REL_WHEEL`/`REL_HWHEEL` notch. A real
+    /// high-resolution mouse sends `REL_WHEEL_HI_RES` on every report and
+    /// `REL_WHEEL` once a notch has accumulated, and consumers that read only
+    /// the latter depend on that.
+    wheel_x: WheelRemainder,
+    wheel_y: WheelRemainder,
 }
 
 impl UinputInjector {
@@ -84,6 +91,11 @@ impl UinputInjector {
         axes.insert(RelativeAxisCode::REL_Y);
         axes.insert(RelativeAxisCode::REL_WHEEL);
         axes.insert(RelativeAxisCode::REL_HWHEEL);
+        // Declaring these is what makes libinput read the device as a
+        // high-resolution wheel and scroll by the fraction rather than wait
+        // for a whole notch.
+        axes.insert(RelativeAxisCode::REL_WHEEL_HI_RES);
+        axes.insert(RelativeAxisCode::REL_HWHEEL_HI_RES);
 
         let pointer = VirtualDevice::builder()
             .map_err(open_uinput_error)?
@@ -121,6 +133,8 @@ impl UinputInjector {
             keyboard,
             active: true,
             held: std::collections::HashSet::new(),
+            wheel_x: WheelRemainder::default(),
+            wheel_y: WheelRemainder::default(),
         })
     }
 
@@ -173,12 +187,26 @@ impl InputInjector for UinputInjector {
                 self.emit(&[KeyEvent::new(key, pressed as i32).into()])
             }
             InputEvent::PointerScroll { dx, dy } => {
-                let mut evs: Vec<EvdevEvent> = Vec::with_capacity(2);
+                let mut evs: Vec<EvdevEvent> = Vec::with_capacity(4);
                 if dy != 0 {
-                    evs.push(RelativeAxisEvent::new(RelativeAxisCode::REL_WHEEL, dy).into());
+                    evs.push(RelativeAxisEvent::new(RelativeAxisCode::REL_WHEEL_HI_RES, dy).into());
+                    let notches = self.wheel_y.notches(dy);
+                    if notches != 0 {
+                        evs.push(
+                            RelativeAxisEvent::new(RelativeAxisCode::REL_WHEEL, notches).into(),
+                        );
+                    }
                 }
                 if dx != 0 {
-                    evs.push(RelativeAxisEvent::new(RelativeAxisCode::REL_HWHEEL, dx).into());
+                    evs.push(
+                        RelativeAxisEvent::new(RelativeAxisCode::REL_HWHEEL_HI_RES, dx).into(),
+                    );
+                    let notches = self.wheel_x.notches(dx);
+                    if notches != 0 {
+                        evs.push(
+                            RelativeAxisEvent::new(RelativeAxisCode::REL_HWHEEL, notches).into(),
+                        );
+                    }
                 }
                 if evs.is_empty() {
                     Ok(())

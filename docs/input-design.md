@@ -49,7 +49,12 @@ OS to re-init the device, producing lag/flicker).
 - `InputEvent::PointerButton { button, pressed }` — `MouseButton` =
   Left/Right/Middle plus the two side buttons, `Back` (evdev `BTN_SIDE`, Windows
   `XBUTTON1`) and `Forward` (`BTN_EXTRA` / `XBUTTON2`).
-- `InputEvent::PointerScroll { dx, dy }` — notches, +y = up (evdev REL_WHEEL).
+- `InputEvent::PointerScroll { dx, dy }` — 120ths of a notch (`SCROLL_NOTCH`),
+  +y = up (evdev `REL_WHEEL_HI_RES`, Windows `WHEEL_DELTA`, libei discrete).
+  Fractions matter: a touchpad scrolls by them, and rounding each report to a
+  whole notch turned a precision touchpad's two-finger scroll into nothing.
+  Injectors that only take whole notches (evdev `REL_WHEEL`, macOS lines) add
+  the fractions up first (`input/src/wheel.rs`).
 - `InputEvent::Key { key, pressed }` — **key is a Linux evdev keycode** (`KEY_*`
   from `input-event-codes.h`) used as the neutral cross-platform namespace; each
   platform maps to/from it. Carried as `Message::Input(InputEvent)`.

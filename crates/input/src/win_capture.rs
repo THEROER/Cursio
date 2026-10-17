@@ -51,9 +51,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::win_keymap::scancode_to_evdev;
 use crate::{win::INJECTED_TAG, CaptureHandle, InputError};
 
-/// One wheel notch in `WHEEL_DELTA` units, as RawInput reports wheel motion.
-const WHEEL_DELTA: i16 = 120;
-
 /// Custom thread message setting the capture mode. `wparam` is a
 /// [`mode_to_code`] value. Drives hook install/remove, grab, and edge-watch.
 /// `WM_APP` (0x8000) is the first value reserved for app-defined messages.
@@ -402,19 +399,23 @@ unsafe fn emit_mouse(raw: &RAWINPUT) {
         }
     }
 
-    // Wheel: usButtonData carries a signed WHEEL_DELTA-scaled amount. Convert
-    // to notches to match the neutral scroll unit (evdev REL_WHEEL notches).
-    let wheel_amount = mouse.Anonymous.Anonymous.usButtonData as i16;
-    if button_flags & RI_MOUSE_WHEEL != 0 {
-        let notches = (wheel_amount / WHEEL_DELTA) as i32;
-        if notches != 0 {
-            push(InputEvent::PointerScroll { dx: 0, dy: notches });
+    // Wheel: usButtonData carries a signed WHEEL_DELTA-scaled amount, which is
+    // the neutral unit already. A precision touchpad sends a fraction of a
+    // notch per report (15, 40), so dividing to whole notches here dropped
+    // two-finger scrolling entirely.
+    let wheel_amount = i32::from(mouse.Anonymous.Anonymous.usButtonData as i16);
+    if wheel_amount != 0 {
+        if button_flags & RI_MOUSE_WHEEL != 0 {
+            push(InputEvent::PointerScroll {
+                dx: 0,
+                dy: wheel_amount,
+            });
         }
-    }
-    if button_flags & RI_MOUSE_HWHEEL != 0 {
-        let notches = (wheel_amount / WHEEL_DELTA) as i32;
-        if notches != 0 {
-            push(InputEvent::PointerScroll { dx: notches, dy: 0 });
+        if button_flags & RI_MOUSE_HWHEEL != 0 {
+            push(InputEvent::PointerScroll {
+                dx: wheel_amount,
+                dy: 0,
+            });
         }
     }
 }

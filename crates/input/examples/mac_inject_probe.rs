@@ -60,7 +60,10 @@ fn main() {
     }
 
     println!("scrolling down then up");
-    for dy in [-3, 3] {
+    for dy in [
+        -3 * cursio_protocol::SCROLL_NOTCH,
+        3 * cursio_protocol::SCROLL_NOTCH,
+    ] {
         injector
             .inject(InputEvent::PointerScroll { dx: 0, dy })
             .expect("scroll");

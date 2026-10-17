@@ -25,8 +25,13 @@ pub enum InputEvent {
     /// A mouse button changed state.
     PointerButton { button: MouseButton, pressed: bool },
 
-    /// Scroll wheel motion. `dx` = horizontal, `dy` = vertical; units are
-    /// notches (positive y = scroll up), matching evdev `REL_WHEEL`.
+    /// Scroll motion. `dx` = horizontal, `dy` = vertical, positive y = scroll
+    /// up; units are [`SCROLL_NOTCH`]ths of a wheel notch, matching evdev
+    /// `REL_WHEEL_HI_RES`, Windows' `WHEEL_DELTA` and libei's discrete steps.
+    ///
+    /// Not whole notches: a touchpad scrolls in fractions of one, and every
+    /// fraction rounded to a notch on its own is zero — two-finger scrolling
+    /// on a Windows precision touchpad arrived as nothing at all.
     PointerScroll { dx: i32, dy: i32 },
 
     /// A keyboard key changed state. `key` is a platform-neutral Linux evdev
@@ -34,6 +39,9 @@ pub enum InputEvent {
     /// on this namespace and map to/from their own platform as needed.
     Key { key: u16, pressed: bool },
 }
+
+/// One wheel notch in [`InputEvent::PointerScroll`] units.
+pub const SCROLL_NOTCH: i32 = 120;
 
 /// Mouse buttons Cursio recognises. Buttons beyond these (thumb clusters past
 /// the usual two, tilt-wheel clicks) are dropped rather than guessed at.

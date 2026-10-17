@@ -24,9 +24,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 use crate::win_keymap::evdev_to_scancode;
 use crate::{InputError, InputInjector};
 
-/// One wheel notch in `WHEEL_DELTA` units, what `MOUSEEVENTF_WHEEL` expects.
-const WHEEL_DELTA: i32 = 120;
-
 /// Sentinel we stamp into every injected event's `dwExtraInfo` /
 /// `ExtraInformation`. The RawInput capture side ([`crate::win_capture`]) reads
 /// it back and drops these events, so our own injection never feeds the capture
@@ -192,12 +189,13 @@ impl InputInjector for WinInjector {
                 result
             }
             InputEvent::PointerScroll { dx, dy } => {
-                // Neutral scroll is in notches; Windows wants WHEEL_DELTA units.
+                // Neutral scroll is in WHEEL_DELTA units already, and Windows
+                // scrolls smoothly by a fraction of a notch.
                 if dy != 0 {
-                    self.send_mouse(MOUSEEVENTF_WHEEL, 0, 0, dy * WHEEL_DELTA)?;
+                    self.send_mouse(MOUSEEVENTF_WHEEL, 0, 0, dy)?;
                 }
                 if dx != 0 {
-                    self.send_mouse(MOUSEEVENTF_HWHEEL, 0, 0, dx * WHEEL_DELTA)?;
+                    self.send_mouse(MOUSEEVENTF_HWHEEL, 0, 0, dx)?;
                 }
                 Ok(())
             }

@@ -410,8 +410,11 @@ unsafe fn translate(state: &mut TapState, event_type: u32, event: *mut c_void) {
                 }
             }
             EVENT_SCROLL_WHEEL => {
-                let dy = CGEventGetIntegerValueField(event, FIELD_SCROLL_AXIS_1) as i32;
-                let dx = CGEventGetIntegerValueField(event, FIELD_SCROLL_AXIS_2) as i32;
+                let notch = f64::from(cursio_protocol::SCROLL_NOTCH);
+                let dy = (CGEventGetDoubleValueField(event, FIELD_SCROLL_FIXED_AXIS_1) * notch)
+                    .round() as i32;
+                let dx = (CGEventGetDoubleValueField(event, FIELD_SCROLL_FIXED_AXIS_2) * notch)
+                    .round() as i32;
                 if dx != 0 || dy != 0 {
                     state.emit(InputEvent::PointerScroll { dx, dy });
                 }
@@ -523,8 +526,11 @@ const FIELD_BUTTON_NUMBER: u32 = 3;
 const FIELD_DELTA_X: u32 = 4;
 const FIELD_DELTA_Y: u32 = 5;
 const FIELD_KEYCODE: u32 = 9;
-const FIELD_SCROLL_AXIS_1: u32 = 11;
-const FIELD_SCROLL_AXIS_2: u32 = 12;
+/// `kCGScrollWheelEventFixedPtDeltaAxis1`/`2`: lines, with the fraction a
+/// trackpad scrolls by. The integer `DeltaAxis` fields round that away, so a
+/// slow two-finger scroll read through them is no scroll at all.
+const FIELD_SCROLL_FIXED_AXIS_1: u32 = 93;
+const FIELD_SCROLL_FIXED_AXIS_2: u32 = 94;
 /// `kCGEventSourceUserData` — what the injector stamps itself with.
 const FIELD_SOURCE_USER_DATA: u32 = 42;
 
@@ -551,6 +557,7 @@ extern "C" {
     ) -> *mut c_void;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
     fn CGEventGetIntegerValueField(event: *mut c_void, field: u32) -> i64;
+    fn CGEventGetDoubleValueField(event: *mut c_void, field: u32) -> f64;
     fn CGEventGetFlags(event: *mut c_void) -> u64;
     fn CGEventGetLocation(event: *mut c_void) -> crate::mac::Point;
 }

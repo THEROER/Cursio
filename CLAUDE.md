@@ -249,7 +249,7 @@ This is the second class of thing on the channel — **state and events of a dev
 
 ### Wire compatibility
 
-Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 19) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
+Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 20) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
 
 **Never** change the update lane (`protocol/src/update.rs`): its bytes are pinned by tests, `Message::Hello` stays variant 0 and `Message::Update` variant 17, and every connection opens with its `Preamble`. It is the one thing two builds of any age can still exchange, which is how the one that is behind gets updated. Add a new kind instead; old builds skip kinds they do not know.
 

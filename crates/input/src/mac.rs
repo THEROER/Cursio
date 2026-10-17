@@ -63,6 +63,9 @@ pub struct MacInjector {
     /// Counts injected motion events, purely so the motion log can be sampled
     /// instead of firing on every event.
     motion_seq: u64,
+    /// Scroll not yet worth a whole line.
+    wheel_x: crate::wheel::WheelRemainder,
+    wheel_y: crate::wheel::WheelRemainder,
 }
 
 impl MacInjector {
@@ -92,6 +95,8 @@ impl MacInjector {
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
             motion_seq: 0,
+            wheel_x: Default::default(),
+            wheel_y: Default::default(),
         })
     }
 
@@ -235,10 +240,11 @@ impl InputInjector for MacInjector {
                 result
             }
             InputEvent::PointerScroll { dx, dy } => {
-                if dx == 0 && dy == 0 {
+                let (lines_x, lines_y) = (self.wheel_x.notches(dx), self.wheel_y.notches(dy));
+                if lines_x == 0 && lines_y == 0 {
                     return Ok(());
                 }
-                let event = Event::scroll(&self.source, dy, dx)?;
+                let event = Event::scroll(&self.source, lines_y, lines_x)?;
                 event.set_flags(self.flags);
                 event.post();
                 Ok(())
@@ -466,8 +472,8 @@ impl Event {
 
     /// Vertical and horizontal scroll, in lines.
     ///
-    /// Lines rather than pixels because the neutral event counts notches, and a
-    /// pixel-unit scroll of "1" would be an imperceptible twitch.
+    /// Lines rather than pixels, one per notch, because that is how a wheel
+    /// scrolls here; the injector adds fractions up to whole lines first.
     fn scroll(source: &EventSource, vertical: i32, horizontal: i32) -> Result<Self, InputError> {
         // SAFETY: the variadic tail is the second wheel, matching the wheel
         // count of 2 passed just before it.

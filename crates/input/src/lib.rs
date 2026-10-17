@@ -25,6 +25,8 @@ pub mod mac_cursor;
 pub mod mac_keymap;
 #[cfg(target_os = "linux")]
 pub mod uinput;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod wheel;
 #[cfg(target_os = "windows")]
 pub mod win;
 #[cfg(target_os = "windows")]
