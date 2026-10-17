@@ -37,3 +37,5 @@ tracing.workspace = true
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-android = "0.2"
 tracing-subscriber.workspace = true
+# `__system_property_get`, for the log level a release build is diagnosed at.
+libc.workspace = true

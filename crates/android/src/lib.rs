@@ -379,8 +379,30 @@ fn init_logcat() {
     };
     let _ = tracing_subscriber::registry()
         .with(layer)
-        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(tracing_subscriber::EnvFilter::new(log_filter()))
         .try_init();
+}
+
+/// The filter logcat gets: `info`, unless `debug.cursio.log` says otherwise.
+///
+/// A release APK is not debuggable, so its log file cannot be read and an
+/// environment variable cannot be set; whatever happens below `info` — a
+/// peer seen, a dial that failed — was simply invisible on the phone where it
+/// mattered. A `debug.*` property is one the shell may set, so
+/// `adb shell setprop debug.cursio.log debug` and a restart of the app raise
+/// it without a rebuild.
+#[cfg(target_os = "android")]
+fn log_filter() -> String {
+    let mut value = [0u8; 92];
+    // SAFETY: the name is NUL-terminated and the buffer is PROP_VALUE_MAX (92)
+    // bytes, the most the call writes.
+    let len = unsafe {
+        libc::__system_property_get(c"debug.cursio.log".as_ptr(), value.as_mut_ptr().cast())
+    };
+    match std::str::from_utf8(&value[..len.max(0) as usize]) {
+        Ok(filter) if !filter.trim().is_empty() => filter.trim().to_string(),
+        _ => "info".to_string(),
+    }
 }
 
 /// No logcat off Android — the crate still builds on a desktop so its tests

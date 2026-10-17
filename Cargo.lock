@@ -1114,6 +1114,7 @@ dependencies = [
  "cursio-protocol",
  "cursio-transport",
  "jni",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
