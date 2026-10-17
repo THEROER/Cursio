@@ -120,9 +120,10 @@ const BTN_EXTRA: u32 = 0x114;
 /// The reis event stream is **not `Send`** (it holds callback closures), so it
 /// can't live on the shared tokio runtime. We run the whole portal + libei
 /// machine on a **dedicated thread** with its own current-thread runtime and a
-/// `LocalSet`, and hand only the (Send) channels back out. Blocks until the
-/// portal session + libei handshake are up (so a grant failure or a declined
-/// dialog surfaces here) via a oneshot readiness signal.
+/// `LocalSet`, and hand only the (Send) channels back out. Waits briefly for
+/// the portal session + libei handshake (so a grant failure surfaces here),
+/// but not for a permission dialog nobody has answered yet — see
+/// [`PORTAL_ANSWER_WAIT`].
 pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (edges_tx, edges_rx) = mpsc::unbounded_channel();
@@ -158,6 +159,10 @@ pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
                         capture_loop(portal, tx, edges_tx, grab_rx, edge_rx).await;
                     }
                     Err(e) => {
+                        // Read only if the caller is still waiting; past the
+                        // wait the dialog was answered late, and this is the
+                        // only place that can say how.
+                        tracing::warn!(error = %e, "input capture did not start");
                         let _ = ready_tx.send(Err(e));
                     }
                 }
@@ -165,19 +170,36 @@ pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
         })
         .map_err(InputError::Io)?;
 
-    match ready_rx.recv() {
-        Ok(Ok(())) => Ok(CaptureHandle {
-            events: rx,
-            edges: edges_rx,
-            devices: vec!["Wayland InputCapture portal".into()],
-            grab,
-        }),
+    let handle = CaptureHandle {
+        events: rx,
+        edges: edges_rx,
+        devices: vec!["Wayland InputCapture portal".into()],
+        grab,
+    };
+    match ready_rx.recv_timeout(PORTAL_ANSWER_WAIT) {
+        Ok(Ok(())) => Ok(handle),
         Ok(Err(e)) => Err(InputError::Unavailable(e)),
-        Err(_) => Err(InputError::Unavailable(
+        // The portal is showing its permission dialog and nobody has answered
+        // yet. Waiting for that held up the whole node — no links, no audio,
+        // not even to the phones — for as long as the dialog sat unnoticed.
+        // The handle is good already: its events start once the user allows.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                "waiting for the desktop to allow input capture; the mesh runs meanwhile, \
+                 and the shared cursor starts once the dialog is answered"
+            );
+            Ok(handle)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(InputError::Unavailable(
             "wayland capture thread ended before signalling readiness".into(),
         )),
     }
 }
+
+/// How long starting capture waits for the portal before carrying on without
+/// its answer. A session with a saved grant answers well within this; only a
+/// dialog waiting on the user takes longer.
+const PORTAL_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything the capture loop needs from a portal session that is up.
 ///
