@@ -60,8 +60,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// `update` in the status and `update_apply`, for builds from the mesh. v6:
 /// `forget`, removing a machine from the mesh. v7: `streams` in the status and
 /// `set_stream_volume`, the listener's volume on each peer stream. v8:
-/// `set_name`, and `available` in the status.
-pub const CONTROL_VERSION: u32 = 8;
+/// `set_name`, and `available` in the status. v9: `share`, sending a link,
+/// text or file to a peer.
+pub const CONTROL_VERSION: u32 = 9;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -183,15 +184,22 @@ pub enum Command {
     Forget {
         peer: PeerId,
     },
-    /// Set the listener's volume (linear, up to [`MAX_LOCAL_VOLUME`]) and
-    /// mute on one peer stream playing here. See [`crate::mixer`].
-    ///
-    /// [`MAX_LOCAL_VOLUME`]: crate::mixer::MAX_LOCAL_VOLUME
     /// Rename this machine. Saved at once; peers see it once their links are
     /// brought up again, so the status names `name` until a restart.
     SetName {
         name: String,
     },
+    /// Send a link, text or a file on this machine to a peer, to open, copy
+    /// or keep. `peer` is its id or its name.
+    Share {
+        peer: String,
+        target: String,
+        action: cursio_protocol::share::ShareAction,
+    },
+    /// Set the listener's volume (linear, up to [`MAX_LOCAL_VOLUME`]) and
+    /// mute on one peer stream playing here. See [`crate::mixer`].
+    ///
+    /// [`MAX_LOCAL_VOLUME`]: crate::mixer::MAX_LOCAL_VOLUME
     SetStreamVolume {
         // Not `id`: a command is flattened into its `Request`, whose own `id`
         // would collide with it on the wire.
@@ -750,6 +758,14 @@ impl NodeState {
             },
             Command::Forget { peer } => self.forget(peer),
             Command::SetName { name } => self.rename(&name),
+            Command::Share {
+                peer,
+                target,
+                action,
+            } => match crate::share_sink::share(&peer, &target, action) {
+                Ok(()) => Reply::Done,
+                Err(e) => error(e),
+            },
             Command::SetStreamVolume {
                 stream,
                 volume,

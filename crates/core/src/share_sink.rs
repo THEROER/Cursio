@@ -115,6 +115,60 @@ impl ShareOutbox {
     }
 }
 
+/// Send `target` to `peer` (an id or a name): a file when it names one on
+/// this machine, a link when it is a web address, otherwise text. Returns once
+/// it is on its way; the receiver's answer is logged.
+pub fn share(peer: &str, target: &str, action: ShareAction) -> Result<(), String> {
+    let targets = outbox().targets();
+    let (id, _) = targets
+        .iter()
+        .find(|(id, name)| id.to_string() == peer || name.eq_ignore_ascii_case(peer))
+        .ok_or_else(|| {
+            let names: Vec<_> = targets.iter().map(|(_, n)| n.as_str()).collect();
+            format!(
+                "no connected machine called {peer}; connected: {}",
+                if names.is_empty() {
+                    "none".into()
+                } else {
+                    names.join(", ")
+                }
+            )
+        })?;
+    let path = Path::new(target);
+    let (content, path) = if path.is_file() {
+        let size = std::fs::metadata(path)
+            .map_err(|e| format!("cannot read {target}: {e}"))?
+            .len();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "shared file".into());
+        (
+            ShareContent::File {
+                name,
+                size,
+                mime: None,
+            },
+            Some(path.to_path_buf()),
+        )
+    } else if target.len() > cursio_protocol::share::MAX_INLINE_TEXT {
+        return Err("that is too long to send as text; save it to a file and send the file".into());
+    } else if openable_url(target) {
+        (ShareContent::Url(target.trim().to_string()), None)
+    } else {
+        (ShareContent::Text(target.to_string()), None)
+    };
+    outbox().send(
+        id,
+        Outgoing {
+            content,
+            action,
+            path,
+            reply: None,
+        },
+    )
+}
+
 /// Whether a link may be opened: a web page, nothing that runs or reads local
 /// files. A trusted peer may drive this machine's cursor, but `file:`,
 /// `javascript:` or a custom scheme registered by some installed program is a

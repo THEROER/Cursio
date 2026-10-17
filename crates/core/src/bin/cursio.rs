@@ -107,6 +107,22 @@ enum Command {
         /// The machine's name or id, as `cursio status` shows it.
         machine: String,
     },
+    /// Send a link, text or a file to a connected machine.
+    ///
+    /// A link opens in that machine's browser and a file in its default
+    /// program; `--copy` puts it on that machine's clipboard instead, and
+    /// `--save` keeps a file in its Downloads. Goes through the running node.
+    Send {
+        /// A web address, a file on this machine, or text.
+        target: String,
+        /// The machine's name or id, as `cursio status` shows it.
+        #[arg(long)]
+        to: String,
+        #[arg(long, conflicts_with = "save")]
+        copy: bool,
+        #[arg(long)]
+        save: bool,
+    },
     /// List peers discovered on the LAN, then exit.
     Peers {
         #[arg(long, default_value_t = 5)]
@@ -1019,6 +1035,12 @@ async fn run() -> anyhow::Result<()> {
             restart_process("asked to").await
         }
         Command::Forget { machine } => forget_machine(&machine, &config_path).await,
+        Command::Send {
+            target,
+            to,
+            copy,
+            save,
+        } => send_share(&target, &to, copy, save).await,
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Portal { action } => portal(action).await,
     }
@@ -3100,10 +3122,45 @@ async fn print_status(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Open a code window on the running node and wait for it to be used.
-///
-/// Through the node rather than on its own: the pairing is the mesh's own
-/// handshake with the stranger, and only the running node is listening.
+/// Hand a share to the running node, which holds the links.
+async fn send_share(target: &str, to: &str, copy: bool, save: bool) -> anyhow::Result<()> {
+    use cursio_core::control::{Command, Reply};
+    use cursio_protocol::share::ShareAction;
+    let action = match (copy, save) {
+        (true, _) => ShareAction::Copy,
+        (_, true) => ShareAction::Save,
+        _ => ShareAction::Open,
+    };
+    // The node's working directory is not this shell's, so a relative path
+    // would name some other file there, or none.
+    let target = match std::fs::canonicalize(target) {
+        Ok(path) if path.is_file() => path.to_string_lossy().into_owned(),
+        _ => target.to_string(),
+    };
+    let client = control_client().await.map_err(|e| {
+        anyhow::anyhow!("no running node to send through ({e}); start `cursio mesh` first")
+    })?;
+    match client
+        .request(Command::Share {
+            peer: to.to_string(),
+            target,
+            action,
+        })
+        .await?
+    {
+        Reply::Done => {
+            println!("sent to {to}");
+            Ok(())
+        }
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!(
+            "the running node does not know how to share ({other:?}); restart it with this version of Cursio"
+        ),
+    }
+}
+
+/// Remove a machine: through the running node when there is one, so the link
+/// closes at once, otherwise only in the files.
 async fn forget_machine(machine: &str, config_path: &std::path::Path) -> anyhow::Result<()> {
     use cursio_core::control::{Command, Reply};
     let (peer, _) = cursio_core::forget::resolve(machine)?;
