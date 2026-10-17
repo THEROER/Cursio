@@ -1,7 +1,9 @@
 <script setup lang="ts">
 const { t } = useI18n()
-const { status, linkLost, isConnected, targets, driven, connecting, connectError, connect, click, zone, surface } =
+const { status, linkLost, isConnected, targets, driven, connecting, connectError, connect, click, zone, speed, surface } =
   useTouchpad()
+
+const speedPercent = computed(() => Math.round(speed.value * 100))
 
 /**
  * The whole screen as a buttonless clickpad: every pixel above the button
@@ -100,6 +102,21 @@ const buttons: { name: "left" | "middle" | "right"; label: string }[] = [
           <LpIcon name="lucide:maximize" :size="16" />
           {{ t("pad.fullScreen") }}
         </LpButton>
+
+        <LpFormField :label="t('pad.speed')">
+          <div class="flex items-center gap-4">
+            <LpSlider
+              :model-value="speedPercent"
+              :min="POINTER_SPEED_MIN * 100"
+              :max="POINTER_SPEED_MAX * 100"
+              :step="5"
+              :aria-label="t('pad.speed')"
+              class="flex-1 py-3"
+              @update:model-value="(v: number) => (speed = v / 100)"
+            />
+            <span class="w-12 shrink-0 text-right font-mono text-xs tabular-nums">{{ speedPercent }}%</span>
+          </div>
+        </LpFormField>
       </LpScrollArea>
     </div>
 

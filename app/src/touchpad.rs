@@ -23,7 +23,7 @@
 use std::sync::Mutex;
 
 use cursio_core::session::CapturedInput;
-use cursio_protocol::{InputEvent, MouseButton};
+use cursio_protocol::{GesturePhase, InputEvent, MouseButton, GESTURE_SCALE_ONE};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// What the UI is told, so the screen can say something true rather than
@@ -109,6 +109,44 @@ pub fn button_named(name: &str) -> Option<MouseButton> {
     }
 }
 
+/// Translate the UI's gesture into the wire vocabulary. Unknown names are
+/// refused, as for buttons: a gesture that is never ended leaves the peer
+/// holding virtual fingers down.
+pub fn gesture(
+    kind: &str,
+    phase: &str,
+    fingers: u8,
+    dx: i32,
+    dy: i32,
+    scale: f64,
+    rotation: i32,
+) -> Option<InputEvent> {
+    let phase = match phase {
+        "begin" => GesturePhase::Begin,
+        "update" => GesturePhase::Update,
+        "end" => GesturePhase::End,
+        "cancel" => GesturePhase::Cancel,
+        _ => return None,
+    };
+    match kind {
+        "swipe" => Some(InputEvent::GestureSwipe {
+            phase,
+            fingers,
+            dx,
+            dy,
+        }),
+        "pinch" => Some(InputEvent::GesturePinch {
+            phase,
+            fingers,
+            scale: (scale * f64::from(GESTURE_SCALE_ONE)).round() as i32,
+            rotation,
+            dx,
+            dy,
+        }),
+        _ => None,
+    }
+}
+
 /// Tauri commands. Thin by design: everything they do is push an event or
 /// pick the session to push into.
 pub mod commands {
@@ -182,6 +220,34 @@ pub mod commands {
         }
         pad.send(InputEvent::PointerScroll { dx, dy })
     }
+
+    /// A swipe of three or more fingers, or a pinch. `scale` is the ratio to
+    /// the gesture's start; `rotation` this update's turn in hundredths of a
+    /// degree.
+    #[tauri::command]
+    #[allow(clippy::too_many_arguments)]
+    pub fn touchpad_gesture(
+        pad: State<'_, Touchpad>,
+        kind: &str,
+        phase: &str,
+        fingers: u8,
+        dx: i32,
+        dy: i32,
+        scale: f64,
+        rotation: i32,
+    ) -> bool {
+        match gesture(kind, phase, fingers, dx, dy, scale, rotation) {
+            Some(event) => pad.send(event),
+            None => {
+                tracing::warn!(
+                    kind,
+                    phase,
+                    "unknown gesture from the touch surface; ignoring"
+                );
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +264,27 @@ mod tests {
         assert_eq!(button_named(""), None);
         assert_eq!(button_named("Left"), None, "names are exact, not guessed");
         assert_eq!(button_named("thumb"), None);
+    }
+
+    #[test]
+    fn a_pinch_scale_reaches_the_wire_as_a_fixed_point_ratio() {
+        assert_eq!(
+            gesture("pinch", "update", 2, 1, -1, 1.5, 250),
+            Some(InputEvent::GesturePinch {
+                phase: GesturePhase::Update,
+                fingers: 2,
+                scale: GESTURE_SCALE_ONE * 3 / 2,
+                rotation: 250,
+                dx: 1,
+                dy: -1,
+            })
+        );
+        assert_eq!(
+            gesture("pinch", "Update", 2, 0, 0, 1.0, 0),
+            None,
+            "names are exact"
+        );
+        assert_eq!(gesture("rotate", "end", 2, 0, 0, 1.0, 0), None);
     }
 
     /// With no link chosen, events must be refused rather than buffered.

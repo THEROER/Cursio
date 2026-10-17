@@ -173,6 +173,7 @@ pub fn run() {
             touchpad::commands::touchpad_motion,
             touchpad::commands::touchpad_button,
             touchpad::commands::touchpad_scroll,
+            touchpad::commands::touchpad_gesture,
             node::commands::node_status,
             node::commands::node_config,
             node::commands::node_set_module,
