@@ -40,7 +40,7 @@
 pub mod transport;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -72,7 +72,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// v16: `phone_screen`, a phone's screen shown here.
 /// v17: `call_setup` in the status, `voice_on` on a phone's calls, and
 /// `[calls]` in the config. v18: `kind` on each stream playing here.
-pub const CONTROL_VERSION: u32 = 18;
+/// v19: `dir` on `gallery_save`, a folder to save into other than
+/// Pictures/Cursio.
+pub const CONTROL_VERSION: u32 = 19;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -303,11 +305,15 @@ pub enum Command {
         offset: u64,
         len: u32,
     },
-    /// Copy one item to this machine's `Pictures/Cursio/<peer>`.
+    /// Copy one item to this machine's `Pictures/Cursio/<peer>`, or into `dir`
+    /// when given: a folder the user picked, or the app's cache for a file it
+    /// is about to open, copy or send on.
     GallerySave {
         peer: String,
         item: String,
         name: String,
+        #[serde(default)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -322,6 +328,7 @@ enum GalleryAsk<'a> {
         peer: &'a str,
         item: &'a str,
         name: &'a str,
+        dir: Option<&'a Path>,
     },
 }
 
@@ -415,7 +422,17 @@ impl Command {
                     len: *len,
                 },
             ),
-            Command::GallerySave { peer, item, name } => GalleryAsk::Save { peer, item, name },
+            Command::GallerySave {
+                peer,
+                item,
+                name,
+                dir,
+            } => GalleryAsk::Save {
+                peer,
+                item,
+                name,
+                dir: dir.as_deref(),
+            },
             _ => return None,
         })
     }
@@ -444,14 +461,24 @@ pub async fn ask_gallery(command: &Command) -> Option<Reply> {
             },
             Err(message) => Reply::Error { message },
         },
-        GalleryAsk::Save { peer, item, name } => {
+        GalleryAsk::Save {
+            peer,
+            item,
+            name,
+            dir,
+        } => {
             let peer_name = hub
                 .peers()
                 .into_iter()
                 .find(|p| p.peer.to_string() == peer || p.name.eq_ignore_ascii_case(peer))
                 .map(|p| p.name)
                 .unwrap_or_else(|| peer.to_string());
-            match crate::gallery_hub::save_dir(&peer_name) {
+            // The socket is this user's alone, so a folder it names is one the
+            // user chose; the item's own name is still made safe by `save`.
+            let dir = dir
+                .map(Path::to_path_buf)
+                .or_else(|| crate::gallery_hub::save_dir(&peer_name));
+            match dir {
                 None => Reply::Error {
                     message: "this machine names no Pictures or Downloads folder to save into"
                         .into(),
@@ -1779,5 +1806,26 @@ mod tests {
         let read: Status = serde_json::from_value(json).unwrap();
         assert_eq!(read.update, crate::update::agent::UpdateStatus::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gallery_save_names_its_folder_or_leaves_it_to_the_node() {
+        let older: Command = serde_json::from_str(
+            r#"{"cmd":"gallery_save","peer":"POCO","item":"7","name":"a.jpg"}"#,
+        )
+        .unwrap();
+        let Command::GallerySave { dir, .. } = older else {
+            panic!("not a gallery save: {older:?}");
+        };
+        assert_eq!(dir, None);
+
+        let chosen: Command = serde_json::from_str(
+            r#"{"cmd":"gallery_save","peer":"POCO","item":"7","name":"a.jpg","dir":"/tmp/x"}"#,
+        )
+        .unwrap();
+        let Command::GallerySave { dir, .. } = chosen else {
+            panic!("not a gallery save: {chosen:?}");
+        };
+        assert_eq!(dir.as_deref(), Some(Path::new("/tmp/x")));
     }
 }

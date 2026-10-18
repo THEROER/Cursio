@@ -53,6 +53,9 @@ zbus = "5"
 # Held below 2.5, which requires Tauri 2.12 and would move the whole app's
 # Tauri with it.
 tauri-plugin-single-instance = "~2.4"
+# The native "Save as" a gallery item asks for. 2.7 is the last line on Tauri
+# 2.10/2.11; a later one would move the app's Tauri too.
+tauri-plugin-dialog = "~2.7"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

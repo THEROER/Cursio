@@ -712,7 +712,141 @@ pub mod commands {
         item: String,
         name: String,
     ) -> Result<Reply, NodeError> {
-        gallery(link, Command::GallerySave { peer, item, name }).await
+        gallery(
+            link,
+            Command::GallerySave {
+                peer,
+                item,
+                name,
+                dir: None,
+            },
+        )
+        .await
+    }
+
+    /// Copy one item where the user picks in the system's save dialog;
+    /// `None` when the dialog was cancelled.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn gallery_save_as(
+        app: tauri::AppHandle,
+        link: State<'_, NodeLink>,
+        peer: String,
+        item: String,
+        name: String,
+    ) -> Result<Option<String>, NodeError> {
+        use tauri_plugin_dialog::DialogExt;
+        // The dialog blocks until answered, so it waits off the runtime.
+        let picked = tauri::async_runtime::spawn_blocking(move || {
+            app.dialog().file().set_file_name(&name).blocking_save_file()
+        })
+        .await
+        .map_err(NodeError::failed)?;
+        let Some(picked) = picked else {
+            return Ok(None);
+        };
+        let picked = picked
+            .into_path()
+            .map_err(|e| NodeError::failed(format!("not a place on this computer: {e}")))?;
+        let (Some(dir), Some(name)) = (picked.parent(), picked.file_name()) else {
+            return Err(NodeError::failed(format!("{} names no file", picked.display())));
+        };
+        let reply = gallery(
+            link,
+            Command::GallerySave {
+                peer,
+                item,
+                name: name.to_string_lossy().into_owned(),
+                dir: Some(dir.to_path_buf()),
+            },
+        )
+        .await?;
+        Ok(saved_path(reply))
+    }
+
+    /// Copy one item into the app's cache, for opening it in its own
+    /// application, copying it as a file or sending it on. Answers the path.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn gallery_fetch(
+        app: tauri::AppHandle,
+        link: State<'_, NodeLink>,
+        peer: String,
+        item: String,
+        name: String,
+    ) -> Result<String, NodeError> {
+        use tauri::Manager;
+        let dir = app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| NodeError::failed(format!("this computer names no cache folder: {e}")))?
+            .join("gallery")
+            // The peer's id, not its name: an id is always a safe folder name.
+            .join(&peer);
+        // Fetched afresh each time: a name kept from an earlier fetch may be a
+        // different photo now, and `save` picks a free name beside it anyway.
+        let reply = gallery(
+            link,
+            Command::GallerySave {
+                peer,
+                item,
+                name,
+                dir: Some(dir),
+            },
+        )
+        .await?;
+        saved_path(reply).ok_or_else(|| NodeError::failed("the node saved nothing"))
+    }
+
+    #[cfg(desktop)]
+    fn saved_path(reply: Reply) -> Option<String> {
+        match reply {
+            Reply::SavedFile { path } => Some(path.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
+    /// Open a file on this computer in its default application.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub fn file_open(path: String) -> Result<(), NodeError> {
+        crate::gallery_files::open(std::path::Path::new(&path)).map_err(NodeError::failed)
+    }
+
+    /// Show a file on this computer selected in the file manager.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub fn file_reveal(path: String) -> Result<(), NodeError> {
+        crate::gallery_files::reveal(std::path::Path::new(&path)).map_err(NodeError::failed)
+    }
+
+    /// Put files on this computer's clipboard as files.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn files_copy(paths: Vec<String>) -> Result<(), NodeError> {
+        let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
+        // The clipboard backend takes ownership on a thread and waits for it.
+        tauri::async_runtime::spawn_blocking(move || crate::gallery_files::copy(&paths))
+            .await
+            .map_err(NodeError::failed)?
+            .map_err(NodeError::failed)
+    }
+
+    /// Send a file on this computer to a peer's downloads. `peer` is its id or
+    /// its name.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn file_send(
+        link: State<'_, NodeLink>,
+        peer: String,
+        path: String,
+    ) -> Result<Reply, NodeError> {
+        link.request(Command::Share {
+            peer,
+            target: path,
+            action: cursio_protocol::share::ShareAction::Save,
+        })
+        .await
     }
 
     /// Answer, decline, end or move the voice of a phone's call. `phone` is

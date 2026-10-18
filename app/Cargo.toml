@@ -42,6 +42,9 @@ tokio.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 tauri-plugin-single-instance.workspace = true
+tauri-plugin-dialog.workspace = true
+# A gallery item copied as a file, for a file manager or a chat to paste.
+clipboard-core.workspace = true
 
 # On a phone the app is the node: no separate `cursio` process can live there,
 # so the mesh runs in this process, owned by the foreground service.

@@ -17,6 +17,9 @@ mod autostart;
 /// A phone's call, in a small window of its own.
 #[cfg(desktop)]
 mod call_window;
+/// Opening, showing and copying a gallery item once it is on this computer.
+#[cfg(desktop)]
+mod gallery_files;
 /// Installed versions and rolling back to the previous one.
 #[cfg(desktop)]
 mod install;
@@ -178,6 +181,7 @@ pub fn run() {
                 route => tray::open(app, &route.unwrap_or_else(|| "/".into())),
             }
         }))
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             node::follow(app.handle().clone());
             // Started by the node for a call: the call window alone, the main
@@ -225,6 +229,12 @@ pub fn run() {
             node::commands::gallery_thumbnail,
             node::commands::gallery_read,
             node::commands::gallery_save,
+            node::commands::gallery_save_as,
+            node::commands::gallery_fetch,
+            node::commands::file_open,
+            node::commands::file_reveal,
+            node::commands::files_copy,
+            node::commands::file_send,
             node::commands::node_call,
             node::commands::node_phone_screen,
             node::commands::node_status,
