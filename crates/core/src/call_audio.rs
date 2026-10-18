@@ -154,7 +154,23 @@ impl MediaAudioFactory for MusicFactory {
 /// Failing is not fatal: calls still work over the mesh, with the voice on
 /// the phone, and the phone's sound can still come by playback capture. The
 /// reason is logged once, with what to do about it.
+///
+/// The registration runs on a thread of its own and is not waited for. Both
+/// services talk to BlueZ through zbus's blocking API, which runs its future
+/// on the calling thread; called from the node's startup, which is inside the
+/// Tokio runtime, that panicked ("cannot start a runtime from within a
+/// runtime") on every Linux machine with Bluetooth, and the update that
+/// carried it rolled back. See `session_bus` for the same trap.
 pub fn start() {
+    if let Err(e) = std::thread::Builder::new()
+        .name("bluetooth-setup".into())
+        .spawn(register)
+    {
+        tracing::warn!(error = %e, "cannot start Bluetooth setup; calls' voice stays on the phone");
+    }
+}
+
+fn register() {
     match MediaSinkService::start(Arc::new(MusicFactory)) {
         // Lives as long as the process: dropping it unregisters the speaker.
         Ok(service) => std::mem::forget(service),
