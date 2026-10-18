@@ -57,7 +57,7 @@ const title = computed(() => {
   >
     <template #logo>
       <div class="flex items-center gap-2 px-1" data-tauri-drag-region>
-        <LpIcon name="lucide:mouse-pointer-2" :size="20" class="text-brand" />
+        <CursioLogo :size="20" class="text-brand" />
         <div class="min-w-0" data-tauri-drag-region>
           <p class="truncate text-sm font-semibold" data-tauri-drag-region>{{ t("app.title") }}</p>
           <p class="truncate text-xs text-muted" data-tauri-drag-region>{{ status?.node.name ?? t("app.desktopSubtitle") }}</p>
