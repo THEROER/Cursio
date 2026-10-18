@@ -69,6 +69,10 @@ pub mod link;
 pub mod live;
 pub mod logging;
 pub mod mesh;
+/// Where a phone's messages are answered and a desktop's requests leave.
+pub mod messages_hub;
+/// The messages module on one link.
+pub mod messages_session;
 pub mod metrics;
 pub mod mixer;
 pub mod module;
