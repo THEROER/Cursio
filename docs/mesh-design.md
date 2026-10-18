@@ -292,7 +292,13 @@ a real test setup.
 
 `cursio status` and `cursio pair [CODE]` are clients of it: `cursio pair` shows
 a code, `cursio pair ABCD-EFGH` on the other machine enters it, and both wait
-for the outcome. The Tauri app (`app/`) is another client and never runs the
+for the outcome. Every pairing reply, and the status, carry `nearby`: each
+machine discovery has heard on the LAN, with its address, when, and whether it
+is already in this mesh. Both clients show it while a code waits and say so
+plainly when it holds no stranger — a code shown to a network where nothing can
+be heard is never used, and without the list the only sign was the window
+expiring. mDNS says nothing when a machine leaves, so the list is "heard", not
+"reachable", and `last_seen` says how old. The Tauri app (`app/`) is another client and never runs the
 mesh itself: the node self-elevates on Windows and drives GTK4 on Linux while
 the webview is GTK3, and it has to keep running with no window open.
 

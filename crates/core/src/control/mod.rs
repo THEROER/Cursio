@@ -63,7 +63,8 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// `set_name`, and `available` in the status. v9: `share`, sending a link,
 /// text or file to a peer. v10: a phone's messages — `list_conversations`,
 /// `list_messages`, `send_sms`, `mark_sms_read`, and `messages` in the status.
-pub const CONTROL_VERSION: u32 = 10;
+/// v11: `nearby` in the status and in every pairing reply.
+pub const CONTROL_VERSION: u32 = 11;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -353,6 +354,11 @@ pub enum Reply {
     Pairing {
         state: Option<PairingState>,
         last: Option<PairingOutcome>,
+        /// Who a code could reach. Carried with the window rather than only
+        /// in the status, because "nobody is visible" is the answer to "why
+        /// does the code never get used". Defaulted from a v10 node.
+        #[serde(default)]
+        nearby: Vec<NearbyMachine>,
     },
     Done,
     /// Status will now be pushed on this connection.
@@ -408,6 +414,26 @@ pub struct Status {
     /// Phones whose messages can be read now. Defaulted from a v9 node.
     #[serde(default)]
     pub messages: Vec<crate::messages_hub::MessagesPeer>,
+    /// Machines heard announcing themselves on the LAN. Defaulted from a v10
+    /// node.
+    #[serde(default)]
+    pub nearby: Vec<NearbyMachine>,
+}
+
+/// A machine this node has heard announce itself on the LAN.
+///
+/// Heard, not reachable: mDNS says a machine exists and where, and says
+/// nothing when it leaves, so `last_seen` is how old that knowledge is. What
+/// it is for is the case pairing cannot explain on its own — an empty list
+/// means no code typed anywhere will ever reach this node by discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NearbyMachine {
+    pub id: PeerId,
+    pub name: String,
+    pub addr: std::net::SocketAddr,
+    /// Already in this node's mesh, so a code would add nothing.
+    pub paired: bool,
+    pub last_seen: SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -476,6 +502,27 @@ struct Inner {
     /// saved one: links carry a name from their greeting.
     greeted_as: Option<String>,
     available: Vec<ModuleSwitch>,
+    /// Every machine discovery reported, by id: name, address, when.
+    nearby: BTreeMap<PeerId, (String, std::net::SocketAddr, SystemTime)>,
+}
+
+impl Inner {
+    /// Strangers first, since they are who a code is for, then by name.
+    fn nearby(&self) -> Vec<NearbyMachine> {
+        let mut machines: Vec<NearbyMachine> = self
+            .nearby
+            .iter()
+            .map(|(id, (name, addr, last_seen))| NearbyMachine {
+                id: *id,
+                name: name.clone(),
+                addr: *addr,
+                paired: self.known.iter().any(|k| k.id == *id) || self.links.contains_key(id),
+                last_seen: *last_seen,
+            })
+            .collect();
+        machines.sort_by(|a, b| a.paired.cmp(&b.paired).then_with(|| a.name.cmp(&b.name)));
+        machines
+    }
 }
 
 /// The daemon's state as the control socket sees it.
@@ -542,6 +589,7 @@ impl NodeState {
                 links: BTreeMap::new(),
                 greeted_as: None,
                 available: Vec::new(),
+                nearby: BTreeMap::new(),
             })),
             config_path,
             overrides,
@@ -724,6 +772,23 @@ impl NodeState {
         self.changed();
     }
 
+    /// Discovery heard `peer` announce itself at `addr`.
+    ///
+    /// Subscribers are woken only when a machine is new or moved: mDNS
+    /// repeats itself, and a repeat changes nothing a window shows but the age.
+    pub fn saw(&self, peer: PeerId, name: &str, addr: std::net::SocketAddr) {
+        let moved = {
+            let mut inner = self.inner();
+            let previous = inner
+                .nearby
+                .insert(peer, (name.to_owned(), addr, SystemTime::now()));
+            previous.is_none_or(|(was_name, was_addr, _)| was_name != name || was_addr != addr)
+        };
+        if moved {
+            self.changed();
+        }
+    }
+
     /// Resolves when a client asked for a restart.
     pub async fn restart_requested(&self) {
         self.restart.notified().await
@@ -768,6 +833,7 @@ impl NodeState {
             .as_ref()
             .is_some_and(|greeted| *greeted != node.name);
         let available = inner.available.clone();
+        let nearby = inner.nearby();
         drop(inner);
         let running = self.running();
         let mut restart_needed = crate::live::restart_needed(&self.started, &running);
@@ -790,6 +856,7 @@ impl NodeState {
             streams: self.mixer.streams(),
             calls: crate::calls_hub::hub().phones(),
             messages: crate::messages_hub::hub().peers(),
+            nearby,
         }
     }
 
@@ -939,6 +1006,7 @@ impl NodeState {
         Reply::Pairing {
             state: self.pairing.state(),
             last: self.pairing.last_outcome(),
+            nearby: self.inner().nearby(),
         }
     }
 }
@@ -1195,6 +1263,74 @@ mod tests {
         node.handle(Command::PairCancel);
         assert_eq!(node.status().pairing, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pairing_window_lists_strangers_before_machines_already_paired() {
+        let dir = temp_dir("nearby");
+        let node = state(&dir, Overrides::default());
+        let paired = PeerId::from_u128(1);
+        let stranger = PeerId::from_u128(2);
+        node.set_known(vec![KnownPeerView {
+            id: paired,
+            name: "Alpha".into(),
+            presence: Presence::Offline,
+        }]);
+        node.saw(paired, "Alpha", "192.168.1.2:46073".parse().unwrap());
+        node.saw(stranger, "Zulu", "192.168.1.3:46073".parse().unwrap());
+
+        let Reply::Pairing { nearby, .. } = node.handle(Command::PairShow) else {
+            panic!("expected a pairing reply");
+        };
+        let listed: Vec<(&str, bool)> =
+            nearby.iter().map(|m| (m.name.as_str(), m.paired)).collect();
+        assert_eq!(listed, vec![("Zulu", false), ("Alpha", true)]);
+        assert_eq!(node.status().nearby, nearby);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pairing_window_with_nobody_heard_lists_nobody() {
+        let dir = temp_dir("nobody");
+        let node = state(&dir, Overrides::default());
+        let Reply::Pairing { nearby, .. } = node.handle(Command::PairShow) else {
+            panic!("expected a pairing reply");
+        };
+        assert!(nearby.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hearing_the_same_machine_again_wakes_no_subscriber_but_a_move_does() {
+        let dir = temp_dir("resighting");
+        let node = state(&dir, Overrides::default());
+        let peer = PeerId::from_u128(7);
+        let addr: std::net::SocketAddr = "10.0.0.7:46073".parse().unwrap();
+        node.saw(peer, "Phone", addr);
+        let mut revisions = node.revisions();
+        revisions.mark_unchanged();
+
+        node.saw(peer, "Phone", addr);
+        assert!(!revisions.has_changed().unwrap());
+
+        node.saw(peer, "Phone", "10.0.0.8:46073".parse().unwrap());
+        assert!(revisions.has_changed().unwrap());
+        assert_eq!(node.status().nearby[0].addr.to_string(), "10.0.0.8:46073");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pairing_reply_from_an_older_node_reads_as_nobody_visible() {
+        let reply: Reply =
+            serde_json::from_str(r#"{"reply":"pairing","state":null,"last":null}"#).unwrap();
+        assert_eq!(
+            reply,
+            Reply::Pairing {
+                state: None,
+                last: None,
+                nearby: Vec::new(),
+            }
+        );
     }
 
     #[test]

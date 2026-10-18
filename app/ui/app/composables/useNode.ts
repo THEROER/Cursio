@@ -81,6 +81,16 @@ export interface PairingState {
   failed_attempts: number
 }
 
+/** A machine the node heard announce itself on the LAN. Mirrors `control::NearbyMachine`. */
+export interface NearbyMachine {
+  id: string
+  name: string
+  addr: string
+  /** Already in this node's mesh. */
+  paired: boolean
+  last_seen: SystemTime
+}
+
 export type PairingOutcome =
   | { outcome: "paired"; peer: string }
   | { outcome: "expired" }
@@ -157,7 +167,7 @@ export interface NodeConfig {
 export type Reply =
   | { reply: "saved"; pinned: string[]; restart_needed: string[] }
   | { reply: "config"; path: string; file: NodeConfig; effective: NodeConfig; pinned: string[] }
-  | { reply: "pairing"; state: PairingState | null; last: PairingOutcome | null }
+  | { reply: "pairing"; state: PairingState | null; last: PairingOutcome | null; nearby?: NearbyMachine[] }
   | { reply: "done" }
   | { reply: "forgotten"; name: string; was_builder: boolean }
   | { reply: string; [key: string]: unknown }

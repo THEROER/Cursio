@@ -1920,6 +1920,7 @@ async fn run_mesh(
 
                     // Discovery saw someone. Refresh their address if trusted.
                     Some(peer) = seen_rx.recv() => {
+                        control.saw(peer.peer_id, &peer.display_name, peer.addr);
                         let known = registry.borrow_mut().note_seen(
                             peer.peer_id,
                             &peer.display_name,
@@ -3501,23 +3502,39 @@ async fn pair_with_code(code: Option<String>) -> anyhow::Result<()> {
         Some(code) => Command::PairEnter { code },
         None => Command::PairShow,
     };
-    match client.request(command).await? {
+    let mut shown_nearby = match client.request(command).await? {
         Reply::Pairing {
-            state: Some(state), ..
-        } => match state.code {
-            Some(code) => println!(
-                "Pairing code: {code}\nOn the other machine run `cursio pair {code}`, or enter it in the Cursio app."
-            ),
-            None => println!("Code accepted; waiting for the other machine…"),
-        },
+            state: Some(state),
+            nearby,
+            ..
+        } => {
+            match state.code {
+                Some(code) => println!(
+                    "Pairing code: {code}\nOn the other machine run `cursio pair {code}`, or enter it in the Cursio app."
+                ),
+                None => println!("Code accepted; waiting for the other machine…"),
+            }
+            print_nearby(&nearby);
+            nearby_names(&nearby)
+        }
         Reply::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected reply {other:?}"),
-    }
+    };
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let Reply::Pairing { state, last } = client.request(Command::Pairing).await? else {
+        let Reply::Pairing {
+            state,
+            last,
+            nearby,
+        } = client.request(Command::Pairing).await?
+        else {
             anyhow::bail!("unexpected reply while waiting for pairing");
         };
+        let names = nearby_names(&nearby);
+        if state.is_some() && names != shown_nearby {
+            print_nearby(&nearby);
+            shown_nearby = names;
+        }
         if state.is_some() {
             continue;
         }
@@ -3534,6 +3551,37 @@ async fn pair_with_code(code: Option<String>) -> anyhow::Result<()> {
         };
     }
 }
+
+/// Who a pairing code could reach, compared by name and pairing state so a
+/// repeated sighting does not print the list again.
+fn nearby_names(nearby: &[cursio_core::control::NearbyMachine]) -> Vec<(String, bool)> {
+    nearby.iter().map(|m| (m.name.clone(), m.paired)).collect()
+}
+
+/// Say who this node can see while a code waits, and say plainly when that is
+/// nobody: a code shown to an empty network is never going to be used, and
+/// without this the only sign is the window expiring.
+fn print_nearby(nearby: &[cursio_core::control::NearbyMachine]) {
+    if nearby.is_empty() {
+        println!("{}", NOBODY_VISIBLE);
+        return;
+    }
+    println!("Visible on this network:");
+    for machine in nearby {
+        let what = if machine.paired {
+            "already paired"
+        } else {
+            "can pair"
+        };
+        println!("  {} ({}) — {what}", machine.name, machine.addr);
+    }
+}
+
+const NOBODY_VISIBLE: &str = "No other Cursio machine is visible on this network, so nothing can \
+use this code yet. Check that the other machine runs Cursio and is on the same network (not a \
+guest network or a VPN, and not a hotspot that isolates its clients), and that the firewall lets \
+Cursio through. Where the network blocks discovery, pair from a terminal with \
+`cursio mesh --pair --pair-addr <address>:<port>`.";
 
 /// Browse the LAN and print discovered peers, then exit.
 async fn list_peers(identity: NodeIdentity, timeout_secs: u64) -> anyhow::Result<()> {

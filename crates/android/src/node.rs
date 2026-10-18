@@ -378,6 +378,7 @@ async fn serve(node: Node) -> anyhow::Result<()> {
             },
 
             Some(peer) = seen_rx.recv() => {
+                ctx.control.saw(peer.peer_id, &peer.display_name, peer.addr);
                 note_seen(&ctx.registry, &shared, &peer);
                 if !ctx.registry.borrow().is_known(&peer.peer_id) {
                     strangers.insert(peer.peer_id, Stranger {

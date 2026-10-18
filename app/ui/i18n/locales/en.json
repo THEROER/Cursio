@@ -331,7 +331,14 @@
     "copyHint": "Select to copy",
     "cancelTitle": "Close the pairing window?",
     "cancelBody": "The code stops working at once; the other machine has to start again with a new one.",
-    "keepOpen": "Keep it open"
+    "keepOpen": "Keep it open",
+    "nearbyTitle": "Visible on this network",
+    "nearbyHint": "A code reaches only the machines listed here.",
+    "nearbyPaired": "Already paired",
+    "nearbyNew": "Can pair",
+    "nobodyTitle": "No other Cursio machine is visible",
+    "nobodyBody": "Nothing on this network can use a code yet. Check that the other machine runs Cursio and is on the same network, not a guest network or a VPN; that a phone's hotspot does not isolate its clients; and that the firewall lets Cursio through.",
+    "nobodyCli": "Where the network blocks discovery, pair from a terminal by address: cursio mesh --pair --pair-addr ADDRESS:46073"
   },
   "settings": {
     "autostartTitle": "Start at login",

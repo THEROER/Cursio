@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { toMillis, type PairingOutcome, type PairingState, type Reply } from "~/composables/useNode"
+import { toMillis, type NearbyMachine, type PairingOutcome, type PairingState, type Reply } from "~/composables/useNode"
 
 const { t } = useI18n()
 const { pairShow, pairEnter, pairCancel, pairing } = useNode()
@@ -8,6 +8,9 @@ const toast = useCursioToast()
 
 const state = ref<PairingState | null>(null)
 const outcome = ref<PairingOutcome | null>(null)
+// Who a code could reach. Known before a window opens, so the page can say
+// "nobody is visible" before the user shows a code that cannot be used.
+const nearby = ref<NearbyMachine[] | null>(null)
 const code = ref("")
 const now = ref(Date.now())
 const confirmCancel = ref(false)
@@ -20,7 +23,11 @@ function take(reply: Reply) {
   // Say how the window closed once, when it closes, not on every poll after.
   if (was && !state.value && last) announce(last)
   outcome.value = last
+  // A node older than the list sends none, which is not the same as nobody.
+  nearby.value = (reply.nearby as NearbyMachine[] | undefined) ?? null
 }
+
+const strangers = computed(() => nearby.value?.filter((m) => !m.paired).length ?? 0)
 
 function announce(o: PairingOutcome) {
   switch (o.outcome) {
@@ -47,13 +54,18 @@ onMounted(async () => {
   } catch {
     // The shell already says the node is not running.
   }
+  // Polled with no window open too, slower: the list of who is visible
+  // changes as machines come and go, and it is what tells the user a code
+  // would be wasted.
+  let ticks = 0
   timer = setInterval(async () => {
     now.value = Date.now()
-    if (!state.value) return
+    ticks += 1
+    if (!state.value && ticks % 3 !== 0) return
     try {
       take(await pairing())
     } catch (e) {
-      toast.failure(e, { title: t("pair.failed") })
+      if (state.value) toast.failure(e, { title: t("pair.failed") })
     }
   }, 1000)
 })
@@ -125,6 +137,29 @@ const remaining = computed(() => {
           </form>
         </LpCard>
       </div>
+
+      <LpAlert v-if="nearby && strangers === 0" variant="warning" :title="t('pair.nobodyTitle')">
+        <p class="text-sm">{{ t("pair.nobodyBody") }}</p>
+        <p v-if="!isMobile" class="mt-2 font-mono text-xs text-muted">{{ t("pair.nobodyCli") }}</p>
+      </LpAlert>
+
+      <LpCard v-if="nearby && nearby.length" padded class="flex flex-col gap-3">
+        <h3 class="flex items-center gap-2 text-sm font-semibold">
+          <LpIcon name="lucide:radar" :size="16" class="text-brand" />{{ t("pair.nearbyTitle") }}
+        </h3>
+        <p class="text-xs text-muted">{{ t("pair.nearbyHint") }}</p>
+        <ul class="flex flex-col divide-y divide-line">
+          <li v-for="m in nearby" :key="m.id" class="flex items-center justify-between gap-3 py-2">
+            <div class="min-w-0">
+              <p class="truncate text-sm font-medium">{{ m.name }}</p>
+              <p class="truncate font-mono text-xs text-muted">{{ m.addr }}</p>
+            </div>
+            <LpBadge :tone="m.paired ? 'neutral' : 'success'">
+              {{ m.paired ? t("pair.nearbyPaired") : t("pair.nearbyNew") }}
+            </LpBadge>
+          </li>
+        </ul>
+      </LpCard>
 
       <LpCodeBlock v-if="!isMobile" :model-value="t('pair.cliCommands')" lang="bash" :title="t('pair.cli')" />
     </section>
