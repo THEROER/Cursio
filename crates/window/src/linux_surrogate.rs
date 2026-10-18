@@ -63,15 +63,15 @@ fn to_texture(fb: &Framebuffer) -> gdk::MemoryTexture {
 enum SurrogateCommand {
     /// A decoded tile to blit and present.
     Frame { seq: u32, dirty: Rect, raw: Vec<u8> },
-    /// A raw H.264 packet, to be decoded **on the GTK thread**.
+    /// A raw H.264 packet, for this window's own decoder thread
+    /// ([`spawn_video`]).
     ///
-    /// Every other codec is decoded on the session's thread, to keep expensive
-    /// work off the UI. Video cannot be: `ffmpeg`'s scaling context is not
-    /// `Send` (the crate deliberately declines to claim it is, though it does
-    /// claim it for codec contexts), and [`SessionModule`] requires `Send`. So
-    /// the packet crosses the channel instead of the pixels, and the decoder
-    /// lives beside the framebuffer it feeds. That is also where the decoded
-    /// frame is wanted, so it costs one less copy.
+    /// Every other codec is decoded on the session's thread. Video cannot be:
+    /// `ffmpeg`'s scaling context is not `Send` (the crate deliberately
+    /// declines to claim it is, though it does claim it for codec contexts),
+    /// and [`SessionModule`] requires `Send`. Nor on the GTK thread, where it
+    /// used to be: a phone's 848×1920 stream took ticks past 100 ms there, and
+    /// the window stopped answering its own close button.
     VideoPacket { seq: u32, packet: Vec<u8> },
     /// Window geometry changed; reallocate before the next blit.
     Resize { width: u32, height: u32 },
@@ -339,15 +339,14 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
 /// for the title bar and panels.
 fn fitted(width: u32, height: u32) -> (i32, i32) {
     use gtk::prelude::*;
-    let room = gtk::gdk::Display::default()
-        .and_then(|display| {
-            let monitors = display.monitors();
-            (0..monitors.n_items())
-                .filter_map(|i| monitors.item(i)?.downcast::<gtk::gdk::Monitor>().ok())
-                .map(|m| m.geometry())
-                .map(|g| (g.width(), g.height()))
-                .max_by_key(|(w, h)| w * h)
-        });
+    let room = gtk::gdk::Display::default().and_then(|display| {
+        let monitors = display.monitors();
+        (0..monitors.n_items())
+            .filter_map(|i| monitors.item(i)?.downcast::<gtk::gdk::Monitor>().ok())
+            .map(|m| m.geometry())
+            .map(|g| (g.width(), g.height()))
+            .max_by_key(|(w, h)| w * h)
+    });
     fit_into(width, height, room)
 }
 
@@ -376,6 +375,78 @@ fn contained_to_host(widget: (f64, f64), host: (u32, u32), x: f64, y: f64) -> (u
     let hx = ((x - ox) / scale).clamp(0.0, (fw - 1) as f64);
     let hy = ((y - oy) / scale).clamp(0.0, (fh - 1) as f64);
     (hx as u32, hy as u32)
+}
+
+/// One window's H.264 decoder, on a thread of its own.
+struct VideoThread {
+    packets: std::sync::mpsc::Sender<(u32, Vec<u8>)>,
+    /// Converted pictures, at most one waiting: a window that falls behind
+    /// holds the decoder back, which then decodes what queued up meanwhile
+    /// and converts only the last of it.
+    pictures: std::sync::mpsc::Receiver<(u32, crate::video::DecodedFrame)>,
+}
+
+/// Start the decoder thread for window `id`. It ends when the window drops
+/// its [`VideoThread`].
+fn spawn_video(
+    id: WindowId,
+    wants_keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> VideoThread {
+    let (packets, packets_rx) = std::sync::mpsc::channel::<(u32, Vec<u8>)>();
+    let (pictures_tx, pictures) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name(format!("surrogate-video-{id}"))
+        .spawn(move || {
+            let mut decoder: Option<VideoDecoder> = None;
+            while let Ok(first) = packets_rx.recv() {
+                let mut newest = None;
+                for (seq, packet) in std::iter::once(first).chain(packets_rx.try_iter()) {
+                    if decoder.is_none() {
+                        match VideoDecoder::open() {
+                            Ok(d) => decoder = Some(d),
+                            Err(e) => {
+                                tracing::error!(error = %e, "no H.264 decoder; video frames will be dropped");
+                                continue;
+                            }
+                        }
+                    }
+                    let Some(dec) = decoder.as_mut() else {
+                        continue;
+                    };
+                    match dec.feed(&packet) {
+                        Ok(()) => newest = Some(seq),
+                        Err(e) => {
+                            // Its reference pictures are now suspect; start
+                            // again from the host's next keyframe.
+                            tracing::warn!(error = %e, "video decode failed; restarting the decoder");
+                            decoder = None;
+                        }
+                    }
+                    if !decoder.as_ref().is_some_and(VideoDecoder::synced) {
+                        wants_keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                let (Some(dec), Some(seq)) = (decoder.as_mut(), newest) else {
+                    continue;
+                };
+                match dec.take_newest() {
+                    Ok(Some(pic)) => {
+                        if pictures_tx.send((seq, pic)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "video conversion failed; restarting the decoder");
+                        decoder = None;
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "cannot start the video decoder thread; video frames will be dropped");
+    }
+    VideoThread { packets, pictures }
 }
 
 /// The GTK thread: owns the window, the framebuffer, and the main loop.
@@ -435,9 +506,9 @@ fn gtk_thread(
     let main_loop_window = window.clone();
     let picture_for_frames = picture.clone();
     let fb_for_frames = fb.clone();
-    // Lives on this thread because ffmpeg's scaler isn't `Send`; opened on the
-    // first video packet, so a purely lossless stream never allocates one.
-    let mut decoder: Option<VideoDecoder> = None;
+    // Started on the first video packet, so a purely lossless stream never
+    // has one.
+    let mut video: Option<VideoThread> = None;
     // Created before the timeout so the tick can end the loop itself; `run()` is
     // called further down once the window is up.
     let quit = glib::MainLoop::new(None, false);
@@ -473,63 +544,9 @@ fn gtk_thread(
                             Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
                     }
                     Ok(SurrogateCommand::VideoPacket { seq, packet }) => {
-                        // Opened on first use: a window that never sends video
-                        // never pays for a decoder.
-                        if decoder.is_none() {
-                            match VideoDecoder::open() {
-                                Ok(d) => decoder = Some(d),
-                                Err(e) => {
-                                    tracing::error!(error = %e, "no H.264 decoder; video frames will be dropped");
-                                    continue;
-                                }
-                            }
-                        }
-                        let Some(dec) = decoder.as_mut() else {
-                            continue;
-                        };
-                        match dec.decode(&packet) {
-                            Ok(pictures) => {
-                                for pic in pictures {
-                                    let mut fb = fb_for_frames.borrow_mut();
-                                    // A video frame is the whole window, and the
-                                    // stream carries its own geometry — adopt it if
-                                    // it disagrees, rather than refusing the blit.
-                                    if fb.width != pic.width || fb.height != pic.height {
-                                        fb.resize(pic.width, pic.height);
-                                        // The window follows too, so a stream that
-                                        // changes resolution — a quality change, or
-                                        // an encoder rounding up to whole macroblocks
-                                        // — is not shown scaled into the old
-                                        // window's size for the rest of the session.
-                                        let (w, h) = fitted(pic.width, pic.height);
-                                        main_loop_window.set_default_size(w, h);
-                                    }
-                                    let full = Rect {
-                                        x: 0,
-                                        y: 0,
-                                        width: pic.width,
-                                        height: pic.height,
-                                    };
-                                    if let Err(e) = fb.blit(full, &pic.pixels) {
-                                        tracing::warn!(error = %e, "dropping decoded video frame");
-                                        continue;
-                                    }
-                                    painted = true;
-                                    presented_seq = Some(
-                                        presented_seq.map_or(seq, |previous| previous.max(seq)),
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                // Its reference pictures are now suspect; start
-                                // again from the host's next keyframe.
-                                tracing::warn!(error = %e, "video decode failed; restarting the decoder");
-                                decoder = None;
-                            }
-                        }
-                        if !decoder.as_ref().is_some_and(VideoDecoder::synced) {
-                            wants_keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        let thread =
+                            video.get_or_insert_with(|| spawn_video(id, wants_keyframe.clone()));
+                        let _ = thread.packets.send((seq, packet));
                     }
                     Ok(SurrogateCommand::Resize { width, height }) => {
                         fb_for_frames.borrow_mut().resize(width, height);
@@ -569,6 +586,40 @@ fn gtk_thread(
                     }
                 }
             }
+            // Only the newest picture is worth drawing; the decoder thread already
+            // skipped converting the ones before it.
+            if let Some((seq, pic)) = video
+                .as_ref()
+                .and_then(|thread| thread.pictures.try_iter().last())
+            {
+                let mut fb = fb_for_frames.borrow_mut();
+                // A video frame is the whole window, and the stream carries its own
+                // geometry — adopt it if it disagrees, rather than refusing the blit.
+                // The window follows too, so a stream that changes resolution — a
+                // quality change, or an encoder rounding up to whole macroblocks — is
+                // not shown scaled into the old window's size for the rest of the
+                // session.
+                if fb.width != pic.width || fb.height != pic.height {
+                    fb.resize(pic.width, pic.height);
+                    let (w, h) = fitted(pic.width, pic.height);
+                    main_loop_window.set_default_size(w, h);
+                }
+                let full = Rect {
+                    x: 0,
+                    y: 0,
+                    width: pic.width,
+                    height: pic.height,
+                };
+                match fb.blit(full, &pic.pixels) {
+                    Ok(()) => {
+                        painted = true;
+                        presented_seq =
+                            Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
+                    }
+                    Err(e) => tracing::warn!(error = %e, "dropping decoded video frame"),
+                }
+            }
+
             // One texture swap per tick, not per tile: several tiles of the same
             // visual update coalesce into a single present.
             if painted {

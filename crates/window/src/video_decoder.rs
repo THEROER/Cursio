@@ -38,6 +38,8 @@ pub struct VideoDecoder {
     synced: bool,
     /// Frames dropped while waiting to sync, for one honest log line.
     dropped_before_sync: u32,
+    /// The newest picture [`Self::feed`] produced, not yet converted.
+    newest: Option<ffmpeg_next::frame::Video>,
 }
 
 impl VideoDecoder {
@@ -61,6 +63,7 @@ impl VideoDecoder {
             bgra: ffmpeg_next::frame::Video::empty(),
             synced: false,
             dropped_before_sync: 0,
+            newest: None,
         })
     }
 
@@ -75,8 +78,47 @@ impl VideoDecoder {
     /// Each returned frame is a full window image, tightly packed
     /// (`width * height * 4`), ready to blit. An empty result is normal.
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<DecodedFrame>, WindowError> {
-        if packet.is_empty() {
+        if !self.send(packet)? {
             return Ok(Vec::new());
+        }
+        self.drain()
+    }
+
+    /// Feed one packet, keeping only the newest picture it yields, without
+    /// converting it; [`Self::take_newest`] converts that one. A viewer that
+    /// fell behind decodes every packet — later pictures are built on them —
+    /// but converts and shows only the last, where [`Self::decode`] paid a
+    /// colour conversion for each picture nobody would see.
+    pub fn feed(&mut self, packet: &[u8]) -> Result<(), WindowError> {
+        if !self.send(packet)? {
+            return Ok(());
+        }
+        loop {
+            let mut frame = ffmpeg_next::frame::Video::empty();
+            match self.decoder.receive_frame(&mut frame) {
+                Ok(()) => self.newest = Some(frame),
+                Err(ffmpeg_next::Error::Other {
+                    errno: ffmpeg_next::error::EAGAIN,
+                })
+                | Err(ffmpeg_next::Error::Eof) => return Ok(()),
+                Err(e) => return Err(WindowError::Backend(format!("receive_frame: {e}"))),
+            }
+        }
+    }
+
+    /// The newest picture fed since the last call, as BGRA.
+    pub fn take_newest(&mut self) -> Result<Option<DecodedFrame>, WindowError> {
+        match self.newest.take() {
+            Some(frame) => self.convert(&frame).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Hand a packet to the decoder once the stream is synced; false for one
+    /// dropped while waiting for a keyframe.
+    fn send(&mut self, packet: &[u8]) -> Result<bool, WindowError> {
+        if packet.is_empty() {
+            return Ok(false);
         }
 
         // Entering mid-stream: everything before the first keyframe references
@@ -84,7 +126,7 @@ impl VideoDecoder {
         if !self.synced {
             if !contains_keyframe(packet) {
                 self.dropped_before_sync += 1;
-                return Ok(Vec::new());
+                return Ok(false);
             }
             if self.dropped_before_sync > 0 {
                 tracing::info!(
@@ -99,8 +141,7 @@ impl VideoDecoder {
         self.decoder
             .send_packet(&pkt)
             .map_err(|e| WindowError::Backend(format!("send_packet: {e}")))?;
-
-        self.drain()
+        Ok(true)
     }
 
     /// Collect frames the decoder has ready.
@@ -110,46 +151,7 @@ impl VideoDecoder {
 
         loop {
             match self.decoder.receive_frame(&mut frame) {
-                Ok(()) => {
-                    let (w, h) = (frame.width(), frame.height());
-                    // Build (or rebuild) the converter once the real geometry is
-                    // known — it can only be trusted after a successful decode.
-                    let needs_scaler = match &self.scaler {
-                        Some(_) => self.bgra.width() != w || self.bgra.height() != h,
-                        None => true,
-                    };
-                    if needs_scaler {
-                        self.scaler = Some(
-                            ffmpeg_next::software::scaling::Context::get(
-                                frame.format(),
-                                w,
-                                h,
-                                ffmpeg_next::format::Pixel::BGRA,
-                                w,
-                                h,
-                                ffmpeg_next::software::scaling::Flags::BILINEAR,
-                            )
-                            .map_err(|e| WindowError::Backend(format!("YUV→BGRA: {e}")))?,
-                        );
-                        self.bgra =
-                            ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, w, h);
-                    }
-
-                    self.scaler
-                        .as_mut()
-                        .expect("scaler built above")
-                        .run(&frame, &mut self.bgra)
-                        .map_err(|e| WindowError::Backend(format!("scale: {e}")))?;
-
-                    out.push(DecodedFrame {
-                        width: w,
-                        height: h,
-                        // Repack tightly: ffmpeg aligns rows to `stride`, which
-                        // may exceed `width * 4`, but every consumer here
-                        // expects no padding.
-                        pixels: repack(&self.bgra, w, h),
-                    });
-                }
+                Ok(()) => out.push(self.convert(&frame)?),
                 // No more frames from this packet — the ordinary exit.
                 Err(ffmpeg_next::Error::Other {
                     errno: ffmpeg_next::error::EAGAIN,
@@ -159,6 +161,46 @@ impl VideoDecoder {
             }
         }
         Ok(out)
+    }
+}
+
+impl VideoDecoder {
+    /// One decoded picture as tightly packed BGRA.
+    fn convert(&mut self, frame: &ffmpeg_next::frame::Video) -> Result<DecodedFrame, WindowError> {
+        let (w, h) = (frame.width(), frame.height());
+        // Build (or rebuild) the converter once the real geometry is known —
+        // it can only be trusted after a successful decode.
+        let needs_scaler = match &self.scaler {
+            Some(_) => self.bgra.width() != w || self.bgra.height() != h,
+            None => true,
+        };
+        if needs_scaler {
+            self.scaler = Some(
+                ffmpeg_next::software::scaling::Context::get(
+                    frame.format(),
+                    w,
+                    h,
+                    ffmpeg_next::format::Pixel::BGRA,
+                    w,
+                    h,
+                    ffmpeg_next::software::scaling::Flags::BILINEAR,
+                )
+                .map_err(|e| WindowError::Backend(format!("YUV→BGRA: {e}")))?,
+            );
+            self.bgra = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, w, h);
+        }
+        self.scaler
+            .as_mut()
+            .expect("scaler built above")
+            .run(frame, &mut self.bgra)
+            .map_err(|e| WindowError::Backend(format!("scale: {e}")))?;
+        Ok(DecodedFrame {
+            width: w,
+            height: h,
+            // Repack tightly: ffmpeg aligns rows to `stride`, which may exceed
+            // `width * 4`, but every consumer here expects no padding.
+            pixels: repack(&self.bgra, w, h),
+        })
     }
 }
 
