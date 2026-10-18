@@ -5,11 +5,13 @@
 //! - [`pairing`]: password-authenticated key agreement (SPAKE2) + a confirmed
 //!   shared secret, plus persistence of trusted peers.
 //! - [`tcp`]: the concrete Wi-Fi/LAN transport (framed TCP over tokio).
+//! - [`stream`]: the same framing over any byte stream — the Bluetooth link.
 //! - [`Transport`] / [`select_transport`]: the abstraction and auto-selection
 //!   that let a future channel slot in without touching callers.
 //!
-//! Only one transport (TCP) exists today. The trait and selector exist now so
-//! the session/core layer is written against the abstraction from day one.
+//! TCP and a Bluetooth byte stream carry the same messages: everything above
+//! [`Transport`] — the handshake, Noise, modules, priorities — is written
+//! against the trait, so a link is the same link whichever one carries it.
 
 use async_trait::async_trait;
 use cursio_protocol::Message;
@@ -19,6 +21,7 @@ pub mod discovery;
 pub mod pairing;
 pub mod priority;
 mod send_backlog;
+pub mod stream;
 pub mod tcp;
 #[cfg(test)]
 pub(crate) mod test_util;
