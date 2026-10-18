@@ -87,6 +87,30 @@ const VIRTUAL_DEVICES_HINT: &str =
 #[cfg(not(target_os = "windows"))]
 const VIRTUAL_DEVICES_HINT: &str = "this platform has no backend for them yet";
 
+/// The mixer row of an application stream: a relayed call or phone sound
+/// carries its phone in a marked label, which is what the row should say.
+fn mixer_name_of_app(app: &str) -> (String, crate::mixer::StreamKind) {
+    use crate::mixer::StreamKind;
+    if crate::audio_relay::call_of(app).is_some() {
+        (app.to_string(), StreamKind::Call)
+    } else if let Some(phone) = crate::audio_relay::phone_sound_of(app) {
+        (format!("{phone} sound"), StreamKind::PhoneSound)
+    } else {
+        (app.to_string(), StreamKind::App)
+    }
+}
+
+/// What a peer's microphone is called: the device it advertised, or plainly
+/// "Microphone" for one without a description, as a phone's sole input may be.
+fn microphone_name(meta: &cursio_protocol::AudioStreamMeta) -> String {
+    meta.device
+        .as_ref()
+        .map(|(_, d)| d.trim())
+        .filter(|d| !d.is_empty())
+        .unwrap_or("Microphone")
+        .to_string()
+}
+
 /// Say once per process that a peer's devices cannot be published here.
 ///
 /// A peer's outputs (as Intent Sinks) and its microphone (as a recording
@@ -243,6 +267,12 @@ pub struct AudioEngine {
     /// The name each advertised stream renders under, kept for as long as the
     /// peer offers the stream so a failed open can retry under the right name.
     pending_labels: HashMap<u32, String>,
+    /// What each stream is called in this machine's mixer, and what kind it is.
+    /// Apart from `pending_labels`, which holds the system node's name
+    /// ("Cursio(peer): app"): the mixer names the peer beside the row, and a
+    /// microphone has no app name at all, which is how its rows read
+    /// "stream 900800".
+    mixer_names: HashMap<u32, (String, crate::mixer::StreamKind)>,
     /// For an inbound per-app stream tagged with a target device (the peer routed
     /// an app into one of OUR devices via its Intent Sink), the device to render
     /// it into. Keyed by stream id. Absent ⇒ render into the default output.
@@ -504,6 +534,7 @@ impl AudioEngine {
             playbacks: HashMap::new(),
             gains: HashMap::new(),
             pending_labels: HashMap::new(),
+            mixer_names: HashMap::new(),
             inbound_app_device: HashMap::new(),
             failed_playbacks: std::collections::HashSet::new(),
             peer_streams: std::collections::HashSet::new(),
@@ -595,6 +626,10 @@ impl SessionModule for AudioEngine {
         for (i, dev) in devices.iter().enumerate() {
             let id = id_base + 1 + i as u32;
             self.inbound_targets.insert(id, dev.id.clone());
+            self.mixer_names.insert(
+                id,
+                (dev.description.clone(), crate::mixer::StreamKind::Device),
+            );
             // We advertised it ⇒ we OWN this device's replicated state.
             self.owned_device_nodes.insert(dev.id.clone());
             let meta = cursio_protocol::AudioStreamMeta {
@@ -1009,6 +1044,7 @@ impl SessionModule for AudioEngine {
                 tracing::info!(id, ?reason, "peer closed a stream; dropping playback");
                 self.playbacks.remove(&id);
                 self.pending_labels.remove(&id);
+                self.mixer_names.remove(&id);
                 self.inbound_app_device.remove(&id);
                 self.decoders.remove(&id);
                 self.failed_playbacks.remove(&id);
@@ -1716,6 +1752,7 @@ impl AudioEngine {
             // ("speech-dispatcher") is one that chimes tomorrow, and guessing
             // wrong hides a real application.
             self.pending_labels.insert(meta.id, label.clone());
+            self.mixer_names.insert(meta.id, mixer_name_of_app(app));
             let target = self
                 .inbound_app_device
                 .get(&meta.id)
@@ -1734,14 +1771,12 @@ impl AudioEngine {
         // eagerly because it must appear in the input list before anything can
         // choose to record from it.
         if meta.role == cursio_protocol::StreamRole::Capture {
-            let desc = meta
-                .device
-                .as_ref()
-                .map(|(_, d)| d.clone())
-                .unwrap_or_else(|| "Microphone".to_string());
+            let desc = microphone_name(meta);
             let label = format!("Cursio({peer_name}): {desc}");
             let id = meta.id;
             tracing::info!(id, %label, "peer advertised a microphone");
+            self.mixer_names
+                .insert(id, (desc, crate::mixer::StreamKind::Microphone));
             if self.peer_mic.is_none() {
                 self.peer_mic = Some(id);
             }
@@ -1846,6 +1881,17 @@ impl AudioEngine {
         }
     }
 
+    /// What a stream's mixer row says. A stream the peer never described still
+    /// says whose sound it is, rather than its id.
+    fn mixer_name(&self, id: u32) -> (String, crate::mixer::StreamKind) {
+        self.mixer_names.get(&id).cloned().unwrap_or_else(|| {
+            (
+                format!("Sound from {}", self.peer_name),
+                crate::mixer::StreamKind::App,
+            )
+        })
+    }
+
     /// Take delivery of playbacks whose worker has finished.
     fn collect_opened_playbacks(&mut self) {
         while let Ok(opened) = self.playback_ready_rx.try_recv() {
@@ -1857,13 +1903,8 @@ impl AudioEngine {
             }
             match opened.result {
                 Ok(p) => {
-                    let name = self
-                        .pending_labels
-                        .get(&opened.id)
-                        .cloned()
-                        .or_else(|| self.inbound_targets.get(&opened.id).cloned())
-                        .unwrap_or_else(|| format!("stream {}", opened.id));
-                    self.mixer.add(opened.id, &self.peer_name, &name);
+                    let (name, kind) = self.mixer_name(opened.id);
+                    self.mixer.add(opened.id, &self.peer_name, &name, kind);
                     self.playbacks.insert(opened.id, p);
                     // Any gain that arrived while the node was coming up, so a
                     // knob turned during the open is not lost.
@@ -3453,6 +3494,83 @@ mod tests {
         );
         e.inbound_calls.close(9001);
         assert!(e.inbound_calls.streams.is_empty());
+    }
+
+    fn capture_meta(device: Option<(&str, &str)>) -> cursio_protocol::AudioStreamMeta {
+        cursio_protocol::AudioStreamMeta {
+            id: 901800,
+            role: cursio_protocol::StreamRole::Capture,
+            app_name: None,
+            device: device.map(|(id, desc)| (id.to_string(), desc.to_string())),
+            format: cursio_protocol::AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_kind: cursio_protocol::SampleKind::F32,
+            },
+            codec: cursio_protocol::AudioCodec::Opus,
+        }
+    }
+
+    #[test]
+    fn a_peers_microphone_is_named_by_the_device_it_advertised() {
+        assert_eq!(
+            microphone_name(&capture_meta(Some((
+                "alsa_input.usb",
+                "Blue Yeti Analog Stereo"
+            )))),
+            "Blue Yeti Analog Stereo"
+        );
+        assert_eq!(
+            microphone_name(&capture_meta(Some(("mic", "  ")))),
+            "Microphone"
+        );
+        assert_eq!(microphone_name(&capture_meta(None)), "Microphone");
+    }
+
+    #[test]
+    fn a_relayed_call_and_phone_sound_are_told_from_an_application() {
+        use crate::mixer::StreamKind;
+        assert_eq!(
+            mixer_name_of_app(&crate::audio_relay::call_label("POCO X7 Pro")),
+            ("Call · POCO X7 Pro".to_string(), StreamKind::Call)
+        );
+        assert_eq!(
+            mixer_name_of_app(&crate::audio_relay::phone_sound_label("POCO X7 Pro")),
+            ("POCO X7 Pro sound".to_string(), StreamKind::PhoneSound)
+        );
+        assert_eq!(
+            mixer_name_of_app("Firefox"),
+            ("Firefox".to_string(), StreamKind::App)
+        );
+    }
+
+    #[test]
+    fn a_stream_never_described_is_named_after_its_peer_not_its_id() {
+        let e = engine();
+        let (name, kind) = e.mixer_name(424242);
+        assert!(!name.contains("424242"), "got {name}");
+        assert!(name.starts_with("Sound from "), "got {name}");
+        assert_eq!(kind, crate::mixer::StreamKind::App);
+    }
+
+    #[test]
+    fn a_closed_stream_forgets_its_mixer_name() {
+        let mut e = engine();
+        e.mixer_names.insert(
+            901800,
+            ("Blue Yeti".into(), crate::mixer::StreamKind::Microphone),
+        );
+        let close = Message::module(
+            ModuleId::AUDIO,
+            AudioMsg::PRIORITY,
+            &AudioMsg::StreamClose {
+                id: 901800,
+                reason: cursio_protocol::AudioStreamCloseReason::SourceGone,
+            },
+        )
+        .unwrap();
+        assert!(e.handle_message(&close));
+        assert!(!e.mixer_names.contains_key(&901800));
     }
 
     /// A stream keeps the name it was advertised under while its node comes up.

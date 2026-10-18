@@ -333,7 +333,11 @@ impl Music {
                 )
                 .map_err(|e| format!("cannot play the phone's sound here: {e}"))?,
             ),
-            Target::Peer(peer) => MusicSink::Peer(audio_relay::open(peer, &self.name, false)),
+            Target::Peer(peer) => MusicSink::Peer(audio_relay::open(
+                peer,
+                &audio_relay::phone_sound_label(&self.name),
+                false,
+            )),
         });
         Ok(())
     }

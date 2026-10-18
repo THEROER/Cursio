@@ -80,6 +80,12 @@ function mountPath(peer) {
     return GLib.build_filenamev([GLib.get_home_dir(), 'Cursio', peer]);
 }
 
+/* A peer's microphones are streams too, but muting one is not "playing its
+ * sound here". */
+function soundOf(status) {
+    return (status?.streams ?? []).filter(s => s.kind !== 'microphone');
+}
+
 /* The machine's header row: name on the left, its state as icons on the
  * right, the way the system's own device rows look. */
 const PeerHeader = GObject.registerClass(
@@ -211,7 +217,7 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
                 p.link?.status, p.link?.modules, p.link?.path]),
             problems: status.problems.map(p => [p.severity, p.summary]),
             muted: this._mutedPeers(status),
-            playing: [...new Set(status.streams.map(s => s.peer))],
+            playing: [...new Set(soundOf(status).map(s => s.peer))],
             calls: (status.calls ?? []).map(p => [p.name, p.hands_free, p.audio_here,
                 p.calls.map(c => [c.state, c.name, c.number])]),
             messages: (status.messages ?? []).map(m => m.name),
@@ -220,12 +226,12 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
     }
 
     _mutedPeers(status) {
-        const names = new Set(status.streams.map(s => s.peer));
+        const names = new Set(soundOf(status).map(s => s.peer));
         return [...names].filter(n => this._peerMuted(status, n)).sort();
     }
 
     _peerMuted(status, name) {
-        const streams = status.streams.filter(s => s.peer === name);
+        const streams = soundOf(status).filter(s => s.peer === name);
         return streams.length > 0 && streams.every(s => s.muted);
     }
 
@@ -303,7 +309,7 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
         }
         if (has('files') && GLib.file_test(mountPath(name), GLib.FileTest.IS_DIR))
             this._peers.addAction('Browse Files', () => this._browse(name));
-        if (status.streams.some(s => s.peer === name)) {
+        if (soundOf(status).some(s => s.peer === name)) {
             const sound = new PopupMenu.PopupSwitchMenuItem('Play its sound here',
                 !this._peerMuted(status, name));
             sound.connect('toggled', (_item, on) => this._setMuted(name, !on));
@@ -404,7 +410,7 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
     }
 
     _setMuted(peer, muted) {
-        for (const stream of this._status?.streams ?? []) {
+        for (const stream of soundOf(this._status)) {
             if (stream.peer !== peer)
                 continue;
             this._run({

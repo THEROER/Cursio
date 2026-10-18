@@ -411,7 +411,14 @@ async function restartNode() {
       <section v-if="status" class="flex flex-col gap-3">
         <LpSection :title="t('streams.title')" :description="t('streams.description')" icon="lucide:volume-2" />
         <LpCard padded>
-          <PlayingStreams />
+          <PlayingStreams show="sound" />
+        </LpCard>
+      </section>
+
+      <section v-if="status?.streams?.some((s) => s.kind === 'microphone')" class="flex flex-col gap-3">
+        <LpSection :title="t('streams.microphones')" :description="t('streams.microphonesDescription')" icon="lucide:mic" />
+        <LpCard padded>
+          <PlayingStreams show="microphones" />
         </LpCard>
       </section>
 

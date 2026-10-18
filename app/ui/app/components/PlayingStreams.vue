@@ -1,5 +1,13 @@
 <script setup lang="ts">
-import { MAX_STREAM_VOLUME, type PlayingStream } from "~/composables/useNode"
+import { MAX_STREAM_VOLUME, type PlayingStream, type StreamKind } from "~/composables/useNode"
+
+/**
+ * `sound` is what plays out of this machine; `microphones` are peers'
+ * microphones published here as inputs, whose slider is how loud each comes
+ * in. Apart because a microphone row among an app's sound read as something
+ * playing that nothing could be heard from.
+ */
+const props = withDefaults(defineProps<{ show?: "sound" | "microphones" }>(), { show: "sound" })
 
 /**
  * Peers' streams playing on this machine, each with the listener's own volume
@@ -22,7 +30,21 @@ const MAX_PERCENT = Math.round(MAX_STREAM_VOLUME * 100)
 const DRAG_SEND_MS = 120
 const SETTLE_MS = 3000
 
-const streams = computed<PlayingStream[]>(() => status.value?.streams ?? [])
+const streams = computed<PlayingStream[]>(() =>
+  (status.value?.streams ?? []).filter((s) => (s.kind === "microphone") === (props.show === "microphones")),
+)
+
+const ICONS: Record<StreamKind, string> = {
+  app: "lucide:app-window",
+  microphone: "lucide:mic",
+  device: "lucide:speaker",
+  call: "lucide:phone",
+  phone_sound: "lucide:smartphone",
+}
+
+function iconOf(s: PlayingStream): string {
+  return ICONS[s.kind ?? "app"] ?? "lucide:audio-lines"
+}
 
 const draftVolume = ref<Record<number, number>>({})
 const draftMuted = ref<Record<number, boolean>>({})
@@ -118,14 +140,14 @@ onBeforeUnmount(() => {
   <LpEmptyState
     v-if="streams.length === 0"
     compact
-    icon="lucide:volume-off"
-    :title="t('streams.none')"
-    :description="t('streams.noneHint')"
+    :icon="show === 'microphones' ? 'lucide:mic-off' : 'lucide:volume-off'"
+    :title="show === 'microphones' ? t('streams.noMicrophones') : t('streams.none')"
+    :description="show === 'microphones' ? t('streams.noMicrophonesHint') : t('streams.noneHint')"
   />
   <ul v-else class="flex flex-col divide-y divide-line">
     <li v-for="s in streams" :key="s.id" class="flex flex-col gap-2 py-3 first:pt-0 last:pb-0">
       <div class="flex items-center gap-3">
-        <LpIcon name="lucide:audio-lines" :size="18" class="shrink-0 text-muted" />
+        <LpIcon :name="iconOf(s)" :size="18" class="shrink-0 text-muted" />
         <div class="min-w-0 flex-1">
           <p class="truncate text-sm font-medium">{{ s.name }}</p>
           <p class="truncate text-xs text-muted">{{ t("streams.from", { peer: s.peer }) }}</p>

@@ -26,12 +26,31 @@ struct MixerState {
     generation: u64,
 }
 
+/// What a stream playing here is, so a window can group and label it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamKind {
+    /// One application's sound. Also what a node older than this field sent.
+    #[default]
+    App,
+    /// A peer's microphone, published here as an input.
+    Microphone,
+    /// Sound a peer sends back into one of this machine's devices.
+    Device,
+    /// A phone call's voice, relayed from the computer carrying it.
+    Call,
+    /// A phone's own sound, relayed from the computer it plays through.
+    PhoneSound,
+}
+
 /// One stream playing here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MixerStream {
     pub id: u32,
     pub peer: String,
     pub name: String,
+    #[serde(default)]
+    pub kind: StreamKind,
     /// Linear, 1.0 = as sent.
     pub volume: f32,
     pub muted: bool,
@@ -64,7 +83,7 @@ impl LocalMixer {
 
     /// A stream started playing. A playback reopened on another device keeps
     /// the volume it had.
-    pub fn add(&self, id: u32, peer: &str, name: &str) {
+    pub fn add(&self, id: u32, peer: &str, name: &str, kind: StreamKind) {
         self.state()
             .streams
             .entry(id)
@@ -72,6 +91,7 @@ impl LocalMixer {
                 id,
                 peer: peer.to_owned(),
                 name: name.to_owned(),
+                kind,
                 volume: 1.0,
                 muted: false,
             });
@@ -103,7 +123,7 @@ mod tests {
     fn the_local_mixer_scales_mutes_and_refuses_unknown_streams() {
         let mixer = LocalMixer::default();
         assert!(!mixer.set(7, 0.5, false), "nothing plays as stream 7 yet");
-        mixer.add(7, "Nocturne", "Firefox");
+        mixer.add(7, "Nocturne", "Firefox", StreamKind::App);
         assert_eq!(mixer.level(7), 1.0);
         let before = mixer.generation();
         assert!(mixer.set(7, 0.5, false));
@@ -122,9 +142,9 @@ mod tests {
     #[test]
     fn a_reopened_playback_keeps_its_local_volume() {
         let mixer = LocalMixer::default();
-        mixer.add(7, "Nocturne", "Firefox");
+        mixer.add(7, "Nocturne", "Firefox", StreamKind::App);
         mixer.set(7, 0.3, false);
-        mixer.add(7, "Nocturne", "Firefox");
+        mixer.add(7, "Nocturne", "Firefox", StreamKind::App);
         assert_eq!(mixer.level(7), 0.3);
         mixer.remove(7);
         assert_eq!(mixer.level(7), 1.0);

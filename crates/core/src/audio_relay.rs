@@ -40,6 +40,20 @@ pub fn call_of(label: &str) -> Option<&str> {
     label.strip_prefix(CALL_LABEL)
 }
 
+/// What a phone's own sound is called on the machine that plays it, marked
+/// the same way as a call so that machine can tell it from an application.
+pub const PHONE_SOUND_LABEL: &str = "Phone sound · ";
+
+/// The label a phone's sound carries to the peer playing it.
+pub fn phone_sound_label(phone: &str) -> String {
+    format!("{PHONE_SOUND_LABEL}{phone}")
+}
+
+/// The phone a stream labelled by [`phone_sound_label`] carries the sound of.
+pub fn phone_sound_of(label: &str) -> Option<&str> {
+    label.strip_prefix(PHONE_SOUND_LABEL)
+}
+
 /// One relay's shared state, as the audio module of the peer's link sees it.
 pub(crate) struct Relay {
     pub(crate) peer: PeerId,

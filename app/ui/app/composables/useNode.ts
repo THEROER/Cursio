@@ -204,12 +204,16 @@ export type CallAction =
   | { action: "mute"; muted: boolean }
   | { action: "audio_here"; here: boolean }
 
+/** `cursio_core::mixer::StreamKind`; absent from a node before control v18. */
+export type StreamKind = "app" | "microphone" | "device" | "call" | "phone_sound"
+
 /** Mirrors `cursio_core::mixer::MixerStream`: the listener's own say on one stream. */
 export interface PlayingStream {
   id: number
   /** The machine it comes from, by name. */
   peer: string
   name: string
+  kind?: StreamKind
   /** Linear, 1 is as sent, up to `MAX_STREAM_VOLUME`. */
   volume: number
   muted: boolean

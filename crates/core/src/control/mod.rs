@@ -71,8 +71,8 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// status.
 /// v16: `phone_screen`, a phone's screen shown here.
 /// v17: `call_setup` in the status, `voice_on` on a phone's calls, and
-/// `[calls]` in the config.
-pub const CONTROL_VERSION: u32 = 17;
+/// `[calls]` in the config. v18: `kind` on each stream playing here.
+pub const CONTROL_VERSION: u32 = 18;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -1538,7 +1538,7 @@ mod tests {
         assert!(matches!(refused, Reply::Error { .. }), "got {refused:?}");
 
         let engines = node.mixer();
-        engines.add(7, "Nocturne", "Firefox");
+        engines.add(7, "Nocturne", "Firefox", crate::mixer::StreamKind::App);
         let reply = node.handle(Command::SetStreamVolume {
             stream: 7,
             volume: 0.5,
