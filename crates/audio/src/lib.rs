@@ -479,6 +479,27 @@ impl Playback {
         Self::open_on(id, node_name, None)
     }
 
+    /// Open playback on the output `device` names — its id as
+    /// [`list_output_devices`] gives it — on every platform, Linux included,
+    /// where [`open_on`](Playback::open_on) leaves the node to the session
+    /// manager. `None` is the default output.
+    pub fn open_to(
+        id: AudioStreamId,
+        node_name: String,
+        device: Option<String>,
+    ) -> Result<Self, AudioError> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Playback {
+                inner: pipewire_backend::PwSink::open_to(id, node_name, device)?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::open_on(id, node_name, device)
+        }
+    }
+
     /// Open playback, optionally targeting a specific output device by friendly
     /// name (`device`). On **Windows**, `Some(name)` renders the peer's audio
     /// into the matching endpoint (e.g. a VB-Audio cable) — how a Linux device

@@ -1798,20 +1798,36 @@ impl PwSink {
     /// `node_name` names the node in the graph — e.g. `"Cursio: Spotify (PC)"`
     /// for a per-app stream — so it is addressable/routable on its own.
     pub fn open(id: AudioStreamId, node_name: String) -> Result<Self, AudioError> {
-        Self::open_as(id, node_name, false)
+        Self::open_as(id, node_name, false, None)
+    }
+
+    /// Open a playback node the session manager links to the output named
+    /// `target` (its node name) rather than to the default one; `None` is
+    /// [`open`](PwSink::open).
+    pub fn open_to(
+        id: AudioStreamId,
+        node_name: String,
+        target: Option<String>,
+    ) -> Result<Self, AudioError> {
+        Self::open_as(id, node_name, false, target)
     }
 
     /// Open as a virtual **microphone**: the node is published with
     /// `media.class = Audio/Source`, so local apps can select it as a recording
     /// device and hear what the peer's microphone picks up.
     pub fn virtual_source(id: AudioStreamId, node_name: String) -> Result<Self, AudioError> {
-        Self::open_as(id, node_name, true)
+        Self::open_as(id, node_name, true, None)
     }
 
     /// Shared body of [`open`](PwSink::open) and
     /// [`virtual_source`](PwSink::virtual_source) — the two differ only in
     /// whether the node is published as a source.
-    fn open_as(id: AudioStreamId, node_name: String, as_source: bool) -> Result<Self, AudioError> {
+    fn open_as(
+        id: AudioStreamId,
+        node_name: String,
+        as_source: bool,
+        target: Option<String>,
+    ) -> Result<Self, AudioError> {
         let (feed_tx, feed_rx) = std_mpsc::channel::<Vec<u8>>();
         let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
@@ -1831,6 +1847,7 @@ impl PwSink {
                 run_playback_loop(
                     node_name,
                     as_source,
+                    target,
                     feed_rx,
                     stop_rx,
                     ready_tx,
@@ -1922,6 +1939,8 @@ fn run_playback_loop(
     // Publish the node as `Audio/Source` (a virtual microphone) rather than an
     // ordinary playback stream.
     as_source: bool,
+    // The output to be linked to, by node name; the default output when unset.
+    target: Option<String>,
     feed_rx: std_mpsc::Receiver<Vec<u8>>,
     stop_rx: std_mpsc::Receiver<()>,
     ready_tx: std_mpsc::Sender<Result<(), String>>,
@@ -1966,6 +1985,9 @@ fn run_playback_loop(
         if as_source {
             props.insert(*pipewire::keys::MEDIA_CLASS, "Audio/Source");
             props.insert(*pipewire::keys::AUDIO_CHANNELS, "2");
+        }
+        if let Some(target) = &target {
+            props.insert("target.object", target.as_str());
         }
 
         // The stream name is also surfaced by some tools; use the real label.
