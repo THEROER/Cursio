@@ -134,8 +134,42 @@ impl Drop for DrivenMark {
 }
 
 /// How long since the last keyboard or pointer input, if the system says.
+///
+/// Read by one thread for the whole process, once a second, and answered
+/// here from that reading. Every link's notification module asked Mutter
+/// itself, twice every two seconds, and Mutter answers from the Shell's main
+/// thread: 120 ms a call on average and over a second while the Shell was
+/// busy, all of it spent stalling that module's own traffic.
 #[cfg(target_os = "linux")]
 fn idle() -> Option<Duration> {
+    static READING: OnceLock<Mutex<Option<(std::time::Instant, Duration)>>> = OnceLock::new();
+    let reading = READING.get_or_init(|| {
+        let spawned = std::thread::Builder::new()
+            .name("idle-monitor".into())
+            .spawn(|| loop {
+                let idle = read_idle();
+                if let Some(reading) = READING.get() {
+                    *reading.lock().unwrap_or_else(|e| e.into_inner()) =
+                        idle.map(|idle| (std::time::Instant::now(), idle));
+                }
+                std::thread::sleep(IDLE_POLL);
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "cannot start the idle monitor; presence falls back to driving alone");
+        }
+        Mutex::new(None)
+    });
+    let (at, idle) = (*reading.lock().unwrap_or_else(|e| e.into_inner()))?;
+    // Idle time grows by itself between readings; input in between is the
+    // up-to-a-second error this costs.
+    Some(idle + at.elapsed())
+}
+
+#[cfg(target_os = "linux")]
+const IDLE_POLL: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+fn read_idle() -> Option<Duration> {
     let ms = crate::session_bus::with_bus(|bus| {
         let reply = bus
             .call_method(
