@@ -141,4 +141,20 @@ object CursioNative {
     /** A desktop wants this phone found: ring until it is, or stop. */
     @JvmStatic
     fun onRing(on: Boolean) = Ringer.ring(on)
+
+    /**
+     * This phone's calls changed, or what it may do with them; see
+     * [CallMonitor]. [calls] is a JSON array of
+     * `{id, incoming, state, number, name}`.
+     */
+    external fun nativeCallsChanged(available: Boolean, reason: String?, bluetoothName: String?, calls: String)
+
+    /**
+     * A computer asked for [kind] (`answer`, `decline`, `hangup`, `dial`,
+     * `mute`). Called by the node, on its own thread; returns why it could
+     * not be done, or null.
+     */
+    @JvmStatic
+    fun onCallRequest(kind: String, number: String?, muted: Boolean): String? =
+        CallMonitor.act(kind, number, muted)
 }

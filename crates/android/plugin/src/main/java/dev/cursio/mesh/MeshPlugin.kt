@@ -36,6 +36,16 @@ import app.tauri.plugin.Plugin
     permissions = [
         Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = MeshPlugin.NOTIFICATIONS),
         Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = MeshPlugin.MICROPHONE),
+        Permission(
+            strings = [
+                Manifest.permission.READ_PHONE_STATE,
+                Manifest.permission.READ_CALL_LOG,
+                Manifest.permission.ANSWER_PHONE_CALLS,
+                Manifest.permission.CALL_PHONE,
+                Manifest.permission.READ_CONTACTS,
+            ],
+            alias = MeshPlugin.CALLS,
+        ),
     ],
 )
 class MeshPlugin(private val activity: Activity) : Plugin(activity) {
@@ -148,6 +158,12 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
                 launchFirst(invoke, PowerSetup.autostartIntents(activity))
             }
             NOTIFICATION_ACCESS -> launchFirst(invoke, notificationAccessIntents())
+            BLUETOOTH -> launchFirst(invoke, listOf(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)))
+            CALLS -> if (CallMonitor.granted(activity)) {
+                invoke.resolve(setupState())
+            } else {
+                requestPermissionForAlias(CALLS, invoke, "permissionAnswered")
+            }
             else -> invoke.reject("unknown grant \"$what\"")
         }
     }
@@ -188,6 +204,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
      * again from here, while the window is still in front.
      */
     private fun afterGrant() {
+        CallMonitor.refresh()
         if (Prefs.wantedRunning(activity) && MeshService.micGranted(activity) && !MeshService.holdsMicrophone()) {
             startFromForeground()
         }
@@ -236,6 +253,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
             "notificationAccess",
             NotificationManagerCompat.getEnabledListenerPackages(activity).contains(activity.packageName),
         )
+        state.put("calls", CallMonitor.granted(activity))
         return state
     }
 
@@ -264,5 +282,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         const val BATTERY = "battery"
         const val AUTOSTART = "autostart"
         const val NOTIFICATION_ACCESS = "notificationAccess"
+        const val CALLS = "calls"
+        const val BLUETOOTH = "bluetooth"
     }
 }

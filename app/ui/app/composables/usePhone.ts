@@ -13,9 +13,18 @@ export interface PhoneSetup {
   autostartSetting: boolean
   /** The phone's notifications may be shown on the machine the user is at. */
   notificationAccess: boolean
+  /** The phone's calls may be shown, answered and placed from a computer. */
+  calls: boolean
 }
 
-export type PhoneGrant = "notifications" | "microphone" | "battery" | "autostart" | "notificationAccess"
+export type PhoneGrant =
+  | "notifications"
+  | "microphone"
+  | "battery"
+  | "autostart"
+  | "notificationAccess"
+  | "calls"
+  | "bluetooth"
 
 export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 
@@ -132,6 +141,7 @@ export function usePhone() {
       !s.microphone ||
       !s.battery ||
       !s.notificationAccess ||
+      !s.calls ||
       (s.autostartSetting && !autostartDone.value)
     )
   })

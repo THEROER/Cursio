@@ -49,6 +49,10 @@ pub struct Setup {
     pub autostart_setting: bool,
     /// This phone's notifications may be read and shown on a desktop.
     pub notification_access: bool,
+    /// This phone's calls may be shown, answered and placed from a computer.
+    /// Defaulted for a plugin built before the row existed.
+    #[serde(default)]
+    pub calls: bool,
 }
 
 /// One of the things [`Setup`] lists, for the user to grant.
@@ -60,6 +64,10 @@ pub enum Grant {
     Battery,
     Autostart,
     NotificationAccess,
+    Calls,
+    /// Not a grant: Android's Bluetooth screen, where the computer is paired
+    /// and picked as the speaker.
+    Bluetooth,
 }
 
 #[derive(Serialize)]

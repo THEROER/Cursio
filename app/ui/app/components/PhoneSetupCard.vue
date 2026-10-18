@@ -24,6 +24,7 @@ const ROWS: Row[] = [
   { what: "microphone", icon: "lucide:mic" },
   { what: "battery", icon: "lucide:battery-charging" },
   { what: "notificationAccess", icon: "lucide:bell-ring" },
+  { what: "calls", icon: "lucide:phone" },
 ]
 
 const busy = ref<PhoneGrant | null>(null)

@@ -23,6 +23,18 @@ const busy = ref(false)
  */
 let resumeAsked = false
 
+/**
+ * The computer as this phone's Bluetooth speaker needs no consent prompt, but
+ * only Android's own Bluetooth screen can pair it and pick it.
+ */
+async function openBluetooth() {
+  try {
+    await mobileRequest("bluetooth")
+  } catch (e) {
+    toast.failure(e, { title: t("phoneAudio.bluetoothFailed") })
+  }
+}
+
 async function refresh() {
   try {
     ;[targets.value, state.value] = await Promise.all([phoneAudioTargets(), phoneAudioState()])
@@ -141,5 +153,11 @@ onBeforeUnmount(() => {
       </div>
     </LpFormField>
     <p class="text-xs text-muted">{{ t("phoneAudio.limits") }}</p>
+    <div class="flex flex-col gap-2">
+      <p class="text-xs text-muted">{{ t("phoneAudio.bluetoothHint") }}</p>
+      <LpButton variant="soft" size="sm" :disabled="busy" @click="openBluetooth">
+        {{ t("phoneAudio.bluetooth") }}
+      </LpButton>
+    </div>
   </LpCard>
 </template>

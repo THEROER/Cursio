@@ -101,6 +101,7 @@ class MeshService : Service() {
         deviceStatus = DeviceStatus(this).also { it.start() }
         instance = this
         CursioNotificationListener.rebindIfLost(this)
+        CallMonitor.start(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -314,6 +315,7 @@ class MeshService : Service() {
     }
 
     override fun onDestroy() {
+        CallMonitor.stop()
         handler.removeCallbacks(refresh)
         deviceStatus.stop()
         capture?.stop()

@@ -202,6 +202,8 @@
     "batteryHint": "Keeps links up while the screen is off.",
     "notificationAccess": "Notifications on your computer",
     "notificationAccessHint": "Shows this phone's notifications on the computer you are at, with their buttons and replies.",
+    "calls": "Calls on your computer",
+    "callsHint": "Answer, decline and place this phone's calls from a computer. Pair the phone with the computer over Bluetooth to talk through the computer's speakers and microphone.",
     "autostart": "Autostart",
     "autostartHint": "This phone also stops apps that are not on its own Autostart list. Allow Cursio there; Android cannot tell the app whether you did.",
     "autostartDone": "I've allowed it",
@@ -368,7 +370,10 @@
     "volumeFailed": "The volume was not changed",
     "awaited": "{device} is not connected right now. The sound plays on this phone and goes back to it when it returns.",
     "remembered": "Before Cursio restarted, the sound played on {device}. Android asks again after every restart before it lets the sound go there.",
-    "resume": "Play there again"
+    "resume": "Play there again",
+    "bluetooth": "Use Bluetooth (no screen-share prompt)",
+    "bluetoothHint": "Pair this phone with the computer and pick it as the speaker: every app's sound then plays there through Cursio, with no prompt after a restart. Bluetooth adds about a fifth of a second of delay, fine for music and video; for games the option above is quicker.",
+    "bluetoothFailed": "The Bluetooth settings did not open"
   },
   "touchpad": {
     "driving": "Driving {peer}",
