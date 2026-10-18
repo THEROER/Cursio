@@ -199,6 +199,42 @@ object CursioNative {
      * `mute`). Called by the node, on its own thread; returns why it could
      * not be done, or null.
      */
+    /** The screen capture is up, or the phone turned, at this many pixels. */
+    external fun nativeScreenStarted(width: Int, height: Int)
+
+    /**
+     * One unit of the screen's encoder: [size] bytes at [offset] of the
+     * codec's direct output [buffer], read before this returns.
+     */
+    external fun nativeScreenUnit(buffer: java.nio.ByteBuffer, offset: Int, size: Int, config: Boolean, key: Boolean)
+
+    external fun nativeScreenStopped()
+
+    /** Show the screen on every computer linked now; answers how many. */
+    external fun nativeScreenShareWithLinked(): Int
+
+    /** A computer asked to see the screen; the user is asked on the phone. */
+    @JvmStatic
+    fun onScreenAsk(computer: String) {
+        val context = ScreenConsentActivity.context ?: return
+        ScreenConsentActivity.ask(context, computer)
+    }
+
+    /** Nobody watches the screen any more. */
+    @JvmStatic
+    fun onScreenStop() = MeshService.stopScreen()
+
+    @JvmStatic
+    fun onScreenKeyframe() = MeshService.screenKeyframe()
+
+    @JvmStatic
+    fun onScreenBitrate(bitsPerSecond: Int) = MeshService.screenBitrate(bitsPerSecond)
+
+    /** A computer's mouse on the screen, as `phone_gesture` decided; see [ScreenTouch]. */
+    @JvmStatic
+    fun onScreenGesture(kind: Int, x1: Float, y1: Float, x2: Float, y2: Float, dx: Int, dy: Int, text: String?) =
+        ScreenTouch.gesture(kind, x1, y1, x2, y2, dx, dy, text)
+
     @JvmStatic
     fun onCallRequest(kind: String, number: String?, muted: Boolean): String? =
         CallMonitor.act(kind, number, muted)

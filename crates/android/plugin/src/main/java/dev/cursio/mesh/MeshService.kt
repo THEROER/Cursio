@@ -70,6 +70,7 @@ class MeshService : Service() {
     private var wifiLocks: List<WifiManager.WifiLock> = emptyList()
     private lateinit var deviceStatus: DeviceStatus
     private var capture: PlaybackCapture? = null
+    private var screen: ScreenShare? = null
 
     /** The status line last posted, so an unchanged one is not posted again. */
     private var shownStatus: String? = null
@@ -118,8 +119,13 @@ class MeshService : Service() {
         // nothing that can block belongs before this line. A null intent is a
         // sticky restart, which happens in the background by definition.
         val fromForeground = intent?.getBooleanExtra(EXTRA_FROM_FOREGROUND, false) ?: false
+        // Stopping the screen is the notification's button; what follows is
+        // an ordinary start of a service that is already running.
+        if (intent?.action == ACTION_SCREEN_STOP) endScreen(fromForeground)
         val capturing = intent?.action == ACTION_CAPTURE
-        if (!enterForeground(fromForeground, projection = capturing || capture != null)) {
+        val screening = intent?.action == ACTION_SCREEN
+        val projecting = capturing || screening || capture != null || screen != null
+        if (!enterForeground(fromForeground, projection = projecting)) {
             takePendingCapture()?.invoke("Android refused to keep the Cursio service in the foreground")
             stopSelf()
             return START_NOT_STICKY
@@ -136,6 +142,10 @@ class MeshService : Service() {
             if (error != null) Log.w(TAG, "playback capture did not start: $error")
             takePendingCapture()?.invoke(error)
         }
+        if (screening) {
+            val error = beginScreen(intent!!)
+            if (error != null) Log.w(TAG, "showing the screen did not start: $error")
+        }
 
         // START_STICKY: if the system reclaims this process under memory
         // pressure, bring it back. A mesh node that stays gone until the user
@@ -150,7 +160,10 @@ class MeshService : Service() {
      * `IllegalStateException` (`ForegroundServiceStartNotAllowedException`) for
      * a background start; both mean "less", not "nothing".
      */
-    private fun enterForeground(fromForeground: Boolean, projection: Boolean = capture != null): Boolean {
+    private fun enterForeground(
+        fromForeground: Boolean,
+        projection: Boolean = capture != null || screen != null,
+    ): Boolean {
         // What the service already holds is asked for again, so a start that
         // may claim less (a sticky restart) does not quietly drop the
         // microphone the window claimed earlier. The projection type is the
@@ -230,7 +243,7 @@ class MeshService : Service() {
         } catch (e: RuntimeException) {
             "capturing playback failed: ${e.message ?: e.javaClass.simpleName}"
         }
-        if (error != null) enterForeground(fromForeground = true, projection = false)
+        if (error != null) enterForeground(fromForeground = true, projection = screen != null)
         return error
     }
 
@@ -238,7 +251,60 @@ class MeshService : Service() {
     private fun endCapture(fromForeground: Boolean) {
         capture?.stop()
         capture = null
-        if (activeTypes and projectionType() != 0) enterForeground(fromForeground, projection = false)
+        if (activeTypes and projectionType() != 0 && screen == null) {
+            enterForeground(fromForeground, projection = false)
+        }
+    }
+
+    /**
+     * Start showing the screen on computers, from the consent the user just
+     * gave, or say why not. Android starts one projection per consent and
+     * stops an app's earlier one when it starts the next, so sharing the
+     * screen ends a playback capture that was running.
+     */
+    private fun beginScreen(intent: Intent): String? {
+        if (activeTypes and projectionType() == 0) return "Android refused the screen-capture service type"
+        val data = IntentCompat.getParcelableExtra(intent, EXTRA_PROJECTION, Intent::class.java)
+            ?: return "the screen-capture consent was missing"
+        val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+        screen?.stop()
+        screen = null
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        val error = try {
+            val projection = manager.getMediaProjection(code, data)
+            if (projection == null) {
+                "Android did not accept the screen-capture consent"
+            } else {
+                var started: ScreenShare? = null
+                started = ScreenShare.start(this, projection) {
+                    handler.post { if (screen != null && screen === started) endScreen(fromForeground = false) }
+                }
+                screen = started
+                if (intent.getBooleanExtra(ScreenConsentActivity.EXTRA_EVERYONE, false)) {
+                    val computers = CursioNative.nativeScreenShareWithLinked()
+                    Log.i(TAG, "showing the screen on $computers computers")
+                }
+                notificationManager().notify(NOTIFICATION_ID, buildNotification(Node.statusLine()))
+                null
+            }
+        } catch (e: SecurityException) {
+            "Android refused the projection: ${e.message}"
+        } catch (e: RuntimeException) {
+            "showing the screen failed: ${e.message ?: e.javaClass.simpleName}"
+        }
+        if (error != null) enterForeground(fromForeground = true, projection = capture != null)
+        return error
+    }
+
+    /** Stop showing the screen and give up the projection type if nothing else needs it. */
+    private fun endScreen(fromForeground: Boolean) {
+        val share = screen ?: return
+        screen = null
+        share.stop()
+        if (activeTypes and projectionType() != 0 && capture == null) {
+            enterForeground(fromForeground, projection = false)
+        }
+        notificationManager().notify(NOTIFICATION_ID, buildNotification(Node.statusLine()))
     }
 
     private fun projectionType(): Int =
@@ -321,6 +387,8 @@ class MeshService : Service() {
         deviceStatus.stop()
         capture?.stop()
         capture = null
+        screen?.stop()
+        screen = null
         takePendingCapture()?.invoke("the Cursio service stopped")
         instance = null
         activeTypes = 0
@@ -364,6 +432,16 @@ class MeshService : Service() {
             // and the service stays in the foreground without it showing.
             .setShowWhen(false)
             .addAction(Notification.Action.Builder(null, "Stop", stop).build())
+        if (screen != null) {
+            val stopScreen = PendingIntent.getService(
+                this,
+                2,
+                Intent(this, MeshService::class.java).setAction(ACTION_SCREEN_STOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            builder.setSubText("Showing this screen on computers")
+                .addAction(Notification.Action.Builder(null, "Stop showing screen", stopScreen).build())
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             // Without this Android 12+ may hold the notification back for ten
             // seconds, and a phone that just booted shows no sign the node is up.
@@ -400,6 +478,42 @@ class MeshService : Service() {
         private const val ACTION_CAPTURE = "dev.cursio.mesh.CAPTURE_PLAYBACK"
         private const val EXTRA_RESULT_CODE = "dev.cursio.mesh.RESULT_CODE"
         private const val EXTRA_PROJECTION = "dev.cursio.mesh.PROJECTION"
+        private const val ACTION_SCREEN = "dev.cursio.mesh.SCREEN"
+        private const val ACTION_SCREEN_STOP = "dev.cursio.mesh.SCREEN_STOP"
+
+        /**
+         * Show this screen on computers, from a consent just given; with
+         * [everyone], on every computer linked now, otherwise on the ones
+         * that asked. Must run from the visible window or the consent
+         * activity: the projection type is claimed by this start.
+         *
+         * @throws IllegalStateException when Android refuses the start.
+         */
+        fun startScreen(context: Context, resultCode: Int, data: Intent, everyone: Boolean) {
+            val intent = Intent(context, MeshService::class.java)
+                .setAction(ACTION_SCREEN)
+                .putExtra(EXTRA_FROM_FOREGROUND, true)
+                .putExtra(EXTRA_RESULT_CODE, resultCode)
+                .putExtra(EXTRA_PROJECTION, data)
+                .putExtra(ScreenConsentActivity.EXTRA_EVERYONE, everyone)
+            context.startForegroundService(intent)
+        }
+
+        /** Stop showing the screen; nobody is watching any more. */
+        fun stopScreen() {
+            main.post { instance?.endScreen(fromForeground = false) }
+        }
+
+        fun screenKeyframe() {
+            main.post { instance?.screen?.keyframe() }
+        }
+
+        fun screenBitrate(bitsPerSecond: Int) {
+            main.post { instance?.screen?.setBitrate(bitsPerSecond) }
+        }
+
+        /** Whether the screen is being shown now. */
+        fun showingScreen(): Boolean = instance?.screen != null
 
         /** The foreground types the running service holds; 0 when it is not running. */
         @Volatile

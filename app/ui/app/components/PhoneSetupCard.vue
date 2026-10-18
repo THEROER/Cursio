@@ -30,6 +30,7 @@ const ROWS: Row[] = [
   { what: "nearby", icon: "lucide:bluetooth" },
   { what: "storage", icon: "lucide:folder-open" },
   { what: "companion", icon: "lucide:laptop" },
+  { what: "touch", icon: "lucide:pointer" },
 ]
 
 const busy = ref<PhoneGrant | null>(null)

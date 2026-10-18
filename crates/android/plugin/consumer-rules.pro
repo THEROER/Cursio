@@ -16,6 +16,11 @@
     public static void onMediaRemote(...);
     public static java.lang.String onGalleryList(...);
     public static byte[] onGalleryBytes(...);
+    public static void onScreenAsk(...);
+    public static void onScreenStop(...);
+    public static void onScreenKeyframe(...);
+    public static void onScreenBitrate(...);
+    public static void onScreenGesture(...);
     public static java.lang.String btComputers(...);
     public static java.lang.String btConnect(...);
 }

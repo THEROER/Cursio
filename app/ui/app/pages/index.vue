@@ -49,6 +49,17 @@ function isPinned(key: ModuleSwitch) {
 
 const { battery, network } = useMachineText()
 
+/** What the peer's menu offers depends on what the link carries. */
+function peerRef(p: PeerView) {
+  const link = p.presence === "online" ? p.link : null
+  return {
+    id: p.id,
+    name: p.name,
+    presence: p.presence,
+    screen: link?.device_kind === "Phone" && link.modules.includes("window"),
+  }
+}
+
 function presenceTone(p: PeerView) {
   return p.presence === "online" ? "success" : p.presence === "connecting" ? "brand" : "neutral"
 }
@@ -172,7 +183,7 @@ function presenceTone(p: PeerView) {
           <PeerMenu
             v-for="peer in status.peers"
             :key="peer.id"
-            :peer="{ id: peer.id, name: peer.name, presence: peer.presence }"
+            :peer="peerRef(peer)"
           >
             <LpCard padded class="flex flex-col gap-3">
               <div class="flex items-center gap-2">
@@ -186,7 +197,7 @@ function presenceTone(p: PeerView) {
                 <LpTooltip v-if="peer.link?.path === 'bluetooth'" :content="t('peer.overBluetoothHint')">
                   <LpBadge size="sm" tone="outline">{{ t("peer.overBluetooth") }}</LpBadge>
                 </LpTooltip>
-                <PeerMenuButton :peer="{ id: peer.id, name: peer.name, presence: peer.presence }" />
+                <PeerMenuButton :peer="peerRef(peer)" />
               </div>
               <LpUptimeBar
                 :segments="uptime(peer.id)"

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Gestures to touch the screen for a computer's mouse, and window content
+     only to find the focused text field typing goes into. No events are
+     asked for: nothing here reads what the user does. -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/cursio_touch_description"
+    android:notificationTimeout="0" />

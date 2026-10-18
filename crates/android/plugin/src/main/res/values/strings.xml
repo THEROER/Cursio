@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="cursio_touch_description">Lets a computer of yours that is showing this phone\'s screen tap, swipe and type on it with its mouse and keyboard. Touches come only while you are showing the screen to that computer.</string>
+</resources>

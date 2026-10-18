@@ -74,6 +74,14 @@ pub struct Setup {
     /// Defaulted for a plugin built before the row existed.
     #[serde(default)]
     pub gallery: bool,
+    /// A computer showing this screen may tap and type on it (the
+    /// accessibility service is on). Defaulted for a plugin built before the
+    /// row existed.
+    #[serde(default)]
+    pub touch: bool,
+    /// The screen is being shown on computers now.
+    #[serde(default)]
+    pub showing_screen: bool,
 }
 
 /// One of the things [`Setup`] lists, for the user to grant.
@@ -94,6 +102,9 @@ pub enum Grant {
     Storage,
     Companion,
     Gallery,
+    /// Not a grant either: the accessibility list, where the user turns on
+    /// touch from computers.
+    Touch,
 }
 
 #[derive(Serialize)]
@@ -192,6 +203,25 @@ pub mod commands {
     #[tauri::command]
     pub fn phone_audio_volume(volume: f32) -> Result<(), String> {
         cursio_android::set_playback_volume(volume).map_err(|e| e.to_string())
+    }
+
+    /// Show this screen on every computer linked now (`true`), after the
+    /// system's consent, or stop showing it.
+    #[tauri::command]
+    pub async fn phone_screen_share(app: AppHandle, show: bool) -> Result<(), String> {
+        let plugin = plugin(&app)?;
+        let command = if show {
+            "startScreenShare"
+        } else {
+            "stopScreenShare"
+        };
+        tauri::async_runtime::spawn_blocking(move || {
+            plugin.run_mobile_plugin::<serde_json::Value>(command, ())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map(drop)
+        .map_err(|e| e.to_string())
     }
 
     /// Bring the node down and up again, so its links greet peers with what

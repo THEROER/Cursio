@@ -177,5 +177,30 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!-- The system's "start recording or casting?" for a computer that
+             asked to show this screen; invisible, it only hosts the dialog. -->
+        <activity
+            android:name="dev.cursio.mesh.ScreenConsentActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- A computer's mouse as a finger on this screen. Runs only once the
+             user turns it on in the accessibility settings; the system binds
+             it, so it is exported to the system alone through the permission. -->
+        <service
+            android:name="dev.cursio.mesh.ScreenTouch"
+            android:exported="true"
+            android:label="Cursio: control from a computer"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/cursio_touch" />
+        </service>
     </application>
 </manifest>

@@ -241,6 +241,11 @@ async function restartNode() {
         <PhoneAudioCard />
       </section>
 
+      <section v-if="status && isMobile" class="flex flex-col gap-3">
+        <LpSection :title="t('phoneScreen.title')" :description="t('phoneScreen.description')" icon="lucide:cast" />
+        <PhoneScreenCard />
+      </section>
+
       <section v-if="status" class="flex flex-col gap-3">
         <LpSection :title="t('streams.title')" :description="t('streams.description')" icon="lucide:volume-2" />
         <LpCard padded>

@@ -25,6 +25,10 @@ export interface PhoneSetup {
   companion: boolean
   /** The phone's photos and videos may be browsed from its peers. */
   gallery: boolean
+  /** A computer showing this screen may tap and type on it. */
+  touch: boolean
+  /** The screen is being shown on computers now. */
+  showingScreen: boolean
 }
 export type PhoneGrant =
   | "notifications"
@@ -39,6 +43,7 @@ export type PhoneGrant =
   | "storage"
   | "companion"
   | "gallery"
+  | "touch"
 
 export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 
@@ -60,6 +65,12 @@ export interface PhoneAudioTarget {
 }
 
 export const phoneAudioTargets = () => invoke<PhoneAudioTarget[]>("phone_audio_targets")
+
+/**
+ * Show this screen on every computer linked now, or stop. Starting resolves
+ * once Android's consent dialog is open; the screen appears when it is allowed.
+ */
+export const phoneScreenShare = (show: boolean) => invoke<void>("phone_screen_share", { show })
 
 /**
  * Send everything the phone plays to `target`, or stop with `null`. Resolves
@@ -161,6 +172,7 @@ export function usePhone() {
       !s.storage ||
       !s.companion ||
       !s.gallery ||
+      !s.touch ||
       (s.autostartSetting && !autostartDone.value)
     )
   })

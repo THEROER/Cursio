@@ -699,7 +699,7 @@ negotiating either way, because refusal with a reason beats silence (the same
 rule as the service module). Viewing stays passive in the other sense: nothing
 opens without `--remote-screen`.
 
-### Protocol (window module v5, `WindowMsg`)
+### Protocol (window module v6, `WindowMsg`)
 
 | Message | Direction | Class | Meaning |
 |---|---|---|---|
@@ -711,6 +711,7 @@ opens without `--remote-screen`.
 | `SourceShown { source, title, width, height }` | host → viewer | Video | the frames that follow are a new source |
 | `SourceEnded { reason }` | host → viewer | Video | stream ended (closed, failed, picker cancelled) |
 | `KeyframeRequest { id }` | viewer → host | Control | send the whole current picture now (also used by transfers) |
+| `RequestScreen { show }` | viewer → host | Control | a computer asking a phone for its whole screen as a window (see "A phone as host") |
 
 Frames are ordinary `WindowFrame`s under `SCREEN_STREAM_ID`, acks ordinary
 `FrameAck`s. Requests and the list are `Control` so a switch asked for during a
@@ -722,7 +723,7 @@ on one link: frames only flow host → viewer, so a frame bearing it is always
 ours to show, and an ack bearing it always for the stream we host. The host
 re-reads its list every 2 s while subscribed and resends only on change.
 `PROTOCOL_VERSION` is unchanged: this is the window module's own vocabulary,
-versioned through its `ModuleAdvert` (2 → 3 for these, 3 → 4 for `VideoCaps`, 4 → 5 for `KeyframeRequest`).
+versioned through its `ModuleAdvert` (2 → 3 for these, 3 → 4 for `VideoCaps`, 4 → 5 for `KeyframeRequest`, 5 → 6 for `RequestScreen`).
 
 ### What each host can offer
 
@@ -768,3 +769,91 @@ screens. The Windows view can only be a window, and the Linux node is offered
 as a monitor or window by the kind of its source. To appear as a real
 *screen* on Windows the viewer would need a virtual monitor (IddCx, a signed
 driver); out of scope, see above.
+
+## A phone as host: its screen on a computer, driven with the mouse (2026-10-18)
+
+What scrcpy does over ADB, done over the mesh: a phone's whole screen opens on
+a computer as an ordinary transferred window titled `<phone> — screen`, and the
+computer's mouse and keyboard work on it as a finger and a few keys. Nothing
+needs ADB, a cable, or the phone in developer mode.
+
+### Why it is a window transfer and not a module
+
+It is the AirPlay case turned around. The phone's hardware encoder makes H.264
+from the screen (MediaProjection → a virtual display whose surface is
+MediaCodec's input), `TileCodec::LossyVideo` already carries H.264 between
+Cursio machines, and every viewer's surrogate already decodes it. So the
+access units go out exactly as the encoder made them — no pixel passes through
+the app — and the computer opens the surrogate it opens for any window. Its
+pointer comes back as the `WindowInput` every surrogate sends. The policy is
+`core/src/phone_screen.rs` (who watches, when the window opens and closes) and
+`core/src/phone_gesture.rs` (what a mouse means on a touch screen); the phone's
+half is `ScreenShare.kt` (projection, encoder) and `ScreenTouch.kt` (touch).
+
+The phone advertises the window module as `ModuleRole::Source`: it hosts its
+screen and shows nothing, so two phones do not run the module, and its
+renderer (`NoViewRenderer`) refuses an offer with that reason.
+
+### Who starts it
+
+- **The computer** asks with `WindowMsg::RequestScreen { show }` (window module
+  v6) — from `cursio screen <phone>`, the GNOME menu's *Show Screen* or the
+  app's peer menu, all through the control socket's `phone_screen`. Android
+  lets nothing capture the screen without a consent shown on the phone, so
+  the request becomes a notification there ("Nocturne wants to show this
+  screen — Allow"), never a stream or a dialog out of nowhere.
+- **The phone**, from *Settings → This screen → computer*, shows it on every
+  computer linked at that moment.
+
+Either way the consent is the system's own dialog for the whole display. Once
+the capture is up, every computer that asked gets a window. When the last
+window closes (or its link ends), the capture stops, and the system's
+recording indicator goes with it. *Stop showing screen* on the service's
+notification ends it from the phone.
+
+### Size, rate and turning
+
+The long side is held to 1920 px (in macroblocks of 16), 60 fps, starting at
+6 Mbit/s. The encoder repeats the last frame after 200 ms of a still screen,
+so a viewer joining late still gets pictures. Keyframes are sent on request —
+a window that just opened, a viewer whose decoder lost its place, or one that
+fell more than 64 units behind and skipped to the next keyframe. The bitrate
+halves when more than 30 frames are unacknowledged and grows by a quarter
+after five seconds of keeping up, within 1–12 Mbit/s: the phone's encoder takes
+only a target, so frames in flight is the signal it can be steered by.
+
+Turning the phone changes the display's size, and a transferred window's size
+is fixed by its offer, so a turn rebuilds the encoder at the new size and the
+computer's window closes and reopens at the new shape.
+
+### Mouse as a finger
+
+| Computer | Phone |
+|---|---|
+| left button down, move, up | one touch: a tap, a long press or a drag, by how long and how far |
+| wheel | a short swipe at the last press (or the centre), the content following the wheel |
+| right button, side "back" button, Esc | Back |
+| middle button | Home |
+| Ctrl + left drag | a pinch: a second finger mirrored about where the press began |
+| keys | typed into the focused field (US layout); Backspace, Enter |
+
+`dispatchGesture` is the one public way an app touches the screen, through an
+accessibility service the user turns on once by hand ("Cursio: control from a
+computer"). A held button is one continuous stroke (`continueStroke`); Android
+takes a continuation only once the previous piece is dispatched, so moves
+arriving meanwhile are folded into the next piece — the finger goes where the
+pointer is now. Typing sets the focused field's text through the accessibility
+tree: a character lands at the end of the field rather than at the caret, and
+keys that are not characters (arrows, shortcuts) do nothing. That is the limit
+of not being a keyboard; an input method would lift it and is not built.
+
+### Limits
+
+- One projection per app: showing the screen ends a playback capture that was
+  running, and the other way round (Android stops an app's earlier projection
+  when it starts the next).
+- The capture covers the screen as the phone draws it, including what apps
+  mark secure (banking, DRM video), which Android draws black.
+- The phone's sound is not part of it; that is *Phone audio → computer*.
+- A computer's capture apps can take the phone as a remote-screen source too
+  (`PhoneScreenSources`); picking it waits up to 90 s for the phone's consent.

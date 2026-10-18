@@ -338,9 +338,12 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         .with(Box::new(cursio_core::gallery_session::GalleryFactory {
             store: Some(crate::gallery::AndroidGallery::shared()),
             view: true,
-        }));
+        }))
+        // The phone's screen, shown on a computer and driven from it.
+        .with(Box::new(cursio_core::window_session::WindowFactory::default()));
     cursio_core::media_hub::hub().set_backend(crate::media::AndroidBackend::shared());
     cursio_core::media_hub::hub().set_display(crate::media::AndroidDisplay::shared());
+    cursio_core::phone_screen::set_backend(crate::screen::AndroidScreen::shared());
     for advert in modules.advertise() {
         tracing::info!(module = %advert.id, version = advert.version, "module available");
     }

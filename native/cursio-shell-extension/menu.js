@@ -286,6 +286,10 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
 
         if (link.device_kind === 'Phone')
             this._peers.addAction('Ring', () => this._run({cmd: 'ring', peer: name}, name));
+        // The phone asks its user before its screen opens here, so the
+        // window follows a moment after, not at once.
+        if (link.device_kind === 'Phone' && has('window'))
+            this._peers.addAction('Show Screen', () => this._run({cmd: 'phone_screen', peer: name}, name));
         if ((status.messages ?? []).some(m => m.name === name))
             this._peers.addAction('Messages', () => this._openSettings(['--page', 'messages']));
         if ((status.gallery ?? []).some(g => g.name === name))

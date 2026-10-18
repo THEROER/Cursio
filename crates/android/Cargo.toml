@@ -17,7 +17,7 @@ crate-type = ["rlib"]
 # own `default-features`, and a `default-features = false` next to it is
 # ignored — which silently pulled PipeWire, FUSE and an AirPlay receiver into a
 # phone build. Naming the path here is what actually turns them off.
-cursio-core = { path = "../core", default-features = false, features = ["audio", "bluetooth", "files"] }
+cursio-core = { path = "../core", default-features = false, features = ["audio", "bluetooth", "files", "window"] }
 # Its share policy, to offer the phone's storage. Only the server half builds
 # here: the FUSE mount is `target_os = "linux"`, which an Android target is not.
 cursio-files.workspace = true

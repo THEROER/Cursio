@@ -53,6 +53,7 @@ object Node {
             GalleryStore.context = context.applicationContext
             BtLink.context = context.applicationContext
             MediaNotifier.context = context.applicationContext
+            ScreenConsentActivity.context = context.applicationContext
             initialized = CursioNative.nativeInit(context.filesDir.absolutePath)
             if (!initialized) loadError = "the native node refused its data directory"
             if (initialized) {

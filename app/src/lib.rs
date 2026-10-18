@@ -226,6 +226,7 @@ pub fn run() {
             node::commands::gallery_read,
             node::commands::gallery_save,
             node::commands::node_call,
+            node::commands::node_phone_screen,
             node::commands::node_status,
             node::commands::node_config,
             node::commands::node_set_module,
@@ -288,6 +289,7 @@ pub fn run() {
             mobile::commands::phone_audio_route,
             mobile::commands::phone_audio_state,
             mobile::commands::phone_audio_volume,
+            mobile::commands::phone_screen_share,
         ]);
 
     builder

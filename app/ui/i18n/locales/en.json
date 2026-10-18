@@ -280,6 +280,8 @@
     "storageHint": "Your computer shows this phone's storage as a folder, to open, copy and save files as if they were local. Android asks for \"All files access\".",
     "companion": "Wake with this computer",
     "companionHint": "Lets Android keep Cursio running and start it again whenever a computer paired over Bluetooth is near — even after the phone stops it.",
+    "touch": "Control from a computer",
+    "touchHint": "A computer showing this screen can tap, swipe and type with its mouse and keyboard. Turn on “Cursio: control from a computer” in the accessibility list.",
     "autostart": "Autostart",
     "autostartHint": "This phone also stops apps that are not on its own Autostart list. Allow Cursio there; Android cannot tell the app whether you did.",
     "autostartDone": "I've allowed it",
@@ -329,6 +331,9 @@
   },
   "peerMenu": {
     "open": "Actions for {name}",
+    "showScreen": "Show screen",
+    "screenAsked": "Asked {name}: its screen opens here once it is allowed on the phone",
+    "screenFailed": "{name}'s screen cannot be shown",
     "showInLogs": "Show in logs",
     "copyId": "Copy id",
     "idCopied": "{name}'s id copied",
@@ -461,6 +466,16 @@
     "bluetooth": "Use Bluetooth (no screen-share prompt)",
     "bluetoothHint": "Pair this phone with the computer and pick it as the speaker: every app's sound then plays there through Cursio, with no prompt after a restart. Bluetooth adds about a fifth of a second of delay, fine for music and video; for games the option above is quicker.",
     "bluetoothFailed": "The Bluetooth settings did not open"
+  },
+  "phoneScreen": {
+    "title": "This screen → computer",
+    "description": "Show this phone's screen in a window on your computers, and use it there with the mouse.",
+    "show": "Show on computers",
+    "stop": "Stop showing",
+    "showing": "Showing this screen on your computers",
+    "consent": "Android asks before anything of the screen leaves the phone.",
+    "noTouch": "The computers can see the screen but not touch it: turn on control from a computer above.",
+    "failed": "The screen is not shown"
   },
   "touchpad": {
     "driving": "Driving {peer}",

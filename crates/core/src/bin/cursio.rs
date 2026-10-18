@@ -131,6 +131,16 @@ enum Command {
         /// The phone's name or id, as `cursio status` shows it.
         phone: String,
     },
+    /// Show a connected phone's screen in a window here, and use it with the
+    /// mouse: a click is a tap, a drag a swipe, the right button Back. The
+    /// phone asks its user to allow it first. Goes through the running node.
+    Screen {
+        /// The phone's name, as `cursio status` shows it.
+        phone: String,
+        /// Stop showing it instead.
+        #[arg(long)]
+        stop: bool,
+    },
     /// Answer, decline, end or place a call on a connected phone. Goes through
     /// the running node.
     Call {
@@ -1158,6 +1168,7 @@ async fn run() -> anyhow::Result<()> {
             save,
         } => send_share(&target, &to, copy, save).await,
         Command::Ring { phone } => ring_phone(&phone).await,
+        Command::Screen { phone, stop } => phone_screen(&phone, !stop).await,
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Call { action } => call(action).await,
         Command::Bluetooth { action } => bluetooth(action),
@@ -3560,6 +3571,35 @@ async fn ring_phone(phone: &str) -> anyhow::Result<()> {
         Reply::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!(
             "the running node does not know how to ring ({other:?}); restart it with this version of Cursio"
+        ),
+    }
+}
+
+async fn phone_screen(phone: &str, show: bool) -> anyhow::Result<()> {
+    use cursio_core::control::{Command, Reply};
+    let client = control_client().await.map_err(|e| {
+        anyhow::anyhow!(
+            "no running node to show the phone through ({e}); start `cursio mesh` first"
+        )
+    })?;
+    match client
+        .request(Command::PhoneScreen {
+            peer: phone.to_string(),
+            show,
+        })
+        .await?
+    {
+        Reply::Done if show => {
+            println!("asked {phone}; its screen opens here once it is allowed on the phone");
+            Ok(())
+        }
+        Reply::Done => {
+            println!("{phone}'s screen is no longer shown here");
+            Ok(())
+        }
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!(
+            "the running node does not know how to show a phone's screen ({other:?}); restart it with this version of Cursio"
         ),
     }
 }

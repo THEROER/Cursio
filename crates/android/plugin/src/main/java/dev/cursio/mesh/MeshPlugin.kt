@@ -185,6 +185,32 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         MeshService.stopPlaybackCapture { invoke.resolve() }
     }
 
+    /**
+     * Show this screen on every computer linked now. The system asks the user
+     * first; this resolves once the dialog is open, and the screen appears on
+     * the computers when it is allowed.
+     */
+    @Command
+    fun startScreenShare(invoke: Invoke) {
+        if (!Prefs.wantedRunning(activity)) {
+            invoke.reject("start Cursio before showing this screen")
+            return
+        }
+        try {
+            ScreenConsentActivity.open(activity)
+            invoke.resolve()
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "no screen-capture consent dialog", e)
+            invoke.reject("this phone has no screen-capture consent dialog")
+        }
+    }
+
+    @Command
+    fun stopScreenShare(invoke: Invoke) {
+        MeshService.stopScreen()
+        invoke.resolve()
+    }
+
     @Command
     fun setup(invoke: Invoke) {
         invoke.resolve(setupState())
@@ -223,6 +249,9 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
                 else -> requestPermissionForAlias(STORAGE, invoke, "permissionAnswered")
             }
             COMPANION -> requestCompanion(invoke)
+            // Android lets no app turn an accessibility service on, so the
+            // list is where the user goes to do it.
+            TOUCH -> launchFirst(invoke, listOf(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)))
             CALLS -> if (CallMonitor.granted(activity)) {
                 invoke.resolve(setupState())
             } else {
@@ -391,6 +420,8 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         state.put("nearby", nearbyGranted())
         state.put("storage", storageGranted())
         state.put("companion", ComputerCompanion.associated(activity))
+        state.put("touch", ScreenTouch.enabled(activity))
+        state.put("showingScreen", MeshService.showingScreen())
         return state
     }
 
@@ -449,5 +480,6 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         const val NEARBY = "nearby"
         const val STORAGE = "storage"
         const val COMPANION = "companion"
+        const val TOUCH = "touch"
     }
 }

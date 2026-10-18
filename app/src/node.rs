@@ -708,6 +708,18 @@ pub mod commands {
         link.request(Command::Call { phone, action }).await
     }
 
+    /// Show a phone's screen in a window here, or stop.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn node_phone_screen(
+        link: State<'_, NodeLink>,
+        phone: String,
+        show: bool,
+    ) -> Result<Reply, NodeError> {
+        link.request(Command::PhoneScreen { peer: phone, show })
+            .await
+    }
+
     /// Off the window's thread: `systemctl` or a process spawn can take a
     /// noticeable moment, and a synchronous command would freeze the window
     /// for it.

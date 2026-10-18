@@ -1,10 +1,13 @@
 import type { ContextMenuItemDef } from "@leavepulse/ui"
+import { invoke } from "@tauri-apps/api/core"
 
 /** What a peer's menu needs to know about the machine it is for. */
 export interface PeerRef {
   id: string
   name: string
   presence?: "online" | "connecting" | "offline"
+  /** A phone linked with the window module, whose screen can open here. */
+  screen?: boolean
 }
 
 // One removal at a time, whichever card, node or list asked for it: the
@@ -33,6 +36,21 @@ export function usePeerMenu() {
         label: t("peerMenu.showInLogs"),
         icon: "lucide:scroll-text",
         onSelect: () => showInLogs(peer.name),
+      })
+    }
+    if (peer.screen && !isMobile.value) {
+      list.push({
+        label: t("peerMenu.showScreen"),
+        icon: "lucide:cast",
+        // The phone asks its user first: the window follows once allowed.
+        onSelect: async () => {
+          try {
+            await invoke("node_phone_screen", { phone: peer.name, show: true })
+            toast.success(t("peerMenu.screenAsked", { name: peer.name }))
+          } catch (e) {
+            toast.failure(e, { title: t("peerMenu.screenFailed", { name: peer.name }) })
+          }
+        },
       })
     }
     list.push(
