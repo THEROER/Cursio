@@ -218,9 +218,45 @@ struct Voice {
     stop: Sender<()>,
 }
 
+/// The major device class of a Class of Device: bits 8–12.
+const MAJOR_CLASS_SHIFT: u32 = 8;
+const MAJOR_CLASS_MASK: u32 = 0x1f;
+const MAJOR_CLASS_PHONE: u32 = 0x02;
+
+/// Whether a device of Bluetooth Class of Device `class` may be taken as a
+/// phone. A laptop can play the gateway side of hands-free too — Windows does,
+/// for its own Phone Link — and taken as a phone it showed up among the
+/// calls with nothing to call. A device that gives no class is let through:
+/// refusing it would refuse every phone whose stack leaves the field out.
+fn takes_calls(class: Option<u32>) -> bool {
+    class.is_none_or(|c| (c >> MAJOR_CLASS_SHIFT) & MAJOR_CLASS_MASK == MAJOR_CLASS_PHONE)
+}
+
+fn device_class(bus: &Connection, path: &str) -> Option<u32> {
+    let reply = bus
+        .call_method(
+            Some("org.bluez"),
+            path,
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("org.bluez.Device1", "Class"),
+        )
+        .ok()?;
+    let value: OwnedValue = reply.body().deserialize().ok()?;
+    u32::try_from(value).ok()
+}
+
 fn run_link(shared: Shared, phone: String, adapter: String, device: OwnedObjectPath, fd: OwnedFd) {
     let name = property(&shared.bus, device.as_str(), "org.bluez.Device1", "Alias")
         .unwrap_or_else(|| phone.clone());
+    let class = device_class(&shared.bus, device.as_str());
+    if !takes_calls(class) {
+        // Dropping the socket refuses the link; the device's own stack sees
+        // the headset go away.
+        tracing::info!(%phone, %name, class = ?class, "not a phone; refusing its hands-free link");
+        drop(fd);
+        return;
+    }
     let local = property(&shared.bus, &adapter, "org.bluez.Adapter1", "Address")
         .and_then(|a| sco::bdaddr(&a).ok());
     let (commands, commands_rx) = mpsc::channel();
@@ -480,5 +516,14 @@ mod tests {
         );
         assert_eq!(adapter_from_path(path), "/org/bluez/hci0");
         assert_eq!(address_from_path("/org/bluez/hci0"), None);
+    }
+
+    #[test]
+    fn only_a_phone_class_device_is_taken_as_a_phone() {
+        // A smartphone (major class Phone) and a laptop (major class Computer)
+        // as BlueZ reports them.
+        assert!(takes_calls(Some(0x5a020c)));
+        assert!(!takes_calls(Some(0x2a010c)));
+        assert!(takes_calls(None));
     }
 }

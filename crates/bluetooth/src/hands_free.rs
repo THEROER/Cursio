@@ -224,8 +224,13 @@ impl HandsFree {
                 out.push(HfOutput::Event(HfEvent::Refused(reason)));
             }
             Some(Pending::List) => {
-                let calls = if ok {
-                    let listing = std::mem::take(&mut self.listing);
+                let listing = std::mem::take(&mut self.listing);
+                // A messenger's call (WhatsApp, Telegram) is no telephony
+                // call: Android raises the `call` indicator for it — a
+                // "virtual call", so the headset opens audio — but lists
+                // nothing under `+CLCC`. Taken at its word the listing would
+                // say there is no call, and the voice would never come here.
+                let calls = if ok && !listing.is_empty() {
                     listing
                         .into_iter()
                         .map(|e| self.call_from_listing(e))
@@ -442,6 +447,27 @@ mod tests {
                 state: CallState::Ringing,
                 number: Some("+380501234567".into()),
                 name: Some("Mom".into()),
+            }])]
+        );
+    }
+
+    #[test]
+    fn a_messengers_call_that_clcc_does_not_list_is_still_a_call() {
+        let mut hf = connected(871);
+        for _ in 0..3 {
+            hf.feed("OK");
+        }
+        let out = hf.feed("+CIEV: 1,1");
+        assert_eq!(sent(&out), vec!["AT+CLCC"]);
+        let out = hf.feed("OK");
+        assert_eq!(
+            events(&out),
+            vec![HfEvent::Calls(vec![Call {
+                id: 1,
+                direction: CallDirection::Incoming,
+                state: CallState::Active,
+                number: None,
+                name: None,
             }])]
         );
     }
