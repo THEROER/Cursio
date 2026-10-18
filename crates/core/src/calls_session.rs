@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cursio_protocol::calls::CallsMsg;
-use cursio_protocol::{Message, ModuleId, PeerId};
+use cursio_protocol::{Message, ModuleId, ModuleRole, PeerId};
 use cursio_transport::{TransportError, TransportTx};
 use tokio::sync::mpsc;
 
@@ -158,9 +158,22 @@ impl crate::module::ModuleFactory for CallsFactory {
         ModuleId::CALLS
     }
 
+    /// A phone is the source of calls and a computer their sink, so two phones
+    /// or two computers have nothing to exchange and do not start the module.
+    /// A build that still advertises `Both` pairs with either, which is what
+    /// lets this ship without a version bump.
     fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
-        self.supported()
-            .then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::CALLS, VERSION))
+        let role = match (self.actor.is_some(), self.computer) {
+            (true, true) => ModuleRole::Both,
+            (true, false) => ModuleRole::Source,
+            (false, true) => ModuleRole::Sink,
+            (false, false) => return None,
+        };
+        Some(cursio_protocol::ModuleAdvert::new(
+            ModuleId::CALLS,
+            VERSION,
+            role,
+        ))
     }
 
     fn supported(&self) -> bool {
@@ -189,6 +202,42 @@ mod tests {
             self.0.lock().unwrap().push(msg.clone());
             Err("answering calls is not allowed on this phone".into())
         }
+    }
+
+    fn calls_advert(actor: bool, computer: bool) -> Option<cursio_protocol::ModuleAdvert> {
+        use crate::module::ModuleFactory;
+        struct Silent;
+        impl CallActor for Silent {
+            fn act(&self, _: &CallsMsg) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        CallsFactory {
+            actor: actor.then(|| Arc::new(Silent) as Arc<dyn CallActor>),
+            computer,
+        }
+        .advert()
+    }
+
+    #[test]
+    fn calls_run_between_a_phone_and_a_computer_only() {
+        let phone = [calls_advert(true, false).unwrap()];
+        let computer = [calls_advert(false, true).unwrap()];
+        assert!(cursio_protocol::negotiate(&phone, &computer).is_agreed(ModuleId::CALLS));
+        assert!(!cursio_protocol::negotiate(&phone, &phone).is_agreed(ModuleId::CALLS));
+        assert!(!cursio_protocol::negotiate(&computer, &computer).is_agreed(ModuleId::CALLS));
+    }
+
+    #[test]
+    fn a_build_advertising_calls_both_ways_still_pairs_with_either_side() {
+        let older = [cursio_protocol::ModuleAdvert::symmetric(
+            ModuleId::CALLS,
+            VERSION,
+        )];
+        let phone = [calls_advert(true, false).unwrap()];
+        let computer = [calls_advert(false, true).unwrap()];
+        assert!(cursio_protocol::negotiate(&phone, &older).is_agreed(ModuleId::CALLS));
+        assert!(cursio_protocol::negotiate(&computer, &older).is_agreed(ModuleId::CALLS));
     }
 
     #[test]
