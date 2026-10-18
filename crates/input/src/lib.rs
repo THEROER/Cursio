@@ -14,6 +14,8 @@ use cursio_protocol::{EdgeSet, InputEvent};
 #[cfg(target_os = "linux")]
 pub mod capture;
 #[cfg(any(target_os = "windows", test))]
+mod edge_gate;
+#[cfg(any(target_os = "windows", test))]
 mod gesture_shortcut;
 #[cfg(target_os = "linux")]
 pub mod lin_cursor;

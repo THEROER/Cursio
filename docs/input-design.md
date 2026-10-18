@@ -135,7 +135,7 @@ call exists rather than a constructor argument:
 
 | backend | how it follows the edges |
 | --- | --- |
-| Windows | a bitmask the low-level mouse hook reads; a hook may not lock |
+| Windows | a bitmask the low-level mouse hook reads; a hook may not lock. There is no barrier, so `input/src/edge_gate.rs` decides from positions: a pointer reaching a 1px zone on an armed edge crosses, unless it arrived in one jump of more than 60px (a game's flick). Such a fast arrival only arms the zone, and the next push while still against the edge crosses — a touchpad swipe lands exactly like a flick, and refusing it until the pointer left and came back slowly meant hammering the edge to cross. The capture thread is per-monitor DPI aware, so the desktop bounds are in the hook's physical pixels |
 | macOS | read from the event tap on every event |
 | Wayland | capture is taken down, barriers placed on every armed edge, capture re-armed — a barrier is a D-Bus object living on one edge. The portal session itself is opened only when the first edge is armed: GNOME's InputCapture (version 1) cannot remember a grant, so opening it at start-up asked on every restart, even with no machine to send the cursor to |
 | evdev on X11 | the X server is asked where the pointer is (`QueryPointer`) after motion, while this machine holds the cursor; a push outward at a watched edge is a crossing, and the pointer is warped back inside |

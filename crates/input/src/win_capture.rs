@@ -22,13 +22,16 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 use cursio_protocol::{Edge, InputEvent, MouseButton};
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::HiDpi::{
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
@@ -48,6 +51,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
+use crate::edge_gate::EdgeGate;
 use crate::win_keymap::scancode_to_evdev;
 use crate::{win::INJECTED_TAG, CaptureHandle, InputError};
 
@@ -71,17 +75,6 @@ const MODE_DORMANT: usize = 2;
 /// thread, from [`apply_mode`].
 static HOOK_MODE: AtomicUsize = AtomicUsize::new(MODE_IDLE);
 
-/// Set once we've emitted an EdgeCrossing, so a cursor parked in the jump zone
-/// doesn't fire a storm of crossings. Cleared when the cursor leaves the zone.
-static IN_JUMP_ZONE: AtomicBool = AtomicBool::new(false);
-
-/// Largest single-step movement (px, along the edge's normal) that still counts
-/// as a deliberate crossing. Deliberately pushing the pointer into an edge moves
-/// it a few pixels per event; a fast flick in a game jumps far more, and taking
-/// that as a screen switch yanks control away mid-game. Tuned to reject flicks
-/// while leaving ordinary "shove it at the edge" motion well under the limit.
-const MAX_CROSS_STEP: i32 = 60;
-
 /// The installed low-level hooks, as raw `HHOOK` pointer bits (0 = not
 /// installed). Stored so the capture thread can uninstall them. `AtomicIsize`
 /// holds the pointer value; only touched on the capture thread.
@@ -99,10 +92,10 @@ thread_local! {
     /// the hook can report a jump-zone crossing.
     static EDGE_SENDER: RefCell<Option<mpsc::UnboundedSender<crate::EdgeCrossing>>> = const { RefCell::new(None) };
 
-    /// Previous cursor position seen by the mouse hook, for measuring how fast
-    /// the pointer arrived at an edge (see [`MAX_CROSS_STEP`]). Thread-local
-    /// because only the hook thread touches it.
-    static LAST_POS: std::cell::Cell<Option<POINT>> = const { std::cell::Cell::new(None) };
+    /// Whether a pointer at the edge means a crossing; see [`EdgeGate`].
+    /// Thread-local because the hook and [`apply_mode`] both run on the
+    /// capture thread and nowhere else.
+    static GATE: RefCell<EdgeGate> = RefCell::new(EdgeGate::default());
 }
 
 /// Signalled once by the capture thread when it's up: `Ok(thread_id)` when the
@@ -132,6 +125,15 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
     std::thread::Builder::new()
         .name("cursio-rawinput".into())
         .spawn(move || {
+            // The hook reports the cursor in physical pixels whatever this
+            // thread's awareness, but GetSystemMetrics answers an unaware
+            // thread in scaled ones. On a laptop at 150% the right and bottom
+            // edges then lay a third of the way inside the screen, and a
+            // crossing's position along the edge came out clamped to 1.
+            // SAFETY: affects only this thread; no preconditions.
+            unsafe {
+                SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            }
             SENDER.with(|s| *s.borrow_mut() = Some(tx_for_thread));
             EDGE_SENDER.with(|s| *s.borrow_mut() = Some(edges_for_thread));
             // `run_message_loop` signals `ready_tx` itself once registration
@@ -518,27 +520,22 @@ fn apply_mode(code: usize) {
     // bounce control straight back. Move it inward, off the edge — the same thing
     // Deskflow's `avoidJumpZone()` does after a switch. Crossing again then means
     // actually travelling back to the edge, which is the intent we want.
-    if code == MODE_ACTIVE && was != MODE_ACTIVE {
-        nudge_off_edge();
-        // Belt and braces: treat the zone as occupied until the cursor is seen
-        // outside it, in case the nudge was clamped (edge of the desktop).
-        IN_JUMP_ZONE.store(true, Ordering::SeqCst);
-    }
-
-    // Giving control AWAY: the cursor stays where it was — on the edge it just
-    // crossed. Mark the zone occupied so that if we become active again the
-    // first move can't be read as a fresh crossing and bounce control straight
-    // back. `LAST_POS` is cleared too: while dormant the hook stops sampling, so
-    // the next position we see is stale by an arbitrary amount and its "step"
-    // would be meaningless (a huge step reads as a flick, a tiny one as a
-    // deliberate push — both wrong).
     //
-    // Same failure this guards against as the Dormant check in wl_capture: a
-    // second, spurious crossing after a handoff, which ends with BOTH sides
-    // dormant and input frozen until Ctrl+Alt+G.
-    if code != MODE_ACTIVE && was == MODE_ACTIVE {
-        IN_JUMP_ZONE.store(true, Ordering::SeqCst);
-        LAST_POS.with(|last| last.set(None));
+    // Belt and braces: the zone is treated as occupied until the cursor is
+    // seen outside it, in case the nudge was clamped (edge of the desktop).
+    //
+    // Giving control AWAY: the cursor stays where it was — on the edge it just
+    // crossed — so the zone is occupied for the same reason, and the last
+    // position is dropped: while dormant the hook stops sampling, so the next
+    // step measured from it would be meaningless. Same failure this guards
+    // against as the Dormant check in wl_capture: a second, spurious crossing
+    // after a handoff, which ends with BOTH sides dormant and input frozen
+    // until Ctrl+Alt+G.
+    if (code == MODE_ACTIVE) != (was == MODE_ACTIVE) {
+        if code == MODE_ACTIVE {
+            nudge_off_edge();
+        }
+        GATE.with(|gate| gate.borrow_mut().ownership_changed());
     }
     // Hooks needed for Active (edge watch) or Dormant (grab); gone in Idle.
     let want_hooks = code == MODE_ACTIVE || code == MODE_DORMANT;
@@ -633,22 +630,13 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
 }
 
-/// Check whether the cursor at `pt` (absolute virtual-desktop coords) has hit
-/// the jump zone of any watched edge, and if so emit one [`EdgeCrossing`] with
-/// the normalized position along that edge. Debounced via [`IN_JUMP_ZONE`] so
-/// parking on the edge fires exactly once until the cursor leaves the zone.
+/// Pass the cursor at `pt` (physical virtual-desktop coords) to the
+/// [`EdgeGate`], and emit the [`EdgeCrossing`] it decides on, if any.
 fn check_jump_zone(pt: POINT) {
-    let watched = crate::watched_edges();
-    // Sampled even with nothing armed, so the first move after an edge is
-    // armed measures its step from where the pointer really was.
-    let prev = LAST_POS.with(|last| last.replace(Some(pt)));
-    if watched.is_empty() {
-        return;
-    }
-
-    // Virtual-desktop bounds (spans all monitors). SAFETY: GetSystemMetrics has
-    // no preconditions.
-    let (vx, vy, vw, vh) = unsafe {
+    // Virtual-desktop bounds (spans all monitors), physical like `pt` because
+    // the capture thread is per-monitor DPI aware. SAFETY: GetSystemMetrics
+    // has no preconditions.
+    let bounds = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
             GetSystemMetrics(SM_YVIRTUALSCREEN),
@@ -656,54 +644,20 @@ fn check_jump_zone(pt: POINT) {
             GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
     };
-    if vw <= 0 || vh <= 0 {
+    let watched = crate::watched_edges();
+    let Some(crossing) = GATE.with(|gate| gate.borrow_mut().on_move((pt.x, pt.y), bounds, watched))
+    else {
         return;
-    }
-
-    // 1px jump zone at the true outer edge, matching Deskflow's getJumpZoneSize.
-    const ZONE: i32 = 1;
-    // In a corner two watched edges can both be hit; the first in `EdgeSet`
-    // order wins, which is arbitrary but stable, and moving along the edge a
-    // pixel settles it.
-    let hit = watched.iter().find_map(|edge| {
-        let (in_zone, pos_norm) = match edge {
-            Edge::Left => (pt.x <= vx + ZONE, frac(pt.y - vy, vh)),
-            Edge::Right => (pt.x >= vx + vw - 1 - ZONE, frac(pt.y - vy, vh)),
-            Edge::Top => (pt.y <= vy + ZONE, frac(pt.x - vx, vw)),
-            Edge::Bottom => (pt.y >= vy + vh - 1 - ZONE, frac(pt.x - vx, vw)),
-        };
-        in_zone.then_some((edge, pos_norm))
-    });
-
-    if let Some((edge, pos_norm)) = hit {
-        // How far the cursor moved since the last hook call, along the axis
-        // that matters for this edge. A deliberate cross is a person pushing
-        // into the edge; a fast flick — aiming in a game, say — covers hundreds
-        // of pixels in one step and should NOT hand the machine away mid-play.
-        let step = match prev {
-            Some(p) if edge.is_horizontal() => (pt.y - p.y).abs(),
-            Some(p) => (pt.x - p.x).abs(),
-            None => 0,
-        };
-        if step > MAX_CROSS_STEP {
-            // Treat the flick as "already in the zone" so it can't fire, and so
-            // the user has to leave and re-approach the edge to cross on purpose.
-            IN_JUMP_ZONE.store(true, Ordering::SeqCst);
-            tracing::debug!(step, "ignoring edge hit from a fast flick");
-            return;
-        }
-        // Fire once per entry into the zone.
-        if !IN_JUMP_ZONE.swap(true, Ordering::SeqCst) {
-            crate::note_crossed(edge);
-            EDGE_SENDER.with(|s| {
-                if let Some(tx) = s.borrow().as_ref() {
-                    let _ = tx.send(crate::EdgeCrossing { edge, pos_norm });
-                }
+    };
+    crate::note_crossed(crossing.edge);
+    EDGE_SENDER.with(|s| {
+        if let Some(tx) = s.borrow().as_ref() {
+            let _ = tx.send(crate::EdgeCrossing {
+                edge: crossing.edge,
+                pos_norm: crossing.pos_norm,
             });
         }
-    } else {
-        IN_JUMP_ZONE.store(false, Ordering::SeqCst);
-    }
+    });
 }
 
 /// How far to pull the cursor back from the peer-facing edge when this machine
@@ -733,15 +687,6 @@ fn nudge_off_edge() {
     // the virtual desktop.
     unsafe {
         SetCursorPos(pt.x + dx, pt.y + dy);
-    }
-}
-
-/// Normalize `v` into `0.0..=1.0` over `span` pixels (guards span > 0).
-fn frac(v: i32, span: i32) -> f32 {
-    if span <= 0 {
-        0.0
-    } else {
-        (v as f32 / span as f32).clamp(0.0, 1.0)
     }
 }
 

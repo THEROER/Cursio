@@ -39,6 +39,9 @@ windows-sys = { version = "0.61", features = [
     # and expanding %SystemRoot% in the paths it stores.
     "Win32_System_Registry",
     "Win32_System_Environment",
+    # Per-monitor DPI awareness for the capture thread, so edge bounds and
+    # hook positions are both physical pixels.
+    "Win32_UI_HiDpi",
 ] }
 
 [dev-dependencies]
