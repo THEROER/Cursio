@@ -1325,7 +1325,7 @@ mod tests {
                         peer: ModuleRole::Source,
                     },
                 ),
-                (ModuleId::FILES, SkipReason::PeerLacks),
+                (ModuleId::CLIPBOARD, SkipReason::PeerLacks),
             ],
         };
 
@@ -1334,7 +1334,7 @@ mod tests {
         assert!(skipped.is_empty());
         assert_eq!(
             inapplicable,
-            vec!["messages".to_string(), "files".to_string()]
+            vec!["messages".to_string(), "clipboard".to_string()]
         );
     }
 
