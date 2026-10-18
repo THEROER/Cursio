@@ -105,7 +105,7 @@ Anything requiring a compositor, a GPU or a peer is tested through in-memory fak
 
 **Platform code**: gate with `#[cfg(target_os = ...)]` and always give a fallback arm that returns an explicit error instead of degrading silently. Unimplemented codec paths are errors, not silent fallbacks, so premature use surfaces rather than shipping garbage.
 
-`docs/*.md` are the source of truth for their subsystems (`mesh-design`, `platform-design`, `input-design`, `audio-design`, `clipboard-design`, `window-transfer-design`). If code diverges from a design doc, fix one or the other in the same change.
+`docs/*.md` are the source of truth for their subsystems (`mesh-design`, `platform-design`, `input-design`, `audio-design`, `clipboard-design`, `window-transfer-design`, `calls-design`). If code diverges from a design doc, fix one or the other in the same change.
 
 ## Architecture
 
@@ -130,7 +130,7 @@ Every node listens for peers dialling in *and* dials the known peers that are do
 
 A feature is a `SessionModule` (`core/src/module.rs`), built by a `ModuleFactory`, assembled into a `ModuleRegistry`. `run_session` hands each built module to a `ModuleHost`: a dedicated OS thread that runs it with `Handle::block_on` on the link's runtime (so what a module spawns outlives its thread), calling `start`, then `pump` at the module's own pace (fast while it has traffic, idle after ~100 ms of quiet, `has_pending_work` keeps it fast) and `handle_message` for its inbox, and finally `shutdown`. Each module sends through its own clone of the prioritized sender (`TransportTx::clone_sender`), so its frames are scheduled against input exactly as before. Inbound routing is by id, not by asking: the reader task sends each message to the one module named by `Message::module_id()` (enveloped `Module` frames plus the `AudioChunk`/`WindowFrame`/`WindowInput` hot paths), and only the session's own vocabulary reaches the session loop.
 
-`ModuleId` constants live in `protocol/src/capability.rs` (input 1, audio 2, clipboard 3, window 4, files 5, service 6, usb 7, update 8, share 9, notify 10). Both sides advertise `ModuleAdvert` in `Hello`, negotiate, and build only what they agreed on — this is what fixed the old failure where `--audio` on one side silently half-configured the link. The CLI's only job is to construct the registry; after that nothing names a specific module. **Add capability by adding a module, not by branching in the CLI.**
+`ModuleId` constants live in `protocol/src/capability.rs` (input 1, audio 2, clipboard 3, window 4, files 5, service 6, usb 7, update 8, share 9, notify 10, calls 12; 11 is SMS). Both sides advertise `ModuleAdvert` in `Hello`, negotiate, and build only what they agreed on — this is what fixed the old failure where `--audio` on one side silently half-configured the link. The CLI's only job is to construct the registry; after that nothing names a specific module. **Add capability by adding a module, not by branching in the CLI.**
 
 A slow `pump` (≥50 ms) or `handle_message` (≥20 ms) is still logged, now as delaying *that module's* own traffic — it no longer means input waited. Teardown asks every module to stop, waits at most `MODULE_SHUTDOWN_GRACE` (3 s) for all of them, then detaches a wedged one with a warning naming it and closes its sender so the link can close. A module's `start` failing or its send failing ends the session, as before. Keep pumps bounded anyway: while one runs, its own replies wait.
 
@@ -240,6 +240,12 @@ The phone builds with `audio` on, because `cursio-audio` has an Android backend 
 The `cursio` binary is `required-features = ["desktop"]`: it drives capture, mounts and an AirPlay receiver, and a phone has no terminal to run it from.
 
 **Do not switch another module's feature on for Android to "see if it works".** It will not fail at the feature — it fails deep inside PipeWire or FUSE, which is a far worse error to read. Each module needs an Android backend first. `DeviceKind::Phone`, `ModuleRole::Source`/`Sink` and `session::local_device_kind()`'s `target_os = "android"` arm already exist for that.
+
+### Calls and the phone's sound over Bluetooth
+
+Android gives an app no way to record or inject a call's audio, so the voice crosses only the way a headset gets it: Bluetooth HFP. **Cursio is the hands-free unit itself** (`crates/bluetooth`), not PipeWire: it registers HF with BlueZ, runs the AT dialogue sans-IO in `hands_free.rs` (tested on recorded dialogues), and carries SCO's 8 kHz PCM through an ordinary playback node and the microphone tap, so the computer keeps its own devices and no headset device appears. It is also the phone's **A2DP speaker** (`linux/media.rs`, SBC via `dlopen`ed `libsbc.so.1`), which replaces playback capture's per-process screen-recording prompt. Both roles must be taken from PipeWire first: `cursio bluetooth install` writes a WirePlumber drop-in leaving it `a2dp_source bap_source hfp_ag hsp_ag` and restarts WirePlumber — a running node never does. SCO is taken by binding the adapter's own address, which the kernel prefers over PipeWire's wildcard listener, and only while a call is up.
+
+Over the mesh the `calls` module (12) carries every call as state, resent whole, and the computer's requests back; the voice stays on the phone. `core/src/calls_hub.rs` shows a phone once — by its hands-free link while one is up, by the mesh otherwise, matched by name because Android hides its Bluetooth address — and routes a request the same way. See `docs/calls-design.md`.
 
 ### Node state is not a module
 
