@@ -897,12 +897,23 @@ fn install_desktop_file(bin: &str, exec: &Path) -> Result<()> {
         "cursio-app" => ("Cursio", "LAN-first cross-machine workspace"),
         _ => (bin, "Cursio"),
     };
+    // The window's Wayland app id is the binary's name, not the file name of
+    // this launcher, so without `StartupWMClass` GNOME cannot tie the two
+    // together and the dock shows "cursio-app" with a generic icon.
+    let icon = if bin == "cursio-app" {
+        install_app_icons(&base_data_dir()?)?;
+        "Icon=cursio\n".to_string()
+    } else {
+        String::new()
+    };
     let desktop = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name={name}\n\
          Comment={comment}\n\
          Exec={exec}\n\
+         {icon}\
+         StartupWMClass={bin}\n\
          Terminal=false\n\
          Categories=Utility;\n",
         exec = exec.display(),
@@ -910,6 +921,46 @@ fn install_desktop_file(bin: &str, exec: &Path) -> Result<()> {
     let path = apps_dir.join(format!("dev.cursio.{bin}.desktop"));
     std::fs::write(&path, desktop).with_context(|| format!("writing {}", path.display()))?;
     println!("  ↳ launcher {}", path.display());
+    // Best effort: both only refresh caches a desktop would also rebuild on
+    // its own, and neither is installed everywhere.
+    let _ = Command::new("update-desktop-database")
+        .arg(&apps_dir)
+        .status();
+    Ok(())
+}
+
+/// `$XDG_DATA_HOME`, or `~/.local/share`.
+fn base_data_dir() -> Result<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .context("HOME not set")
+}
+
+/// Put the logo into the user's hicolor theme as `cursio`, which is the name
+/// the launcher asks for.
+fn install_app_icons(data_dir: &Path) -> Result<()> {
+    let src = checkout_dir().join("app/icons");
+    let theme = data_dir.join("icons/hicolor");
+    for (file, size) in [
+        ("32x32.png", "32x32"),
+        ("128x128.png", "128x128"),
+        ("128x128@2x.png", "256x256"),
+        ("icon.png", "512x512"),
+    ] {
+        let dir = theme.join(size).join("apps");
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::copy(src.join(file), dir.join("cursio.png"))
+            .with_context(|| format!("installing the {size} icon"))?;
+    }
+    let scalable = theme.join("scalable/apps");
+    std::fs::create_dir_all(&scalable)?;
+    std::fs::copy(src.join("logo.svg"), scalable.join("cursio.svg"))
+        .context("installing the scalable icon")?;
+    let _ = Command::new("gtk-update-icon-cache")
+        .args(["-f", "-t"])
+        .arg(&theme)
+        .status();
     Ok(())
 }
 
