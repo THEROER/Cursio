@@ -26,6 +26,12 @@
 //! converts between the link's 8 kHz mono and the 48 kHz stereo the audio path
 //! runs at. The sockets and D-Bus live in the platform half, which on
 //! anything but Linux is an error saying so.
+//!
+//! ## The mesh's own channel
+//!
+//! [`MeshChannel`] is the odd one out: no Bluetooth profile's protocol at all,
+//! just an RFCOMM socket under Cursio's [`MESH_UUID`] that a paired phone
+//! opens and the mesh runs over unchanged, as it does over TCP.
 
 pub mod a2dp;
 pub mod at;
@@ -35,10 +41,15 @@ pub mod resample;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{HandsFreeService, MediaSinkService};
+pub use linux::{HandsFreeService, MediaSinkService, MeshChannel};
 
 /// The Bluetooth address of a remote device, as BlueZ prints it.
 pub type Address = String;
+
+/// The service a phone opens to reach the mesh over Bluetooth. Fixed, and the
+/// same in the Android app (`BtLink.kt`): it is how the phone finds this
+/// machine's channel among everything else the computer offers.
+pub const MESH_UUID: &str = "8a3f6c2e-0b4d-4e8a-9c1f-43757273696f";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BluetoothError {
@@ -46,6 +57,8 @@ pub enum BluetoothError {
     Bus(String),
     #[error("bluez refused the hands-free profile: {0}; PipeWire holds that role until `cursio bluetooth install` hands it over (or oFono does, if it runs)")]
     Register(String),
+    #[error("bluez refused the mesh's bluetooth channel: {0}")]
+    RegisterChannel(String),
     #[error("bluetooth socket: {0}")]
     Io(#[from] std::io::Error),
     #[error("no hands-free link to {0}")]

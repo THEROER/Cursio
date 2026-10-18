@@ -153,8 +153,14 @@ impl Drop for Decoder {
 mod tests {
     use super::*;
 
-    type Encode =
-        unsafe extern "C" fn(*mut SbcT, *const c_void, usize, *mut c_void, usize, *mut isize) -> isize;
+    type Encode = unsafe extern "C" fn(
+        *mut SbcT,
+        *const c_void,
+        usize,
+        *mut c_void,
+        usize,
+        *mut isize,
+    ) -> isize;
 
     /// Encode with libsbc's own encoder, so the decoder is checked against
     /// the frames the library itself writes, through this crate's `sbc_t`.
@@ -195,7 +201,8 @@ mod tests {
         let config = crate::a2dp::select_sbc(&[0xFF, 0xFF, 2, 53]).unwrap();
         let tone: Vec<i16> = (0..4800)
             .flat_map(|i| {
-                let v = ((i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 8000.0) as i16;
+                let v =
+                    ((i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 8000.0) as i16;
                 [v, v]
             })
             .collect();
@@ -204,7 +211,12 @@ mod tests {
         let mut decoder = Decoder::new(&config).unwrap();
         let mut pcm = Vec::new();
         decoder.decode(&frames, &mut pcm);
-        assert!(pcm.len() > tone.len() * 9 / 10, "decoded {} of {}", pcm.len(), tone.len());
+        assert!(
+            pcm.len() > tone.len() * 9 / 10,
+            "decoded {} of {}",
+            pcm.len(),
+            tone.len()
+        );
         let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap();
         assert!((6000..10000).contains(&peak), "peak {peak}");
     }

@@ -10,10 +10,12 @@
 //! runtime thread (see `cursio_core::session_bus`), and both sockets are
 //! blocking file descriptors read under `poll`.
 
+mod channel;
 mod media;
 mod sbc;
 mod sco;
 
+pub use channel::MeshChannel;
 pub use media::MediaSinkService;
 
 use std::collections::HashMap;
