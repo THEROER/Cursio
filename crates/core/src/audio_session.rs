@@ -151,8 +151,17 @@ pub struct AudioEngine {
     /// the peer sends audio back on that id.
     inbound_targets: HashMap<u32, String>,
     /// Recordings of this machine's microphones, keyed by stream id, so the peer
-    /// can use them as its own inputs.
+    /// can use them as its own inputs. Open only while the peer may be
+    /// listening; see `mic_devices`.
     mic_captures: HashMap<u32, cursio_audio::Capture>,
+    /// Every microphone advertised to the peer, open or not, by stream id, so
+    /// one the peer said nothing records from can be closed and reopened when
+    /// something does. Unlike a program stream, a microphone kept running for
+    /// an idle peer is not free: on a phone each link held its own recording
+    /// open for the whole session — four links, four `AudioRecord`s and the
+    /// CPU awake to gate their silence — and that was a large part of what the
+    /// app cost in battery with nothing being said.
+    mic_devices: HashMap<u32, String>,
     /// Intent Sinks we created for the peer's advertised devices: real local
     /// output nodes that carry NO audio, only observe which app streams are routed
     /// into them. Keyed by the peer's device stream id. See docs/audio-design.md
@@ -509,6 +518,7 @@ impl AudioEngine {
             id_base,
             inbound_targets: HashMap::new(),
             mic_captures: HashMap::new(),
+            mic_devices: HashMap::new(),
             intent_sinks: HashMap::new(),
             intent_sink_device: HashMap::new(),
             routed_apps: HashMap::new(),
@@ -699,7 +709,11 @@ impl SessionModule for AudioEngine {
             };
             tracing::info!(id, device = %dev.description, "advertising microphone");
             send_control(tx, AudioMsg::StreamAdvertise(meta)).await?;
+            // Open from the start all the same: some peers' playbacks open only
+            // on a stream's first chunk, and a peer that never heard one could
+            // never say it is listening. The first "not listening" closes it.
             self.mic_captures.insert(id, cap);
+            self.mic_devices.insert(id, dev.id.clone());
         }
 
         // NOTE: there is deliberately NO global "everything" stream. It used to
@@ -998,6 +1012,7 @@ impl SessionModule for AudioEngine {
                     self.unwanted_streams.insert(id);
                 }
                 tracing::info!(id, listening, "peer reported demand for one of our streams");
+                self.follow_mic_demand(id, listening);
                 true
             }
             AudioMsg::FrameAck(ack) => {
@@ -2031,6 +2046,32 @@ impl AudioEngine {
     /// Only transitions are sent: the owner holds the last value, so repeating
     /// it every pump (~100/s per stream) would flood the shared channel that
     /// input rides on to say nothing new.
+    /// Close one of our microphones the peer stopped recording from, and open
+    /// it again when it starts. Other streams only stop being sent (see
+    /// `unwanted_streams`); a microphone also stops being recorded.
+    fn follow_mic_demand(&mut self, id: u32, listening: bool) {
+        let Some(device) = self.mic_devices.get(&id) else {
+            return;
+        };
+        if !listening {
+            if self.mic_captures.remove(&id).is_some() {
+                self.pending_packets.remove(&id);
+                tracing::info!(id, "nothing on the peer records this microphone; closed it");
+            }
+            return;
+        }
+        if self.mic_captures.contains_key(&id) {
+            return;
+        }
+        match cursio_audio::Capture::mic_tap(id, Some(device.clone())) {
+            Ok(cap) => {
+                tracing::info!(id, "the peer records this microphone again; opened it");
+                self.mic_captures.insert(id, cap);
+            }
+            Err(e) => tracing::warn!(id, error = %e, "cannot reopen the microphone the peer asked for"),
+        }
+    }
+
     async fn pump_demand(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
         let relay_hears = self.peer_mic.filter(|_| self.relay_wants_mic());
         let changed: Vec<(u32, bool)> = self

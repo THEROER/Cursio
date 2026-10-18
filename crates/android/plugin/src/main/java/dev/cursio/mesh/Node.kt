@@ -71,6 +71,8 @@ object Node {
 
     fun isRunning(): Boolean = initialized && CursioNative.nativeIsRunning()
 
+    fun busy(): Boolean = isRunning() && CursioNative.nativeBusy()
+
     fun statusLine(): String = if (isRunning()) CursioNative.nativeStatusLine() else loadError ?: "starting"
 
     /** Start the node unless it is already running. */

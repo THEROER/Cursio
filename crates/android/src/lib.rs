@@ -611,6 +611,26 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeIsRunning(
     })
 }
 
+/// Whether the node is moving data now — a stream, a transfer, an answer
+/// owed — so the service holds the CPU and radio awake only then.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeBusy(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    guard(&mut env, JNI_FALSE, |_env| {
+        Ok(if cursio_core::modules_busy() {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        })
+    })
+}
+
 /// # Safety
 ///
 /// Called by the JVM with valid arguments; not callable from Rust.

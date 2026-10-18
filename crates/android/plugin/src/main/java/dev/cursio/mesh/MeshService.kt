@@ -131,11 +131,14 @@ class MeshService : Service() {
             return START_NOT_STICKY
         }
 
-        acquireLocks()
         Node.start(this)
 
         handler.removeCallbacks(refresh)
         handler.postDelayed(refresh, REFRESH_INTERVAL_MS)
+        // Busy from the start: a node coming up is dialling and handshaking.
+        lastBusyAt = android.os.SystemClock.elapsedRealtime()
+        handler.removeCallbacks(power)
+        handler.post(power)
 
         if (capturing) {
             val error = beginCapture(intent!!)
@@ -321,24 +324,66 @@ class MeshService : Service() {
             0
         }
 
+    /** When the node last had work, for [IDLE_GRACE_MS]. */
+    private var lastBusyAt = 0L
+
+    /** Re-reads what the node is doing and holds the locks that calls for. */
+    private val power = object : Runnable {
+        override fun run() {
+            updateLocks()
+            handler.postDelayed(this, POWER_CHECK_MS)
+        }
+    }
+
     /**
-     * Hold the CPU and the Wi-Fi radio awake for as long as the node runs.
+     * Hold the CPU and the Wi-Fi radio awake while the node has work, and the
+     * multicast filter open while it may need to find a machine.
      *
      * The foreground service keeps the process; it does not keep the radio
      * listening. With the screen off, Wi-Fi power save batches incoming
-     * packets behind the access point's beacon interval and Doze parks the
-     * CPU between them, so audio arrives in bursts — heard as stutter — and
-     * heartbeats arrive late enough for a peer to call the link dead. Each lock
-     * closes one of those gaps:
+     * packets behind the access point's beacon interval and the CPU sleeps
+     * between them, so a stream arrives in bursts — heard as stutter. Each
+     * lock closes one of those gaps:
      * - the partial wake lock keeps the CPU running to decode and play;
-     * - the multicast lock lets mDNS through at all — without it Android
-     *   filters multicast and the phone announces itself and hears nobody;
      * - the Wi-Fi lock keeps the radio out of power save. Low-latency mode
      *   (API 29+) is honoured only while the app is in front, so on 29–33 the
      *   high-performance lock is held alongside it; from 34 that lock does
-     *   nothing and is skipped.
+     *   nothing and is skipped;
+     * - the multicast lock lets mDNS through at all — without it Android
+     *   filters multicast and the phone announces itself and hears nobody.
+     *
+     * They used to be held for as long as the node ran, and that was most of
+     * what Cursio cost a phone's battery (a quarter of it, on a day of
+     * nothing streaming): a held wake lock let every idle timer of every link
+     * keep the CPU up. Idle, nothing needs them. A peer's packet wakes a
+     * sleeping phone by itself, and its heartbeats every few seconds are what
+     * keep the link from looking dead; the node answers in that wake. So the
+     * CPU and radio locks follow the node's own "moving data" signal (any
+     * module at its fast pace, a capture or a shown screen), held a few
+     * seconds past the last of it so a stream with gaps does not flap them.
+     * Multicast is open while the screen is on, while busy, and for a short
+     * window every few minutes otherwise, which is enough to hear a machine
+     * that changed address; machines already known are dialled directly.
      */
-    private fun acquireLocks() {
+    private fun updateLocks() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val busy = Node.busy() || capture != null || screen != null
+        if (busy) lastBusyAt = now
+        val working = busy || now - lastBusyAt < IDLE_GRACE_MS
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val discovering = working || pm.isInteractive || now % DISCOVERY_EVERY_MS < DISCOVERY_FOR_MS
+        holdWork(working)
+        holdMulticast(discovering)
+    }
+
+    private fun holdWork(held: Boolean) {
+        if (!held) {
+            wifiLocks.forEach { if (it.isHeld) it.release() }
+            wifiLocks = emptyList()
+            wakeLock?.let { if (it.isHeld) it.release() }
+            wakeLock = null
+            return
+        }
         if (wakeLock == null) {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "cursio:mesh").apply {
@@ -347,12 +392,6 @@ class MeshService : Service() {
             }
         }
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        if (multicastLock == null) {
-            multicastLock = wifi.createMulticastLock("cursio:mdns").apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        }
         if (wifiLocks.isEmpty()) {
             val modes = buildList {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -372,6 +411,21 @@ class MeshService : Service() {
         }
     }
 
+    private fun holdMulticast(held: Boolean) {
+        if (!held) {
+            multicastLock?.let { if (it.isHeld) it.release() }
+            multicastLock = null
+            return
+        }
+        if (multicastLock == null) {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wifi.createMulticastLock("cursio:mdns").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+    }
+
     private fun releaseLocks() {
         wifiLocks.forEach { if (it.isHeld) it.release() }
         wifiLocks = emptyList()
@@ -384,6 +438,7 @@ class MeshService : Service() {
     override fun onDestroy() {
         CallMonitor.stop()
         handler.removeCallbacks(refresh)
+        handler.removeCallbacks(power)
         deviceStatus.stop()
         capture?.stop()
         capture = null
@@ -472,6 +527,17 @@ class MeshService : Service() {
         private const val CHANNEL_ID = "cursio-mesh"
         private const val NOTIFICATION_ID = 1
         private const val REFRESH_INTERVAL_MS = 5_000L
+
+        /** How often the locks are fitted to what the node is doing. */
+        private const val POWER_CHECK_MS = 1_000L
+
+        /** How long past the last work the CPU and radio stay held. */
+        private const val IDLE_GRACE_MS = 10_000L
+
+        /** With the screen off and nothing to do: a discovery window this
+         *  long every [DISCOVERY_EVERY_MS]. */
+        private const val DISCOVERY_FOR_MS = 30_000L
+        private const val DISCOVERY_EVERY_MS = 5 * 60_000L
 
         private const val ACTION_STOP = "dev.cursio.mesh.STOP"
         private const val EXTRA_FROM_FOREGROUND = "dev.cursio.mesh.FROM_FOREGROUND"

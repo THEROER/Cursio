@@ -63,6 +63,9 @@ object CursioNative {
 
     external fun nativeIsRunning(): Boolean
 
+    /** Whether the node is moving data now: a stream, a transfer, an answer owed. */
+    external fun nativeBusy(): Boolean
+
     /** One line for the service notification: what this node can see. */
     external fun nativeStatusLine(): String
 

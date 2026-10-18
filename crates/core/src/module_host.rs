@@ -81,6 +81,32 @@ pub(crate) const IDLE_PUMP_INTERVAL: Duration = Duration::from_millis(50);
 /// silence before the pace changes at all.
 pub(crate) const IDLE_PUMP_AFTER: u32 = 20;
 
+/// The pace of a module that has been quiet for long, after
+/// [`DEEP_IDLE_AFTER`] pumps at [`IDLE_PUMP_INTERVAL`].
+///
+/// Even 50 ms is a wakeup per module per link twenty times a second: a phone
+/// with eight modules on four links woke ~640 times a second with nothing
+/// happening, and held the CPU awake to do it. What arrives from the peer
+/// wakes a module through its inbox at once, whatever its pace; only a module
+/// that has to notice something local — a capture that started producing, a
+/// copy — waits, and a second is a fair price for that once it has been
+/// quiet this long.
+pub(crate) const DEEP_IDLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Pumps at [`IDLE_PUMP_INTERVAL`] before dropping to [`DEEP_IDLE_INTERVAL`]:
+/// two seconds of nothing.
+pub(crate) const DEEP_IDLE_AFTER: u32 = 40;
+
+/// How many modules, across every link of this process, are at the fast pace
+/// now — that is, have traffic. Zero means the node is idle, which a phone
+/// uses to let its CPU and radio sleep; see [`modules_busy`].
+static FAST_MODULES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether any module of any link is moving data or owes an answer now.
+pub fn modules_busy() -> bool {
+    FAST_MODULES.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
 /// Warn when a single pump takes at least this long.
 ///
 /// Only the module itself waited, so this is no longer "the mouse froze" — it
@@ -274,15 +300,19 @@ impl TransportTx for LinkTx {
 struct Pace {
     interval: tokio::time::Interval,
     fast: bool,
+    /// Past [`DEEP_IDLE_AFTER`] at the idle pace.
+    deep: bool,
     silent_pumps: u32,
     last_sent: u64,
 }
 
 impl Pace {
     fn new() -> Self {
+        FAST_MODULES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             interval: Self::interval(MODULE_PUMP_INTERVAL),
             fast: true,
+            deep: false,
             silent_pumps: 0,
             last_sent: 0,
         }
@@ -307,9 +337,11 @@ impl Pace {
         self.last_sent = sent;
         if active {
             self.silent_pumps = 0;
+            self.deep = false;
             if !self.fast {
                 self.interval = Self::interval(MODULE_PUMP_INTERVAL);
                 self.fast = true;
+                FAST_MODULES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return true;
             }
         } else if self.fast {
@@ -317,10 +349,27 @@ impl Pace {
             if self.silent_pumps >= IDLE_PUMP_AFTER {
                 self.interval = Self::interval(IDLE_PUMP_INTERVAL);
                 self.fast = false;
+                self.silent_pumps = 0;
+                FAST_MODULES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return true;
+            }
+        } else if !self.deep {
+            self.silent_pumps = self.silent_pumps.saturating_add(1);
+            if self.silent_pumps >= DEEP_IDLE_AFTER {
+                self.interval = Self::interval(DEEP_IDLE_INTERVAL);
+                self.deep = true;
                 return true;
             }
         }
         false
+    }
+}
+
+impl Drop for Pace {
+    fn drop(&mut self) {
+        if self.fast {
+            FAST_MODULES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -806,5 +855,27 @@ mod tests {
             pace.fast,
             "a module owed an answer is busy however little it sends"
         );
+    }
+
+    /// Quiet at the idle pace for long, a module sleeps a second between
+    /// pumps; anything it sends brings it straight back to the fast pace.
+    #[tokio::test]
+    async fn a_long_quiet_module_drops_to_the_deep_idle_pace() {
+        let mut pace = Pace::new();
+        for _ in 0..IDLE_PUMP_AFTER {
+            pace.follow(0, false);
+        }
+        assert!(!pace.fast && !pace.deep);
+        for _ in 0..DEEP_IDLE_AFTER - 1 {
+            assert!(!pace.follow(0, false));
+        }
+        assert!(!pace.deep, "one pump short of the threshold is not deep yet");
+        assert!(pace.follow(0, false));
+        assert!(pace.deep);
+        assert_eq!(pace.interval.period(), DEEP_IDLE_INTERVAL);
+
+        assert!(pace.follow(1, false), "sending wakes it");
+        assert!(pace.fast && !pace.deep);
+        assert_eq!(pace.interval.period(), MODULE_PUMP_INTERVAL);
     }
 }

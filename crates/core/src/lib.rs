@@ -101,6 +101,7 @@ pub mod module;
 /// Running each session module on a thread of its own, off the loop the
 /// shared cursor rides.
 pub(crate) mod module_host;
+pub use module_host::modules_busy;
 /// The unelevated process that keeps a peer's drives where Explorer sees them.
 pub mod mount_helper;
 pub mod node_status;
