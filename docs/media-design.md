@@ -87,6 +87,21 @@ A player paused for more than five minutes leaves the phone's shade on its
 own (`MediaNotifier.STALE_MS`) and returns when it plays: a browser keeps the
 player of any tab that once played a video, for as long as the tab is open.
 
+## Several players at once
+
+Sound is never the question: every application is a stream of its own, all of
+them play at once, mixed by the system's mixer with a volume each. What needs
+an answer is which player one button means.
+
+On a phone, the main player is the one that last started playing on any
+computer (`MediaNotifier.present`): only its `MediaSession` is active and its
+notification held, and it is posted last, so the system's media controls and
+HyperOS's island follow it instead of whichever player last changed a title.
+The others stay in the shade with their own buttons. Pausing does not hand
+the place on — a second press would start the player beside it. A desktop
+needs nothing of ours: a peer's players are MPRIS players there, and GNOME's
+media keys already go to the one that last started.
+
 ## Pausing for a call
 
 What KDE Connect does: while any phone reports a call (`calls_hub`), the

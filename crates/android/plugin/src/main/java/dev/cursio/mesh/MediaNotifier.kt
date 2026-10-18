@@ -45,7 +45,19 @@ object MediaNotifier {
     private val shown = HashMap<String, Shown>()
     private var receiverRegistered = false
 
-    private class Shown(val session: MediaSession, val id: Int, var artKey: String? = null)
+    private class Shown(
+        val session: MediaSession,
+        val id: Int,
+        val peer: String,
+        val player: String,
+        var artKey: String? = null,
+    ) {
+        var peerName = ""
+        var last: JSONObject? = null
+        var playing = false
+        /** When it last went from not playing to playing; see [present]. */
+        var startedAt = 0L
+    }
 
     /**
      * When each player was last seen playing, by [key]. A browser keeps a
@@ -93,10 +105,14 @@ object MediaNotifier {
             val entry = shown.getOrPut(k) {
                 val session = MediaSession(ctx, "cursio-$peerName-$player")
                 session.setCallback(Buttons(peer, player), main)
-                Shown(session, k.hashCode())
+                Shown(session, k.hashCode(), peer, player)
             }
+            val playing = p.optBoolean("playing")
+            if (playing && !entry.playing) entry.startedAt = now
+            entry.playing = playing
+            entry.peerName = peerName
+            entry.last = p
             fill(entry, p, peerName)
-            manager.notify(entry.id, notification(ctx, entry, p, peer, player, peerName))
         }
         if (nextStale != Long.MAX_VALUE) {
             main.postDelayed({
@@ -118,6 +134,26 @@ object MediaNotifier {
             manager.cancel(entry.id)
             entry.session.isActive = false
             entry.session.release()
+        }
+        present(manager, ctx)
+    }
+
+    /**
+     * Post every computer's players, with one of them the main one: the one
+     * that last started playing, anywhere. Only its session is active and its
+     * notification held, and it is posted last so it sits first — which is
+     * what the system's media controls and HyperOS's island follow, so the
+     * island stays on the music just started instead of hopping to whichever
+     * player last changed a title. The others stay in the shade, each with
+     * its own buttons. A pause does not hand the place on, or a second press
+     * would start the player beside it.
+     */
+    private fun present(manager: NotificationManager, ctx: Context) {
+        val lead = shown.entries.maxByOrNull { it.value.startedAt }?.key
+        for ((k, entry) in shown.entries.sortedBy { it.key == lead }) {
+            val p = entry.last ?: continue
+            entry.session.isActive = k == lead
+            manager.notify(entry.id, notification(ctx, entry, p, entry.peer, entry.player, entry.peerName, k == lead))
         }
     }
 
@@ -160,7 +196,6 @@ object MediaNotifier {
                 )
                 .build(),
         )
-        entry.session.isActive = true
     }
 
     private fun button(ctx: Context, icon: Int, title: String, peer: String, player: String, command: String): Notification.Action {
@@ -182,6 +217,7 @@ object MediaNotifier {
         peer: String,
         player: String,
         peerName: String,
+        main: Boolean,
     ): Notification {
         val playing = p.optBoolean("playing")
         val actions = listOf(
@@ -199,7 +235,7 @@ object MediaNotifier {
             .setContentTitle(p.optString("title"))
             .setContentText(p.optString("artist"))
             .setSubText(listOf(p.optString("app"), peerName).filter { it.isNotEmpty() }.joinToString(" · "))
-            .setOngoing(playing)
+            .setOngoing(playing && main)
             .setShowWhen(false)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setStyle(Notification.MediaStyle().setMediaSession(entry.session.sessionToken).setShowActionsInCompactView(0, 1, 2))
