@@ -1,9 +1,9 @@
 {
   "uuid": "cursio@cursio.dev",
   "name": "Cursio",
-  "description": "Lets the Cursio daemon see when you drag a window, so dragging one past the screen edge sends it to the paired machine. Without this extension Cursio still runs — window transfer just has to be started from the command line instead of by dragging.",
+  "description": "Puts your Cursio machines in quick settings — each one's battery and network, with ringing a phone, sending files or the clipboard, browsing a shared disk and muting its sound — and lets the Cursio daemon see when you drag a window, so dragging one past the screen edge sends it to the paired machine.",
   "shell-version": ["45", "46", "47", "48", "49"],
   "url": "https://github.com/THEROER/cursio",
-  "version": 1,
+  "version": 2,
   "session-modes": ["user"]
 }

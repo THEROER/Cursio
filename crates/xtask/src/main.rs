@@ -546,6 +546,10 @@ fn install(only: Option<BinArg>, no_build: bool) -> Result<()> {
         }
     }
 
+    if cfg!(target_os = "linux") {
+        install_shell_extension()?;
+    }
+
     warn_if_not_on_path(&bin_dir);
     println!("\nDone. Logs go to {}", cursio_log_dir().display());
     Ok(())
@@ -906,6 +910,40 @@ fn install_desktop_file(bin: &str, exec: &Path) -> Result<()> {
     let path = apps_dir.join(format!("dev.cursio.{bin}.desktop"));
     std::fs::write(&path, desktop).with_context(|| format!("writing {}", path.display()))?;
     println!("  ↳ launcher {}", path.display());
+    Ok(())
+}
+
+/// Copy the GNOME Shell extension (drag bridge and quick settings tile) into
+/// the user's extensions directory.
+///
+/// Skipped without GNOME Shell. The running Shell does not reload an
+/// extension's code on Wayland, so a changed copy only takes effect at the
+/// next login — said here because nothing else would.
+fn install_shell_extension() -> Result<()> {
+    if which("gnome-shell").is_none() {
+        return Ok(());
+    }
+    let src = checkout_dir().join("native/cursio-shell-extension");
+    let dst = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .context("HOME not set")?
+        .join("gnome-shell/extensions/cursio@cursio.dev");
+    std::fs::create_dir_all(&dst).with_context(|| format!("creating {}", dst.display()))?;
+    for entry in std::fs::read_dir(&src).with_context(|| format!("reading {}", src.display()))? {
+        let path = entry?.path();
+        if path.is_file() {
+            let to = dst.join(path.file_name().context("extension file has no name")?);
+            std::fs::copy(&path, &to)
+                .with_context(|| format!("copying {} → {}", path.display(), to.display()))?;
+        }
+    }
+    println!(
+        "✓ installed the GNOME Shell extension → {}\n  \
+         enable it with `gnome-extensions enable cursio@cursio.dev`; a changed one \
+         loads at the next login",
+        dst.display()
+    );
     Ok(())
 }
 

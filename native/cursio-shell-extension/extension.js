@@ -1,4 +1,5 @@
-/* Cursio GNOME Shell extension — the window-drag bridge.
+/* Cursio GNOME Shell extension — the window-drag bridge, and the quick
+ * settings tile (`menu.js`, over the node's control socket in `control.js`).
  *
  * ## Why this exists
  *
@@ -38,6 +39,8 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Meta from 'gi://Meta';
+
+import {CursioIndicator} from './menu.js';
 
 const IFACE = `
 <node>
@@ -118,12 +121,24 @@ export default class CursioExtension {
             'grab-op-begin', this._onGrabBegin.bind(this),
             'grab-op-end', this._onGrabEnd.bind(this),
             this);
+
+        // Separate from the bridge above: a tile that failed to build (an
+        // icon or API a Shell release renamed) must not take drag detection
+        // down with it.
+        try {
+            this._indicator = new CursioIndicator();
+        } catch (e) {
+            logError(e, 'cursio: quick settings tile');
+            this._indicator = null;
+        }
     }
 
     disable() {
         // Must fully unwind: an extension is disabled on screen lock, and
         // anything left behind (a timer, a signal, a bus name) leaks for the
         // rest of the session and is re-added on unlock.
+        this._indicator?.destroy();
+        this._indicator = null;
         this._stopPolling();
         global.display.disconnectObject(this);
         for (const sender of [...this._scanoutHolders.keys()])

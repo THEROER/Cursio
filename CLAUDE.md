@@ -257,4 +257,4 @@ Settings changes never restart the node: `Message::Reconfigure` renegotiates a r
 
 ### Native and tooling directories
 
-`native/playfair` (FairPlay C, vendored) · `native/cursio-vad` (Windows audio driver fork, see `CURSIO-FORK.md`) · `native/cursio-shell-extension` (GNOME extension for drag detection) · `tools/wgc-probe` (settles whether Windows Graphics Capture keeps delivering frames from a hidden window) · `crates/xtask` (all build/install/cross-compile automation).
+`native/playfair` (FairPlay C, vendored) · `native/cursio-vad` (Windows audio driver fork, see `CURSIO-FORK.md`) · `native/cursio-shell-extension` (GNOME extension: drag detection, plus the quick-settings tile — every machine's battery and network, ring, send, browse, mute — drawn from the control socket's pushed status and holding no state of its own; `cargo xtask install` copies it, and a changed one loads at the next login) · `tools/wgc-probe` (settles whether Windows Graphics Capture keeps delivering frames from a hidden window) · `crates/xtask` (all build/install/cross-compile automation).

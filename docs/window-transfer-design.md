@@ -553,6 +553,9 @@ of the capture backend work.
      re-publishing Mutter's grab-op signals on D-Bus. Note this is a GNOME
      limitation, not a Wayland one — wlroots compositors do offer
      `ext_foreign_toplevel_list`.
+   - The same extension also carries Cursio's quick-settings tile
+     (`menu.js`, a client of the control socket); a tile that fails to build
+     is logged and leaves the drag bridge running.
    - The extension is **optional**, and without it a GNOME machine cannot
      *start* a transfer — it still receives one. Nothing in the daemon may
      depend on it being present.
