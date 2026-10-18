@@ -247,12 +247,15 @@ object MediaNotifier {
         if (main && islandHere(ctx)) {
             builder.addExtras(
                 Island.mediaExtras(
-                    ctx,
-                    p.optString("title"),
-                    p.optString("artist"),
-                    listOf(p.optString("app"), entry.peerName).filter { it.isNotEmpty() }.joinToString(" · "),
-                    art?.let { Icon.createWithBitmap(it) },
-                    actions[1],
+                    title = p.optString("title"),
+                    subtitle = listOf(p.optString("artist"), p.optString("app"), entry.peerName)
+                        .filter { it.isNotEmpty() }
+                        .joinToString(" · "),
+                    cover = art,
+                    fallback = Icon.createWithResource(ctx, R.drawable.ic_notify),
+                    positionMs = p.optLong("positionMs", -1).takeIf { it >= 0 },
+                    durationMs = p.optLong("durationMs", -1).takeIf { it > 0 },
+                    buttons = actions.take(3),
                 ),
             )
         }
