@@ -869,7 +869,10 @@ mod tests {
         for _ in 0..DEEP_IDLE_AFTER - 1 {
             assert!(!pace.follow(0, false));
         }
-        assert!(!pace.deep, "one pump short of the threshold is not deep yet");
+        assert!(
+            !pace.deep,
+            "one pump short of the threshold is not deep yet"
+        );
         assert!(pace.follow(0, false));
         assert!(pace.deep);
         assert_eq!(pace.interval.period(), DEEP_IDLE_INTERVAL);

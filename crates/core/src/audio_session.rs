@@ -2068,7 +2068,9 @@ impl AudioEngine {
                 tracing::info!(id, "the peer records this microphone again; opened it");
                 self.mic_captures.insert(id, cap);
             }
-            Err(e) => tracing::warn!(id, error = %e, "cannot reopen the microphone the peer asked for"),
+            Err(e) => {
+                tracing::warn!(id, error = %e, "cannot reopen the microphone the peer asked for")
+            }
         }
     }
 
