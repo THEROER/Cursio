@@ -46,6 +46,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(desktop)]
 const PHONE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Longest one gallery answer may take: the node waits
+/// [`cursio_core::gallery_hub::ANSWER_WAIT`] for the peer itself.
+#[cfg(desktop)]
+const GALLERY_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Longest saving one gallery item may take: a long video is many slices,
+/// each answered in turn.
+#[cfg(desktop)]
+const GALLERY_SAVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// How soon to look for a node again once it has gone.
 const RECONNECT: Duration = Duration::from_secs(1);
 
@@ -599,6 +609,91 @@ pub mod commands {
     ) -> Result<Reply, NodeError> {
         link.request_within(Command::MarkSmsRead { peer, thread_id }, PHONE_TIMEOUT)
             .await
+    }
+
+    /// Put a gallery command to the machine it names: through the node's
+    /// socket on a desktop, straight to the in-process node on a phone.
+    async fn gallery(
+        #[cfg_attr(mobile, allow(unused_variables))] link: State<'_, NodeLink>,
+        command: Command,
+    ) -> Result<Reply, NodeError> {
+        #[cfg(desktop)]
+        {
+            let deadline = match command {
+                Command::GallerySave { .. } => GALLERY_SAVE_TIMEOUT,
+                _ => GALLERY_TIMEOUT,
+            };
+            link.request_within(command, deadline).await
+        }
+        #[cfg(mobile)]
+        match cursio_core::control::ask_gallery(&command).await {
+            Some(Reply::Error { message }) => Err(NodeError::Failed { message }),
+            Some(reply) => Ok(reply),
+            None => Err(NodeError::failed("not a gallery command")),
+        }
+    }
+
+    /// A page of a machine's gallery, newest first. `peer` is its id.
+    #[tauri::command]
+    pub async fn gallery_list(
+        link: State<'_, NodeLink>,
+        peer: String,
+        limit: u32,
+        after: Option<cursio_protocol::gallery::PageMark>,
+        filter: cursio_protocol::gallery::MediaFilter,
+    ) -> Result<Reply, NodeError> {
+        gallery(
+            link,
+            Command::GalleryList {
+                peer,
+                limit,
+                after,
+                filter,
+            },
+        )
+        .await
+    }
+
+    #[tauri::command]
+    pub async fn gallery_thumbnail(
+        link: State<'_, NodeLink>,
+        peer: String,
+        item: String,
+        max_px: u32,
+    ) -> Result<Reply, NodeError> {
+        gallery(link, Command::GalleryThumbnail { peer, item, max_px }).await
+    }
+
+    #[tauri::command]
+    pub async fn gallery_read(
+        link: State<'_, NodeLink>,
+        peer: String,
+        item: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Reply, NodeError> {
+        gallery(
+            link,
+            Command::GalleryRead {
+                peer,
+                item,
+                offset,
+                len,
+            },
+        )
+        .await
+    }
+
+    /// Copy one item into this computer's `Pictures/Cursio/<peer>`.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn gallery_save(
+        link: State<'_, NodeLink>,
+        peer: String,
+        item: String,
+        name: String,
+    ) -> Result<Reply, NodeError> {
+        gallery(link, Command::GallerySave { peer, item, name }).await
     }
 
     /// Answer, decline, end or move the voice of a phone's call. `phone` is

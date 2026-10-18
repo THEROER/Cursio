@@ -61,14 +61,38 @@ fn app_start_page(start: tauri::State<'_, StartPage>) -> Option<String> {
 #[cfg(desktop)]
 const CALL_ROUTE: &str = "/call";
 
-/// The route `--page <name>` names, e.g. `--page messages` → `/messages`.
-/// Only a plain page name is taken: this is an argument any program may pass.
+/// The route `--page <name>` names, e.g. `--page messages` → `/messages`, and
+/// `--peer <machine>` beside it opens that page on one machine
+/// (`/gallery?peer=dark`). Only a plain page name is taken, and the machine
+/// is percent-encoded whole: this is an argument any program may pass.
 #[cfg(desktop)]
 fn page_route(args: impl IntoIterator<Item = String>) -> Option<String> {
-    let mut args = args.into_iter();
-    args.find(|a| a == "--page")?;
-    let page = args.next()?;
-    (!page.is_empty() && page.chars().all(|c| c.is_ascii_lowercase())).then(|| format!("/{page}"))
+    let args: Vec<String> = args.into_iter().collect();
+    let after = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+    };
+    let page = after("--page")?;
+    if page.is_empty() || !page.chars().all(|c| c.is_ascii_lowercase()) {
+        return None;
+    }
+    let peer = after("--peer").filter(|p| !p.is_empty() && p.len() <= 128);
+    Some(match peer {
+        None => format!("/{page}"),
+        Some(peer) => {
+            let encoded: String = peer
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect();
+            format!("/{page}?peer={encoded}")
+        }
+    })
 }
 
 /// Steer WebKitGTK away from the renderer paths that crash it, before any
@@ -197,6 +221,10 @@ pub fn run() {
             node::commands::messages_thread,
             node::commands::messages_send,
             node::commands::messages_mark_read,
+            node::commands::gallery_list,
+            node::commands::gallery_thumbnail,
+            node::commands::gallery_read,
+            node::commands::gallery_save,
             node::commands::node_call,
             node::commands::node_status,
             node::commands::node_config,
@@ -249,6 +277,9 @@ pub fn run() {
             node::commands::node_pairing,
             node::commands::node_forget,
             node::commands::node_start,
+            node::commands::gallery_list,
+            node::commands::gallery_thumbnail,
+            node::commands::gallery_read,
             mobile::commands::mobile_setup,
             mobile::commands::mobile_request,
             mobile::commands::mobile_restart,
@@ -281,5 +312,29 @@ mod tests {
         assert_eq!(page_route(args(&["cursio-app", "--page", "../etc"])), None);
         assert_eq!(page_route(args(&["cursio-app", "--page"])), None);
         assert_eq!(page_route(args(&["cursio-app", "--hidden"])), None);
+    }
+
+    #[test]
+    fn a_peer_argument_opens_the_page_on_that_machine_encoded_whole() {
+        assert_eq!(
+            page_route(args(&[
+                "cursio-app",
+                "--page",
+                "gallery",
+                "--peer",
+                "POCO X7 Pro"
+            ])),
+            Some("/gallery?peer=POCO%20X7%20Pro".into())
+        );
+        assert_eq!(
+            page_route(args(&[
+                "cursio-app",
+                "--peer",
+                "a&page=x",
+                "--page",
+                "gallery"
+            ])),
+            Some("/gallery?peer=a%26page%3Dx".into())
+        );
     }
 }

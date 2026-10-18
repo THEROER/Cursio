@@ -70,6 +70,10 @@ pub struct Setup {
     /// Defaulted for a plugin built before the row existed.
     #[serde(default)]
     pub companion: bool,
+    /// This phone's photos and videos may be browsed from its peers.
+    /// Defaulted for a plugin built before the row existed.
+    #[serde(default)]
+    pub gallery: bool,
 }
 
 /// One of the things [`Setup`] lists, for the user to grant.
@@ -89,6 +93,7 @@ pub enum Grant {
     Nearby,
     Storage,
     Companion,
+    Gallery,
 }
 
 #[derive(Serialize)]

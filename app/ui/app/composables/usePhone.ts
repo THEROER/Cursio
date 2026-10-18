@@ -23,6 +23,8 @@ export interface PhoneSetup {
   storage: boolean
   /** Cursio is the companion app of a computer paired over Bluetooth. */
   companion: boolean
+  /** The phone's photos and videos may be browsed from its peers. */
+  gallery: boolean
 }
 export type PhoneGrant =
   | "notifications"
@@ -36,6 +38,7 @@ export type PhoneGrant =
   | "nearby"
   | "storage"
   | "companion"
+  | "gallery"
 
 export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 
@@ -157,6 +160,7 @@ export function usePhone() {
       !s.nearby ||
       !s.storage ||
       !s.companion ||
+      !s.gallery ||
       (s.autostartSetting && !autostartDone.value)
     )
   })

@@ -32,6 +32,9 @@ const items = computed<SidebarItem[]>(() => [
   ...(status.value?.messages?.length || route.path === "/messages"
     ? [{ id: "/messages", label: t("nav.messages"), icon: "lucide:message-square" }]
     : []),
+  ...(status.value?.gallery?.length || route.path === "/gallery"
+    ? [{ id: "/gallery", label: t("nav.gallery"), icon: "lucide:images" }]
+    : []),
   { id: "/settings", label: t("nav.settings"), icon: "lucide:settings" },
 ])
 

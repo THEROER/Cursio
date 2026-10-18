@@ -215,6 +215,7 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
             calls: (status.calls ?? []).map(p => [p.name, p.hands_free, p.audio_here,
                 p.calls.map(c => [c.state, c.name, c.number])]),
             messages: (status.messages ?? []).map(m => m.name),
+            gallery: (status.gallery ?? []).map(g => g.name),
         });
     }
 
@@ -287,6 +288,8 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
             this._peers.addAction('Ring', () => this._run({cmd: 'ring', peer: name}, name));
         if ((status.messages ?? []).some(m => m.name === name))
             this._peers.addAction('Messages', () => this._openSettings(['--page', 'messages']));
+        if ((status.gallery ?? []).some(g => g.name === name))
+            this._peers.addAction('Gallery', () => this._openSettings(['--page', 'gallery', '--peer', name]));
         if (has('share')) {
             this._peers.addAction('Send Files…', () => this._sendFiles(name));
             // Where the clipboard is shared, a copy is already on the other

@@ -26,6 +26,7 @@ const ROWS: Row[] = [
   { what: "notificationAccess", icon: "lucide:bell-ring" },
   { what: "calls", icon: "lucide:phone" },
   { what: "messages", icon: "lucide:message-square" },
+  { what: "gallery", icon: "lucide:images" },
   { what: "nearby", icon: "lucide:bluetooth" },
   { what: "storage", icon: "lucide:folder-open" },
   { what: "companion", icon: "lucide:laptop" },

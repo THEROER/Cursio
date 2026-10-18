@@ -25,6 +25,7 @@ const items = computed(() => [
   { path: "/", label: t("nav.status"), icon: "lucide:activity", dot: (status.value?.problems.length ?? 0) > 0 },
   { path: "/pair", label: t("nav.pair"), icon: "lucide:link", dot: !!status.value?.pairing },
   { path: "/touchpad", label: t("nav.touchpad"), icon: "lucide:mouse-pointer-click", dot: false },
+  { path: "/gallery", label: t("nav.gallery"), icon: "lucide:images", dot: false },
   { path: "/settings", label: t("nav.settings"), icon: "lucide:settings", dot: false },
 ])
 

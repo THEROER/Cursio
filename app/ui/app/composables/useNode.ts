@@ -138,6 +138,8 @@ export interface NodeStatusReply {
   messages?: import("~/composables/useMessages").MessagesPeer[]
   /** Phones whose calls this machine sees; absent from a node without the calls module. */
   calls?: PhoneCalls[]
+  /** Machines whose galleries can be browsed; absent from a node older than control v15. */
+  gallery?: import("~/composables/useGallery").GalleryPeer[]
 }
 
 /** Mirrors `cursio_protocol::calls::Call`. */
