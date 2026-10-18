@@ -145,9 +145,11 @@ object MediaNotifier {
      * Post every computer's players, with one of them the main one: the one
      * that last started playing, anywhere. Only its session is active and its
      * notification held, and it is posted last so it sits first — which is
-     * what the system's media controls and HyperOS's island follow, so the
-     * island stays on the music just started instead of hopping to whichever
-     * player last changed a title. The others stay in the shade, each with
+     * what the system's media controls and HyperOS's own music island follow,
+     * so the island stays on the music just started instead of hopping to
+     * whichever player last changed a title. No Focus extras on top: HyperOS
+     * draws its native music island for this session, and a Focus card
+     * replaced it a second later with a poorer one. The others stay in the shade, each with
      * its own buttons. A pause does not hand the place on, or a second press
      * would start the player beside it.
      */
@@ -284,30 +286,11 @@ object MediaNotifier {
         // itself, MIUI 12 left an empty grey square.
         val art = entry.session.controller.metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
         (art ?: appIcon(ctx))?.let { builder.setLargeIcon(it) }
-        if (main && islandHere(ctx)) {
-            builder.addExtras(
-                Island.mediaExtras(
-                    title = p.optString("title"),
-                    subtitle = listOf(p.optString("artist"), p.optString("app"), entry.peerName)
-                        .filter { it.isNotEmpty() }
-                        .joinToString(" · "),
-                    cover = art,
-                    fallback = Icon.createWithResource(ctx, R.drawable.ic_notify),
-                    positionMs = p.optLong("positionMs", -1).takeIf { it >= 0 },
-                    durationMs = p.optLong("durationMs", -1).takeIf { it > 0 },
-                    buttons = actions.take(3),
-                ),
-            )
-        }
         return builder.build()
     }
 
     private var icon: Bitmap? = null
 
-    /** Asked once: HyperOS's answer does not change while the app runs. */
-    private var island: Boolean? = null
-
-    private fun islandHere(ctx: Context): Boolean = island ?: Island.supported(ctx).also { island = it }
 
     private fun appIcon(ctx: Context): Bitmap? {
         icon?.let { return it }
