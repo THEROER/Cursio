@@ -47,6 +47,24 @@ pub const VERSION: u16 = 1;
 /// How often a peer is asked again for devices it would not lend.
 const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The longest a device the peer keeps refusing for the same reason waits
+/// before it is asked for again.
+///
+/// A refusal that repeats with the same reason is one nothing on this link is
+/// changing — a machine that needs elevation to bind devices refused every
+/// device every minute, all day, a warning on each side each time. Doubling
+/// the wait from [`RETRY_INTERVAL`] up to this keeps a granted permission
+/// noticed within the hour, and a changed listing or a new link asks at once.
+const MAX_REFUSAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// A peer's refusal of one device, and when it is worth asking again.
+struct Refusal {
+    error: String,
+    /// How many times in a row the peer gave this same reason.
+    count: u32,
+    until: std::time::Instant,
+}
+
 /// How often this machine's own ports are re-read.
 ///
 /// Short enough that plugging a phone in feels immediate, long enough to be
@@ -181,6 +199,12 @@ pub struct UsbEngine {
     /// retrying at all (a missing module gets loaded, a permission granted) are
     /// slow, so they wait for [`RETRY_INTERVAL`] like any other refusal.
     failed: HashMap<UsbDeviceId, std::time::Instant>,
+    /// Peer devices the peer refused, backed off per device. See
+    /// [`MAX_REFUSAL_BACKOFF`].
+    refused: HashMap<UsbDeviceId, Refusal>,
+    /// Refusals this machine already reported as a lender, so the same
+    /// device refused for the same reason is a warning once per link.
+    refusals_said: std::collections::HashSet<(UsbDeviceId, String)>,
 }
 
 impl UsbEngine {
@@ -200,6 +224,8 @@ impl UsbEngine {
             offered: Vec::new(),
             last_retry: None,
             failed: HashMap::new(),
+            refused: HashMap::new(),
+            refusals_said: std::collections::HashSet::new(),
             sent: Vec::new(),
             last_scan: None,
         }
@@ -261,7 +287,11 @@ impl UsbEngine {
                 self.announced = false;
             }
             Err(error) => {
-                tracing::warn!(peer = %self.peer_name, %device, %error, "refused a device");
+                if self.refusals_said.insert((device, error.to_string())) {
+                    tracing::warn!(peer = %self.peer_name, %device, %error, "refused a device");
+                } else {
+                    tracing::debug!(peer = %self.peer_name, %device, %error, "refused a device again");
+                }
                 self.outbound.push(UsbMsg::Refused { device, error });
             }
         }
@@ -383,6 +413,14 @@ impl UsbEngine {
             }
         }
 
+        // A device whose listing changed (its holder let go, it was plugged in
+        // again) is a new question: its refusal no longer stands. Retrying
+        // passes the same listing back, which changes nothing.
+        for device in devices {
+            if self.offered.iter().find(|d| d.id == device.id) != Some(device) {
+                self.refused.remove(&device.id);
+            }
+        }
         self.offered = devices.to_vec();
         let now = std::time::Instant::now();
         for device in devices {
@@ -396,6 +434,9 @@ impl UsbEngine {
                     continue;
                 }
                 self.failed.remove(&device.id);
+            }
+            if self.refused.get(&device.id).is_some_and(|r| now < r.until) {
+                continue;
             }
             // Some devices are what the peer is using to be a usable machine:
             // its Bluetooth radio, its keyboard, its sound card. Taking one is
@@ -471,8 +512,44 @@ impl UsbEngine {
             _ => self.last_retry = Some(now),
         }
 
-        let offered = std::mem::take(&mut self.offered);
+        // Cloned, not taken: `on_devices` compares against the kept listing to
+        // notice changes, and an emptied one would look like every device changed.
+        let offered = self.offered.clone();
         self.on_devices(&offered);
+    }
+
+    /// The peer would not lend a device.
+    ///
+    /// Never final: the peer that held it lets go, the user accepts the
+    /// prompt, the driver gets installed, and treating a refusal as permanent
+    /// would mean a device that never appears until Cursio is restarted. But
+    /// the same reason given again means nothing changed, so each repeat waits
+    /// twice as long before the next ask, up to [`MAX_REFUSAL_BACKOFF`].
+    fn on_refused(&mut self, device: UsbDeviceId, error: String) {
+        self.asking.remove(&device);
+        let count = match self.refused.get(&device) {
+            Some(previous) if previous.error == error => previous.count.saturating_add(1),
+            _ => 1,
+        };
+        let wait = RETRY_INTERVAL
+            .saturating_mul(1u32.checked_shl(count - 1).unwrap_or(u32::MAX))
+            .min(MAX_REFUSAL_BACKOFF);
+        if count == 1 {
+            tracing::info!(peer = %self.peer_name, %device, %error, "peer would not lend a device");
+        } else {
+            tracing::debug!(
+                peer = %self.peer_name, %device, %error, count, wait_s = wait.as_secs(),
+                "peer would not lend a device again"
+            );
+        }
+        self.refused.insert(
+            device,
+            Refusal {
+                error,
+                count,
+                until: std::time::Instant::now() + wait,
+            },
+        );
     }
 
     /// The peer agreed. Present its device on this machine.
@@ -631,18 +708,7 @@ impl SessionModule for UsbEngine {
             UsbMsg::Data { stream, bytes } => self.on_data(stream, &bytes),
             UsbMsg::Devices(devices) => self.on_devices(&devices),
             UsbMsg::Claimed { device, stream } => self.on_claimed(device, stream),
-            UsbMsg::Refused { device, error } => {
-                // Cleared either way, so the device is asked for again on the
-                // next listing. A refusal is rarely permanent: the peer that
-                // held it lets go, the user accepts the prompt, the driver
-                // gets installed. Treating it as final would mean a device
-                // that never appears until Cursio is restarted.
-                self.asking.remove(&device);
-                tracing::info!(
-                    peer = %self.peer_name, %device, %error,
-                    "peer would not lend a device"
-                );
-            }
+            UsbMsg::Refused { device, error } => self.on_refused(device, error.to_string()),
             UsbMsg::Detached {
                 device,
                 stream,
@@ -2137,6 +2203,88 @@ mod tests {
                 .any(|m| matches!(m, UsbMsg::Claim { device, .. } if *device == UsbDeviceId(1))),
             "a failure must not be permanent"
         );
+    }
+
+    fn claims(engine: &mut UsbEngine, id: u64) -> bool {
+        taken(engine)
+            .iter()
+            .any(|m| matches!(m, UsbMsg::Claim { device, .. } if *device == UsbDeviceId(id)))
+    }
+
+    /// What filled two machines' logs every minute: a peer that needs
+    /// elevation refuses every device for the same reason, and asking again
+    /// on the minute changes nothing.
+    #[test]
+    fn a_device_refused_again_for_the_same_reason_waits_twice_as_long() {
+        let mut e = attaching_engine();
+        e.on_devices(&[offered(1)]);
+        let _ = taken(&mut e);
+        e.on_refused(UsbDeviceId(1), "needs elevated privilege".into());
+        e.on_refused(UsbDeviceId(1), "needs elevated privilege".into());
+
+        let refusal = &e.refused[&UsbDeviceId(1)];
+        assert_eq!(refusal.count, 2);
+        let wait = refusal.until - std::time::Instant::now();
+        assert!(wait > RETRY_INTERVAL && wait <= RETRY_INTERVAL * 2);
+
+        // The minute's retry passes: still too soon for this device.
+        e.last_retry = Some(std::time::Instant::now() - RETRY_INTERVAL * 2);
+        e.retry_refused();
+        assert!(!claims(&mut e, 1), "asked again before the backoff ran out");
+    }
+
+    #[test]
+    fn a_refusal_never_waits_longer_than_the_cap() {
+        let mut e = attaching_engine();
+        for _ in 0..40 {
+            e.on_refused(UsbDeviceId(1), "needs elevated privilege".into());
+        }
+        let wait = e.refused[&UsbDeviceId(1)].until - std::time::Instant::now();
+        assert!(wait <= MAX_REFUSAL_BACKOFF);
+    }
+
+    /// A new reason is a new situation, so the wait starts over.
+    #[test]
+    fn a_refusal_for_a_different_reason_starts_the_wait_over() {
+        let mut e = attaching_engine();
+        e.on_refused(UsbDeviceId(1), "needs elevated privilege".into());
+        e.on_refused(UsbDeviceId(1), "needs elevated privilege".into());
+        e.on_refused(UsbDeviceId(1), "held by another machine".into());
+        assert_eq!(e.refused[&UsbDeviceId(1)].count, 1);
+    }
+
+    /// The holder letting go shows in the listing, and that is worth asking
+    /// about at once rather than at the end of an hour's backoff.
+    #[test]
+    fn a_changed_listing_asks_again_for_a_refused_device() {
+        let mut e = attaching_engine();
+        let held = UsbDevice {
+            holder: Some(peer(9)),
+            ..offered(1)
+        };
+        e.on_devices(&[held]);
+        let _ = taken(&mut e);
+        for _ in 0..5 {
+            e.on_refused(UsbDeviceId(1), "held by another machine".into());
+        }
+
+        e.on_devices(&[offered(1)]);
+        assert!(claims(&mut e, 1), "a freed device was not asked for");
+    }
+
+    /// The lender side of the same noise: one warning per device and reason
+    /// on a link, not one a minute.
+    #[test]
+    fn a_lender_reports_the_same_refusal_once() {
+        let mut e = engine(&[]);
+        e.on_claim(UsbDeviceId(5), "adb");
+        e.on_claim(UsbDeviceId(5), "adb");
+        assert_eq!(e.refusals_said.len(), 1);
+        let refusals = taken(&mut e)
+            .iter()
+            .filter(|m| matches!(m, UsbMsg::Refused { .. }))
+            .count();
+        assert_eq!(refusals, 2, "each claim still gets its answer");
     }
 
     /// Retrying must not re-ask for what this machine already has: the peer
