@@ -14,6 +14,7 @@ pub mod clipboard;
 pub mod files;
 pub mod frame;
 pub mod input;
+pub mod messages;
 pub mod node;
 pub mod notify;
 pub mod paths;
