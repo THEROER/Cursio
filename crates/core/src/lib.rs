@@ -94,6 +94,8 @@ pub mod notify_display;
 pub mod notify_hub;
 /// The notification module on one link.
 pub mod notify_session;
+/// A phone's notifications shown as Windows toasts.
+pub mod notify_toast;
 pub mod opener;
 /// Who may pair right now, with what secret, and for how long.
 pub mod pairing_window;

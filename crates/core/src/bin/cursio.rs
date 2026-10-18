@@ -1726,7 +1726,13 @@ fn notify_display() -> Option<std::sync::Arc<dyn cursio_core::notify_hub::Notify
         .map(|d| d as std::sync::Arc<dyn cursio_core::notify_hub::NotifyDisplay>)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn notify_display() -> Option<std::sync::Arc<dyn cursio_core::notify_hub::NotifyDisplay>> {
+    cursio_core::notify_toast::ToastDisplay::start()
+        .map(|d| d as std::sync::Arc<dyn cursio_core::notify_hub::NotifyDisplay>)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn notify_display() -> Option<std::sync::Arc<dyn cursio_core::notify_hub::NotifyDisplay>> {
     tracing::info!("a phone's notifications are not shown on this platform yet");
     None

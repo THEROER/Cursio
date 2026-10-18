@@ -131,6 +131,16 @@ windows = { version = "0.61", features = [
     "Win32_System_Pipes",
     # GetLastInputInfo — whether the user is at this machine; see presence.rs.
     "Win32_UI_Input_KeyboardAndMouse",
+    # A phone's notifications as toasts, and this machine's own read back to
+    # spot duplicates; see notify_toast.rs. COM for the apartment the toast
+    # thread joins.
+    "Win32_System_Com",
+    "Foundation",
+    "Foundation_Collections",
+    "Data_Xml_Dom",
+    "ApplicationModel",
+    "UI_Notifications",
+    "UI_Notifications_Management",
 ] }
 
 [dev-dependencies]

@@ -266,8 +266,20 @@ aside — appeared in the last 10 s. A copy that arrives first is shown and
 taken down if the twin follows within 2 s; an app that has matched twice is
 remembered (`notify-native-apps.json` in the config directory, forgotten after
 14 days without a match) and its copies wait those 2 s instead, then show if
-no twin came. Calls are never held. Windows shows no phone notifications yet,
-so it has nothing to drop; `crates/core/src/notify_dedup.rs` holds the rest.
+no twin came. Calls are never held. `crates/core/src/notify_dedup.rs` holds
+the rest.
+
+**On Windows a phone's notifications are toasts.** An unpackaged program has
+no AppUserModelID to show them under, so the node registers `dev.cursio.Cursio`
+under `HKCU\Software\Classes\AppUserModelId` with the name and logo; a reply
+is typed into the toast's own text field, and closing it closes the phone's.
+WinRT runs on one thread of its own in the multithreaded apartment, as D-Bus
+does on Linux. Presence is `GetLastInputInfo` plus "not driving a peer", the
+same test as Linux. Twins are read from `UserNotificationListener`, polled
+once a second (its change event needs a packaged background task); it asks
+the user's consent and may refuse a program without package identity, and
+then copies show at once, as before deduplication existed
+(`crates/core/src/notify_toast.rs`).
 
 The reason this decomposes cleanly is that all four are *state replication or
 bulk transfer* — the two patterns the audio and clipboard modules already
