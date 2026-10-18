@@ -2,6 +2,13 @@
 import { getCurrentWindow } from "@tauri-apps/api/window"
 import type { CallAction, PhoneCall, PhoneCalls } from "~/composables/useNode"
 
+// The window is transparent so the card's rounded corners show; the page
+// behind the card must be too, or the theme's background fills them in.
+useHead({
+  htmlAttrs: { style: "background: transparent" },
+  bodyAttrs: { style: "background: transparent" },
+})
+
 /**
  * A phone's call, alone in the small call window (`call_window.rs`).
  *

@@ -34,6 +34,10 @@ pub fn open(app: &AppHandle) {
         .inner_size(WIDTH, HEIGHT)
         .resizable(false)
         .decorations(false)
+        // The card draws its own rounded corners; an opaque window behind it
+        // showed square ones, and Windows' shadow outlines the square too.
+        .transparent(true)
+        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(false)
         .focused(true);
