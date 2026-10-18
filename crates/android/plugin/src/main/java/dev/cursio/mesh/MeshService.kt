@@ -148,6 +148,9 @@ class MeshService : Service() {
         if (screening) {
             val error = beginScreen(intent!!)
             if (error != null) Log.w(TAG, "showing the screen did not start: $error")
+            // A kept consent the system no longer honours: ask for a new one.
+            val computer = intent.getStringExtra(ScreenConsentActivity.EXTRA_REUSED_FOR)
+            if (error != null && computer != null) ScreenConsentActivity.consentRefused(this, computer)
         }
 
         // START_STICKY: if the system reclaims this process under memory
@@ -555,13 +558,14 @@ class MeshService : Service() {
          *
          * @throws IllegalStateException when Android refuses the start.
          */
-        fun startScreen(context: Context, resultCode: Int, data: Intent, everyone: Boolean) {
+        fun startScreen(context: Context, resultCode: Int, data: Intent, everyone: Boolean, reusedFor: String? = null) {
             val intent = Intent(context, MeshService::class.java)
                 .setAction(ACTION_SCREEN)
                 .putExtra(EXTRA_FROM_FOREGROUND, true)
                 .putExtra(EXTRA_RESULT_CODE, resultCode)
                 .putExtra(EXTRA_PROJECTION, data)
                 .putExtra(ScreenConsentActivity.EXTRA_EVERYONE, everyone)
+                .putExtra(ScreenConsentActivity.EXTRA_REUSED_FOR, reusedFor)
             context.startForegroundService(intent)
         }
 

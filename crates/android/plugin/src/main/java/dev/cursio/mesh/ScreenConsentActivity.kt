@@ -12,6 +12,8 @@ import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 
 /**
@@ -19,9 +21,20 @@ import android.util.Log
  * computer, from wherever the user was when it was asked for.
  *
  * Its own invisible activity because the consent is an activity result, and a
- * computer's request arrives with no window of Cursio's open: the request
- * becomes a notification ([ask]), and tapping its button opens this, which
- * shows the system dialog over whatever the user is doing and goes away.
+ * computer's request arrives with no window of Cursio's open. How much of it
+ * the user sees depends on what Android allows ([ask]):
+ * - before Android 14 one consent may start any number of projections, so
+ *   after the first "Start now" a computer asking again is simply shown the
+ *   screen, until the app's process ends;
+ * - from 14 each projection needs its own consent, and the system dialog
+ *   opens on the phone at once when the screen is on and the app may start
+ *   an activity from the background — which an app associated with a
+ *   computer through CompanionDeviceManager may, as may one allowed to draw
+ *   over other apps;
+ * - otherwise, and always alongside, a notification whose button opens it:
+ *   a request that arrived while the phone lay in a pocket is still there
+ *   when it comes out, and a start Android silently refused leaves the user
+ *   something to tap.
  */
 class ScreenConsentActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -49,6 +62,7 @@ class ScreenConsentActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         getSystemService(NotificationManager::class.java).cancel(PROMPT_ID)
         if (requestCode == REQUEST && resultCode == RESULT_OK && data != null) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) kept = Intent(data)
             val everyone = intent.getBooleanExtra(EXTRA_EVERYONE, false)
             try {
                 MeshService.startScreen(this, resultCode, data, everyone)
@@ -68,6 +82,13 @@ class ScreenConsentActivity : Activity() {
         private const val PROMPT_ID = 0x53435245
         const val EXTRA_EVERYONE = "dev.cursio.mesh.SCREEN_EVERYONE"
 
+        /** On a start from a kept consent: the computer to ask again for if it fails. */
+        const val EXTRA_REUSED_FOR = "dev.cursio.mesh.SCREEN_REUSED_FOR"
+
+        /** The last consent given, before Android 14, for the next request. */
+        @Volatile
+        private var kept: Intent? = null
+
         /** The application context, set before the node can ask anything. */
         @Volatile
         var context: Context? = null
@@ -81,13 +102,47 @@ class ScreenConsentActivity : Activity() {
             )
         }
 
-        /**
-         * A computer asked to see this screen: say so, with a button that
-         * opens the consent. Never the consent itself — an app in the
-         * background may not start an activity, and a dialog appearing
-         * unasked would be the wrong thing to answer by reflex anyway.
-         */
+        /** A computer asked to see this screen; see the class for what follows. */
         fun ask(context: Context, computer: String) {
+            val consent = kept
+            if (consent != null) {
+                try {
+                    MeshService.startScreen(context, RESULT_OK, consent, everyone = false, reusedFor = computer)
+                    return
+                } catch (e: IllegalStateException) {
+                    Log.w(TAG, "cannot start showing the screen from the kept consent", e)
+                }
+            }
+            prompt(context, computer)
+            if (mayOpenNow(context)) {
+                try {
+                    context.startActivity(
+                        Intent(context, ScreenConsentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                } catch (e: RuntimeException) {
+                    Log.i(TAG, "the screen consent could not open by itself; the notification stays", e)
+                }
+            }
+        }
+
+        /** The kept consent was refused when used: forget it and ask anew. */
+        fun consentRefused(context: Context, computer: String) {
+            kept = null
+            ask(context, computer)
+        }
+
+        /**
+         * Only with the screen on: a dialog that pops up on a phone nobody is
+         * looking at is one nobody answers, and it would still be waiting,
+         * unexplained, when they next did.
+         */
+        private fun mayOpenNow(context: Context): Boolean {
+            val power = context.getSystemService(PowerManager::class.java)
+            if (power?.isInteractive != true) return false
+            return ComputerCompanion.associated(context) || Settings.canDrawOverlays(context)
+        }
+
+        private fun prompt(context: Context, computer: String) {
             val manager = context.getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, "Screen requests", NotificationManager.IMPORTANCE_HIGH).apply {
