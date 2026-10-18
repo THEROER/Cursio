@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- One path per shape: the bars and the dots wind opposite ways, and in a
+     single path their overlaps cancelled out and showed as holes. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
@@ -6,5 +8,20 @@
     android:viewportHeight="24">
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M6.816,8.444L17.184,8.444L17.184,6.884L6.816,6.884ZM6.139,8.051L11.323,17.123L12.677,16.349L7.493,7.277ZM16.507,7.277L11.323,16.349L12.677,17.123L17.861,8.051ZM4.416,7.664a2.400,2.400 0,1 1,4.800,0a2.400,2.400 0,1 1,-4.800,0ZM14.784,7.664a2.400,2.400 0,1 1,4.800,0a2.400,2.400 0,1 1,-4.800,0ZM9.600,16.736a2.400,2.400 0,1 1,4.800,0a2.400,2.400 0,1 1,-4.800,0Z" />
+        android:pathData="M6.816,8.444L17.184,8.444L17.184,6.884L6.816,6.884Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6.139,8.051L11.323,17.123L12.677,16.349L7.493,7.277Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M16.507,7.277L11.323,16.349L12.677,17.123L17.861,8.051Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4.416,7.664a2.400,2.400 0,1 1,4.800,0a2.400,2.400 0,1 1,-4.800,0Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M14.784,7.664a2.400,2.400 0,1 1,4.800,0a2.400,2.400 0,1 1,-4.800,0Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M9.600,16.736a2.400,2.400 0,1 1,4.800,0a2.400,2.400 0,1 1,-4.800,0Z" />
 </vector>
