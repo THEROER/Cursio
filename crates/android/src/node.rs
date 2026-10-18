@@ -321,7 +321,14 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         .with(Box::new(cursio_core::messages_session::MessagesFactory {
             store: Some(crate::messages::AndroidStore::shared()),
             view: false,
+        }))
+        .with(Box::new(cursio_core::media_session::MediaFactory {
+            plays: true,
+            shows: true,
+            shows_only_computers: true,
         }));
+    cursio_core::media_hub::hub().set_backend(crate::media::AndroidBackend::shared());
+    cursio_core::media_hub::hub().set_display(crate::media::AndroidDisplay::shared());
     for advert in modules.advertise() {
         tracing::info!(module = %advert.id, version = advert.version, "module available");
     }

@@ -1,0 +1,234 @@
+package dev.cursio.mesh
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.BitmapFactory
+import android.graphics.drawable.Icon
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * The computers' players on this phone (`crates/android/src/media.rs`).
+ *
+ * Each becomes a media session of this app's and a media-style notification
+ * tied to it. That pairing — not a custom layout — is what Android's media
+ * controls and HyperOS's island pick up: they show any app's active session
+ * with its notification, the way KDE Connect's players appear there. Buttons
+ * on it come back through the session's callback and go to the computer;
+ * "Disconnect" hides that player until it plays something else.
+ */
+object MediaNotifier {
+    private const val TAG = "Cursio"
+    private const val CHANNEL_ID = "cursio_media"
+    private const val ACTION = "dev.cursio.mesh.MEDIA"
+
+    @Volatile
+    var context: Context? = null
+
+    private val main = Handler(Looper.getMainLooper())
+    private val shown = HashMap<String, Shown>()
+    private var receiverRegistered = false
+
+    private class Shown(val session: MediaSession, val id: Int, var artKey: String? = null)
+
+    /** A computer's players changed; [json] is the full list, empty to clear. */
+    fun update(peer: String, peerName: String, json: String) {
+        val ctx = context ?: return
+        main.post {
+            try {
+                apply(ctx, peer, peerName, JSONArray(json))
+            } catch (e: Exception) {
+                Log.w(TAG, "could not show $peerName's players", e)
+            }
+        }
+    }
+
+    private fun key(peer: String, player: String) = "$peer\u0000$player"
+
+    private fun apply(ctx: Context, peer: String, peerName: String, list: JSONArray) {
+        val manager = ctx.getSystemService(NotificationManager::class.java)
+        ensureChannel(manager)
+        ensureReceiver(ctx)
+        val present = HashSet<String>()
+        for (i in 0 until list.length()) {
+            val p = list.getJSONObject(i)
+            val player = p.getString("id")
+            val k = key(peer, player)
+            present.add(k)
+            val entry = shown.getOrPut(k) {
+                val session = MediaSession(ctx, "cursio-$peerName-$player")
+                session.setCallback(Buttons(peer, player), main)
+                Shown(session, k.hashCode())
+            }
+            fill(entry, p, peerName)
+            manager.notify(entry.id, notification(ctx, entry, p, peer, player, peerName))
+        }
+        val gone = shown.keys.filter { it.startsWith("$peer\u0000") && it !in present }
+        for (k in gone) {
+            val entry = shown.remove(k) ?: continue
+            manager.cancel(entry.id)
+            entry.session.isActive = false
+            entry.session.release()
+        }
+    }
+
+    private fun fill(entry: Shown, p: JSONObject, peerName: String) {
+        val meta = MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, p.optString("title"))
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, p.optString("artist").ifEmpty { "${p.optString("app")} · $peerName" })
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, p.optString("album"))
+        if (p.has("durationMs")) meta.putLong(MediaMetadata.METADATA_KEY_DURATION, p.getLong("durationMs"))
+        val art = p.optString("art", "").ifEmpty { null }
+        if (art != null) {
+            val bytes = try {
+                CursioNative.nativeMediaArt(art)
+            } catch (e: UnsatisfiedLinkError) {
+                null
+            }
+            if (bytes != null && bytes.isNotEmpty()) {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let {
+                    meta.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it)
+                }
+            }
+        }
+        entry.artKey = art
+        entry.session.setMetadata(meta.build())
+        var actions = 0L
+        if (p.optBoolean("canPlay")) actions = actions or PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PLAY_PAUSE
+        if (p.optBoolean("canPause")) actions = actions or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE
+        if (p.optBoolean("canNext")) actions = actions or PlaybackState.ACTION_SKIP_TO_NEXT
+        if (p.optBoolean("canPrevious")) actions = actions or PlaybackState.ACTION_SKIP_TO_PREVIOUS
+        if (p.optBoolean("canSeek")) actions = actions or PlaybackState.ACTION_SEEK_TO
+        val playing = p.optBoolean("playing")
+        entry.session.setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(actions)
+                .setState(
+                    if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                    p.optLong("positionMs", PlaybackState.PLAYBACK_POSITION_UNKNOWN),
+                    if (playing) 1f else 0f,
+                    SystemClock.elapsedRealtime(),
+                )
+                .build(),
+        )
+        entry.session.isActive = true
+    }
+
+    private fun button(ctx: Context, icon: Int, title: String, peer: String, player: String, command: String): Notification.Action {
+        val intent = Intent(ACTION).setPackage(ctx.packageName)
+            .putExtra("peer", peer).putExtra("player", player).putExtra("command", command)
+        val pending = PendingIntent.getBroadcast(
+            ctx,
+            (peer + player + command).hashCode(),
+            intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return Notification.Action.Builder(Icon.createWithResource(ctx, icon), title, pending).build()
+    }
+
+    private fun notification(
+        ctx: Context,
+        entry: Shown,
+        p: JSONObject,
+        peer: String,
+        player: String,
+        peerName: String,
+    ): Notification {
+        val playing = p.optBoolean("playing")
+        val actions = listOf(
+            button(ctx, android.R.drawable.ic_media_previous, "Previous", peer, player, "previous"),
+            if (playing) {
+                button(ctx, android.R.drawable.ic_media_pause, "Pause", peer, player, "pause")
+            } else {
+                button(ctx, android.R.drawable.ic_media_play, "Play", peer, player, "play")
+            },
+            button(ctx, android.R.drawable.ic_media_next, "Next", peer, player, "next"),
+            button(ctx, android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", peer, player, "dismiss"),
+        )
+        val builder = Notification.Builder(ctx, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notify)
+            .setContentTitle(p.optString("title"))
+            .setContentText(listOf(p.optString("artist"), "${p.optString("app")} · $peerName").filter { it.isNotEmpty() }.joinToString(" — "))
+            .setSubText(peerName)
+            .setOngoing(playing)
+            .setShowWhen(false)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setStyle(Notification.MediaStyle().setMediaSession(entry.session.sessionToken).setShowActionsInCompactView(0, 1, 2))
+        for (a in actions) builder.addAction(a)
+        entry.session.controller.metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)?.let { builder.setLargeIcon(it) }
+        return builder.build()
+    }
+
+    private fun ensureChannel(manager: NotificationManager) {
+        if (manager.getNotificationChannel(CHANNEL_ID) != null) return
+        // Low importance: a player is something to reach, not an interruption.
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "Your computers' players", NotificationManager.IMPORTANCE_LOW).apply {
+                setShowBadge(false)
+            },
+        )
+    }
+
+    private fun ensureReceiver(ctx: Context) {
+        if (receiverRegistered) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, intent: Intent) {
+                val peer = intent.getStringExtra("peer") ?: return
+                val player = intent.getStringExtra("player") ?: return
+                val command = intent.getStringExtra("command") ?: return
+                if (command == "dismiss") {
+                    try {
+                        CursioNative.nativeMediaDismiss(peer, player)
+                    } catch (e: UnsatisfiedLinkError) {
+                        Log.w(TAG, "the node library is not loaded", e)
+                    }
+                } else {
+                    press(peer, player, command, 0)
+                }
+            }
+        }
+        val filter = IntentFilter(ACTION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ctx.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            ctx.registerReceiver(receiver, filter)
+        }
+        receiverRegistered = true
+    }
+
+    private fun press(peer: String, player: String, command: String, arg: Long) {
+        // Off the main thread: the node answers once the command is queued, but
+        // a JNI call is still no place for the UI thread to wait.
+        Thread {
+            val why = try {
+                CursioNative.nativeMediaRemoteCommand(peer, player, command, arg)
+            } catch (e: UnsatisfiedLinkError) {
+                "the node library is not loaded"
+            }
+            if (why.isNotEmpty()) Log.i(TAG, "a player button went nowhere: $why")
+        }.start()
+    }
+
+    private class Buttons(val peer: String, val player: String) : MediaSession.Callback() {
+        override fun onPlay() = press(peer, player, "play", 0)
+        override fun onPause() = press(peer, player, "pause", 0)
+        override fun onSkipToNext() = press(peer, player, "next", 0)
+        override fun onSkipToPrevious() = press(peer, player, "previous", 0)
+        override fun onSeekTo(pos: Long) = press(peer, player, "seek", pos)
+        override fun onStop() = press(peer, player, "pause", 0)
+    }
+}

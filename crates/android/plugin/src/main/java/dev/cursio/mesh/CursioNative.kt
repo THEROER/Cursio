@@ -190,4 +190,30 @@ object CursioNative {
     @JvmStatic
     fun onCallRequest(kind: String, number: String?, muted: Boolean): String? =
         CallMonitor.act(kind, number, muted)
+
+    /** This phone's players changed; [json] is [MediaBridge]'s list. */
+    external fun nativeMediaChanged(json: String)
+
+    /** A button on a computer's player; answers why it went nowhere, or `""`. */
+    external fun nativeMediaRemoteCommand(peer: String, player: String, command: String, arg: Long): String
+
+    /** "Disconnect" on a computer's player: hide it until its next track. */
+    external fun nativeMediaDismiss(peer: String, player: String)
+
+    /** A computer player's cover by the key its list named; empty until it arrives. */
+    external fun nativeMediaArt(art: String): ByteArray
+
+    /** A computer pressed [command] on this phone's [player]; why not, or null. */
+    @JvmStatic
+    fun onMediaCommand(player: String, command: String, arg: Long): String? =
+        MediaBridge.command(player, command, arg)
+
+    /** [player]'s cover for a computer, or null. */
+    @JvmStatic
+    fun onMediaArt(player: String): ByteArray? = MediaBridge.art(player)
+
+    /** A computer's players to show here; see [MediaNotifier]. */
+    @JvmStatic
+    fun onMediaRemote(peer: String, peerName: String, json: String) =
+        MediaNotifier.update(peer, peerName, json)
 }

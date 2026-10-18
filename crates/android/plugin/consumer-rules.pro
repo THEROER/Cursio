@@ -11,6 +11,9 @@
     public static void onRing(...);
     public static java.lang.String onSmsRequest(...);
     public static java.lang.String onCallRequest(...);
+    public static java.lang.String onMediaCommand(...);
+    public static byte[] onMediaArt(...);
+    public static void onMediaRemote(...);
     public static java.lang.String btComputers(...);
     public static java.lang.String btConnect(...);
 }

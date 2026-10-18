@@ -41,6 +41,9 @@ class CursioNotificationListener : NotificationListenerService() {
 
     override fun onListenerConnected() {
         instance = this
+        // Notification access is also what lists other apps' players; it may
+        // have just been granted.
+        MediaBridge.watch(this)
     }
 
     override fun onListenerDisconnected() {

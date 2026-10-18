@@ -51,9 +51,13 @@ object Node {
             Ringer.context = context.applicationContext
             SmsStore.context = context.applicationContext
             BtLink.context = context.applicationContext
+            MediaNotifier.context = context.applicationContext
             initialized = CursioNative.nativeInit(context.filesDir.absolutePath)
             if (!initialized) loadError = "the native node refused its data directory"
-            if (initialized) SmsStore.watch(context)
+            if (initialized) {
+                SmsStore.watch(context)
+                MediaBridge.watch(context)
+            }
             initialized
         } catch (e: LinkageError) {
             loadError = "native library unusable: ${e.message ?: e.javaClass.simpleName}"
