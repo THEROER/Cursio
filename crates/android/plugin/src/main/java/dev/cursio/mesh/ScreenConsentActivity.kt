@@ -140,6 +140,41 @@ class ScreenConsentActivity : Activity() {
             }
         }
 
+        const val EXTRA_COMPUTER = "dev.cursio.mesh.SCREEN_COMPUTER"
+        private const val EXTRA_ALWAYS = "dev.cursio.mesh.SCREEN_ALWAYS"
+        private const val PREFS = "cursio-screen"
+        private const val TRUSTED = "always"
+
+        private fun trusted(context: Context, computer: String): Boolean =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getStringSet(TRUSTED, emptySet())!!.contains(computer)
+
+        private fun trust(context: Context, computer: String) {
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val set = prefs.getStringSet(TRUSTED, emptySet())!! + computer
+            prefs.edit().putStringSet(TRUSTED, set).apply()
+        }
+
+        private fun startKept(context: Context, consent: Intent, computer: String): Boolean = try {
+            MeshService.startScreen(context, RESULT_OK, consent, everyone = false, reusedFor = computer)
+            true
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "cannot start showing the screen from the kept consent", e)
+            false
+        }
+
+        private fun answer(context: Context, computer: String, always: Boolean = false): Intent =
+            Intent(context, ScreenConsentActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .putExtra(EXTRA_COMPUTER, computer)
+                .putExtra(EXTRA_ALWAYS, always)
+
+        /** "Allow" in the window, from the user looking at it. */
+        fun allowed(context: Context, computer: String, always: Boolean) {
+            if (always) trust(context, computer)
+            context.startActivity(answer(context, computer))
+        }
+
         /** The kept consent was refused when used: forget it and ask anew. */
         fun consentRefused(context: Context, computer: String) {
             kept = null
