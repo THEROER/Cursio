@@ -1818,6 +1818,11 @@ fn module_registry(
             shows: media,
             shows_only_computers: false,
         }))
+        .with(Box::new(cursio_core::gallery_session::GalleryFactory {
+            store: cursio_core::gallery_folder::FolderGallery::for_user()
+                .map(|g| std::sync::Arc::new(g) as _),
+            view: true,
+        }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,
             reasons: services.reasons,

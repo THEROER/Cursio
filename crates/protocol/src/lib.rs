@@ -13,6 +13,7 @@ pub mod capability;
 pub mod clipboard;
 pub mod files;
 pub mod frame;
+pub mod gallery;
 pub mod input;
 pub mod media;
 pub mod messages;

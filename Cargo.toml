@@ -87,6 +87,10 @@ cc = "1"
 
 # Storage / config
 directories = "5"
+# Thumbnails of a computer's own photos for the gallery: decoders for what a
+# Pictures folder holds, and the JPEG encoder the thumbnails travel as.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+base64 = "0.22"
 # `config.toml`: a format people edit by hand, with comments, unlike the JSON
 # the trust store and identity are kept in.
 toml = "0.8"

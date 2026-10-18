@@ -487,6 +487,13 @@ final link, must land inside too. A link may still be listed and stat'ed as the
 link it is. A whole volume has nothing outside it to escape to and pays none of
 this.
 
+**The gallery** (`core/src/gallery_folder.rs`, `GalleryStore.kt`). Read-only
+and narrower than files: a computer offers its Pictures and Videos folders and
+nothing else, a phone the rows of its MediaStore. An id is resolved on the
+machine that issued it, confined the same way as a folder root — no `..`, and
+the resolved file, links followed, must be inside a gallery folder. See
+`gallery-design.md`.
+
 **The network** (`core/src/firewall.rs`). On Windows the mesh and discovery
 rules keep `profile=any` — Windows files many home LANs as Public, and a
 private-only rule would leave exactly those machines unreachable — but carry

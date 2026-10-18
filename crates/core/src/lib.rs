@@ -60,6 +60,13 @@ pub mod firewall;
 /// Removing a machine from the mesh: the trust store, builder trust, and what
 /// the running node holds about it.
 pub mod forget;
+/// This computer's Pictures and Videos, answered to peers browsing them.
+#[cfg(feature = "gallery")]
+pub mod gallery_folder;
+/// Where this machine's gallery is answered and a window's requests leave.
+pub mod gallery_hub;
+/// The gallery module on one link.
+pub mod gallery_session;
 /// Link, module and platform problems, each raised and cleared by name.
 pub mod health;
 pub mod identity;

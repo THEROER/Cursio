@@ -26,7 +26,7 @@ required-features = ["desktop"]
 # module that is off costs nothing to compile and cannot be negotiated on.
 [features]
 default = ["desktop"]
-desktop = ["audio", "input", "window", "files", "airplay", "usb", "calls", "bluetooth"]
+desktop = ["audio", "input", "window", "files", "airplay", "usb", "calls", "bluetooth", "gallery"]
 audio = ["dep:cursio-audio"]
 input = ["dep:cursio-input"]
 window = ["dep:cursio-window"]
@@ -39,6 +39,10 @@ calls = ["dep:cursio-bluetooth", "audio"]
 # network is not there. Only the socket comes from BlueZ; what crosses it is
 # the mesh itself.
 bluetooth = ["dep:cursio-bluetooth"]
+# This computer's Pictures and Videos for peers to browse: a folder walk and a
+# thumbnail decoder. A phone answers from its MediaStore instead, and browses
+# a peer's gallery without this.
+gallery = ["dep:image"]
 # AirPlay carries a window back to the mesh, so it cannot be built without the
 # window module to carry it through.
 airplay = ["dep:cursio-airplay", "window"]
@@ -53,6 +57,9 @@ cursio-window = { workspace = true, optional = true }
 cursio-files = { workspace = true, optional = true }
 cursio-usb = { workspace = true, optional = true }
 cursio-bluetooth = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+# Thumbnails cross the control socket's JSON as text.
+base64.workspace = true
 # Compresses file chunks when it pays; see files_session::pack.
 zstd = "0.13"
 # Build manifests: every installed file is checked against its sha256.

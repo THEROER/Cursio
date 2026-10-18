@@ -66,8 +66,10 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// v11: `nearby` in the status and in every pairing reply. v12: `path` on a
 /// link, the network or Bluetooth. v13: `inapplicable` on a link, apart from
 /// `skipped`. v14: `screens` in the status, `show_screen_source`, and
-/// `tray_attached`.
-pub const CONTROL_VERSION: u32 = 14;
+/// `tray_attached`. v15: a machine's gallery — `gallery_list`,
+/// `gallery_thumbnail`, `gallery_read`, `gallery_save`, and `gallery` in the
+/// status.
+pub const CONTROL_VERSION: u32 = 15;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -265,10 +267,51 @@ pub enum Command {
         peer: String,
         thread_id: i64,
     },
+    /// A machine's photos and videos, newest first, after `after` when
+    /// given. `peer` is its id or name; see [`crate::gallery_hub`].
+    GalleryList {
+        peer: String,
+        #[serde(default = "default_page")]
+        limit: u32,
+        #[serde(default)]
+        after: Option<cursio_protocol::gallery::PageMark>,
+        #[serde(default)]
+        filter: cursio_protocol::gallery::MediaFilter,
+    },
+    /// One item's thumbnail, a JPEG at most `max_px` on its longer edge.
+    GalleryThumbnail {
+        peer: String,
+        // Not `id`, which the request's own id would collide with.
+        item: String,
+        max_px: u32,
+    },
+    /// `len` bytes of one item from `offset`, for a viewer showing it whole.
+    GalleryRead {
+        peer: String,
+        item: String,
+        offset: u64,
+        len: u32,
+    },
+    /// Copy one item to this machine's `Pictures/Cursio/<peer>`.
+    GallerySave {
+        peer: String,
+        item: String,
+        name: String,
+    },
 }
 
 fn default_page() -> u32 {
     50
+}
+
+/// A gallery command, ready to put to the machine it names.
+enum GalleryAsk<'a> {
+    Request(&'a str, cursio_protocol::gallery::GalleryRequest),
+    Save {
+        peer: &'a str,
+        item: &'a str,
+        name: &'a str,
+    },
 }
 
 impl Command {
@@ -321,17 +364,99 @@ impl Command {
         })
     }
 
+    fn gallery_ask(&self) -> Option<GalleryAsk<'_>> {
+        use cursio_protocol::gallery::GalleryRequest;
+        Some(match self {
+            Command::GalleryList {
+                peer,
+                limit,
+                after,
+                filter,
+            } => GalleryAsk::Request(
+                peer,
+                GalleryRequest::List {
+                    limit: *limit,
+                    after: after.clone(),
+                    filter: *filter,
+                },
+            ),
+            Command::GalleryThumbnail { peer, item, max_px } => GalleryAsk::Request(
+                peer,
+                GalleryRequest::Thumbnail {
+                    id: item.clone(),
+                    max_px: *max_px,
+                },
+            ),
+            Command::GalleryRead {
+                peer,
+                item,
+                offset,
+                len,
+            } => GalleryAsk::Request(
+                peer,
+                GalleryRequest::Read {
+                    id: item.clone(),
+                    offset: *offset,
+                    len: *len,
+                },
+            ),
+            Command::GallerySave { peer, item, name } => GalleryAsk::Save { peer, item, name },
+            _ => return None,
+        })
+    }
+
     /// Whether answering waits on a peer rather than on this node alone. Such
     /// a command is answered off the connection's loop, so the status pushes
     /// and quick requests behind it are not held for seconds.
     pub fn waits_on_peer(&self) -> bool {
-        self.messages_request().is_some()
+        self.messages_request().is_some() || self.gallery_ask().is_some()
     }
+}
+
+/// Answer a gallery command by asking the machine it names.
+pub async fn ask_gallery(command: &Command) -> Option<Reply> {
+    use base64::Engine as _;
+    use cursio_protocol::gallery::GalleryResponse;
+    let hub = crate::gallery_hub::hub();
+    let reply = match command.gallery_ask()? {
+        GalleryAsk::Request(peer, request) => match hub.ask(peer, request).await {
+            Ok(GalleryResponse::Items(items)) => Reply::Media { items },
+            Ok(GalleryResponse::Thumbnail(jpeg)) => Reply::Thumbnail {
+                jpeg: jpeg.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
+            },
+            Ok(GalleryResponse::Slice(bytes)) => Reply::Slice {
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            },
+            Err(message) => Reply::Error { message },
+        },
+        GalleryAsk::Save { peer, item, name } => {
+            let peer_name = hub
+                .peers()
+                .into_iter()
+                .find(|p| p.peer.to_string() == peer || p.name.eq_ignore_ascii_case(peer))
+                .map(|p| p.name)
+                .unwrap_or_else(|| peer.to_string());
+            match crate::gallery_hub::save_dir(&peer_name) {
+                None => Reply::Error {
+                    message: "this machine names no Pictures or Downloads folder to save into"
+                        .into(),
+                },
+                Some(dir) => match hub.save(peer, item, name, &dir).await {
+                    Ok(path) => Reply::SavedFile { path },
+                    Err(message) => Reply::Error { message },
+                },
+            }
+        }
+    };
+    Some(reply)
 }
 
 /// Answer a command that waits on a peer; anything else goes to `state`.
 pub async fn handle_waiting(state: &NodeState, command: Command) -> Reply {
     use cursio_protocol::messages::MessagesResponse;
+    if let Some(reply) = ask_gallery(&command).await {
+        return reply;
+    }
     let Some((peer, request)) = command.messages_request() else {
         return state.handle(command);
     };
@@ -392,6 +517,22 @@ pub enum Reply {
     Messages {
         messages: Vec<cursio_protocol::messages::TextMessage>,
     },
+    /// A page of a machine's gallery.
+    Media {
+        items: Vec<cursio_protocol::gallery::MediaItem>,
+    },
+    /// A thumbnail as base64 JPEG, or none where the machine cannot make one.
+    Thumbnail {
+        jpeg: Option<String>,
+    },
+    /// Bytes of a gallery item, base64.
+    Slice {
+        data: String,
+    },
+    /// Where a gallery item was saved on this machine.
+    SavedFile {
+        path: PathBuf,
+    },
 }
 
 /// Everything a status window shows, in one reply.
@@ -436,6 +577,10 @@ pub struct Status {
     /// v13 node.
     #[serde(default)]
     pub screens: Vec<crate::screen_views::ScreenView>,
+    /// Machines whose galleries can be browsed now. Defaulted from a v14
+    /// node.
+    #[serde(default)]
+    pub gallery: Vec<crate::gallery_hub::GalleryPeer>,
 }
 
 /// A machine this node has heard announce itself on the LAN.
@@ -953,6 +1098,7 @@ impl NodeState {
             messages: crate::messages_hub::hub().peers(),
             nearby,
             screens: crate::screen_views::list(),
+            gallery: crate::gallery_hub::hub().peers(),
         }
     }
 
@@ -1102,6 +1248,12 @@ impl NodeState {
             | Command::SendSms { .. }
             | Command::MarkSmsRead { .. } => {
                 error("a phone's messages are read from a desktop's control socket")
+            }
+            Command::GalleryList { .. }
+            | Command::GalleryThumbnail { .. }
+            | Command::GalleryRead { .. }
+            | Command::GallerySave { .. } => {
+                error("a machine's gallery is browsed from a desktop's control socket")
             }
         }
     }
