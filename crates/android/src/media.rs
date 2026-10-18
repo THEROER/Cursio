@@ -196,6 +196,8 @@ struct Shown<'a> {
     can_previous: bool,
     can_seek: bool,
     art: Option<String>,
+    /// 0.0–1.0, when the computer can set this player's volume.
+    volume: Option<f32>,
 }
 
 pub fn shown_json(players: &[RemotePlayer]) -> String {
@@ -217,6 +219,7 @@ pub fn shown_json(players: &[RemotePlayer]) -> String {
             can_seek: r.player.can_seek,
             // Only once fetched: the notifier asks for the bytes by this.
             art: r.art.as_ref().and(r.player.art).map(|a| a.to_string()),
+            volume: r.player.volume,
         })
         .collect();
     serde_json::to_string(&shown).unwrap_or_else(|_| "[]".into())

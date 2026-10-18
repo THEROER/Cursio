@@ -13,6 +13,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.drawable.Icon
 import android.media.MediaMetadata
+import android.media.VolumeProvider
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
@@ -57,6 +58,8 @@ object MediaNotifier {
         var playing = false
         /** When it last went from not playing to playing; see [present]. */
         var startedAt = 0L
+        /** The computer's volume for this player, while it has one. */
+        var volume: VolumeProvider? = null
     }
 
     /**
@@ -157,7 +160,44 @@ object MediaNotifier {
         }
     }
 
+    /**
+     * The player's own volume on its computer, as the session's remote
+     * volume: the phone's volume keys and the slider under the player then
+     * turn Spotify up on the computer, not the phone's speaker — the way a
+     * cast session's volume works. A player whose computer cannot set its
+     * volume plays "locally", so the keys keep their ordinary meaning.
+     */
+    private fun followVolume(entry: Shown, p: JSONObject) {
+        if (!p.has("volume") || p.isNull("volume")) {
+            if (entry.volume != null) {
+                entry.session.setPlaybackToLocal(
+                    android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_MEDIA).build(),
+                )
+                entry.volume = null
+            }
+            return
+        }
+        val level = (p.getDouble("volume") * VOLUME_STEPS).toInt().coerceIn(0, VOLUME_STEPS)
+        val provider = entry.volume ?: object : VolumeProvider(VOLUME_CONTROL_ABSOLUTE, VOLUME_STEPS, level) {
+            override fun onSetVolumeTo(volume: Int) {
+                val v = volume.coerceIn(0, VOLUME_STEPS)
+                currentVolume = v
+                press(entry.peer, entry.player, "volume", v * 1000L / VOLUME_STEPS)
+            }
+
+            override fun onAdjustVolume(direction: Int) = onSetVolumeTo(currentVolume + direction * VOLUME_STEP)
+        }.also {
+            entry.volume = it
+            entry.session.setPlaybackToRemote(it)
+        }
+        provider.currentVolume = level
+    }
+
+    private const val VOLUME_STEPS = 100
+    private const val VOLUME_STEP = 5
+
     private fun fill(entry: Shown, p: JSONObject, peerName: String) {
+        followVolume(entry, p)
         val meta = MediaMetadata.Builder()
             .putString(MediaMetadata.METADATA_KEY_TITLE, p.optString("title"))
             .putString(MediaMetadata.METADATA_KEY_ARTIST, p.optString("artist").ifEmpty { "${p.optString("app")} · $peerName" })

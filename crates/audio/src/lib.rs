@@ -219,6 +219,12 @@ pub fn list_app_streams() -> Result<Vec<AppStream>, AudioError> {
     }
 }
 
+/// An application's own volume in the Windows mixer, by process name, and
+/// setting it: what a player's volume is on Windows, whose media controls
+/// expose none.
+#[cfg(target_os = "windows")]
+pub use wasapi_backend::{app_volume, set_app_volume};
+
 /// Marker in a device name that identifies one of Cursio's own mirrors, so
 /// enumeration can skip them (see [`list_output_devices`]).
 #[cfg(any(target_os = "linux", target_os = "windows"))]

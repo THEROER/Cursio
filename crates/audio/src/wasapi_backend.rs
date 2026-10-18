@@ -25,6 +25,7 @@ use windows::Win32::Media::Audio::{
     IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
     IAudioRenderClient, IAudioSessionControl, IAudioSessionControl2, IAudioSessionManager2,
+    ISimpleAudioVolume,
     IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
 };
@@ -147,7 +148,39 @@ fn list_endpoints(
 /// Cursio's own sessions are skipped so we never capture our own playback.
 pub fn list_app_streams() -> Result<Vec<crate::AppStream>, AudioError> {
     let _com = ComGuard::new()?;
-    // SAFETY: COM is initialized on this thread for the duration of the guard.
+    let mut out = Vec::new();
+    for (pid, ctl2) in app_sessions()? {
+        // Prefer the session's *display name* when it has one: that's what
+        // the Windows mixer shows, and it's how Cursio labels its own
+        // per-stream sessions ("Cursio(Peer): Firefox"). Fall back to the
+        // owning process name for ordinary apps, which set no display name.
+        // SAFETY: COM is initialized on this thread for the guard's life; the
+        // string is freed with the allocator COM used for it.
+        let display = unsafe {
+            ctl2.GetDisplayName().ok().and_then(|p| {
+                let s = p.to_string().ok();
+                windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const _));
+                s
+            })
+        }
+        .filter(|s| !s.is_empty());
+        let name = display
+            .or_else(|| process_name(pid))
+            .unwrap_or_else(|| format!("pid {pid}"));
+        out.push(crate::AppStream {
+            id: pid.to_string(),
+            app_name: name,
+        });
+    }
+    Ok(out)
+}
+
+/// Every application's audio session on the default render device, with its
+/// process id. System sessions (pid 0) and Cursio's own are left out — ours
+/// by pid, not by name: our streams are deliberately named "Cursio(Peer): …",
+/// so a name filter would hide exactly the rows wanted. The caller holds COM.
+fn app_sessions() -> Result<Vec<(u32, IAudioSessionControl2)>, AudioError> {
+    // SAFETY: the caller has COM initialized on this thread.
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
@@ -164,7 +197,6 @@ pub fn list_app_streams() -> Result<Vec<crate::AppStream>, AudioError> {
         let count = sessions
             .GetCount()
             .map_err(|e| AudioError::Backend(format!("session count: {e}")))?;
-
         let mut out = Vec::new();
         for i in 0..count {
             let Ok(ctl) = sessions.GetSession(i) else {
@@ -175,39 +207,47 @@ pub fn list_app_streams() -> Result<Vec<crate::AppStream>, AudioError> {
                 continue;
             };
             let pid = ctl2.GetProcessId().unwrap_or(0);
-            if pid == 0 {
-                continue; // system/shared session, not an app
-            }
-            // Prefer the session's *display name* when it has one: that's what
-            // the Windows mixer shows, and it's how Cursio labels its own
-            // per-stream sessions ("Cursio(Peer): Firefox"). Fall back to the
-            // owning process name for ordinary apps, which set no display name.
-            let display = ctl2
-                .GetDisplayName()
-                .ok()
-                .and_then(|p| {
-                    let s = p.to_string().ok();
-                    windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const _));
-                    s
-                })
-                .filter(|s| !s.is_empty());
-            // Skip our OWN sessions by process id, not by name: our streams are
-            // deliberately named "Cursio(Peer): …", so a name-based filter would
-            // hide exactly the rows we want to see (and still wouldn't catch a
-            // differently-named one). The pid is unambiguous.
-            if pid == std::process::id() {
+            if pid == 0 || pid == std::process::id() {
                 continue;
             }
-            let name = display
-                .or_else(|| process_name(pid))
-                .unwrap_or_else(|| format!("pid {pid}"));
-            out.push(crate::AppStream {
-                id: pid.to_string(),
-                app_name: name,
-            });
+            out.push((pid, ctl2));
         }
         Ok(out)
     }
+}
+
+/// The sessions of every process named `process` (no `.exe`, any case).
+fn sessions_of(process: &str) -> Result<Vec<ISimpleAudioVolume>, AudioError> {
+    Ok(app_sessions()?
+        .into_iter()
+        .filter(|(pid, _)| process_name(*pid).is_some_and(|n| n.eq_ignore_ascii_case(process)))
+        .filter_map(|(_, ctl2)| ctl2.cast::<ISimpleAudioVolume>().ok())
+        .collect())
+}
+
+/// An application's own volume in the Windows mixer (0.0–1.0), by process
+/// name; `None` while it has no audio session.
+pub fn app_volume(process: &str) -> Option<f32> {
+    let _com = ComGuard::new().ok()?;
+    let session = sessions_of(process).ok()?.into_iter().next()?;
+    // SAFETY: COM is initialized on this thread for the guard's life.
+    unsafe { session.GetMasterVolume() }.ok()
+}
+
+/// Set an application's own volume in the Windows mixer, on every session it
+/// has — Spotify plays through more than one process.
+pub fn set_app_volume(process: &str, volume: f32) -> Result<(), AudioError> {
+    let _com = ComGuard::new()?;
+    let sessions = sessions_of(process)?;
+    if sessions.is_empty() {
+        return Err(AudioError::Backend(format!("{process} is not playing anything")));
+    }
+    for session in sessions {
+        // SAFETY: COM is initialized on this thread for the guard's life.
+        unsafe { session.SetMasterVolume(volume.clamp(0.0, 1.0), std::ptr::null()) }
+            .map_err(|e| AudioError::Backend(format!("set {process}'s volume: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Resolve a process id to its executable name (without path/extension).

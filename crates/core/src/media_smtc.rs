@@ -129,8 +129,10 @@ fn read_player(session: &Session) -> Option<Player> {
         .Thumbnail()
         .is_ok()
         .then(|| art_hash(&format!("{id}\u{0}{title}\u{0}{artist}\u{0}{album}")));
+    let app = app_name(&id);
     Some(Player {
-        app: app_name(&id),
+        volume: app_volume(&app),
+        app,
         id,
         title,
         artist,
@@ -138,7 +140,6 @@ fn read_player(session: &Session) -> Option<Player> {
         state,
         duration_ms,
         position_ms,
-        volume: None,
         can_play: controls.IsPlayEnabled().unwrap_or(false),
         can_pause: controls.IsPauseEnabled().unwrap_or(false),
         can_next: controls.IsNextEnabled().unwrap_or(false),
@@ -146,6 +147,29 @@ fn read_player(session: &Session) -> Option<Player> {
         can_seek: controls.IsPlaybackPositionEnabled().unwrap_or(false),
         art,
     })
+}
+
+/// A player's volume is its app's own in the Windows mixer: the media
+/// controls carry none, and Spotify's in-app slider is not reachable from
+/// outside it. The two multiply, so turning this one is heard the same.
+#[cfg(feature = "audio")]
+fn app_volume(app: &str) -> Option<f32> {
+    cursio_audio::app_volume(app)
+}
+
+#[cfg(not(feature = "audio"))]
+fn app_volume(_app: &str) -> Option<f32> {
+    None
+}
+
+#[cfg(feature = "audio")]
+fn set_app_volume(app: &str, volume: f32) -> Result<(), String> {
+    cursio_audio::set_app_volume(app, volume).map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "audio"))]
+fn set_app_volume(_app: &str, _volume: f32) -> Result<(), String> {
+    Err("this build has no audio backend to set a player's volume with".into())
 }
 
 /// A player's name from its app id: `Spotify.exe` is Spotify, and a packaged
@@ -181,8 +205,10 @@ impl MediaBackend for SmtcBackend {
             MediaCommand::Seek { position_ms } => {
                 session.TryChangePlaybackPositionAsync(position_ms as i64 * 10_000)
             }
-            MediaCommand::SetVolume { .. } => {
-                return Err("Windows does not let one app set another's player volume".into())
+            MediaCommand::SetVolume { volume } => {
+                set_app_volume(&app_name(player), volume)?;
+                hub().local_changed();
+                return Ok(());
             }
         }
         .and_then(|op| op.get())
