@@ -40,6 +40,12 @@ pub const DOWN_EVENT: &str = "node://down";
 #[cfg(desktop)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Longest a request answered by a phone may take: the node itself waits
+/// [`cursio_core::messages_hub::ANSWER_WAIT`] for the phone, and says which
+/// one did not answer; this only catches a node that never replies at all.
+#[cfg(desktop)]
+const PHONE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How soon to look for a node again once it has gone.
 const RECONNECT: Duration = Duration::from_secs(1);
 
@@ -121,14 +127,25 @@ impl NodeLink {
     /// follower is between connections, within [`REQUEST_TIMEOUT`].
     #[cfg(desktop)]
     pub async fn request(&self, command: Command) -> Result<Reply, NodeError> {
+        self.request_within(command, REQUEST_TIMEOUT).await
+    }
+
+    /// [`Self::request`] with a deadline of the caller's: a command the node
+    /// answers only once a peer has is given longer than one it answers itself.
+    #[cfg(desktop)]
+    pub async fn request_within(
+        &self,
+        command: Command,
+        deadline: Duration,
+    ) -> Result<Reply, NodeError> {
         let client = match self.connected() {
             Some(client) => client,
             None => connect().await?.0,
         };
-        match tokio::time::timeout(REQUEST_TIMEOUT, client.request(command)).await {
+        match tokio::time::timeout(deadline, client.request(command)).await {
             Err(_) => Err(NodeError::failed(format!(
                 "the node did not answer within {} s",
-                REQUEST_TIMEOUT.as_secs()
+                deadline.as_secs()
             ))),
             Ok(Err(e)) => Err(NodeError::NotRunning {
                 message: e.to_string(),
@@ -505,6 +522,78 @@ pub mod commands {
             muted,
         })
         .await
+    }
+
+    /// A phone's conversations, newest first. `peer` is its id.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn messages_conversations(
+        link: State<'_, NodeLink>,
+        peer: String,
+        limit: u32,
+        before_ms: Option<i64>,
+    ) -> Result<Reply, NodeError> {
+        link.request_within(
+            Command::ListConversations {
+                peer,
+                limit,
+                before_ms,
+            },
+            PHONE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// One conversation's messages, newest first.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn messages_thread(
+        link: State<'_, NodeLink>,
+        peer: String,
+        thread_id: i64,
+        limit: u32,
+        before_ms: Option<i64>,
+    ) -> Result<Reply, NodeError> {
+        link.request_within(
+            Command::ListMessages {
+                peer,
+                thread_id,
+                limit,
+                before_ms,
+            },
+            PHONE_TIMEOUT,
+        )
+        .await
+    }
+
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn messages_send(
+        link: State<'_, NodeLink>,
+        peer: String,
+        addresses: Vec<String>,
+        body: String,
+    ) -> Result<Reply, NodeError> {
+        link.request_within(
+            Command::SendSms {
+                peer,
+                addresses,
+                body,
+            },
+            PHONE_TIMEOUT,
+        )
+        .await
+    }
+
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn messages_mark_read(
+        link: State<'_, NodeLink>,
+        peer: String,
+        thread_id: i64,
+    ) -> Result<Reply, NodeError> {
+        link.request_within(Command::MarkSmsRead { peer, thread_id }, PHONE_TIMEOUT)
+            .await
     }
 
     /// Off the window's thread: `systemctl` or a process spawn can take a

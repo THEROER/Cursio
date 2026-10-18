@@ -27,6 +27,11 @@ const items = computed<SidebarItem[]>(() => [
   { id: "/", label: t("nav.status"), icon: "lucide:activity", badge: status.value?.problems.length || undefined },
   { id: "/placement", label: t("nav.placement"), icon: "lucide:layout-grid" },
   { id: "/pair", label: t("nav.pair"), icon: "lucide:link", badge: status.value?.pairing ? "•" : undefined },
+  // Only while a phone shares its messages, or the page is already open
+  // (`cursio-app --page messages` from the Shell menu).
+  ...(status.value?.messages?.length || route.path === "/messages"
+    ? [{ id: "/messages", label: t("nav.messages"), icon: "lucide:message-square" }]
+    : []),
   { id: "/settings", label: t("nav.settings"), icon: "lucide:settings" },
 ])
 

@@ -41,6 +41,29 @@ fn app_platform() -> &'static str {
     }
 }
 
+/// The page `--page` asked for when this process started, for the window to
+/// take once it is listening: a `navigate` event sent while the page is still
+/// loading reaches nobody.
+#[cfg(desktop)]
+#[derive(Default)]
+struct StartPage(std::sync::Mutex<Option<String>>);
+
+#[cfg(desktop)]
+#[tauri::command]
+fn app_start_page(start: tauri::State<'_, StartPage>) -> Option<String> {
+    start.0.lock().unwrap_or_else(|p| p.into_inner()).take()
+}
+
+/// The route `--page <name>` names, e.g. `--page messages` → `/messages`.
+/// Only a plain page name is taken: this is an argument any program may pass.
+#[cfg(desktop)]
+fn page_route(args: impl IntoIterator<Item = String>) -> Option<String> {
+    let mut args = args.into_iter();
+    args.find(|a| a == "--page")?;
+    let page = args.next()?;
+    (!page.is_empty() && page.chars().all(|c| c.is_ascii_lowercase())).then(|| format!("/{page}"))
+}
+
 /// Steer WebKitGTK away from the renderer paths that crash it, before any
 /// thread exists and before Tauri creates the webview.
 ///
@@ -109,7 +132,18 @@ pub fn run() {
     let builder = tauri::Builder::default().manage(node::NodeLink::default());
 
     #[cfg(desktop)]
+    let first_page = page_route(std::env::args());
+
+    #[cfg(desktop)]
     let builder = builder
+        // First, as the plugin requires: a second launch must be caught before
+        // it builds a window and a tray of its own.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if argv.iter().any(|a| a == "--hidden") {
+                return;
+            }
+            tray::open(app, &page_route(argv).unwrap_or_else(|| "/".into()));
+        }))
         .setup(move |app| {
             node::follow(app.handle().clone());
             // `reg.exe` / `systemctl`: off the thread that draws the window.
@@ -125,8 +159,13 @@ pub fn run() {
             } else if !hidden {
                 tray::open(app.handle(), "/");
             }
+            *tauri::Manager::state::<StartPage>(app)
+                .0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = first_page.clone();
             Ok(())
         })
+        .manage(StartPage::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -135,6 +174,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_platform,
+            app_start_page,
+            node::commands::messages_conversations,
+            node::commands::messages_thread,
+            node::commands::messages_send,
+            node::commands::messages_mark_read,
             node::commands::node_status,
             node::commands::node_config,
             node::commands::node_set_module,
@@ -198,4 +242,24 @@ pub fn run() {
     builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(all(test, desktop))]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_page_argument_opens_only_a_plain_page_name() {
+        assert_eq!(
+            page_route(args(&["cursio-app", "--page", "messages"])),
+            Some("/messages".into())
+        );
+        assert_eq!(page_route(args(&["cursio-app", "--page", "../etc"])), None);
+        assert_eq!(page_route(args(&["cursio-app", "--page"])), None);
+        assert_eq!(page_route(args(&["cursio-app", "--hidden"])), None);
+    }
 }

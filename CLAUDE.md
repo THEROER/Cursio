@@ -105,7 +105,7 @@ Anything requiring a compositor, a GPU or a peer is tested through in-memory fak
 
 **Platform code**: gate with `#[cfg(target_os = ...)]` and always give a fallback arm that returns an explicit error instead of degrading silently. Unimplemented codec paths are errors, not silent fallbacks, so premature use surfaces rather than shipping garbage.
 
-`docs/*.md` are the source of truth for their subsystems (`mesh-design`, `platform-design`, `input-design`, `audio-design`, `clipboard-design`, `window-transfer-design`, `calls-design`). If code diverges from a design doc, fix one or the other in the same change.
+`docs/*.md` are the source of truth for their subsystems (`mesh-design`, `platform-design`, `input-design`, `audio-design`, `clipboard-design`, `window-transfer-design`, `messages-design`, `calls-design`). If code diverges from a design doc, fix one or the other in the same change.
 
 ## Architecture
 
@@ -130,7 +130,7 @@ Every node listens for peers dialling in *and* dials the known peers that are do
 
 A feature is a `SessionModule` (`core/src/module.rs`), built by a `ModuleFactory`, assembled into a `ModuleRegistry`. `run_session` hands each built module to a `ModuleHost`: a dedicated OS thread that runs it with `Handle::block_on` on the link's runtime (so what a module spawns outlives its thread), calling `start`, then `pump` at the module's own pace (fast while it has traffic, idle after ~100 ms of quiet, `has_pending_work` keeps it fast) and `handle_message` for its inbox, and finally `shutdown`. Each module sends through its own clone of the prioritized sender (`TransportTx::clone_sender`), so its frames are scheduled against input exactly as before. Inbound routing is by id, not by asking: the reader task sends each message to the one module named by `Message::module_id()` (enveloped `Module` frames plus the `AudioChunk`/`WindowFrame`/`WindowInput` hot paths), and only the session's own vocabulary reaches the session loop.
 
-`ModuleId` constants live in `protocol/src/capability.rs` (input 1, audio 2, clipboard 3, window 4, files 5, service 6, usb 7, update 8, share 9, notify 10, calls 12; 11 is SMS). Both sides advertise `ModuleAdvert` in `Hello`, negotiate, and build only what they agreed on — this is what fixed the old failure where `--audio` on one side silently half-configured the link. The CLI's only job is to construct the registry; after that nothing names a specific module. **Add capability by adding a module, not by branching in the CLI.**
+`ModuleId` constants live in `protocol/src/capability.rs` (input 1, audio 2, clipboard 3, window 4, files 5, service 6, usb 7, update 8, share 9, notify 10, messages 11, calls 12). Both sides advertise `ModuleAdvert` in `Hello`, negotiate, and build only what they agreed on — this is what fixed the old failure where `--audio` on one side silently half-configured the link. The CLI's only job is to construct the registry; after that nothing names a specific module. **Add capability by adding a module, not by branching in the CLI.**
 
 A slow `pump` (≥50 ms) or `handle_message` (≥20 ms) is still logged, now as delaying *that module's* own traffic — it no longer means input waited. Teardown asks every module to stop, waits at most `MODULE_SHUTDOWN_GRACE` (3 s) for all of them, then detaches a wedged one with a warning naming it and closes its sender so the link can close. A module's `start` failing or its send failing ends the session, as before. Keep pumps bounded anyway: while one runs, its own replies wait.
 
@@ -230,6 +230,10 @@ Kotlin lives in the Gradle library module `crates/android/plugin` (`src/main/jav
 **Paths are handed in, not derived.** Android's writable directory is chosen by the system per install and reaches the app only through `Context.getFilesDir()`, so `nativeInit` must be called first and everything persistent resolves against `cursio_protocol::paths` (logs through `cursio_log::set_log_dir`, which stays independent so the logging primitive does not depend on the wire vocabulary).
 
 **Depend on `cursio-core` by path, not `workspace = true`.** A workspace dependency carries its own `default-features`, and a `default-features = false` beside it is ignored — which silently pulled PipeWire, FUSE and libopus into a phone build.
+
+### Messages: asked for, never pushed
+
+A phone's SMS are read and sent from a desktop (`messages_session.rs`, `docs/messages-design.md`). The phone advertises `Source` with `SmsStore.kt` behind it, a desktop `Sink`; two desktops leave the module off. Nothing is copied ahead of time: the desktop asks for a page (newest first, cut by date) and the phone answers it, sending unasked only `Changed`. Requests are bounded by `messages_session::check` before the store sees them. Only the default SMS app may write the provider, so marking read is refused with that reason rather than faked; MMS attachments are flagged, not carried. Control commands that wait on a phone (`Command::waits_on_peer`) are answered off the socket connection's loop.
 
 ### Android: the core crosses, a module crosses with its backend
 

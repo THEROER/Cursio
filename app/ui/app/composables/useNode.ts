@@ -119,6 +119,8 @@ export interface NodeStatusReply {
   update: UpdateStatus
   /** Peer streams playing on this machine. The app's own core defaults it from an older node. */
   streams: PlayingStream[]
+  /** Phones whose messages can be read here; absent from a node older than control v10. */
+  messages?: import("~/composables/useMessages").MessagesPeer[]
 }
 
 /** Mirrors `cursio_core::mixer::MixerStream`: the listener's own say on one stream. */

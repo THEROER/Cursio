@@ -48,6 +48,11 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 # Session-bus calls: desktop notifications and Mutter's idle time.
 zbus = "5"
+# A second `cursio-app` (the Shell menu opening a page, a launcher click)
+# hands its arguments to the running one instead of starting another tray.
+# Held below 2.5, which requires Tauri 2.12 and would move the whole app's
+# Tauri with it.
+tauri-plugin-single-instance = "~2.4"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
