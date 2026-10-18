@@ -61,8 +61,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// `forget`, removing a machine from the mesh. v7: `streams` in the status and
 /// `set_stream_volume`, the listener's volume on each peer stream. v8:
 /// `set_name`, and `available` in the status. v9: `share`, sending a link,
-/// text or file to a peer.
-pub const CONTROL_VERSION: u32 = 9;
+/// text or file to a peer. v10: a phone's messages — `list_conversations`,
+/// `list_messages`, `send_sms`, `mark_sms_read`, and `messages` in the status.
+pub const CONTROL_VERSION: u32 = 10;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -218,6 +219,115 @@ pub enum Command {
     Ring {
         peer: String,
     },
+    /// A phone's conversations, newest first, older than `before_ms` when
+    /// given. `peer` is the phone's id or name. Answered by the phone, so it
+    /// takes as long as the link does; see [`crate::messages_hub`].
+    ListConversations {
+        peer: String,
+        #[serde(default = "default_page")]
+        limit: u32,
+        #[serde(default)]
+        before_ms: Option<i64>,
+    },
+    /// One conversation's messages, newest first.
+    ListMessages {
+        peer: String,
+        thread_id: i64,
+        #[serde(default = "default_page")]
+        limit: u32,
+        #[serde(default)]
+        before_ms: Option<i64>,
+    },
+    /// Send an SMS from the phone.
+    SendSms {
+        peer: String,
+        addresses: Vec<String>,
+        body: String,
+    },
+    /// Mark a conversation read on the phone, which only the phone's default
+    /// SMS app may do; the refusal says so.
+    MarkSmsRead {
+        peer: String,
+        thread_id: i64,
+    },
+}
+
+fn default_page() -> u32 {
+    50
+}
+
+impl Command {
+    /// The request a messages command puts to a phone, and which phone.
+    fn messages_request(&self) -> Option<(&str, cursio_protocol::messages::MessagesRequest)> {
+        use cursio_protocol::messages::MessagesRequest;
+        Some(match self {
+            Command::ListConversations {
+                peer,
+                limit,
+                before_ms,
+            } => (
+                peer,
+                MessagesRequest::ListConversations {
+                    limit: *limit,
+                    before_ms: *before_ms,
+                },
+            ),
+            Command::ListMessages {
+                peer,
+                thread_id,
+                limit,
+                before_ms,
+            } => (
+                peer,
+                MessagesRequest::ListMessages {
+                    thread_id: *thread_id,
+                    limit: *limit,
+                    before_ms: *before_ms,
+                },
+            ),
+            Command::SendSms {
+                peer,
+                addresses,
+                body,
+            } => (
+                peer,
+                MessagesRequest::Send {
+                    addresses: addresses.clone(),
+                    body: body.clone(),
+                },
+            ),
+            Command::MarkSmsRead { peer, thread_id } => (
+                peer,
+                MessagesRequest::MarkRead {
+                    thread_id: *thread_id,
+                },
+            ),
+            _ => return None,
+        })
+    }
+
+    /// Whether answering waits on a peer rather than on this node alone. Such
+    /// a command is answered off the connection's loop, so the status pushes
+    /// and quick requests behind it are not held for seconds.
+    pub fn waits_on_peer(&self) -> bool {
+        self.messages_request().is_some()
+    }
+}
+
+/// Answer a command that waits on a peer; anything else goes to `state`.
+pub async fn handle_waiting(state: &NodeState, command: Command) -> Reply {
+    use cursio_protocol::messages::MessagesResponse;
+    let Some((peer, request)) = command.messages_request() else {
+        return state.handle(command);
+    };
+    match crate::messages_hub::hub().ask(peer, request).await {
+        Ok(MessagesResponse::Conversations(conversations)) => {
+            Reply::Conversations { conversations }
+        }
+        Ok(MessagesResponse::Messages(messages)) => Reply::Messages { messages },
+        Ok(MessagesResponse::Sent | MessagesResponse::Done) => Reply::Done,
+        Err(message) => Reply::Error { message },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,6 +366,12 @@ pub enum Reply {
         /// It had been trusted to sign builds for this machine.
         was_builder: bool,
     },
+    Conversations {
+        conversations: Vec<cursio_protocol::messages::Conversation>,
+    },
+    Messages {
+        messages: Vec<cursio_protocol::messages::TextMessage>,
+    },
 }
 
 /// Everything a status window shows, in one reply.
@@ -289,6 +405,9 @@ pub struct Status {
     /// Every connected phone that reports calls, and its calls now.
     #[serde(default)]
     pub calls: Vec<crate::calls_hub::PhoneCalls>,
+    /// Phones whose messages can be read now. Defaulted from a v9 node.
+    #[serde(default)]
+    pub messages: Vec<crate::messages_hub::MessagesPeer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -670,6 +789,7 @@ impl NodeState {
             update: crate::update::agent::status(),
             streams: self.mixer.streams(),
             calls: crate::calls_hub::hub().phones(),
+            messages: crate::messages_hub::hub().peers(),
         }
     }
 
@@ -804,6 +924,14 @@ impl NodeState {
                 }
                 Err(e) => error(e),
             },
+            // They wait on a phone, which this synchronous path must not;
+            // the socket answers them through `handle_waiting`.
+            Command::ListConversations { .. }
+            | Command::ListMessages { .. }
+            | Command::SendSms { .. }
+            | Command::MarkSmsRead { .. } => {
+                error("a phone's messages are read from a desktop's control socket")
+            }
         }
     }
 
@@ -886,6 +1014,17 @@ mod tests {
                 stream: 4,
                 volume: 0.5,
                 muted: true,
+            },
+            Command::ListMessages {
+                peer: "POCO".into(),
+                thread_id: 12,
+                limit: 30,
+                before_ms: Some(1_700_000_000_000),
+            },
+            Command::SendSms {
+                peer: "POCO".into(),
+                addresses: vec!["+380501234567".into()],
+                body: "on my way".into(),
             },
         ];
         for (id, command) in commands.into_iter().enumerate() {

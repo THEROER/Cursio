@@ -143,6 +143,12 @@ enum Command {
         #[command(subcommand)]
         action: BluetoothAction,
     },
+    /// Read and send a connected phone's text messages, through the running
+    /// node.
+    Sms {
+        #[command(subcommand)]
+        action: SmsAction,
+    },
     /// List peers discovered on the LAN, then exit.
     Peers {
         #[arg(long, default_value_t = 5)]
@@ -423,6 +429,31 @@ enum PortalAction {
     /// Forward every screen-cast request to GNOME; what D-Bus starts when no
     /// `cursio mesh` holds the backend's name.
     Relay,
+}
+
+#[derive(Subcommand)]
+enum SmsAction {
+    /// The phone's conversations, newest first.
+    List {
+        /// The phone's name or id, as `cursio status` shows it.
+        phone: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// One conversation, oldest of the page first.
+    Read {
+        phone: String,
+        /// The conversation's id, as `cursio sms list` shows it.
+        thread: i64,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Send an SMS from the phone.
+    Send {
+        phone: String,
+        number: String,
+        text: String,
+    },
 }
 
 /// What this machine offers over `--files`: the flag's roots when any were
@@ -1114,6 +1145,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Call { action } => call(action).await,
         Command::Bluetooth { action } => bluetooth(action),
+        Command::Sms { action } => sms(action).await,
         Command::Portal { action } => portal(action).await,
         Command::MountHelper { .. } => unreachable!("handled before the node starts"),
     }
@@ -1746,6 +1778,10 @@ fn module_registry(
         .with(Box::new(cursio_core::calls_session::CallsFactory {
             actor: None,
             computer: true,
+        }))
+        .with(Box::new(cursio_core::messages_session::MessagesFactory {
+            store: None,
+            view: true,
         }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,
@@ -3289,6 +3325,87 @@ async fn print_status(json: bool) -> anyhow::Result<()> {
 }
 
 /// Hand a share to the running node, which holds the links.
+/// `cursio sms`: one request to the phone through the running node.
+async fn sms(action: SmsAction) -> anyhow::Result<()> {
+    use cursio_core::control::{Command, Reply};
+    let client = control_client().await.map_err(|e| {
+        anyhow::anyhow!(
+            "no running node to reach the phone through ({e}); start `cursio mesh` first"
+        )
+    })?;
+    let command = match &action {
+        SmsAction::List { phone, limit } => Command::ListConversations {
+            peer: phone.clone(),
+            limit: *limit,
+            before_ms: None,
+        },
+        SmsAction::Read {
+            phone,
+            thread,
+            limit,
+        } => Command::ListMessages {
+            peer: phone.clone(),
+            thread_id: *thread,
+            limit: *limit,
+            before_ms: None,
+        },
+        SmsAction::Send {
+            phone,
+            number,
+            text,
+        } => Command::SendSms {
+            peer: phone.clone(),
+            addresses: vec![number.clone()],
+            body: text.clone(),
+        },
+    };
+    match client.request(command).await? {
+        Reply::Conversations { conversations } => {
+            for c in conversations {
+                let who = if c.names.is_empty() {
+                    c.addresses.join(", ")
+                } else {
+                    c.names.join(", ")
+                };
+                println!(
+                    "{:>6}  {}{}  {}",
+                    c.thread_id,
+                    if c.unread { "* " } else { "" },
+                    who,
+                    c.snippet.replace('\n', " ")
+                );
+            }
+            Ok(())
+        }
+        Reply::Messages { messages } => {
+            for m in messages.iter().rev() {
+                let arrow = match m.kind {
+                    cursio_protocol::messages::MessageKind::Inbox => "<",
+                    cursio_protocol::messages::MessageKind::Failed => "!",
+                    _ => ">",
+                };
+                let attachment = if m.attachment {
+                    " [attachment not shown]"
+                } else {
+                    ""
+                };
+                println!("{arrow} {}: {}{attachment}", m.address, m.body);
+            }
+            Ok(())
+        }
+        Reply::Done => {
+            if let SmsAction::Send { number, .. } = action {
+                println!("handed to the phone for {number}");
+            }
+            Ok(())
+        }
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!(
+            "the running node does not know a phone's messages ({other:?}); restart it with this version of Cursio"
+        ),
+    }
+}
+
 async fn send_share(target: &str, to: &str, copy: bool, save: bool) -> anyhow::Result<()> {
     use cursio_core::control::{Command, Reply};
     use cursio_protocol::share::ShareAction;

@@ -160,8 +160,16 @@ where
     let mut refresh = tokio::time::interval(PUSH_REFRESH);
     let mut subscribed = false;
     let mut last_pushed: Option<super::Status> = None;
+    // Answers to commands that wait on a peer, written whenever they arrive;
+    // ids let the client match them however late.
+    let (late_tx, mut late) = tokio::sync::mpsc::unbounded_channel::<Response>();
     let result = loop {
         tokio::select! {
+            Some(response) = late.recv() => {
+                if let Err(e) = write_json(&mut write, &response).await {
+                    break Err(e);
+                }
+            }
             line = lines.recv() => {
                 let line = match line {
                     Some(Ok(Some(line))) => line,
@@ -169,6 +177,15 @@ where
                     Some(Err(e)) => break Err(e),
                 };
                 let response = match serde_json::from_str::<Request>(&line) {
+                    Ok(request) if request.command.waits_on_peer() => {
+                        let state = state.clone();
+                        let late_tx = late_tx.clone();
+                        tokio::spawn(async move {
+                            let reply = super::handle_waiting(&state, request.command).await;
+                            let _ = late_tx.send(Response { id: request.id, reply });
+                        });
+                        continue;
+                    }
                     Ok(request) => {
                         subscribed |= request.command == Command::Subscribe;
                         Response {
@@ -606,6 +623,29 @@ mod tests {
         );
         assert!(matches!(ping.unwrap(), Reply::Pong { .. }));
         assert!(matches!(status.unwrap(), Reply::Status(_)));
+    }
+
+    /// A request waiting on a phone that has not answered yet does not hold
+    /// up a quick one sent after it on the same connection.
+    #[tokio::test]
+    async fn a_request_waiting_on_a_phone_does_not_hold_up_the_next_one() {
+        let dir = std::env::temp_dir().join(format!("cursio-ctl-wait-{}", std::process::id()));
+        let phone = cursio_protocol::PeerId::from_bytes([0x61; 16]);
+        let (_outbox, _token) = crate::messages_hub::hub().register(phone, "slowphone".into());
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(serve_connection(server_side, node(&dir)));
+        let (client, _pushes) = Client::start(client_side);
+        let waiting = client.request(Command::ListConversations {
+            peer: "slowphone".into(),
+            limit: 10,
+            before_ms: None,
+        });
+        tokio::pin!(waiting);
+        let ping = tokio::select! {
+            _ = &mut waiting => panic!("nobody answered for the phone, yet it returned"),
+            ping = client.request(Command::Ping) => ping,
+        };
+        assert!(matches!(ping.unwrap(), Reply::Pong { .. }));
     }
 
     /// A subscriber is sent the status at once and again when something it
