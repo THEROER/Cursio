@@ -612,7 +612,11 @@ swaps captures under one reserved `SCREEN_STREAM_ID` and sends `SourceShown`
 ahead of the new source's first frame; the view restarts its decoder in
 place), it follows the source's size (nobody sees it, so 1:1 is best for the
 capture), and its selector — which cannot be a right-click on a window that is
-nowhere — is a **notification-area icon** per peer with the same menu. A new
+nowhere — is the Cursio app's tray, a "Show in Discord/OBS" submenu with a
+peer each (`screen_views`, `show_screen_source`). Each view also has a
+**notification-area icon** with the same menu, shown only while no app is
+attached (`tray_attached`): an icon per peer beside the app's own read as the
+same program twice, and a node without the app still needs a selector. A new
 view shows the peer's first monitor unasked. Painting fills only the letterbox
 bars, never the whole client first: DWM composes a redirected window whenever
 it likes, and a capture taken between a full black fill and the blit recorded
@@ -744,7 +748,8 @@ versioned through its `ModuleAdvert` (2 → 3 for these, 3 → 4 for `VideoCaps`
 
 On Linux there is no selector of Cursio's beyond the portal chooser: each pick
 in the capture app is a new request. On Windows the menu (screens, windows,
-"Show nothing") hangs off the view's notification-area icon; it is
+"Show nothing") is in the app's tray, or on the view's own notification-area
+icon when no app is attached; the icon's menu is
 `TrackPopupMenu`, a window of its own, so it never reaches the pixels even if
 the view were visible. An idle view paints one line of hint naming the icon —
 seen only in the capture app's preview, which is exactly where someone wonders

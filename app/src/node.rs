@@ -270,7 +270,12 @@ async fn relay(
     mut pushes: tokio::sync::mpsc::Receiver<Reply>,
 ) -> NodeError {
     match tokio::time::timeout(REQUEST_TIMEOUT, client.request(Command::Subscribe)).await {
-        Ok(Ok(Reply::Subscribed)) => {}
+        Ok(Ok(Reply::Subscribed)) => {
+            // An older node does not know the command; its views keep their icons.
+            if crate::tray::shown() {
+                let _ = client.request(Command::TrayAttached).await;
+            }
+        }
         Ok(Ok(other)) => {
             return NodeError::failed(format!(
                 "the running node does not push its status ({other:?}); restart it with this \
