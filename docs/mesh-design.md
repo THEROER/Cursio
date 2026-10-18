@@ -475,6 +475,47 @@ input p50/p99/max (with video and bulk p99 beside it) at `debug`, or `info` when
 input p99 reaches 4 ms; `TransportTx::queue_delay` returns the last complete
 window.
 
+## Two paths, one mesh: the network and Bluetooth
+
+A phone with Wi-Fi off, or out of the house's range, or on a hotspot the
+computer is not on, is still the same peer — so it keeps the same link, carried
+by Bluetooth. **Bluetooth is a second path, not a second protocol**: the bytes
+on it are the mesh's own, the same `Hello`, stored key (or pairing), Noise
+`NNpsk0`, module negotiation and priority classes as over TCP. Only the socket
+differs: `cursio_transport::stream::StreamTransport` frames messages over any
+byte stream, and the session layer is written against `Transport`, so nothing
+above it can tell. (HFP and A2DP, Cursio as a phone's headset and speaker, are
+the deliberate exceptions, like AirPlay: Android hands a call's voice and an
+unprompted copy of its sound only to those profiles. They are not this path.)
+
+- **The phone dials, the computer listens.** Android keeps an app from learning
+  its own Bluetooth address, so the computer has nothing to call until the
+  phone has. The computer registers a BlueZ external profile under Cursio's own
+  UUID (`cursio_bluetooth::MESH_UUID`, `MeshChannel`): BlueZ picks the RFCOMM
+  channel, publishes the SDP record and hands each accepted socket to
+  `NewConnection`, and the mesh loop runs it like an accepted TCP connection.
+  Only paired devices may open it (`RequireAuthentication`).
+- **Finding the computer** needs no discovery protocol: the phone lists the
+  computers it is paired with in the system's Bluetooth settings and asks each
+  for the Cursio service. Which mesh peer answered is learned from `Hello`, as
+  on TCP.
+- **The network wins.** The phone dials over Bluetooth only once a known
+  computer has been off the network for 20 s (`bt::NETWORK_GRACE`), each device
+  at most every 30 s. A Bluetooth link ends itself once its computer is heard
+  on the network again *and* answers a TCP connection there — hearing alone is
+  not enough, a hotspot's client hears a LAN it cannot reach — and the ordinary
+  dial takes over at network speed.
+- **What fits.** RFCOMM carries a few hundred kilobytes a second. The priority
+  classes already keep input, notifications, messages, calls' control and Opus
+  audio ahead of screens and files, so those keep working and the bulk classes
+  simply go slowly.
+- **Visible.** A link's path is `LinkView::path` (`network` or `bluetooth`,
+  control v12): `cursio status` shows `bluetooth` for such a peer, the GNOME
+  menu a Bluetooth icon, the app a badge.
+
+On Windows and macOS the computer's half is not built yet and says so in the
+log; phones reach those machines over the network only.
+
 ## Where it lives
 
 All five parts shipped, and the code is laid out along the same seams:

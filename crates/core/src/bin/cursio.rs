@@ -1905,8 +1905,30 @@ async fn run_mesh(
     local
         .run_until(async move {
             let mut sweep = tokio::time::interval(cursio_core::mesh::sweep_interval());
+            let mut bluetooth = BluetoothListener::start();
             loop {
                 tokio::select! {
+                    // A paired phone off the network opened the mesh's
+                    // Bluetooth channel. Same handshake, same session: only
+                    // the path differs.
+                    Some((device, transport)) = bluetooth.accept() => {
+                        tracing::info!(%device, "peer dialled in over bluetooth");
+                        spawn_peer_session(
+                            transport,
+                            identity.clone(),
+                            Role::Responder,
+                            None,
+                            registry.clone(),
+                            pairing.clone(),
+                            control.clone(),
+                            capture.clone(),
+                            status.clone(),
+                            live.clone(),
+                            modules.clone(),
+                            offer,
+                        );
+                    }
+
                     // A peer dialled us. We don't know who until the handshake,
                     // so the session itself reports the identity back.
                     accepted = listener.accept() => {
@@ -2173,9 +2195,47 @@ fn start_control(state: cursio_core::control::NodeState) {
     });
 }
 
+/// The mesh's Bluetooth channel where this build has one, and on Windows a
+/// listener that never accepts, so the mesh loop reads the same either way.
+struct BluetoothListener {
+    #[cfg(unix)]
+    inner: cursio_core::bluetooth_link::Listener,
+}
+
+impl BluetoothListener {
+    fn start() -> Self {
+        #[cfg(unix)]
+        {
+            BluetoothListener {
+                inner: cursio_core::bluetooth_link::listen(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tracing::warn!("the mesh's bluetooth channel is not implemented on this platform; phones reach it over the network only");
+            BluetoothListener {}
+        }
+    }
+
+    #[cfg(unix)]
+    async fn accept(
+        &mut self,
+    ) -> Option<(
+        String,
+        cursio_transport::stream::StreamTransport<tokio::net::UnixStream>,
+    )> {
+        self.inner.accept().await
+    }
+
+    #[cfg(not(unix))]
+    async fn accept(&mut self) -> Option<(String, TcpTransport)> {
+        std::future::pending().await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn spawn_peer_session(
-    transport: TcpTransport,
+fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
+    transport: T,
     identity: NodeIdentity,
     role: Role,
     expected: Option<cursio_protocol::PeerId>,
@@ -2307,8 +2367,8 @@ type IdentifiedCallback<'a> = dyn FnMut(cursio_protocol::PeerId, &str) + 'a;
 // Down from 13 arguments to 10, and the rest are session plumbing rather than
 // per-module knobs — a new module adds nothing here.
 #[allow(clippy::too_many_arguments)]
-async fn run_pairing_and_session(
-    transport: TcpTransport,
+async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
+    transport: T,
     identity: NodeIdentity,
     // Consulted only for a stranger, and told how the meeting went: a code
     // is spent by one success, and every window shuts after a few failures.
@@ -2355,6 +2415,7 @@ async fn run_pairing_and_session(
         status: status.borrow().current(),
         sends_input,
     };
+    let path = cursio_core::control::LinkPath::of(transport.kind());
     let identified = cursio_core::link::identify(transport, &plan).await?;
     // Report who this turned out to be before the slower half runs: for an
     // inbound connection this is the first moment we know at all, and the mesh
@@ -2431,6 +2492,7 @@ async fn run_pairing_and_session(
                 .map(|(id, why)| (id.to_string(), why.to_string()))
                 .collect(),
             since: std::time::SystemTime::now(),
+            path,
         },
     );
     let mut secure = link.transport;
@@ -3288,10 +3350,11 @@ async fn print_status(json: bool) -> anyhow::Result<()> {
         status.peers.len()
     );
     for peer in &status.peers {
-        let presence = match peer.presence {
-            Presence::Online => "online",
-            Presence::Connecting => "connecting",
-            Presence::Offline => "offline",
+        let presence = match (peer.presence, peer.link.as_ref().map(|l| l.path)) {
+            (Presence::Online, Some(cursio_core::control::LinkPath::Bluetooth)) => "bluetooth",
+            (Presence::Online, _) => "online",
+            (Presence::Connecting, _) => "connecting",
+            (Presence::Offline, _) => "offline",
         };
         match &peer.link {
             Some(link) => {

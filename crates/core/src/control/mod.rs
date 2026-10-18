@@ -63,8 +63,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// `set_name`, and `available` in the status. v9: `share`, sending a link,
 /// text or file to a peer. v10: a phone's messages — `list_conversations`,
 /// `list_messages`, `send_sms`, `mark_sms_read`, and `messages` in the status.
-/// v11: `nearby` in the status and in every pairing reply.
-pub const CONTROL_VERSION: u32 = 11;
+/// v11: `nearby` in the status and in every pairing reply. v12: `path` on a
+/// link, the network or Bluetooth.
+pub const CONTROL_VERSION: u32 = 12;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -484,6 +485,34 @@ pub struct LinkView {
     /// Modules this node offers that do not run on this link, and why.
     pub skipped: Vec<(String, String)>,
     pub since: SystemTime,
+    /// What carries the link. Defaulted from a v11 node, which only had the
+    /// network.
+    #[serde(default)]
+    pub path: LinkPath,
+}
+
+/// What carries a link: the same mesh either way, at very different speeds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkPath {
+    /// TCP over Wi-Fi or Ethernet.
+    #[default]
+    Network,
+    /// An RFCOMM channel to a paired device, kept for when the network is not
+    /// there: a few hundred kilobytes a second, enough for everything but
+    /// screens.
+    Bluetooth,
+}
+
+impl LinkPath {
+    /// The path a transport's [`kind`](cursio_transport::Transport::kind) names.
+    pub fn of(kind: &str) -> Self {
+        if kind == cursio_transport::stream::BLUETOOTH {
+            LinkPath::Bluetooth
+        } else {
+            LinkPath::Network
+        }
+    }
 }
 
 /// A known peer as the mesh loop last published it.
@@ -1057,6 +1086,21 @@ mod tests {
     }
 
     #[test]
+    fn a_link_from_a_node_that_knew_only_the_network_reads_as_network() {
+        let json = r#"{"position":{"x":1,"y":0},"device_kind":"Desktop","status":{},
+            "modules":[],"skipped":[],"since":{"secs_since_epoch":0,"nanos_since_epoch":0}}"#;
+        let link: LinkView = serde_json::from_str(json).unwrap();
+        assert_eq!(link.path, LinkPath::Network);
+    }
+
+    #[test]
+    fn names_a_bluetooth_transport_as_the_bluetooth_path() {
+        assert_eq!(LinkPath::of("bluetooth"), LinkPath::Bluetooth);
+        assert_eq!(LinkPath::of("tcp"), LinkPath::Network);
+        assert_eq!(LinkPath::of("encrypted"), LinkPath::Network);
+    }
+
+    #[test]
     fn every_command_and_reply_survives_the_wire() {
         let commands = [
             Command::Ping,
@@ -1356,6 +1400,7 @@ mod tests {
                 modules: vec!["clipboard".into()],
                 skipped: vec![],
                 since: SystemTime::now(),
+                path: LinkPath::Network,
             },
         );
         let peers = node.status().peers;

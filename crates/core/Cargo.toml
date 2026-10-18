@@ -26,7 +26,7 @@ required-features = ["desktop"]
 # module that is off costs nothing to compile and cannot be negotiated on.
 [features]
 default = ["desktop"]
-desktop = ["audio", "input", "window", "files", "airplay", "usb", "calls"]
+desktop = ["audio", "input", "window", "files", "airplay", "usb", "calls", "bluetooth"]
 audio = ["dep:cursio-audio"]
 input = ["dep:cursio-input"]
 window = ["dep:cursio-window"]
@@ -35,6 +35,10 @@ usb = ["dep:cursio-usb"]
 # A phone's calls with their voice on this computer: the Bluetooth hands-free
 # unit, whose audio rides the audio module's playback and microphone.
 calls = ["dep:cursio-bluetooth", "audio"]
+# The mesh over Bluetooth: an RFCOMM channel paired phones open when the
+# network is not there. Only the socket comes from BlueZ; what crosses it is
+# the mesh itself.
+bluetooth = ["dep:cursio-bluetooth"]
 # AirPlay carries a window back to the mesh, so it cannot be built without the
 # window module to carry it through.
 airplay = ["dep:cursio-airplay", "window"]

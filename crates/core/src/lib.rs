@@ -25,6 +25,9 @@ pub mod audio_gate;
 #[cfg(feature = "audio")]
 pub mod audio_session;
 /// Handing a paired phone's headset and speaker roles from PipeWire to Cursio.
+/// The mesh's channel over Bluetooth, for a paired phone off the network.
+#[cfg(all(feature = "bluetooth", unix))]
+pub mod bluetooth_link;
 #[cfg(all(target_os = "linux", feature = "calls"))]
 pub mod bluetooth_setup;
 /// A phone's call voice, played and recorded on this computer's audio.
