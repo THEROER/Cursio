@@ -71,10 +71,22 @@ class MeshService : Service() {
     private lateinit var deviceStatus: DeviceStatus
     private var capture: PlaybackCapture? = null
 
-    /** Keeps the notification's status line current while the service runs. */
+    /** The status line last posted, so an unchanged one is not posted again. */
+    private var shownStatus: String? = null
+
+    /**
+     * Keeps the notification's status line current while the service runs.
+     *
+     * Posted only when the line changes: reposting every tick was ~4700 posts a
+     * day, which the system counts against the app and which brings a dismissed
+     * notification straight back.
+     */
     private val refresh = object : Runnable {
         override fun run() {
-            notificationManager().notify(NOTIFICATION_ID, buildNotification())
+            val status = Node.statusLine()
+            if (status != shownStatus) {
+                notificationManager().notify(NOTIFICATION_ID, buildNotification(status))
+            }
             handler.postDelayed(this, REFRESH_INTERVAL_MS)
         }
     }
@@ -320,7 +332,8 @@ class MeshService : Service() {
     /** Not a bound service: the node's lifetime is the service's, not a caller's. */
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(status: String = Node.statusLine()): Notification {
+        shownStatus = status
         // The Activity is Tauri's, generated into the app under the app's own
         // package, which this library cannot name; the launcher entry finds it.
         val launch = packageManager.getLaunchIntentForPackage(packageName)
@@ -341,10 +354,11 @@ class MeshService : Service() {
         )
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Cursio")
-            .setContentText(Node.statusLine())
+            .setContentText(status)
             .setSmallIcon(R.drawable.ic_notify)
             .setContentIntent(open)
-            .setOngoing(true)
+            // Not ongoing: from Android 14 that lets the user swipe it away,
+            // and the service stays in the foreground without it showing.
             .setShowWhen(false)
             .addAction(Notification.Action.Builder(null, "Stop", stop).build())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -358,7 +372,8 @@ class MeshService : Service() {
     private fun createChannel() {
         // Low importance: this notification exists because the platform
         // requires one, not because the user needs telling. Anything higher
-        // makes a sound every time the status line changes.
+        // makes a sound every time the status line changes, and lower is not
+        // available — the system raises a foreground service's channel to low.
         val channel = NotificationChannel(
             CHANNEL_ID,
             "Cursio mesh",
