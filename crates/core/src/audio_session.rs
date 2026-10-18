@@ -747,6 +747,19 @@ impl SessionModule for AudioEngine {
     /// is never reached and everything the peer sends is silently ignored (this
     /// really happened — the peer's advertisements never got read). The caller
     /// additionally polls `biased`, inbound first, for the same reason.
+    /// Busy while anything here is being listened to. Silence is dropped
+    /// before it is sent, so "sent nothing" said nothing about whether a
+    /// stream was live: an engine left playing silence slowed to the idle
+    /// pace, the sound that followed went stale before the next pump and was
+    /// dropped in turn, and it never sent again — Nocturne's apps went silent
+    /// in Lightmoon's VoiceMeeter.
+    fn has_pending_work(&self) -> bool {
+        let wanted = |id: &u32| !self.unwanted_streams.contains(id);
+        self.mic_captures.keys().any(wanted)
+            || self.routed_apps.values().any(|(id, _)| wanted(id))
+            || !self.relays.is_empty()
+    }
+
     async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
         // Runs every pump, not just when audio moves: a stall is precisely the
         // case where the send path below never executes, so checking only there
