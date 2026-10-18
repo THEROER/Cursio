@@ -106,6 +106,7 @@ rpassword = "7"
 # and the user's idle time from Mutter; see notify_display.rs and presence.rs.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
+gio.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Self-elevation at startup: without admin rights, Windows' UIPI silently drops

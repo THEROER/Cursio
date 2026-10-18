@@ -193,6 +193,9 @@ fn read_players(bus: &zbus::blocking::Connection) -> Snapshot {
         .into_iter()
         .filter(|n| n.starts_with(PREFIX) && !n.starts_with(OURS))
     {
+        if bluetooth_proxy(bus, &name) {
+            continue;
+        }
         let Some(props) = get_all(bus, &name, PLAYER_IFACE) else {
             continue;
         };
@@ -209,7 +212,9 @@ fn read_players(bus: &zbus::blocking::Connection) -> Snapshot {
             Some("Paused") => PlaybackState::Paused,
             _ => PlaybackState::Stopped,
         };
-        let art_url = str_of(meta.get("mpris:artUrl")).filter(|u| u.starts_with("file://"));
+        let art_url = str_of(meta.get("mpris:artUrl")).filter(|u| {
+            u.starts_with("file://") || u.starts_with("https://") || u.starts_with("http://")
+        });
         let art = art_url.as_deref().map(hash_of);
         if let (Some(hash), Some(url)) = (art, art_url) {
             snap.art_urls.insert(hash, url);
@@ -318,6 +323,9 @@ impl MediaBackend for MprisBackend {
             .art_urls
             .get(&art)
             .cloned()?;
+        if !url.starts_with("file://") {
+            return remote_art(art, &url);
+        }
         let path = percent_decode(url.trim_start_matches("file://"));
         let meta = std::fs::metadata(&path).ok()?;
         if meta.len() as usize > MAX_ART_BYTES {
@@ -635,6 +643,62 @@ fn serve(
             tracing::debug!(error = %e, "could not announce a peer player's change");
         }
     }
+}
+
+/// Whether `name` is BlueZ's `mpris-proxy` standing in for a Bluetooth
+/// device's player — a phone or a computer playing through this one. That
+/// device is not this machine: a peer offers its own players itself, and
+/// sending one on made Lightmoon's Spotify reach the phones a second time, as
+/// "LIGHTMOON · Nocturne" and without its cover.
+fn bluetooth_proxy(bus: &zbus::blocking::Connection, name: &str) -> bool {
+    let pid: Option<u32> = bus
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionUnixProcessID",
+            &(name,),
+        )
+        .ok()
+        .and_then(|r| r.body().deserialize().ok());
+    pid.and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok())
+        .is_some_and(|comm| comm.trim() == "mpris-proxy")
+}
+
+/// A cover the player names by web address, as Spotify does: fetched here
+/// and sent like a local one, so the phone needs no network of its own and
+/// the mesh carries only its own messages. The last few are kept, since every
+/// link's media module asks for the same cover.
+fn remote_art(hash: u64, url: &str) -> Option<(String, Vec<u8>)> {
+    use gio::prelude::*;
+    static CACHE: Mutex<Vec<(u64, String, Vec<u8>)>> = Mutex::new(Vec::new());
+    const KEPT: usize = 8;
+    {
+        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, mime, bytes)) = cache.iter().find(|(h, ..)| *h == hash) {
+            return Some((mime.clone(), bytes.clone()));
+        }
+    }
+    let (bytes, _) = gio::File::for_uri(url)
+        .load_contents(gio::Cancellable::NONE)
+        .map_err(|e| tracing::debug!(%url, error = %e, "cannot fetch a player's cover"))
+        .ok()?;
+    if bytes.len() > MAX_ART_BYTES {
+        tracing::debug!(%url, size = bytes.len(), "cover too large to send");
+        return None;
+    }
+    let mime = if bytes.starts_with(b"\x89PNG") {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
+    let bytes = bytes.to_vec();
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if cache.len() >= KEPT {
+        cache.remove(0);
+    }
+    cache.push((hash, mime.into(), bytes.clone()));
+    Some((mime.into(), bytes))
 }
 
 #[cfg(test)]

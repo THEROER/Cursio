@@ -1199,6 +1199,7 @@ dependencies = [
  "cursio-window",
  "directories",
  "ed25519-dalek",
+ "gio 0.22.8",
  "hostname",
  "image",
  "libc",

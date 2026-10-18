@@ -48,6 +48,10 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 # Session-bus calls: desktop notifications and Mutter's idle time.
 zbus = "5"
+# A player's cover that is a web address (Spotify's are), fetched the way the
+# desktop fetches one: GIO is already linked through GTK, and its HTTP backend
+# is the desktop's own, so the node gains no TLS stack of its own.
+gio = "0.22"
 # A second `cursio-app` (the Shell menu opening a page, a launcher click)
 # hands its arguments to the running one instead of starting another tray.
 # Held below 2.5, which requires Tauri 2.12 and would move the whole app's
