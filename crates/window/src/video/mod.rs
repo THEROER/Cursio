@@ -42,6 +42,7 @@ pub(crate) fn contains_keyframe(packet: &[u8]) -> bool {
 
 /// The `profile_idc` of the first SPS in a packet: 244 is High 4:4:4
 /// Predictive, the lossless stream, which NVDEC does not decode.
+#[cfg(target_os = "linux")]
 pub(crate) fn sps_profile(packet: &[u8]) -> Option<u8> {
     nal_units(packet)
         .find(|nal| nal[0] & 0x1F == 7)
@@ -95,6 +96,7 @@ pub(crate) fn crop_bgra(pixels: Vec<u8>, width: u32, area: (u32, u32, u32, u32))
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_profile_is_read_from_the_sps_after_either_start_code() {
         // AUD, then an SPS for High 4:4:4 Predictive, then an IDR.
