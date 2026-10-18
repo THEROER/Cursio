@@ -137,7 +137,7 @@ call exists rather than a constructor argument:
 | --- | --- |
 | Windows | a bitmask the low-level mouse hook reads; a hook may not lock |
 | macOS | read from the event tap on every event |
-| Wayland | capture is taken down, barriers placed on every armed edge, capture re-armed — a barrier is a D-Bus object living on one edge |
+| Wayland | capture is taken down, barriers placed on every armed edge, capture re-armed — a barrier is a D-Bus object living on one edge. The portal session itself is opened only when the first edge is armed: GNOME's InputCapture (version 1) cannot remember a grant, so opening it at start-up asked on every restart, even with no machine to send the cursor to |
 | evdev on X11 | the X server is asked where the pointer is (`QueryPointer`) after motion, while this machine holds the cursor; a push outward at a watched edge is a crossing, and the pointer is warped back inside |
 | evdev, no display | **cannot**: `REL_X`/`REL_Y` is a device, not a desktop |
 

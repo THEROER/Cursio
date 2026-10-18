@@ -123,7 +123,8 @@ const BTN_EXTRA: u32 = 0x114;
 /// `LocalSet`, and hand only the (Send) channels back out. Waits briefly for
 /// the portal session + libei handshake (so a grant failure surfaces here),
 /// but not for a permission dialog nobody has answered yet — see
-/// [`PORTAL_ANSWER_WAIT`].
+/// [`PORTAL_ANSWER_WAIT`]. With no edge watched yet the portal is not asked at
+/// all until one is.
 pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (edges_tx, edges_rx) = mpsc::unbounded_channel();
@@ -136,6 +137,13 @@ pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
     // peer greets us; on a capture restarted mid-mesh it already holds the
     // right edges.
     let mut edge_rx = watched_edges().subscribe();
+    // With no peer bordering any edge there is nothing to capture for, and
+    // GNOME's InputCapture portal (version 1) cannot remember a grant: every
+    // session is a permission dialog. Asking at start-up put one up on every
+    // restart, including on a machine that only had phones to talk to, and an
+    // unanswered one is invisible from here — the cursor just never left. So
+    // the portal is asked only once a peer that takes the cursor borders us.
+    let deferred = edge_rx.borrow().is_empty();
 
     std::thread::Builder::new()
         .name("cursio-wayland".into())
@@ -152,7 +160,32 @@ pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                match setup_portal(&mut edge_rx).await {
+                if deferred {
+                    if edge_rx.wait_for(|e| !e.is_empty()).await.is_err() {
+                        return;
+                    }
+                    tracing::info!("a peer borders this desktop; asking it to allow input capture");
+                }
+                let started = {
+                    let setup = setup_portal(&mut edge_rx);
+                    tokio::pin!(setup);
+                    match tokio::time::timeout(PORTAL_ANSWER_WAIT, &mut setup).await {
+                        Ok(started) => started,
+                        Err(_) => {
+                            // Nobody is waiting on `ready_rx` any more when
+                            // capture was deferred, so the wait is reported
+                            // from here instead.
+                            if deferred {
+                                tracing::warn!(
+                                    "waiting for the desktop to allow input capture; the \
+                                     shared cursor starts once the dialog is answered"
+                                );
+                            }
+                            setup.await
+                        }
+                    }
+                };
+                match started {
                     Ok(portal) => {
                         let _ = ready_tx.send(Ok(()));
                         capture_loop(portal, tx, edges_tx, grab_rx, edge_rx).await;
@@ -175,6 +208,12 @@ pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
         devices: vec!["Wayland InputCapture portal".into()],
         grab,
     };
+    if deferred {
+        tracing::info!(
+            "input capture waits for a peer to border this desktop; the desktop is asked then"
+        );
+        return Ok(handle);
+    }
     match ready_rx.recv_timeout(PORTAL_ANSWER_WAIT) {
         Ok(Ok(())) => Ok(handle),
         Ok(Err(e)) => Err(InputError::Unavailable(e)),
