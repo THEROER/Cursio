@@ -140,6 +140,35 @@ export interface NodeStatusReply {
   calls?: PhoneCalls[]
   /** Machines whose galleries can be browsed; absent from a node older than control v15. */
   gallery?: import("~/composables/useGallery").GalleryPeer[]
+  /** This computer as a phone's Bluetooth headset; absent where it cannot be one, and from a node older than control v16. */
+  call_setup?: CallSetup | null
+}
+
+/** Mirrors `cursio_core::calls_hub::ServiceState`. */
+export type ServiceState = { state: "starting" } | { state: "running" } | { state: "failed"; reason: string }
+
+/** Mirrors `cursio_core::calls_hub::CallSetup`. */
+export interface CallSetup {
+  /** `cursio bluetooth install` handed the phone roles from PipeWire to Cursio. */
+  roles_taken: boolean
+  hands_free: ServiceState
+  speaker: ServiceState
+  phones: { name: string; address: string; connected: boolean }[]
+  outputs: AudioDevice[]
+  inputs: AudioDevice[]
+}
+
+export interface AudioDevice {
+  id: string
+  name: string
+}
+
+/** Mirrors `cursio_core::config::CallsConfig`. */
+export interface CallsConfig {
+  answer_moves_voice: boolean
+  voice: "here" | "follow"
+  output: string | null
+  input: string | null
 }
 
 /** Mirrors `cursio_protocol::calls::Call`. */
@@ -159,6 +188,8 @@ export interface PhoneCalls {
   calls: PhoneCall[]
   /** The voice of the call that is up plays on this computer. */
   audio_here: boolean
+  /** The machine this computer sends the voice on to, when it plays elsewhere. */
+  voice_on?: string | null
   /** Reached over Bluetooth hands-free, so the voice can come here. */
   hands_free: boolean
   unavailable: string | null
@@ -201,6 +232,8 @@ export interface UpdateStatus {
 /** The part of `cursio_core::config::Config` the app reads. */
 export interface NodeConfig {
   audio: { render_device: string | null; mic_gate: string | null }
+  /** Absent from a node older than control v16. */
+  calls?: CallsConfig
   [key: string]: unknown
 }
 
@@ -311,6 +344,7 @@ export function useNode() {
     setName: (name: string) => call<Reply>("node_set_name", { name }),
     config: () => call<Reply>("node_config"),
     setMicGate: (value: string) => call<Reply>("node_set_mic_gate", { value }),
+    setCalls: (calls: CallsConfig) => call<Reply>("node_set_calls", { calls }),
     setStreamVolume: (stream: number, volume: number, muted: boolean) =>
       call<Reply>("node_set_stream_volume", { stream, volume, muted }),
     pairShow: () => call<Reply>("node_pair_show"),

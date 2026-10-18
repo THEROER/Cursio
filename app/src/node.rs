@@ -465,6 +465,25 @@ pub mod commands {
         link.request(Command::SetConfig { config }).await
     }
 
+    /// Replace the `[calls]` section of the config file, like
+    /// [`node_set_mic_gate`]: the file's own config, not the effective one.
+    #[tauri::command]
+    pub async fn node_set_calls(
+        link: State<'_, NodeLink>,
+        calls: cursio_core::config::CallsConfig,
+    ) -> Result<Reply, NodeError> {
+        let mut config = match link.request(Command::Config).await? {
+            Reply::Config { file, .. } => *file,
+            other => {
+                return Err(NodeError::failed(format!(
+                    "the node answered a config request with {other:?}"
+                )));
+            }
+        };
+        config.calls = calls;
+        link.request(Command::SetConfig { config }).await
+    }
+
     #[tauri::command]
     pub async fn node_pair_show(link: State<'_, NodeLink>) -> Result<Reply, NodeError> {
         link.request(Command::PairShow).await

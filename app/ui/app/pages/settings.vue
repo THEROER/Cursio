@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core"
-import type { Reply } from "~/composables/useNode"
+import type { CallsConfig, Reply, ServiceState } from "~/composables/useNode"
 
 const { t } = useI18n()
-const { status, restart, config, setMicGate, setName } = useNode()
+const { status, restart, config, setMicGate, setName, setCalls } = useNode()
 const { isMobile, ready } = usePlatform()
 const toast = useCursioToast()
 
@@ -121,6 +121,76 @@ function setGateMode(mode: string) {
   void saveMicGate()
 }
 
+/** The `[calls]` section as the file has it; `null` until read. */
+const calls = ref<CallsConfig | null>(null)
+const callsBusy = ref(false)
+const callSetup = computed(() => status.value?.call_setup ?? null)
+
+/** "No device chosen", as a value the select can hold: it takes no empty string. */
+const DEFAULT_DEVICE = "cursio:default"
+
+const voiceModes = computed(() => [
+  { value: "follow", label: t("settings.callsVoiceFollow") },
+  { value: "here", label: t("settings.callsVoiceHere") },
+])
+
+function deviceOptions(devices: { id: string; name: string }[], chosen: string | null) {
+  const options = [{ value: DEFAULT_DEVICE, label: t("settings.callsDefault") }]
+  for (const d of devices) options.push({ value: d.id, label: d.name })
+  // A device chosen earlier that is not plugged in now is still the setting.
+  if (chosen && !devices.some((d) => d.id === chosen)) options.push({ value: chosen, label: chosen })
+  return options
+}
+
+const outputOptions = computed(() => deviceOptions(callSetup.value?.outputs ?? [], calls.value?.output ?? null))
+const inputOptions = computed(() => deviceOptions(callSetup.value?.inputs ?? [], calls.value?.input ?? null))
+
+function serviceLabel(state: ServiceState) {
+  if (state.state === "running") return t("settings.callsRunning")
+  if (state.state === "failed") return t("settings.callsFailed")
+  return t("settings.callsStarting")
+}
+
+function serviceTone(state: ServiceState) {
+  if (state.state === "running") return "success"
+  if (state.state === "failed") return "danger"
+  return "neutral"
+}
+
+async function loadCalls() {
+  try {
+    const reply = await config()
+    if (reply.reply !== "config") return
+    const { file } = reply as Extract<Reply, { reply: "config" }>
+    calls.value = file.calls ?? { answer_moves_voice: true, voice: "follow", output: null, input: null }
+  } catch (e) {
+    toast.failure(e, { title: t("settings.callsFailedSave") })
+  }
+}
+
+watch(
+  () => !!callSetup.value,
+  (up) => {
+    if (up && calls.value === null) void loadCalls()
+  },
+  { immediate: true },
+)
+
+async function saveCalls(change: Partial<CallsConfig>) {
+  if (!calls.value) return
+  const next = { ...calls.value, ...change }
+  callsBusy.value = true
+  try {
+    await setCalls(next)
+    calls.value = next
+    toast.success(t("settings.saved"))
+  } catch (e) {
+    toast.failure(e, { title: t("settings.callsFailedSave"), retry: () => saveCalls(change) })
+  } finally {
+    callsBusy.value = false
+  }
+}
+
 interface Autostart {
   node: boolean
   tray: boolean
@@ -233,6 +303,98 @@ async function restartNode() {
             </span>
           </div>
           <p v-if="gatePinned" class="text-xs text-muted">{{ t("settings.micGatePinned") }}</p>
+        </LpCard>
+      </section>
+
+      <section v-if="status && !isMobile" class="flex flex-col gap-3">
+        <LpSection :title="t('settings.callsTitle')" :description="t('settings.callsDescription')" icon="lucide:phone" />
+        <LpCard v-if="!callSetup" padded>
+          <p class="text-sm text-muted">{{ t("settings.callsUnsupported") }}</p>
+        </LpCard>
+        <LpSkeleton v-else-if="!calls" rounded="card" class="h-48" />
+        <LpCard v-else padded class="flex flex-col gap-4">
+          <ul class="flex flex-col divide-y divide-line">
+            <li class="flex flex-col gap-2 pb-3">
+              <div class="flex items-center gap-4">
+                <p class="min-w-0 flex-1 text-sm font-medium">{{ t("settings.callsRoles") }}</p>
+                <LpBadge :tone="callSetup.roles_taken ? 'success' : 'warning'" dot size="sm">
+                  {{ callSetup.roles_taken ? t("settings.callsRolesTaken") : t("settings.callsFailed") }}
+                </LpBadge>
+              </div>
+              <template v-if="!callSetup.roles_taken">
+                <p class="text-xs text-muted">{{ t("settings.callsRolesKept") }}</p>
+                <LpCodeBlock model-value="cursio bluetooth install" />
+              </template>
+            </li>
+            <li
+              v-for="row in [
+                { label: t('settings.callsHandsFree'), state: callSetup.hands_free },
+                { label: t('settings.callsSpeaker'), state: callSetup.speaker },
+              ]"
+              :key="row.label"
+              class="flex flex-col gap-1 py-3"
+            >
+              <div class="flex items-center gap-4">
+                <p class="min-w-0 flex-1 text-sm font-medium">{{ row.label }}</p>
+                <LpBadge :tone="serviceTone(row.state)" dot size="sm">{{ serviceLabel(row.state) }}</LpBadge>
+              </div>
+              <p v-if="row.state.state === 'failed'" class="text-xs text-muted">{{ row.state.reason }}</p>
+            </li>
+            <li class="flex flex-col gap-2 pt-3">
+              <p class="text-sm font-medium">{{ t("settings.callsPhones") }}</p>
+              <p v-if="!callSetup.phones.length" class="text-xs text-muted">{{ t("settings.callsNoPhones") }}</p>
+              <div v-for="phone in callSetup.phones" :key="phone.address" class="flex items-center gap-3">
+                <LpIcon name="lucide:smartphone" :size="16" class="shrink-0 text-muted" />
+                <span class="min-w-0 flex-1 truncate text-sm">{{ phone.name }}</span>
+                <span class="font-mono text-xs text-muted">{{ phone.address }}</span>
+                <LpBadge v-if="phone.connected" tone="success" dot size="sm">{{ t("settings.callsConnected") }}</LpBadge>
+              </div>
+            </li>
+          </ul>
+
+          <div class="flex items-center gap-4">
+            <div class="min-w-0 flex-1">
+              <p class="text-sm font-medium">{{ t("settings.callsAnswerMoves") }}</p>
+              <p class="text-xs text-muted">{{ t("settings.callsAnswerMovesHint") }}</p>
+            </div>
+            <LpSwitch
+              :model-value="calls.answer_moves_voice"
+              :disabled="callsBusy"
+              :aria-label="t('settings.callsAnswerMoves')"
+              @update:model-value="(v: boolean) => saveCalls({ answer_moves_voice: v })"
+            />
+          </div>
+          <div class="flex flex-wrap items-center gap-4">
+            <div class="min-w-0 flex-1">
+              <p class="text-sm font-medium">{{ t("settings.callsVoice") }}</p>
+              <p class="text-xs text-muted">{{ t("settings.callsVoiceHint") }}</p>
+            </div>
+            <LpSegmented
+              :model-value="calls.voice"
+              :options="voiceModes"
+              :disabled="callsBusy"
+              size="sm"
+              @update:model-value="(v: string) => saveCalls({ voice: v as CallsConfig['voice'] })"
+            />
+          </div>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <LpFormField :label="t('settings.callsOutput')">
+              <LpSelect
+                :model-value="calls.output ?? DEFAULT_DEVICE"
+                :options="outputOptions"
+                :disabled="callsBusy"
+                @update:model-value="(v: string) => saveCalls({ output: v === DEFAULT_DEVICE ? null : v })"
+              />
+            </LpFormField>
+            <LpFormField :label="t('settings.callsInput')">
+              <LpSelect
+                :model-value="calls.input ?? DEFAULT_DEVICE"
+                :options="inputOptions"
+                :disabled="callsBusy"
+                @update:model-value="(v: string) => saveCalls({ input: v === DEFAULT_DEVICE ? null : v })"
+              />
+            </LpFormField>
+          </div>
         </LpCard>
       </section>
 

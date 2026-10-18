@@ -69,10 +69,14 @@ const stateText = computed(() => {
   }
 })
 
+// A voice another computer sends here is "here" too, though this one has no
+// hands-free link to move it with.
 const voiceText = computed(() => {
   const phone = current.value?.phone
-  if (!phone?.hands_free || incoming.value) return null
-  return phone.audio_here ? t("call.voiceHere") : t("call.voicePhone")
+  if (!phone || incoming.value) return null
+  if (phone.audio_here && phone.voice_on) return t("call.voiceOn", { machine: phone.voice_on })
+  if (phone.audio_here) return t("call.voiceHere")
+  return phone.hands_free ? t("call.voicePhone") : null
 })
 
 /** Mute is the phone's state, but the phone does not report it back. */
