@@ -475,6 +475,43 @@ input p50/p99/max (with video and bulk p99 beside it) at `debug`, or `info` when
 input p99 reaches 4 ms; `TransportTx::queue_delay` returns the last complete
 window.
 
+## Where a phone's notification goes
+
+A phone's notification is shown on the computer the user is at, and only
+there. Each computer says whether the user is at it (`NotifyMsg::Presence`:
+holding its own cursor, input in the last five minutes); the phone sends to
+those that are, and to all of them when none is.
+
+Five minutes is right for a desk — reading a long page is not leaving — and
+wrong the moment the user gets up and takes the phone: every message for the
+next five minutes lit up an empty desk. So the phone answers one more question
+itself, in `core/src/at_phone.rs`: **is the user holding me?**
+
+- **The strong signal is order.** The phone's screen on and unlocked is
+  someone using it — the screen times out without a touch, so this is also
+  "touched recently", without reading anyone's input. A computer says when it
+  is in use right now (`NotifyMsg::Activity`: input in the last 15 s, and how
+  long ago when that changes). The user is at the phone when it was picked up
+  after the last input on every computer; any computer that sees input after
+  that has them back. Picking the phone up at the desk while still typing
+  keeps the notifications on the computer; stopping to read the phone keeps
+  them on the phone, where the user is looking.
+- **The weak signal is movement.** The phone's own Wi-Fi signal falling by
+  10 dB or more within 90 s while it is in hand looks like being carried out
+  of the room. It only decides when a computer is too old to say whether it
+  is in use; it never overrides one known to be in use, because a hand over
+  the antenna moves the signal too.
+- **Not used: Bluetooth distance.** Android has no public API for the signal
+  strength of a connected classic link, reading it on Linux needs a raw HCI
+  socket (`CAP_NET_RAW`), and Bluetooth Channel Sounding, which measures
+  distance properly, is absent on the phones here (`pm list features` shows
+  no `channel_sounding`). The decision does not depend on it.
+
+`Activity` was added without bumping the module's version: a phone too old to
+decode it drops it and keeps deciding by `Presence` alone, which is exactly
+what it did before. Everything here rides the notify module; there is no
+second channel.
+
 ## Two paths, one mesh: the network and Bluetooth
 
 A phone with Wi-Fi off, or out of the house's range, or on a hotspot the

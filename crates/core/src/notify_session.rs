@@ -48,6 +48,11 @@ pub struct NotifyEngine {
     events_tx: mpsc::UnboundedSender<DisplayEvent>,
     events_rx: mpsc::UnboundedReceiver<DisplayEvent>,
     here: Option<bool>,
+    /// What this desktop last told a phone about being in use right now; see
+    /// [`NotifyMsg::Activity`]. Only a phone is told: it alone decides where
+    /// its notifications go.
+    active: Option<bool>,
+    peer_is_phone: bool,
     presence_at: Instant,
     shown: HashSet<NotificationKey>,
     /// Copies of an app known to have a client here, waiting to see whether
@@ -78,6 +83,8 @@ impl NotifyEngine {
             events_tx,
             events_rx,
             here: None,
+            active: None,
+            peer_is_phone,
             presence_at: Instant::now(),
             shown: HashSet::new(),
             held: Vec::new(),
@@ -97,6 +104,18 @@ impl NotifyEngine {
             self.here = Some(here);
             self.queued.push(NotifyMsg::Presence { here });
         }
+        if !self.peer_is_phone {
+            return;
+        }
+        if let Some((active, idle)) = crate::presence::activity() {
+            if self.active != Some(active) {
+                self.active = Some(active);
+                self.queued.push(NotifyMsg::Activity {
+                    active,
+                    idle_ms: u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+        }
     }
 
     fn on_message(&mut self, msg: NotifyMsg) {
@@ -104,6 +123,11 @@ impl NotifyEngine {
             NotifyMsg::Presence { here } => {
                 if self.actor.is_some() {
                     hub().set_here(self.peer, here);
+                }
+            }
+            NotifyMsg::Activity { active, idle_ms } => {
+                if self.actor.is_some() {
+                    hub().set_activity(self.peer, active, Duration::from_millis(idle_ms));
                 }
             }
             NotifyMsg::Posted(notification) => self.posted(notification),

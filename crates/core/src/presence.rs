@@ -27,6 +27,23 @@ pub fn user_here() -> bool {
     idle().is_none_or(|idle| idle < AWAY_AFTER)
 }
 
+/// How long a machine counts as in use after its last input, for
+/// [`activity`]. Short on purpose: it is the answer to "is someone typing here
+/// right now", which is what a phone just picked up is compared against —
+/// `AWAY_AFTER` would keep a desk "in use" for minutes after the user left it.
+pub const ACTIVE_WITHIN: Duration = Duration::from_secs(15);
+
+/// Whether this machine is in use right now, and how long ago its last input
+/// was; `None` when the system cannot say. A machine whose mouse drives a peer
+/// is not in use itself: the input lands on the other screen.
+pub fn activity() -> Option<(bool, Duration)> {
+    if crate::update::quiet::driving() {
+        return Some((false, ACTIVE_WITHIN));
+    }
+    let idle = idle()?;
+    Some((idle < ACTIVE_WITHIN, idle))
+}
+
 /// How long since the last keyboard or pointer input, if the system says.
 #[cfg(target_os = "linux")]
 fn idle() -> Option<Duration> {

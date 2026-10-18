@@ -386,6 +386,7 @@ pub fn report(
         ?signal_dbm,
         "the app reported power and network"
     );
+    crate::at_phone::note_wifi(signal_dbm);
     *platform::REPORTED.lock().unwrap_or_else(|p| p.into_inner()) = platform::Reported {
         battery: battery.map(|b| b.min(100)),
         source,

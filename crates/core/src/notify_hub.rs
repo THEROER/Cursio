@@ -15,6 +15,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use crate::at_phone::DesktopActivity;
 
 use cursio_protocol::notify::{Notification, NotificationKey, NotifyMsg};
 use cursio_protocol::PeerId;
@@ -65,6 +68,9 @@ struct Link {
     /// What the peer last said; `false` until it says, so a desktop is not
     /// lit up before it has answered.
     here: bool,
+    /// What the peer last said about being in use right now, and when its
+    /// last input was then; `None` from a peer too old to say.
+    activity: Option<(bool, Instant)>,
     name: String,
     /// Only a phone rings; a desktop asked to would say nothing, and silence
     /// reads as "it is ringing somewhere I cannot hear".
@@ -101,6 +107,7 @@ impl NotifyHub {
                 token,
                 tx,
                 here: false,
+                activity: None,
                 name: name.to_string(),
                 phone,
             },
@@ -164,8 +171,34 @@ impl NotifyHub {
         }
     }
 
+    /// `peer` is in use right now (`active`), or its last input was `idle` ago.
+    pub fn set_activity(&self, peer: PeerId, active: bool, idle: Duration) {
+        if let Some(link) = self.lock().get_mut(&peer) {
+            let last = Instant::now()
+                .checked_sub(idle)
+                .unwrap_or_else(Instant::now);
+            link.activity = Some((active, last));
+        }
+    }
+
+    /// What every desktop said about being in use, for [`crate::at_phone`].
+    /// One in use right now had input "now": it keeps saying so only by not
+    /// saying it stopped.
+    fn desktop_activity(links: &HashMap<PeerId, Link>, now: Instant) -> Vec<DesktopActivity> {
+        links
+            .values()
+            .filter(|l| !l.phone)
+            .map(|l| DesktopActivity {
+                last_input: l
+                    .activity
+                    .map(|(active, last)| if active { now } else { last }),
+            })
+            .collect()
+    }
+
     /// Send a notification posted here to the desktops whose user is at them,
-    /// or to all of them when none is.
+    /// or to all of them when none is — or to none, while the user has this
+    /// phone in hand (see [`crate::at_phone`]).
     pub fn post(&self, notification: Notification) {
         if notification.kind == cursio_protocol::notify::NotifyKind::Call
             && crate::calls_hub::hub().reports_calls()
@@ -174,6 +207,10 @@ impl NotifyHub {
             return;
         }
         let links = self.lock();
+        if crate::at_phone::user_at_phone(&Self::desktop_activity(&links, Instant::now())) {
+            tracing::debug!(app = %notification.app_id, "the user has the phone in hand; keeping it here");
+            return;
+        }
         let present: Vec<&Link> = links.values().filter(|l| l.here).collect();
         let targets: Vec<&Link> = if present.is_empty() {
             links.values().collect()
@@ -245,6 +282,31 @@ mod tests {
         hub.post(notification("k1"));
         assert_eq!(posted(&mut a).len(), 1);
         assert_eq!(posted(&mut b).len(), 1);
+    }
+
+    #[test]
+    fn a_desktop_in_use_now_counts_as_input_this_moment() {
+        let hub = NotifyHub::default();
+        let desk = PeerId::from_u128(1);
+        let laptop = PeerId::from_u128(2);
+        let silent = PeerId::from_u128(3);
+        let phone = PeerId::from_u128(4);
+        let _a = hub.register(desk, "desk", false);
+        let _b = hub.register(laptop, "laptop", false);
+        let _c = hub.register(silent, "old", false);
+        let _d = hub.register(phone, "phone", true);
+        hub.set_activity(desk, true, Duration::from_secs(1));
+        hub.set_activity(laptop, false, Duration::from_secs(60));
+        let now = Instant::now() + Duration::from_secs(30);
+        let mut seen: Vec<Option<Instant>> = NotifyHub::desktop_activity(&hub.lock(), now)
+            .into_iter()
+            .map(|d| d.last_input)
+            .collect();
+        seen.sort();
+        assert_eq!(seen.len(), 3, "the phone's own link is not a desktop");
+        assert_eq!(seen[0], None, "a desktop that never said stays unknown");
+        assert!(seen[1].is_some_and(|at| at < now - Duration::from_secs(60)));
+        assert_eq!(seen[2], Some(now));
     }
 
     #[test]

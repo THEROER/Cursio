@@ -99,6 +99,14 @@ pub enum NotifyMsg {
     /// The phone stops by itself too, when the user answers it there or after
     /// a while — a phone that is lost may never be reached to be told.
     Ring { on: bool },
+    /// Desktop -> phone: whether this machine has had input in the last few
+    /// seconds (`active`), and how long ago the last input was when that
+    /// changed. Finer than [`NotifyMsg::Presence`], which stays true for
+    /// minutes: it is what lets the phone tell that the user got up and took
+    /// it. Added without a version bump on purpose — a phone that cannot
+    /// decode it drops it and keeps deciding by `Presence` alone, which is
+    /// exactly what it did before.
+    Activity { active: bool, idle_ms: u64 },
 }
 
 impl NotifyMsg {

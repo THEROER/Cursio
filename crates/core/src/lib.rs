@@ -20,6 +20,7 @@
 
 #[cfg(feature = "airplay")]
 pub mod airplay_window;
+pub mod at_phone;
 #[cfg(feature = "audio")]
 pub mod audio_gate;
 #[cfg(feature = "audio")]
