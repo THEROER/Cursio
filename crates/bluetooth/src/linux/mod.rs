@@ -21,13 +21,14 @@ pub use media::MediaSinkService;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use zbus::blocking::Connection;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
-use crate::hands_free::{HandsFree, HfEvent, HfOutput};
+use crate::hands_free::{Codec, HandsFree, HfEvent, HfOutput};
 use crate::{BluetoothError, CallAudioFactory, HfCommand, LinkEvent};
 
 const PROFILE_PATH: &str = "/dev/cursio/handsfree";
@@ -36,11 +37,14 @@ const HFP_HF_UUID: &str = "0000111e-0000-1000-8000-00805f9b34fb";
 /// HFP 1.7, the version whose `+CLCC` and indicator handling this speaks.
 const HFP_VERSION: u16 = 0x0107;
 /// The SDP record's features: CLI presentation (bit 2) and remote volume
-/// (bit 4). Wideband (bit 5) is left off with codec negotiation; see
-/// [`crate::hands_free`].
+/// (bit 4).
 const SDP_FEATURES: u16 = (1 << 2) | (1 << 4);
-/// CVSD's rate on the SCO socket.
-const CVSD_RATE: u32 = 8_000;
+/// Wideband speech, in the record only where libsbc can carry it; see
+/// [`crate::hands_free`].
+const SDP_WIDEBAND: u16 = 1 << 5;
+/// A wideband link that has given no readable frame in this long is taken to
+/// be one the adapter cannot carry.
+const WIDEBAND_PROOF: std::time::Duration = std::time::Duration::from_secs(2);
 
 struct Link {
     commands: Sender<HfCommand>,
@@ -142,7 +146,12 @@ impl HandsFreeService {
         let mut options: HashMap<&str, Value> = HashMap::new();
         options.insert("Name", Value::from("Cursio hands-free"));
         options.insert("Version", Value::U16(HFP_VERSION));
-        options.insert("Features", Value::U16(SDP_FEATURES));
+        let features = if sbc::msbc_available() {
+            SDP_FEATURES | SDP_WIDEBAND
+        } else {
+            SDP_FEATURES
+        };
+        options.insert("Features", Value::U16(features));
         options.insert("RequireAuthentication", Value::Bool(true));
         options.insert("AutoConnect", Value::Bool(true));
         let path = ObjectPath::try_from(PROFILE_PATH).expect("constant path is valid");
@@ -246,6 +255,33 @@ fn device_class(bus: &Connection, path: &str) -> Option<u32> {
     u32::try_from(value).ok()
 }
 
+/// What a voice thread shares with its link's thread.
+#[derive(Clone)]
+struct VoiceLink {
+    muted: Arc<AtomicBool>,
+    /// The codec the phone last chose, read when the audio link arrives.
+    codec: Arc<AtomicU8>,
+    /// Whether mSBC is offered, so an incoming link must be set up in the
+    /// air mode the phone chose before it is accepted.
+    wideband: bool,
+    /// Set by a voice thread whose wideband link carried nothing readable.
+    unreadable: Arc<AtomicBool>,
+}
+
+impl VoiceLink {
+    fn codec(&self) -> Codec {
+        match self.codec.load(Ordering::Relaxed) {
+            1 => Codec::Msbc,
+            _ => Codec::Cvsd,
+        }
+    }
+
+    fn set_codec(&self, codec: Codec) {
+        self.codec
+            .store(u8::from(codec == Codec::Msbc), Ordering::Relaxed);
+    }
+}
+
 fn run_link(shared: Shared, phone: String, adapter: String, device: OwnedObjectPath, fd: OwnedFd) {
     let name = property(&shared.bus, device.as_str(), "org.bluez.Device1", "Alias")
         .unwrap_or_else(|| phone.clone());
@@ -264,10 +300,16 @@ fn run_link(shared: Shared, phone: String, adapter: String, device: OwnedObjectP
     tracing::info!(%phone, %name, "phone connected as hands-free");
 
     let mut file = std::fs::File::from(fd);
-    let mut hf = HandsFree::new();
+    let wideband = sbc::msbc_available();
+    let mut hf = HandsFree::with_wideband(wideband);
     let mut pending = String::new();
     let mut voice: Option<Voice> = None;
-    let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let link = VoiceLink {
+        muted: Arc::default(),
+        codec: Arc::default(),
+        wideband,
+        unreadable: Arc::default(),
+    };
     let mut want_here = true;
     let mut buf = [0u8; 1024];
     let mut announced = false;
@@ -298,7 +340,7 @@ fn run_link(shared: Shared, phone: String, adapter: String, device: OwnedObjectP
                         match (call_up, voice.is_some()) {
                             (true, false) if want_here => {
                                 voice = local.and_then(|local| {
-                                    start_voice(&shared, &phone, local, None, muted.clone())
+                                    start_voice(&shared, &phone, local, None, link.clone())
                                 });
                             }
                             (false, true) => {
@@ -307,6 +349,10 @@ fn run_link(shared: Shared, phone: String, adapter: String, device: OwnedObjectP
                             }
                             _ => {}
                         }
+                    }
+                    HfOutput::Event(HfEvent::Codec(codec)) => {
+                        tracing::debug!(%phone, ?codec, "the phone chose the call's codec");
+                        link.set_codec(codec);
                     }
                     HfOutput::Event(HfEvent::Refused(reason)) => {
                         let _ = shared.events.send(LinkEvent::Refused {
@@ -321,7 +367,7 @@ fn run_link(shared: Shared, phone: String, adapter: String, device: OwnedObjectP
                     HfCommand::Answer => outputs.extend(hf.answer()),
                     HfCommand::HangUp => outputs.extend(hf.hang_up()),
                     HfCommand::Dial(number) => outputs.extend(hf.dial(&number)),
-                    HfCommand::Mute(on) => muted.store(on, std::sync::atomic::Ordering::Relaxed),
+                    HfCommand::Mute(on) => link.muted.store(on, Ordering::Relaxed),
                     HfCommand::AudioHere(here) => {
                         want_here = here;
                         if !here {
@@ -329,13 +375,26 @@ fn run_link(shared: Shared, phone: String, adapter: String, device: OwnedObjectP
                             // voice back: the phone keeps the call on itself.
                             voice = None;
                         } else if voice.is_none() && !hf.calls().is_empty() {
-                            let remote = sco::bdaddr(&phone).ok();
+                            // A phone that negotiates codecs opens the link
+                            // itself once asked, in the codec it picks.
+                            let remote = match hf.request_audio() {
+                                Some(asked) => {
+                                    outputs.extend(asked);
+                                    None
+                                }
+                                None => sco::bdaddr(&phone).ok(),
+                            };
                             voice = local.and_then(|local| {
-                                start_voice(&shared, &phone, local, remote, muted.clone())
+                                start_voice(&shared, &phone, local, remote, link.clone())
                             });
                         }
                     }
                 }
+            }
+            if link.unreadable.swap(false, Ordering::Relaxed) {
+                tracing::warn!(%phone, "the wideband audio link carried nothing readable; calls go narrowband from the next one");
+                outputs.extend(hf.drop_wideband());
+                link.set_codec(Codec::Cvsd);
             }
             if !outputs.is_empty() {
                 continue;
@@ -375,7 +434,7 @@ fn start_voice(
     phone: &str,
     local: [u8; 6],
     remote: Option<[u8; 6]>,
-    muted: Arc<std::sync::atomic::AtomicBool>,
+    link: VoiceLink,
 ) -> Option<Voice> {
     let (stop, stop_rx) = mpsc::channel();
     let shared = shared.clone();
@@ -384,8 +443,8 @@ fn start_voice(
         .name(format!("sco-{phone}"))
         .spawn(move || {
             let socket = match remote {
-                Some(remote) => sco::connect(local, remote).map(Some),
-                None => wait_for_sco(local, &phone, &stop_rx),
+                Some(remote) => sco::connect(local, remote, link.codec() == Codec::Msbc).map(Some),
+                None => wait_for_sco(local, &phone, &stop_rx, &link),
             };
             let socket = match socket {
                 Ok(Some(socket)) => socket,
@@ -403,7 +462,7 @@ fn start_voice(
                 phone: phone.clone(),
                 here: true,
             });
-            if let Err(e) = carry_voice(&shared, &phone, socket, &stop_rx, &muted) {
+            if let Err(e) = carry_voice(&shared, &phone, socket, &stop_rx, &link) {
                 tracing::info!(%phone, error = %e, "the call's audio link ended");
             }
             let _ = shared.events.send(LinkEvent::Audio { phone, here: false });
@@ -431,14 +490,23 @@ fn wait_for_sco(
     local: [u8; 6],
     phone: &str,
     stop: &Receiver<()>,
+    link: &VoiceLink,
 ) -> std::io::Result<Option<OwnedFd>> {
-    let listener = sco::listen(local)?;
+    let listener = sco::listen(local, link.wideband)?;
     loop {
         if stopped(stop) {
             return Ok(None);
         }
         match sco::accept(&listener, 200)? {
-            Some((socket, from)) if from == phone => return Ok(Some(socket)),
+            Some((socket, from)) if from == phone => {
+                if link.wideband {
+                    // Deferred: the air mode is the codec the phone chose
+                    // with `+BCS`, which by now has arrived.
+                    sco::set_transparent(&socket, link.codec() == Codec::Msbc)?;
+                    sco::authorize(&socket)?;
+                }
+                return Ok(Some(socket));
+            }
             Some((_, from)) => {
                 // Taken from PipeWire's wildcard listener because ours is
                 // more specific; it is a headset of this computer's, and
@@ -457,14 +525,28 @@ fn carry_voice(
     phone: &str,
     socket: OwnedFd,
     stop: &Receiver<()>,
-    muted: &std::sync::atomic::AtomicBool,
+    link: &VoiceLink,
 ) -> std::io::Result<()> {
+    let codec = link.codec();
     let mtu = sco::mtu(&socket);
-    let mut audio = shared
+    let audio = shared
         .audio
-        .open(phone, CVSD_RATE)
+        .open(phone, codec.rate())
         .map_err(std::io::Error::other)?;
-    tracing::info!(%phone, mtu, "call audio flowing through this computer");
+    tracing::info!(%phone, mtu, ?codec, "call audio flowing through this computer");
+    match codec {
+        Codec::Cvsd => carry_cvsd(audio, socket, mtu, stop, &link.muted),
+        Codec::Msbc => carry_msbc(audio, socket, mtu, stop, link),
+    }
+}
+
+fn carry_cvsd(
+    mut audio: Box<dyn crate::CallAudio>,
+    socket: OwnedFd,
+    mtu: usize,
+    stop: &Receiver<()>,
+    muted: &AtomicBool,
+) -> std::io::Result<()> {
     let mut file = std::fs::File::from(socket);
     let probe = OwnedFd::from(file.try_clone()?);
     let mut packet = vec![0u8; mtu.max(48)];
@@ -493,13 +575,83 @@ fn carry_voice(
         audio.play(&pcm);
         mic.clear();
         audio.record(pcm.len(), &mut mic);
-        if muted.load(std::sync::atomic::Ordering::Relaxed) {
+        if muted.load(Ordering::Relaxed) {
             mic.iter_mut().for_each(|s| *s = 0);
         }
         out.clear();
         out.extend(mic.iter().flat_map(|s| s.to_le_bytes()));
         out.resize(n - n % 2, 0);
         file.write_all(&out)?;
+    }
+}
+
+/// The wideband counterpart: whole frames are found in what arrives, each
+/// decoded frame is answered with one encoded frame of microphone, and the
+/// answer leaves in writes of the size the phone sends, which keeps both
+/// directions on the phone's clock as in CVSD.
+///
+/// A frame that does not decode is played as silence of its length rather
+/// than skipped, so the call's timing holds across a lost packet.
+fn carry_msbc(
+    mut audio: Box<dyn crate::CallAudio>,
+    socket: OwnedFd,
+    mtu: usize,
+    stop: &Receiver<()>,
+    link: &VoiceLink,
+) -> std::io::Result<()> {
+    use crate::msbc::{self, FRAME_SAMPLES};
+
+    let mut codec = sbc::Msbc::new().map_err(std::io::Error::other)?;
+    let mut file = std::fs::File::from(socket);
+    let probe = OwnedFd::from(file.try_clone()?);
+    let mut packet = vec![0u8; mtu.max(msbc::PACKET_LEN)];
+    let mut frames = msbc::Reassembler::default();
+    let mut outgoing = std::collections::VecDeque::<u8>::new();
+    let mut pcm = Vec::with_capacity(FRAME_SAMPLES);
+    let mut mic = Vec::with_capacity(FRAME_SAMPLES);
+    let mut sent = 0usize;
+    let mut readable = 0usize;
+    let started = std::time::Instant::now();
+    loop {
+        if stopped(stop) {
+            return Ok(());
+        }
+        if !sco::readable(&probe, 100)? {
+            continue;
+        }
+        let n = file.read(&mut packet)?;
+        if n == 0 {
+            return Ok(());
+        }
+        frames.push(&packet[..n]);
+        while let Some(frame) = frames.next_frame() {
+            pcm.clear();
+            if codec.decode(&frame, &mut pcm) {
+                readable += 1;
+            } else {
+                pcm.resize(FRAME_SAMPLES, 0);
+            }
+            audio.play(&pcm);
+            mic.clear();
+            audio.record(FRAME_SAMPLES, &mut mic);
+            if link.muted.load(Ordering::Relaxed) {
+                mic.iter_mut().for_each(|s| *s = 0);
+            }
+            if let Some(encoded) = codec.encode(&mic) {
+                outgoing.extend(msbc::packet(sent, &encoded));
+                sent += 1;
+            }
+        }
+        if readable == 0 && started.elapsed() > WIDEBAND_PROOF {
+            link.unreadable.store(true, Ordering::Relaxed);
+            return Err(std::io::Error::other(
+                "no mSBC frame could be read from the audio link",
+            ));
+        }
+        if outgoing.len() >= n {
+            let out: Vec<u8> = outgoing.drain(..n).collect();
+            file.write_all(&out)?;
+        }
     }
 }
 

@@ -6,6 +6,12 @@
 //! the adapter's own address takes the phone's call audio without touching
 //! PipeWire. It would take a headset's too, so the listener exists only while
 //! one of our phones has a call.
+//!
+//! A wideband call needs the link in transparent air mode, so the controller
+//! passes mSBC through instead of converting CVSD. Outgoing, that is set
+//! before connecting. Incoming, the listener defers accepting: the socket
+//! comes back before the link is set up, takes the air mode the phone asked
+//! for with `+BCS`, and is accepted by the first read ([`authorize`]).
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -14,6 +20,12 @@ const AF_BLUETOOTH: libc::c_int = 31;
 const BTPROTO_SCO: libc::c_int = 2;
 const SOL_SCO: libc::c_int = 17;
 const SCO_OPTIONS: libc::c_int = 1;
+const SOL_BLUETOOTH: libc::c_int = 274;
+const BT_DEFER_SETUP: libc::c_int = 7;
+const BT_VOICE: libc::c_int = 11;
+/// `BT_VOICE_CVSD_16BIT`, the kernel's default air mode.
+const VOICE_CVSD: u16 = 0x0060;
+const VOICE_TRANSPARENT: u16 = 0x0003;
 
 #[repr(C)]
 struct SockaddrSco {
@@ -79,10 +91,56 @@ fn bind(fd: &OwnedFd, local: [u8; 6]) -> io::Result<()> {
     Ok(())
 }
 
-/// A listener on the adapter's own address.
-pub fn listen(local: [u8; 6]) -> io::Result<OwnedFd> {
+fn set_option<T>(fd: &OwnedFd, name: libc::c_int, value: &T) -> io::Result<()> {
+    // SAFETY: value is a valid T for the length passed.
+    let r = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            SOL_BLUETOOTH,
+            name,
+            value as *const T as *const libc::c_void,
+            std::mem::size_of::<T>() as libc::socklen_t,
+        )
+    };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Carry the link in transparent air mode (mSBC) or CVSD.
+pub fn set_transparent(fd: &OwnedFd, transparent: bool) -> io::Result<()> {
+    let setting = if transparent {
+        VOICE_TRANSPARENT
+    } else {
+        VOICE_CVSD
+    };
+    set_option(fd, BT_VOICE, &setting)
+}
+
+/// Accept a connection taken from a deferring listener, in the air mode set
+/// on it: the kernel completes the link on the first read.
+pub fn authorize(fd: &OwnedFd) -> io::Result<()> {
+    let mut byte = 0u8;
+    // SAFETY: one writable byte.
+    let r = unsafe { libc::read(fd.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+    if r < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::WouldBlock {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// A listener on the adapter's own address. With `defer`, a connection is
+/// handed over before it is set up; see [`authorize`].
+pub fn listen(local: [u8; 6], defer: bool) -> io::Result<OwnedFd> {
     let fd = socket()?;
     bind(&fd, local)?;
+    if defer {
+        set_option(&fd, BT_DEFER_SETUP, &1u32)?;
+    }
     // SAFETY: listen(2) on a bound socket we own.
     if unsafe { libc::listen(fd.as_raw_fd(), 1) } < 0 {
         return Err(io::Error::last_os_error());
@@ -118,9 +176,12 @@ pub fn accept(listener: &OwnedFd, timeout_ms: i32) -> io::Result<Option<(OwnedFd
 }
 
 /// Open the audio link from this side, for bringing a call's sound back here.
-pub fn connect(local: [u8; 6], remote: [u8; 6]) -> io::Result<OwnedFd> {
+pub fn connect(local: [u8; 6], remote: [u8; 6], transparent: bool) -> io::Result<OwnedFd> {
     let fd = socket()?;
     bind(&fd, local)?;
+    if transparent {
+        set_transparent(&fd, true)?;
+    }
     let addr = SockaddrSco {
         family: AF_BLUETOOTH as libc::sa_family_t,
         bdaddr: remote,

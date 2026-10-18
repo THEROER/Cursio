@@ -22,13 +22,20 @@
 //! indicators and the last `+CLIP`, which is right for the one-call case and
 //! all a phone without `+CLCC` can give.
 //!
-//! ## Narrowband only, on purpose
+//! ## Wideband when this side can carry it
 //!
-//! Codec negotiation (mSBC wideband) is not advertised, so the phone uses
-//! CVSD: 8 kHz, which the controller turns into linear PCM on the SCO socket
-//! and needs no codec here. mSBC needs a transparent SCO path and an SBC codec
-//! on this side; offering it before both exist would have the phone pick a
+//! CVSD (8 kHz) needs no codec here: the controller turns it into linear PCM
+//! on the SCO socket. mSBC (16 kHz) needs an SBC codec on this side and a
+//! transparent SCO path, so codec negotiation is advertised only by a unit
+//! built [`HandsFree::with_wideband`] — which the platform half does when
+//! libsbc can encode mSBC. Offering it otherwise would have the phone pick a
 //! codec the audio path cannot decode.
+//!
+//! The phone chooses with `+BCS` before it opens the audio link, and this side
+//! confirms with `AT+BCS`. When a wideband link then carries nothing a frame
+//! can be read from — an adapter that cannot do transparent SCO accepts the
+//! socket option and delivers noise — [`HandsFree::drop_wideband`] lists CVSD
+//! alone with `AT+BAC=1`, and the phone uses it from the next call on.
 
 use std::collections::VecDeque;
 
@@ -37,12 +44,53 @@ use cursio_protocol::calls::{Call, CallDirection, CallState};
 use crate::at::{self, AgLine};
 
 /// What this unit says it supports in `AT+BRSF`: caller id (bit 2), remote
-/// volume (bit 4), enhanced call status (bit 5). Three-way calling, voice
-/// recognition and codec negotiation are deliberately absent.
+/// volume (bit 4), enhanced call status (bit 5). Three-way calling and voice
+/// recognition are deliberately absent; codec negotiation is added by a
+/// wideband unit ([`HF_CODEC_NEGOTIATION`]).
 pub const HF_FEATURES: u32 = (1 << 2) | (1 << 4) | (1 << 5);
+
+/// The unit's `AT+BRSF` bit for codec negotiation.
+pub const HF_CODEC_NEGOTIATION: u32 = 1 << 7;
 
 /// The phone's `+BRSF` bit for enhanced call status (`AT+CLCC`).
 const AG_ENHANCED_CALL_STATUS: u32 = 1 << 6;
+/// The phone's `+BRSF` bit for codec negotiation.
+const AG_CODEC_NEGOTIATION: u32 = 1 << 9;
+
+/// The voice codec on the audio link, as `+BCS` numbers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Codec {
+    /// 8 kHz, linear PCM on the socket.
+    #[default]
+    Cvsd,
+    /// 16 kHz mSBC frames in H2 packets (see [`crate::msbc`]).
+    Msbc,
+}
+
+impl Codec {
+    fn from_id(id: u32) -> Option<Self> {
+        match id {
+            1 => Some(Codec::Cvsd),
+            2 => Some(Codec::Msbc),
+            _ => None,
+        }
+    }
+
+    fn id(self) -> u32 {
+        match self {
+            Codec::Cvsd => 1,
+            Codec::Msbc => 2,
+        }
+    }
+
+    /// The link's sample rate in this codec.
+    pub fn rate(self) -> u32 {
+        match self {
+            Codec::Cvsd => 8_000,
+            Codec::Msbc => crate::msbc::RATE,
+        }
+    }
+}
 
 /// Something the link's owner needs to act on or show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +101,8 @@ pub enum HfEvent {
     Calls(Vec<Call>),
     /// A command the user asked for failed on the phone.
     Refused(String),
+    /// The phone chose the codec its next audio link will carry.
+    Codec(Codec),
 }
 
 /// What to do with the link after feeding it.
@@ -66,6 +116,7 @@ pub enum HfOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Features,
+    Codecs,
     IndicatorNames,
     IndicatorValues,
     Reporting,
@@ -84,6 +135,9 @@ enum Pending {
 }
 
 pub struct HandsFree {
+    /// Whether mSBC is offered to the phone.
+    wideband: bool,
+    codec: Codec,
     phase: Phase,
     queue: VecDeque<(String, Pending)>,
     in_flight: Option<Pending>,
@@ -102,8 +156,16 @@ impl Default for HandsFree {
 }
 
 impl HandsFree {
+    /// A narrowband unit: CVSD only, no codec negotiation.
     pub fn new() -> Self {
+        Self::with_wideband(false)
+    }
+
+    /// A unit offering mSBC beside CVSD when `wideband`.
+    pub fn with_wideband(wideband: bool) -> Self {
         HandsFree {
+            wideband,
+            codec: Codec::Cvsd,
             phase: Phase::Features,
             queue: VecDeque::new(),
             in_flight: None,
@@ -118,7 +180,73 @@ impl HandsFree {
 
     /// The first line on a new link: the hands-free unit speaks first.
     pub fn start(&mut self) -> Vec<HfOutput> {
-        self.command(format!("AT+BRSF={HF_FEATURES}"), Pending::Setup)
+        let features = if self.wideband {
+            HF_FEATURES | HF_CODEC_NEGOTIATION
+        } else {
+            HF_FEATURES
+        };
+        self.command(format!("AT+BRSF={features}"), Pending::Setup)
+    }
+
+    /// The codec the phone last chose for the audio link.
+    pub fn codec(&self) -> Codec {
+        self.codec
+    }
+
+    /// Stop offering mSBC: a wideband link proved unreadable here. The phone
+    /// is told only when codecs were negotiated at all.
+    pub fn drop_wideband(&mut self) -> Vec<HfOutput> {
+        if !self.wideband {
+            return Vec::new();
+        }
+        self.wideband = false;
+        self.codec = Codec::Cvsd;
+        if self.negotiates_codecs() {
+            self.command("AT+BAC=1".into(), Pending::Quiet)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Ask the phone to open the audio link itself, when codecs are
+    /// negotiated: `AT+BCC` has it pick the codec (`+BCS`) and then connect,
+    /// so the link carries what both sides agreed. `None` means this side
+    /// opens the link, in CVSD.
+    pub fn request_audio(&mut self) -> Option<Vec<HfOutput>> {
+        (self.wideband && self.negotiates_codecs())
+            .then(|| self.command("AT+BCC".into(), Pending::Quiet))
+    }
+
+    fn negotiates_codecs(&self) -> bool {
+        self.ag_features & AG_CODEC_NEGOTIATION != 0
+    }
+
+    fn available_codecs(&self) -> &'static str {
+        if self.wideband {
+            "AT+BAC=1,2"
+        } else {
+            "AT+BAC=1"
+        }
+    }
+
+    /// The phone picked `id` for the next audio link: confirm one this side
+    /// carries, or list again what it does.
+    fn select_codec(&mut self, id: u32, out: &mut Vec<HfOutput>) {
+        match Codec::from_id(id) {
+            Some(codec) if codec == Codec::Cvsd || self.wideband => {
+                self.codec = codec;
+                out.push(HfOutput::Event(HfEvent::Codec(codec)));
+                self.queue
+                    .push_back((format!("AT+BCS={}", codec.id()), Pending::Quiet));
+                self.send_next(out);
+            }
+            _ => {
+                tracing::debug!(id, "the phone chose a codec this side does not carry");
+                self.queue
+                    .push_back((self.available_codecs().into(), Pending::Quiet));
+                self.send_next(out);
+            }
+        }
     }
 
     pub fn is_ready(&self) -> bool {
@@ -187,7 +315,8 @@ impl HandsFree {
                 }
             }
             AgLine::Other(line) => tracing::debug!(%line, "unhandled line from the phone"),
-            AgLine::Chld | AgLine::Volume { .. } | AgLine::Bcs(_) => {}
+            AgLine::Bcs(id) => self.select_codec(id, &mut out),
+            AgLine::Chld | AgLine::Volume { .. } => {}
         }
         out
     }
@@ -251,6 +380,19 @@ impl HandsFree {
             (Phase::Features, _) => {
                 // A phone that refuses BRSF is an HFP 0.96 gateway; it still
                 // answers the rest, so the setup carries on.
+                if self.wideband && self.negotiates_codecs() {
+                    self.phase = Phase::Codecs;
+                    Some("AT+BAC=1,2")
+                } else {
+                    self.phase = Phase::IndicatorNames;
+                    Some("AT+CIND=?")
+                }
+            }
+            (Phase::Codecs, ok) => {
+                // Refused, the phone stays on CVSD; the setup goes on.
+                if !ok {
+                    self.wideband = false;
+                }
                 self.phase = Phase::IndicatorNames;
                 Some("AT+CIND=?")
             }
@@ -528,6 +670,87 @@ mod tests {
         assert!(sent(&hf.dial("+38 050 123")).is_empty());
         assert_eq!(sent(&hf.feed("OK")), vec!["AT+CMEE=1"]);
         assert_eq!(sent(&hf.feed("OK")), vec!["ATD+38050123;"]);
+    }
+
+    /// Setup of a wideband unit up to the indicators.
+    fn wideband_setup(ag_features: u32) -> (HandsFree, Vec<String>) {
+        let mut hf = HandsFree::with_wideband(true);
+        assert_eq!(sent(&hf.start()), vec!["AT+BRSF=180"]);
+        hf.feed(&format!("+BRSF: {ag_features}"));
+        let next = sent(&hf.feed("OK"));
+        (hf, next)
+    }
+
+    #[test]
+    fn a_wideband_unit_lists_msbc_to_a_phone_that_negotiates_codecs() {
+        let (mut hf, next) = wideband_setup(871);
+        assert_eq!(next, vec!["AT+BAC=1,2"]);
+        assert_eq!(sent(&hf.feed("OK")), vec!["AT+CIND=?"]);
+    }
+
+    #[test]
+    fn a_phone_without_codec_negotiation_is_not_asked_about_codecs() {
+        let (_, next) = wideband_setup(871 & !AG_CODEC_NEGOTIATION);
+        assert_eq!(next, vec!["AT+CIND=?"]);
+    }
+
+    /// A wideband unit through the whole setup, nothing left in flight.
+    fn wideband_connected() -> HandsFree {
+        let (mut hf, _) = wideband_setup(871);
+        assert_eq!(sent(&hf.feed("OK")), vec!["AT+CIND=?"]);
+        hf.feed(NAMES);
+        hf.feed("OK");
+        hf.feed("+CIND: 0,0,1,4,0,3,0");
+        hf.feed("OK");
+        assert!(events(&hf.feed("OK")).contains(&HfEvent::Connected));
+        for _ in 0..3 {
+            hf.feed("OK");
+        }
+        hf
+    }
+
+    #[test]
+    fn the_phones_choice_of_msbc_is_confirmed_and_reported() {
+        let mut hf = wideband_connected();
+        let out = hf.feed("+BCS: 2");
+        assert_eq!(sent(&out), vec!["AT+BCS=2"]);
+        assert_eq!(events(&out), vec![HfEvent::Codec(Codec::Msbc)]);
+        assert_eq!(hf.codec().rate(), 16_000);
+    }
+
+    #[test]
+    fn a_narrowband_unit_answers_a_choice_of_msbc_with_cvsd_alone() {
+        let mut hf = connected(871);
+        for _ in 0..3 {
+            hf.feed("OK");
+        }
+        let out = hf.feed("+BCS: 2");
+        assert_eq!(sent(&out), vec!["AT+BAC=1"]);
+        assert!(events(&out).is_empty());
+        assert_eq!(hf.codec(), Codec::Cvsd);
+    }
+
+    #[test]
+    fn bringing_the_voice_here_lets_a_wideband_phone_pick_the_codec_and_connect() {
+        let mut hf = wideband_connected();
+        assert_eq!(sent(&hf.request_audio().unwrap()), vec!["AT+BCC"]);
+        let mut narrow = connected(871);
+        for _ in 0..3 {
+            narrow.feed("OK");
+        }
+        assert!(narrow.request_audio().is_none());
+    }
+
+    #[test]
+    fn dropping_wideband_lists_cvsd_alone_and_takes_it_from_then_on() {
+        let mut hf = wideband_connected();
+        hf.feed("+BCS: 2");
+        hf.feed("OK");
+        assert_eq!(sent(&hf.drop_wideband()), vec!["AT+BAC=1"]);
+        assert_eq!(hf.codec(), Codec::Cvsd);
+        hf.feed("OK");
+        assert_eq!(sent(&hf.feed("+BCS: 1")), vec!["AT+BCS=1"]);
+        assert!(hf.drop_wideband().is_empty());
     }
 
     #[test]

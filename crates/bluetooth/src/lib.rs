@@ -22,9 +22,9 @@
 //! ## Layout
 //!
 //! [`at`] parses what the phone sends and [`hands_free`] runs the protocol
-//! without a socket, so both are tested on recorded dialogues. [`resample`]
-//! converts between the link's 8 kHz mono and the 48 kHz stereo the audio path
-//! runs at. The sockets and D-Bus live in the platform half, which on
+//! without a socket, so both are tested on recorded dialogues. [`msbc`] frames
+//! wideband voice on a transparent link, and [`resample`] converts between the
+//! link's 8 or 16 kHz mono and the 48 kHz stereo the audio path runs at. The sockets and D-Bus live in the platform half, which on
 //! anything but Linux is an error saying so.
 //!
 //! ## The mesh's own channel
@@ -36,6 +36,7 @@
 pub mod a2dp;
 pub mod at;
 pub mod hands_free;
+pub mod msbc;
 pub mod resample;
 
 #[cfg(target_os = "linux")]
@@ -106,7 +107,7 @@ pub trait MediaAudioFactory: Send + Sync {
 
 /// Opens [`CallAudio`] when a call's voice arrives.
 pub trait CallAudioFactory: Send + Sync {
-    /// `link_rate` is 8000 for CVSD.
+    /// `link_rate` is 8000 for CVSD, 16000 for mSBC.
     fn open(&self, phone: &str, link_rate: u32) -> Result<Box<dyn CallAudio>, String>;
 }
 

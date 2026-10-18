@@ -38,7 +38,8 @@ Cursio takes the role itself instead (`crates/bluetooth`):
   `AT+CLCC` call listings, one command at a time. Answer, hang up and dial are
   `ATA`, `AT+CHUP`, `ATD<number>;`.
 - While a call is up it listens for the phone's SCO connection and carries the
-  voice: CVSD, 8 kHz linear PCM, through an ordinary Cursio playback node and
+  voice — CVSD (8 kHz linear PCM) or mSBC (16 kHz, below) — through an
+  ordinary Cursio playback node and
   the same microphone tap that shares a microphone with peers
   (`core/src/call_audio.rs`). The computer keeps its devices; nothing appears
   or disappears on the desktop.
@@ -70,12 +71,41 @@ without touching PipeWire. Because the more specific listener would also take
 a headset's SCO, it exists only while a phone has a call, and anything else
 that connects in that window is refused with a warning naming it.
 
-### Narrowband for now
+### Wideband (mSBC) when this machine can carry it
 
-Codec negotiation is not advertised, so the phone uses CVSD (8 kHz). Wideband
-(mSBC, 16 kHz) needs a transparent SCO path and an SBC codec with the H2
-framing on this side; offering it before both exist would have the phone pick
-a codec the audio path cannot decode.
+CVSD is 8 kHz; mSBC is 16 kHz and is what makes a call sound like a call on
+a modern phone. It is offered only where `libsbc.so.1` can set up mSBC
+(`sbc_init_msbc`), checked once per process; elsewhere the unit stays
+narrowband and says so in the log.
+
+- **Negotiation** (`hands_free.rs`). A wideband unit adds codec negotiation
+  (bit 7) to `AT+BRSF` and wideband speech (bit 5) to its SDP record. Against
+  a phone that negotiates codecs (`+BRSF` bit 9) it lists `AT+BAC=1,2` before
+  the indicators. The phone picks the codec of each audio link with `+BCS`,
+  answered with `AT+BCS`; a choice this side cannot carry is answered by
+  listing again.
+- **The link** (`linux/sco.rs`). mSBC needs transparent air mode, so the
+  controller passes the frames through. Incoming, the listener defers
+  accepting (`BT_DEFER_SETUP`): the socket arrives before the link is set up,
+  takes the air mode of the codec the phone just chose (`BT_VOICE`), and the
+  first read accepts it. Bringing the voice back here asks the phone with
+  `AT+BCC` rather than connecting, so the link carries the codec both sides
+  agreed.
+- **Framing** (`msbc.rs`). Each 57-byte frame (120 samples, 7.5 ms) travels
+  as a 60-byte H2 packet: `0x01`, a sequence byte (`08 38 C8 F8`), the frame,
+  one byte of padding. What the socket delivers is cut at the controller's
+  packet size, not at frames, and a lost or corrupted packet is not marked, so
+  the reader scans for an H2 header followed by mSBC's sync word `0xAD`, as
+  PipeWire and oFono do. A frame that does not decode plays as silence of its
+  length, so the call's timing survives a lost packet.
+- **Pacing.** Each decoded frame is answered with one encoded frame of
+  microphone, written in pieces the size of what the phone sends, so both
+  directions stay on the phone's clock as with CVSD.
+- **Falling back.** An adapter that cannot do transparent SCO accepts the
+  socket option and then delivers noise. A wideband link that yields no
+  decodable frame within two seconds is closed, the voice returns to the
+  phone, and the unit lists CVSD alone (`AT+BAC=1`) for the rest of that
+  link; the next call is narrowband.
 
 ## The phone's sound: Cursio as its Bluetooth speaker
 
@@ -195,4 +225,4 @@ through.
 - Carrying a call's voice or the phone's Bluetooth sound on to another
   machine. Both enter the audio path as ordinary playback nodes, so the next
   step is offering them to peers like any local stream.
-- mSBC wideband and AAC, as above.
+- AAC, as above.
