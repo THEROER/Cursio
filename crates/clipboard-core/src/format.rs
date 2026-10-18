@@ -301,10 +301,120 @@ impl ClipboardContent {
             None => self.entries.push(entry),
         }
     }
+
+    /// Files on this machine, as a file manager copies them: a
+    /// `text/uri-list` of `file://` URIs, which a backend offers in its own
+    /// form (`CF_HDROP` on Windows).
+    pub fn files(paths: &[impl AsRef<std::path::Path>]) -> Self {
+        let mut list = String::new();
+        for path in paths {
+            list.push_str(&file_uri(path.as_ref()));
+            // RFC 2483 separates URIs with CRLF.
+            list.push_str("\r\n");
+        }
+        Self::single(ClipboardFormat::UriList, list.into_bytes())
+    }
+
+    /// The local files a `text/uri-list` names, skipping comments and any URI
+    /// that is not `file://` on this machine.
+    pub fn file_paths(&self) -> Option<Vec<std::path::PathBuf>> {
+        let list = std::str::from_utf8(self.bytes(&ClipboardFormat::UriList)?).ok()?;
+        let paths: Vec<_> = list
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(path_of_uri)
+            .collect();
+        (!paths.is_empty()).then_some(paths)
+    }
+}
+
+/// A `file://` URI for an absolute path, percent-encoding all but the
+/// unreserved characters and the separators.
+fn file_uri(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    // A Windows path is spelled with forward slashes after a leading one, as
+    // `file:///C:/Users/…`.
+    let text = text.replace('\\', "/");
+    let mut uri = String::from("file://");
+    if !text.starts_with('/') {
+        uri.push('/');
+    }
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                uri.push(byte as char)
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
+}
+
+fn path_of_uri(uri: &str) -> Option<std::path::PathBuf> {
+    // `file:` URIs from other machines name their host; only a local one is a
+    // path here.
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(rest.len());
+    let raw = rest.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            let hex = std::str::from_utf8(&raw[i + 1..i + 3]).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            bytes.push(raw[i]);
+            i += 1;
+        }
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    // `/C:/…` is a Windows drive path.
+    let text = match text.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => text[1..].replace('/', "\\"),
+        _ => text,
+    };
+    Some(std::path::PathBuf::from(text))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_files_come_back_as_the_same_paths() {
+        let paths = [
+            std::path::PathBuf::from("/home/me/Pictures/Cursio/POCO X7 Pro/IMG 1.jpg"),
+            std::path::PathBuf::from("/tmp/фото #2.png"),
+        ];
+        let content = ClipboardContent::files(&paths);
+        let list = std::str::from_utf8(content.bytes(&ClipboardFormat::UriList).unwrap()).unwrap();
+        assert!(list.starts_with("file:///home/me/Pictures/Cursio/POCO%20X7%20Pro/IMG%201.jpg\r\n"));
+        assert_eq!(content.file_paths().unwrap(), paths);
+    }
+
+    #[test]
+    fn a_windows_path_is_carried_as_a_drive_uri_and_back() {
+        let content = ClipboardContent::files(&[std::path::Path::new("C:\\Users\\me\\a b.jpg")]);
+        let list = std::str::from_utf8(content.bytes(&ClipboardFormat::UriList).unwrap()).unwrap();
+        assert_eq!(list, "file:///C:/Users/me/a%20b.jpg\r\n");
+        assert_eq!(
+            content.file_paths().unwrap(),
+            [std::path::PathBuf::from("C:\\Users\\me\\a b.jpg")]
+        );
+    }
+
+    #[test]
+    fn a_file_on_another_host_is_not_a_local_path() {
+        let content = ClipboardContent::single(
+            ClipboardFormat::UriList,
+            b"# copied\r\nfile://other/home/x.jpg\r\nhttps://example.org/x\r\n".to_vec(),
+        );
+        assert_eq!(content.file_paths(), None);
+    }
 
     #[test]
     fn mime_roundtrips_for_known_formats() {

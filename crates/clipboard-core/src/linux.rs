@@ -230,6 +230,13 @@ impl Clipboard for ArboardClipboard {
         selection: Selection,
         content: &ClipboardContent,
     ) -> Result<(), ClipboardError> {
+        // Files first: a file list is what was copied when there is one.
+        // arboard offers it as `text/uri-list`, which file managers paste as
+        // files and chat windows attach.
+        if let Some(paths) = content.file_paths() {
+            return set_serving(selection, move |set| set.file_list(&paths));
+        }
+
         // Prefer an image if one is present, else the richest text. arboard
         // sets one representation at a time, so unlike a data-control backend
         // this cannot offer text and HTML simultaneously.

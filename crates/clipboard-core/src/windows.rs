@@ -144,6 +144,11 @@ impl Clipboard for WinClipboard {
 
         let mut wrote_any = false;
 
+        if let Some(paths) = content.file_paths() {
+            write_bytes(CF_HDROP, &drop_files(&paths))?;
+            wrote_any = true;
+        }
+
         if let Some(bytes) = content.bytes(&ClipboardFormat::Text) {
             let text = String::from_utf8_lossy(bytes);
             write_text(&text)?;
@@ -250,6 +255,29 @@ fn write_bytes(format: u32, bytes: &[u8]) -> Result<(), ClipboardError> {
             .map_err(|e| ClipboardError::Backend(format!("SetClipboardData failed: {e}")))?;
         Ok(())
     }
+}
+
+/// The standard format id of a file list, `CF_HDROP`.
+const CF_HDROP: u32 = 15;
+
+/// A `DROPFILES` block: the 20-byte header (`pFiles`, a zero point, `fNC`,
+/// `fWide`) then each path as NUL-terminated UTF-16, and one more NUL to end
+/// the list. Explorer and every file dialog read pasted files from this.
+fn drop_files(paths: &[std::path::PathBuf]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&20u32.to_le_bytes()); // pFiles: offset of the list
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // fNC
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // fWide: UTF-16 paths
+    for path in paths {
+        for unit in path.as_os_str().to_string_lossy().encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0]);
+    }
+    bytes.extend_from_slice(&[0, 0]);
+    bytes
 }
 
 /// Write text as `CF_UNICODETEXT` (UTF-16, NUL-terminated).
@@ -431,4 +459,23 @@ unsafe extern "system" fn watch_wndproc(
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_list_is_a_wide_dropfiles_block_ending_in_two_nuls() {
+        let block = drop_files(&[std::path::PathBuf::from("C:\\a.jpg")]);
+        assert_eq!(&block[..4], &20u32.to_le_bytes());
+        assert_eq!(&block[16..20], &1u32.to_le_bytes());
+        let units: Vec<u16> = block[20..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let mut expected: Vec<u16> = "C:\\a.jpg".encode_utf16().collect();
+        expected.extend([0, 0]);
+        assert_eq!(units, expected);
+    }
 }
