@@ -17,7 +17,7 @@ crate-type = ["rlib"]
 # own `default-features`, and a `default-features = false` next to it is
 # ignored — which silently pulled PipeWire, FUSE and an AirPlay receiver into a
 # phone build. Naming the path here is what actually turns them off.
-cursio-core = { path = "../core", default-features = false, features = ["audio"] }
+cursio-core = { path = "../core", default-features = false, features = ["audio", "bluetooth"] }
 # For the phone's playback route: the targets and the PCM the JVM captures.
 cursio-audio.workspace = true
 serde.workspace = true

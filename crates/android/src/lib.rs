@@ -37,6 +37,7 @@ use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jint, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
+mod bt;
 mod calls;
 mod jvm;
 mod messages;

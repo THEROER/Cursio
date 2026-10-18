@@ -175,6 +175,9 @@ function presenceTone(p: PeerView) {
                 />
                 <p class="min-w-0 flex-1 truncate font-medium">{{ peer.name }}</p>
                 <LpBadge :tone="presenceTone(peer)" dot size="sm">{{ t(`presence.${peer.presence}`) }}</LpBadge>
+                <LpTooltip v-if="peer.link?.path === 'bluetooth'" :content="t('peer.overBluetoothHint')">
+                  <LpBadge size="sm" tone="outline">{{ t("peer.overBluetooth") }}</LpBadge>
+                </LpTooltip>
                 <PeerMenuButton :peer="{ id: peer.id, name: peer.name, presence: peer.presence }" />
               </div>
               <LpUptimeBar

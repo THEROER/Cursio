@@ -104,9 +104,18 @@ class PeerHeader extends PopupMenu.PopupBaseMenuItem {
             this.opacity = 128;
             return;
         }
-        const net = networkIcon(link.status);
-        if (net)
-            this.add_child(new St.Icon({icon_name: net, style_class: 'popup-menu-icon'}));
+        // Over Bluetooth the phone's own network says nothing about how it
+        // reaches this machine, and screens will not come through: say so.
+        if (link.path === 'bluetooth') {
+            this.add_child(new St.Icon({
+                icon_name: 'bluetooth-active-symbolic',
+                style_class: 'popup-menu-icon',
+            }));
+        } else {
+            const net = networkIcon(link.status);
+            if (net)
+                this.add_child(new St.Icon({icon_name: net, style_class: 'popup-menu-icon'}));
+        }
         const battery = batteryIcon(link.status);
         if (battery) {
             this.add_child(new St.Label({
@@ -199,7 +208,7 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
             return 'down';
         return JSON.stringify({
             peers: status.peers.map(p => [p.name, p.presence, p.link?.device_kind,
-                p.link?.status, p.link?.modules]),
+                p.link?.status, p.link?.modules, p.link?.path]),
             problems: status.problems.map(p => [p.severity, p.summary]),
             muted: this._mutedPeers(status),
             playing: [...new Set(status.streams.map(s => s.peer))],

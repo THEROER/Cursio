@@ -48,6 +48,7 @@ use cursio_protocol::{PeerId, Position, ServiceOffer};
 use cursio_transport::discovery;
 use cursio_transport::pairing::{Role, TrustStore};
 use cursio_transport::tcp::{TcpListenerHandle, TcpTransport};
+use cursio_transport::Transport;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Where the phone stands in the layout. It never takes the cursor
@@ -253,6 +254,13 @@ struct NodeCtx {
     control: NodeState,
     pairing: PairingWindow,
     shared: Arc<Shared>,
+    /// When each machine was last heard announcing itself on the network:
+    /// what tells a Bluetooth link that the network is back.
+    heard: RefCell<HashMap<PeerId, std::time::Instant>>,
+    /// When to open Bluetooth links, and to which devices.
+    bluetooth: RefCell<crate::bt::Dialer>,
+    /// Since when each known computer has been off the network.
+    unreachable_since: RefCell<HashMap<PeerId, std::time::Instant>>,
 }
 
 /// Listen, announce, dial, and run a session per link until asked to stop.
@@ -344,6 +352,9 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         control,
         pairing,
         shared: Arc::clone(&shared),
+        heard: RefCell::new(HashMap::new()),
+        bluetooth: RefCell::new(crate::bt::Dialer::default()),
+        unreachable_since: RefCell::new(HashMap::new()),
     });
 
     // Machines seen announcing themselves that this node does not trust yet.
@@ -371,14 +382,16 @@ async fn serve(node: Node) -> anyhow::Result<()> {
 
             accepted = listener.accept() => match accepted {
                 Ok(transport) => {
-                    tracing::info!(addr = %transport.peer_addr(), "peer dialled in");
-                    spawn_session(transport, Rc::clone(&ctx), Role::Responder, None);
+                    let addr = transport.peer_addr();
+                    tracing::info!(%addr, "peer dialled in");
+                    spawn_session(transport, Rc::clone(&ctx), Role::Responder, None, Some(addr));
                 }
                 Err(e) => tracing::warn!(error = %e, "accept failed"),
             },
 
             Some(peer) = seen_rx.recv() => {
                 ctx.control.saw(peer.peer_id, &peer.display_name, peer.addr);
+                ctx.heard.borrow_mut().insert(peer.peer_id, std::time::Instant::now());
                 note_seen(&ctx.registry, &shared, &peer);
                 if !ctx.registry.borrow().is_known(&peer.peer_id) {
                     strangers.insert(peer.peer_id, Stranger {
@@ -402,7 +415,8 @@ async fn serve(node: Node) -> anyhow::Result<()> {
                         match TcpTransport::connect(stranger.addr).await {
                             Ok(t) => {
                                 tracing::info!(peer = %stranger.name, addr = %stranger.addr, "dialled an unpaired machine to pair with it");
-                                spawn_session(t, Rc::clone(&ctx), Role::Initiator, None);
+                                let addr = Some(stranger.addr);
+                                spawn_session(t, Rc::clone(&ctx), Role::Initiator, None, addr);
                             }
                             Err(e) => tracing::warn!(peer = %stranger.name, error = %e, "could not reach the machine to pair with"),
                         }
@@ -420,7 +434,8 @@ async fn serve(node: Node) -> anyhow::Result<()> {
                             if let Ok(mut store) = TrustStore::load() {
                                 let _ = store.remember_addr(&target.peer_id, target.addr);
                             }
-                            spawn_session(t, Rc::clone(&ctx), Role::Initiator, Some(target.peer_id));
+                            let addr = Some(target.addr);
+                            spawn_session(t, Rc::clone(&ctx), Role::Initiator, Some(target.peer_id), addr);
                         }
                         Err(e) => {
                             tracing::debug!(peer = %target.display_name, error = %e, "dial failed; will retry");
@@ -428,6 +443,7 @@ async fn serve(node: Node) -> anyhow::Result<()> {
                         }
                     }
                 }
+                dial_bluetooth(&ctx).await;
             }
         }
     }
@@ -453,12 +469,17 @@ const STRANGER_RECALL: std::time::Duration = std::time::Duration::from_secs(10);
 /// radio and a CPU that would rather stay asleep.
 const STOP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-fn spawn_session(transport: TcpTransport, ctx: Rc<NodeCtx>, role: Role, expected: Option<PeerId>) {
+fn spawn_session<T: Transport + 'static>(
+    transport: T,
+    ctx: Rc<NodeCtx>,
+    role: Role,
+    expected: Option<PeerId>,
+    addr: Option<SocketAddr>,
+) {
     tokio::task::spawn_local(async move {
         if let Some(id) = expected {
             ctx.registry.borrow_mut().set_state(id, PeerState::Online);
         }
-        let addr = transport.peer_addr();
         let who = std::cell::Cell::new(expected);
         let result = run_link(transport, &ctx, role, addr, &who).await;
         match &result {
@@ -474,11 +495,12 @@ fn spawn_session(transport: TcpTransport, ctx: Rc<NodeCtx>, role: Role, expected
 }
 
 /// Greet, pair if this is a first meeting, secure, and run the session.
-async fn run_link(
-    transport: TcpTransport,
+async fn run_link<T: Transport + 'static>(
+    transport: T,
     ctx: &NodeCtx,
     role: Role,
-    addr: SocketAddr,
+    // `None` over Bluetooth, which has no address the network could dial.
+    addr: Option<SocketAddr>,
     who: &std::cell::Cell<Option<PeerId>>,
 ) -> anyhow::Result<()> {
     let password = ctx.pairing.password();
@@ -494,6 +516,7 @@ async fn run_link(
         // for whichever peer it is pointed at.
         sends_input: true,
     };
+    let path = cursio_core::control::LinkPath::of(transport.kind());
     let identified = cursio_core::link::identify(transport, &plan).await?;
     let peer_id = identified.peer.peer_id;
     let peer_name = identified.peer.display_name.clone();
@@ -535,7 +558,7 @@ async fn run_link(
         // phone the user just paired should show and dial the machine at once.
         ctx.registry
             .borrow_mut()
-            .admit(peer_id, peer_name.clone(), Some(addr));
+            .admit(peer_id, peer_name.clone(), addr);
         ctx.registry
             .borrow_mut()
             .set_state(peer_id, PeerState::Online);
@@ -556,6 +579,7 @@ async fn run_link(
                 .map(|(id, why)| (id.to_string(), why.to_string()))
                 .collect(),
             since: std::time::SystemTime::now(),
+            path,
         },
     );
     publish(ctx);
@@ -589,6 +613,112 @@ async fn run_link(
     match result {
         Ok(()) | Err(cursio_core::session::SessionError::PeerLeft) => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Open Bluetooth links to paired computers the network has not reached for
+/// a while; see [`crate::bt`].
+async fn dial_bluetooth(ctx: &Rc<NodeCtx>) {
+    let now = std::time::Instant::now();
+    let offline: Vec<PeerId> = ctx
+        .registry
+        .borrow()
+        .all()
+        .filter(|peer| !matches!(peer.state, PeerState::Online | PeerState::Connecting))
+        .map(|peer| peer.peer_id)
+        .collect();
+    let gone_for = {
+        let mut since = ctx.unreachable_since.borrow_mut();
+        since.retain(|id, _| offline.contains(id));
+        for id in &offline {
+            since.entry(*id).or_insert(now);
+        }
+        since.values().map(|at| now.duration_since(*at)).max()
+    };
+    if gone_for.is_none() {
+        return;
+    }
+    let paired = tokio::task::spawn_blocking(crate::bt::paired_computers)
+        .await
+        .unwrap_or_default();
+    let due = ctx.bluetooth.borrow_mut().due(&paired, gone_for, now);
+    for device in due {
+        let address = device.address.clone();
+        let opened = tokio::task::spawn_blocking(move || crate::bt::connect(&address)).await;
+        let fd = match opened {
+            Ok(Ok(fd)) => fd,
+            Ok(Err(why)) => {
+                tracing::debug!(device = %device.name, %why, "no mesh over bluetooth to this device");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the bluetooth dial did not finish");
+                continue;
+            }
+        };
+        let transport = match cursio_core::bluetooth_link::transport(fd) {
+            Ok(transport) => transport,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot use the bluetooth link");
+                continue;
+            }
+        };
+        tracing::info!(device = %device.name, "reached a computer over bluetooth");
+        ctx.bluetooth.borrow_mut().set_linked(&device.address, true);
+        spawn_bluetooth_session(transport, Rc::clone(ctx), device.address);
+    }
+}
+
+/// A session over Bluetooth that ends itself once the network reaches the
+/// same computer again, so the ordinary dial takes over at network speed.
+fn spawn_bluetooth_session<T: Transport + 'static>(
+    transport: T,
+    ctx: Rc<NodeCtx>,
+    address: String,
+) {
+    tokio::task::spawn_local(async move {
+        let who = std::cell::Cell::new(None);
+        let started = std::time::Instant::now();
+        let ended = tokio::select! {
+            result = run_link(transport, &ctx, Role::Initiator, None, &who) => result,
+            () = network_back(&ctx, &who, started) => {
+                tracing::info!("the network reaches this computer again; leaving bluetooth");
+                Ok(())
+            }
+        };
+        if let Err(e) = &ended {
+            tracing::warn!(error = %e, "bluetooth session ended with error");
+        }
+        ctx.bluetooth.borrow_mut().set_linked(&address, false);
+        if let Some(id) = who.get() {
+            ctx.registry.borrow_mut().mark_offline(id);
+            ctx.control.link_down(&id);
+        }
+        publish(&ctx);
+    });
+}
+
+/// Resolve once the link's peer has been heard on the network since the link
+/// came up and answers a TCP connection there: hearing alone is not enough,
+/// a hotspot client hears the LAN it cannot dial.
+async fn network_back(
+    ctx: &NodeCtx,
+    who: &std::cell::Cell<Option<PeerId>>,
+    since: std::time::Instant,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let Some(id) = who.get() else { continue };
+        let heard = ctx.heard.borrow().get(&id).is_some_and(|at| *at > since);
+        if !heard {
+            continue;
+        }
+        let addr = ctx.registry.borrow().get(&id).and_then(|peer| peer.addr);
+        let Some(addr) = addr else { continue };
+        if let Ok(probe) = TcpTransport::connect(addr).await {
+            drop(probe);
+            return;
+        }
     }
 }
 

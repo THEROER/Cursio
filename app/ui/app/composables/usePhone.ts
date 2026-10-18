@@ -17,6 +17,8 @@ export interface PhoneSetup {
   calls: boolean
   /** The phone's SMS may be read and sent from a desktop. */
   messages: boolean
+  /** The phone may reach its computers over Bluetooth when the network does not. */
+  nearby: boolean
 }
 export type PhoneGrant =
   | "notifications"
@@ -27,6 +29,7 @@ export type PhoneGrant =
   | "calls"
   | "bluetooth"
   | "messages"
+  | "nearby"
 
 export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 
@@ -145,6 +148,7 @@ export function usePhone() {
       !s.notificationAccess ||
       !s.calls ||
       !s.messages ||
+      !s.nearby ||
       (s.autostartSetting && !autostartDone.value)
     )
   })

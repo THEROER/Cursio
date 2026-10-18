@@ -57,6 +57,10 @@ pub struct Setup {
     /// plugin built before the row existed.
     #[serde(default)]
     pub messages: bool,
+    /// The phone may reach its computers over Bluetooth when the network
+    /// does not. Defaulted for a plugin built before the row existed.
+    #[serde(default)]
+    pub nearby: bool,
 }
 
 /// One of the things [`Setup`] lists, for the user to grant.
@@ -73,6 +77,7 @@ pub enum Grant {
     /// and picked as the speaker.
     Bluetooth,
     Messages,
+    Nearby,
 }
 
 #[derive(Serialize)]

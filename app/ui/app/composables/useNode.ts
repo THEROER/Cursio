@@ -27,6 +27,8 @@ export interface LinkView {
   modules: string[]
   skipped: [string, string][]
   since: SystemTime
+  /** What carries the link; absent from a node older than control v12. */
+  path?: "network" | "bluetooth"
 }
 
 /**

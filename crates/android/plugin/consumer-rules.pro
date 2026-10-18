@@ -10,4 +10,6 @@
     public static void onNotificationDismiss(...);
     public static void onRing(...);
     public static java.lang.String onSmsRequest(...);
+    public static java.lang.String btComputers(...);
+    public static java.lang.String btConnect(...);
 }

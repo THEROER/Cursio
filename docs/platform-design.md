@@ -309,6 +309,19 @@ This also fixes the dependency inversion already present: `cursio-core`
 currently knows every module, which is why `main` can't add one without touching
 core.
 
+### The phone over Bluetooth
+
+The phone's node opens the mesh's Bluetooth path itself (`crates/android/src/
+bt.rs`, `BtLink.kt`). Android gives an app an RFCOMM socket only as Java
+streams, never as a descriptor, so the node makes a socket pair, hands one end
+to `BtLink.connect` — which owns it from then on and closes it on every way out
+— and reads the other end as an ordinary socket; two Kotlin threads copy bytes
+between the pair and the Bluetooth streams. Only computers are dialled
+(`BluetoothClass.Device.Major.COMPUTER`): asking headphones for a service they
+cannot have is seconds of radio time each. It needs the "nearby devices"
+permission (`BLUETOOTH_CONNECT`) from Android 12, offered as a row of the
+phone's setup card.
+
 ## Migration order
 
 Each step is independently useful and independently revertable. Deliberately not

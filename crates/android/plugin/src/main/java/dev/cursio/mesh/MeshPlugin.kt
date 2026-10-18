@@ -51,6 +51,7 @@ import app.tauri.plugin.Plugin
             strings = [Manifest.permission.READ_SMS, Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS],
             alias = MeshPlugin.MESSAGES,
         ),
+        Permission(strings = [Manifest.permission.BLUETOOTH_CONNECT], alias = MeshPlugin.NEARBY),
     ],
 )
 class MeshPlugin(private val activity: Activity) : Plugin(activity) {
@@ -187,6 +188,12 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
             }
             MICROPHONE -> requestMicrophone(invoke)
             MESSAGES -> requestMessages(invoke)
+            NEARBY ->
+                if (nearbyGranted()) {
+                    invoke.resolve(setupState())
+                } else {
+                    requestPermissionForAlias(NEARBY, invoke, "permissionAnswered")
+                }
             BATTERY -> launchFirst(invoke, PowerSetup.batteryOptimizationIntents(activity))
             AUTOSTART -> {
                 Prefs.setOpenedAutostart(activity)
@@ -254,6 +261,10 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
     private fun messagesGranted(): Boolean =
         granted(Manifest.permission.READ_SMS) && granted(Manifest.permission.SEND_SMS)
 
+    /** Below Android 12 Bluetooth needed no runtime grant. */
+    private fun nearbyGranted(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.S || granted(Manifest.permission.BLUETOOTH_CONNECT)
+
     private fun afterGrant() {
         CallMonitor.refresh()
         SmsStore.watch(activity)
@@ -307,6 +318,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         )
         state.put("calls", CallMonitor.granted(activity))
         state.put("messages", messagesGranted())
+        state.put("nearby", nearbyGranted())
         return state
     }
 
@@ -338,5 +350,6 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         const val CALLS = "calls"
         const val BLUETOOTH = "bluetooth"
         const val MESSAGES = "messages"
+        const val NEARBY = "nearby"
     }
 }

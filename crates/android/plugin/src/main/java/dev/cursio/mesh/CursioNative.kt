@@ -152,6 +152,18 @@ object CursioNative {
     @JvmStatic
     fun onRing(on: Boolean) = Ringer.ring(on)
 
+    /** Paired computers, as `address\tname` lines; see [BtLink]. */
+    @JvmStatic
+    fun btComputers(): String = BtLink.computers()
+
+    /**
+     * Open the mesh's Bluetooth channel to [address] through [fd], which the
+     * app now owns. Called by the node off its own thread; blocks until
+     * connected and answers why it failed, or null.
+     */
+    @JvmStatic
+    fun btConnect(address: String, fd: Int): String? = BtLink.connect(address, fd)
+
     /**
      * This phone's calls changed, or what it may do with them; see
      * [CallMonitor]. [calls] is a JSON array of
