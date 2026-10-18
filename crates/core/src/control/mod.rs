@@ -189,6 +189,12 @@ pub enum Command {
     SetName {
         name: String,
     },
+    /// Act on a phone's calls: `phone` is its name or id. Goes by Bluetooth
+    /// hands-free when the phone is reached that way, else over the mesh.
+    Call {
+        phone: String,
+        action: crate::calls_hub::CallAction,
+    },
     /// Send a link, text or a file on this machine to a peer, to open, copy
     /// or keep. `peer` is its id or its name.
     Share {
@@ -280,6 +286,9 @@ pub struct Status {
     /// Defaulted from a v6 node.
     #[serde(default)]
     pub streams: Vec<crate::mixer::MixerStream>,
+    /// Every connected phone that reports calls, and its calls now.
+    #[serde(default)]
+    pub calls: Vec<crate::calls_hub::PhoneCalls>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -660,6 +669,7 @@ impl NodeState {
             pairing: self.pairing.state(),
             update: crate::update::agent::status(),
             streams: self.mixer.streams(),
+            calls: crate::calls_hub::hub().phones(),
         }
     }
 
@@ -768,6 +778,10 @@ impl NodeState {
                 target,
                 action,
             } => match crate::share_sink::share(&peer, &target, action) {
+                Ok(()) => Reply::Done,
+                Err(e) => error(e),
+            },
+            Command::Call { phone, action } => match crate::calls_hub::hub().act(&phone, action) {
                 Ok(()) => Reply::Done,
                 Err(e) => error(e),
             },

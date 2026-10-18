@@ -167,6 +167,12 @@ impl NotifyHub {
     /// Send a notification posted here to the desktops whose user is at them,
     /// or to all of them when none is.
     pub fn post(&self, notification: Notification) {
+        if notification.kind == cursio_protocol::notify::NotifyKind::Call
+            && crate::calls_hub::hub().reports_calls()
+        {
+            // The calls module shows this call with buttons of its own.
+            return;
+        }
         let links = self.lock();
         let present: Vec<&Link> = links.values().filter(|l| l.here).collect();
         let targets: Vec<&Link> = if present.is_empty() {

@@ -131,6 +131,18 @@ enum Command {
         /// The phone's name or id, as `cursio status` shows it.
         phone: String,
     },
+    /// Answer, decline, end or place a call on a connected phone. Goes through
+    /// the running node.
+    Call {
+        #[command(subcommand)]
+        action: CallCommand,
+    },
+    /// Make this computer the headset and speaker of paired phones, taking
+    /// those roles from PipeWire (Linux).
+    Bluetooth {
+        #[command(subcommand)]
+        action: BluetoothAction,
+    },
     /// List peers discovered on the LAN, then exit.
     Peers {
         #[arg(long, default_value_t = 5)]
@@ -365,6 +377,41 @@ impl MeshArgs {
             mac_modifiers: self.mac_modifiers.clone(),
         }
     }
+}
+
+#[derive(Subcommand)]
+enum CallCommand {
+    /// List the calls of every connected phone.
+    List,
+    /// Answer the call ringing on PHONE.
+    Answer { phone: String },
+    /// Refuse the call ringing on PHONE.
+    Decline { phone: String },
+    /// End the call that is up on PHONE.
+    Hangup { phone: String },
+    /// Call NUMBER from PHONE.
+    Dial { phone: String, number: String },
+    /// Mute (or with --off, unmute) the microphone on the call.
+    Mute {
+        phone: String,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Move the call's voice to this computer, or with --phone back to it.
+    Audio {
+        phone: String,
+        #[arg(long)]
+        phone_side: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BluetoothAction {
+    /// Take the hands-free and media sink roles from PipeWire (restarts
+    /// WirePlumber; Bluetooth audio drops for a second).
+    Install,
+    /// Give those roles back to PipeWire.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -1065,6 +1112,8 @@ async fn run() -> anyhow::Result<()> {
         } => send_share(&target, &to, copy, save).await,
         Command::Ring { phone } => ring_phone(&phone).await,
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
+        Command::Call { action } => call(action).await,
+        Command::Bluetooth { action } => bluetooth(action),
         Command::Portal { action } => portal(action).await,
         Command::MountHelper { .. } => unreachable!("handled before the node starts"),
     }
@@ -1076,6 +1125,67 @@ async fn portal(action: PortalAction) -> anyhow::Result<()> {
         PortalAction::Install => cursio_core::portal_setup::install(),
         PortalAction::Uninstall => cursio_core::portal_setup::uninstall(),
         PortalAction::Relay => Ok(cursio_window::linux_portal::serve(None).await?),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bluetooth(action: BluetoothAction) -> anyhow::Result<()> {
+    match action {
+        BluetoothAction::Install => cursio_core::bluetooth_setup::install(),
+        BluetoothAction::Uninstall => cursio_core::bluetooth_setup::uninstall(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bluetooth(_action: BluetoothAction) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "a phone's calls reach this computer's audio over bluetooth only on Linux so far; calls are still answered and placed from here over the mesh"
+    )
+}
+
+async fn call(command: CallCommand) -> anyhow::Result<()> {
+    use cursio_core::calls_hub::CallAction;
+    use cursio_core::control::{Command, Reply};
+    let client = control_client()
+        .await
+        .map_err(|e| anyhow::anyhow!("no running node ({e}); start `cursio mesh` first"))?;
+    let (phone, action) = match command {
+        CallCommand::List => {
+            let Reply::Status(status) = client.request(Command::Status).await? else {
+                anyhow::bail!("the node did not answer with its status");
+            };
+            if status.calls.is_empty() {
+                println!("no phone that reports calls is connected");
+            }
+            for phone in &status.calls {
+                let route = if phone.hands_free {
+                    "bluetooth"
+                } else {
+                    "mesh"
+                };
+                println!("{} ({route})", phone.name);
+                if let Some(why) = &phone.unavailable {
+                    println!("  calls off: {why}");
+                }
+                for c in &phone.calls {
+                    println!("  #{} {:?} {:?} {}", c.id, c.direction, c.state, c.who());
+                }
+            }
+            return Ok(());
+        }
+        CallCommand::Answer { phone } => (phone, CallAction::Answer),
+        CallCommand::Decline { phone } => (phone, CallAction::Decline),
+        CallCommand::Hangup { phone } => (phone, CallAction::HangUp),
+        CallCommand::Dial { phone, number } => (phone, CallAction::Dial { number }),
+        CallCommand::Mute { phone, off } => (phone, CallAction::Mute { muted: !off }),
+        CallCommand::Audio { phone, phone_side } => {
+            (phone, CallAction::AudioHere { here: !phone_side })
+        }
+    };
+    match client.request(Command::Call { phone, action }).await? {
+        Reply::Done => Ok(()),
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected reply from the node: {other:?}"),
     }
 }
 
@@ -1605,6 +1715,15 @@ fn module_registry(
         tracing::warn!("no audio backend on this platform; --audio is not advertised to peers");
     }
 
+    // One display for a phone's notifications and its calls: they are the
+    // same notification server, and a call's buttons answer through it.
+    let display = notify_display();
+    if let Some(display) = &display {
+        cursio_core::calls_display::start(display.clone());
+    }
+    #[cfg(feature = "calls")]
+    cursio_core::call_audio::start();
+
     cursio_core::module::ModuleRegistry::new()
         .with_switches(switches)
         .with(Box::new(cursio_core::audio_session::AudioFactory {
@@ -1620,9 +1739,13 @@ fn module_registry(
             sink: cursio_core::share_sink::DesktopSink::shared(),
         }))
         .with(Box::new(cursio_core::notify_session::NotifyFactory {
-            display: notify_display(),
+            display: display.clone(),
             actor: None,
             rings: true,
+        }))
+        .with(Box::new(cursio_core::calls_session::CallsFactory {
+            actor: None,
+            computer: true,
         }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,

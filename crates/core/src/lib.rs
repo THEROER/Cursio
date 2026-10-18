@@ -24,6 +24,18 @@ pub mod airplay_window;
 pub mod audio_gate;
 #[cfg(feature = "audio")]
 pub mod audio_session;
+/// Handing a paired phone's headset and speaker roles from PipeWire to Cursio.
+#[cfg(all(target_os = "linux", feature = "calls"))]
+pub mod bluetooth_setup;
+/// A phone's call voice, played and recorded on this computer's audio.
+#[cfg(feature = "calls")]
+pub mod call_audio;
+/// A phone's calls as notifications here, with buttons that act on them.
+pub mod calls_display;
+/// Where a phone's calls meet this machine, over the mesh or Bluetooth.
+pub mod calls_hub;
+/// The calls module on one link.
+pub mod calls_session;
 pub mod clipboard_session;
 /// What `cursio mesh` runs, read from `config.toml` and overridden by flags.
 pub mod config;

@@ -1178,6 +1178,7 @@ dependencies = [
  "clipboard-core",
  "cursio-airplay",
  "cursio-audio",
+ "cursio-bluetooth",
  "cursio-files",
  "cursio-input",
  "cursio-log",
