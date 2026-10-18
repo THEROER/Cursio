@@ -356,6 +356,42 @@ impl CallPause {
     }
 }
 
+/// Whether two lists differ in anything a remote control shows. A position
+/// counts only when it jumped: a second's drift is a track playing.
+pub(crate) fn players_changed(old: &[Player], new: &[Player]) -> bool {
+    if old.len() != new.len() {
+        return true;
+    }
+    old.iter().zip(new).any(|(a, b)| {
+        let mut a2 = a.clone();
+        let mut b2 = b.clone();
+        a2.position_ms = None;
+        b2.position_ms = None;
+        if a2 != b2 {
+            return true;
+        }
+        match (a.position_ms, b.position_ms) {
+            (Some(x), Some(y)) => {
+                let expected = if a.state == cursio_protocol::media::PlaybackState::Playing {
+                    x + 1_000
+                } else {
+                    x
+                };
+                expected.abs_diff(y) > 3_000
+            }
+            _ => false,
+        }
+    })
+}
+
+/// The id a cover is asked for by: a hash of whatever names it on this machine.
+pub(crate) fn art_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

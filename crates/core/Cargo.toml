@@ -149,6 +149,10 @@ windows = { version = "0.61", features = [
     "ApplicationModel",
     "UI_Notifications",
     "UI_Notifications_Management",
+    # This machine's players, from the system media controls; see
+    # media_smtc.rs. Streams for reading a player's cover.
+    "Media_Control",
+    "Storage_Streams",
 ] }
 
 [dev-dependencies]

@@ -57,9 +57,18 @@ nothing here may wait in front of the cursor.
   app's own plus a `Notification.MediaStyle` notification tied to its token.
   That pairing, not a custom layout, is what Android's media controls and
   HyperOS's island pick up — how KDE Connect's players appear there.
-- **Windows** does not advertise the module yet: its
-  `GlobalSystemMediaTransportControlsSessionManager` backend is not written,
-  and advertising a module that answers nothing would read as a broken link.
+- `media_smtc.rs` — **Windows** reads its players from
+  `GlobalSystemMediaTransportControlsSessionManager`, the sessions behind the
+  system's own media flyout: track, state, timeline, buttons and cover (the
+  session's thumbnail stream). It advertises the module as a `Source` only:
+  Windows lets no app publish a session for a player that is not itself, so
+  peers' players are not shown there.
+- A player BlueZ's `mpris-proxy` stands in for — a phone or a computer
+  playing through this one over Bluetooth — is skipped on Linux. It is not
+  this machine's: a peer offers its own players, and forwarding the proxy
+  sent them to phones a second time, under the wrong machine and without a
+  cover. A cover named by a web address (Spotify's) is fetched here through
+  GIO and sent like a local file, so the phone needs no network of its own.
 
 ## Who shows whom
 
@@ -74,15 +83,19 @@ stopping anything — a video left paused in a browser tab otherwise sits in
 the island all day. It comes back when its title changes: the next thing that
 plays there is worth showing again.
 
+A player paused for more than five minutes leaves the phone's shade on its
+own (`MediaNotifier.STALE_MS`) and returns when it plays: a browser keeps the
+player of any tab that once played a video, for as long as the tab is open.
+
 ## Pausing for a call
 
 What KDE Connect does: while any phone reports a call (`calls_hub`), the
 machine the user is at (`presence::user_here`) pauses what plays there, and
 resumes exactly those players once the call ends (`media_hub::CallPause`,
-ticked by the MPRIS poll). A machine the user is not at is left alone.
+ticked by the MPRIS or SMTC poll). A machine the user is not at is left alone.
 
 ## Not yet
 
-- Windows backend (above).
+- Peers' players shown on Windows (above: no app may publish a session).
 - Volume from the phone's notification: the session callback carries no
   volume; the computer's own volume is the audio module's job.

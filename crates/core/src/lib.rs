@@ -88,6 +88,9 @@ pub mod media_hub;
 /// This desktop's MPRIS players, and peers' players offered as MPRIS ones.
 #[cfg(target_os = "linux")]
 pub mod media_mpris;
+/// This Windows machine's players, from the system media controls.
+#[cfg(target_os = "windows")]
+pub mod media_smtc;
 /// The media module on one link.
 pub mod media_session;
 pub mod mesh;

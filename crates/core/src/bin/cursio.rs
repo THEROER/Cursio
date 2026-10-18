@@ -1792,14 +1792,21 @@ fn module_registry(
     }
     #[cfg(feature = "calls")]
     cursio_core::call_audio::start();
-    // Players are read and shown over MPRIS; Windows' media session API is
-    // not wired yet, and the module is not advertised there rather than
+    // Players are read and shown over MPRIS. Windows' system media controls
+    // are read but cannot be published to, so there the module only offers
+    // this machine's players; elsewhere it is not advertised rather than
     // advertised and silent.
     #[cfg(target_os = "linux")]
     cursio_core::media_mpris::start();
-    #[cfg(not(target_os = "linux"))]
-    tracing::warn!("sharing what plays is not implemented on this platform yet");
-    let media = cfg!(target_os = "linux");
+    #[cfg(target_os = "linux")]
+    let (media_plays, media_shows) = (true, true);
+    #[cfg(target_os = "windows")]
+    let (media_plays, media_shows) = (cursio_core::media_smtc::start(), false);
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let (media_plays, media_shows) = {
+        tracing::warn!("sharing what plays is not implemented on this platform yet");
+        (false, false)
+    };
 
     cursio_core::module::ModuleRegistry::new()
         .with_switches(switches)
@@ -1829,8 +1836,8 @@ fn module_registry(
             view: true,
         }))
         .with(Box::new(cursio_core::media_session::MediaFactory {
-            plays: media,
-            shows: media,
+            plays: media_plays,
+            shows: media_shows,
             shows_only_computers: false,
         }))
         .with(Box::new(cursio_core::gallery_session::GalleryFactory {

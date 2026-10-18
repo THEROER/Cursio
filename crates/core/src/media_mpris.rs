@@ -20,9 +20,7 @@
 //! All of it runs outside the Tokio runtime: zbus's blocking calls run their
 //! future on the calling thread (see `session_bus`).
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -77,7 +75,7 @@ impl MprisBackend {
             return;
         };
         let mut snap = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
-        if changed(&snap.players, &read.players) {
+        if crate::media_hub::players_changed(&snap.players, &read.players) {
             *snap = read;
             drop(snap);
             hub().local_changed();
@@ -89,39 +87,6 @@ impl MprisBackend {
     }
 }
 
-/// Whether two lists differ in anything a remote control shows. A position
-/// counts only when it jumped: a second's drift is a track playing.
-fn changed(old: &[Player], new: &[Player]) -> bool {
-    if old.len() != new.len() {
-        return true;
-    }
-    old.iter().zip(new).any(|(a, b)| {
-        let mut a2 = a.clone();
-        let mut b2 = b.clone();
-        a2.position_ms = None;
-        b2.position_ms = None;
-        if a2 != b2 {
-            return true;
-        }
-        match (a.position_ms, b.position_ms) {
-            (Some(x), Some(y)) => {
-                let expected = if a.state == PlaybackState::Playing {
-                    x + 1_000
-                } else {
-                    x
-                };
-                expected.abs_diff(y) > 3_000
-            }
-            _ => false,
-        }
-    })
-}
-
-fn hash_of(s: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
 
 fn str_of(v: Option<&OwnedValue>) -> Option<String> {
     match &**v? {
@@ -215,7 +180,7 @@ fn read_players(bus: &zbus::blocking::Connection) -> Snapshot {
         let art_url = str_of(meta.get("mpris:artUrl")).filter(|u| {
             u.starts_with("file://") || u.starts_with("https://") || u.starts_with("http://")
         });
-        let art = art_url.as_deref().map(hash_of);
+        let art = art_url.as_deref().map(crate::media_hub::art_hash);
         if let (Some(hash), Some(url)) = (art, art_url) {
             snap.art_urls.insert(hash, url);
         }
@@ -518,7 +483,7 @@ impl PlayerIface {
                 m.insert(k.to_string(), v);
             }
         };
-        let track = format!("/dev/cursio/track/{:016x}", hash_of(&p.title));
+        let track = format!("/dev/cursio/track/{:016x}", crate::media_hub::art_hash(&p.title));
         if let Ok(path) = ObjectPath::try_from(track.as_str()) {
             put("mpris:trackid", Value::from(path));
         }
@@ -704,6 +669,7 @@ fn remote_art(hash: u64, url: &str) -> Option<(String, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_hub::players_changed as changed;
 
     fn player(state: PlaybackState, position_ms: u64) -> Player {
         Player {
