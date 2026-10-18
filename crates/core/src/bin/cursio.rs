@@ -732,6 +732,20 @@ fn limit_malloc_arenas() {
     }
 }
 
+/// Let SIGINT stop this process however it was started.
+///
+/// A program started in the background by a non-interactive shell inherits
+/// SIGINT as ignored, and every node an update helper or `nohup … &` brings up
+/// is such a program. The helper stops the old node with SIGINT, so a node
+/// started that way could never be replaced: on one machine the switch timed
+/// out, retried every 15 s, and the machine stayed on an old protocol for good.
+#[cfg(unix)]
+fn accept_interrupt() {
+    // SAFETY: restoring a signal's default disposition before any thread or
+    // handler exists has no memory effects.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+}
+
 /// Lift the open-descriptor limit from the soft default to the hard one.
 ///
 /// A node's descriptors scale with what it serves, not with what it does: each
@@ -782,6 +796,8 @@ fn main() -> anyhow::Result<()> {
     limit_malloc_arenas();
     #[cfg(unix)]
     raise_descriptor_limit();
+    #[cfg(unix)]
+    accept_interrupt();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

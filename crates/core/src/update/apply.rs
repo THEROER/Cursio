@@ -317,6 +317,11 @@ fn stop_process(pid: u32) {
     {
         // SAFETY: kill with a valid signal number has no memory effects.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
+        // A node that predates `accept_interrupt` and was started in the
+        // background ignores SIGINT, and nothing would ever replace it.
+        // SIGTERM ends it the same way the default SIGINT does.
+        // SAFETY: as above.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     }
     #[cfg(windows)]
     {
