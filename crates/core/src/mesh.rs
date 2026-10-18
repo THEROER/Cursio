@@ -83,6 +83,18 @@ pub fn next_dial_targets(local_id: PeerId, registry: &SharedRegistry) -> Vec<Dia
 /// [`should_dial`]: crate::registry::should_dial
 const YIELD_GRACE: Duration = Duration::from_secs(10);
 
+/// The same, for a peer this node has not heard in this run and knows only by
+/// the address it remembered.
+///
+/// Waiting on such a peer for good stranded a hotspot's client: the phone on
+/// another phone's hotspot sits behind that phone's NAT, where the LAN's
+/// multicast never arrives and no call from the LAN can reach it, so a peer
+/// whose id makes it the caller dials a dead address forever while the client
+/// never calls out — though calling out through the NAT works. Longer than
+/// [`YIELD_GRACE`] because a stale address is the common case here, and the
+/// peer that can still call has had several of its own attempts first.
+const UNHEARD_GRACE: Duration = Duration::from_secs(30);
+
 fn next_dial_targets_at(
     local_id: PeerId,
     registry: &SharedRegistry,
@@ -95,8 +107,12 @@ fn next_dial_targets_at(
         let Some(addr) = peer.addr else { continue };
         if !crate::registry::should_dial(local_id, peer.peer_id) {
             let since = reg.yielding(peer.peer_id, now).unwrap_or(now);
-            let heard = peer.seen_at.is_some();
-            if !heard || now.duration_since(since) < YIELD_GRACE {
+            let grace = if peer.seen_at.is_some() {
+                YIELD_GRACE
+            } else {
+                UNHEARD_GRACE
+            };
+            if now.duration_since(since) < grace {
                 tracing::trace!(peer = %peer.display_name, "yielding dial to the peer");
                 continue;
             }
@@ -201,21 +217,21 @@ mod tests {
         assert_eq!(late[0].addr, addr);
     }
 
-    /// An address remembered from an earlier run is not reason enough: both
-    /// sides would call one another's stale addresses.
+    /// A hotspot's client never hears the LAN and cannot be called from it, so
+    /// it calls the remembered address itself — later than a heard peer.
     #[test]
-    fn a_waiting_node_that_never_heard_the_peer_keeps_waiting() {
+    fn a_waiting_node_that_never_heard_the_peer_calls_its_remembered_address_later() {
         let (low, high) = (PeerId::from_u128(1), PeerId::from_u128(2));
+        let addr: SocketAddr = "192.168.1.92:46073".parse().unwrap();
         let mut reg = PeerRegistry::default();
-        reg.admit(
-            low,
-            "low".into(),
-            Some("192.168.1.18:41217".parse().unwrap()),
-        );
+        reg.admit(low, "low".into(), Some(addr));
         let reg = shared(reg);
         let start = Instant::now();
         assert!(next_dial_targets_at(high, &reg, start).is_empty());
-        assert!(next_dial_targets_at(high, &reg, start + YIELD_GRACE * 3).is_empty());
+        assert!(next_dial_targets_at(high, &reg, start + YIELD_GRACE).is_empty());
+        let late = next_dial_targets_at(high, &reg, start + UNHEARD_GRACE);
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].addr, addr);
     }
 
     /// A dial in flight must not be started again by the next sweep.
