@@ -131,6 +131,23 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
         this._peers = new PopupMenu.PopupMenuSection();
         this._problems = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._peers);
+        // Every machine adds five rows, so a few phones push the menu past the
+        // screen. The section is added first so its items stay wired to this
+        // menu (an activated row still closes it), then moved into a scroller.
+        const box = this._peers.actor.get_parent();
+        box.remove_child(this._peers.actor);
+        const scroll = new St.ScrollView({
+            style: 'max-height: 26em;',
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            overlay_scrollbars: true,
+        });
+        // `set_child` from GNOME 46; 45 only has `add_actor`.
+        if (scroll.set_child)
+            scroll.set_child(this._peers.actor);
+        else
+            scroll.add_actor(this._peers.actor);
+        box.insert_child_at_index(scroll, 0);
         this.menu.addMenuItem(this._problems);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addAction('Cursio Settings', () => this._openSettings());
