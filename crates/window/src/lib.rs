@@ -106,6 +106,16 @@ mod windows_surrogate;
 #[cfg(target_os = "windows")]
 pub use windows_surrogate::{Win32Surrogate, Win32WindowRenderer};
 
+/// Whether remote-screen views keep their own notification-area icon. Off
+/// while the Cursio app is attached: its tray carries every view's selector.
+/// Views exist as windows on Windows only; elsewhere there is no icon.
+pub fn set_remote_screen_icons_shown(shown: bool) {
+    #[cfg(target_os = "windows")]
+    windows_surrogate::set_icons_shown(shown);
+    #[cfg(not(target_os = "windows"))]
+    let _ = shown;
+}
+
 #[cfg(target_os = "linux")]
 mod linux_surrogate;
 #[cfg(target_os = "linux")]

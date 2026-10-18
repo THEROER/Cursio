@@ -50,6 +50,8 @@ use crate::{
 mod unseen;
 mod win32;
 
+pub use unseen::set_icons_shown;
+
 /// What the session hands the window thread.
 pub(crate) enum SurrogateCommand {
     /// A decoded tile to blit and present.

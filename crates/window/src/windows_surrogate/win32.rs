@@ -354,6 +354,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+            unseen::ICONS_CHANGED => {
+                if unseen::icons_shown() {
+                    unseen::add_icon(hwnd, &view.tip);
+                } else {
+                    unseen::remove_icon(hwnd);
+                }
+                return LRESULT(0);
+            }
             m if m == view.taskbar_created => {
                 unseen::add_icon(hwnd, &view.tip);
                 unseen::remove_from_taskbar(hwnd);
@@ -665,6 +673,7 @@ pub(crate) fn run(
 
         if is_view {
             unseen::hide(hwnd);
+            unseen::track(hwnd);
             unseen::add_icon(hwnd, &meta.title);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             unseen::remove_from_taskbar(hwnd);
@@ -827,6 +836,7 @@ pub(crate) fn run(
 
         closed.store(true, Ordering::Relaxed);
         if is_view {
+            unseen::untrack(hwnd);
             unseen::remove_icon(hwnd);
         }
         let _ = DestroyWindow(hwnd);

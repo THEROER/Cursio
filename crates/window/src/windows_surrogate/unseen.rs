@@ -37,9 +37,14 @@
 //!
 //! The view's selector used to be a right-click menu on the window; nobody can
 //! right-click a window that is nowhere, so the same menu hangs off a
-//! notification-area icon, one per peer.
+//! notification-area icon, one per peer. Those icons stand aside while the
+//! Cursio app is attached to the node: its tray carries the same choice for
+//! every peer, and an icon per peer next to it was the same thing twice.
 
-use windows::Win32::Foundation::{COLORREF, HWND};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
@@ -48,13 +53,79 @@ use windows::Win32::UI::Shell::{
     NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongW, LoadIconW, RegisterWindowMessageW, SetLayeredWindowAttributes, SetWindowLongW,
-    SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, IDI_APPLICATION, LWA_ALPHA, SWP_NOACTIVATE,
-    SWP_NOSIZE, WM_APP, WS_EX_LAYERED,
+    CreateIconFromResourceEx, GetWindowLongW, LoadIconW, PostMessageW, RegisterWindowMessageW,
+    SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, HICON, HWND_TOPMOST,
+    IDI_APPLICATION, LR_DEFAULTCOLOR, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOSIZE, WM_APP, WS_EX_LAYERED,
 };
 
 /// The message the notification-area icon reports its clicks with.
 pub(super) const TRAY_MESSAGE: u32 = WM_APP + 1;
+
+/// Posted to every view when [`set_icons_shown`] changes, so each adds or
+/// removes its icon on its own thread, the one that owns the window.
+pub(super) const ICONS_CHANGED: u32 = WM_APP + 2;
+
+/// Whether views keep an icon in the notification area: not while the Cursio
+/// app's tray carries their selector.
+static ICONS_SHOWN: AtomicBool = AtomicBool::new(true);
+
+/// Every open view, as raw handles: `HWND` is not `Send`.
+fn views() -> &'static Mutex<Vec<isize>> {
+    static VIEWS: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
+    VIEWS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Show or hide every view's icon, now and for views opened later.
+pub fn set_icons_shown(shown: bool) {
+    if ICONS_SHOWN.swap(shown, Ordering::SeqCst) == shown {
+        return;
+    }
+    for &hwnd in views().lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        // SAFETY: posting to a window that has since gone only fails.
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                ICONS_CHANGED,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }
+}
+
+pub(super) fn icons_shown() -> bool {
+    ICONS_SHOWN.load(Ordering::SeqCst)
+}
+
+pub(super) fn track(hwnd: HWND) {
+    views()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(hwnd.0 as isize);
+}
+
+pub(super) fn untrack(hwnd: HWND) {
+    views()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|&h| h != hwnd.0 as isize);
+}
+
+/// The Cursio logo, built once from the PNG the app's icons are made from. The
+/// stock application icon stood in before, and next to the app's own tray it
+/// read as some other program's.
+fn logo() -> HICON {
+    static LOGO: OnceLock<isize> = OnceLock::new();
+    let raw = *LOGO.get_or_init(|| {
+        const PNG: &[u8] = include_bytes!("../../../../app/icons/32x32.png");
+        // SAFETY: the bytes are a complete PNG, which icon resources may be.
+        unsafe { CreateIconFromResourceEx(PNG, true, 0x0003_0000, 32, 32, LR_DEFAULTCOLOR) }
+            .or_else(|_| unsafe { LoadIconW(None, IDI_APPLICATION) })
+            .map(|icon| icon.0 as isize)
+            .unwrap_or_default()
+    });
+    HICON(raw as *mut _)
+}
 
 /// Make `hwnd` unseen: layered and fully transparent (which also makes it
 /// click-through), placed over the primary monitor above everything else.
@@ -110,7 +181,7 @@ fn icon_data(hwnd: HWND, tip: &str) -> NOTIFYICONDATAW {
         uID: 1,
         uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
         uCallbackMessage: TRAY_MESSAGE,
-        hIcon: unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default(),
+        hIcon: logo(),
         ..Default::default()
     };
     for (slot, unit) in data.szTip.iter_mut().take(127).zip(tip.encode_utf16()) {
@@ -119,8 +190,12 @@ fn icon_data(hwnd: HWND, tip: &str) -> NOTIFYICONDATAW {
     data
 }
 
-/// Show the view's icon, titled like the view itself.
+/// Show the view's icon, titled like the view itself, unless the app's tray
+/// stands in for it.
 pub(super) unsafe fn add_icon(hwnd: HWND, tip: &str) {
+    if !icons_shown() {
+        return;
+    }
     if !Shell_NotifyIconW(NIM_ADD, &icon_data(hwnd, tip)).as_bool() {
         tracing::warn!(
             "could not add the remote-screen icon to the notification area; \
