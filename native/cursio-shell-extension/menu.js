@@ -24,7 +24,11 @@ import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js'
 
 import {ControlClient} from './control.js';
 
-const TILE_ICON = 'video-joined-displays-symbolic';
+// Shipped beside this file rather than named from the theme: the logo is in no
+// icon theme, and a `-symbolic` file is recoloured with the panel's foreground
+// like a themed one.
+const TILE_ICON = Gio.icon_new_for_string(
+    GLib.build_filenamev([GLib.path_get_dirname(GLib.filename_from_uri(import.meta.url)[0]), 'cursio-symbolic.svg']));
 
 function kindIcon(kind) {
     switch (kind) {
@@ -120,7 +124,7 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
         super._init({
             title: 'Cursio',
             subtitle: 'not running',
-            iconName: TILE_ICON,
+            gicon: TILE_ICON,
             toggleMode: false,
         });
         this.menu.setHeader(TILE_ICON, 'Cursio', 'Your machines, together');
