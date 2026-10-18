@@ -389,6 +389,42 @@ impl CaptureSession for Box<dyn CaptureSession + Send> {
 /// The entry point a viewer backend provides: given a [`WindowMeta`] received
 /// as a [`Message::WindowOffer`](cursio_protocol::Message::WindowOffer), create
 /// the local surrogate window to mirror it.
+/// A viewer for a machine that only hosts: a phone streams its own screen and
+/// has nowhere to show a computer's window, so an offer is refused with that
+/// reason rather than left unanswered.
+pub struct NoViewRenderer;
+
+impl WindowRenderer for NoViewRenderer {
+    type Surrogate = NoSurrogate;
+
+    fn open(&mut self, _meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
+        Err(WindowError::Backend(
+            "this machine shows its own screen to others but cannot show theirs".into(),
+        ))
+    }
+}
+
+/// Never constructed; it exists to satisfy [`NoViewRenderer`]'s associated type.
+pub enum NoSurrogate {}
+
+impl Surrogate for NoSurrogate {
+    fn apply_frame(&mut self, _frame: &WindowFrame) -> Result<(), WindowError> {
+        match *self {}
+    }
+
+    fn input(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<WindowInput> {
+        match *self {}
+    }
+
+    fn take_ack(&mut self) -> Option<WindowFrameAck> {
+        match *self {}
+    }
+
+    fn close(&mut self, _reason: WindowCloseReason) {
+        match *self {}
+    }
+}
+
 pub trait WindowRenderer {
     type Surrogate: Surrogate;
 

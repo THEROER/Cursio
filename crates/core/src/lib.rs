@@ -114,12 +114,17 @@ pub mod notify_toast;
 pub mod opener;
 /// Who may pair right now, with what secret, and for how long.
 pub mod pairing_window;
+/// Raising memory, swap and i/o pressure as a problem while it lasts.
+/// A mouse on a computer turned into a finger on a phone's screen.
+pub mod phone_gesture;
+/// A phone's screen shown on a computer as a window it can be driven from.
+#[cfg(feature = "window")]
+pub mod phone_screen;
 /// Installing Cursio as this user's ScreenCast portal backend.
 #[cfg(all(target_os = "linux", feature = "window"))]
 pub mod portal_setup;
 /// Whether the user is at this machine: where a phone's notification goes.
 pub mod presence;
-/// Raising memory, swap and i/o pressure as a problem while it lasts.
 pub mod pressure;
 /// Renegotiating a running link when either side's settings change.
 pub mod reconfigure;

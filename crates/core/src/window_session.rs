@@ -162,6 +162,12 @@ pub struct WindowEngine<C: WindowCapture, R: WindowRenderer> {
     /// What the peer's decoder takes, from its [`WindowMsg::VideoCaps`].
     /// Only the High profile until it says otherwise.
     peer_video: VideoCaps,
+    /// The user here asked to see (or stop seeing) the peer's whole screen;
+    /// sent on as [`WindowMsg::RequestScreen`]. Set for a link to a phone.
+    screen_asks: Option<tokio::sync::mpsc::UnboundedReceiver<bool>>,
+    /// What this host does when the peer asks for its screen. Set on a phone;
+    /// elsewhere the request is ignored.
+    on_screen_request: Option<Box<dyn FnMut(bool) + Send>>,
 }
 
 /// A transfer asked for from outside the session loop.
@@ -192,7 +198,21 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             screen_host: ScreenHost::refusing("this machine has no remote-screen capture backend"),
             screen_view: None,
             peer_video: VideoCaps::default(),
+            screen_asks: None,
+            on_screen_request: None,
         }
+    }
+
+    /// Send the peer what the user here asks of its screen.
+    pub fn with_screen_asks(mut self, asks: tokio::sync::mpsc::UnboundedReceiver<bool>) -> Self {
+        self.screen_asks = Some(asks);
+        self
+    }
+
+    /// Act on the peer asking for this machine's screen.
+    pub fn on_screen_request(mut self, act: impl FnMut(bool) + Send + 'static) -> Self {
+        self.on_screen_request = Some(Box::new(act));
+        self
     }
 
     /// Serve the peer's remote-screen view with `host` — which may itself be a
@@ -426,6 +446,14 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                     self.note_transfer_ended();
                 }
             }
+            WindowMsg::RequestScreen { show } => match self.on_screen_request.as_mut() {
+                Some(act) => act(show),
+                None => tracing::debug!(
+                    peer = %self.peer_name,
+                    show,
+                    "the peer asked for this machine's screen, which is not offered that way here"
+                ),
+            },
             other => tracing::debug!(?other, "remote-screen message this node does not serve"),
         }
     }
@@ -597,6 +625,14 @@ where
         for (id, reason) in std::mem::take(&mut self.pending_closes) {
             send_control(tx, WindowMsg::Close { id, reason }).await?;
         }
+        let asks: Vec<bool> = match self.screen_asks.as_mut() {
+            Some(rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
+            None => Vec::new(),
+        };
+        for show in asks {
+            tracing::info!(peer = %self.peer_name, show, "asking the peer about its screen");
+            send_control(tx, WindowMsg::RequestScreen { show }).await?;
+        }
         // Each offer must precede that window's first frame.
         for meta in self.take_unsent_offers() {
             tracing::info!(id = meta.id, "offering window to the peer");
@@ -702,6 +738,7 @@ pub struct WindowFactory {
     /// to agree with the first. The remote-screen options below are not that:
     /// a view is a different thing (see `remote_screen`), not a second way to
     /// start a transfer.
+    #[cfg(feature = "airplay")]
     pub airplay: Option<AirPlayShare>,
     /// Offer every peer's windows and screens to this machine's capture apps
     /// (`--remote-screen`). Off by default: it asks each peer for its source
@@ -717,6 +754,21 @@ pub struct WindowFactory {
     /// silence. Shared so the app can change it; the node restarts the module
     /// on every link for the change to reach the engines already built.
     pub screen_host: crate::live::Shared<bool>,
+}
+
+/// Hosting views, viewing none, sharing no iPhone: what a phone runs. A
+/// constructor rather than a literal because which fields exist depends on
+/// the features this crate was built with, which a dependent cannot see.
+impl Default for WindowFactory {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "airplay")]
+            airplay: None,
+            remote_screen: false,
+            screen_hub: None,
+            screen_host: crate::live::Shared::new(true),
+        }
+    }
 }
 
 impl WindowFactory {
@@ -739,7 +791,12 @@ impl WindowFactory {
                 ctx.local.display_name
             ))
         };
-        let engine = engine.with_screen_host(host);
+        let mut engine = engine.with_screen_host(host);
+        // A phone's screen is asked for from here (the menu, the app, `cursio
+        // screen`), which reaches this link through the registry.
+        if ctx.peer.device_kind == cursio_protocol::DeviceKind::Phone {
+            engine = engine.with_screen_asks(crate::phone_screen::register_phone(ctx.peer_name()));
+        }
         match (self.remote_screen, self.screen_hub.as_ref()) {
             (false, _) => engine,
             (true, Some(hub)) => {
@@ -771,6 +828,7 @@ fn screen_sources(machine: &str) -> ScreenHost {
 }
 
 /// The receiver stream this node can offer through the window module.
+#[cfg(feature = "airplay")]
 #[derive(Clone)]
 pub struct AirPlayShare {
     pub tap: cursio_airplay::MirrorTap,
@@ -787,10 +845,12 @@ pub struct AirPlayShare {
 /// a Windows peer is the whole point of the backend, and negotiation would skip
 /// the module entirely if this said otherwise. Its renderer refuses politely,
 /// so a peer offering *it* a window gets a clear error rather than silence.
+/// A phone counts for the same reason: it hosts its screen and shows nothing.
 const SUPPORTED: bool = cfg!(any(
     target_os = "linux",
     target_os = "windows",
-    target_os = "macos"
+    target_os = "macos",
+    target_os = "android"
 ));
 
 /// What a window backend found, as this machine's problem list says it.
@@ -821,17 +881,44 @@ impl crate::module::ModuleFactory for WindowFactory {
     /// it. Receiving is passive and costs an idle engine; offering stays the
     /// deliberate act of dragging a window across an edge.
     fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
-        SUPPORTED.then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::WINDOW, VERSION))
+        // A phone only hosts (its own screen), so two phones have nothing to
+        // show each other and do not run the module.
+        let role = if cfg!(target_os = "android") {
+            cursio_protocol::ModuleRole::Source
+        } else {
+            cursio_protocol::ModuleRole::Both
+        };
+        SUPPORTED.then(|| cursio_protocol::ModuleAdvert::new(ModuleId::WINDOW, VERSION, role))
     }
 
     #[allow(unused_variables)]
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         cursio_window::notice::set_reporter(report_notice);
+        #[cfg(feature = "airplay")]
         if let Some(share) = &self.airplay {
             share.state.note_offer(ctx.peer.peer_id, ctx.peer.service);
         }
+        #[cfg(target_os = "android")]
+        {
+            let computer = ctx.peer_name().to_string();
+            let phone = ctx.local.display_name.clone();
+            let requests = crate::phone_screen::spawn_trigger(computer.clone(), phone.clone());
+            let asked_by = computer.clone();
+            let engine = WindowEngine::new(
+                crate::phone_screen::PhoneScreenCapture::new(computer.clone(), phone.clone()),
+                cursio_window::NoViewRenderer,
+                computer,
+            )
+            .with_requests(requests)
+            .on_screen_request(move |show| crate::phone_screen::requested(&asked_by, show))
+            .with_screen_host(ScreenHost::serving(std::sync::Arc::new(
+                crate::phone_screen::PhoneScreenSources { phone },
+            )));
+            Ok(Box::new(engine))
+        }
         #[cfg(target_os = "linux")]
         {
+            #[cfg(feature = "airplay")]
             if let Some(airplay) = self
                 .airplay
                 .clone()
@@ -857,6 +944,7 @@ impl crate::module::ModuleFactory for WindowFactory {
         }
         #[cfg(target_os = "windows")]
         {
+            #[cfg(feature = "airplay")]
             if let Some(airplay) = self
                 .airplay
                 .clone()
@@ -885,6 +973,7 @@ impl crate::module::ModuleFactory for WindowFactory {
         }
         #[cfg(target_os = "macos")]
         {
+            #[cfg(feature = "airplay")]
             if let Some(airplay) = self
                 .airplay
                 .clone()
@@ -905,7 +994,12 @@ impl crate::module::ModuleFactory for WindowFactory {
             .with_transfer_ended(ended);
             Ok(Box::new(self.with_screen(engine, ctx)))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "android"
+        )))]
         {
             // Unreachable in practice: `advert` returns `None` here, so
             // negotiation never agrees on this module.
@@ -916,7 +1010,8 @@ impl crate::module::ModuleFactory for WindowFactory {
 
 /// Version of this module's wire vocabulary ([`WindowMsg`]). Bump when those
 /// types change shape; peers run the module only on an exact match.
-pub const VERSION: u16 = 5;
+/// 6: [`WindowMsg::RequestScreen`], a computer asking a phone for its screen.
+pub const VERSION: u16 = 6;
 
 /// Watch for windows dragged toward the peer's edge and turn that into
 /// [`TransferRequest`]s.
@@ -1027,7 +1122,10 @@ fn spawn_drag_trigger(
 ///
 /// Sharing follows mesh placement rather than a drag: only the selected host
 /// offers a surrogate, and a host or quality change closes and recreates it.
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(all(
+    feature = "airplay",
+    any(target_os = "linux", target_os = "windows", target_os = "macos")
+))]
 fn airplay_engine<R: cursio_window::WindowRenderer>(
     share: AirPlayShare,
     renderer: R,
@@ -1042,7 +1140,10 @@ fn airplay_engine<R: cursio_window::WindowRenderer>(
     .with_requests(requests)
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(all(
+    feature = "airplay",
+    any(target_os = "linux", target_os = "windows", target_os = "macos")
+))]
 fn spawn_airplay_trigger(
     state: crate::service_session::ServiceState,
     local: cursio_protocol::PeerId,
@@ -1087,6 +1188,7 @@ mod tests {
     use cursio_window::window_test_support::*;
     use tokio::sync::mpsc;
 
+    #[cfg(feature = "airplay")]
     fn airplay_offer(
         fitness: cursio_protocol::Fitness,
         wanted: Option<cursio_protocol::Quality>,
@@ -1098,6 +1200,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "airplay")]
     #[tokio::test]
     async fn airplay_window_transfer_follows_host_and_quality_changes() {
         let local = cursio_protocol::PeerId::from_u128(1);

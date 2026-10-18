@@ -69,7 +69,8 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// `tray_attached`. v15: a machine's gallery — `gallery_list`,
 /// `gallery_thumbnail`, `gallery_read`, `gallery_save`, and `gallery` in the
 /// status.
-pub const CONTROL_VERSION: u32 = 15;
+/// v16: `phone_screen`, a phone's screen shown here.
+pub const CONTROL_VERSION: u32 = 16;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -236,6 +237,14 @@ pub enum Command {
     Ring {
         peer: String,
     },
+    /// Show a connected phone's screen in a window here (`show`), driven
+    /// with this machine's mouse, or stop. `peer` is its name. The phone asks
+    /// its user first, so the window appears only once they allow it.
+    PhoneScreen {
+        peer: String,
+        #[serde(default = "default_true")]
+        show: bool,
+    },
     /// A phone's conversations, newest first, older than `before_ms` when
     /// given. `peer` is the phone's id or name. Answered by the phone, so it
     /// takes as long as the link does; see [`crate::messages_hub`].
@@ -312,6 +321,10 @@ enum GalleryAsk<'a> {
         item: &'a str,
         name: &'a str,
     },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Command {
@@ -688,8 +701,9 @@ impl LinkPath {
 /// A phone lacking any other module is not running an old build; it has no
 /// backend for that duty, and listing it as missing would ask for an update
 /// that cannot help.
-const PHONE_MODULES: [cursio_protocol::ModuleId; 8] = [
+const PHONE_MODULES: [cursio_protocol::ModuleId; 9] = [
     cursio_protocol::ModuleId::AUDIO,
+    cursio_protocol::ModuleId::WINDOW,
     cursio_protocol::ModuleId::INPUT,
     cursio_protocol::ModuleId::SHARE,
     cursio_protocol::ModuleId::NOTIFY,
@@ -1234,6 +1248,18 @@ impl NodeState {
                     error(format!("no stream {stream} is playing here"))
                 }
             }
+            #[cfg(feature = "window")]
+            Command::PhoneScreen { peer, show } => match crate::phone_screen::ask(&peer, show) {
+                Ok(name) => {
+                    tracing::info!(phone = %name, show, "asking a phone about its screen");
+                    Reply::Done
+                }
+                Err(e) => error(e),
+            },
+            #[cfg(not(feature = "window"))]
+            Command::PhoneScreen { .. } => {
+                error("this build has no window module to show a phone's screen in")
+            }
             Command::Ring { peer } => match crate::notify_hub::hub().ring(&peer, true) {
                 Ok(name) => {
                     tracing::info!(phone = %name, "asking a phone to ring");
@@ -1299,7 +1325,7 @@ mod tests {
                         peer: ModuleRole::Source,
                     },
                 ),
-                (ModuleId::WINDOW, SkipReason::PeerLacks),
+                (ModuleId::FILES, SkipReason::PeerLacks),
             ],
         };
 
@@ -1308,7 +1334,7 @@ mod tests {
         assert!(skipped.is_empty());
         assert_eq!(
             inapplicable,
-            vec!["messages".to_string(), "window".to_string()]
+            vec!["messages".to_string(), "files".to_string()]
         );
     }
 
@@ -1450,6 +1476,33 @@ mod tests {
             Command::Ring {
                 peer: "POCO X7 Pro".into()
             }
+        );
+    }
+
+    #[test]
+    fn a_phone_screen_request_shows_unless_told_to_stop() {
+        let request: Request =
+            serde_json::from_str(r#"{"id":1,"cmd":"phone_screen","peer":"POCO X7 Pro"}"#).unwrap();
+        assert_eq!(
+            request.command,
+            Command::PhoneScreen {
+                peer: "POCO X7 Pro".into(),
+                show: true
+            }
+        );
+    }
+
+    #[test]
+    fn showing_a_phone_that_is_not_linked_answers_with_an_error() {
+        let dir = temp_dir("phone-screen");
+        let node = state(&dir, Overrides::default());
+        let reply = node.handle(Command::PhoneScreen {
+            peer: "nobody-here".into(),
+            show: true,
+        });
+        assert!(
+            matches!(&reply, Reply::Error { message } if message.contains("cannot show its screen")),
+            "{reply:?}"
         );
     }
 

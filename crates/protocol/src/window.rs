@@ -346,6 +346,12 @@ pub enum WindowMsg {
     /// the whole current picture now rather than when the source next changes,
     /// which on a still screen is never.
     KeyframeRequest { id: WindowId },
+    /// Viewer -> host: show (`true`) or stop showing (`false`) the host's whole
+    /// screen as a window here. Answered by an ordinary [`Offer`](Self::Offer)
+    /// once the host's user lets it capture, which on a phone is a system
+    /// consent the request cannot skip; a host with nothing to offer ignores
+    /// it, so a desktop that never streams its screen this way stays as it is.
+    RequestScreen { show: bool },
 }
 
 /// What a viewer's H.264 decoder accepts, beyond the High profile every
@@ -389,7 +395,8 @@ impl WindowMsg {
             | Self::ShowSource { .. }
             | Self::StopSource
             | Self::VideoCaps(_)
-            | Self::KeyframeRequest { .. } => crate::Priority::Control,
+            | Self::KeyframeRequest { .. }
+            | Self::RequestScreen { .. } => crate::Priority::Control,
             _ => Self::PRIORITY,
         }
     }
