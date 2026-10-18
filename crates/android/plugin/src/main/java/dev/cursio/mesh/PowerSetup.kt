@@ -32,26 +32,16 @@ object PowerSetup {
      * HyperOS answers the system's exemption dialog with its own battery page
      * instead, and choosing "No restrictions" there never reaches Android's
      * list — so the stock check stayed false and the setup row kept asking
-     * for what the user had already given. HyperOS keeps that choice in the
-     * secure setting below, as a comma-separated list of packages. Reading it
-     * may be refused on a later build; then only the stock answer counts.
+     * for what the user had already given. The choice is kept by HyperOS's
+     * power keeper, in no setting or provider an app may read (checked on a
+     * POCO X7 Pro), so as with Autostart, having been to the page is the
+     * signal there is.
      */
     fun isIgnoringBatteryOptimizations(context: Context): Boolean {
         val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-        return pm.isIgnoringBatteryOptimizations(context.packageName) || hyperOsUnrestricted(context)
+        return pm.isIgnoringBatteryOptimizations(context.packageName) ||
+            (hasXiaomiAutostart() && Prefs.openedBattery(context))
     }
-
-    private fun hyperOsUnrestricted(context: Context): Boolean {
-        if (!hasXiaomiAutostart()) return false
-        val list = try {
-            Settings.Secure.getString(context.contentResolver, HYPEROS_NO_RESTRICT)
-        } catch (e: SecurityException) {
-            null
-        } ?: return false
-        return list.split(',').any { it.trim() == context.packageName }
-    }
-
-    private const val HYPEROS_NO_RESTRICT = "MILLET_NO_RESTRICT_APP"
 
     /**
      * The system's own one-tap dialog, then the list it lives in.

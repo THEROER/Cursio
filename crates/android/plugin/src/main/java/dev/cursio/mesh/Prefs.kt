@@ -11,6 +11,7 @@ object Prefs {
     private const val KEY_ASKED_MESSAGES = "asked_messages"
     private const val KEY_ASKED_GALLERY = "asked_gallery"
     private const val KEY_OPENED_AUTOSTART = "opened_autostart"
+    private const val KEY_OPENED_BATTERY = "opened_battery"
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -55,4 +56,10 @@ object Prefs {
 
     fun setOpenedAutostart(context: Context) =
         prefs(context).edit().putBoolean(KEY_OPENED_AUTOSTART, true).apply()
+
+    /** The same for HyperOS's battery page; see [PowerSetup.isIgnoringBatteryOptimizations]. */
+    fun openedBattery(context: Context): Boolean = prefs(context).getBoolean(KEY_OPENED_BATTERY, false)
+
+    fun setOpenedBattery(context: Context) =
+        prefs(context).edit().putBoolean(KEY_OPENED_BATTERY, true).apply()
 }

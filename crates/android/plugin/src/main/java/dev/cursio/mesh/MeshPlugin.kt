@@ -258,7 +258,10 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
                 } else {
                     requestPermissionForAlias(NEARBY, invoke, "permissionAnswered")
                 }
-            BATTERY -> launchFirst(invoke, PowerSetup.batteryOptimizationIntents(activity))
+            BATTERY -> {
+                Prefs.setOpenedBattery(activity)
+                launchFirst(invoke, PowerSetup.batteryOptimizationIntents(activity))
+            }
             AUTOSTART -> {
                 Prefs.setOpenedAutostart(activity)
                 launchFirst(invoke, PowerSetup.autostartIntents(activity))
