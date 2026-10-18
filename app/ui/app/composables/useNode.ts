@@ -131,7 +131,40 @@ export interface NodeStatusReply {
   streams: PlayingStream[]
   /** Phones whose messages can be read here; absent from a node older than control v10. */
   messages?: import("~/composables/useMessages").MessagesPeer[]
+  /** Phones whose calls this machine sees; absent from a node without the calls module. */
+  calls?: PhoneCalls[]
 }
+
+/** Mirrors `cursio_protocol::calls::Call`. */
+export interface PhoneCall {
+  id: number
+  direction: "Incoming" | "Outgoing"
+  state: "Ringing" | "Waiting" | "Dialing" | "Alerting" | "Active" | "Held"
+  /** `null` when the caller withheld it. */
+  number: string | null
+  /** The phone's contacts' name for the number, when they have one. */
+  name: string | null
+}
+
+/** Mirrors `cursio_core::calls_hub::PhoneCalls`. */
+export interface PhoneCalls {
+  name: string
+  calls: PhoneCall[]
+  /** The voice of the call that is up plays on this computer. */
+  audio_here: boolean
+  /** Reached over Bluetooth hands-free, so the voice can come here. */
+  hands_free: boolean
+  unavailable: string | null
+}
+
+/** Mirrors `cursio_core::calls_hub::CallAction`. */
+export type CallAction =
+  | { action: "answer" }
+  | { action: "decline" }
+  | { action: "hang_up" }
+  | { action: "dial"; number: string }
+  | { action: "mute"; muted: boolean }
+  | { action: "audio_here"; here: boolean }
 
 /** Mirrors `cursio_core::mixer::MixerStream`: the listener's own say on one stream. */
 export interface PlayingStream {
@@ -280,6 +313,8 @@ export function useNode() {
     restart: () => call<Reply>("node_restart"),
     applyUpdate: () => call<Reply>("node_update_apply"),
     forget: (peer: string) => call<Reply>("node_forget", { peer }),
+    /** Act on a phone's call; `phone` is its name in `status.calls`. */
+    callAction: (phone: string, action: CallAction) => call<Reply>("node_call", { phone, action }),
     start: () => call<void>("node_start"),
   }
 }

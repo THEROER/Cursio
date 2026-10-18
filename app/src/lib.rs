@@ -14,6 +14,9 @@
 /// Starting the node and the tray at login.
 #[cfg(desktop)]
 mod autostart;
+/// A phone's call, in a small window of its own.
+#[cfg(desktop)]
+mod call_window;
 /// Installed versions and rolling back to the previous one.
 #[cfg(desktop)]
 mod install;
@@ -53,6 +56,10 @@ struct StartPage(std::sync::Mutex<Option<String>>);
 fn app_start_page(start: tauri::State<'_, StartPage>) -> Option<String> {
     start.0.lock().unwrap_or_else(|p| p.into_inner()).take()
 }
+
+/// `--page call` opens the call window rather than a page of the main one.
+#[cfg(desktop)]
+const CALL_ROUTE: &str = "/call";
 
 /// The route `--page <name>` names, e.g. `--page messages` → `/messages`.
 /// Only a plain page name is taken: this is an argument any program may pass.
@@ -142,10 +149,21 @@ pub fn run() {
             if argv.iter().any(|a| a == "--hidden") {
                 return;
             }
-            tray::open(app, &page_route(argv).unwrap_or_else(|| "/".into()));
+            match page_route(argv) {
+                Some(route) if route == CALL_ROUTE => call_window::open(app),
+                route => tray::open(app, &route.unwrap_or_else(|| "/".into())),
+            }
         }))
         .setup(move |app| {
             node::follow(app.handle().clone());
+            // Started by the node for a call: the call window alone, the main
+            // window left in the tray as if started at login.
+            let for_call = first_page.as_deref() == Some(CALL_ROUTE);
+            let hidden = hidden || for_call;
+            let first_page = if for_call { None } else { first_page.clone() };
+            if for_call {
+                call_window::open(app.handle());
+            }
             // `reg.exe` / `systemctl`: off the thread that draws the window.
             tauri::async_runtime::spawn_blocking(autostart::refresh);
             if let Err(e) = tray::install(app.handle()) {
@@ -179,6 +197,7 @@ pub fn run() {
             node::commands::messages_thread,
             node::commands::messages_send,
             node::commands::messages_mark_read,
+            node::commands::node_call,
             node::commands::node_status,
             node::commands::node_config,
             node::commands::node_set_module,

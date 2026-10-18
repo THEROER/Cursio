@@ -8,6 +8,15 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 // anything listened, so it is taken once the listener is up.
 let unlisten: UnlistenFn | undefined
 onMounted(async () => {
+  // The call window loads this same app and is told apart by its label (see
+  // `call_window.rs`); it shows the call page and nothing else.
+  const label = await import("@tauri-apps/api/webviewWindow")
+    .then((m) => m.getCurrentWebviewWindow().label)
+    .catch(() => "main")
+  if (label === "call") {
+    void navigateTo("/call")
+    return
+  }
   unlisten = await listen<string>("navigate", (event) => {
     void navigateTo(event.payload)
   })

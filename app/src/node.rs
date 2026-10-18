@@ -596,6 +596,18 @@ pub mod commands {
             .await
     }
 
+    /// Answer, decline, end or move the voice of a phone's call. `phone` is
+    /// its name as the status's `calls` gives it.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn node_call(
+        link: State<'_, NodeLink>,
+        phone: String,
+        action: cursio_core::calls_hub::CallAction,
+    ) -> Result<Reply, NodeError> {
+        link.request(Command::Call { phone, action }).await
+    }
+
     /// Off the window's thread: `systemctl` or a process spawn can take a
     /// noticeable moment, and a synchronous command would freeze the window
     /// for it.

@@ -13,6 +13,26 @@
     "messages": "Messages",
     "label": "Pages"
   },
+  "call": {
+    "title": "Call",
+    "unknown": "Unknown caller",
+    "incoming": "Incoming call",
+    "waiting": "Call waiting",
+    "calling": "Calling…",
+    "held": "On hold",
+    "active": "On a call",
+    "ended": "Call ended",
+    "voiceHere": "voice on this computer",
+    "voicePhone": "voice on the phone",
+    "answer": "Answer",
+    "decline": "Decline",
+    "hangUp": "Hang up",
+    "mute": "Mute",
+    "unmute": "Unmute",
+    "usePhone": "Use phone",
+    "useComputer": "Use computer",
+    "failed": "The phone did not do that"
+  },
   "messages": {
     "title": "Messages",
     "description": "Your phone's text messages, read and answered from here. They stay on the phone.",

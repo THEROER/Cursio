@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "The status window draws its own title bar, so it moves, sizes and closes itself",
-  "windows": ["main"],
+  "windows": ["main", "call"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
