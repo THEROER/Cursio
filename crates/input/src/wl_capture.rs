@@ -135,8 +135,7 @@ pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
     // first run the shared value is empty and the first barriers go up when a
     // peer greets us; on a capture restarted mid-mesh it already holds the
     // right edges.
-    let edge_rx = watched_edges().subscribe();
-    let edges = *edge_rx.borrow();
+    let mut edge_rx = watched_edges().subscribe();
 
     std::thread::Builder::new()
         .name("cursio-wayland".into())
@@ -153,7 +152,7 @@ pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                match setup_portal(edges).await {
+                match setup_portal(&mut edge_rx).await {
                     Ok(portal) => {
                         let _ = ready_tx.send(Ok(()));
                         capture_loop(portal, tx, edges_tx, grab_rx, edge_rx).await;
@@ -217,12 +216,20 @@ struct Portal {
     rects: Vec<Rect>,
     /// Which zone set the current `rects` (and so the barrier ids) belong to.
     zone_set: u32,
+    /// The edges the barriers were actually placed on. Not re-read from the
+    /// shared value by the loop: setup can sit on the permission dialog for
+    /// hours, peers greet meanwhile, and a loop that took the current value as
+    /// "already placed" kept the empty set it started with — no barrier at all
+    /// until some peer moved.
+    edges: EdgeSet,
 }
 
 /// Open the InputCapture portal session, connect libei, and place outer-edge
 /// barriers. Returns the pieces the capture loop drives. Runs on the Wayland
 /// thread's LocalSet.
-async fn setup_portal(edges: EdgeSet) -> Result<Portal, String> {
+async fn setup_portal(
+    edge_rx: &mut tokio::sync::watch::Receiver<EdgeSet>,
+) -> Result<Portal, String> {
     let ic = InputCapture::new()
         .await
         .map_err(|e| format!("open InputCapture portal: {e}"))?;
@@ -250,6 +257,9 @@ async fn setup_portal(edges: EdgeSet) -> Result<Portal, String> {
 
     // Barriers on the OUTER edges only — the portal rejects internal seams.
     let (rects, zone_set) = read_zones(&ic, &session).await?;
+    // Read only now, not when the thread started: a change from here on wakes
+    // the capture loop, which compares against what was placed.
+    let edges = *edge_rx.borrow_and_update();
     let barrier_info = place_barriers(&ic, &session, &rects, zone_set, edges).await;
 
     Ok(Portal {
@@ -260,6 +270,7 @@ async fn setup_portal(edges: EdgeSet) -> Result<Portal, String> {
         barrier_info,
         rects,
         zone_set,
+        edges,
     })
 }
 
@@ -546,11 +557,8 @@ async fn capture_loop(
         mut barrier_info,
         mut rects,
         mut zone_set,
+        mut edges,
     } = portal;
-    // The edges the barriers currently sit on. Read from the shared value
-    // rather than from a parameter: it may already have moved while the portal
-    // handshake was running.
-    let mut edges = *edge_rx.borrow_and_update();
 
     let mut activated = match ic.receive_activated().await {
         Ok(s) => s,
