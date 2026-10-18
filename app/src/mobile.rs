@@ -93,6 +93,10 @@ pub struct PhoneAudioState {
     /// Linear, 0 to 1.
     pub volume: f32,
     pub awaited: Option<String>,
+    /// The device chosen before Cursio restarted, while nothing is routed.
+    pub remembered: Option<String>,
+    /// That device's key, when it is connected and can be resumed now.
+    pub resume: Option<u64>,
 }
 
 pub mod commands {
@@ -138,13 +142,16 @@ pub mod commands {
         .map_err(|e| e.to_string())?
     }
 
-    /// How loud the phone's sound reaches the computer, and the device it is
-    /// waiting for while that device's machine is away.
+    /// How loud the phone's sound reaches the computer, the device it is
+    /// waiting for while that device's machine is away, and the one chosen
+    /// before a restart that only the user's consent can bring back.
     #[tauri::command]
     pub fn phone_audio_state() -> PhoneAudioState {
         PhoneAudioState {
             volume: cursio_android::playback_volume(),
             awaited: cursio_android::awaited_playback(),
+            remembered: cursio_android::remembered_playback(),
+            resume: cursio_android::resumable_playback().map(|t| t.key),
         }
     }
 

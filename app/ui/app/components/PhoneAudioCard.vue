@@ -16,11 +16,24 @@ const targets = ref<PhoneAudioTarget[] | null>(null)
 const state = ref<PhoneAudioState | null>(null)
 const busy = ref(false)
 
+/**
+ * Whether this window already asked to resume the device chosen before a
+ * restart. Android's consent cannot outlive the process, so the choice comes
+ * back as one prompt — once, so declining it is not answered with another.
+ */
+let resumeAsked = false
+
 async function refresh() {
   try {
     ;[targets.value, state.value] = await Promise.all([phoneAudioTargets(), phoneAudioState()])
   } catch (e) {
     toast.failure(e, { title: t("phoneAudio.listFailed") })
+    return
+  }
+  const resume = state.value?.resume
+  if (resume != null && !resumeAsked && !busy.value) {
+    resumeAsked = true
+    await pick(String(resume))
   }
 }
 
@@ -45,7 +58,9 @@ const options = computed(() => [
 async function pick(value: string | string[] | undefined) {
   if (typeof value !== "string") return
   const target = value === OFF ? null : Number(value)
-  if (target === (active.value?.key ?? null)) return
+  // Choosing "off" while a pre-restart device is remembered is how the user
+  // forgets it, so it still goes through.
+  if (target === (active.value?.key ?? null) && !(target === null && state.value?.remembered)) return
   busy.value = true
   try {
     await phoneAudioRoute(target)
@@ -95,6 +110,20 @@ onBeforeUnmount(() => {
     <p v-if="active" class="text-xs">{{ t("phoneAudio.playingOn", { device: active.name }) }}</p>
     <LpAlert v-else-if="state?.awaited" variant="warning">
       {{ t("phoneAudio.awaited", { device: state.awaited }) }}
+    </LpAlert>
+    <LpAlert v-else-if="state?.remembered" variant="warning">
+      <div class="flex flex-col gap-2">
+        <span>{{ t("phoneAudio.remembered", { device: state.remembered }) }}</span>
+        <LpButton
+          v-if="state.resume != null"
+          variant="soft"
+          size="sm"
+          :disabled="busy"
+          @click="pick(String(state.resume))"
+        >
+          {{ t("phoneAudio.resume") }}
+        </LpButton>
+      </div>
     </LpAlert>
     <p v-else-if="targets.length === 0" class="text-xs text-muted">{{ t("phoneAudio.none") }}</p>
     <LpFormField :label="t('phoneAudio.volume')">

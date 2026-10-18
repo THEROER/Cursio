@@ -50,6 +50,10 @@ export interface PhoneAudioState {
   volume: number
   /** The chosen device, while its machine is away. */
   awaited: string | null
+  /** The device chosen before Cursio restarted, while nothing is routed. */
+  remembered: string | null
+  /** That device's key, when it is connected and can be resumed now. */
+  resume: number | null
 }
 
 export const phoneAudioState = () => invoke<PhoneAudioState>("phone_audio_state")

@@ -131,9 +131,12 @@ pub fn input_to(
 
 /// Peer devices this phone's playback can be sent to.
 #[cfg(target_os = "android")]
-pub use cursio_audio::android_backend::{playback_targets, route_playback, PlaybackTarget};
+pub use cursio_audio::android_backend::{playback_targets, PlaybackTarget};
 #[cfg(target_os = "android")]
-pub use phone_audio::{awaited_playback, playback_volume, set_playback_volume};
+pub use phone_audio::{
+    awaited_playback, playback_volume, remembered_playback, resumable_playback, route_playback,
+    set_playback_volume,
+};
 
 /// One line for the service notification.
 pub fn status_line() -> String {

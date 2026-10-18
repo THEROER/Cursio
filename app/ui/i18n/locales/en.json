@@ -366,7 +366,9 @@
     "listFailed": "The output devices could not be read",
     "volume": "Volume on the computer",
     "volumeFailed": "The volume was not changed",
-    "awaited": "{device} is not connected right now. The sound plays on this phone and goes back to it when it returns."
+    "awaited": "{device} is not connected right now. The sound plays on this phone and goes back to it when it returns.",
+    "remembered": "Before Cursio restarted, the sound played on {device}. Android asks again after every restart before it lets the sound go there.",
+    "resume": "Play there again"
   },
   "touchpad": {
     "driving": "Driving {peer}",
