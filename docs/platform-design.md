@@ -256,6 +256,19 @@ monolith:
 | Media control | async, `Both` | MPRIS / SMTC. Tiny state object; the audio module's device-state replication (owner mutates, broadcasts whole object) is the pattern. |
 | Phone sensors / battery | async, `Source` from phone | Pure state replication, no commands. |
 
+**A phone's copy of what a desktop client already showed is dropped.**
+Telegram, WhatsApp and Discord push every message to every client they run,
+so the machine the user sat at showed its own client's notification and then
+the phone's copy. That machine now watches its own notification server (a
+D-Bus monitor on `Notify`, GTK's and the portal's `AddNotification`) and drops
+a copy whose twin — same app, same text once emoji and punctuation are set
+aside — appeared in the last 10 s. A copy that arrives first is shown and
+taken down if the twin follows within 2 s; an app that has matched twice is
+remembered (`notify-native-apps.json` in the config directory, forgotten after
+14 days without a match) and its copies wait those 2 s instead, then show if
+no twin came. Calls are never held. Windows shows no phone notifications yet,
+so it has nothing to drop; `crates/core/src/notify_dedup.rs` holds the rest.
+
 The reason this decomposes cleanly is that all four are *state replication or
 bulk transfer* — the two patterns the audio and clipboard modules already
 established. Nothing new is required at the platform layer.

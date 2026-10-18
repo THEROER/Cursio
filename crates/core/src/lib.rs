@@ -83,6 +83,8 @@ pub(crate) mod module_host;
 pub mod mount_helper;
 pub mod node_status;
 /// A phone's notifications shown through this desktop's notification server.
+/// Not showing a phone's copy of what a desktop client already showed.
+pub mod notify_dedup;
 #[cfg(target_os = "linux")]
 pub mod notify_display;
 /// Where a phone's notifications enter the mesh and a desktop's answers leave.

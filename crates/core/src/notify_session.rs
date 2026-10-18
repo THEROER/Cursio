@@ -21,7 +21,10 @@ use cursio_protocol::{Message, ModuleId, PeerId};
 use cursio_transport::{TransportError, TransportTx};
 use tokio::sync::mpsc;
 
+use cursio_protocol::notify::Notification;
+
 use crate::module::SessionModule;
+use crate::notify_dedup::{dedup, Decision};
 use crate::notify_hub::{hub, DisplayEvent, NotifyActor, NotifyDisplay};
 
 /// Version of [`NotifyMsg`]; peers run the module only on an exact match.
@@ -47,6 +50,12 @@ pub struct NotifyEngine {
     here: Option<bool>,
     presence_at: Instant,
     shown: HashSet<NotificationKey>,
+    /// Copies of an app known to have a client here, waiting to see whether
+    /// that client shows them first: (copy, when it arrived, until when).
+    held: Vec<(Notification, Instant, Instant)>,
+    /// Copies already shown, taken down again if a client's twin turns up
+    /// before the moment given. See [`crate::notify_dedup`].
+    watched: Vec<(Notification, Instant, Instant)>,
     queued: Vec<NotifyMsg>,
 }
 
@@ -71,6 +80,8 @@ impl NotifyEngine {
             here: None,
             presence_at: Instant::now(),
             shown: HashSet::new(),
+            held: Vec::new(),
+            watched: Vec::new(),
             queued: Vec::new(),
         }
     }
@@ -95,19 +106,10 @@ impl NotifyEngine {
                     hub().set_here(self.peer, here);
                 }
             }
-            NotifyMsg::Posted(notification) => {
-                if let Some(display) = &self.display {
-                    tracing::debug!(peer = %self.peer_name, app = %notification.app_name, "showing a notification");
-                    display.show(
-                        self.peer,
-                        &self.peer_name,
-                        &notification,
-                        self.events_tx.clone(),
-                    );
-                    self.shown.insert(notification.key);
-                }
-            }
+            NotifyMsg::Posted(notification) => self.posted(notification),
             NotifyMsg::Removed { key } => {
+                self.held.retain(|(n, _, _)| n.key != key);
+                self.watched.retain(|(n, _, _)| n.key != key);
                 if let Some(display) = &self.display {
                     if self.shown.remove(&key) {
                         display.close(self.peer, &key);
@@ -131,6 +133,86 @@ impl NotifyEngine {
                     tracing::warn!(peer = %self.peer_name, "asked to ring, but this machine has no ringer")
                 }
             },
+        }
+    }
+
+    fn posted(&mut self, notification: Notification) {
+        if self.display.is_none() {
+            return;
+        }
+        // An update of one already on screen replaces it in place; whatever
+        // was decided about it the first time still stands.
+        if self.shown.contains(&notification.key) {
+            self.show(&notification);
+            return;
+        }
+        self.held.retain(|(n, _, _)| n.key != notification.key);
+        let now = Instant::now();
+        match dedup().decide(&notification, now) {
+            Decision::Duplicate => {
+                tracing::debug!(peer = %self.peer_name, app = %notification.app_name, "a client here already showed this; not showing the phone's copy");
+            }
+            Decision::Show => self.show(&notification),
+            Decision::ShowWatching(until) => {
+                self.show(&notification);
+                self.watched.push((notification, now, until));
+            }
+            Decision::Hold(until) => self.held.push((notification, now, until)),
+        }
+    }
+
+    fn show(&mut self, notification: &Notification) {
+        let Some(display) = &self.display else { return };
+        tracing::debug!(peer = %self.peer_name, app = %notification.app_name, "showing a notification");
+        display.show(
+            self.peer,
+            &self.peer_name,
+            notification,
+            self.events_tx.clone(),
+        );
+        self.shown.insert(notification.key.clone());
+    }
+
+    /// Show held copies whose wait ran out, and take down shown ones whose
+    /// twin arrived. The record is read first and released before anything
+    /// reaches the notification server, which the watcher must not wait on.
+    fn settle(&mut self, now: Instant) {
+        if self.held.is_empty() && self.watched.is_empty() {
+            return;
+        }
+        let mut show = Vec::new();
+        let mut take_down = Vec::new();
+        {
+            let mut record = dedup();
+            self.held.retain(|(n, since, until)| {
+                if record.arrived(n, *since) {
+                    false
+                } else if now >= *until {
+                    show.push(n.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            self.watched.retain(|(n, since, until)| {
+                if record.arrived(n, *since) {
+                    take_down.push(n.key.clone());
+                    false
+                } else {
+                    now < *until
+                }
+            });
+        }
+        for n in show {
+            self.show(&n);
+        }
+        if let Some(display) = &self.display {
+            for key in take_down {
+                tracing::debug!(peer = %self.peer_name, "a client here showed this too; taking the phone's copy down");
+                // Closed here only: on the phone it is still unread.
+                self.shown.remove(&key);
+                display.close(self.peer, &key);
+            }
         }
     }
 
@@ -173,6 +255,7 @@ impl SessionModule for NotifyEngine {
 
     async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
         self.check_presence(Instant::now());
+        self.settle(Instant::now());
         while let Ok(event) = self.events_rx.try_recv() {
             self.on_event(event);
         }
@@ -183,6 +266,11 @@ impl SessionModule for NotifyEngine {
             send(tx, &msg).await?;
         }
         Ok(())
+    }
+
+    fn has_pending_work(&self) -> bool {
+        // A held copy is due within seconds; the idle pace would show it late.
+        !self.held.is_empty() || !self.watched.is_empty()
     }
 
     fn handle_message(&mut self, msg: &Message) -> bool {
