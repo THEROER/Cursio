@@ -79,14 +79,15 @@ object Island {
         ctx: Context,
         title: String,
         artist: String,
+        source: String,
         cover: Icon?,
         button: Notification.Action,
     ): Bundle =
         focus(
             business = "music",
-            heading = artist.ifEmpty { title },
+            heading = title,
             title = title,
-            content = artist,
+            content = listOf(artist, source).filter { it.isNotEmpty() }.joinToString(" · "),
             islandText = title,
             // Below a ringing phone, a call or a timer.
             priority = 1,
@@ -119,6 +120,10 @@ object Island {
                 "baseInfo",
                 JSONObject().put("type", 1).put("title", heading).put("content", content),
             )
+            // The picture beside the text in the expanded card, not only in
+            // the island itself: without it a player's card was two lines of
+            // text on black.
+            .put("picInfo", picInfo)
             .put(
                 "param_island",
                 JSONObject()

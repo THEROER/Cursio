@@ -250,6 +250,7 @@ object MediaNotifier {
                     ctx,
                     p.optString("title"),
                     p.optString("artist"),
+                    listOf(p.optString("app"), entry.peerName).filter { it.isNotEmpty() }.joinToString(" · "),
                     art?.let { Icon.createWithBitmap(it) },
                     actions[1],
                 ),
