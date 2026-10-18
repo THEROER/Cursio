@@ -399,140 +399,151 @@ fn gtk_thread(
     // called further down once the window is up.
     let quit = glib::MainLoop::new(None, false);
     let quit_for_cmds = quit.clone();
-    glib::timeout_add_local(std::time::Duration::from_millis(4), move || {
-        // Time each tick. GTK dispatches this on the UI thread, so anything slow
-        // here stops the window answering the compositor — which is exactly what
-        // the desktop's "wait / force quit" dialog reports. A threshold log names
-        // the culprit instead of leaving "it froze" to guesswork.
-        let tick_started = std::time::Instant::now();
+    // Below GTK's input and redraw priorities. A phone's H.264 decoded here
+    // takes a tick past 100 ms, and at the default priority — the same as
+    // input — a tick re-armed every 4 ms kept the loop busy for good: the
+    // close button and the host's close waited behind the frames, and the
+    // window could only be got rid of by stopping the node.
+    glib::timeout_add_local_full(
+        std::time::Duration::from_millis(4),
+        glib::Priority::DEFAULT_IDLE,
+        move || {
+            // Time each tick. GTK dispatches this on the UI thread, so anything slow
+            // here stops the window answering the compositor — which is exactly what
+            // the desktop's "wait / force quit" dialog reports. A threshold log names
+            // the culprit instead of leaving "it froze" to guesswork.
+            let tick_started = std::time::Instant::now();
 
-        let mut painted = false;
-        let mut presented_seq: Option<u32> = None;
-        // Bounded per tick: a burst of frames must not starve the paint that
-        // makes them visible.
-        for _ in 0..16 {
-            match commands.try_recv() {
-                Ok(SurrogateCommand::Frame { seq, dirty, raw }) => {
-                    if let Err(e) = fb_for_frames.borrow_mut().blit(dirty, &raw) {
-                        tracing::warn!(error = %e, "dropping malformed tile");
-                        continue;
-                    }
-                    painted = true;
-                    presented_seq = Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
-                }
-                Ok(SurrogateCommand::VideoPacket { seq, packet }) => {
-                    // Opened on first use: a window that never sends video
-                    // never pays for a decoder.
-                    if decoder.is_none() {
-                        match VideoDecoder::open() {
-                            Ok(d) => decoder = Some(d),
-                            Err(e) => {
-                                tracing::error!(error = %e, "no H.264 decoder; video frames will be dropped");
-                                continue;
-                            }
+            let mut painted = false;
+            let mut presented_seq: Option<u32> = None;
+            // Bounded per tick: a burst of frames must not starve the paint that
+            // makes them visible.
+            for _ in 0..16 {
+                match commands.try_recv() {
+                    Ok(SurrogateCommand::Frame { seq, dirty, raw }) => {
+                        if let Err(e) = fb_for_frames.borrow_mut().blit(dirty, &raw) {
+                            tracing::warn!(error = %e, "dropping malformed tile");
+                            continue;
                         }
+                        painted = true;
+                        presented_seq =
+                            Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
                     }
-                    let Some(dec) = decoder.as_mut() else {
-                        continue;
-                    };
-                    match dec.decode(&packet) {
-                        Ok(pictures) => {
-                            for pic in pictures {
-                                let mut fb = fb_for_frames.borrow_mut();
-                                // A video frame is the whole window, and the
-                                // stream carries its own geometry — adopt it if
-                                // it disagrees, rather than refusing the blit.
-                                if fb.width != pic.width || fb.height != pic.height {
-                                    fb.resize(pic.width, pic.height);
-                                    // The window follows too. `ContentFit::Fill`
-                                    // stretches the texture across whatever
-                                    // allocation it is given, so a stream that
-                                    // changes resolution — a quality change, or
-                                    // an encoder rounding up to whole macroblocks
-                                    // — would otherwise be scaled into the old
-                                    // window's size for the rest of the session.
-                                    main_loop_window
-                                        .set_default_size(pic.width as i32, pic.height as i32);
-                                }
-                                let full = Rect {
-                                    x: 0,
-                                    y: 0,
-                                    width: pic.width,
-                                    height: pic.height,
-                                };
-                                if let Err(e) = fb.blit(full, &pic.pixels) {
-                                    tracing::warn!(error = %e, "dropping decoded video frame");
+                    Ok(SurrogateCommand::VideoPacket { seq, packet }) => {
+                        // Opened on first use: a window that never sends video
+                        // never pays for a decoder.
+                        if decoder.is_none() {
+                            match VideoDecoder::open() {
+                                Ok(d) => decoder = Some(d),
+                                Err(e) => {
+                                    tracing::error!(error = %e, "no H.264 decoder; video frames will be dropped");
                                     continue;
                                 }
-                                painted = true;
-                                presented_seq =
-                                    Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
                             }
                         }
-                        Err(e) => {
-                            // Its reference pictures are now suspect; start
-                            // again from the host's next keyframe.
-                            tracing::warn!(error = %e, "video decode failed; restarting the decoder");
-                            decoder = None;
+                        let Some(dec) = decoder.as_mut() else {
+                            continue;
+                        };
+                        match dec.decode(&packet) {
+                            Ok(pictures) => {
+                                for pic in pictures {
+                                    let mut fb = fb_for_frames.borrow_mut();
+                                    // A video frame is the whole window, and the
+                                    // stream carries its own geometry — adopt it if
+                                    // it disagrees, rather than refusing the blit.
+                                    if fb.width != pic.width || fb.height != pic.height {
+                                        fb.resize(pic.width, pic.height);
+                                        // The window follows too. `ContentFit::Fill`
+                                        // stretches the texture across whatever
+                                        // allocation it is given, so a stream that
+                                        // changes resolution — a quality change, or
+                                        // an encoder rounding up to whole macroblocks
+                                        // — would otherwise be scaled into the old
+                                        // window's size for the rest of the session.
+                                        main_loop_window
+                                            .set_default_size(pic.width as i32, pic.height as i32);
+                                    }
+                                    let full = Rect {
+                                        x: 0,
+                                        y: 0,
+                                        width: pic.width,
+                                        height: pic.height,
+                                    };
+                                    if let Err(e) = fb.blit(full, &pic.pixels) {
+                                        tracing::warn!(error = %e, "dropping decoded video frame");
+                                        continue;
+                                    }
+                                    painted = true;
+                                    presented_seq = Some(
+                                        presented_seq.map_or(seq, |previous| previous.max(seq)),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                // Its reference pictures are now suspect; start
+                                // again from the host's next keyframe.
+                                tracing::warn!(error = %e, "video decode failed; restarting the decoder");
+                                decoder = None;
+                            }
+                        }
+                        if !decoder.as_ref().is_some_and(VideoDecoder::synced) {
+                            wants_keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    if !decoder.as_ref().is_some_and(VideoDecoder::synced) {
-                        wants_keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(SurrogateCommand::Resize { width, height }) => {
+                        fb_for_frames.borrow_mut().resize(width, height);
+                        main_loop_window.set_default_size(width as i32, height as i32);
+                        painted = true;
+                    }
+                    Ok(SurrogateCommand::Grow { width, height }) => {
+                        fb_for_frames.borrow_mut().grow_to(width, height);
+                        main_loop_window.set_default_size(width as i32, height as i32);
+                        painted = true;
+                    }
+                    Ok(SurrogateCommand::Close(reason)) => {
+                        tracing::info!(?reason, id, "surrogate window closing");
+                        main_loop_window.close();
+                        // Quit the loop explicitly.
+                        //
+                        // `ControlFlow::Break` only stops THIS timeout, and
+                        // `window.close()` merely *requests* a close — it does not
+                        // raise `close-request`, which is what `quit()` was wired to.
+                        // So the GTK main loop kept running with nothing left to
+                        // service it: the window stayed on screen and stopped
+                        // answering the compositor, which the desktop reports as
+                        // "GTK Application is not responding" with wait/force-quit.
+                        quit_for_cmds.quit();
+                        return glib::ControlFlow::Break;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        // Session gone (peer disconnected, process shutting down):
+                        // same teardown as an explicit Close.
+                        tracing::info!(id, "surrogate command channel closed; tearing down");
+                        main_loop_window.close();
+                        quit_for_cmds.quit();
+                        return glib::ControlFlow::Break;
                     }
                 }
-                Ok(SurrogateCommand::Resize { width, height }) => {
-                    fb_for_frames.borrow_mut().resize(width, height);
-                    main_loop_window.set_default_size(width as i32, height as i32);
-                    painted = true;
-                }
-                Ok(SurrogateCommand::Grow { width, height }) => {
-                    fb_for_frames.borrow_mut().grow_to(width, height);
-                    main_loop_window.set_default_size(width as i32, height as i32);
-                    painted = true;
-                }
-                Ok(SurrogateCommand::Close(reason)) => {
-                    tracing::info!(?reason, id, "surrogate window closing");
-                    main_loop_window.close();
-                    // Quit the loop explicitly.
-                    //
-                    // `ControlFlow::Break` only stops THIS timeout, and
-                    // `window.close()` merely *requests* a close — it does not
-                    // raise `close-request`, which is what `quit()` was wired to.
-                    // So the GTK main loop kept running with nothing left to
-                    // service it: the window stayed on screen and stopped
-                    // answering the compositor, which the desktop reports as
-                    // "GTK Application is not responding" with wait/force-quit.
-                    quit_for_cmds.quit();
-                    return glib::ControlFlow::Break;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // Session gone (peer disconnected, process shutting down):
-                    // same teardown as an explicit Close.
-                    tracing::info!(id, "surrogate command channel closed; tearing down");
-                    main_loop_window.close();
-                    quit_for_cmds.quit();
-                    return glib::ControlFlow::Break;
+            }
+            // One texture swap per tick, not per tile: several tiles of the same
+            // visual update coalesce into a single present.
+            if painted {
+                picture_for_frames.set_paintable(Some(&to_texture(&fb_for_frames.borrow())));
+                if let Some(seq) = presented_seq {
+                    let _ = presented_tx.send(seq);
                 }
             }
-        }
-        // One texture swap per tick, not per tile: several tiles of the same
-        // visual update coalesce into a single present.
-        if painted {
-            picture_for_frames.set_paintable(Some(&to_texture(&fb_for_frames.borrow())));
-            if let Some(seq) = presented_seq {
-                let _ = presented_tx.send(seq);
+            let took = tick_started.elapsed();
+            if took >= std::time::Duration::from_millis(100) {
+                tracing::warn!(
+                    took_ms = took.as_millis() as u64,
+                    "surrogate tick blocked the GTK loop"
+                );
             }
-        }
-        let took = tick_started.elapsed();
-        if took >= std::time::Duration::from_millis(100) {
-            tracing::warn!(
-                took_ms = took.as_millis() as u64,
-                "surrogate tick blocked the GTK loop"
-            );
-        }
-        glib::ControlFlow::Continue
-    });
+            glib::ControlFlow::Continue
+        },
+    );
 
     window.present();
     let _ = ready_tx.send(Ok(()));
