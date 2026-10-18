@@ -8,7 +8,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.drawable.Icon
 import android.media.MediaMetadata
 import android.media.session.MediaSession
@@ -45,11 +47,24 @@ object MediaNotifier {
 
     private class Shown(val session: MediaSession, val id: Int, var artKey: String? = null)
 
+    /**
+     * When each player was last seen playing, by [key]. A browser keeps a
+     * paused player for as long as the tab with the video is open — hours —
+     * and it sat in the shade the whole time, so a player paused longer than
+     * [STALE_MS] is taken down until it plays again.
+     */
+    private val lastPlaying = HashMap<String, Long>()
+    private const val STALE_MS = 5 * 60_000L
+
+    /** Each computer's last list, re-applied once a pause has gone stale. */
+    private val lastLists = HashMap<String, Pair<String, String>>()
+
     /** A computer's players changed; [json] is the full list, empty to clear. */
     fun update(peer: String, peerName: String, json: String) {
         val ctx = context ?: return
         main.post {
             try {
+                lastLists[peer] = peerName to json
                 apply(ctx, peer, peerName, JSONArray(json))
             } catch (e: Exception) {
                 Log.w(TAG, "could not show $peerName's players", e)
@@ -64,10 +79,16 @@ object MediaNotifier {
         ensureChannel(manager)
         ensureReceiver(ctx)
         val present = HashSet<String>()
+        val now = SystemClock.elapsedRealtime()
+        var nextStale = Long.MAX_VALUE
         for (i in 0 until list.length()) {
             val p = list.getJSONObject(i)
             val player = p.getString("id")
             val k = key(peer, player)
+            if (p.optBoolean("playing")) lastPlaying[k] = now
+            val since = lastPlaying.getOrPut(k) { now }
+            if (now - since >= STALE_MS) continue
+            nextStale = minOf(nextStale, since + STALE_MS - now)
             present.add(k)
             val entry = shown.getOrPut(k) {
                 val session = MediaSession(ctx, "cursio-$peerName-$player")
@@ -77,6 +98,20 @@ object MediaNotifier {
             fill(entry, p, peerName)
             manager.notify(entry.id, notification(ctx, entry, p, peer, player, peerName))
         }
+        if (nextStale != Long.MAX_VALUE) {
+            main.postDelayed({
+                val (name, json) = lastLists[peer] ?: return@postDelayed
+                try {
+                    apply(ctx, peer, name, JSONArray(json))
+                } catch (e: Exception) {
+                    Log.w(TAG, "could not refresh $name's players", e)
+                }
+            }, nextStale + 1_000L)
+        }
+        // A stale player stays listed, and stays down; one the computer
+        // dropped is forgotten.
+        val listed = listedKeys(peer, list)
+        lastPlaying.keys.removeAll { it.startsWith("$peer\u0000") && it !in listed }
         val gone = shown.keys.filter { it.startsWith("$peer\u0000") && it !in present }
         for (k in gone) {
             val entry = shown.remove(k) ?: continue
@@ -162,16 +197,40 @@ object MediaNotifier {
         val builder = Notification.Builder(ctx, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notify)
             .setContentTitle(p.optString("title"))
-            .setContentText(listOf(p.optString("artist"), "${p.optString("app")} · $peerName").filter { it.isNotEmpty() }.joinToString(" — "))
-            .setSubText(peerName)
+            .setContentText(p.optString("artist"))
+            .setSubText(listOf(p.optString("app"), peerName).filter { it.isNotEmpty() }.joinToString(" · "))
             .setOngoing(playing)
             .setShowWhen(false)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setStyle(Notification.MediaStyle().setMediaSession(entry.session.sessionToken).setShowActionsInCompactView(0, 1, 2))
         for (a in actions) builder.addAction(a)
-        entry.session.controller.metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)?.let { builder.setLargeIcon(it) }
+        // Without a cover, the app's own icon: HyperOS puts it there by
+        // itself, MIUI 12 left an empty grey square.
+        val art = entry.session.controller.metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+        (art ?: appIcon(ctx))?.let { builder.setLargeIcon(it) }
         return builder.build()
     }
+
+    private var icon: Bitmap? = null
+
+    private fun appIcon(ctx: Context): Bitmap? {
+        icon?.let { return it }
+        return try {
+            val drawable = ctx.packageManager.getApplicationIcon(ctx.packageName)
+            val size = 192
+            Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).also {
+                drawable.setBounds(0, 0, size, size)
+                drawable.draw(Canvas(it))
+                icon = it
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "no app icon for a player without a cover", e)
+            null
+        }
+    }
+
+    private fun listedKeys(peer: String, list: JSONArray): Set<String> =
+        (0 until list.length()).map { key(peer, list.getJSONObject(it).getString("id")) }.toSet()
 
     private fun ensureChannel(manager: NotificationManager) {
         if (manager.getNotificationChannel(CHANNEL_ID) != null) return
