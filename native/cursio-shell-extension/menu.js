@@ -136,11 +136,31 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
         // menu (an activated row still closes it), then moved into a scroller.
         const box = this._peers.actor.get_parent();
         box.remove_child(this._peers.actor);
+        // `vfade` fades the rows at the edges the way the Shell's own lists do,
+        // and the scrollbar takes its own column rather than covering the
+        // switches at the right of each row.
         const scroll = new St.ScrollView({
+            style_class: 'vfade',
             style: 'max-height: 26em;',
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
-            overlay_scrollbars: true,
+            overlay_scrollbars: false,
+        });
+        // A wheel notch jumps a whole step at once; easing to it reads as
+        // scrolling. Touchpads send smooth deltas and keep the default path.
+        scroll.connect('scroll-event', (_actor, event) => {
+            const direction = event.get_scroll_direction();
+            if (direction !== Clutter.ScrollDirection.UP && direction !== Clutter.ScrollDirection.DOWN)
+                return Clutter.EVENT_PROPAGATE;
+            const adjustment = scroll.vadjustment ?? scroll.get_vscroll_bar().get_adjustment();
+            const step = adjustment.step_increment || 48;
+            const from = adjustment.get_transition('value') ? this._scrollTarget : adjustment.value;
+            const target = Math.max(adjustment.lower, Math.min(
+                adjustment.upper - adjustment.page_size,
+                from + (direction === Clutter.ScrollDirection.UP ? -step : step)));
+            this._scrollTarget = target;
+            adjustment.ease(target, {duration: 180, mode: Clutter.AnimationMode.EASE_OUT_QUAD});
+            return Clutter.EVENT_STOP;
         });
         // `set_child` from GNOME 46; 45 only has `add_actor`.
         if (scroll.set_child)
