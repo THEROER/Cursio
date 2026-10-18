@@ -142,13 +142,19 @@ function onKey(event: KeyboardEvent) {
   }
 }
 
-watch(phoneId, () => {
-  open.value = null
-  composingNew.value = false
-  thread.value = []
-  listLoaded.value = false
-  void loadList()
-})
+// Immediate: arriving from another page, the shared status is already there,
+// so the phone is picked above before this watch exists and it never fires.
+watch(
+  phoneId,
+  () => {
+    open.value = null
+    composingNew.value = false
+    thread.value = []
+    listLoaded.value = false
+    void loadList()
+  },
+  { immediate: true },
+)
 watch(revision, () => {
   void loadList()
   if (open.value) void loadThread()
