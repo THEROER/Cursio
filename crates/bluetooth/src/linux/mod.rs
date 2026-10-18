@@ -229,18 +229,13 @@ struct Voice {
     stop: Sender<()>,
 }
 
-/// The major device class of a Class of Device: bits 8–12.
-const MAJOR_CLASS_SHIFT: u32 = 8;
-const MAJOR_CLASS_MASK: u32 = 0x1f;
-const MAJOR_CLASS_PHONE: u32 = 0x02;
-
 /// Whether a device of Bluetooth Class of Device `class` may be taken as a
 /// phone. A laptop can play the gateway side of hands-free too — Windows does,
 /// for its own Phone Link — and taken as a phone it showed up among the
 /// calls with nothing to call. A device that gives no class is let through:
 /// refusing it would refuse every phone whose stack leaves the field out.
 fn takes_calls(class: Option<u32>) -> bool {
-    class.is_none_or(|c| (c >> MAJOR_CLASS_SHIFT) & MAJOR_CLASS_MASK == MAJOR_CLASS_PHONE)
+    class.is_none_or(devices::is_phone_class)
 }
 
 fn device_class(bus: &Connection, path: &str) -> Option<u32> {

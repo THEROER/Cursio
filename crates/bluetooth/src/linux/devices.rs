@@ -74,7 +74,8 @@ fn phone(props: &HashMap<String, OwnedValue>) -> Option<PairedDevice> {
     })
 }
 
-fn is_phone_class(class: u32) -> bool {
+/// Whether a Class of Device has the phone major class (bits 8–12).
+pub(super) fn is_phone_class(class: u32) -> bool {
     (class >> 8) & 0x1F == MAJOR_CLASS_PHONE
 }
 
