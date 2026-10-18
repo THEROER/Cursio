@@ -202,6 +202,10 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
                 p.link?.status, p.link?.modules]),
             problems: status.problems.map(p => [p.severity, p.summary]),
             muted: this._mutedPeers(status),
+            playing: [...new Set(status.streams.map(s => s.peer))],
+            calls: (status.calls ?? []).map(p => [p.name, p.hands_free, p.audio_here,
+                p.calls.map(c => [c.state, c.name, c.number])]),
+            messages: (status.messages ?? []).map(m => m.name),
         });
     }
 
@@ -265,19 +269,54 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
         const has = module => link.modules.includes(module);
         const name = peer.name;
 
+        // A call is the one thing here that cannot wait, so it comes first.
+        const phoneCalls = (status.calls ?? []).find(p => p.name === name);
+        for (const call of phoneCalls?.calls ?? [])
+            this._addCall(name, phoneCalls, call);
+
         if (link.device_kind === 'Phone')
             this._peers.addAction('Ring', () => this._run({cmd: 'ring', peer: name}, name));
+        if ((status.messages ?? []).some(m => m.name === name))
+            this._peers.addAction('Messages', () => this._openSettings(['--page', 'messages']));
         if (has('share')) {
             this._peers.addAction('Send Files…', () => this._sendFiles(name));
-            this._peers.addAction('Send Clipboard', () => this._sendClipboard(name));
+            // Where the clipboard is shared, a copy is already on the other
+            // side; sending it again would be a second way of what happened.
+            if (!has('clipboard'))
+                this._peers.addAction('Send Clipboard', () => this._sendClipboard(name));
         }
         if (has('files') && GLib.file_test(mountPath(name), GLib.FileTest.IS_DIR))
             this._peers.addAction('Browse Files', () => this._browse(name));
         if (status.streams.some(s => s.peer === name)) {
-            const sound = new PopupMenu.PopupSwitchMenuItem('Sound',
+            const sound = new PopupMenu.PopupSwitchMenuItem('Play its sound here',
                 !this._peerMuted(status, name));
             sound.connect('toggled', (_item, on) => this._setMuted(name, !on));
             this._peers.addMenuItem(sound);
+        }
+    }
+
+    _addCall(phone, side, call) {
+        const who = call.name ?? call.number ?? 'Unknown caller';
+        const incoming = call.state === 'Ringing' || call.state === 'Waiting';
+        const what = incoming ? 'Incoming call'
+            : call.state === 'Held' ? 'On hold'
+                : call.state === 'Dialing' || call.state === 'Alerting' ? 'Calling' : 'In call';
+        this._peers.addMenuItem(new PopupMenu.PopupImageMenuItem(`${what}: ${who}`,
+            'call-start-symbolic', {reactive: false}));
+        const act = action => this._run({cmd: 'call', phone, action: {action}}, phone);
+        if (incoming) {
+            this._peers.addAction('Answer', () => act('answer'));
+            this._peers.addAction('Decline', () => act('decline'));
+            return;
+        }
+        this._peers.addAction('Hang Up', () => act('hang_up'));
+        // Only hands-free can carry the voice here; over the mesh it stays on
+        // the phone, and a switch that cannot move it would mislead.
+        if (side.hands_free) {
+            const voice = new PopupMenu.PopupSwitchMenuItem('Voice on this computer', side.audio_here);
+            voice.connect('toggled', (_item, here) =>
+                this._run({cmd: 'call', phone, action: {action: 'audio_here', here}}, phone));
+            this._peers.addMenuItem(voice);
         }
     }
 
@@ -361,13 +400,14 @@ class CursioToggle extends QuickSettings.QuickMenuToggle {
         }
     }
 
-    _openSettings() {
+    _openSettings(args = []) {
+        this.menu.close();
         // The root's stable launcher, never a `versions/<v>/` path: it hands
         // over to whichever build is current.
         const app = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'lib', 'cursio',
             'cursio-app']);
         try {
-            Gio.Subprocess.new([app], Gio.SubprocessFlags.NONE);
+            Gio.Subprocess.new([app, ...args], Gio.SubprocessFlags.NONE);
         } catch (e) {
             Main.notify('Cursio', `cannot start the Cursio app: ${e.message}`);
         }
