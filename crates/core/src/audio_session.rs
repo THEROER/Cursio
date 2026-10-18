@@ -101,6 +101,13 @@ fn report_no_virtual_devices(reported: &std::sync::atomic::AtomicBool, what: &st
         tracing::debug!(%what, "peer audio device not published here (no virtual devices)");
         return false;
     }
+    // A phone never publishes a peer's devices: as far as an app can address
+    // them it has one output and one input, and that is the design, not a gap.
+    // Raised there it was a warning nothing could clear, on every phone.
+    if cfg!(target_os = "android") {
+        tracing::debug!(%what, "peer audio devices are not published on a phone");
+        return true;
+    }
     tracing::warn!(
         %what,
         "this machine cannot publish a peer's audio outputs or microphones; {VIRTUAL_DEVICES_HINT} \
