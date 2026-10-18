@@ -102,6 +102,7 @@ class MeshService : Service() {
         instance = this
         CursioNotificationListener.rebindIfLost(this)
         CallMonitor.start(this)
+        ComputerCompanion.observe(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

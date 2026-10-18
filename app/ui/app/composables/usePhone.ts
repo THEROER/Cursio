@@ -21,6 +21,8 @@ export interface PhoneSetup {
   nearby: boolean
   /** A computer may mount the phone's storage. */
   storage: boolean
+  /** Cursio is the companion app of a computer paired over Bluetooth. */
+  companion: boolean
 }
 export type PhoneGrant =
   | "notifications"
@@ -33,6 +35,7 @@ export type PhoneGrant =
   | "messages"
   | "nearby"
   | "storage"
+  | "companion"
 
 export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 
@@ -153,6 +156,7 @@ export function usePhone() {
       !s.messages ||
       !s.nearby ||
       !s.storage ||
+      !s.companion ||
       (s.autostartSetting && !autostartDone.value)
     )
   })

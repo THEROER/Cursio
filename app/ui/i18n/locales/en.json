@@ -252,6 +252,8 @@
     "nearbyHint": "When Wi-Fi does not reach your computer, Cursio carries on over Bluetooth with a computer this phone is paired with.",
     "storage": "This phone's files on your computer",
     "storageHint": "Your computer shows this phone's storage as a folder, to open, copy and save files as if they were local. Android asks for \"All files access\".",
+    "companion": "Wake with this computer",
+    "companionHint": "Lets Android keep Cursio running and start it again whenever a computer paired over Bluetooth is near — even after the phone stops it.",
     "autostart": "Autostart",
     "autostartHint": "This phone also stops apps that are not on its own Autostart list. Allow Cursio there; Android cannot tell the app whether you did.",
     "autostartDone": "I've allowed it",

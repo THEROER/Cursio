@@ -213,6 +213,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> launchFirst(invoke, allFilesAccessIntents())
                 else -> requestPermissionForAlias(STORAGE, invoke, "permissionAnswered")
             }
+            COMPANION -> requestCompanion(invoke)
             CALLS -> if (CallMonitor.granted(activity)) {
                 invoke.resolve(setupState())
             } else {
@@ -267,6 +268,37 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
                 Prefs.setAskedMessages(activity)
                 requestPermissionForAlias(MESSAGES, invoke, "permissionAnswered")
             }
+        }
+    }
+
+    /**
+     * The association is made against computers already paired over Bluetooth,
+     * which Android 12+ lists only under the Nearby devices grant; both are
+     * said rather than showing an empty system dialog.
+     */
+    private fun requestCompanion(invoke: Invoke) {
+        when {
+            ComputerCompanion.associated(activity) && ComputerCompanion.unassociatedComputers(activity).isEmpty() ->
+                invoke.resolve(setupState())
+            !nearbyGranted() -> invoke.reject("allow Nearby devices first, so Cursio can see the paired computers")
+            ComputerCompanion.unassociatedComputers(activity).isEmpty() ->
+                invoke.reject("pair this phone with your computer over Bluetooth first")
+            else -> try {
+                startActivityForResult(invoke, Intent(activity, CompanionActivity::class.java), "companionAnswered")
+            } catch (e: ActivityNotFoundException) {
+                Log.w(TAG, "no companion screen", e)
+                invoke.reject("this phone has no companion device support")
+            }
+        }
+    }
+
+    @ActivityCallback
+    private fun companionAnswered(invoke: Invoke, result: ActivityResult) {
+        val error = result.data?.getStringExtra(CompanionActivity.EXTRA_ERROR)
+        if (error != null && !ComputerCompanion.associated(activity)) {
+            invoke.reject(error)
+        } else {
+            invoke.resolve(setupState())
         }
     }
 
@@ -332,6 +364,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         state.put("messages", messagesGranted())
         state.put("nearby", nearbyGranted())
         state.put("storage", storageGranted())
+        state.put("companion", ComputerCompanion.associated(activity))
         return state
     }
 
@@ -386,5 +419,6 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         const val MESSAGES = "messages"
         const val NEARBY = "nearby"
         const val STORAGE = "storage"
+        const val COMPANION = "companion"
     }
 }

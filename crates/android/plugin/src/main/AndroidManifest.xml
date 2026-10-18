@@ -83,6 +83,13 @@
     <!-- Lets the app ask for the exemption in one system dialog instead of
          sending the user through the battery settings list to find it. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- What a companion association with a paired computer grants (see
+         ComputerCompanion): all `normal`, held only while an association exists. -->
+    <uses-feature android:name="android.software.companion_device_setup" android:required="false" />
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND" />
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_USE_DATA_IN_BACKGROUND" />
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_START_FOREGROUND_SERVICES_FROM_BACKGROUND" />
+    <uses-permission android:name="android.permission.REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE" />
 
     <!-- No backup: the files directory holds this node's identity and trust
          store, and restoring them onto another phone would make two devices
@@ -133,6 +140,27 @@
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- The system's "Allow Cursio to manage this computer?" dialog. Never
+             recreated: the association's callback belongs to the instance that
+             asked, and a translucent screen over a landscape window is rotated
+             (and was relaunched) the moment it opened. -->
+        <activity
+            android:name="dev.cursio.mesh.CompanionActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Bound by the system while an associated computer is near. -->
+        <service
+            android:name="dev.cursio.mesh.CompanionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_COMPANION_DEVICE_SERVICE">
+            <intent-filter>
+                <action android:name="android.companion.CompanionDeviceService" />
             </intent-filter>
         </service>
 

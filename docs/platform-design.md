@@ -362,6 +362,40 @@ rescans once a second, so the folder appears on the computer the moment the
 user allows it, without a restart. The grant is a row of the phone's setup
 card.
 
+### Staying alive: the phone as a computer's companion
+
+HyperOS kills background apps that are not on its own Autostart list and
+resets that grant on its own; a battery exemption only answers Android's Doze.
+The one mechanism Android gives an ordinary app for "this app serves that
+device" is a **companion association** (`ComputerCompanion.kt`), offered as the
+setup card's "Wake with this computer" row. It grants, while it exists,
+`REQUEST_COMPANION_RUN_IN_BACKGROUND`, `…_USE_DATA_IN_BACKGROUND` and
+`…_START_FOREGROUND_SERVICES_FROM_BACKGROUND` (all `normal`), and from
+Android 12 the system binds `CompanionService` whenever an associated computer
+is near — which both restarts a killed node and exempts the package from the
+skin's background limits for as long as the binding lasts (Android 16 logs
+"Exempting package").
+
+What an outside app may *not* have, read from the phones' own permission
+tables rather than assumed: the "computer" profile Phone Link holds
+(`REQUEST_COMPANION_PROFILE_COMPUTER`) and self-managed associations are both
+`signature|privileged`. So the association is a plain Bluetooth one, by
+address, to computers already paired here.
+
+`CompanionActivity` asks once per paired computer with `setSingleDevice(true)`.
+That flag is load-bearing: only for a single-device request does the system's
+discovery offer an already *bonded* device (read from Android 10's
+`DeviceDiscoveryService`); a multi-device request lists only what an inquiry
+finds, and a computer is not discoverable, so the dialog never came and the
+transparent screen waited for Back — which, pressed again, closed the app. A
+request the system leaves unanswered ends after 20 s with a reason. The screen
+declares its own configuration changes, because a translucent screen over the
+landscape window rotated and was relaunched, losing the callback.
+
+A force-stopped app is not woken (that is the user saying stop); a process the
+skin killed is. Presence observing needs Android 12, so on Android 10 the
+association gives the background grants only.
+
 ## Migration order
 
 Each step is independently useful and independently revertable. Deliberately not

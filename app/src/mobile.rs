@@ -65,6 +65,11 @@ pub struct Setup {
     /// built before the row existed.
     #[serde(default)]
     pub storage: bool,
+    /// Cursio is the companion app of a computer paired over Bluetooth, so
+    /// the system keeps it running and wakes it near that computer.
+    /// Defaulted for a plugin built before the row existed.
+    #[serde(default)]
+    pub companion: bool,
 }
 
 /// One of the things [`Setup`] lists, for the user to grant.
@@ -83,6 +88,7 @@ pub enum Grant {
     Messages,
     Nearby,
     Storage,
+    Companion,
 }
 
 #[derive(Serialize)]
