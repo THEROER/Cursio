@@ -36,6 +36,12 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Ringing a lost phone also shakes it; see Ringer. -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Android 16 shows a ringing phone as a Live Update only with this;
+         an install-time permission, asked of nobody. -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <!-- A ringing phone floats as a heads-up on skins that float nothing else;
+         see Ringer. Granted at install below Android 14, an alarm's use above. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Lets the app ask for the exemption in one system dialog instead of
          sending the user through the battery settings list to find it. -->

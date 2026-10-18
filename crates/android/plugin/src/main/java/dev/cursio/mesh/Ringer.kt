@@ -9,12 +9,14 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.drawable.Icon
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.VibrationEffect
@@ -42,6 +44,15 @@ import android.util.Log
  *    Android sends but the SDK does not name);
  *  - by itself after [TIMEOUT_MS], because a phone that is truly lost may
  *    never be reached again to be told to stop.
+ *
+ * Where it shows: everywhere a heads-up does (a high-importance channel), and
+ * on a phone with an island in the island too, so a phone someone is already
+ * holding says what the noise is and offers the button without pulling the
+ * shade down. Two ways in, because neither covers both cases: HyperOS 3.0
+ * draws only its own Focus notifications there ([Island]), while Android 16's
+ * Live Updates (`setRequestPromotedOngoing`) are what HyperOS 3.1 and other
+ * skins put in theirs. Both are plain notification extras; a system that knows
+ * neither shows the ordinary heads-up.
  */
 object Ringer {
     private const val TAG = "Cursio"
@@ -202,15 +213,53 @@ object Ringer {
             Intent(ACTION_STOP).setPackage(ctx.packageName),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val notification = Notification.Builder(ctx, CHANNEL_ID)
+        val found = Notification.Action.Builder(
+            Icon.createWithResource(ctx, R.drawable.ic_notify),
+            "Found it",
+            stopIntent,
+        ).build()
+        val builder = Notification.Builder(ctx, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notify)
-            .setContentTitle("Your computer is looking for this phone")
+            .setContentTitle(TITLE)
             .setContentText("Unlock it or tap here to stop the ringing")
+            .setStyle(Notification.BigTextStyle().bigText("Unlock it or tap here to stop the ringing"))
             .setCategory(Notification.CATEGORY_ALARM)
+            // Ongoing so it stays in the island and on top for as long as it
+            // rings; "Found it", a tap and the timeout end it instead of a swipe.
+            .setOngoing(true)
+            .setTimeoutAfter(TIMEOUT_MS)
             .setContentIntent(stopIntent)
             .setDeleteIntent(stopIntent)
-            .addAction(Notification.Action.Builder(null, "Found it", stopIntent).build())
-            .build()
-        manager.notify(NOTIFICATION_ID, notification)
+            .addAction(found)
+        val island = Island.supported(ctx)
+        if (!island) {
+            // MIUI floats no third-party heads-up unless the user found the
+            // per-app switch; a full-screen intent is the one it floats anyway,
+            // and on an unlocked screen Android shows it as a heads-up rather
+            // than opening anything. Not on the island path: that one already
+            // has the place a heads-up would take.
+            ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)?.let { launch ->
+                val open = PendingIntent.getActivity(
+                    ctx,
+                    1,
+                    launch,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                )
+                builder.setFullScreenIntent(open, true)
+            }
+        }
+        if (island) {
+            // Not also a Live Update: HyperOS renders one of those itself at
+            // the lowest island priority, and a hotspot's island then hides it.
+            builder.addExtras(Island.extras(ctx, TITLE, found))
+        } else if (Build.VERSION.SDK_INT >= 36) {
+            // Android 16's Live Update: the status-bar chip, and the island on
+            // skins that draw these there. The extra is what
+            // `setRequestPromotedOngoing` sets, which compileSdk 36 lacks.
+            builder.addExtras(Bundle().apply { putBoolean("android.requestPromotedOngoing", true) })
+        }
+        manager.notify(NOTIFICATION_ID, builder.build())
     }
+
+    private const val TITLE = "Your computer is looking for this phone"
 }
