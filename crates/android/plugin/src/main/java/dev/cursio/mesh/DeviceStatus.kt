@@ -1,5 +1,6 @@
 package dev.cursio.mesh
 
+import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -13,6 +14,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 
@@ -45,6 +47,17 @@ class DeviceStatus(context: Context) {
         override fun onReceive(context: Context, intent: Intent) = onBattery(intent)
     }
 
+    /**
+     * Whether someone is using the phone: screen on and unlocked. The screen
+     * times out without touches, so this is also "touched recently" without
+     * reading anyone's input. Unlock arrives as USER_PRESENT; a phone with no
+     * lock screen sends only SCREEN_ON, which is why the keyguard is asked.
+     */
+    private val screen = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) = onScreen()
+    }
+    private var inUse: Boolean? = null
+
     private val network = object : ConnectivityManager.NetworkCallback() {
         override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = onNetwork(caps)
 
@@ -68,6 +81,17 @@ class DeviceStatus(context: Context) {
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
         sticky?.let(::onBattery)
+        ContextCompat.registerReceiver(
+            context,
+            screen,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_USER_PRESENT)
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        onScreen()
         try {
             connectivity.registerDefaultNetworkCallback(network, main)
         } catch (e: RuntimeException) {
@@ -81,6 +105,8 @@ class DeviceStatus(context: Context) {
         if (!started) return
         started = false
         context.unregisterReceiver(battery)
+        context.unregisterReceiver(screen)
+        inUse = null
         try {
             connectivity.unregisterNetworkCallback(network)
         } catch (e: IllegalArgumentException) {
@@ -129,6 +155,15 @@ class DeviceStatus(context: Context) {
         }
         val rssi = info?.rssi ?: return UNKNOWN_SIGNAL
         return if (rssi == INVALID_RSSI) UNKNOWN_SIGNAL else rssi
+    }
+
+    private fun onScreen() {
+        val power = context.getSystemService(PowerManager::class.java)
+        val keyguard = context.getSystemService(KeyguardManager::class.java)
+        val now = power?.isInteractive == true && keyguard?.isKeyguardLocked != true
+        if (now == inUse) return
+        inUse = now
+        Node.reportInUse(now)
     }
 
     private fun update(next: Reading) {

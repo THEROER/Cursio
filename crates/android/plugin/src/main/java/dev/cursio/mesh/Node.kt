@@ -108,6 +108,16 @@ object Node {
      * before that the library may not load at all, and [init] is where that
      * failure is caught and named.
      */
+    /** The screen is on and unlocked ([inUse]), or no longer; see [DeviceStatus]. */
+    fun reportInUse(inUse: Boolean) {
+        if (!initialized) return
+        try {
+            CursioNative.nativePhoneInUse(inUse)
+        } catch (e: UnsatisfiedLinkError) {
+            Log.w(TAG, "this native library cannot take whether the phone is in use", e)
+        }
+    }
+
     fun reportStatus(battery: Int, power: String, network: String, signalDbm: Int) {
         if (!initialized || reportUnavailable) return
         try {

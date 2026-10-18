@@ -82,6 +82,12 @@ object CursioNative {
     external fun nativeReportStatus(battery: Int, power: String, network: String, signalDbm: Int): Boolean
 
     /**
+     * Whether the screen is on and unlocked, which a phone's notifications use
+     * to stay here rather than go to a computer the user has left.
+     */
+    external fun nativePhoneInUse(inUse: Boolean)
+
+    /**
      * Hand the node the first [len] samples of [samples]: what this phone is
      * playing, interleaved stereo f32 at 48 kHz, for the peer it is routed to.
      */

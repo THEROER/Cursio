@@ -450,6 +450,25 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeReportStatus(
     })
 }
 
+/// The screen came on unlocked (`in_use`), or went off or locked; see
+/// `cursio_core::at_phone`.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativePhoneInUse(
+    mut env: JNIEnv,
+    _class: JClass,
+    in_use: jboolean,
+) {
+    guard(&mut env, (), |_env| {
+        cursio_core::at_phone::set_in_use(in_use != JNI_FALSE);
+        Ok(())
+    })
+}
+
 /// Hand in `len` samples of what this phone is playing — interleaved stereo
 /// f32 at 48 kHz from AudioPlaybackCapture — for the peer device it is routed
 /// to.
