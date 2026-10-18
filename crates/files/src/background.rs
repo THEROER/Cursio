@@ -151,7 +151,8 @@ fn yield_to_everything_else() {
         // at full speed.
         unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
     }
-    #[cfg(target_os = "linux")]
+    // Android is Linux underneath, and the same call is per-thread there too.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // `PRIO_PROCESS` with a *thread* id is per-thread on Linux, which is
         // what we want: the rest of cursio must keep its own priority.

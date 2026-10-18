@@ -659,7 +659,7 @@ fn write_at(file: &File, offset: u64, bytes: &[u8]) -> Result<(), FileError> {
 ///
 /// `ENOSPC` is the answer that matters: an installer asking for room it cannot
 /// have must be told so now rather than partway through a download.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn reserve_space(file: &File, size: u64) -> Result<(), FileError> {
     use std::os::fd::AsRawFd;
 
@@ -727,7 +727,7 @@ fn reserve_space(file: &File, size: u64) -> Result<(), FileError> {
 
 /// No way to reserve without moving the end of the file here, so only the
 /// truncating half of the contract is honoured.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
 fn reserve_space(file: &File, size: u64) -> Result<(), FileError> {
     let len = file.metadata().map_err(to_file_error)?.len();
     if size < len {
@@ -836,7 +836,7 @@ pub(crate) fn capacity_of(path: &Path) -> (u64, u64) {
 /// `statvfs` is POSIX, so one implementation covers both Unix hosts. The field
 /// widths differ (macOS counts blocks in 32 bits, Linux in 64), which the casts
 /// below absorb.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn raw_capacity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -885,7 +885,12 @@ fn raw_capacity(path: &Path) -> Option<(u64, u64)> {
     Some((total, free_to_caller))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "windows"
+)))]
 fn raw_capacity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
@@ -1226,7 +1231,107 @@ fn is_removable_drive(letter: char) -> bool {
     unsafe { GetDriveTypeW(path.as_ptr()) == DRIVE_REMOVABLE }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+/// A phone's shared storage: what its own file manager calls "Internal
+/// storage", plus each memory card.
+///
+/// Not `/`: an app sees almost nothing of the phone's real root, and what it
+/// does see is the system's, not the user's. The storage a person thinks of as
+/// "the phone's files" — Download, DCIM, Music — is the primary shared volume,
+/// reached at `/storage/self/primary`, the current user's view of it whatever
+/// that user's number. Cards are mounted beside it under `/storage/<uuid>`.
+///
+/// Read with plain file calls rather than through the Storage Access
+/// Framework: the app holds "All files access" (or, on Android 10, the legacy
+/// storage permission), which is what makes these real paths readable, so the
+/// same server that answers for a desktop's disks answers here. SAF would mean
+/// a JNI round trip and a content-provider query per entry, which turns a
+/// directory of photos into seconds of waiting.
+///
+/// Until the user grants that access the directories are unreadable, and a
+/// volume that answers `Denied` to everything is worse than none; so nothing
+/// is offered, and the module's once-a-second rescan offers it the moment the
+/// grant is made.
+#[cfg(target_os = "android")]
+fn detect_volumes() -> Vec<SharedVolume> {
+    storage_volumes(Path::new("/storage"), Path::new("/storage/self/primary"))
+}
+
+/// [`detect_volumes`] for a phone, against any directory standing in for
+/// `/storage` — so it is testable on the host.
+#[cfg(any(target_os = "android", test))]
+fn storage_volumes(storage: &Path, primary: &Path) -> Vec<SharedVolume> {
+    let readable = |path: &Path| std::fs::read_dir(path).is_ok();
+    let mut out = Vec::new();
+    if readable(primary) {
+        let (total_bytes, free_bytes) = capacity_of(primary);
+        out.push(SharedVolume {
+            info: Volume {
+                // A name and not the path: the mount presents a volume under
+                // the last component of its id, which for this path is `primary`
+                // (or `0`), and neither says what the folder holds.
+                id: INTERNAL_STORAGE.to_string(),
+                label: INTERNAL_STORAGE.to_string(),
+                writable: true,
+                total_bytes,
+                free_bytes,
+                removable: false,
+            },
+            root: primary.to_path_buf(),
+            confined: false,
+        });
+    }
+    let Ok(entries) = std::fs::read_dir(storage) else {
+        return out;
+    };
+    let mut cards: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            // `emulated` holds every user's primary storage and `self` is the
+            // link to ours; both are the volume already offered above.
+            name != "emulated" && name != "self"
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && readable(p))
+        .collect();
+    cards.sort();
+    let numbered = cards.len() > 1;
+    for (i, root) in cards.into_iter().enumerate() {
+        let name = match numbered {
+            true => format!("{SD_CARD} {}", i + 1),
+            false => SD_CARD.to_string(),
+        };
+        let (total_bytes, free_bytes) = capacity_of(&root);
+        out.push(SharedVolume {
+            info: Volume {
+                id: name.clone(),
+                label: name,
+                writable: true,
+                total_bytes,
+                free_bytes,
+                removable: true,
+            },
+            root,
+            confined: false,
+        });
+    }
+    out
+}
+
+/// What a phone's own file manager calls its primary shared storage.
+#[cfg(any(target_os = "android", test))]
+const INTERNAL_STORAGE: &str = "Internal storage";
+
+/// What a phone's memory card is called, numbered when there are several.
+#[cfg(any(target_os = "android", test))]
+const SD_CARD: &str = "SD card";
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+)))]
 fn detect_volumes() -> Vec<SharedVolume> {
     Vec::new()
 }
@@ -2036,5 +2141,63 @@ mod tests {
             srv.rename(&id, "a.txt", "b.txt"),
             Err(FileError::ReadOnly)
         ));
+    }
+
+    /// A phone that has not been granted storage access offers nothing,
+    /// rather than a volume that answers "denied" to every request.
+    #[test]
+    fn a_phone_without_storage_access_offers_no_volume() {
+        let storage = tempfile::tempdir().unwrap();
+        let missing = storage.path().join("self/primary");
+        assert!(storage_volumes(storage.path(), &missing).is_empty());
+    }
+
+    /// The primary storage is offered under the name a phone's file manager
+    /// gives it, not under `primary` or `0`, the last part of its path.
+    #[test]
+    fn a_phones_primary_storage_is_offered_as_internal_storage() {
+        let storage = tempfile::tempdir().unwrap();
+        let primary = storage.path().join("emulated/0");
+        std::fs::create_dir_all(primary.join("Download")).unwrap();
+        std::fs::create_dir_all(storage.path().join("self")).unwrap();
+        let volumes = storage_volumes(storage.path(), &primary);
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].info.id, INTERNAL_STORAGE);
+        assert_eq!(volumes[0].root, primary);
+        assert!(!volumes[0].info.removable);
+        assert_eq!(
+            crate::volume_dir_name(&volumes[0].info.id),
+            INTERNAL_STORAGE
+        );
+    }
+
+    /// A memory card mounted beside the primary storage is its own,
+    /// removable volume; `emulated` and `self` are not cards.
+    #[test]
+    fn a_memory_card_is_offered_as_a_removable_volume_of_its_own() {
+        let storage = tempfile::tempdir().unwrap();
+        let primary = storage.path().join("emulated/0");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(storage.path().join("self")).unwrap();
+        std::fs::create_dir_all(storage.path().join("1A2B-3C4D")).unwrap();
+        let volumes = storage_volumes(storage.path(), &primary);
+        let ids: Vec<&str> = volumes.iter().map(|v| v.info.id.as_str()).collect();
+        assert_eq!(ids, [INTERNAL_STORAGE, SD_CARD]);
+        assert!(volumes[1].info.removable);
+    }
+
+    /// Two cards are numbered, so neither hides the other under one name.
+    #[test]
+    fn two_memory_cards_are_numbered() {
+        let storage = tempfile::tempdir().unwrap();
+        let primary = storage.path().join("emulated/0");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(storage.path().join("1111-1111")).unwrap();
+        std::fs::create_dir_all(storage.path().join("2222-2222")).unwrap();
+        let ids: Vec<String> = storage_volumes(storage.path(), &primary)
+            .into_iter()
+            .map(|v| v.info.id)
+            .collect();
+        assert_eq!(ids, [INTERNAL_STORAGE, "SD card 1", "SD card 2"]);
     }
 }

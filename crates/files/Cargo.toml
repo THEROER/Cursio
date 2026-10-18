@@ -31,6 +31,12 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
+# A phone serves its shared storage and never mounts anything, so only the
+# calls the server half makes: `statvfs` for capacity, `fallocate` for a
+# reservation, `setpriority` for the worker threads.
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"
+
 # Windows mounting goes through WinFsp. Gated on the MSVC environment, not just
 # on Windows: `winfsp-sys` refuses any other triple outright (its build script
 # panics with "unsupported triple" on MinGW), so the MinGW cross-build that
