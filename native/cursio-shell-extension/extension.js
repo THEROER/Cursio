@@ -1,4 +1,5 @@
-/* Cursio GNOME Shell extension — the window-drag bridge, and the quick
+/* Cursio GNOME Shell extension — the window-drag bridge, the placement of
+ * the app's call window (`callWindow.js`), and the quick
  * settings tile (`menu.js`, over the node's control socket in `control.js`).
  *
  * ## Why this exists
@@ -40,6 +41,7 @@ import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Meta from 'gi://Meta';
 
+import {CallWindowPlacer} from './callWindow.js';
 import {CursioIndicator} from './menu.js';
 
 const IFACE = `
@@ -131,6 +133,12 @@ export default class CursioExtension {
             logError(e, 'cursio: quick settings tile');
             this._indicator = null;
         }
+        try {
+            this._callPlacer = new CallWindowPlacer();
+        } catch (e) {
+            logError(e, 'cursio: call window placement');
+            this._callPlacer = null;
+        }
     }
 
     disable() {
@@ -139,6 +147,8 @@ export default class CursioExtension {
         // rest of the session and is re-added on unlock.
         this._indicator?.destroy();
         this._indicator = null;
+        this._callPlacer?.destroy();
+        this._callPlacer = null;
         this._stopPolling();
         global.display.disconnectObject(this);
         for (const sender of [...this._scanoutHolders.keys()])
