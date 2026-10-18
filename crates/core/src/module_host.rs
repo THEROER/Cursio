@@ -613,7 +613,7 @@ async fn drive(
             }
             let busy = std::mem::take(&mut saw_inbound) || module.has_pending_work();
             if pace.follow(tx.sent(), busy) {
-                tracing::debug!(module = name, fast = pace.fast, "module pace changed");
+                tracing::trace!(module = name, fast = pace.fast, "module pace changed");
             }
         }
 
