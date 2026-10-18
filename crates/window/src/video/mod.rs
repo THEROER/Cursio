@@ -35,34 +35,34 @@ pub struct DecodedFrame {
 /// if the encoder's packet boundaries change, and it is what actually decides
 /// whether the decoder can start here.
 pub(crate) fn contains_keyframe(packet: &[u8]) -> bool {
-    // NAL units are separated by 0x000001 or 0x00000001; the byte after the
-    // start code carries the type in its low 5 bits.
+    // 5 = IDR slice; 7 = SPS, which the encoder emits immediately before an
+    // IDR, so either marks a valid entry point.
+    nal_units(packet).any(|nal| matches!(nal[0] & 0x1F, 5 | 7))
+}
+
+/// The `profile_idc` of the first SPS in a packet: 244 is High 4:4:4
+/// Predictive, the lossless stream, which NVDEC does not decode.
+pub(crate) fn sps_profile(packet: &[u8]) -> Option<u8> {
+    nal_units(packet)
+        .find(|nal| nal[0] & 0x1F == 7)
+        .and_then(|sps| sps.get(1).copied())
+}
+
+/// Each NAL unit of an Annex B packet, from its header byte on. Units are
+/// separated by 0x000001 or 0x00000001; the header's low 5 bits are its type.
+fn nal_units(packet: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut i = 0;
-    while i + 3 < packet.len() {
-        let is_start = packet[i] == 0 && packet[i + 1] == 0 && packet[i + 2] == 1;
-        let is_long = packet[i] == 0
-            && packet[i + 1] == 0
-            && packet[i + 2] == 0
-            && i + 4 < packet.len()
-            && packet[i + 3] == 1;
-        if is_start || is_long {
-            let nal = if is_long {
-                packet[i + 4]
-            } else {
-                packet[i + 3]
-            };
-            match nal & 0x1F {
-                // 5 = IDR slice; 7 = SPS, which the encoder emits immediately
-                // before an IDR, so either marks a valid entry point.
-                5 | 7 => return true,
-                _ => {}
+    std::iter::from_fn(move || {
+        while i + 3 < packet.len() {
+            let long = packet[i..].starts_with(&[0, 0, 0, 1]) && i + 4 < packet.len();
+            if long || packet[i..].starts_with(&[0, 0, 1]) {
+                i += if long { 4 } else { 3 };
+                return Some(&packet[i..]);
             }
-            i += if is_long { 4 } else { 3 };
-        } else {
             i += 1;
         }
-    }
-    false
+        None
+    })
 }
 
 /// Cut `(x, y, w, h)` out of a tightly packed BGRA picture `width` pixels wide.
@@ -94,6 +94,18 @@ pub(crate) fn crop_bgra(pixels: Vec<u8>, width: u32, area: (u32, u32, u32, u32))
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_profile_is_read_from_the_sps_after_either_start_code() {
+        // AUD, then an SPS for High 4:4:4 Predictive, then an IDR.
+        let packet = [
+            0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x67, 244, 0, 0x1F, 0, 0, 1, 0x65, 0x88,
+        ];
+        assert_eq!(sps_profile(&packet), Some(244));
+        assert!(contains_keyframe(&packet));
+        assert_eq!(sps_profile(&[0, 0, 1, 0x41, 0x9A]), None);
+        assert!(!contains_keyframe(&[0, 0, 1, 0x41, 0x9A]));
+    }
 
     #[test]
     fn cropping_the_macroblock_padding_keeps_the_visible_rows() {

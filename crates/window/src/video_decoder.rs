@@ -22,8 +22,11 @@
 //! order. `Priority::Video` only affects which class is *scheduled* first, never
 //! whether a message survives.
 
-use crate::video::{contains_keyframe, DecodedFrame};
+use crate::video::{contains_keyframe, sps_profile, DecodedFrame};
 use crate::WindowError;
+
+/// H.264's `profile_idc` for High 4:4:4 Predictive.
+const PROFILE_HIGH_444: u8 = 244;
 
 /// Decodes one window's H.264 stream back into BGRA frames.
 pub struct VideoDecoder {
@@ -40,6 +43,8 @@ pub struct VideoDecoder {
     dropped_before_sync: u32,
     /// The newest picture [`Self::feed`] produced, not yet converted.
     newest: Option<ffmpeg_next::frame::Video>,
+    /// Decoding on NVDEC, which takes every profile but the lossless one.
+    hardware: bool,
 }
 
 impl VideoDecoder {
@@ -49,9 +54,31 @@ impl VideoDecoder {
     /// geometry, and taking it from the bitstream avoids trusting a
     /// [`WindowMeta`] that may disagree with what was actually encoded.
     pub fn open() -> Result<Self, WindowError> {
-        let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264)
-            .ok_or_else(|| WindowError::Backend("no H.264 decoder in FFmpeg".into()))?;
-        let ctx = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+        // NVDEC first: a phone's 848×1920 stream, or a peer's 4K window,
+        // decoded on the CPU is what the viewer spent its time on. No NVIDIA
+        // GPU or driver and it fails to open, which is the ordinary case on
+        // other machines.
+        match Self::open_codec(ffmpeg_next::decoder::find_by_name("h264_cuvid")) {
+            Ok(mut decoder) => {
+                tracing::debug!("decoding video on the GPU (NVDEC)");
+                decoder.hardware = true;
+                Ok(decoder)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "no NVDEC here; decoding video on the CPU");
+                Self::open_codec(ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264))
+            }
+        }
+    }
+
+    fn open_codec(codec: Option<ffmpeg_next::Codec>) -> Result<Self, WindowError> {
+        let codec =
+            codec.ok_or_else(|| WindowError::Backend("no H.264 decoder in FFmpeg".into()))?;
+        let mut ctx = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+        // Output each picture as soon as it is decoded. Without it NVDEC holds
+        // up to four frames back for reordering a live stream never does —
+        // 66 ms at 60 fps — and the software decoder may hold some too.
+        ctx.set_flags(ffmpeg_next::codec::Flags::LOW_DELAY);
         let decoder = ctx
             .decoder()
             .video()
@@ -64,6 +91,7 @@ impl VideoDecoder {
             synced: false,
             dropped_before_sync: 0,
             newest: None,
+            hardware: false,
         })
     }
 
@@ -133,6 +161,14 @@ impl VideoDecoder {
                     dropped = self.dropped_before_sync,
                     "video stream synced on keyframe"
                 );
+            }
+            // Only the first keyframe says which stream this is. NVDEC opens
+            // happily and then returns nothing for High 4:4:4, so a lossless
+            // window is handed to the CPU before its first packet.
+            if self.hardware && sps_profile(packet) == Some(PROFILE_HIGH_444) {
+                tracing::debug!("lossless stream; decoding it on the CPU");
+                *self = Self::open_codec(ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264))?;
+                self.dropped_before_sync = 0;
             }
             self.synced = true;
         }
