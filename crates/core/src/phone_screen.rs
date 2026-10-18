@@ -165,15 +165,20 @@ pub fn started(width: u32, height: u32) {
 
 /// One unit from the encoder. `config` marks the parameter sets.
 pub fn unit(data: &[u8], config: bool, key: bool) {
-    let data: Arc<[u8]> = Arc::from(data);
     if config {
-        feed().parameters = Some(data.clone());
+        feed().parameters = Some(Arc::from(data));
+        return;
     }
+    // A decoder joining, or restarting after an error, drops everything
+    // before a keyframe — parameter sets travelling alone included — and then
+    // cannot decode that keyframe either, forever, since the encoder emits
+    // them once. So every keyframe carries them, as AirPlay's tap does.
+    let data: Arc<[u8]> = match (key, feed().parameters.clone()) {
+        (true, Some(parameters)) => [&parameters[..], data].concat().into(),
+        _ => Arc::from(data),
+    };
     // No receiver is the ordinary case before anyone watches.
-    let _ = shared().units.send(Unit {
-        data,
-        key: key || config,
-    });
+    let _ = shared().units.send(Unit { data, key });
 }
 
 /// The capture ended on the phone (stopped there, or the system took it).
@@ -368,7 +373,6 @@ impl PhoneScreenSession {
     fn open(id: WindowId, title: String, running: Running, computer: Option<String>) -> Self {
         let (frames_tx, frames_rx) = mpsc::channel(CAPTURE_FRAME_QUEUE_CAPACITY);
         let units = shared().units.subscribe();
-        let parameters = feed().parameters.clone();
         let dirty = Rect {
             x: 0,
             y: 0,
@@ -376,14 +380,7 @@ impl PhoneScreenSession {
             height: running.height,
         };
         let sent = Arc::new(AtomicU32::new(0));
-        let forward = tokio::spawn(forward(
-            units,
-            parameters,
-            frames_tx,
-            id,
-            dirty,
-            sent.clone(),
-        ));
+        let forward = tokio::spawn(forward(units, frames_tx, id, dirty, sent.clone()));
         // A new viewer has nothing to decode from until the next keyframe,
         // which on a still screen would be never.
         if let Some(backend) = backend() {
@@ -406,13 +403,12 @@ impl PhoneScreenSession {
     }
 }
 
-/// Stream units as frames: parameter sets first, then from a keyframe on.
+/// Stream units as frames from a keyframe on.
 ///
 /// A window that falls behind skips to the next keyframe rather than
 /// showing pictures built on ones it never got.
 async fn forward(
     mut units: broadcast::Receiver<Unit>,
-    parameters: Option<Arc<[u8]>>,
     frames: mpsc::Sender<WindowFrame>,
     id: WindowId,
     dirty: Rect,
@@ -431,11 +427,6 @@ async fn forward(
         seq = seq.wrapping_add(1);
         f
     };
-    if let Some(parameters) = parameters {
-        if frames.send(frame(&parameters)).await.is_err() {
-            return;
-        }
-    }
     let mut synced = false;
     loop {
         match units.recv().await {
@@ -800,7 +791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_viewer_gets_the_parameter_sets_then_pictures_from_a_keyframe() {
+    async fn a_viewer_gets_pictures_from_a_keyframe_carrying_the_parameter_sets() {
         let _turn = SERIAL.lock().await;
         let _backend = fake();
         started(100, 200);
@@ -810,11 +801,12 @@ mod tests {
         tokio::task::yield_now().await;
         unit(&[0, 0, 0, 1, 0x41], false, false);
         unit(&[0, 0, 0, 1, 0x65], false, true);
+        unit(&[0, 0, 0, 1, 0x41], false, false);
         let first = session.frames().recv().await.unwrap();
-        assert_eq!(first.data, [0, 0, 0, 1, 0x67]);
+        assert_eq!(first.data, [0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x65]);
         assert_eq!(first.codec, TileCodec::LossyVideo);
         let second = session.frames().recv().await.unwrap();
-        assert_eq!(second.data, [0, 0, 0, 1, 0x65]);
+        assert_eq!(second.data, [0, 0, 0, 1, 0x41]);
     }
 
     #[tokio::test]
