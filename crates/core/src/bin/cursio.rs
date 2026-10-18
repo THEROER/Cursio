@@ -1840,6 +1840,7 @@ fn module_registry(
         .with(Box::new(cursio_core::files_session::FilesFactory {
             enabled: true,
             share: files_share,
+            role: cursio_protocol::ModuleRole::Both,
         }))
         // Like files, a machine both offers its own ports and attaches a
         // peer's. The factory carries the node-level state every link shares,

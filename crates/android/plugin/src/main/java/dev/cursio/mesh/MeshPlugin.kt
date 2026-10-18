@@ -8,7 +8,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.result.ActivityResult
@@ -52,6 +54,11 @@ import app.tauri.plugin.Plugin
             alias = MeshPlugin.MESSAGES,
         ),
         Permission(strings = [Manifest.permission.BLUETOOTH_CONNECT], alias = MeshPlugin.NEARBY),
+        // Android 10 only; from 11 storage is the "All files access" screen.
+        Permission(
+            strings = [Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE],
+            alias = MeshPlugin.STORAGE,
+        ),
     ],
 )
 class MeshPlugin(private val activity: Activity) : Plugin(activity) {
@@ -201,6 +208,11 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
             }
             NOTIFICATION_ACCESS -> launchFirst(invoke, notificationAccessIntents())
             BLUETOOTH -> launchFirst(invoke, listOf(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)))
+            STORAGE -> when {
+                storageGranted() -> invoke.resolve(setupState())
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> launchFirst(invoke, allFilesAccessIntents())
+                else -> requestPermissionForAlias(STORAGE, invoke, "permissionAnswered")
+            }
             CALLS -> if (CallMonitor.granted(activity)) {
                 invoke.resolve(setupState())
             } else {
@@ -319,8 +331,30 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         state.put("calls", CallMonitor.granted(activity))
         state.put("messages", messagesGranted())
         state.put("nearby", nearbyGranted())
+        state.put("storage", storageGranted())
         return state
     }
+
+    /**
+     * Whether a computer can mount this phone's storage: "All files access"
+     * from Android 11, the legacy storage permissions before it. The node
+     * offers the storage on its own once this holds; see the files server's
+     * Android volume scan.
+     */
+    private fun storageGranted(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            granted(Manifest.permission.READ_EXTERNAL_STORAGE) &&
+                granted(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+
+    /** Cursio's own row where the system has one, every app's list otherwise. */
+    private fun allFilesAccessIntents(): List<Intent> = listOf(
+        Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+            .setData(Uri.fromParts("package", activity.packageName, null)),
+        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+    )
 
     /**
      * Cursio's own switch where Android 11 has one, the list of every app's
@@ -351,5 +385,6 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         const val BLUETOOTH = "bluetooth"
         const val MESSAGES = "messages"
         const val NEARBY = "nearby"
+        const val STORAGE = "storage"
     }
 }

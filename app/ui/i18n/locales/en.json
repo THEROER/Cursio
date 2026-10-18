@@ -250,6 +250,8 @@
     "messagesHint": "Read this phone's SMS conversations and send texts from your computer.",
     "nearby": "Stay connected over Bluetooth",
     "nearbyHint": "When Wi-Fi does not reach your computer, Cursio carries on over Bluetooth with a computer this phone is paired with.",
+    "storage": "This phone's files on your computer",
+    "storageHint": "Your computer shows this phone's storage as a folder, to open, copy and save files as if they were local. Android asks for \"All files access\".",
     "autostart": "Autostart",
     "autostartHint": "This phone also stops apps that are not on its own Autostart list. Allow Cursio there; Android cannot tell the app whether you did.",
     "autostartDone": "I've allowed it",

@@ -334,6 +334,34 @@ cannot have is seconds of radio time each. It needs the "nearby devices"
 permission (`BLUETOOTH_CONNECT`) from Android 12, offered as a row of the
 phone's setup card.
 
+### The phone's storage on a computer
+
+The phone runs the files module's server half and nothing else of it
+(`ModuleRole::Source`; a computer is `Both`), so a computer mounts the phone's
+storage under `~/Cursio/<phone>/` exactly as it mounts another computer's
+disks, and two phones do not start the module at all. There is no Android
+mount: a phone has nowhere to present one.
+
+What it serves is the shared storage a person thinks of as the phone's files:
+`/storage/self/primary` as **Internal storage**, and each card under
+`/storage/<uuid>` as **SD card**, removable (`cursio_files::server`,
+`detect_volumes`'s Android arm). It reads them as plain files, which is why the
+grant is "All files access" (`MANAGE_EXTERNAL_STORAGE`) from Android 11 and the
+legacy storage permissions with `requestLegacyExternalStorage` on Android 10,
+rather than the Storage Access Framework. SAF answers through a content
+provider: every entry of a listing is a JNI call and a provider query, a
+directory of a few thousand photos takes seconds to list, and none of the
+desktop server's code — chunked reads, write-back, rename, `statvfs` — would
+apply. With real paths the server that answers for a desktop's disks answers
+here unchanged. Google Play restricts that permission to file managers and
+the like; Cursio's APK is installed directly.
+
+Until the grant is made the storage is unreadable and no volume is offered —
+a volume answering "denied" to everything would look broken. The module
+rescans once a second, so the folder appears on the computer the moment the
+user allows it, without a restart. The grant is a row of the phone's setup
+card.
+
 ## Migration order
 
 Each step is independently useful and independently revertable. Deliberately not

@@ -326,6 +326,14 @@ async fn serve(node: Node) -> anyhow::Result<()> {
             plays: true,
             shows: true,
             shows_only_computers: true,
+        }))
+        // The phone's shared storage, for a computer to mount. Offered always:
+        // what it holds is empty until the user grants storage access, and the
+        // module's rescan offers the volumes the moment that happens.
+        .with(Box::new(cursio_core::files_session::FilesFactory {
+            enabled: true,
+            share: cursio_core::live::Shared::new(cursio_files::SharePolicy::everything()),
+            role: cursio_protocol::ModuleRole::Source,
         }));
     cursio_core::media_hub::hub().set_backend(crate::media::AndroidBackend::shared());
     cursio_core::media_hub::hub().set_display(crate::media::AndroidDisplay::shared());

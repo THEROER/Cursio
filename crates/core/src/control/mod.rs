@@ -543,13 +543,14 @@ impl LinkPath {
 /// A phone lacking any other module is not running an old build; it has no
 /// backend for that duty, and listing it as missing would ask for an update
 /// that cannot help.
-const PHONE_MODULES: [cursio_protocol::ModuleId; 6] = [
+const PHONE_MODULES: [cursio_protocol::ModuleId; 7] = [
     cursio_protocol::ModuleId::AUDIO,
     cursio_protocol::ModuleId::INPUT,
     cursio_protocol::ModuleId::SHARE,
     cursio_protocol::ModuleId::NOTIFY,
     cursio_protocol::ModuleId::CALLS,
     cursio_protocol::ModuleId::MESSAGES,
+    cursio_protocol::ModuleId::FILES,
 ];
 
 /// Split what negotiation skipped into what is worth showing as off

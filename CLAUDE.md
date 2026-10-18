@@ -241,6 +241,8 @@ A phone's SMS are read and sent from a desktop (`messages_session.rs`, `docs/mes
 
 The phone builds with `audio` on, because `cursio-audio` has an Android backend (`android_backend.rs`): AAudio playback of peer streams and the microphone with the platform's echo canceller (input presets are why the minimum is API 28), each stream on a thread that reopens it when AAudio disconnects it on a route change. Opus there is `audiopus_sys`'s bundled libopus — `shiguredo_opus` has no Android build — and CMake finds the NDK only through `ANDROID_NDK_ROOT` with the Ninja generator, which `cargo xtask android` sets. A phone has one output and one input as far as an app can address them, so it advertises exactly those two; the listener's per-stream volume is `audio_session::LocalMixer`, multiplied with the owner's `AudioGain`.
 
+It also builds with `files`, serving only (`ModuleRole::Source`): the phone's shared storage — **Internal storage** and each card — read as plain files under "All files access", so a computer mounts it like another computer's disk. The FUSE mount is `target_os = "linux"`, which an Android target is not, so nothing of it builds there. See "The phone's storage on a computer" in `docs/platform-design.md`.
+
 The `cursio` binary is `required-features = ["desktop"]`: it drives capture, mounts and an AirPlay receiver, and a phone has no terminal to run it from.
 
 **Do not switch another module's feature on for Android to "see if it works".** It will not fail at the feature — it fails deep inside PipeWire or FUSE, which is a far worse error to read. Each module needs an Android backend first. `DeviceKind::Phone`, `ModuleRole::Source`/`Sink` and `session::local_device_kind()`'s `target_os = "android"` arm already exist for that.

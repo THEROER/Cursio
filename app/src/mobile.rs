@@ -61,6 +61,10 @@ pub struct Setup {
     /// does not. Defaulted for a plugin built before the row existed.
     #[serde(default)]
     pub nearby: bool,
+    /// A computer may mount this phone's storage. Defaulted for a plugin
+    /// built before the row existed.
+    #[serde(default)]
+    pub storage: bool,
 }
 
 /// One of the things [`Setup`] lists, for the user to grant.
@@ -78,6 +82,7 @@ pub enum Grant {
     Bluetooth,
     Messages,
     Nearby,
+    Storage,
 }
 
 #[derive(Serialize)]

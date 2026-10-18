@@ -2,7 +2,9 @@
 <!-- Merged into the Tauri app's manifest. Everything the phone's node needs
      lives here rather than in app/gen/android, which `tauri android init`
      regenerates. -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- The mesh is LAN-only by design, but Android gates local sockets and
          mDNS behind the ordinary network permissions all the same. -->
@@ -35,6 +37,21 @@
     <!-- SEND_SMS implies telephony is required; a tablet without a SIM is
          still a mesh member, it just has no messages to offer. -->
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
+
+    <!-- The phone's shared storage, for a computer to mount. "All files
+         access" from Android 11 is what makes /storage readable as plain
+         files, so the same file server that answers for a desktop's disks
+         answers here; Android 10 reaches the same through the legacy storage
+         permissions and requestLegacyExternalStorage below. -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
 
     <!-- The phone's microphone, sent to a peer. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -70,7 +87,11 @@
     <!-- No backup: the files directory holds this node's identity and trust
          store, and restoring them onto another phone would make two devices
          answer as one peer. -->
-    <application android:allowBackup="false">
+    <!-- Legacy storage: Android 10's way of reading /storage as files, the
+         one release between the old permissions and "All files access". -->
+    <application
+        android:allowBackup="false"
+        android:requestLegacyExternalStorage="true">
 
         <!-- One service, every type it may ever hold. Which of them a given
              start claims is decided in MeshService.wantedTypes, because the

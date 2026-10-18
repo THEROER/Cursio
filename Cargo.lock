@@ -1110,6 +1110,7 @@ dependencies = [
  "anyhow",
  "cursio-audio",
  "cursio-core",
+ "cursio-files",
  "cursio-log",
  "cursio-protocol",
  "cursio-transport",

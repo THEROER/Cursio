@@ -2400,6 +2400,11 @@ pub struct FilesFactory {
     ///
     /// [`SharePolicy::everything`]: cursio_files::SharePolicy::everything
     pub share: crate::live::Shared<cursio_files::SharePolicy>,
+    /// `Both` on a computer, which serves its disks and mounts a peer's.
+    /// `Source` on a phone, which only serves its storage: it has nowhere to
+    /// present a mount, and two phones have nothing to exchange, so the module
+    /// does not start between them.
+    pub role: cursio_protocol::ModuleRole,
 }
 
 impl crate::module::ModuleFactory for FilesFactory {
@@ -2409,7 +2414,7 @@ impl crate::module::ModuleFactory for FilesFactory {
 
     fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
         self.enabled
-            .then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::FILES, VERSION))
+            .then(|| cursio_protocol::ModuleAdvert::new(ModuleId::FILES, VERSION, self.role))
     }
 
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
@@ -3757,5 +3762,28 @@ mod tests {
         assert!(!crate::diagnostics::snapshot()
             .iter()
             .any(|p| p.id.starts_with("files.walk.4000001.")));
+    }
+
+    fn files_advert(role: cursio_protocol::ModuleRole) -> cursio_protocol::ModuleAdvert {
+        use crate::module::ModuleFactory;
+        FilesFactory {
+            enabled: true,
+            share: crate::live::Shared::new(cursio_files::SharePolicy::everything()),
+            role,
+        }
+        .advert()
+        .expect("an enabled factory advertises")
+    }
+
+    /// A phone's storage is mounted by a computer; two phones serve and
+    /// neither can mount, so the module does not start between them.
+    #[test]
+    fn a_phone_shares_its_storage_with_a_computer_but_not_with_another_phone() {
+        use cursio_protocol::ModuleRole;
+        let phone = [files_advert(ModuleRole::Source)];
+        let computer = [files_advert(ModuleRole::Both)];
+        assert!(cursio_protocol::negotiate(&phone, &computer).is_agreed(ModuleId::FILES));
+        assert!(cursio_protocol::negotiate(&computer, &computer).is_agreed(ModuleId::FILES));
+        assert!(!cursio_protocol::negotiate(&phone, &phone).is_agreed(ModuleId::FILES));
     }
 }

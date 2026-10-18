@@ -19,6 +19,8 @@ export interface PhoneSetup {
   messages: boolean
   /** The phone may reach its computers over Bluetooth when the network does not. */
   nearby: boolean
+  /** A computer may mount the phone's storage. */
+  storage: boolean
 }
 export type PhoneGrant =
   | "notifications"
@@ -30,6 +32,7 @@ export type PhoneGrant =
   | "bluetooth"
   | "messages"
   | "nearby"
+  | "storage"
 
 export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 
@@ -149,6 +152,7 @@ export function usePhone() {
       !s.calls ||
       !s.messages ||
       !s.nearby ||
+      !s.storage ||
       (s.autostartSetting && !autostartDone.value)
     )
   })
