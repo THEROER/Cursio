@@ -71,6 +71,9 @@ impl ModuleId {
     /// A phone's notifications, shown on the machine the user is at; see
     /// [`notify`](crate::notify).
     pub const NOTIFY: ModuleId = ModuleId(10);
+    /// A phone's calls, answered, placed and ended from a computer; see
+    /// [`calls`](crate::calls). 11 is taken by SMS.
+    pub const CALLS: ModuleId = ModuleId(12);
 
     /// Human-readable name, for logs and diagnostics. Unknown ids are rendered
     /// numerically rather than hidden — that is exactly the case worth seeing in
@@ -87,6 +90,7 @@ impl ModuleId {
             ModuleId::UPDATE => "update",
             ModuleId::SHARE => "share",
             ModuleId::NOTIFY => "notify",
+            ModuleId::CALLS => "calls",
             _ => "unknown",
         }
     }

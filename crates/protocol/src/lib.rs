@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod audio;
+pub mod calls;
 pub mod capability;
 pub mod clipboard;
 pub mod files;
