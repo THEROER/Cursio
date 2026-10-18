@@ -334,6 +334,50 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
     }
 }
 
+/// A window's size for a picture of `width`×`height`: as large as the picture,
+/// but scaled down, keeping its shape, to fit the largest monitor with room
+/// for the title bar and panels.
+fn fitted(width: u32, height: u32) -> (i32, i32) {
+    use gtk::prelude::*;
+    let room = gtk::gdk::Display::default()
+        .and_then(|display| {
+            let monitors = display.monitors();
+            (0..monitors.n_items())
+                .filter_map(|i| monitors.item(i)?.downcast::<gtk::gdk::Monitor>().ok())
+                .map(|m| m.geometry())
+                .map(|g| (g.width(), g.height()))
+                .max_by_key(|(w, h)| w * h)
+        });
+    fit_into(width, height, room)
+}
+
+fn fit_into(width: u32, height: u32, room: Option<(i32, i32)>) -> (i32, i32) {
+    let (w, h) = (width.max(1) as f64, height.max(1) as f64);
+    let Some((room_w, room_h)) = room else {
+        return (w as i32, h as i32);
+    };
+    // A tenth kept back: the top bar, a dock, and the window's own title bar.
+    let scale = (room_w as f64 * 0.9 / w)
+        .min(room_h as f64 * 0.9 / h)
+        .min(1.0);
+    ((w * scale).round() as i32, (h * scale).round() as i32)
+}
+
+/// Map a point in a `Contain`-fitted picture onto host pixels: the picture is
+/// scaled by one factor and centred, so a point in the letterbox clamps to
+/// the nearest edge.
+fn contained_to_host(widget: (f64, f64), host: (u32, u32), x: f64, y: f64) -> (u32, u32) {
+    let ((w, h), (fw, fh)) = (widget, host);
+    if w <= 0.0 || h <= 0.0 || fw == 0 || fh == 0 {
+        return (0, 0);
+    }
+    let scale = (w / fw as f64).min(h / fh as f64);
+    let (ox, oy) = ((w - fw as f64 * scale) / 2.0, (h - fh as f64 * scale) / 2.0);
+    let hx = ((x - ox) / scale).clamp(0.0, (fw - 1) as f64);
+    let hy = ((y - oy) / scale).clamp(0.0, (fh - 1) as f64);
+    (hx as u32, hy as u32)
+}
+
 /// The GTK thread: owns the window, the framebuffer, and the main loop.
 fn gtk_thread(
     meta: WindowMeta,
@@ -353,20 +397,19 @@ fn gtk_thread(
     let fb = Rc::new(RefCell::new(Framebuffer::new(meta.width, meta.height)));
 
     let picture = gtk::Picture::builder()
-        // `Fill` maps the texture onto the whole allocation, which keeps the
-        // widget↔host coordinate mapping a single ratio (see `to_host`) — the
-        // letterboxing of `Contain` would put the host's origin at an offset
-        // this code would then have to track. Sharpness comes from the window
-        // being resized to the source's resolution whenever that changes, so
-        // the ratio stays 1:1 and nothing is resampled.
-        .content_fit(gtk::ContentFit::Fill)
+        // `Contain`, not `Fill`: a window taller than the monitor — a phone's
+        // screen is 1920 high — is cut to the monitor by the compositor, and
+        // `Fill` then stretched the picture across whatever was left. The
+        // letterbox this leaves is accounted for in `to_host`.
+        .content_fit(gtk::ContentFit::Contain)
         .build();
     picture.set_paintable(Some(&to_texture(&fb.borrow())));
 
+    let (width, height) = fitted(meta.width, meta.height);
     let window = gtk::Window::builder()
         .title(&meta.title)
-        .default_width(meta.width as i32)
-        .default_height(meta.height as i32)
+        .default_width(width)
+        .default_height(height)
         .child(&picture)
         .build();
 
@@ -453,15 +496,13 @@ fn gtk_thread(
                                     // it disagrees, rather than refusing the blit.
                                     if fb.width != pic.width || fb.height != pic.height {
                                         fb.resize(pic.width, pic.height);
-                                        // The window follows too. `ContentFit::Fill`
-                                        // stretches the texture across whatever
-                                        // allocation it is given, so a stream that
+                                        // The window follows too, so a stream that
                                         // changes resolution — a quality change, or
                                         // an encoder rounding up to whole macroblocks
-                                        // — would otherwise be scaled into the old
+                                        // — is not shown scaled into the old
                                         // window's size for the rest of the session.
-                                        main_loop_window
-                                            .set_default_size(pic.width as i32, pic.height as i32);
+                                        let (w, h) = fitted(pic.width, pic.height);
+                                        main_loop_window.set_default_size(w, h);
                                     }
                                     let full = Rect {
                                         x: 0,
@@ -492,12 +533,14 @@ fn gtk_thread(
                     }
                     Ok(SurrogateCommand::Resize { width, height }) => {
                         fb_for_frames.borrow_mut().resize(width, height);
-                        main_loop_window.set_default_size(width as i32, height as i32);
+                        let (w, h) = fitted(width, height);
+                        main_loop_window.set_default_size(w, h);
                         painted = true;
                     }
                     Ok(SurrogateCommand::Grow { width, height }) => {
                         fb_for_frames.borrow_mut().grow_to(width, height);
-                        main_loop_window.set_default_size(width as i32, height as i32);
+                        let (w, h) = fitted(width, height);
+                        main_loop_window.set_default_size(w, h);
                         painted = true;
                     }
                     Ok(SurrogateCommand::Close(reason)) => {
@@ -579,14 +622,13 @@ fn attach_input_controllers(
         x: f64,
         y: f64,
     ) -> (u32, u32) {
-        let (w, h) = (picture.width() as f64, picture.height() as f64);
         let fb = fb.borrow();
-        if w <= 0.0 || h <= 0.0 {
-            return (0, 0);
-        }
-        let hx = (x / w * fb.width as f64).clamp(0.0, (fb.width.saturating_sub(1)) as f64);
-        let hy = (y / h * fb.height as f64).clamp(0.0, (fb.height.saturating_sub(1)) as f64);
-        (hx as u32, hy as u32)
+        contained_to_host(
+            (picture.width() as f64, picture.height() as f64),
+            (fb.width, fb.height),
+            x,
+            y,
+        )
     }
 
     // Pointer motion.
@@ -737,6 +779,37 @@ mod input_tests {
         assert_eq!(map_button(8), Some(MouseButton::Back));
         assert_eq!(map_button(9), Some(MouseButton::Forward));
         assert_eq!(map_button(42), None);
+    }
+
+    #[test]
+    fn a_phone_screen_taller_than_the_monitor_is_scaled_down_keeping_its_shape() {
+        let (w, h) = fit_into(848, 1920, Some((3840, 1080)));
+        assert_eq!(h, 972);
+        assert_eq!(w, (848.0_f64 * 972.0 / 1920.0).round() as i32);
+        assert_eq!(fit_into(800, 600, Some((3840, 1080))), (800, 600));
+        assert_eq!(fit_into(800, 600, None), (800, 600));
+    }
+
+    #[test]
+    fn a_click_in_a_letterboxed_picture_lands_on_the_same_host_pixel() {
+        // A 100×200 host shown in a 300×200 widget: scale 1, 100 px bars each side.
+        assert_eq!(
+            contained_to_host((300.0, 200.0), (100, 200), 150.0, 100.0),
+            (50, 100)
+        );
+        assert_eq!(
+            contained_to_host((300.0, 200.0), (100, 200), 10.0, 0.0),
+            (0, 0)
+        );
+        // Half size: the widget's 50,100 is the host's 100,200 - clamped to the last pixel.
+        assert_eq!(
+            contained_to_host((50.0, 100.0), (100, 200), 50.0, 100.0),
+            (99, 199)
+        );
+        assert_eq!(
+            contained_to_host((50.0, 100.0), (100, 200), 25.0, 50.0),
+            (50, 100)
+        );
     }
 }
 
