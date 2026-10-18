@@ -33,13 +33,21 @@ function isActive(path: string) {
 }
 
 const title = computed(() => items.value.find((i) => isActive(i.path))?.label ?? t("app.title"))
+
+// The tab bar is the kit's, so its marker slides between destinations; the
+// route stays the single source of which one is open.
+const tabs = computed(() => items.value.map((i) => ({ value: i.path, label: i.label, icon: i.icon, dot: i.dot })))
+const activeTab = computed({
+  get: () => items.value.find((i) => isActive(i.path))?.path ?? "/",
+  set: (path: string) => void navigateTo(path),
+})
 </script>
 
 <template>
   <div class="cursio-mobile flex h-dvh flex-col overflow-hidden bg-surface text-ink">
     <header class="cursio-mobile__top shrink-0 border-b border-line bg-surface">
       <div class="flex h-14 items-center gap-3 px-4">
-        <LpIcon name="lucide:mouse-pointer-2" :size="20" class="shrink-0 text-brand" />
+        <CursioLogo :size="20" class="shrink-0 text-brand" />
         <div class="min-w-0 flex-1">
           <h1 class="truncate text-base font-semibold leading-tight">{{ title }}</h1>
           <p class="truncate text-xs text-muted">{{ status?.node.name ?? t("app.title") }}</p>
@@ -61,28 +69,14 @@ const title = computed(() => items.value.find((i) => isActive(i.path))?.label ??
       </LpScrollArea>
     </main>
 
-    <nav class="cursio-mobile__tabs shrink-0 border-t border-line bg-surface" :aria-label="t('nav.label')">
-      <ul class="grid grid-cols-4">
-        <li v-for="item in items" :key="item.path">
-          <NuxtLink
-            :to="item.path"
-            class="relative flex min-h-14 flex-col items-center justify-center gap-0.5 px-1 py-1.5 text-[11px] font-medium transition-colors"
-            :class="isActive(item.path) ? 'text-brand' : 'text-muted'"
-            :aria-current="isActive(item.path) ? 'page' : undefined"
-          >
-            <span
-              class="absolute inset-x-6 top-0 h-0.5 rounded-b-pill"
-              :class="isActive(item.path) ? 'bg-brand' : 'bg-transparent'"
-            />
-            <span class="relative">
-              <LpIcon :name="item.icon" :size="22" />
-              <span v-if="item.dot" class="absolute -right-1 -top-0.5 size-2 rounded-full bg-accent" />
-            </span>
-            <span class="max-w-full truncate">{{ item.label }}</span>
-          </NuxtLink>
-        </li>
-      </ul>
-    </nav>
+    <LpTabs
+      v-model="activeTab"
+      :items="tabs"
+      variant="bottom"
+      accent
+      :label="t('nav.label')"
+      class="shrink-0"
+    />
 
     <AppCommands />
     <PeerForgetDialog />
@@ -97,12 +91,6 @@ const title = computed(() => items.value.find((i) => isActive(i.path))?.label ??
 }
 
 .cursio-mobile__sides {
-  padding-left: env(safe-area-inset-left);
-  padding-right: env(safe-area-inset-right);
-}
-
-.cursio-mobile__tabs {
-  padding-bottom: env(safe-area-inset-bottom);
   padding-left: env(safe-area-inset-left);
   padding-right: env(safe-area-inset-right);
 }
