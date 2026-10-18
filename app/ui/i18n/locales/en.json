@@ -35,7 +35,22 @@
     "close": "Close",
     "previous": "Previous",
     "next": "Next",
-    "openFailed": "Could not open it"
+    "openFailed": "Could not open it",
+    "view": "View",
+    "openWith": "Open in its app",
+    "saveAs": "Save as…",
+    "saveMany": "Save {count} to this computer",
+    "savedMany": "Saved {count} items to Pictures/Cursio",
+    "reveal": "Show in folder",
+    "copyFile": "Copy as file",
+    "copyMany": "Copy {count} as files",
+    "copiedMany": "Copied {count} files",
+    "sendTo": "Send to",
+    "sent": "Sent {count} to {name}",
+    "sendFailed": "Could not send it to {name}",
+    "selected": "{count} selected",
+    "selectAll": "Select all",
+    "clearSelection": "Clear selection"
   },
   "call": {
     "title": "Call",

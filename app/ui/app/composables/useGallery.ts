@@ -96,6 +96,16 @@ export function useGallery() {
     return reply.reply === "saved_file" ? (reply.path as string) : ""
   }
 
+  /** Copy where the user picks in the save dialog; null when it was cancelled. */
+  function saveAs(peer: string, item: MediaItem): Promise<string | null> {
+    return invoke<string | null>("gallery_save_as", { peer, item: item.id, name: item.name })
+  }
+
+  /** Copy into the app's cache, for opening, copying or sending on; answers the path. */
+  function fetch(peer: string, item: MediaItem): Promise<string> {
+    return invoke<string>("gallery_fetch", { peer, item: item.id, name: item.name })
+  }
+
   function forget() {
     for (const pending of thumbs.values()) {
       void pending.then((url) => url && URL.revokeObjectURL(url)).catch(() => undefined)
@@ -103,5 +113,5 @@ export function useGallery() {
     thumbs.clear()
   }
 
-  return { list, thumbnail, whole, save, forget }
+  return { list, thumbnail, whole, save, saveAs, fetch, forget }
 }

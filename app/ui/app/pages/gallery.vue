@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import type { LightboxItem, SegmentedOption } from "@leavepulse/ui"
+import type { ContextMenuItemDef, LightboxItem, SegmentedOption } from "@leavepulse/ui"
+import { invoke } from "@tauri-apps/api/core"
 import type { ComponentPublicInstance } from "vue"
 import type { MediaFilter, MediaItem } from "~/composables/useGallery"
 import { GALLERY_PAGE } from "~/composables/useGallery"
@@ -185,6 +186,172 @@ async function save(item: MediaItem) {
   }
 }
 
+/**
+ * Items picked with Ctrl- and Shift-click. A right-click on one of them acts
+ * on them all, as a file manager's does; a right-click elsewhere picks that
+ * item alone.
+ */
+const selected = reactive(new Set<string>())
+let anchor: string | null = null
+watch([peerId, filter], () => {
+  selected.clear()
+  anchor = null
+})
+
+function onCellClick(item: MediaItem, event: MouseEvent) {
+  if (!isMobile.value && (event.ctrlKey || event.metaKey)) {
+    if (selected.has(item.id)) selected.delete(item.id)
+    else selected.add(item.id)
+    anchor = item.id
+    return
+  }
+  if (!isMobile.value && event.shiftKey && anchor) {
+    const from = items.value.findIndex((i) => i.id === anchor)
+    const to = items.value.findIndex((i) => i.id === item.id)
+    if (from >= 0 && to >= 0) {
+      for (const i of items.value.slice(Math.min(from, to), Math.max(from, to) + 1)) selected.add(i.id)
+      return
+    }
+  }
+  selected.clear()
+  anchor = item.id
+  void openItem(item)
+}
+
+const menuItem = ref<MediaItem | null>(null)
+function onCellMenu(item: MediaItem) {
+  menuItem.value = item
+  if (!selected.has(item.id)) selected.clear()
+}
+
+/** What a menu or the selection bar acts on. */
+const targets = computed<MediaItem[]>(() => {
+  const item = menuItem.value
+  if (selected.size && (!item || selected.has(item.id))) return items.value.filter((i) => selected.has(i.id))
+  return item ? [item] : []
+})
+
+/** Machines a file can be sent to: linked now, and taking shared files. */
+const sendTargets = computed(() =>
+  (status.value?.peers ?? []).filter(
+    (p) => p.presence === "online" && p.id !== peerId.value && p.link?.modules.includes("share"),
+  ),
+)
+
+const working = ref(false)
+/** Run one action over items, saying once how it went rather than per item. */
+async function run(title: string, action: () => Promise<void>) {
+  if (working.value) return
+  working.value = true
+  try {
+    await action()
+  } catch (e) {
+    toast.failure(e, { title })
+  } finally {
+    working.value = false
+  }
+}
+
+async function fetchAll(list: MediaItem[]): Promise<string[]> {
+  const peer = peerId.value
+  const paths: string[] = []
+  for (const item of list) paths.push(await gallery.fetch(peer, item))
+  return paths
+}
+
+function saveAll(list: MediaItem[]) {
+  return run(t("gallery.saveFailed"), async () => {
+    let path = ""
+    for (const item of list) path = await gallery.save(peerId.value, item)
+    toast.success(list.length > 1 ? t("gallery.savedMany", { count: list.length }) : t("gallery.saved", { path }))
+  })
+}
+
+function saveAs(item: MediaItem) {
+  return run(t("gallery.saveFailed"), async () => {
+    const path = await gallery.saveAs(peerId.value, item)
+    if (path) toast.success(t("gallery.saved", { path }))
+  })
+}
+
+function openWith(item: MediaItem) {
+  return run(t("gallery.openFailed"), async () => {
+    const [path] = await fetchAll([item])
+    await invoke("file_open", { path })
+  })
+}
+
+function reveal(item: MediaItem) {
+  return run(t("gallery.saveFailed"), async () => {
+    const path = await gallery.save(peerId.value, item)
+    await invoke("file_reveal", { path })
+  })
+}
+
+function copyFiles(list: MediaItem[]) {
+  return run(t("gallery.copyFailed"), async () => {
+    await invoke("files_copy", { paths: await fetchAll(list) })
+    toast.success(list.length > 1 ? t("gallery.copiedMany", { count: list.length }) : t("gallery.copied"))
+  })
+}
+
+function sendAll(list: MediaItem[], peer: { id: string; name: string }) {
+  return run(t("gallery.sendFailed", { name: peer.name }), async () => {
+    for (const path of await fetchAll(list)) await invoke("file_send", { peer: peer.id, path })
+    toast.success(t("gallery.sent", { count: list.length, name: peer.name }))
+  })
+}
+
+const menu = computed<ContextMenuItemDef[]>(() => {
+  const list = targets.value
+  const one = list.length === 1 ? list[0] : undefined
+  const entries: ContextMenuItemDef[] = []
+  if (one) {
+    entries.push(
+      { label: t("gallery.view"), icon: "lucide:eye", onSelect: () => void openItem(one) },
+      { label: t("gallery.openWith"), icon: "lucide:external-link", disabled: working.value, onSelect: () => void openWith(one) },
+    )
+  }
+  entries.push({
+    label: list.length > 1 ? t("gallery.saveMany", { count: list.length }) : t("gallery.save"),
+    icon: "lucide:download",
+    disabled: working.value,
+    separatorBefore: !!one,
+    onSelect: () => void saveAll(list),
+  })
+  if (one) {
+    entries.push(
+      { label: t("gallery.saveAs"), icon: "lucide:folder-down", disabled: working.value, onSelect: () => void saveAs(one) },
+      { label: t("gallery.reveal"), icon: "lucide:folder-open", disabled: working.value, onSelect: () => void reveal(one) },
+    )
+  }
+  entries.push({
+    label: list.length > 1 ? t("gallery.copyMany", { count: list.length }) : t("gallery.copyFile"),
+    icon: "lucide:copy",
+    disabled: working.value,
+    onSelect: () => void copyFiles(list),
+  })
+  if (sendTargets.value.length) {
+    entries.push({
+      label: t("gallery.sendTo"),
+      icon: "lucide:send",
+      disabled: working.value,
+      children: sendTargets.value.map((p) => ({ label: p.name, onSelect: () => void sendAll(list, p) })),
+    })
+  }
+  entries.push(
+    selected.size
+      ? { label: t("gallery.clearSelection"), icon: "lucide:square-x", separatorBefore: true, onSelect: () => selected.clear() }
+      : {
+          label: t("gallery.selectAll"),
+          icon: "lucide:square-check",
+          separatorBefore: true,
+          onSelect: () => items.value.forEach((i) => selected.add(i.id)),
+        },
+  )
+  return entries
+})
+
 function onCopy(_item: LightboxItem, ok: boolean) {
   if (ok) toast.success(t("gallery.copied"))
   else toast.failure(new Error(t("gallery.copyFailed")))
@@ -225,7 +392,20 @@ function describe(item: MediaItem): string {
       </LpCard>
 
       <template v-else>
-        <div class="grid grid-cols-3 gap-1 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6">
+        <div v-if="selected.size" class="flex flex-wrap items-center gap-2 rounded-control bg-surface-soft px-3 py-2">
+          <span class="flex-1 text-sm">{{ t("gallery.selected", { count: selected.size }) }}</span>
+          <LpButton variant="soft" size="sm" :loading="working" @click="saveAll(targets)">
+            <LpIcon name="lucide:download" :size="14" />{{ t("gallery.save") }}
+          </LpButton>
+          <LpButton variant="soft" size="sm" :disabled="working" @click="copyFiles(targets)">
+            <LpIcon name="lucide:copy" :size="14" />{{ t("gallery.copyFile") }}
+          </LpButton>
+          <LpButton variant="muted" size="sm" square :aria-label="t('gallery.clearSelection')" @click="selected.clear()">
+            <LpIcon name="lucide:x" :size="14" />
+          </LpButton>
+        </div>
+        <LpContextMenu :always="!isMobile" :items="isMobile ? [] : menu">
+        <div class="grid grid-cols-3 gap-1 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6" @contextmenu.capture="menuItem = null">
           <button
             v-for="item in items"
             :key="item.id"
@@ -233,8 +413,10 @@ function describe(item: MediaItem): string {
             :data-id="item.id"
             type="button"
             class="group relative aspect-square overflow-hidden rounded-control bg-surface-soft outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            :class="selected.has(item.id) && 'ring-2 ring-brand ring-offset-2 ring-offset-surface'"
             :title="`${item.name} · ${describe(item)}`"
-            @click="openItem(item)"
+            @click="onCellClick(item, $event)"
+            @contextmenu="onCellMenu(item)"
           >
             <img
               v-if="thumbs.get(item.id)"
@@ -254,8 +436,15 @@ function describe(item: MediaItem): string {
               <LpIcon name="lucide:play" :size="10" />
               <template v-if="item.duration_ms">{{ length(item.duration_ms) }}</template>
             </span>
+            <span
+              v-if="selected.has(item.id)"
+              class="absolute left-1 top-1 flex size-5 items-center justify-center rounded-full bg-brand text-white"
+            >
+              <LpIcon name="lucide:check" :size="12" />
+            </span>
           </button>
         </div>
+        </LpContextMenu>
         <LpEmptyState v-if="!items.length && !loading" compact icon="lucide:image" :title="t('gallery.none')" />
         <div ref="sentinel" class="flex justify-center py-2">
           <LpSkeleton v-if="loading" class="h-4 w-24" />
