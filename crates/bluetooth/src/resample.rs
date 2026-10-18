@@ -70,6 +70,49 @@ impl Downsampler {
     }
 }
 
+/// Music PCM (interleaved `i16`, mono or stereo, any rate) to path PCM.
+///
+/// Linear interpolation at a fractional step: 44.1 kHz does not divide
+/// 48 kHz. Fine for listening; the phone picks 48 kHz whenever it can, which
+/// makes this a copy.
+pub struct MusicResampler {
+    /// Input frames per output frame.
+    step: f64,
+    /// Position of the next output frame, in input frames past `prev`.
+    pos: f64,
+    prev: [f32; 2],
+}
+
+impl MusicResampler {
+    pub fn new(rate: u32) -> Self {
+        MusicResampler {
+            step: f64::from(rate) / f64::from(PATH_RATE),
+            pos: 1.0,
+            prev: [0.0; 2],
+        }
+    }
+
+    pub fn push(&mut self, pcm: &[i16], channels: u8, out: &mut Vec<u8>) {
+        let channels = usize::from(channels.clamp(1, 2));
+        for frame in pcm.chunks(channels) {
+            let cur = [
+                f32::from(frame[0]) / 32768.0,
+                f32::from(*frame.get(1).unwrap_or(&frame[0])) / 32768.0,
+            ];
+            while self.pos <= 1.0 {
+                let t = self.pos as f32;
+                for (prev, cur) in self.prev.iter().zip(cur) {
+                    let v = prev + (cur - prev) * t;
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                self.pos += self.step;
+            }
+            self.pos -= 1.0;
+            self.prev = cur;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +147,20 @@ mod tests {
         down.push(&path, &mut link);
         assert_eq!(link.len(), 10);
         assert!((link[9] - 8000).abs() <= 1);
+    }
+
+    #[test]
+    fn music_at_48_khz_passes_frame_for_frame_and_44_1_grows_by_the_ratio() {
+        let mut same = MusicResampler::new(48_000);
+        let mut out = Vec::new();
+        same.push(&[1000, -1000].repeat(480), 2, &mut out);
+        assert_eq!(out.len() / 8, 480);
+
+        let mut up = MusicResampler::new(44_100);
+        let mut out = Vec::new();
+        up.push(&[1000].repeat(4410), 1, &mut out);
+        let frames = out.len() / 8;
+        assert!((4799..=4801).contains(&frames), "{frames}");
     }
 
     #[test]

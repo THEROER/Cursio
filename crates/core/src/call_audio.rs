@@ -11,14 +11,19 @@
 use std::sync::Arc;
 
 use cursio_audio::{Capture, Playback};
-use cursio_bluetooth::resample::{Downsampler, Upsampler};
-use cursio_bluetooth::{CallAudio, CallAudioFactory, HandsFreeService, HfCommand, LinkEvent};
+use cursio_bluetooth::resample::{Downsampler, MusicResampler, Upsampler};
+use cursio_bluetooth::{
+    CallAudio, CallAudioFactory, HandsFreeService, HfCommand, LinkEvent, MediaAudio,
+    MediaAudioFactory, MediaSinkService,
+};
 use cursio_protocol::AudioChunk;
 
 use crate::calls_hub::{hub, CallAction, HandsFreeControl};
 
 /// Stream ids for call audio, clear of the ranges sessions allocate.
 const CALL_STREAM_BASE: u32 = 0xCA11_0000;
+/// The phone's music over Bluetooth.
+const MUSIC_STREAM: u32 = 0xCA11_0010;
 
 struct Voice {
     playback: Playback,
@@ -99,11 +104,64 @@ impl HandsFreeControl for Control {
     }
 }
 
-/// Be the hands-free unit of every paired phone, for the life of the process.
+/// A phone's music, played like any peer stream here.
+struct Music {
+    playback: Playback,
+    resampler: MusicResampler,
+    rate: u32,
+    seq: u32,
+}
+
+impl MediaAudio for Music {
+    fn play(&mut self, pcm: &[i16], rate: u32, channels: u8) {
+        if rate != self.rate {
+            self.rate = rate;
+            self.resampler = MusicResampler::new(rate);
+        }
+        let mut data = Vec::with_capacity(pcm.len() * 8);
+        self.resampler.push(pcm, channels, &mut data);
+        self.seq = self.seq.wrapping_add(1);
+        let chunk = AudioChunk {
+            id: MUSIC_STREAM,
+            seq: self.seq,
+            timestamp: 0,
+            data,
+        };
+        if let Err(e) = self.playback.play(&chunk) {
+            tracing::debug!(error = %e, "phone music dropped");
+        }
+    }
+}
+
+struct MusicFactory;
+
+impl MediaAudioFactory for MusicFactory {
+    fn open(&self, _phone: &str, name: &str) -> Result<Box<dyn MediaAudio>, String> {
+        let playback = Playback::open(MUSIC_STREAM, format!("Cursio — {name}"))
+            .map_err(|e| format!("cannot play the phone's sound here: {e}"))?;
+        Ok(Box::new(Music {
+            playback,
+            resampler: MusicResampler::new(48_000),
+            rate: 48_000,
+            seq: 0,
+        }))
+    }
+}
+
+/// Be the speaker and hands-free unit of every paired phone, for the life of
+/// the process.
 ///
 /// Failing is not fatal: calls still work over the mesh, with the voice on
-/// the phone. The reason is logged once, with what to do about it.
+/// the phone, and the phone's sound can still come by playback capture. The
+/// reason is logged once, with what to do about it.
 pub fn start() {
+    match MediaSinkService::start(Arc::new(MusicFactory)) {
+        // Lives as long as the process: dropping it unregisters the speaker.
+        Ok(service) => std::mem::forget(service),
+        Err(e) => {
+            tracing::warn!(error = %e, "phones cannot pick this computer as a Bluetooth speaker")
+        }
+    }
     let (service, events) = match HandsFreeService::start(Arc::new(Factory)) {
         Ok(started) => started,
         Err(e) => {

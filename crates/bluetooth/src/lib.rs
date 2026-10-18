@@ -27,6 +27,7 @@
 //! runs at. The sockets and D-Bus live in the platform half, which on
 //! anything but Linux is an error saying so.
 
+pub mod a2dp;
 pub mod at;
 pub mod hands_free;
 pub mod resample;
@@ -34,7 +35,7 @@ pub mod resample;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::HandsFreeService;
+pub use linux::{HandsFreeService, MediaSinkService};
 
 /// The Bluetooth address of a remote device, as BlueZ prints it.
 pub type Address = String;
@@ -76,6 +77,18 @@ pub trait CallAudio: Send {
     /// Fill `out` with `samples` of microphone PCM at the link's rate; short
     /// of recorded sound, with silence.
     fn record(&mut self, samples: usize, out: &mut Vec<i16>);
+}
+
+/// Where a phone's music (A2DP) plays on this side.
+pub trait MediaAudio: Send {
+    /// Interleaved 16-bit PCM at `rate`, `channels` wide, as decoded.
+    fn play(&mut self, pcm: &[i16], rate: u32, channels: u8);
+}
+
+/// Opens [`MediaAudio`] when a phone starts playing to this computer.
+pub trait MediaAudioFactory: Send + Sync {
+    /// `phone` is the Bluetooth address, `name` what BlueZ calls the device.
+    fn open(&self, phone: &str, name: &str) -> Result<Box<dyn MediaAudio>, String>;
 }
 
 /// Opens [`CallAudio`] when a call's voice arrives.
@@ -124,5 +137,15 @@ impl HandsFreeService {
 
     pub fn command(&self, phone: &str, _command: HfCommand) -> Result<(), BluetoothError> {
         Err(BluetoothError::NotConnected(phone.to_string()))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub struct MediaSinkService;
+
+#[cfg(not(target_os = "linux"))]
+impl MediaSinkService {
+    pub fn start(_audio: std::sync::Arc<dyn MediaAudioFactory>) -> Result<Self, BluetoothError> {
+        Err(BluetoothError::Unsupported)
     }
 }
