@@ -12,10 +12,18 @@
 //! otherwise. The two are matched by name, because Android hides its own
 //! Bluetooth address from apps and the name is what both sides can see.
 //!
+//! **Where the voice goes** follows where the call was taken, as on Phone
+//! Link: answered or dialled from this computer, it comes here; answered on
+//! the phone, it stays there — Android otherwise routes it to any connected
+//! hands-free unit, which put a call the user picked up in their hand on the
+//! desk speakers. That is steered once, as the call starts ([`VoicePolicy`]);
+//! a move made afterwards, here or on the phone, is the user's and stands.
+//!
 //! [`CallsEngine`]: crate::calls_session::CallsEngine
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use cursio_protocol::calls::{Call, CallId, CallsMsg};
 use cursio_protocol::PeerId;
@@ -92,6 +100,63 @@ struct HandsFreePhone {
     name: String,
     calls: Vec<Call>,
     audio_here: bool,
+    voice: VoicePolicy,
+}
+
+/// How long after a call starts this computer keeps putting its voice where
+/// the call was taken. The phone opens and closes the audio link on its own
+/// for a moment around answering; past this window a move is the user's.
+const STEER_FOR: Duration = Duration::from_secs(8);
+
+/// Where the voice of a hands-free phone's call should be, decided once as
+/// the call starts.
+#[derive(Debug, Default)]
+struct VoicePolicy {
+    /// Where the voice belongs and until when this computer steers it there.
+    /// `None` until the call is taken somewhere.
+    steer: Option<(bool, Instant)>,
+    /// The last move asked of the phone, so a stream of call updates while
+    /// the phone gets round to it does not ask again for each.
+    asked: Option<bool>,
+}
+
+impl VoicePolicy {
+    /// Answered or dialled from this computer: the voice comes here.
+    fn taken_here(&mut self, now: Instant) {
+        self.steer = Some((true, now + STEER_FOR));
+        self.asked = None;
+    }
+
+    /// The user moved the voice: theirs from now on, nothing is steered.
+    fn moved_by_user(&mut self) {
+        self.steer = Some((false, Instant::now()));
+        self.asked = None;
+    }
+
+    /// The phone's calls changed. A call that is up, or being placed, without
+    /// having been taken here was taken on the phone, and its voice stays
+    /// there; with no call left everything starts over.
+    fn calls(&mut self, calls: &[Call], now: Instant) {
+        if calls.is_empty() {
+            *self = VoicePolicy::default();
+            return;
+        }
+        let started = calls.iter().any(|c| !c.state.is_incoming_offer());
+        if started && self.steer.is_none() {
+            self.steer = Some((false, now + STEER_FOR));
+        }
+    }
+
+    /// The move to ask of the phone now, if the voice is not where it
+    /// belongs and this computer is still steering it.
+    fn correction(&mut self, audio_here: bool, now: Instant) -> Option<bool> {
+        let (want, until) = self.steer?;
+        if now >= until || audio_here == want || self.asked == Some(want) {
+            return None;
+        }
+        self.asked = Some(want);
+        Some(want)
+    }
 }
 
 #[derive(Default)]
@@ -305,17 +370,40 @@ impl CallsHub {
     }
 
     pub fn hands_free_calls(&self, address: &str, calls: Vec<Call>) {
-        if let Some(phone) = lock(&self.desk).hands_free.get_mut(address) {
-            phone.calls = calls;
-        }
+        let now = Instant::now();
+        let steer = {
+            let mut desk = lock(&self.desk);
+            desk.hands_free.get_mut(address).and_then(|phone| {
+                phone.voice.calls(&calls, now);
+                phone.calls = calls;
+                phone.voice.correction(phone.audio_here, now)
+            })
+        };
+        self.steer_voice(address, steer);
         self.changed();
     }
 
     pub fn hands_free_audio(&self, address: &str, here: bool) {
-        if let Some(phone) = lock(&self.desk).hands_free.get_mut(address) {
-            phone.audio_here = here;
-        }
+        let steer = {
+            let mut desk = lock(&self.desk);
+            desk.hands_free.get_mut(address).and_then(|phone| {
+                phone.audio_here = here;
+                phone.voice.correction(here, Instant::now())
+            })
+        };
+        self.steer_voice(address, steer);
         self.changed();
+    }
+
+    /// Ask the phone to put the voice where the call was taken.
+    fn steer_voice(&self, address: &str, here: Option<bool>) {
+        let Some(here) = here else { return };
+        let control = lock(&self.desk).control.clone();
+        if let Some(control) = control {
+            if let Err(e) = control.act(address, &CallAction::AudioHere { here }) {
+                tracing::warn!(phone = %address, here, error = %e, "could not move a call's voice");
+            }
+        }
     }
 
     /// Every phone this computer can see calls of.
@@ -341,7 +429,28 @@ impl CallsHub {
             });
         if let (Some(address), Some(control)) = (hands_free, desk.control.clone()) {
             drop(desk);
-            return control.act(&address, &action);
+            let now = Instant::now();
+            {
+                let mut desk = lock(&self.desk);
+                if let Some(phone) = desk.hands_free.get_mut(&address) {
+                    match action {
+                        CallAction::Answer | CallAction::Dial { .. } => phone.voice.taken_here(now),
+                        CallAction::AudioHere { .. } => phone.voice.moved_by_user(),
+                        _ => {}
+                    }
+                }
+            }
+            control.act(&address, &action)?;
+            // Answering opens the call on the phone's side; the voice comes
+            // here with it rather than waiting for the next update to ask.
+            if action == CallAction::Answer {
+                let steer = lock(&self.desk)
+                    .hands_free
+                    .get_mut(&address)
+                    .and_then(|phone| phone.voice.correction(phone.audio_here, now));
+                self.steer_voice(&address, steer);
+            }
+            return Ok(());
         }
         let Some(phone) = desk
             .mesh
@@ -482,9 +591,108 @@ mod tests {
         hub.act("POCO X7 Pro", CallAction::Answer).unwrap();
         assert!(rx.try_recv().is_err());
         assert_eq!(
-            recorder.0.lock().unwrap().as_slice(),
-            &[("9C:9E:D5:78:FE:C4".to_string(), CallAction::Answer)]
+            recorder.0.lock().unwrap().first(),
+            Some(&("9C:9E:D5:78:FE:C4".to_string(), CallAction::Answer))
         );
+    }
+
+    const PHONE: &str = "9C:9E:D5:78:FE:C4";
+
+    fn hands_free_hub() -> (CallsHub, Arc<Recorder>) {
+        let hub = CallsHub::default();
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        hub.set_hands_free_control(recorder.clone());
+        hub.hands_free_connected(PHONE, "POCO X7 Pro");
+        (hub, recorder)
+    }
+
+    fn asked(recorder: &Recorder) -> Vec<CallAction> {
+        recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+
+    #[test]
+    fn answering_here_brings_the_voice_to_this_computer() {
+        let (hub, recorder) = hands_free_hub();
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Ringing)]);
+        hub.act("POCO X7 Pro", CallAction::Answer).unwrap();
+        assert_eq!(
+            asked(&recorder),
+            [CallAction::Answer, CallAction::AudioHere { here: true }]
+        );
+        // The phone's updates while it opens the audio link ask nothing more.
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Active)]);
+        hub.hands_free_audio(PHONE, false);
+        assert_eq!(asked(&recorder).len(), 2);
+    }
+
+    #[test]
+    fn a_call_answered_on_the_phone_keeps_its_voice_there() {
+        let (hub, recorder) = hands_free_hub();
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Ringing)]);
+        // A ringing call's in-band ring may come here; that is not steered.
+        hub.hands_free_audio(PHONE, true);
+        assert!(asked(&recorder).is_empty());
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Active)]);
+        assert_eq!(asked(&recorder), [CallAction::AudioHere { here: false }]);
+    }
+
+    #[test]
+    fn dialling_here_brings_the_voice_once_the_call_is_placed() {
+        let (hub, recorder) = hands_free_hub();
+        hub.act(
+            "POCO X7 Pro",
+            CallAction::Dial {
+                number: "+380501234567".into(),
+            },
+        )
+        .unwrap();
+        hub.hands_free_calls(PHONE, vec![call(2, CallState::Dialing)]);
+        assert_eq!(
+            asked(&recorder),
+            [
+                CallAction::Dial {
+                    number: "+380501234567".into()
+                },
+                CallAction::AudioHere { here: true }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_move_the_user_made_is_not_undone() {
+        let (hub, recorder) = hands_free_hub();
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Active)]);
+        hub.act("POCO X7 Pro", CallAction::AudioHere { here: true })
+            .unwrap();
+        hub.hands_free_audio(PHONE, true);
+        assert_eq!(asked(&recorder), [CallAction::AudioHere { here: true }]);
+    }
+
+    #[test]
+    fn the_voice_is_left_alone_once_the_call_has_settled() {
+        let mut policy = VoicePolicy::default();
+        let start = Instant::now();
+        policy.calls(&[call(1, CallState::Active)], start);
+        assert_eq!(policy.correction(true, start), Some(false));
+        let mut later = VoicePolicy::default();
+        later.calls(&[call(1, CallState::Active)], start);
+        assert_eq!(later.correction(true, start + STEER_FOR), None);
+    }
+
+    #[test]
+    fn a_new_call_is_steered_afresh_after_the_last_one_ended() {
+        let mut policy = VoicePolicy::default();
+        let now = Instant::now();
+        policy.taken_here(now);
+        policy.calls(&[], now);
+        policy.calls(&[call(2, CallState::Active)], now);
+        assert_eq!(policy.correction(true, now), Some(false));
     }
 
     #[test]
