@@ -64,8 +64,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// text or file to a peer. v10: a phone's messages — `list_conversations`,
 /// `list_messages`, `send_sms`, `mark_sms_read`, and `messages` in the status.
 /// v11: `nearby` in the status and in every pairing reply. v12: `path` on a
-/// link, the network or Bluetooth.
-pub const CONTROL_VERSION: u32 = 12;
+/// link, the network or Bluetooth. v13: `inapplicable` on a link, apart from
+/// `skipped`.
+pub const CONTROL_VERSION: u32 = 13;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -482,8 +483,15 @@ pub struct LinkView {
     /// The peer's greeting status, replaced by any later report of it.
     pub status: NodeStatus,
     pub modules: Vec<String>,
-    /// Modules this node offers that do not run on this link, and why.
+    /// Modules this node offers that could run on this link but do not: one
+    /// side has it switched off, or the peer's build is older. Worth showing.
     pub skipped: Vec<(String, String)>,
+    /// Modules that have no meaning between these two machines — two phones
+    /// with nothing to read from each other's SMS, or a duty a phone has no
+    /// backend for. Kept apart from `skipped` so a window does not present
+    /// them as something to fix. Empty from a v11 node.
+    #[serde(default)]
+    pub inapplicable: Vec<String>,
     pub since: SystemTime,
     /// What carries the link. Defaulted from a v11 node, which only had the
     /// network.
@@ -513,6 +521,45 @@ impl LinkPath {
             LinkPath::Network
         }
     }
+}
+
+/// The modules a phone's node is built with (`crates/android/src/node.rs`).
+/// A phone lacking any other module is not running an old build; it has no
+/// backend for that duty, and listing it as missing would ask for an update
+/// that cannot help.
+const PHONE_MODULES: [cursio_protocol::ModuleId; 6] = [
+    cursio_protocol::ModuleId::AUDIO,
+    cursio_protocol::ModuleId::INPUT,
+    cursio_protocol::ModuleId::SHARE,
+    cursio_protocol::ModuleId::NOTIFY,
+    cursio_protocol::ModuleId::CALLS,
+    cursio_protocol::ModuleId::MESSAGES,
+];
+
+/// Split what negotiation skipped into what is worth showing as off
+/// ([`LinkView::skipped`], with the reason) and what has no meaning between
+/// these two machines ([`LinkView::inapplicable`]).
+pub fn link_skips(
+    negotiated: &cursio_protocol::Negotiated,
+    peer_kind: DeviceKind,
+) -> (Vec<(String, String)>, Vec<String>) {
+    use cursio_protocol::SkipReason;
+    let phone = matches!(peer_kind, DeviceKind::Phone | DeviceKind::Tablet);
+    let mut skipped = Vec::new();
+    let mut inapplicable = Vec::new();
+    for (id, why) in &negotiated.skipped {
+        let pointless = match why {
+            SkipReason::RoleMismatch { .. } => true,
+            SkipReason::PeerLacks => phone && !PHONE_MODULES.contains(id),
+            SkipReason::VersionMismatch { .. } => false,
+        };
+        if pointless {
+            inapplicable.push(id.to_string());
+        } else {
+            skipped.push((id.to_string(), why.to_string()));
+        }
+    }
+    (skipped, inapplicable)
 }
 
 /// A known peer as the mesh loop last published it.
@@ -786,12 +833,13 @@ impl NodeState {
         peer: &PeerId,
         position: Position,
         modules: Vec<String>,
-        skipped: Vec<(String, String)>,
+        (skipped, inapplicable): (Vec<(String, String)>, Vec<String>),
     ) {
         if let Some((_, link)) = self.inner().links.get_mut(peer) {
             link.position = position;
             link.modules = modules;
             link.skipped = skipped;
+            link.inapplicable = inapplicable;
         }
         self.changed();
     }
@@ -1058,6 +1106,61 @@ fn running_install_version() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cursio_protocol::{ModuleId, ModuleRole, Negotiated, SkipReason};
+
+    #[test]
+    fn modules_with_nothing_to_exchange_between_two_machines_are_not_shown_as_off() {
+        let negotiated = Negotiated {
+            agreed: vec![ModuleId::AUDIO],
+            skipped: vec![
+                (
+                    ModuleId::MESSAGES,
+                    SkipReason::RoleMismatch {
+                        local: ModuleRole::Source,
+                        peer: ModuleRole::Source,
+                    },
+                ),
+                (ModuleId::WINDOW, SkipReason::PeerLacks),
+            ],
+        };
+
+        let (skipped, inapplicable) = link_skips(&negotiated, DeviceKind::Phone);
+
+        assert!(skipped.is_empty());
+        assert_eq!(
+            inapplicable,
+            vec!["messages".to_string(), "window".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_module_an_older_build_lacks_stays_shown_as_off_with_its_reason() {
+        let negotiated = Negotiated {
+            agreed: vec![],
+            skipped: vec![
+                (ModuleId::CALLS, SkipReason::PeerLacks),
+                (
+                    ModuleId::AUDIO,
+                    SkipReason::VersionMismatch { local: 2, peer: 1 },
+                ),
+            ],
+        };
+
+        let (skipped, inapplicable) = link_skips(&negotiated, DeviceKind::Desktop);
+
+        assert_eq!(
+            skipped.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(),
+            ["calls", "audio"]
+        );
+        assert!(inapplicable.is_empty());
+    }
+
+    #[test]
+    fn a_link_view_from_a_node_before_v12_reads_without_inapplicable_modules() {
+        let json = r#"{"position":{"x":0,"y":0},"device_kind":"Phone","status":{},"modules":[],"skipped":[],"since":{"secs_since_epoch":0,"nanos_since_epoch":0}}"#;
+        let view: LinkView = serde_json::from_str(json).unwrap();
+        assert!(view.inapplicable.is_empty());
+    }
 
     fn state(dir: &std::path::Path, overrides: Overrides) -> NodeState {
         state_applying(dir, overrides, Arc::new(|_: &Config, _: &Config| {}))
@@ -1399,6 +1502,7 @@ mod tests {
                 },
                 modules: vec!["clipboard".into()],
                 skipped: vec![],
+                inapplicable: vec![],
                 since: SystemTime::now(),
                 path: LinkPath::Network,
             },

@@ -565,6 +565,7 @@ async fn run_link<T: Transport + 'static>(
         tracing::info!(peer = %peer_name, "paired");
     }
     let peer = link.peer.clone();
+    let (skipped, inapplicable) = cursio_core::control::link_skips(&negotiated, peer.device_kind);
     ctx.control.link_up(
         peer.peer_id,
         &peer.display_name,
@@ -573,11 +574,8 @@ async fn run_link<T: Transport + 'static>(
             device_kind: peer.device_kind,
             status: peer.status,
             modules: negotiated.agreed.iter().map(|id| id.to_string()).collect(),
-            skipped: negotiated
-                .skipped
-                .iter()
-                .map(|(id, why)| (id.to_string(), why.to_string()))
-                .collect(),
+            skipped,
+            inapplicable,
             since: std::time::SystemTime::now(),
             path,
         },

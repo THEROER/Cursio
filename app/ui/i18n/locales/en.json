@@ -290,6 +290,8 @@
     "overBluetooth": "Bluetooth",
     "overBluetoothHint": "Connected over Bluetooth because the network does not reach it: everything but screens and large files works, more slowly.",
     "skipped": "{module} off on this link: {why}",
+    "skippedLacks": "Not running with {peer}: it is switched off there, or {peer} runs an older Cursio — update it",
+    "skippedVersion": "Not running with {peer}: the two builds differ — update the older one",
     "noLink": "Not connected in this session, so its position and status are unknown.",
     "uptime": "Connection",
     "uptimeStart": "10 min ago",

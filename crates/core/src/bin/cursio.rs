@@ -2478,6 +2478,7 @@ async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
     });
     let token = hub_link.as_ref().map(|l| l.token);
     let hub = capture.map(|c| c.hub.clone());
+    let (skipped, inapplicable) = cursio_core::control::link_skips(&negotiated, peer.device_kind);
     control.link_up(
         peer.peer_id,
         &peer.display_name,
@@ -2486,11 +2487,8 @@ async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
             device_kind: peer.device_kind,
             status: peer.status,
             modules: negotiated.agreed.iter().map(|id| id.to_string()).collect(),
-            skipped: negotiated
-                .skipped
-                .iter()
-                .map(|(id, why)| (id.to_string(), why.to_string()))
-                .collect(),
+            skipped,
+            inapplicable,
             since: std::time::SystemTime::now(),
             path,
         },
@@ -2509,6 +2507,7 @@ async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
             let control = control.clone();
             let (id, name) = (peer.peer_id, peer.display_name.clone());
             let takes_cursor = peer.device_kind.takes_cursor();
+            let peer_kind = peer.device_kind;
             Box::new(move |state| {
                 if state.edge_changed {
                     match state.peer_edge {
@@ -2539,12 +2538,7 @@ async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
                         .iter()
                         .map(|id| id.to_string())
                         .collect(),
-                    state
-                        .negotiated
-                        .skipped
-                        .iter()
-                        .map(|(id, why)| (id.to_string(), why.to_string()))
-                        .collect(),
+                    cursio_core::control::link_skips(&state.negotiated, peer_kind),
                 );
             })
         },

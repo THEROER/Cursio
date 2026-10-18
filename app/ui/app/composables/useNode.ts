@@ -25,7 +25,10 @@ export interface LinkView {
   device_kind: "Desktop" | "Laptop" | "Phone" | "Tablet" | "Headless"
   status: NodeStatus
   modules: string[]
+  /** Modules this node offers that could run on this link but do not, and why. */
   skipped: [string, string][]
+  /** Modules with no meaning between these two machines; never shown as off. */
+  inapplicable?: string[]
   since: SystemTime
   /** What carries the link; absent from a node older than control v12. */
   path?: "network" | "bluetooth"

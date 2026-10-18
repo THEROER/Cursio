@@ -7,6 +7,14 @@ const { latency: latencyHistory, uptime } = useHistory()
 const { isMobile } = usePlatform()
 const toast = useCursioToast()
 
+// The node's reasons are written for a log; on a badge they should say what
+// to do. A peer lacking a module it could run is switched off there or older.
+function skipHint(peer: string, why: string): string {
+  if (why.startsWith("peer does not have it")) return t("peer.skippedLacks", { peer })
+  if (why.startsWith("version mismatch")) return t("peer.skippedVersion", { peer })
+  return why
+}
+
 const online = computed(() => status.value?.peers.filter((p) => p.presence === "online").length ?? 0)
 
 const latency = computed(() => worstLatency(status.value?.latency ?? []))
@@ -201,7 +209,7 @@ function presenceTone(p: PeerView) {
                 </dl>
                 <div class="flex flex-wrap gap-1">
                   <LpBadge v-for="m in peer.link.modules" :key="m" size="sm" tone="brand">{{ m }}</LpBadge>
-                  <LpTooltip v-for="[m, why] in peer.link.skipped" :key="m" :content="why">
+                  <LpTooltip v-for="[m, why] in peer.link.skipped" :key="m" :content="skipHint(peer.name, why)">
                     <LpBadge size="sm" tone="outline" class="line-through">{{ m }}</LpBadge>
                   </LpTooltip>
                 </div>
