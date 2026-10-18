@@ -166,6 +166,7 @@ fn read_players(bus: &zbus::blocking::Connection) -> Snapshot {
         };
         let app = get_all(bus, &name, "org.mpris.MediaPlayer2")
             .and_then(|p| str_of(p.get("Identity")))
+            .map(|identity| clean_identity(&identity))
             .unwrap_or_else(|| name.trim_start_matches(PREFIX).to_string());
         let meta: HashMap<String, OwnedValue> = props
             .get("Metadata")
@@ -610,6 +611,24 @@ fn serve(
     }
 }
 
+
+/// A player's name as a person reads it. A snap's Firefox reports itself as
+/// "Mozilla firefox_firefox": the snap's name glued on after an underscore,
+/// repeating a word already there. That repeat goes; anything else stays.
+fn clean_identity(identity: &str) -> String {
+    match identity.rsplit_once('_') {
+        Some((name, suffix))
+            if !suffix.is_empty()
+                && name
+                    .split_whitespace()
+                    .any(|word| word.eq_ignore_ascii_case(suffix)) =>
+        {
+            name.to_string()
+        }
+        _ => identity.to_string(),
+    }
+}
+
 /// Whether `name` is BlueZ's `mpris-proxy` standing in for a Bluetooth
 /// device's player — a phone or a computer playing through this one. That
 /// device is not this machine: a peer offers its own players itself, and
@@ -670,6 +689,13 @@ fn remote_art(hash: u64, url: &str) -> Option<(String, Vec<u8>)> {
 mod tests {
     use super::*;
     use crate::media_hub::players_changed as changed;
+
+    #[test]
+    fn a_snaps_name_glued_onto_a_players_identity_is_dropped() {
+        assert_eq!(clean_identity("Mozilla firefox_firefox"), "Mozilla firefox");
+        assert_eq!(clean_identity("Spotify"), "Spotify");
+        assert_eq!(clean_identity("my_player"), "my_player");
+    }
 
     fn player(state: PlaybackState, position_ms: u64) -> Player {
         Player {
