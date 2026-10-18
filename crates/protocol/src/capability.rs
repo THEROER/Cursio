@@ -77,6 +77,9 @@ impl ModuleId {
     /// A phone's calls, answered, placed and ended from a computer; see
     /// [`calls`](crate::calls).
     pub const CALLS: ModuleId = ModuleId(12);
+    /// What is playing on each machine, driven from the others; see
+    /// [`media`](crate::media).
+    pub const MEDIA: ModuleId = ModuleId(13);
 
     /// Human-readable name, for logs and diagnostics. Unknown ids are rendered
     /// numerically rather than hidden — that is exactly the case worth seeing in
@@ -95,6 +98,7 @@ impl ModuleId {
             ModuleId::NOTIFY => "notify",
             ModuleId::MESSAGES => "messages",
             ModuleId::CALLS => "calls",
+            ModuleId::MEDIA => "media",
             _ => "unknown",
         }
     }
