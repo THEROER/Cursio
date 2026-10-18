@@ -86,6 +86,16 @@ pub const PROTOCOL_VERSION: u16 = 21;
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
 
+/// Marks a [`Message::Heartbeat`] as the answer to one, which is never
+/// answered itself.
+///
+/// A phone lets its CPU sleep when idle, and a sleeping phone's own heartbeat
+/// timer does not run — its clock stops with it — so it would go silent and a
+/// computer would call the link dead every fifteen seconds. A packet arriving
+/// does wake it, so answering the computer's beat in that wake keeps the link
+/// heard. A build that predates the echo ignores the flag like any nonce.
+pub const HEARTBEAT_ECHO: u64 = 1 << 63;
+
 /// Top-level message enum. Every frame on the wire is one of these.
 ///
 /// The variants are grouped by phase:
@@ -119,8 +129,8 @@ pub enum Message {
     /// Pairing was rejected or failed (wrong password, version mismatch, etc.).
     PairFailed { reason: String },
 
-    /// Keep-alive. Sent periodically once a session is established; the
-    /// `nonce` lets the sender match a peer's echo if it wants RTT.
+    /// Keep-alive. Sent periodically once a session is established, and
+    /// answered by an echo: the same `nonce` with [`HEARTBEAT_ECHO`] set.
     Heartbeat { nonce: u64 },
 
     /// Graceful shutdown notice. The sender is closing the session.

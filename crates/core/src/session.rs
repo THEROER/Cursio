@@ -1033,7 +1033,17 @@ where
                     None => (None, std::time::Instant::now()),
                 };
                 match incoming {
-                    Some(Message::Heartbeat { nonce }) => tracing::trace!(nonce, "peer heartbeat"),
+                    Some(Message::Heartbeat { nonce }) => {
+                        tracing::trace!(nonce, "peer heartbeat");
+                        if nonce & cursio_protocol::HEARTBEAT_ECHO == 0 {
+                            let echo = Message::Heartbeat {
+                                nonce: nonce | cursio_protocol::HEARTBEAT_ECHO,
+                            };
+                            if let Err(e) = tx.send(&echo).await {
+                                break Err(SessionError::from(e));
+                            }
+                        }
+                    }
                     // The peer's power or network changed. Nothing routes by it
                     // yet, but the window shows it: only the greeting's reading
                     // used to be kept, so a network a phone reported a moment
