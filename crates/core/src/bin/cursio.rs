@@ -1777,6 +1777,14 @@ fn module_registry(
     }
     #[cfg(feature = "calls")]
     cursio_core::call_audio::start();
+    // Players are read and shown over MPRIS; Windows' media session API is
+    // not wired yet, and the module is not advertised there rather than
+    // advertised and silent.
+    #[cfg(target_os = "linux")]
+    cursio_core::media_mpris::start();
+    #[cfg(not(target_os = "linux"))]
+    tracing::warn!("sharing what plays is not implemented on this platform yet");
+    let media = cfg!(target_os = "linux");
 
     cursio_core::module::ModuleRegistry::new()
         .with_switches(switches)
@@ -1804,6 +1812,11 @@ fn module_registry(
         .with(Box::new(cursio_core::messages_session::MessagesFactory {
             store: None,
             view: true,
+        }))
+        .with(Box::new(cursio_core::media_session::MediaFactory {
+            plays: media,
+            shows: media,
+            shows_only_computers: false,
         }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,

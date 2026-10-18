@@ -72,6 +72,13 @@ pub mod link;
 /// Applying a changed config to running links instead of restarting.
 pub mod live;
 pub mod logging;
+/// Where this machine's players meet the mesh and peers' are shown.
+pub mod media_hub;
+/// This desktop's MPRIS players, and peers' players offered as MPRIS ones.
+#[cfg(target_os = "linux")]
+pub mod media_mpris;
+/// The media module on one link.
+pub mod media_session;
 pub mod mesh;
 /// Where a phone's messages are answered and a desktop's requests leave.
 pub mod messages_hub;
