@@ -233,6 +233,7 @@ pub fn run() {
             mobile::commands::mobile_setup,
             mobile::commands::mobile_request,
             mobile::commands::mobile_restart,
+            mobile::commands::mobile_system_bars,
             mobile::commands::phone_audio_targets,
             mobile::commands::phone_audio_route,
             mobile::commands::phone_audio_state,

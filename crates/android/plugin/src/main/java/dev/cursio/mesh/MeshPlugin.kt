@@ -13,6 +13,7 @@ import android.provider.Settings
 import android.util.Log
 import androidx.activity.result.ActivityResult
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.view.WindowCompat
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.Permission
@@ -61,6 +62,35 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
      */
     override fun onResume() {
         if (Prefs.wantedRunning(activity)) startFromForeground()
+        darkBars?.let { applySystemBars(it) }
+    }
+
+    /** The UI's theme as last reported, re-applied when the window comes back. */
+    private var darkBars: Boolean? = null
+
+    /**
+     * Colour the status and navigation bar icons for the theme the page is
+     * actually painted in.
+     *
+     * The window draws under both bars (`enableEdgeToEdge`), and that call
+     * picks their icons from the system's day/night setting. The page has a
+     * theme of its own, so a dark page on a phone in day mode got dark icons
+     * on a dark background — invisible. HyperOS re-tints icons that blend in
+     * only for apps that leave the appearance unset, which edge-to-edge does
+     * not.
+     */
+    @Command
+    fun setSystemBars(invoke: Invoke) {
+        val dark = invoke.getArgs().getBoolean("dark", true)
+        darkBars = dark
+        activity.runOnUiThread { applySystemBars(dark) }
+        invoke.resolve()
+    }
+
+    private fun applySystemBars(dark: Boolean) {
+        val controller = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
+        controller.isAppearanceLightStatusBars = !dark
+        controller.isAppearanceLightNavigationBars = !dark
     }
 
     @Command

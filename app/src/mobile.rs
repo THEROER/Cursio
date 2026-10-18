@@ -188,6 +188,20 @@ pub mod commands {
         .map_err(|e| e.to_string())
     }
 
+    /// Colour the system bars' icons for the page's theme; see the plugin's
+    /// `setSystemBars` for why the system's own day/night is the wrong guide.
+    #[tauri::command]
+    pub fn mobile_system_bars(app: AppHandle, dark: bool) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Args {
+            dark: bool,
+        }
+        plugin(&app)?
+            .run_mobile_plugin::<serde_json::Value>("setSystemBars", Args { dark })
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+
     #[tauri::command]
     pub async fn mobile_setup(app: AppHandle) -> Result<Setup, String> {
         let plugin = plugin(&app)?;
