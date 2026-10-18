@@ -244,10 +244,26 @@ object MediaNotifier {
         // itself, MIUI 12 left an empty grey square.
         val art = entry.session.controller.metadata?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
         (art ?: appIcon(ctx))?.let { builder.setLargeIcon(it) }
+        if (main && islandHere(ctx)) {
+            builder.addExtras(
+                Island.mediaExtras(
+                    ctx,
+                    p.optString("title"),
+                    p.optString("artist"),
+                    art?.let { Icon.createWithBitmap(it) },
+                    actions[1],
+                ),
+            )
+        }
         return builder.build()
     }
 
     private var icon: Bitmap? = null
+
+    /** Asked once: HyperOS's answer does not change while the app runs. */
+    private var island: Boolean? = null
+
+    private fun islandHere(ctx: Context): Boolean = island ?: Island.supported(ctx).also { island = it }
 
     private fun appIcon(ctx: Context): Bitmap? {
         icon?.let { return it }

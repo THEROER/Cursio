@@ -29,7 +29,7 @@ import org.json.JSONObject
 object Island {
     private const val TAG = "Cursio"
     private const val PIC = "miui.focus.pic_cursio"
-    private const val STOP = "miui.focus.action_stop"
+    private const val ACTION = "miui.focus.action_cursio"
 
     /** Whether this phone draws Focus notifications in an island for us. */
     fun supported(ctx: Context): Boolean {
@@ -53,50 +53,97 @@ object Island {
     }
 
     /** The extras that put [title] and [button] in the island. */
-    fun extras(ctx: Context, title: String, button: Notification.Action): Bundle {
-        val pic = JSONObject().put("type", 1).put("pic", PIC)
+    fun extras(ctx: Context, title: String, button: Notification.Action): Bundle =
+        focus(
+            business = "find_phone",
+            heading = "Find my phone",
+            title = title,
+            content = title,
+            islandText = "Ringing",
+            // Above a hotspot's or a timer's: a ringing phone is the one thing
+            // the person holding it needs to see.
+            priority = 3,
+            updatable = false,
+            pic = Icon.createWithResource(ctx, R.drawable.ic_notify),
+            button = button,
+        )
+
+    /**
+     * The extras that put a computer's player in the island: its cover (or
+     * the logo), the track, and play/pause. HyperOS draws its own music
+     * island only for an app playing sound on the phone itself, which a
+     * remote control is not — so without these a computer's player sat in
+     * the shade and never reached the island.
+     */
+    fun mediaExtras(
+        ctx: Context,
+        title: String,
+        artist: String,
+        cover: Icon?,
+        button: Notification.Action,
+    ): Bundle =
+        focus(
+            business = "music",
+            heading = artist.ifEmpty { title },
+            title = title,
+            content = artist,
+            islandText = title,
+            // Below a ringing phone, a call or a timer.
+            priority = 1,
+            updatable = true,
+            pic = cover ?: Icon.createWithResource(ctx, R.drawable.ic_notify),
+            button = button,
+        )
+
+    private fun focus(
+        business: String,
+        heading: String,
+        title: String,
+        content: String,
+        islandText: String,
+        priority: Int,
+        updatable: Boolean,
+        pic: Icon,
+        button: Notification.Action,
+    ): Bundle {
+        val picInfo = JSONObject().put("type", 1).put("pic", PIC)
         val param = JSONObject()
             .put("protocol", 3)
-            .put("business", "find_phone")
+            .put("business", business)
             .put("ticker", title)
             .put("aodTitle", title)
-            .put("updatable", false)
-            .put("enableFloat", true)
-            .put("islandFirstFloat", true)
+            .put("updatable", updatable)
+            .put("enableFloat", !updatable)
+            .put("islandFirstFloat", !updatable)
             .put(
                 "baseInfo",
-                JSONObject().put("type", 1).put("title", "Find my phone").put("content", title),
+                JSONObject().put("type", 1).put("title", heading).put("content", content),
             )
             .put(
                 "param_island",
                 JSONObject()
                     .put("islandProperty", 1)
-                    // Above a hotspot's or a timer's: a ringing phone is the one
-                    // thing the person holding it needs to see.
-                    .put("islandPriority", 3)
+                    .put("islandPriority", priority)
                     .put(
                         "bigIslandArea",
                         JSONObject().put(
                             "imageTextInfoLeft",
                             JSONObject()
                                 .put("type", 1)
-                                .put("picInfo", pic)
-                                .put("textInfo", JSONObject().put("title", "Ringing")),
+                                .put("picInfo", picInfo)
+                                .put("textInfo", JSONObject().put("title", islandText)),
                         ),
                     )
-                    .put("smallIslandArea", JSONObject().put("picInfo", pic)),
+                    .put("smallIslandArea", JSONObject().put("picInfo", picInfo)),
             )
             .put(
                 "actions",
-                JSONArray().put(JSONObject().put("type", 0).put("action", STOP)),
+                JSONArray().put(JSONObject().put("type", 0).put("action", ACTION)),
             )
         return Bundle().apply {
             putString("miui.focus.param", JSONObject().put("param_v2", param).toString())
-            putBundle(
-                "miui.focus.pics",
-                Bundle().apply { putParcelable(PIC, Icon.createWithResource(ctx, R.drawable.ic_notify)) },
-            )
-            putBundle("miui.focus.actions", Bundle().apply { putParcelable(STOP, button) })
+            putBundle("miui.focus.pics", Bundle().apply { putParcelable(PIC, pic) })
+            putBundle("miui.focus.actions", Bundle().apply { putParcelable(ACTION, button) })
         }
     }
 
