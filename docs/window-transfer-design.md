@@ -801,15 +801,17 @@ renderer (`NoViewRenderer`) refuses an offer with that reason.
   app's peer menu, all through the control socket's `phone_screen`. Android
   lets nothing capture the screen without a consent shown on the phone, so
   the request becomes a notification there ("Nocturne wants to show this
-  screen — Allow"). With the phone's screen on, the system's dialog also
-  opens at once, where Android lets the app start an activity from the
-  background (a CompanionDeviceManager association, or drawing over other
-  apps) — a notification alone went unseen under MIUI, which does not pop
-  one up unless the user turned that on per app. Before Android 14 one
-  consent starts any number of captures, so it is kept for the process's
-  life and a computer asking again is shown the screen with no prompt; the
-  system's recording indicator still says so. From 14 every capture needs
-  its own consent, and a kept one is refused there anyway.
+  screen — Allow · Always allow"), or a sheet in Cursio's window when that is
+  in front. With the phone's screen on and nothing to reuse, the system's
+  dialog also opens at once, where Android lets the app start an activity
+  from the background (a CompanionDeviceManager association, or drawing
+  over other apps) — a notification alone went unseen under MIUI, which
+  does not pop one up unless the user turned that on per app. Before
+  Android 14 one system consent starts any number of captures, so it is
+  kept for the process's life: "Allow" then starts the capture at once, and
+  a computer always allowed is not asked at all — the system's recording
+  indicator still says so. From 14 every capture needs the system's own
+  dialog, which an allowed request goes straight to.
 - **The phone**, from *Settings → This screen → computer*, shows it on every
   computer linked at that moment.
 

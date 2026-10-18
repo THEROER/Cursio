@@ -81,6 +81,7 @@ const activeTab = computed({
 
     <AppCommands />
     <PeerForgetDialog />
+    <ScreenAskSheet />
   </div>
 </template>
 

@@ -79,6 +79,11 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
     override fun onResume() {
         if (Prefs.wantedRunning(activity)) startFromForeground()
         darkBars?.let { applySystemBars(it) }
+        shown = this
+    }
+
+    override fun onPause() {
+        if (shown === this) shown = null
     }
 
     /** The UI's theme as last reported, re-applied when the window comes back. */
@@ -203,6 +208,23 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
             Log.w(TAG, "no screen-capture consent dialog", e)
             invoke.reject("this phone has no screen-capture consent dialog")
         }
+    }
+
+    /** The window's answer to [offerScreen]. */
+    @Command
+    fun answerScreen(invoke: Invoke) {
+        val args = invoke.getArgs()
+        val computer = args.getString("computer", "")
+        if (computer.isEmpty()) {
+            invoke.reject("no computer named")
+            return
+        }
+        if (args.getBoolean("allow", false)) {
+            ScreenConsentActivity.allowed(activity, computer, always = args.getBoolean("always", false))
+        } else {
+            Log.i(TAG, "showing this screen to $computer was declined in the window")
+        }
+        invoke.resolve()
     }
 
     @Command
@@ -466,6 +488,23 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
 
     companion object {
         private const val TAG = "Cursio"
+
+        /** The plugin of the window the user is looking at, if any. */
+        @Volatile
+        private var shown: MeshPlugin? = null
+
+        /**
+         * Ask in the open window whether [computer] may see the screen;
+         * false when no window is in front to ask in.
+         */
+        fun offerScreen(computer: String, kept: Boolean): Boolean {
+            val plugin = shown ?: return false
+            plugin.trigger(
+                "screenAsk",
+                JSObject().put("computer", computer).put("kept", kept),
+            )
+            return true
+        }
         const val NOTIFICATIONS = "notifications"
         const val MICROPHONE = "microphone"
         const val BATTERY = "battery"

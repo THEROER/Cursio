@@ -224,6 +224,25 @@ pub mod commands {
         .map_err(|e| e.to_string())
     }
 
+    /// The window's answer to a computer asking to see this screen.
+    #[tauri::command]
+    pub async fn phone_screen_answer(
+        app: AppHandle,
+        computer: String,
+        allow: bool,
+        always: bool,
+    ) -> Result<(), String> {
+        let plugin = plugin(&app)?;
+        let args = serde_json::json!({ "computer": computer, "allow": allow, "always": always });
+        tauri::async_runtime::spawn_blocking(move || {
+            plugin.run_mobile_plugin::<serde_json::Value>("answerScreen", args)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map(drop)
+        .map_err(|e| e.to_string())
+    }
+
     /// Bring the node down and up again, so its links greet peers with what
     /// changed — a new name, most often. The service does it, since the node
     /// is the service's.

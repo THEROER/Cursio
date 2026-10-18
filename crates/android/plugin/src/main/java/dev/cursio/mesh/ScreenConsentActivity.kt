@@ -21,20 +21,21 @@ import android.util.Log
  * computer, from wherever the user was when it was asked for.
  *
  * Its own invisible activity because the consent is an activity result, and a
- * computer's request arrives with no window of Cursio's open. How much of it
- * the user sees depends on what Android allows ([ask]):
- * - before Android 14 one consent may start any number of projections, so
- *   after the first "Start now" a computer asking again is simply shown the
- *   screen, until the app's process ends;
- * - from 14 each projection needs its own consent, and the system dialog
- *   opens on the phone at once when the screen is on and the app may start
- *   an activity from the background — which an app associated with a
- *   computer through CompanionDeviceManager may, as may one allowed to draw
- *   over other apps;
- * - otherwise, and always alongside, a notification whose button opens it:
- *   a request that arrived while the phone lay in a pocket is still there
- *   when it comes out, and a start Android silently refused leaves the user
- *   something to tap.
+ * computer's request arrives with no window of Cursio's open. The question
+ * is asked once, in whichever place the user is ([ask]):
+ * - Cursio's own window, when it is in front: a sheet with Allow, Decline and
+ *   "don't ask again" for that computer;
+ * - otherwise a notification with Allow and Always allow, and — with no
+ *   consent kept, the screen on, and Android letting the app start an
+ *   activity from the background (a CompanionDeviceManager association, or
+ *   drawing over other apps) — the system's dialog at once, since MIUI does
+ *   not pop a notification up unless the user turned that on per app.
+ *
+ * An answer opens this. Before Android 14 one system consent may start any
+ * number of captures, so it is kept for the process's life and an allowed
+ * request starts at once; a computer always allowed is not asked at all.
+ * From 14 every capture needs the system's own dialog, so an allowed request
+ * goes straight to it.
  */
 class ScreenConsentActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -46,6 +47,18 @@ class ScreenConsentActivity : Activity() {
             manager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
         } else {
             manager.createScreenCaptureIntent()
+        }
+        // Opened only as an answer — a tap on the notification, "Allow" in
+        // the window, or a computer always allowed — so a consent kept from
+        // earlier is used without asking the system again.
+        val computer = intent.getStringExtra(EXTRA_COMPUTER)
+        if (intent.getBooleanExtra(EXTRA_ALWAYS, false) && computer != null) trust(this, computer)
+        val keptConsent = kept
+        if (keptConsent != null && computer != null) {
+            getSystemService(NotificationManager::class.java).cancel(PROMPT_ID)
+            startKept(this, keptConsent, computer)
+            finish()
+            return
         }
         try {
             @Suppress("DEPRECATION")
@@ -105,23 +118,25 @@ class ScreenConsentActivity : Activity() {
         /** A computer asked to see this screen; see the class for what follows. */
         fun ask(context: Context, computer: String) {
             val consent = kept
-            if (consent != null) {
-                try {
-                    MeshService.startScreen(context, RESULT_OK, consent, everyone = false, reusedFor = computer)
-                    return
-                } catch (e: IllegalStateException) {
-                    Log.w(TAG, "cannot start showing the screen from the kept consent", e)
-                }
+            if (trusted(context, computer)) {
+                if (consent != null && startKept(context, consent, computer)) return
+                // Android wants its own dialog for this capture: straight to it.
+                prompt(context, computer)
+                if (mayOpenNow(context)) open(context, answer(context, computer))
+                return
             }
+            if (MeshPlugin.offerScreen(computer, kept = consent != null)) return
             prompt(context, computer)
-            if (mayOpenNow(context)) {
-                try {
-                    context.startActivity(
-                        Intent(context, ScreenConsentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                    )
-                } catch (e: RuntimeException) {
-                    Log.i(TAG, "the screen consent could not open by itself; the notification stays", e)
-                }
+            // A kept consent would start the capture with no question at all,
+            // so with one the notification is the question.
+            if (consent == null && mayOpenNow(context)) open(context, answer(context, computer))
+        }
+
+        private fun open(context: Context, intent: Intent) {
+            try {
+                context.startActivity(intent)
+            } catch (e: RuntimeException) {
+                Log.i(TAG, "the screen consent could not open by itself; the notification stays", e)
             }
         }
 
@@ -152,7 +167,13 @@ class ScreenConsentActivity : Activity() {
             val open = PendingIntent.getActivity(
                 context,
                 0,
-                Intent(context, ScreenConsentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                answer(context, computer),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            val always = PendingIntent.getActivity(
+                context,
+                1,
+                answer(context, computer, always = true),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
             val notification = Notification.Builder(context, CHANNEL_ID)
@@ -163,6 +184,7 @@ class ScreenConsentActivity : Activity() {
                 .setContentIntent(open)
                 .setAutoCancel(true)
                 .addAction(Notification.Action.Builder(null, "Allow", open).build())
+                .addAction(Notification.Action.Builder(null, "Always allow", always).build())
                 .build()
             manager.notify(PROMPT_ID, notification)
         }

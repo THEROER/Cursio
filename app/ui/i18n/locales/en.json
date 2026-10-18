@@ -553,5 +553,13 @@
     "left": "Left",
     "middle": "Middle",
     "right": "Right"
+  },
+  "screenAsk": {
+    "title": "{computer} wants to show this screen",
+    "description": "You can see and control this phone from {computer} until you stop it here or close its window there.",
+    "always": "Don't ask again for {computer}",
+    "allow": "Allow",
+    "decline": "Decline",
+    "failed": "Could not answer the request"
   }
 }
