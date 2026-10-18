@@ -2,7 +2,7 @@
 .write_test
 
 # Frontend build artefacts (app/ui is a Nuxt SPA built with bun).
-node_modules/
+node_modules
 .nuxt/
 .output/
 # `nuxt generate` mirrors .output/public here, as a symlink (so no trailing slash).
