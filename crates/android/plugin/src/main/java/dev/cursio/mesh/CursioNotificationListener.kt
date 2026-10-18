@@ -3,6 +3,7 @@ package dev.cursio.mesh
 import android.app.ActivityOptions
 import android.app.Notification
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.RemoteInput
 import android.content.ComponentName
 import android.content.Context
@@ -15,6 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.telecom.TelecomManager
 import android.util.Log
 import androidx.core.app.NotificationManagerCompat
 import java.io.ByteArrayOutputStream
@@ -46,7 +48,13 @@ class CursioNotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
-        if (!worthSending(sbn)) return
+        val skip = skipReason(sbn)
+        if (skip != null) {
+            // Package and reason only: what the notification says stays here.
+            Log.d(TAG, "skipping a notification from ${sbn.packageName}: $skip")
+            return
+        }
+        Log.i(TAG, "forwarding a notification from ${sbn.packageName}${if (isCall(sbn.notification)) " (a call)" else ""}")
         try {
             send(sbn)
         } catch (e: Exception) {
@@ -63,19 +71,74 @@ class CursioNotificationListener : NotificationListenerService() {
         }
     }
 
-    private fun worthSending(sbn: StatusBarNotification): Boolean {
+    /** Why [sbn] is not passed on, or null when it is. */
+    private fun skipReason(sbn: StatusBarNotification): String? {
         val n = sbn.notification
-        if (sbn.packageName == packageName) return false
-        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return false
-        val call = n.category == Notification.CATEGORY_CALL
-        if (sbn.isOngoing && !call) return false
+        if (sbn.packageName == packageName) return "it is Cursio's own"
+        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return "it is a group summary"
+        val call = isCall(n)
+        if (sbn.isOngoing && !call) return "it is ongoing"
         val ranking = Ranking()
         if (currentRanking.getRanking(sbn.key, ranking) &&
             ranking.importance <= NotificationManager.IMPORTANCE_LOW && !call
-        ) return false
+        ) return "it is silent"
         val extras = n.extras
-        return !extras.getCharSequence(Notification.EXTRA_TITLE).isNullOrBlank() ||
-            !extras.getCharSequence(Notification.EXTRA_TEXT).isNullOrBlank()
+        if (extras.getCharSequence(Notification.EXTRA_TITLE).isNullOrBlank() &&
+            extras.getCharSequence(Notification.EXTRA_TEXT).isNullOrBlank()
+        ) return "it has no text"
+        return null
+    }
+
+    /**
+     * Whether [n] is a call. Telegram's incoming call carries no call
+     * category, only `CallStyle` and a full-screen intent on a channel named
+     * for calls; reading the category alone sent it nowhere.
+     */
+    private fun isCall(n: Notification): Boolean {
+        if (n.category == Notification.CATEGORY_CALL) return true
+        if (n.extras.getString(Notification.EXTRA_TEMPLATE) == CALL_STYLE) return true
+        return n.fullScreenIntent != null && n.channelId?.contains("call", ignoreCase = true) == true
+    }
+
+    /**
+     * The phone's own dialer, whose calls the calls module already shows. Any
+     * other app's call is a messenger's, which only this listener sees.
+     */
+    private fun isTelephony(pkg: String): Boolean {
+        val telecom = getSystemService(TelecomManager::class.java)
+        return pkg == telecom?.defaultDialerPackage ||
+            pkg == telecom?.systemDialerPackage ||
+            pkg in IN_CALL_UIS
+    }
+
+    /**
+     * Positions among [Notification.actions] of the buttons that answer,
+     * decline and end a call, -1 for none. `CallStyle` names its buttons'
+     * intents (Android 12+), which is the only language-free way to tell them
+     * apart; an action whose intent is the same is that button.
+     */
+    private fun callRoles(n: Notification): IntArray {
+        val roles = intArrayOf(-1, -1, -1)
+        if (Build.VERSION.SDK_INT < 31) return roles
+        val extras = n.extras
+        val intents = listOf(
+            Notification.EXTRA_ANSWER_INTENT,
+            Notification.EXTRA_DECLINE_INTENT,
+            Notification.EXTRA_HANG_UP_INTENT,
+        ).map { name ->
+            if (Build.VERSION.SDK_INT >= 33) {
+                extras.getParcelable(name, PendingIntent::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                extras.getParcelable<PendingIntent>(name)
+            }
+        }
+        n.actions.orEmpty().forEachIndexed { index, action ->
+            intents.forEachIndexed { role, intent ->
+                if (intent != null && intent == action.actionIntent) roles[role] = index
+            }
+        }
+        return roles
     }
 
     private fun send(sbn: StatusBarNotification) {
@@ -85,12 +148,14 @@ class CursioNotificationListener : NotificationListenerService() {
         val text = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
             ?: extras.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
         val kind = when {
-            n.category == Notification.CATEGORY_CALL -> "call"
+            isCall(n) && isTelephony(sbn.packageName) -> "dialer_call"
+            isCall(n) -> "call"
             n.category == Notification.CATEGORY_MESSAGE ||
                 extras.containsKey(Notification.EXTRA_MESSAGES) -> "message"
             else -> "other"
         }
         val actions = n.actions.orEmpty()
+        val roles = if (kind == "call") callRoles(n) else intArrayOf(-1, -1, -1)
         CursioNative.nativeNotificationPosted(
             sbn.key,
             sbn.packageName,
@@ -102,6 +167,9 @@ class CursioNotificationListener : NotificationListenerService() {
             kind,
             actions.map { it.title?.toString().orEmpty() }.toTypedArray(),
             actions.map { a -> a.remoteInputs?.any { it.allowFreeFormInput } == true }.toBooleanArray(),
+            roles[0],
+            roles[1],
+            roles[2],
         )
     }
 
@@ -139,6 +207,20 @@ class CursioNotificationListener : NotificationListenerService() {
 
         /** Desktop notifications draw an icon at 48–64 px; twice that stays sharp. */
         private const val ICON_PX = 96
+
+        private const val CALL_STYLE = "android.app.Notification\$CallStyle"
+
+        /**
+         * In-call screens that post the telephony call's notification under
+         * their own package rather than the dialer's (Xiaomi, Samsung, AOSP).
+         */
+        private val IN_CALL_UIS = setOf(
+            "com.android.incallui",
+            "com.xiaomi.incallui",
+            "com.samsung.android.incallui",
+            "com.android.server.telecom",
+            "com.android.phone",
+        )
 
         @Volatile
         private var instance: CursioNotificationListener? = null

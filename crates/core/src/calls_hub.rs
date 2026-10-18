@@ -19,14 +19,26 @@
 //! desk speakers. That is steered once, as the call starts ([`VoicePolicy`]);
 //! a move made afterwards, here or on the phone, is the user's and stands.
 //!
+//! **A messenger's call** (WhatsApp, Telegram) is no telephony call: neither
+//! the calls module nor `+CLCC` lists it. It reaches a computer as a phone
+//! notification, which the notify module hands here
+//! ([`CallsHub::messenger_posted`]) together with which of its buttons answer,
+//! decline and end it. It is shown among the phone's calls, in the same
+//! window; acting on it presses that button on the phone. Its voice, when the
+//! phone has a hands-free link, arrives as Android's "virtual call" and is
+//! steered like any other.
+//!
 //! [`CallsEngine`]: crate::calls_session::CallsEngine
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use cursio_protocol::calls::{Call, CallId, CallsMsg};
+use cursio_protocol::calls::{Call, CallDirection, CallId, CallState, CallsMsg};
+use cursio_protocol::notify::Notification;
 use cursio_protocol::PeerId;
+
+use crate::notify_hub::{CallRoles, DisplayEvent};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -159,10 +171,60 @@ impl VoicePolicy {
     }
 }
 
+/// A messenger's call, from a phone's notification.
+struct MessengerCall {
+    /// The phone's name, which places the call with its other calls.
+    phone: String,
+    key: String,
+    /// Shown as the call's name: who, and through which app.
+    label: String,
+    id: CallId,
+    roles: CallRoles,
+    /// The notify module's way back to the phone: a button pressed here.
+    events: mpsc::UnboundedSender<DisplayEvent>,
+}
+
+impl MessengerCall {
+    /// Ringing while the phone offers a way to answer it.
+    fn ringing(&self) -> bool {
+        self.roles.answer.is_some()
+    }
+
+    fn as_call(&self) -> Call {
+        Call {
+            id: self.id,
+            direction: CallDirection::Incoming,
+            state: if self.ringing() {
+                CallState::Ringing
+            } else {
+                CallState::Active
+            },
+            number: None,
+            name: Some(self.label.clone()),
+        }
+    }
+
+    fn press(&self, button: Option<u8>) -> Result<(), String> {
+        let action = button.ok_or_else(|| format!("{} offers no button for that", self.label))?;
+        self.events
+            .send(DisplayEvent::Invoked {
+                key: self.key.clone(),
+                action,
+                reply: None,
+            })
+            .map_err(|_| format!("the link to {} just closed", self.phone))
+    }
+}
+
+/// Ids for messenger calls, apart from the phone's own (small, from `+CLCC`
+/// or the call monitor).
+const MESSENGER_IDS: CallId = 0x4000_0000;
+
 #[derive(Default)]
 struct Desk {
     mesh: HashMap<PeerId, MeshPhone>,
     hands_free: HashMap<String, HandsFreePhone>,
+    messenger: Vec<MessengerCall>,
     control: Option<Arc<dyn HandsFreeControl>>,
     on_change: Option<OnChange>,
 }
@@ -191,6 +253,31 @@ impl Desk {
                     unavailable: phone.unavailable.clone(),
                 });
             }
+        }
+        for call in &self.messenger {
+            let at = match out
+                .iter()
+                .position(|p| p.name.eq_ignore_ascii_case(&call.phone))
+            {
+                Some(at) => at,
+                None => {
+                    out.push(PhoneCalls {
+                        name: call.phone.clone(),
+                        calls: Vec::new(),
+                        audio_here: false,
+                        hands_free: false,
+                        unavailable: None,
+                    });
+                    out.len() - 1
+                }
+            };
+            let phone = &mut out[at];
+            // The hands-free link sees the same call as a "virtual call" with
+            // no number or name; the messenger's own says who it is.
+            phone
+                .calls
+                .retain(|c| c.number.is_some() || c.name.is_some());
+            phone.calls.push(call.as_call());
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
@@ -406,6 +493,114 @@ impl CallsHub {
         }
     }
 
+    /// A phone posted (or updated) a messenger's call. `events` is how a
+    /// button pressed here reaches the phone.
+    pub fn messenger_posted(
+        &self,
+        phone: &str,
+        notification: &Notification,
+        events: mpsc::UnboundedSender<DisplayEvent>,
+    ) {
+        let label = match (notification.title.trim(), notification.app_name.trim()) {
+            ("", app) => app.to_string(),
+            (who, "") => who.to_string(),
+            (who, app) => format!("{who} · {app}"),
+        };
+        {
+            let mut desk = lock(&self.desk);
+            match desk
+                .messenger
+                .iter_mut()
+                .find(|c| c.phone == phone && c.key == notification.key)
+            {
+                Some(call) => {
+                    call.label = label;
+                    call.events = events;
+                }
+                None => {
+                    let id = MESSENGER_IDS + desk.messenger.len() as CallId;
+                    desk.messenger.push(MessengerCall {
+                        phone: phone.to_string(),
+                        key: notification.key.clone(),
+                        label,
+                        id,
+                        roles: CallRoles::default(),
+                        events,
+                    });
+                }
+            }
+        }
+        self.changed();
+    }
+
+    /// Which buttons of a messenger's call answer, decline and end it.
+    pub fn messenger_buttons(&self, phone: &str, key: &str, roles: CallRoles) {
+        {
+            let mut desk = lock(&self.desk);
+            let Some(call) = desk
+                .messenger
+                .iter_mut()
+                .find(|c| c.phone == phone && c.key == key)
+            else {
+                return;
+            };
+            call.roles = roles;
+        }
+        self.changed();
+    }
+
+    /// The phone took a messenger's call notification down: the call ended,
+    /// or became something else.
+    pub fn messenger_removed(&self, phone: &str, key: &str) {
+        let removed = {
+            let mut desk = lock(&self.desk);
+            let before = desk.messenger.len();
+            desk.messenger
+                .retain(|c| !(c.phone == phone && c.key == key));
+            desk.messenger.len() != before
+        };
+        if removed {
+            self.changed();
+        }
+    }
+
+    /// Act on a messenger's call of `phone` when the action is for one: an
+    /// answer or decline while one rings and no telephony call does, an end
+    /// while one is up. `None` when the action is for a telephony call.
+    fn messenger_act(&self, phone: &str, action: &CallAction) -> Option<Result<(), String>> {
+        let desk = lock(&self.desk);
+        let theirs = || {
+            desk.messenger
+                .iter()
+                .filter(|c| c.phone.eq_ignore_ascii_case(phone))
+        };
+        let phones = desk.phones();
+        let telephony: Vec<&Call> = phones
+            .iter()
+            .filter(|p| p.name.eq_ignore_ascii_case(phone))
+            .flat_map(|p| p.calls.iter())
+            .filter(|c| c.id < MESSENGER_IDS)
+            .collect();
+        let telephony_ringing = telephony.iter().any(|c| c.state.is_incoming_offer());
+        let telephony_up = telephony.iter().any(|c| !c.state.is_incoming_offer());
+        let result = match action {
+            CallAction::Answer | CallAction::Decline if !telephony_ringing => {
+                let call = theirs().find(|c| c.ringing())?;
+                let button = match action {
+                    CallAction::Answer => call.roles.answer,
+                    _ => call.roles.decline.or(call.roles.hang_up),
+                };
+                call.press(button)
+            }
+            CallAction::HangUp if !telephony_up => {
+                let call = theirs().find(|c| !c.ringing())?;
+                call.press(call.roles.hang_up.or(call.roles.decline))
+            }
+            _ => return None,
+        };
+        Some(result)
+    }
+
     /// Every phone this computer can see calls of.
     pub fn phones(&self) -> Vec<PhoneCalls> {
         lock(&self.desk).phones()
@@ -415,6 +610,21 @@ impl CallsHub {
     /// Bluetooth name, or its peer id), by hands-free when it is reached that
     /// way and over the mesh otherwise.
     pub fn act(&self, name: &str, action: CallAction) -> Result<(), String> {
+        if let Some(result) = self.messenger_act(name, &action) {
+            if result.is_ok() && action == CallAction::Answer {
+                // Its voice arrives as a virtual call on the hands-free link,
+                // if there is one: answered here, it belongs here.
+                let mut desk = lock(&self.desk);
+                if let Some(phone) = desk
+                    .hands_free
+                    .values_mut()
+                    .find(|p| p.name.eq_ignore_ascii_case(name))
+                {
+                    phone.voice.taken_here(Instant::now());
+                }
+            }
+            return result;
+        }
         let desk = lock(&self.desk);
         let hands_free = desk
             .hands_free
@@ -726,5 +936,104 @@ mod tests {
             CallsMsg::Calls { calls: Vec::new() }
         );
         assert!(hub.reports_calls());
+    }
+
+    fn telegram_call(key: &str) -> Notification {
+        Notification {
+            key: key.into(),
+            app_id: "org.telegram.messenger".into(),
+            app_name: "Telegram".into(),
+            title: "Anaya".into(),
+            text: "Incoming call".into(),
+            icon: None,
+            when_ms: 0,
+            kind: cursio_protocol::notify::NotifyKind::Call,
+            actions: Vec::new(),
+        }
+    }
+
+    fn ringing_roles() -> CallRoles {
+        CallRoles {
+            answer: Some(1),
+            decline: Some(0),
+            hang_up: None,
+        }
+    }
+
+    #[test]
+    fn a_messengers_call_is_shown_among_the_phones_calls_by_who_and_app() {
+        let hub = CallsHub::default();
+        let (events, _rx) = mpsc::unbounded_channel();
+        hub.messenger_posted("POCO X7 Pro", &telegram_call("k"), events);
+        hub.messenger_buttons("POCO X7 Pro", "k", ringing_roles());
+        let phones = hub.phones();
+        assert_eq!(phones.len(), 1);
+        let shown = &phones[0].calls[0];
+        assert_eq!(shown.state, CallState::Ringing);
+        assert_eq!(shown.name.as_deref(), Some("Anaya · Telegram"));
+        hub.messenger_removed("POCO X7 Pro", "k");
+        assert!(hub.phones().is_empty());
+    }
+
+    #[test]
+    fn answering_a_messengers_call_presses_its_answer_button_on_the_phone() {
+        let (hub, recorder) = hands_free_hub();
+        let (events, mut rx) = mpsc::unbounded_channel();
+        hub.messenger_posted("POCO X7 Pro", &telegram_call("k"), events);
+        hub.messenger_buttons("POCO X7 Pro", "k", ringing_roles());
+        hub.act("POCO X7 Pro", CallAction::Answer).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DisplayEvent::Invoked {
+                key: "k".into(),
+                action: 1,
+                reply: None
+            }
+        );
+        assert!(asked(&recorder).is_empty(), "nothing goes to hands-free");
+        // Its voice then arrives as a virtual call, and is kept here.
+        hub.hands_free_calls(
+            PHONE,
+            vec![Call {
+                id: 1,
+                direction: CallDirection::Incoming,
+                state: CallState::Active,
+                number: None,
+                name: None,
+            }],
+        );
+        assert_eq!(asked(&recorder), [CallAction::AudioHere { here: true }]);
+    }
+
+    #[test]
+    fn the_virtual_call_of_a_messenger_is_shown_once_under_its_own_name() {
+        let (hub, _recorder) = hands_free_hub();
+        let (events, _rx) = mpsc::unbounded_channel();
+        hub.messenger_posted("POCO X7 Pro", &telegram_call("k"), events);
+        hub.hands_free_calls(
+            PHONE,
+            vec![Call {
+                id: 1,
+                direction: CallDirection::Incoming,
+                state: CallState::Active,
+                number: None,
+                name: None,
+            }],
+        );
+        let calls = &hub.phones()[0].calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name.as_deref(), Some("Anaya · Telegram"));
+    }
+
+    #[test]
+    fn a_telephony_call_ringing_takes_the_answer_rather_than_a_messengers() {
+        let (hub, recorder) = hands_free_hub();
+        let (events, mut rx) = mpsc::unbounded_channel();
+        hub.messenger_posted("POCO X7 Pro", &telegram_call("k"), events);
+        hub.messenger_buttons("POCO X7 Pro", "k", ringing_roles());
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Ringing)]);
+        hub.act("POCO X7 Pro", CallAction::Answer).unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(asked(&recorder)[0], CallAction::Answer);
     }
 }

@@ -113,8 +113,10 @@ object CursioNative {
 
     /**
      * A notification was posted on this phone; see [CursioNotificationListener].
-     * [kind] is `call`, `message` or `other`; [actionReplies] says which of
-     * [actionTitles] take text.
+     * [kind] is `dialer_call` (the phone's own), `call` (a messenger's),
+     * `message` or `other`; [actionReplies] says which of [actionTitles] take
+     * text. For a messenger's call [answer], [decline] and [hangUp] are the
+     * positions of those buttons among the titles, -1 for none.
      */
     external fun nativeNotificationPosted(
         key: String,
@@ -127,6 +129,9 @@ object CursioNative {
         kind: String,
         actionTitles: Array<String>,
         actionReplies: BooleanArray,
+        answer: Int,
+        decline: Int,
+        hangUp: Int,
     )
 
     /** A notification on this phone went away. */

@@ -189,6 +189,9 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeNotificationPoste
     kind: JString,
     action_titles: jni::objects::JObjectArray,
     action_replies: jni::objects::JBooleanArray,
+    answer: jni::sys::jint,
+    decline: jni::sys::jint,
+    hang_up: jni::sys::jint,
 ) {
     guard(&mut env, (), |env| {
         let mut read = |s: &JString| -> anyhow::Result<String> { Ok(env.get_string(s)?.into()) };
@@ -214,9 +217,22 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeNotificationPoste
             let title: String = env.get_string(&title)?.into();
             actions.push((title, replies[i as usize] != 0));
         }
-        cursio_core::notify_hub::hub().post(notify::notification(
+        let telephony = kind == "dialer_call";
+        let notification = notify::notification(
             key, app_id, app_name, title, text, icon, when_ms, &kind, actions,
-        ));
+        );
+        if notification.kind == cursio_protocol::notify::NotifyKind::Call {
+            // -1 from Kotlin is "no such button".
+            let role = |i: jni::sys::jint| u8::try_from(i).ok();
+            let roles = cursio_core::notify_hub::CallRoles {
+                answer: role(answer),
+                decline: role(decline),
+                hang_up: role(hang_up),
+            };
+            cursio_core::notify_hub::hub().post_call(notification, telephony, roles);
+        } else {
+            cursio_core::notify_hub::hub().post(notification);
+        }
         Ok(())
     })
 }

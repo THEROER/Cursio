@@ -21,16 +21,17 @@ use cursio_protocol::{Message, ModuleId, PeerId};
 use cursio_transport::{TransportError, TransportTx};
 use tokio::sync::mpsc;
 
-use cursio_protocol::notify::Notification;
+use cursio_protocol::notify::{Notification, NotifyKind};
 
 use crate::module::SessionModule;
 use crate::notify_dedup::{dedup, Decision};
-use crate::notify_hub::{hub, DisplayEvent, NotifyActor, NotifyDisplay};
+use crate::notify_hub::{hub, CallRoles, DisplayEvent, NotifyActor, NotifyDisplay};
 
 /// Version of [`NotifyMsg`]; peers run the module only on an exact match.
 /// 2 added [`NotifyMsg::Ring`]: a version-1 phone would have dropped it as
 /// undecodable, so the two never agree and the ring is refused here, by name.
-pub const VERSION: u16 = 2;
+/// 3 added [`NotifyMsg::CallButtons`], for a messenger's call.
+pub const VERSION: u16 = 3;
 
 /// How often a desktop re-reads whether the user is here. The idle time is a
 /// session-bus call, cheap but not free, and a notification that lands on the
@@ -131,7 +132,25 @@ impl NotifyEngine {
                 }
             }
             NotifyMsg::Posted(notification) => self.posted(notification),
+            NotifyMsg::CallButtons {
+                key,
+                answer,
+                decline,
+                hang_up,
+            } => {
+                if self.display.is_some() {
+                    let roles = CallRoles {
+                        answer,
+                        decline,
+                        hang_up,
+                    };
+                    crate::calls_hub::hub().messenger_buttons(&self.peer_name, &key, roles);
+                }
+            }
             NotifyMsg::Removed { key } => {
+                if self.display.is_some() {
+                    crate::calls_hub::hub().messenger_removed(&self.peer_name, &key);
+                }
                 self.held.retain(|(n, _, _)| n.key != key);
                 self.watched.retain(|(n, _, _)| n.key != key);
                 if let Some(display) = &self.display {
@@ -162,6 +181,18 @@ impl NotifyEngine {
 
     fn posted(&mut self, notification: Notification) {
         if self.display.is_none() {
+            return;
+        }
+        // A call the phone forwards as a notification is a messenger's: it is
+        // shown in the call window with the phone's other calls, not as a
+        // notification beside them.
+        if notification.kind == NotifyKind::Call {
+            tracing::debug!(peer = %self.peer_name, app = %notification.app_name, "a messenger's call");
+            crate::calls_hub::hub().messenger_posted(
+                &self.peer_name,
+                &notification,
+                self.events_tx.clone(),
+            );
             return;
         }
         // An update of one already on screen replaces it in place; whatever

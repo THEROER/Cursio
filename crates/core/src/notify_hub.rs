@@ -54,6 +54,15 @@ pub trait NotifyDisplay: Send + Sync {
     fn close(&self, peer: PeerId, key: &str);
 }
 
+/// Which buttons of a call's notification answer, decline and end it, as
+/// positions among its actions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallRoles {
+    pub answer: Option<u8>,
+    pub decline: Option<u8>,
+    pub hang_up: Option<u8>,
+}
+
 /// Acts, on the phone, on what a desktop's user did with a notification.
 pub trait NotifyActor: Send + Sync {
     fn invoke(&self, key: &str, action: u8, reply: Option<&str>);
@@ -200,15 +209,44 @@ impl NotifyHub {
     /// or to all of them when none is — or to none, while the user has this
     /// phone in hand (see [`crate::at_phone`]).
     pub fn post(&self, notification: Notification) {
-        if notification.kind == cursio_protocol::notify::NotifyKind::Call
-            && crate::calls_hub::hub().reports_calls()
-        {
-            // The calls module shows this call with buttons of its own.
+        self.send_to_present(&[NotifyMsg::Posted(notification)]);
+    }
+
+    /// Post a call. A telephony call — the dialer's own notification — is
+    /// left to the calls module when it runs, which shows it with buttons of
+    /// its own. Any other (a messenger's) goes out like a notification, with
+    /// which of its buttons answer, decline and end it, so a desktop can show
+    /// it in its call window.
+    ///
+    /// Every call used to be left to the calls module, which sees telephony
+    /// only: with it running, a WhatsApp or Telegram call reached no desktop
+    /// at all.
+    pub fn post_call(&self, notification: Notification, telephony: bool, buttons: CallRoles) {
+        if telephony && crate::calls_hub::hub().reports_calls() {
+            tracing::info!(app = %notification.app_id, "a telephony call; the calls module shows it");
             return;
         }
+        let key = notification.key.clone();
+        let mut messages = vec![NotifyMsg::Posted(notification)];
+        if buttons != CallRoles::default() {
+            messages.push(NotifyMsg::CallButtons {
+                key,
+                answer: buttons.answer,
+                decline: buttons.decline,
+                hang_up: buttons.hang_up,
+            });
+        }
+        self.send_to_present(&messages);
+    }
+
+    fn send_to_present(&self, messages: &[NotifyMsg]) {
         let links = self.lock();
         if crate::at_phone::user_at_phone(&Self::desktop_activity(&links, Instant::now())) {
-            tracing::debug!(app = %notification.app_id, "the user has the phone in hand; keeping it here");
+            let app = messages.iter().find_map(|m| match m {
+                NotifyMsg::Posted(n) => Some(n.app_id.as_str()),
+                _ => None,
+            });
+            tracing::debug!(app = ?app, "the user has the phone in hand; keeping it here");
             return;
         }
         let present: Vec<&Link> = links.values().filter(|l| l.here).collect();
@@ -217,8 +255,15 @@ impl NotifyHub {
         } else {
             present
         };
+        tracing::info!(
+            desktops = targets.len(),
+            present = links.values().filter(|l| l.here).count(),
+            "forwarding a notification"
+        );
         for link in targets {
-            let _ = link.tx.send(NotifyMsg::Posted(notification.clone()));
+            for msg in messages {
+                let _ = link.tx.send(msg.clone());
+            }
         }
     }
 
@@ -307,6 +352,32 @@ mod tests {
         assert_eq!(seen[0], None, "a desktop that never said stays unknown");
         assert!(seen[1].is_some_and(|at| at < now - Duration::from_secs(60)));
         assert_eq!(seen[2], Some(now));
+    }
+
+    #[test]
+    fn a_messengers_call_goes_out_with_the_roles_of_its_buttons() {
+        let hub = NotifyHub::default();
+        let (mut desk, _) = hub.register(PeerId::from_u128(1), "desk", false);
+        let mut call = notification("c1");
+        call.kind = NotifyKind::Call;
+        let roles = CallRoles {
+            answer: Some(1),
+            decline: Some(0),
+            hang_up: None,
+        };
+        hub.post_call(call.clone(), false, roles);
+        assert_eq!(
+            posted(&mut desk),
+            vec![
+                NotifyMsg::Posted(call),
+                NotifyMsg::CallButtons {
+                    key: "c1".into(),
+                    answer: Some(1),
+                    decline: Some(0),
+                    hang_up: None,
+                },
+            ]
+        );
     }
 
     #[test]

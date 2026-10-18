@@ -146,7 +146,35 @@ request goes by whichever route reaches the phone.
 
 While the phone reports calls itself, the dialer's own call notification no
 longer crosses through the notify module: the computer shows the call with
-buttons of its own, and two would ring twice.
+buttons of its own, and two would ring twice. Only the dialer's: the phone
+tells them apart by package (`TelecomManager`'s default and system dialer, and
+the in-call screens that post under their own name). Holding back every call
+notification held back WhatsApp's and Telegram's too, which the calls module
+cannot see, and those reached no computer at all.
+
+### A messenger's call
+
+A WhatsApp or Telegram call is no telephony call: the call monitor does not
+see it and `+CLCC` does not list it. It reaches a computer as a notification
+— recognised as a call by its category, or, as Telegram posts it, by
+`Notification.CallStyle` or a full-screen intent on a channel named for calls
+— and the phone adds `NotifyMsg::CallButtons`: which of its buttons answer,
+decline and end it. Android names those buttons' intents in `CallStyle`
+(Android 12+), which is the only way to tell them apart in any language. The
+computer shows it among the phone's calls, in the same window, as "who · app";
+answering it presses that button on the phone.
+
+Its voice, with a hands-free link up, comes as Android's **virtual call**: the
+phone raises the `call` indicator so the headset opens audio, but `+CLCC`
+lists nothing. An empty listing while the indicator says a call is up is
+therefore taken as a call without a number, and the voice is steered like any
+other — here when it was answered here, on the phone otherwise. That call is
+shown once, under the messenger's name.
+
+Only a phone is taken as a hands-free gateway: a Windows laptop plays that role
+too (for its own Phone Link) and was shown among the calls. A device whose
+Bluetooth class is not Phone is refused; one that gives no class is let
+through.
 
 ## Where it shows
 

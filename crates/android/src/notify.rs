@@ -96,7 +96,7 @@ pub fn notification(
         icon: icon.filter(|png| !png.is_empty() && png.len() <= MAX_ICON_BYTES),
         when_ms,
         kind: match kind {
-            "call" => NotifyKind::Call,
+            "call" | "dialer_call" => NotifyKind::Call,
             "message" => NotifyKind::Message,
             _ => NotifyKind::Other,
         },

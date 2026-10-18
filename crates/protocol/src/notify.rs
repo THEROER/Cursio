@@ -99,6 +99,19 @@ pub enum NotifyMsg {
     /// The phone stops by itself too, when the user answers it there or after
     /// a while — a phone that is lost may never be reached to be told.
     Ring { on: bool },
+    /// Phone -> desktop, after [`NotifyMsg::Posted`] for a call: which of its
+    /// buttons answer, decline and end it, as positions in
+    /// [`Notification::actions`]. A messenger's call (WhatsApp, Telegram) is
+    /// no telephony call the calls module could see, and its buttons are
+    /// titled in the phone's language; Android names their roles
+    /// (`Notification.CallStyle`), so the desktop can offer it in the same
+    /// call window as a phone call.
+    CallButtons {
+        key: NotificationKey,
+        answer: Option<u8>,
+        decline: Option<u8>,
+        hang_up: Option<u8>,
+    },
     /// Desktop -> phone: whether this machine has had input in the last few
     /// seconds (`active`), and how long ago the last input was when that
     /// changed. Finer than [`NotifyMsg::Presence`], which stays true for
