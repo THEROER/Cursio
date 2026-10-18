@@ -23,6 +23,10 @@ pub mod airplay_window;
 pub mod at_phone;
 #[cfg(feature = "audio")]
 pub mod audio_gate;
+/// Sound made on this machine — a call's voice, a phone's music — sent to a
+/// peer as one of its application streams.
+#[cfg(feature = "audio")]
+pub mod audio_relay;
 #[cfg(feature = "audio")]
 pub mod audio_session;
 /// Handing a paired phone's headset and speaker roles from PipeWire to Cursio.

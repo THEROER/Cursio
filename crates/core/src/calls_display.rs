@@ -229,6 +229,7 @@ mod tests {
             name: "POCO X7 Pro".into(),
             calls: Vec::new(),
             audio_here,
+            voice_on: None,
             hands_free,
             unavailable: None,
         }

@@ -90,6 +90,46 @@ pub struct Config {
     pub input: InputConfig,
     pub files: FilesConfig,
     pub update: UpdateConfig,
+    pub calls: CallsConfig,
+}
+
+/// Where a phone's call voice goes once this computer carries it. Read at
+/// every call, so a change needs no restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CallsConfig {
+    /// Answering or dialling from this computer brings the voice here, as on
+    /// Phone Link. Off, the voice stays wherever the phone puts it.
+    pub answer_moves_voice: bool,
+    /// Where the voice plays while this computer carries it.
+    pub voice: CallVoice,
+    /// The output the voice plays on here, by name; the default output when
+    /// unset.
+    pub output: Option<String>,
+    /// The microphone the call hears here, by name; the default when unset.
+    pub input: Option<String>,
+}
+
+impl Default for CallsConfig {
+    fn default() -> Self {
+        Self {
+            answer_moves_voice: true,
+            voice: CallVoice::Follow,
+            output: None,
+            input: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallVoice {
+    /// Always on this computer's own output and microphone.
+    Here,
+    /// On the machine the user is at: this one, or the peer this machine's
+    /// mouse is driving.
+    #[default]
+    Follow,
 }
 
 /// How this machine takes new builds that reach it over the mesh. Read again
@@ -214,6 +254,7 @@ impl Default for Config {
             input: InputConfig::default(),
             files: FilesConfig::default(),
             update: UpdateConfig::default(),
+            calls: CallsConfig::default(),
         }
     }
 }

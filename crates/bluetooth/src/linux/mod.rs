@@ -11,11 +11,13 @@
 //! blocking file descriptors read under `poll`.
 
 mod channel;
+mod devices;
 mod media;
 mod sbc;
 mod sco;
 
 pub use channel::MeshChannel;
+pub use devices::paired_phones;
 pub use media::MediaSinkService;
 
 use std::collections::HashMap;

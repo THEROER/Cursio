@@ -42,10 +42,24 @@ pub mod resample;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{HandsFreeService, MediaSinkService, MeshChannel};
+pub use linux::{paired_phones, HandsFreeService, MediaSinkService, MeshChannel};
 
 /// The Bluetooth address of a remote device, as BlueZ prints it.
 pub type Address = String;
+
+/// A phone paired with this computer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedDevice {
+    /// What BlueZ calls it (its alias).
+    pub name: String,
+    pub address: Address,
+    pub connected: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn paired_phones() -> Result<Vec<PairedDevice>, BluetoothError> {
+    Err(BluetoothError::Unsupported)
+}
 
 /// The service a phone opens to reach the mesh over Bluetooth. Fixed, and the
 /// same in the Android app (`BtLink.kt`): it is how the phone finds this

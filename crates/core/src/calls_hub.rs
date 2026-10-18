@@ -28,6 +28,18 @@
 //! phone has a hands-free link, arrives as Android's "virtual call" and is
 //! steered like any other.
 //!
+//! "Taken here" includes a peer this computer's mouse drives: answered in the
+//! call window on the screen beside it, the call reaches the phone over the
+//! mesh and this computer only sees it go up. So a call that goes up while
+//! the user's hand was on this desk just now ([`crate::presence::at_desk`])
+//! counts as taken here too; one picked up with the desk untouched was taken
+//! on the phone.
+//!
+//! **Which machine plays it** is the call audio's business
+//! (`call_audio.rs`): this computer or the one the user is at. A computer
+//! playing a voice relayed to it learns of it from its audio module
+//! ([`CallsHub::relayed_voice`]) and shows the call with the voice here.
+//!
 //! [`CallsEngine`]: crate::calls_session::CallsEngine
 
 use std::collections::HashMap;
@@ -41,6 +53,8 @@ use cursio_protocol::PeerId;
 use crate::notify_hub::{CallRoles, DisplayEvent};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+use crate::config::CallsConfig;
 
 /// What a computer's user asked of a phone's calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,10 +99,58 @@ pub struct PhoneCalls {
     pub calls: Vec<Call>,
     /// The voice of the call that is up is playing on this computer.
     pub audio_here: bool,
+    /// The machine the voice plays on when this computer carries it but sends
+    /// it on to the one the user is at. `None` with `audio_here` is this one.
+    #[serde(default)]
+    pub voice_on: Option<String>,
     /// Reached over Bluetooth hands-free, so the voice can come here.
     pub hands_free: bool,
     /// Why this phone cannot report calls, when it said.
     pub unavailable: Option<String>,
+}
+
+/// This computer as a phone's Bluetooth headset and speaker, for the
+/// settings: whether it can be, and with what.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallSetup {
+    /// PipeWire has left the phone roles to Cursio (`cursio bluetooth
+    /// install`); without it neither service can register.
+    pub roles_taken: bool,
+    /// The hands-free unit: calls' voice through this computer.
+    pub hands_free: ServiceState,
+    /// The A2DP sink: the phone's sound through this computer.
+    pub speaker: ServiceState,
+    /// Phones paired with this computer over Bluetooth.
+    pub phones: Vec<PairedPhone>,
+    /// What a call can play on and record from here.
+    pub outputs: Vec<AudioDevice>,
+    pub inputs: Vec<AudioDevice>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ServiceState {
+    #[default]
+    Starting,
+    Running,
+    Failed {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedPhone {
+    pub name: String,
+    pub address: String,
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioDevice {
+    /// What `[calls] output`/`input` holds to pick it.
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Default)]
@@ -112,6 +174,7 @@ struct HandsFreePhone {
     name: String,
     calls: Vec<Call>,
     audio_here: bool,
+    voice_on: Option<String>,
     voice: VoicePolicy,
 }
 
@@ -146,16 +209,28 @@ impl VoicePolicy {
     }
 
     /// The phone's calls changed. A call that is up, or being placed, without
-    /// having been taken here was taken on the phone, and its voice stays
-    /// there; with no call left everything starts over.
-    fn calls(&mut self, calls: &[Call], now: Instant) {
+    /// having been taken here was taken at this desk if the user's hand was
+    /// on it just then (`at_desk`, asked only at that moment), and on the
+    /// phone otherwise, where its voice stays; with no call left everything
+    /// starts over. Not `steering`, nothing is put anywhere.
+    fn calls(
+        &mut self,
+        calls: &[Call],
+        now: Instant,
+        steering: bool,
+        at_desk: impl FnOnce() -> bool,
+    ) {
         if calls.is_empty() {
             *self = VoicePolicy::default();
             return;
         }
         let started = calls.iter().any(|c| !c.state.is_incoming_offer());
         if started && self.steer.is_none() {
-            self.steer = Some((false, now + STEER_FOR));
+            if steering {
+                self.steer = Some((at_desk(), now + STEER_FOR));
+            } else {
+                self.moved_by_user();
+            }
         }
     }
 
@@ -227,6 +302,9 @@ struct Desk {
     messenger: Vec<MessengerCall>,
     control: Option<Arc<dyn HandsFreeControl>>,
     on_change: Option<OnChange>,
+    /// Phones whose call voice a peer relays to play here: the phone's name
+    /// as that peer knows it, and the peers relaying it.
+    relayed: Vec<(String, String)>,
 }
 
 impl Desk {
@@ -239,16 +317,25 @@ impl Desk {
                 name: p.name.clone(),
                 calls: p.calls.clone(),
                 audio_here: p.audio_here,
+                voice_on: p.voice_on.clone(),
                 hands_free: true,
                 unavailable: None,
             })
             .collect();
         for phone in self.mesh.values() {
             if self.hands_free_of(phone).is_none() {
+                let names = [Some(&phone.name), phone.bluetooth_name.as_ref()];
+                let relayed_here = self.relayed.iter().any(|(relayed, _)| {
+                    names
+                        .iter()
+                        .flatten()
+                        .any(|n| n.eq_ignore_ascii_case(relayed))
+                });
                 out.push(PhoneCalls {
                     name: phone.name.clone(),
                     calls: phone.calls.clone(),
-                    audio_here: false,
+                    audio_here: relayed_here && !phone.calls.is_empty(),
+                    voice_on: None,
                     hands_free: false,
                     unavailable: phone.unavailable.clone(),
                 });
@@ -265,6 +352,7 @@ impl Desk {
                         name: call.phone.clone(),
                         calls: Vec::new(),
                         audio_here: false,
+                        voice_on: None,
                         hands_free: false,
                         unavailable: None,
                     });
@@ -299,6 +387,20 @@ impl Desk {
 pub struct CallsHub {
     phone: Mutex<PhoneSide>,
     desk: Mutex<Desk>,
+    settings: Mutex<CallsConfig>,
+    /// `None` where this build carries no Bluetooth calls at all.
+    setup: Mutex<Option<CallSetup>>,
+    at_desk: DeskProbe,
+}
+
+/// Whether the user's hand was on this desk just now; a fake in tests, where
+/// the real answer is whatever the developer's own keyboard says.
+struct DeskProbe(fn() -> bool);
+
+impl Default for DeskProbe {
+    fn default() -> Self {
+        DeskProbe(crate::presence::at_desk)
+    }
 }
 
 /// The process's one hub.
@@ -363,6 +465,61 @@ impl CallsHub {
     }
 
     // ---- computer side ----
+
+    /// Take the user's `[calls]` settings, at start and whenever they change.
+    pub fn configure(&self, settings: CallsConfig) {
+        *lock(&self.settings) = settings;
+    }
+
+    pub fn settings(&self) -> CallsConfig {
+        lock(&self.settings).clone()
+    }
+
+    pub fn set_setup(&self, setup: CallSetup) {
+        *lock(&self.setup) = Some(setup);
+    }
+
+    pub fn setup(&self) -> Option<CallSetup> {
+        lock(&self.setup).clone()
+    }
+
+    /// What BlueZ calls the phone at `address`, while its hands-free link is
+    /// up.
+    pub fn hands_free_name(&self, address: &str) -> Option<String> {
+        lock(&self.desk)
+            .hands_free
+            .get(address)
+            .map(|p| p.name.clone())
+    }
+
+    /// A peer (`from`) started or stopped playing `phone`'s call voice here.
+    pub fn relayed_voice(&self, from: &str, phone: &str, on: bool) {
+        {
+            let mut desk = lock(&self.desk);
+            desk.relayed
+                .retain(|(p, f)| !(p.eq_ignore_ascii_case(phone) && f == from));
+            if on {
+                desk.relayed.push((phone.to_string(), from.to_string()));
+            }
+        }
+        self.changed();
+    }
+
+    /// Where this computer sends the voice of a hands-free phone's call:
+    /// `Some(machine)` when it plays on another one, `None` when here.
+    pub fn voice_sent_to(&self, address: &str, machine: Option<String>) {
+        let changed = lock(&self.desk)
+            .hands_free
+            .get_mut(address)
+            .is_some_and(|phone| {
+                let changed = phone.voice_on != machine;
+                phone.voice_on = machine;
+                changed
+            });
+        if changed {
+            self.changed();
+        }
+    }
 
     /// Show phones' calls somewhere (the notification server) as they change.
     pub fn on_change(&self, f: OnChange) {
@@ -458,10 +615,11 @@ impl CallsHub {
 
     pub fn hands_free_calls(&self, address: &str, calls: Vec<Call>) {
         let now = Instant::now();
+        let steering = self.settings().answer_moves_voice;
         let steer = {
             let mut desk = lock(&self.desk);
             desk.hands_free.get_mut(address).and_then(|phone| {
-                phone.voice.calls(&calls, now);
+                phone.voice.calls(&calls, now, steering, self.at_desk.0);
                 phone.calls = calls;
                 phone.voice.correction(phone.audio_here, now)
             })
@@ -640,11 +798,15 @@ impl CallsHub {
         if let (Some(address), Some(control)) = (hands_free, desk.control.clone()) {
             drop(desk);
             let now = Instant::now();
+            let steering = self.settings().answer_moves_voice;
             {
                 let mut desk = lock(&self.desk);
                 if let Some(phone) = desk.hands_free.get_mut(&address) {
                     match action {
-                        CallAction::Answer | CallAction::Dial { .. } => phone.voice.taken_here(now),
+                        CallAction::Answer | CallAction::Dial { .. } if steering => {
+                            phone.voice.taken_here(now)
+                        }
+                        CallAction::Answer | CallAction::Dial { .. } => phone.voice.moved_by_user(),
                         CallAction::AudioHere { .. } => phone.voice.moved_by_user(),
                         _ => {}
                     }
@@ -809,7 +971,10 @@ mod tests {
     const PHONE: &str = "9C:9E:D5:78:FE:C4";
 
     fn hands_free_hub() -> (CallsHub, Arc<Recorder>) {
-        let hub = CallsHub::default();
+        let hub = CallsHub {
+            at_desk: DeskProbe(|| false),
+            ..CallsHub::default()
+        };
         let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
         hub.set_hands_free_control(recorder.clone());
         hub.hands_free_connected(PHONE, "POCO X7 Pro");
@@ -888,10 +1053,10 @@ mod tests {
     fn the_voice_is_left_alone_once_the_call_has_settled() {
         let mut policy = VoicePolicy::default();
         let start = Instant::now();
-        policy.calls(&[call(1, CallState::Active)], start);
+        policy.calls(&[call(1, CallState::Active)], start, true, || false);
         assert_eq!(policy.correction(true, start), Some(false));
         let mut later = VoicePolicy::default();
-        later.calls(&[call(1, CallState::Active)], start);
+        later.calls(&[call(1, CallState::Active)], start, true, || false);
         assert_eq!(later.correction(true, start + STEER_FOR), None);
     }
 
@@ -900,9 +1065,66 @@ mod tests {
         let mut policy = VoicePolicy::default();
         let now = Instant::now();
         policy.taken_here(now);
-        policy.calls(&[], now);
-        policy.calls(&[call(2, CallState::Active)], now);
+        policy.calls(&[], now, true, || false);
+        policy.calls(&[call(2, CallState::Active)], now, true, || false);
         assert_eq!(policy.correction(true, now), Some(false));
+    }
+
+    #[test]
+    fn a_call_answered_on_the_screen_this_desk_drives_brings_the_voice_here() {
+        let hub = CallsHub {
+            at_desk: DeskProbe(|| true),
+            ..CallsHub::default()
+        };
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        hub.set_hands_free_control(recorder.clone());
+        hub.hands_free_connected(PHONE, "POCO X7 Pro");
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Ringing)]);
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Active)]);
+        assert_eq!(asked(&recorder), [CallAction::AudioHere { here: true }]);
+    }
+
+    #[test]
+    fn with_answering_left_to_the_phone_nothing_moves_the_voice() {
+        let (hub, recorder) = hands_free_hub();
+        hub.configure(CallsConfig {
+            answer_moves_voice: false,
+            ..CallsConfig::default()
+        });
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Ringing)]);
+        hub.act("POCO X7 Pro", CallAction::Answer).unwrap();
+        hub.hands_free_calls(PHONE, vec![call(1, CallState::Active)]);
+        hub.hands_free_audio(PHONE, false);
+        assert_eq!(asked(&recorder), [CallAction::Answer]);
+    }
+
+    #[test]
+    fn a_voice_relayed_here_shows_on_the_phone_it_belongs_to() {
+        let hub = CallsHub::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let peer = PeerId::from_u128(1);
+        hub.register_mesh_phone(peer, "POCO X7 Pro".into(), tx);
+        hub.from_mesh_phone(
+            &peer,
+            CallsMsg::Calls {
+                calls: vec![call(1, CallState::Active)],
+            },
+        );
+        assert!(!hub.phones()[0].audio_here);
+        hub.relayed_voice("Nocturne", "poco x7 pro", true);
+        assert!(hub.phones()[0].audio_here);
+        hub.relayed_voice("Nocturne", "POCO X7 Pro", false);
+        assert!(!hub.phones()[0].audio_here);
+    }
+
+    #[test]
+    fn the_machine_a_voice_is_sent_to_is_shown() {
+        let (hub, _) = hands_free_hub();
+        hub.hands_free_audio(PHONE, true);
+        hub.voice_sent_to(PHONE, Some("Lightmoon".into()));
+        let phone = &hub.phones()[0];
+        assert!(phone.audio_here);
+        assert_eq!(phone.voice_on.as_deref(), Some("Lightmoon"));
     }
 
     #[test]

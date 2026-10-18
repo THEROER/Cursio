@@ -218,6 +218,8 @@ pub struct Plan {
     pub mac_modifiers: Option<String>,
     /// Read by a running audio module on every pump, so it needs no restart.
     pub mic_gate: Option<Option<String>>,
+    /// Read at every call, so it needs no restart either.
+    pub calls: Option<crate::config::CallsConfig>,
 }
 
 /// What applying `next` over `running` takes.
@@ -251,6 +253,9 @@ pub fn plan(running: &Config, next: &Config) -> Plan {
     }
     if running.audio.mic_gate != next.audio.mic_gate {
         plan.mic_gate = Some(next.audio.mic_gate.clone());
+    }
+    if running.calls != next.calls {
+        plan.calls = Some(next.calls.clone());
     }
     plan
 }
@@ -329,6 +334,17 @@ mod tests {
         let plan = plan(&running, &next);
         assert!(plan.restart.is_empty());
         assert_eq!(plan.mic_gate, Some(Some("-55".into())));
+        assert!(restart_needed(&running, &next).is_empty());
+    }
+
+    #[test]
+    fn call_settings_change_without_restarting_anything() {
+        let running = Config::default();
+        let mut next = running.clone();
+        next.calls.voice = crate::config::CallVoice::Here;
+        let plan = plan(&running, &next);
+        assert!(plan.restart.is_empty() && plan.switches.is_empty());
+        assert_eq!(plan.calls, Some(next.calls.clone()));
         assert!(restart_needed(&running, &next).is_empty());
     }
 

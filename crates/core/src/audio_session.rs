@@ -382,6 +382,55 @@ pub struct AudioEngine {
     /// chunk. See [`AudioEngine::pump`].
     recv_seq: HashMap<u32, u32>,
     last_ack_sent: HashMap<u32, std::time::Instant>,
+    /// The peer, for sound made here to reach it ([`crate::audio_relay`]).
+    /// `None` only in tests that build an engine without a link.
+    peer: Option<PeerId>,
+    /// Marks this link as one sound can be relayed over while it runs.
+    _relay_mark: Option<crate::audio_relay::LinkMark>,
+    /// Sound handed over in-process, sent to the peer as application streams.
+    relays: HashMap<
+        u32,
+        (
+            std::sync::Arc<crate::audio_relay::Relay>,
+            tokio::sync::mpsc::UnboundedReceiver<cursio_protocol::AudioChunk>,
+        ),
+    >,
+    /// The first microphone the peer offered: what a relay that wants a
+    /// microphone hears.
+    peer_mic: Option<u32>,
+    /// Streams from the peer carrying a phone call's voice, by the phone's
+    /// name, so this machine's calls show where the voice is.
+    inbound_calls: InboundCalls,
+}
+
+/// The peer's relayed call voices playing here, withdrawn from the calls hub
+/// when the stream or the whole link goes.
+#[derive(Default)]
+struct InboundCalls {
+    peer_name: String,
+    streams: HashMap<u32, String>,
+}
+
+impl InboundCalls {
+    fn open(&mut self, id: u32, phone: &str) {
+        crate::calls_hub::hub().relayed_voice(&self.peer_name, phone, true);
+        self.streams.insert(id, phone.to_string());
+    }
+
+    fn close(&mut self, id: u32) {
+        if let Some(phone) = self.streams.remove(&id) {
+            crate::calls_hub::hub().relayed_voice(&self.peer_name, &phone, false);
+        }
+    }
+}
+
+impl Drop for InboundCalls {
+    fn drop(&mut self) {
+        let ids: Vec<u32> = self.streams.keys().copied().collect();
+        for id in ids {
+            self.close(id);
+        }
+    }
 }
 
 /// Host-side group gain/mute for one Route (all streams funnelled into one target
@@ -422,6 +471,7 @@ impl AudioEngine {
         peer_name: String,
     ) -> Self {
         let id_base = id_base_for(local_id);
+        let peer_name_for_calls = peer_name.clone();
         let (tap_ready_tx, tap_ready_rx) = tokio::sync::mpsc::unbounded_channel();
         let (intent_sink_ready_tx, intent_sink_ready_rx) = tokio::sync::mpsc::unbounded_channel();
         let (playback_ready_tx, playback_ready_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -493,7 +543,22 @@ impl AudioEngine {
             last_adapt: HashMap::new(),
             recv_seq: HashMap::new(),
             last_ack_sent: HashMap::new(),
+            peer: None,
+            _relay_mark: None,
+            relays: HashMap::new(),
+            peer_mic: None,
+            inbound_calls: InboundCalls {
+                peer_name: peer_name_for_calls,
+                streams: HashMap::new(),
+            },
         }
+    }
+
+    /// Take sound made on this machine for `peer` ([`crate::audio_relay`]).
+    pub fn relaying_to(mut self, peer: PeerId) -> Self {
+        self._relay_mark = Some(crate::audio_relay::LinkMark::new(peer, &self.peer_name));
+        self.peer = Some(peer);
+        self
     }
 }
 
@@ -657,6 +722,7 @@ impl SessionModule for AudioEngine {
         // into a peer device's Intent Sink get tapped and shipped, tagged to render
         // into that device; apps that left are torn down after a grace period.
         self.pump_intent_sinks(tx).await?;
+        self.pump_relays(tx).await?;
 
         // Tell the owner which of its streams anything here is actually playing,
         // so it can stay quiet on the rest. See `AudioMsg::StreamDemand`.
@@ -677,7 +743,7 @@ impl SessionModule for AudioEngine {
         // At least one each, so a stream is never handed a share of zero and
         // silenced outright by arithmetic; the whole-pump ceiling still bounds
         // how long this blocks the session loop.
-        let live_streams = self.routed_apps.len() + self.mic_captures.len();
+        let live_streams = self.routed_apps.len() + self.mic_captures.len() + self.relays.len();
         let share = (MAX_CHUNKS_PER_PUMP / live_streams.max(1)).max(1);
 
         // `routed_apps` holds `(stream_id, Capture)` — the per-app Remote Streams
@@ -687,12 +753,16 @@ impl SessionModule for AudioEngine {
         let routed = self
             .routed_apps
             .iter_mut()
-            .map(|(_, (sid, cap))| (&*sid, cap, GateKind::Program));
+            .map(|(_, (sid, cap))| (&*sid, cap.chunks(), GateKind::Program));
         let mics = self
             .mic_captures
             .iter_mut()
-            .map(|(id, cap)| (id, cap, mic_kind));
-        for (id, cap, gate_kind) in routed.chain(mics) {
+            .map(|(id, cap)| (id, cap.chunks(), mic_kind));
+        let relays = self
+            .relays
+            .iter_mut()
+            .map(|(id, (_, pcm))| (id, pcm, GateKind::Program));
+        for (id, chunks, gate_kind) in routed.chain(mics).chain(relays) {
             // Stop as soon as the budget is gone, leaving the rest queued for
             // the next pump rather than discarding it. Dropping audible chunks
             // to stay under budget is itself heard as broken audio — the budget
@@ -716,7 +786,7 @@ impl SessionModule for AudioEngine {
                 if let Some(pending) = self.pending_packets.remove(id) {
                     self.unwanted_dropped += pending.len() as u64;
                 }
-                let drained = drain_stale(cap.chunks(), 0);
+                let drained = drain_stale(chunks, 0);
                 if drained > 0 {
                     self.unwanted_dropped += drained as u64;
                 }
@@ -734,7 +804,7 @@ impl SessionModule for AudioEngine {
             //
             // Same trade as the playback jitter buffer: for live audio freshness
             // beats completeness, so keep the newest and drop what is behind.
-            let dropped = drain_stale(cap.chunks(), MAX_CHUNK_BACKLOG);
+            let dropped = drain_stale(chunks, MAX_CHUNK_BACKLOG);
             if dropped > 0 {
                 self.stale_dropped += dropped as u64;
             }
@@ -751,7 +821,7 @@ impl SessionModule for AudioEngine {
                     continue;
                 }
 
-                let Ok(chunk) = cap.chunks().try_recv() else {
+                let Ok(chunk) = chunks.try_recv() else {
                     break;
                 };
                 // A virtual sink produces chunks continuously whether or not
@@ -825,7 +895,7 @@ impl SessionModule for AudioEngine {
                     .pending_packets
                     .get(id)
                     .is_some_and(|packets| !packets.is_empty())
-                    || !cap.chunks().is_empty())
+                    || !chunks.is_empty())
             {
                 self.over_budget += 1;
             }
@@ -952,6 +1022,10 @@ impl SessionModule for AudioEngine {
                 self.demand_sent.remove(&id);
                 self.unwanted_streams.remove(&id);
                 self.last_ack_sent.remove(&id);
+                self.inbound_calls.close(id);
+                if self.peer_mic == Some(id) {
+                    self.peer_mic = None;
+                }
                 true
             }
         }
@@ -1493,6 +1567,50 @@ impl AudioEngine {
     /// Shared by the orphan sweep above and [`Self::reap_idle_tunnels`], which
     /// differ only in *why* the stream is finished, not in what has to be
     /// cleaned up.
+    /// Offer the peer every relay made for it since the last pump, and close
+    /// the streams of relays whose producer let go.
+    async fn pump_relays(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
+        let Some(peer) = self.peer else {
+            return Ok(());
+        };
+        for (relay, pcm) in crate::audio_relay::unclaimed(peer) {
+            let id = self.id_base + 500 + self.next_app_slot;
+            self.next_app_slot += 1;
+            tracing::info!(id, label = %relay.label, "sending sound made here to the peer");
+            let meta = cursio_protocol::AudioStreamMeta {
+                id,
+                role: cursio_protocol::StreamRole::Playback,
+                app_name: Some(relay.label.clone()),
+                device: None,
+                format: cursio_protocol::AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    sample_kind: cursio_protocol::SampleKind::F32,
+                },
+                codec: cursio_protocol::AudioCodec::Opus,
+            };
+            send_control(tx, AudioMsg::StreamAdvertise(meta)).await?;
+            self.relays.insert(id, (relay, pcm));
+        }
+        let ended: Vec<u32> = self
+            .relays
+            .iter()
+            .filter(|(_, (relay, _))| relay.closed())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ended {
+            self.relays.remove(&id);
+            self.close_app_stream(tx, id, "its producer stopped")
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether a relay is listening to the peer's microphone.
+    fn relay_wants_mic(&self) -> bool {
+        self.relays.values().any(|(relay, _)| relay.wants_mic)
+    }
+
     async fn close_app_stream(
         &mut self,
         tx: &mut dyn TransportTx,
@@ -1564,6 +1682,9 @@ impl AudioEngine {
 
         let peer_name = &self.peer_name;
         if let Some(app) = &meta.app_name {
+            if let Some(phone) = crate::audio_relay::call_of(app) {
+                self.inbound_calls.open(meta.id, phone);
+            }
             let label = format!("Cursio({peer_name}): {app}");
             // A per-app stream may carry a target device: the peer routed this app
             // into one of OUR devices (via its Intent Sink), so we must render it
@@ -1621,6 +1742,9 @@ impl AudioEngine {
             let label = format!("Cursio({peer_name}): {desc}");
             let id = meta.id;
             tracing::info!(id, %label, "peer advertised a microphone");
+            if self.peer_mic.is_none() {
+                self.peer_mic = Some(id);
+            }
             // Published on a worker for the same reason as an Intent Sink: this
             // waits for a PipeWire node, and a peer offering several microphones
             // would otherwise stall the loop once per microphone.
@@ -1867,6 +1991,7 @@ impl AudioEngine {
     /// it every pump (~100/s per stream) would flood the shared channel that
     /// input rides on to say nothing new.
     async fn pump_demand(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
+        let relay_hears = self.peer_mic.filter(|_| self.relay_wants_mic());
         let changed: Vec<(u32, bool)> = self
             .peer_streams
             .iter()
@@ -1887,7 +2012,11 @@ impl AudioEngine {
                 // Silence is the right answer for the third: the owner keeps
                 // sending, the playback opens, and the pump after that reports
                 // the truth.
+                //
+                // The microphone a relay hears is wanted whatever records
+                // from its mirror here: the relay is its listener.
                 let listening = match self.playbacks.get(&id) {
+                    _ if relay_hears == Some(id) => true,
                     Some(p) => p.is_listening(),
                     None if self.failed_playbacks.contains(&id) => false,
                     None => return None,
@@ -2268,6 +2397,42 @@ impl AudioEngine {
     }
 
     /// Audio for one of our streams: render it into the matching real device.
+    /// Decompress one chunk of a stream. One decoder per stream, mirroring the
+    /// encoders — Opus carries state between frames.
+    fn decode(&mut self, id: u32, data: &[u8]) -> Option<Vec<u8>> {
+        let decoder = match self.decoders.entry(id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                match cursio_audio::codec::OpusDecoder::new() {
+                    Ok(d) => e.insert(d),
+                    Err(err) => {
+                        tracing::warn!(error = %err, id, "no decoder for stream");
+                        return None;
+                    }
+                }
+            }
+        };
+        match decoder.decode(data) {
+            Ok(p) => Some(p),
+            Err(err) => {
+                tracing::warn!(error = %err, id, "opus decode failed");
+                None
+            }
+        }
+    }
+
+    /// Hand the peer's microphone to every relay listening to it.
+    fn tee_mic(&self, chunk: &cursio_protocol::AudioChunk, pcm: &[u8]) {
+        for (relay, _) in self.relays.values().filter(|(r, _)| r.wants_mic) {
+            let _ = relay.mic.send(cursio_protocol::AudioChunk {
+                id: chunk.id,
+                seq: chunk.seq,
+                timestamp: chunk.timestamp,
+                data: pcm.to_vec(),
+            });
+        }
+    }
+
     fn on_chunk(&mut self, chunk: &cursio_protocol::AudioChunk) {
         let id = chunk.id;
 
@@ -2318,6 +2483,16 @@ impl AudioEngine {
         // advertised under. Every app then rendered under whichever name did
         // survive — one mixer row on the peer, carrying every application's
         // audio at once.
+        // The microphone a relay hears reaches it whether or not its mirror
+        // here is up: nothing local may be recording from it at all.
+        let tee = self.peer_mic == Some(id) && self.relay_wants_mic();
+        if tee && !self.playbacks.contains_key(&id) {
+            if let Some(pcm) = self.decode(id, &chunk.data) {
+                self.tee_mic(chunk, &pcm);
+            }
+            return;
+        }
+
         if self.opening_playbacks.contains(&id) {
             return;
         }
@@ -2364,27 +2539,12 @@ impl AudioEngine {
             // grow without bound.
             return;
         }
-        // Decompress before playback. One decoder per stream, mirroring the
-        // encoders — Opus carries state between frames.
-        let decoder = match self.decoders.entry(id) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                match cursio_audio::codec::OpusDecoder::new() {
-                    Ok(d) => e.insert(d),
-                    Err(err) => {
-                        tracing::warn!(error = %err, id, "no decoder for stream");
-                        return;
-                    }
-                }
-            }
+        let Some(pcm) = self.decode(id, &chunk.data) else {
+            return;
         };
-        let pcm = match decoder.decode(&chunk.data) {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::warn!(error = %err, id, "opus decode failed");
-                return;
-            }
-        };
+        if tee {
+            self.tee_mic(chunk, &pcm);
+        }
         let chunk = &cursio_protocol::AudioChunk {
             id,
             seq: chunk.seq,
@@ -2570,13 +2730,16 @@ impl crate::module::ModuleFactory for AudioFactory {
     }
 
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
-        Ok(Box::new(AudioEngine::new(
-            ctx.local.peer_id,
-            self.render_device.get(),
-            self.mic_gate.clone(),
-            self.mixer.clone(),
-            ctx.peer_name().to_string(),
-        )))
+        Ok(Box::new(
+            AudioEngine::new(
+                ctx.local.peer_id,
+                self.render_device.get(),
+                self.mic_gate.clone(),
+                self.mixer.clone(),
+                ctx.peer_name().to_string(),
+            )
+            .relaying_to(ctx.peer.peer_id),
+        ))
     }
 }
 
@@ -3215,6 +3378,81 @@ mod tests {
             again.demands().is_empty(),
             "an unchanged demand must not be resent"
         );
+    }
+
+    fn advertised(tx: &RecordingTx) -> Vec<cursio_protocol::AudioStreamMeta> {
+        tx.sent
+            .iter()
+            .filter_map(|m| match m.decode_module::<AudioMsg>(ModuleId::AUDIO) {
+                Ok(Some(AudioMsg::StreamAdvertise(meta))) => Some(meta),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn closed(tx: &RecordingTx) -> Vec<u32> {
+        tx.sent
+            .iter()
+            .filter_map(|m| match m.decode_module::<AudioMsg>(ModuleId::AUDIO) {
+                Ok(Some(AudioMsg::StreamClose { id, .. })) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sound_relayed_to_the_peer_goes_as_an_app_stream_and_ends_with_its_producer() {
+        let peer = PeerId::new_v4();
+        let mut e = engine().relaying_to(peer);
+        let relay = crate::audio_relay::open(peer, "Call · POCO X7 Pro", true);
+        let mut tx = RecordingTx::default();
+        e.pump_relays(&mut tx).await.unwrap();
+        let ads = advertised(&tx);
+        assert_eq!(ads.len(), 1);
+        assert_eq!(ads[0].app_name.as_deref(), Some("Call · POCO X7 Pro"));
+        assert!(ads[0].device.is_none());
+
+        drop(relay);
+        let mut tx = RecordingTx::default();
+        e.pump_relays(&mut tx).await.unwrap();
+        assert_eq!(closed(&tx), vec![ads[0].id]);
+    }
+
+    #[tokio::test]
+    async fn the_peers_microphone_stays_wanted_while_a_relay_hears_it() {
+        let peer = PeerId::new_v4();
+        let mut e = engine().relaying_to(peer);
+        e.peer_streams.insert(476800);
+        e.peer_mic = Some(476800);
+        e.failed_playbacks.insert(476800);
+        let _relay = crate::audio_relay::open(peer, "Call · POCO X7 Pro", true);
+        let mut tx = RecordingTx::default();
+        e.pump_relays(&mut tx).await.unwrap();
+        e.pump_demand(&mut tx).await.unwrap();
+        assert_eq!(tx.demands(), vec![(476800, true)]);
+    }
+
+    #[test]
+    fn a_call_voice_relayed_here_is_shown_on_its_phone_until_it_closes() {
+        let mut e = engine();
+        e.on_advertise(&cursio_protocol::AudioStreamMeta {
+            id: 9001,
+            role: cursio_protocol::StreamRole::Playback,
+            app_name: Some(crate::audio_relay::call_label("Relay Test Phone")),
+            device: None,
+            format: cursio_protocol::AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_kind: cursio_protocol::SampleKind::F32,
+            },
+            codec: cursio_protocol::AudioCodec::Opus,
+        });
+        assert_eq!(
+            e.inbound_calls.streams.get(&9001).map(String::as_str),
+            Some("Relay Test Phone")
+        );
+        e.inbound_calls.close(9001);
+        assert!(e.inbound_calls.streams.is_empty());
     }
 
     /// A stream keeps the name it was advertised under while its node comes up.

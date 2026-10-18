@@ -530,6 +530,19 @@ N machines (desktop + laptop + Steam Deck) with no model change — Cursio becom
 distributed audio *network*, not a PC↔PC link. A Mac is not in that list: with no
 backend, it never advertises the audio module and so is not a node here at all.
 
+### Relayed streams: sound that is not in the local graph
+
+A phone's call voice and its Bluetooth music reach Cursio as PCM off a
+socket, not as an application in the graph, and the computer that carries
+them is not always the one the user sits at. `core/src/audio_relay.rs` lets
+such a producer hand PCM to the audio module of one link; the module sends it
+as an ordinary **Remote Stream** — app name set, no target device — so the
+peer plays it on its default output exactly like a routed application, and no
+message is added to the wire. A relay may ask for the peer's microphone: the
+module then tees the decoded chunks of the first microphone the peer offered
+and reports that stream as listened to for as long as the relay lives. See
+`docs/calls-design.md`, "Where the voice plays".
+
 ## Invariants
 
 Rules that must never be violated. If new code breaks one, the architecture is

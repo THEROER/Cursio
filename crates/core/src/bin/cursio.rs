@@ -904,6 +904,7 @@ async fn run() -> anyhow::Result<()> {
             // switches and settings every link follows, and the options the
             // factories read when they build a module.
             let live = cursio_core::live::LiveConfig::new(&config);
+            cursio_core::calls_hub::hub().configure(config.calls.clone());
             let screen_host = Shared::new(config.modules.screen_host);
             let files_share =
                 Shared::new(share_policy(&files_share_flag, config.files.share.clone())?);
@@ -945,6 +946,9 @@ async fn run() -> anyhow::Result<()> {
                             Ok(gate) => mic_gate.set(gate),
                             Err(error) => tracing::warn!(%error, "keeping the running mic gate"),
                         }
+                    }
+                    if let Some(calls) = &plan.calls {
+                        cursio_core::calls_hub::hub().configure(calls.clone());
                     }
                     if let Some(spec) = &plan.mac_modifiers {
                         if let Err(error) = apply_modifier_map(spec) {

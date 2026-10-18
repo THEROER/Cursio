@@ -753,8 +753,11 @@ where
     // the user's hand is on this mouse. Every report passes through here, so
     // the mark follows each change without a line at each call site.
     let mut driving_mark = crate::update::quiet::DrivingMark::default();
+    // And which peer: a call's voice follows the user to that screen.
+    let mut driven_mark = crate::presence::DrivenMark::new(peer);
     let mut on_ownership = |ownership: Ownership| {
         driving_mark.set(ownership.driving);
+        driven_mark.set(ownership.driving);
         report_ownership(ownership);
     };
     let mut role = CursorRole::new(cursor.start_active);

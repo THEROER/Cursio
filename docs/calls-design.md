@@ -206,6 +206,59 @@ too (for its own Phone Link) and was shown among the calls. A device whose
 Bluetooth class is not Phone is refused; one that gives no class is let
 through.
 
+## Where the voice plays: the machine the user is at
+
+The phone pairs with one computer, which carries the call; the user may sit
+at another. With `[calls] voice = "follow"` (the default) the computer
+carrying the call plays the voice where the user is and records that
+machine's microphone (`core/src/call_audio.rs`); `"here"` keeps it on this
+computer.
+
+- **Where the user is** (`presence::whereabouts`): the peer this machine's
+  mouse drives, else here with recent input, else "away" — and away moves
+  nothing, since a machine left alone cannot say where the user went. It is
+  looked at twice a second, and a new answer must hold for two seconds
+  before the sound moves, so a cursor crossing to a peer and straight back
+  does not tear the call's audio down twice.
+- **Getting there** (`core/src/audio_relay.rs`). The voice leaves as one of
+  this machine's application streams on the audio module — advertised with
+  no device, Opus at the module's low-latency settings, in the `Audio`
+  priority class — so the peer plays it on its default output like any other
+  application of ours, and nothing new crosses the wire: any build that runs
+  the audio module plays it. Its label, `Call · <phone>`, is how the peer
+  knows it carries a call. The microphone comes back the same way: the
+  module tees the decoded PCM of the first microphone the peer offered to
+  the call, and keeps that stream demanded while the call hears it.
+- **Shown there.** The machine playing a relayed voice shows the phone's
+  call with the voice on it (`Status.calls[].audio_here`); the machine
+  carrying it shows where it went (`voice_on`). The call window says "voice
+  on <machine>".
+- **The phone's music** over A2DP follows the same way, under the phone's
+  name.
+- **Taken where?** A call answered in the window on the screen this
+  computer's mouse drives reaches the phone over the mesh, and the computer
+  carrying the voice only sees it go up. So a call going up while the user's
+  hand was on this desk in the last fifteen seconds (`presence::at_desk`) counts
+  as taken here; one picked up with the desk untouched was taken on the
+  phone, and its voice stays there.
+
+## Settings: `[calls]`
+
+| Field | Default | |
+| --- | --- | --- |
+| `answer_moves_voice` | `true` | Answering or dialling from a computer brings the voice to it. Off, nothing steers the voice. |
+| `voice` | `"follow"` | `"here"` or `"follow"` (the machine the user is at). |
+| `output` | unset | The output the voice plays on here, by device id; the default output when unset. |
+| `input` | unset | The microphone the call hears here. |
+
+All four apply at the next call without a restart. The app's settings page
+shows them beside what this computer can do (`Status.call_setup`): whether
+`cursio bluetooth install` handed the roles over, whether the hands-free
+unit and the speaker registered (with BlueZ's reason when not), the phones
+paired with it, and the outputs and microphones to pick from — read every
+twenty seconds on a thread of their own, since BlueZ's and PipeWire's
+blocking calls cannot run on the runtime.
+
 ## Where it shows
 
 - **Notifications** (`calls_display.rs`), through the same notification
@@ -222,7 +275,7 @@ through.
 - Bluetooth on Windows and macOS: their stacks own the HF and A2DP sink roles
   and offer no user-space way to take them. Calls there work over the mesh,
   voice on the phone.
-- Carrying a call's voice or the phone's Bluetooth sound on to another
-  machine. Both enter the audio path as ordinary playback nodes, so the next
-  step is offering them to peers like any local stream.
+- Following a user to a machine this one does not drive: a laptop worked on
+  with its own keyboard is invisible from here, because desktops tell each
+  other nothing about their user. The voice then stays where it was.
 - AAC, as above.
