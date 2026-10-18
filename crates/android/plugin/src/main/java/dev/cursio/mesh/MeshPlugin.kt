@@ -214,7 +214,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun answerScreen(invoke: Invoke) {
         val args = invoke.getArgs()
-        val computer = args.getString("computer", "")
+        val computer = args.getString("computer", "") ?: ""
         if (computer.isEmpty()) {
             invoke.reject("no computer named")
             return
