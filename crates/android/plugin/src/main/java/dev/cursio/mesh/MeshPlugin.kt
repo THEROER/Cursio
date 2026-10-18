@@ -231,6 +231,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         // No API reads the HyperOS grant, so once the user has been sent to
         // the screen it is no longer offered.
         state.put("autostartSetting", PowerSetup.hasXiaomiAutostart() && !Prefs.openedAutostart(activity))
+        CursioNotificationListener.rebindIfLost(activity)
         state.put(
             "notificationAccess",
             NotificationManagerCompat.getEnabledListenerPackages(activity).contains(activity.packageName),

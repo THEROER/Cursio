@@ -4,7 +4,10 @@ import android.app.ActivityOptions
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.RemoteInput
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.Drawable
@@ -13,6 +16,7 @@ import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
+import androidx.core.app.NotificationManagerCompat
 import java.io.ByteArrayOutputStream
 
 /**
@@ -166,6 +170,35 @@ class CursioNotificationListener : NotificationListenerService() {
                 null
             }
             pressed.actionIntent.send(listener, 0, fill, null, null, null, options)
+        }
+
+        /**
+         * Ask Android to bind the listener again when access is granted but it
+         * is not bound. A listener whose process the system killed (HyperOS
+         * does, and an app update does) stays granted and unbound: Settings
+         * shows it on, nothing arrives, and nothing tells the user to act.
+         *
+         * `requestRebind` does not help: it only undoes `requestUnbind`, and
+         * is a no-op for a listener the system dropped. Turning the component
+         * off and on is a package change, which makes Android rebind every
+         * listener of the package.
+         */
+        fun rebindIfLost(context: Context) {
+            if (instance != null) return
+            if (!NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)) return
+            Log.i(TAG, "notification access is on but the listener is unbound; toggling it to rebind")
+            val component = ComponentName(context, CursioNotificationListener::class.java)
+            val pm = context.packageManager
+            pm.setComponentEnabledSetting(
+                component,
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP,
+            )
+            pm.setComponentEnabledSetting(
+                component,
+                PackageManager.COMPONENT_ENABLED_STATE_DEFAULT,
+                PackageManager.DONT_KILL_APP,
+            )
         }
 
         /** Dismiss [key], as if swiped away here. */

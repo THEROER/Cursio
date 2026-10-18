@@ -88,6 +88,7 @@ class MeshService : Service() {
         Node.init(this)
         deviceStatus = DeviceStatus(this).also { it.start() }
         instance = this
+        CursioNotificationListener.rebindIfLost(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
