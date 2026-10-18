@@ -50,6 +50,7 @@ object Node {
             ShareReceiver.context = context.applicationContext
             Ringer.context = context.applicationContext
             SmsStore.context = context.applicationContext
+            GalleryStore.context = context.applicationContext
             BtLink.context = context.applicationContext
             MediaNotifier.context = context.applicationContext
             initialized = CursioNative.nativeInit(context.filesDir.absolutePath)
@@ -57,6 +58,7 @@ object Node {
             if (initialized) {
                 SmsStore.watch(context)
                 MediaBridge.watch(context)
+                GalleryStore.watch(context)
             }
             initialized
         } catch (e: LinkageError) {

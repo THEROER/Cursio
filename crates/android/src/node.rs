@@ -334,6 +334,10 @@ async fn serve(node: Node) -> anyhow::Result<()> {
             enabled: true,
             share: cursio_core::live::Shared::new(cursio_files::SharePolicy::everything()),
             role: cursio_protocol::ModuleRole::Source,
+        }))
+        .with(Box::new(cursio_core::gallery_session::GalleryFactory {
+            store: Some(crate::gallery::AndroidGallery::shared()),
+            view: true,
         }));
     cursio_core::media_hub::hub().set_backend(crate::media::AndroidBackend::shared());
     cursio_core::media_hub::hub().set_display(crate::media::AndroidDisplay::shared());

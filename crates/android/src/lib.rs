@@ -39,6 +39,7 @@ use jni::JNIEnv;
 
 mod bt;
 mod calls;
+mod gallery;
 mod jvm;
 mod media;
 mod messages;
@@ -328,6 +329,23 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeMediaChanged(
     guard(&mut env, (), |env| {
         let json: String = env.get_string(&json)?.into();
         media::changed(&json);
+        Ok(())
+    })
+}
+
+/// MediaStore changed — a photo taken, a screenshot, one deleted — so a peer
+/// browsing this phone's gallery should ask again.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeGalleryChanged(
+    mut env: JNIEnv,
+    _this: JObject,
+) {
+    guard(&mut env, (), |_env| {
+        cursio_core::gallery_hub::hub().changed();
         Ok(())
     })
 }

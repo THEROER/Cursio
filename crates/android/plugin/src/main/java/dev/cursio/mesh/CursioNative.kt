@@ -155,6 +155,18 @@ object CursioNative {
     @JvmStatic
     fun onSmsRequest(request: String): String = SmsStore.handle(request)
 
+    /** The phone's photos or videos changed: a peer browsing them should look again. */
+    external fun nativeGalleryChanged()
+
+    /** A peer asked for a page of this phone's gallery; see [GalleryStore]. */
+    @JvmStatic
+    fun onGalleryList(request: String): String = GalleryStore.list(request)
+
+    /** A thumbnail or a slice of one gallery item; see [GalleryStore.bytes]. */
+    @JvmStatic
+    fun onGalleryBytes(id: String, thumbPx: Int, offset: Long, len: Int): ByteArray? =
+        GalleryStore.bytes(id, thumbPx, offset, len)
+
     /** A desktop's user closed notification [key]: dismiss it here too. */
     @JvmStatic
     fun onNotificationDismiss(key: String) = CursioNotificationListener.dismiss(key)

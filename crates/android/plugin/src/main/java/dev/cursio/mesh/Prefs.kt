@@ -9,6 +9,7 @@ object Prefs {
     private const val KEY_WANTED = "wanted_running"
     private const val KEY_ASKED_MICROPHONE = "asked_microphone"
     private const val KEY_ASKED_MESSAGES = "asked_messages"
+    private const val KEY_ASKED_GALLERY = "asked_gallery"
     private const val KEY_OPENED_AUTOSTART = "opened_autostart"
 
     private fun prefs(context: Context): SharedPreferences =
@@ -39,6 +40,11 @@ object Prefs {
 
     fun setAskedMessages(context: Context) =
         prefs(context).edit().putBoolean(KEY_ASKED_MESSAGES, true).apply()
+
+    fun askedGallery(context: Context): Boolean = prefs(context).getBoolean(KEY_ASKED_GALLERY, false)
+
+    fun setAskedGallery(context: Context) =
+        prefs(context).edit().putBoolean(KEY_ASKED_GALLERY, true).apply()
 
     /**
      * Whether the user has been to the HyperOS Autostart screen. Nothing tells

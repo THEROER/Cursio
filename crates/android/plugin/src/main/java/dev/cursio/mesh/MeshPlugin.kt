@@ -59,6 +59,14 @@ import app.tauri.plugin.Plugin
             strings = [Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE],
             alias = MeshPlugin.STORAGE,
         ),
+        // Two aliases, one per Android generation: each declares only what
+        // that generation's manifest lists, and Tauri refuses an alias naming
+        // a permission the manifest leaves out.
+        Permission(
+            strings = [Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO],
+            alias = MeshPlugin.GALLERY_MEDIA,
+        ),
+        Permission(strings = [Manifest.permission.READ_EXTERNAL_STORAGE], alias = MeshPlugin.GALLERY_STORAGE),
     ],
 )
 class MeshPlugin(private val activity: Activity) : Plugin(activity) {
@@ -195,6 +203,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
             }
             MICROPHONE -> requestMicrophone(invoke)
             MESSAGES -> requestMessages(invoke)
+            GALLERY -> requestGallery(invoke)
             NEARBY ->
                 if (nearbyGranted()) {
                     invoke.resolve(setupState())
@@ -292,6 +301,21 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    /** Same second-refusal rule as the microphone. */
+    private fun requestGallery(invoke: Invoke) {
+        val first = GalleryStore.permissions().first()
+        when {
+            GalleryStore.granted(activity) -> invoke.resolve(setupState())
+            Prefs.askedGallery(activity) && !activity.shouldShowRequestPermissionRationale(first) ->
+                launchFirst(invoke, listOf(PowerSetup.appDetails(activity)))
+            else -> {
+                Prefs.setAskedGallery(activity)
+                val alias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) GALLERY_MEDIA else GALLERY_STORAGE
+                requestPermissionForAlias(alias, invoke, "permissionAnswered")
+            }
+        }
+    }
+
     @ActivityCallback
     private fun companionAnswered(invoke: Invoke, result: ActivityResult) {
         val error = result.data?.getStringExtra(CompanionActivity.EXTRA_ERROR)
@@ -312,6 +336,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
     private fun afterGrant() {
         CallMonitor.refresh()
         SmsStore.watch(activity)
+        GalleryStore.watch(activity)
         if (Prefs.wantedRunning(activity) && MeshService.micGranted(activity) && !MeshService.holdsMicrophone()) {
             startFromForeground()
         }
@@ -362,6 +387,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         )
         state.put("calls", CallMonitor.granted(activity))
         state.put("messages", messagesGranted())
+        state.put("gallery", GalleryStore.granted(activity))
         state.put("nearby", nearbyGranted())
         state.put("storage", storageGranted())
         state.put("companion", ComputerCompanion.associated(activity))
@@ -417,6 +443,9 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         const val CALLS = "calls"
         const val BLUETOOTH = "bluetooth"
         const val MESSAGES = "messages"
+        const val GALLERY = "gallery"
+        const val GALLERY_MEDIA = "galleryMedia"
+        const val GALLERY_STORAGE = "galleryStorage"
         const val NEARBY = "nearby"
         const val STORAGE = "storage"
         const val COMPANION = "companion"
