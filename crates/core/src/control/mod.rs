@@ -597,7 +597,7 @@ pub struct Status {
     #[serde(default)]
     pub gallery: Vec<crate::gallery_hub::GalleryPeer>,
     /// This computer as a phone's Bluetooth headset, for the settings. `None`
-    /// where the build carries no Bluetooth calls, and from a v15 node.
+    /// where the build carries no Bluetooth calls, and from a v16 node.
     #[serde(default)]
     pub call_setup: Option<crate::calls_hub::CallSetup>,
 }
