@@ -230,6 +230,16 @@ object MediaNotifier {
         entry.session.setPlaybackState(
             PlaybackState.Builder()
                 .setActions(actions)
+                // A fourth button in the system's own player card and
+                // HyperOS's island, the way Spotube draws its stop: put this
+                // player away until its next track.
+                .addCustomAction(
+                    PlaybackState.CustomAction.Builder(
+                        DISMISS,
+                        "Disconnect",
+                        android.R.drawable.ic_menu_close_clear_cancel,
+                    ).build(),
+                )
                 .setState(
                     if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
                     p.optLong("positionMs", PlaybackState.PLAYBACK_POSITION_UNKNOWN),
@@ -368,5 +378,15 @@ object MediaNotifier {
         override fun onSkipToPrevious() = press(peer, player, "previous", 0)
         override fun onSeekTo(pos: Long) = press(peer, player, "seek", pos)
         override fun onStop() = press(peer, player, "pause", 0)
+        override fun onCustomAction(action: String, extras: android.os.Bundle?) {
+            if (action != DISMISS) return
+            try {
+                CursioNative.nativeMediaDismiss(peer, player)
+            } catch (e: UnsatisfiedLinkError) {
+                Log.w(TAG, "the node library is not loaded", e)
+            }
+        }
     }
+
+    private const val DISMISS = "dev.cursio.mesh.MEDIA_DISMISS"
 }
