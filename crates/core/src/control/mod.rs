@@ -489,7 +489,7 @@ pub struct LinkView {
     /// Modules that have no meaning between these two machines — two phones
     /// with nothing to read from each other's SMS, or a duty a phone has no
     /// backend for. Kept apart from `skipped` so a window does not present
-    /// them as something to fix. Empty from a v11 node.
+    /// them as something to fix. Empty from a v12 node.
     #[serde(default)]
     pub inapplicable: Vec<String>,
     pub since: SystemTime,
