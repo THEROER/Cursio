@@ -84,8 +84,9 @@ mod tests {
 
     #[test]
     fn a_smartphones_class_is_a_phone_and_a_laptops_is_not() {
-        // A Xiaomi phone, and a Windows laptop that offers hands-free too.
-        assert!(is_phone_class(0x5A020C));
-        assert!(!is_phone_class(0x2A010C));
+        // Read from a paired POCO X7 Pro and a Windows laptop that offers
+        // hands-free too.
+        assert!(is_phone_class(0x5A420C));
+        assert!(!is_phone_class(0x2E410C));
     }
 }
