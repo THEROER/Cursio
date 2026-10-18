@@ -102,8 +102,23 @@ object Island {
         val tintHex = String.format("#%06X", 0xFFFFFF and tint)
         val coverIcon = cover?.let { Icon.createWithBitmap(rounded(it)) } ?: fallback
         val picInfo = JSONObject().put("type", 1).put("pic", PIC)
-        val actionRefs = JSONArray()
-        buttons.forEachIndexed { i, _ -> actionRefs.put(JSONObject().put("type", 0).put("action", "$ACTION$i")) }
+        // Two lists, as HyperOS reads them: the card's buttons name their
+        // action by `actionIntent` with its kind (2, a broadcast — what the
+        // player's buttons are), and the top-level list defines each by
+        // `action`. The same entry in both, as first written, drew no
+        // buttons at all.
+        val cardButtons = JSONArray()
+        val definitions = JSONArray()
+        buttons.forEachIndexed { i, b ->
+            cardButtons.put(
+                JSONObject().put("type", 0).put("actionIntent", "$ACTION$i").put("actionIntentType", 2)
+                    .put("actionTitle", b.title.toString()),
+            )
+            definitions.put(
+                JSONObject().put("type", 0).put("action", "$ACTION$i").put("actionIntentType", 2)
+                    .put("actionTitle", b.title.toString()),
+            )
+        }
         val param = JSONObject()
             .put("protocol", 3)
             .put("business", "music")
@@ -128,8 +143,9 @@ object Island {
                     .put("colorTitleDark", textColor)
                     .put("colorContent", subColor)
                     .put("colorContentDark", subColor)
-                    .put("actions", actionRefs),
+                    .put("actions", cardButtons),
             )
+            .put("actions", definitions)
             .put("bgInfo", JSONObject().put("type", 1).put("colorBg", tintHex))
             .put(
                 "param_island",
