@@ -9,4 +9,5 @@
     public static void onNotificationInvoke(...);
     public static void onNotificationDismiss(...);
     public static void onRing(...);
+    public static java.lang.String onSmsRequest(...);
 }

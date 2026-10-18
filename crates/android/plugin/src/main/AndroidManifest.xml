@@ -27,6 +27,15 @@
          is itself permission-gated. Denied, the service still runs. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- This phone's text messages, read and sent from a desktop; contact
+         names make the conversation list readable. See SmsStore. -->
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- SEND_SMS implies telephony is required; a tablet without a SIM is
+         still a mesh member, it just has no messages to offer. -->
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+
     <!-- The phone's microphone, sent to a peer. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- The echo canceller and communication routing the audio backend asks

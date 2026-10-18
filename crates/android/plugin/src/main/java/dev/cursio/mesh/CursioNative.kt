@@ -134,6 +134,16 @@ object CursioNative {
     fun onNotificationInvoke(key: String, action: Int, reply: String?) =
         CursioNotificationListener.invoke(key, action, reply)
 
+    /** The phone's messages changed: a desktop showing them should look again. */
+    external fun nativeSmsChanged()
+
+    /**
+     * A desktop asked for this phone's messages. Called by the node, on its
+     * own thread, with one JSON request; answers one JSON object, see [SmsStore].
+     */
+    @JvmStatic
+    fun onSmsRequest(request: String): String = SmsStore.handle(request)
+
     /** A desktop's user closed notification [key]: dismiss it here too. */
     @JvmStatic
     fun onNotificationDismiss(key: String) = CursioNotificationListener.dismiss(key)

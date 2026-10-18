@@ -39,6 +39,7 @@ use jni::JNIEnv;
 
 mod calls;
 mod jvm;
+mod messages;
 mod node;
 mod notify;
 #[cfg(target_os = "android")]
@@ -274,6 +275,23 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeNotificationRemov
     guard(&mut env, (), |env| {
         let key: String = env.get_string(&key)?.into();
         cursio_core::notify_hub::hub().remove(&key);
+        Ok(())
+    })
+}
+
+/// The phone's messages changed; every desktop reading them is told to look
+/// again.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeSmsChanged(
+    mut env: JNIEnv,
+    _this: JObject,
+) {
+    guard(&mut env, (), |_env| {
+        cursio_core::messages_hub::hub().changed();
         Ok(())
     })
 }

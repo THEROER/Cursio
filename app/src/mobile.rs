@@ -53,6 +53,10 @@ pub struct Setup {
     /// Defaulted for a plugin built before the row existed.
     #[serde(default)]
     pub calls: bool,
+    /// This phone's SMS may be read and sent from a desktop. Defaulted for a
+    /// plugin built before the row existed.
+    #[serde(default)]
+    pub messages: bool,
 }
 
 /// One of the things [`Setup`] lists, for the user to grant.
@@ -68,6 +72,7 @@ pub enum Grant {
     /// Not a grant: Android's Bluetooth screen, where the computer is paired
     /// and picked as the speaker.
     Bluetooth,
+    Messages,
 }
 
 #[derive(Serialize)]

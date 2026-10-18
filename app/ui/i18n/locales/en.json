@@ -204,6 +204,8 @@
     "notificationAccessHint": "Shows this phone's notifications on the computer you are at, with their buttons and replies.",
     "calls": "Calls on your computer",
     "callsHint": "Answer, decline and place this phone's calls from a computer. Pair the phone with the computer over Bluetooth to talk through the computer's speakers and microphone.",
+    "messages": "Text messages on your computer",
+    "messagesHint": "Read this phone's SMS conversations and send texts from your computer.",
     "autostart": "Autostart",
     "autostartHint": "This phone also stops apps that are not on its own Autostart list. Allow Cursio there; Android cannot tell the app whether you did.",
     "autostartDone": "I've allowed it",

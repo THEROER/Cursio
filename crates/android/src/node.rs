@@ -309,6 +309,10 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         .with(Box::new(cursio_core::calls_session::CallsFactory {
             actor: Some(crate::calls::AndroidCallActor::shared()),
             computer: false,
+        }))
+        .with(Box::new(cursio_core::messages_session::MessagesFactory {
+            store: Some(crate::messages::AndroidStore::shared()),
+            view: false,
         }));
     for advert in modules.advertise() {
         tracing::info!(module = %advert.id, version = advert.version, "module available");

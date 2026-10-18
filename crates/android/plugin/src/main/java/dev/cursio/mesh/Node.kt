@@ -49,8 +49,10 @@ object Node {
         return try {
             ShareReceiver.context = context.applicationContext
             Ringer.context = context.applicationContext
+            SmsStore.context = context.applicationContext
             initialized = CursioNative.nativeInit(context.filesDir.absolutePath)
             if (!initialized) loadError = "the native node refused its data directory"
+            if (initialized) SmsStore.watch(context)
             initialized
         } catch (e: LinkageError) {
             loadError = "native library unusable: ${e.message ?: e.javaClass.simpleName}"

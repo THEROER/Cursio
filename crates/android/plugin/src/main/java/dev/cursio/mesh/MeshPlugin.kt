@@ -46,6 +46,10 @@ import app.tauri.plugin.Plugin
             ],
             alias = MeshPlugin.CALLS,
         ),
+        Permission(
+            strings = [Manifest.permission.READ_SMS, Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS],
+            alias = MeshPlugin.MESSAGES,
+        ),
     ],
 )
 class MeshPlugin(private val activity: Activity) : Plugin(activity) {
@@ -152,6 +156,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
                 }
             }
             MICROPHONE -> requestMicrophone(invoke)
+            MESSAGES -> requestMessages(invoke)
             BATTERY -> launchFirst(invoke, PowerSetup.batteryOptimizationIntents(activity))
             AUTOSTART -> {
                 Prefs.setOpenedAutostart(activity)
@@ -203,8 +208,25 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
      * the type is claimed at `startForeground`, so the service is started
      * again from here, while the window is still in front.
      */
+    /** Same second-refusal rule as the microphone: past it, only the app's settings page can grant. */
+    private fun requestMessages(invoke: Invoke) {
+        when {
+            messagesGranted() -> invoke.resolve(setupState())
+            Prefs.askedMessages(activity) && !activity.shouldShowRequestPermissionRationale(Manifest.permission.READ_SMS) ->
+                launchFirst(invoke, listOf(PowerSetup.appDetails(activity)))
+            else -> {
+                Prefs.setAskedMessages(activity)
+                requestPermissionForAlias(MESSAGES, invoke, "permissionAnswered")
+            }
+        }
+    }
+
+    private fun messagesGranted(): Boolean =
+        granted(Manifest.permission.READ_SMS) && granted(Manifest.permission.SEND_SMS)
+
     private fun afterGrant() {
         CallMonitor.refresh()
+        SmsStore.watch(activity)
         if (Prefs.wantedRunning(activity) && MeshService.micGranted(activity) && !MeshService.holdsMicrophone()) {
             startFromForeground()
         }
@@ -254,6 +276,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
             NotificationManagerCompat.getEnabledListenerPackages(activity).contains(activity.packageName),
         )
         state.put("calls", CallMonitor.granted(activity))
+        state.put("messages", messagesGranted())
         return state
     }
 
@@ -284,5 +307,6 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         const val NOTIFICATION_ACCESS = "notificationAccess"
         const val CALLS = "calls"
         const val BLUETOOTH = "bluetooth"
+        const val MESSAGES = "messages"
     }
 }
