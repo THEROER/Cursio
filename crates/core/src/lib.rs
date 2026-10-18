@@ -114,6 +114,7 @@ pub mod remote_screen;
 /// Where a capture app's request for a peer's screen meets that peer's link.
 #[cfg(feature = "window")]
 pub mod screen_hub;
+pub mod screen_views;
 pub mod service_session;
 pub mod session;
 /// The session bus, from a thread outside the runtime.

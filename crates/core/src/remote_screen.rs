@@ -405,6 +405,9 @@ pub struct ScreenViewer<S: Surrogate> {
     /// The showing a capture app holds now.
     active: Option<ActiveShow>,
     keyframe_asks: KeyframeRequests,
+    /// What the Cursio app's tray picks for this view; see
+    /// [`crate::screen_views`]. Set while the view is open.
+    tray_picks: Option<tokio::sync::mpsc::UnboundedReceiver<crate::screen_views::TrayPick>>,
 }
 
 struct PendingShow {
@@ -434,6 +437,7 @@ impl<S: Surrogate> ScreenViewer<S> {
             pending: None,
             active: None,
             keyframe_asks: KeyframeRequests::default(),
+            tray_picks: None,
         }
     }
 
@@ -605,6 +609,9 @@ impl<S: Surrogate> ScreenViewer<S> {
             }
             _ => return false,
         }
+        if self.view.is_some() {
+            crate::screen_views::update(&self.peer_name, &self.sources, self.showing);
+        }
         true
     }
 
@@ -673,6 +680,7 @@ impl<S: Surrogate> ScreenViewer<S> {
             Ok(view) => {
                 tracing::info!(title = %meta.title, "opened remote-screen view");
                 self.view = Some(view);
+                self.tray_picks = Some(crate::screen_views::open(&self.peer_name));
             }
             Err(e) => {
                 // Once per link: the list refreshes every few seconds, and a
@@ -752,6 +760,11 @@ impl<S: Surrogate> ScreenViewer<S> {
             while let Some(pick) = view.take_source_pick() {
                 picks.push(pick);
             }
+            if let Some(tray) = self.tray_picks.as_mut() {
+                while let Ok(pick) = tray.try_recv() {
+                    picks.push(pick.map_or(SourcePick::Stop, SourcePick::Source));
+                }
+            }
             ack = view.take_ack();
             if self
                 .keyframe_asks
@@ -783,6 +796,8 @@ impl<S: Surrogate> ScreenViewer<S> {
         if closed {
             tracing::info!(peer = %self.peer_name, "remote-screen view closed by the user");
             self.view = None;
+            self.tray_picks = None;
+            crate::screen_views::close(&self.peer_name);
             self.dismissed = true;
             self.showing = None;
             self.wanted = None;
@@ -805,6 +820,9 @@ impl<S: Surrogate> ScreenViewer<S> {
         self.end_active();
         if let Some((hub, key)) = self.demand.as_ref() {
             hub.withdraw(key);
+        }
+        if self.tray_picks.take().is_some() {
+            crate::screen_views::close(&self.peer_name);
         }
     }
 

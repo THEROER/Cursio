@@ -159,6 +159,9 @@ where
     let mut revisions = state.revisions();
     let mut refresh = tokio::time::interval(PUSH_REFRESH);
     let mut subscribed = false;
+    // Held while this connection is an app whose tray stands in for the
+    // remote-screen views' icons; dropping it on the way out brings them back.
+    let mut _tray: Option<crate::screen_views::TrayGuard> = None;
     let mut last_pushed: Option<super::Status> = None;
     // Answers to commands that wait on a peer, written whenever they arrive;
     // ids let the client match them however late.
@@ -188,6 +191,9 @@ where
                     }
                     Ok(request) => {
                         subscribed |= request.command == Command::Subscribe;
+                        if request.command == Command::TrayAttached && _tray.is_none() {
+                            _tray = Some(crate::screen_views::TRAYS.attach());
+                        }
                         Response {
                             id: request.id,
                             reply: state.handle(request.command),

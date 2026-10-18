@@ -65,8 +65,9 @@ use crate::pairing_window::{PairingCode, PairingOutcome, PairingState, PairingWi
 /// `list_messages`, `send_sms`, `mark_sms_read`, and `messages` in the status.
 /// v11: `nearby` in the status and in every pairing reply. v12: `path` on a
 /// link, the network or Bluetooth. v13: `inapplicable` on a link, apart from
-/// `skipped`.
-pub const CONTROL_VERSION: u32 = 13;
+/// `skipped`. v14: `screens` in the status, `show_screen_source`, and
+/// `tray_attached`.
+pub const CONTROL_VERSION: u32 = 14;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -180,6 +181,17 @@ pub enum Command {
     Restart,
     /// Push the status on this connection whenever it changes, starting now.
     Subscribe,
+    /// This connection is the Cursio app, whose tray carries the
+    /// remote-screen views' selector: the views' own notification-area icons
+    /// stand aside until it closes. See [`crate::screen_views`].
+    TrayAttached,
+    /// Show `source` in the remote-screen view of `peer`, or nothing when
+    /// `source` is absent.
+    ShowScreenSource {
+        peer: String,
+        #[serde(default)]
+        source: Option<cursio_protocol::SourceId>,
+    },
     /// Switch to the build from the mesh that is installed and waiting. The
     /// node stops and comes back as that build, or as this one if it fails.
     UpdateApply,
@@ -420,6 +432,10 @@ pub struct Status {
     /// node.
     #[serde(default)]
     pub nearby: Vec<NearbyMachine>,
+    /// Remote-screen views open here and what each can show. Defaulted from a
+    /// v13 node.
+    #[serde(default)]
+    pub screens: Vec<crate::screen_views::ScreenView>,
 }
 
 /// A machine this node has heard announce itself on the LAN.
@@ -934,6 +950,7 @@ impl NodeState {
             calls: crate::calls_hub::hub().phones(),
             messages: crate::messages_hub::hub().peers(),
             nearby,
+            screens: crate::screen_views::list(),
         }
     }
 
@@ -1023,6 +1040,14 @@ impl NodeState {
             // The connection, not the node, keeps subscriptions; see
             // `transport::serve_connection`.
             Command::Subscribe => Reply::Subscribed,
+            // The guard lives on the connection; see `serve_connection`.
+            Command::TrayAttached => Reply::Done,
+            Command::ShowScreenSource { peer, source } => {
+                match crate::screen_views::pick(&peer, source) {
+                    Ok(()) => Reply::Done,
+                    Err(e) => error(e),
+                }
+            }
             Command::UpdateApply => match crate::update::agent::global() {
                 Some(agent) => match agent.apply_ready() {
                     Ok(_) => {
