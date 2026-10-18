@@ -207,6 +207,11 @@ pub enum Command {
         volume: f32,
         muted: bool,
     },
+    /// Make a connected phone ring until it is found. `peer` is its id or its
+    /// name.
+    Ring {
+        peer: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -778,6 +783,13 @@ impl NodeState {
                     error(format!("no stream {stream} is playing here"))
                 }
             }
+            Command::Ring { peer } => match crate::notify_hub::hub().ring(&peer, true) {
+                Ok(name) => {
+                    tracing::info!(phone = %name, "asking a phone to ring");
+                    Reply::Done
+                }
+                Err(e) => error(e),
+            },
         }
     }
 
@@ -880,6 +892,31 @@ mod tests {
         };
         let line = serde_json::to_string(&reply).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), reply);
+    }
+
+    #[test]
+    fn a_ring_request_is_the_line_the_shell_extension_writes() {
+        let request: Request =
+            serde_json::from_str(r#"{"id":1,"cmd":"ring","peer":"POCO X7 Pro"}"#).unwrap();
+        assert_eq!(
+            request.command,
+            Command::Ring {
+                peer: "POCO X7 Pro".into()
+            }
+        );
+    }
+
+    #[test]
+    fn ringing_a_phone_that_is_not_linked_answers_with_an_error() {
+        let dir = temp_dir("ring");
+        let node = state(&dir, Overrides::default());
+        let reply = node.handle(Command::Ring {
+            peer: "nobody-here".into(),
+        });
+        assert!(
+            matches!(&reply, Reply::Error { message } if message.contains("cannot be rung")),
+            "{reply:?}"
+        );
     }
 
     #[test]

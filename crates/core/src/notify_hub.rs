@@ -55,6 +55,8 @@ pub trait NotifyDisplay: Send + Sync {
 pub trait NotifyActor: Send + Sync {
     fn invoke(&self, key: &str, action: u8, reply: Option<&str>);
     fn dismiss(&self, key: &str);
+    /// Ring loudly until found, or stop.
+    fn ring(&self, on: bool);
 }
 
 struct Link {
@@ -63,6 +65,10 @@ struct Link {
     /// What the peer last said; `false` until it says, so a desktop is not
     /// lit up before it has answered.
     here: bool,
+    name: String,
+    /// Only a phone rings; a desktop asked to would say nothing, and silence
+    /// reads as "it is ringing somewhere I cannot hear".
+    phone: bool,
 }
 
 /// This machine's notifications, on their way to its links.
@@ -81,7 +87,12 @@ impl NotifyHub {
     /// A link to `peer` is up: what this machine posts for it arrives on the
     /// returned channel. The token unregisters exactly this registration, so a
     /// link that replaced an older one is not removed by the older one's end.
-    pub fn register(&self, peer: PeerId) -> (mpsc::UnboundedReceiver<NotifyMsg>, u64) {
+    pub fn register(
+        &self,
+        peer: PeerId,
+        name: &str,
+        phone: bool,
+    ) -> (mpsc::UnboundedReceiver<NotifyMsg>, u64) {
         let (tx, rx) = mpsc::unbounded_channel();
         let token: u64 = rand::random();
         self.lock().insert(
@@ -90,9 +101,54 @@ impl NotifyHub {
                 token,
                 tx,
                 here: false,
+                name: name.to_string(),
+                phone,
             },
         );
         (rx, token)
+    }
+
+    /// Ring `peer` (an id or a name), or stop it ringing.
+    ///
+    /// A link registers only once the module was agreed, so a phone that is
+    /// connected but missing here runs a Cursio too old to ring, or has
+    /// notifications switched off — said rather than sent into nothing.
+    pub fn ring(&self, peer: &str, on: bool) -> Result<String, String> {
+        let links = self.lock();
+        let link = links
+            .values()
+            .find(|l| l.name.eq_ignore_ascii_case(peer))
+            .or_else(|| {
+                links
+                    .iter()
+                    .find(|(id, _)| id.to_string() == peer)
+                    .map(|(_, l)| l)
+            })
+            .filter(|l| !l.tx.is_closed())
+            .ok_or_else(|| {
+                let mut phones: Vec<&str> = links
+                    .values()
+                    .filter(|l| l.phone && !l.tx.is_closed())
+                    .map(|l| l.name.as_str())
+                    .collect();
+                phones.sort_unstable();
+                format!(
+                    "{peer} cannot be rung: it is not connected, has notifications switched \
+                     off, or runs an older Cursio; phones that can: {}",
+                    if phones.is_empty() {
+                        "none".to_string()
+                    } else {
+                        phones.join(", ")
+                    }
+                )
+            })?;
+        if !link.phone {
+            return Err(format!("{} is not a phone; only a phone rings", link.name));
+        }
+        link.tx
+            .send(NotifyMsg::Ring { on })
+            .map_err(|_| format!("the link to {} has just closed", link.name))?;
+        Ok(link.name.clone())
     }
 
     pub fn unregister(&self, peer: &PeerId, token: u64) {
@@ -164,8 +220,8 @@ mod tests {
     fn a_notification_goes_only_where_the_user_is() {
         let hub = NotifyHub::default();
         let (desk, laptop) = (PeerId::from_u128(1), PeerId::from_u128(2));
-        let (mut at_desk, _) = hub.register(desk);
-        let (mut at_laptop, _) = hub.register(laptop);
+        let (mut at_desk, _) = hub.register(desk, "desk", false);
+        let (mut at_laptop, _) = hub.register(laptop, "laptop", false);
         hub.set_here(laptop, true);
         hub.post(notification("k1"));
         assert!(posted(&mut at_desk).is_empty());
@@ -178,8 +234,8 @@ mod tests {
     #[test]
     fn with_nobody_at_any_machine_every_machine_keeps_it() {
         let hub = NotifyHub::default();
-        let (mut a, _) = hub.register(PeerId::from_u128(1));
-        let (mut b, _) = hub.register(PeerId::from_u128(2));
+        let (mut a, _) = hub.register(PeerId::from_u128(1), "a", false);
+        let (mut b, _) = hub.register(PeerId::from_u128(2), "b", false);
         hub.post(notification("k1"));
         assert_eq!(posted(&mut a).len(), 1);
         assert_eq!(posted(&mut b).len(), 1);
@@ -189,13 +245,48 @@ mod tests {
     fn an_older_links_end_does_not_unregister_its_replacement() {
         let hub = NotifyHub::default();
         let peer = PeerId::from_u128(1);
-        let (_old, old_token) = hub.register(peer);
-        let (mut new, _) = hub.register(peer);
+        let (_old, old_token) = hub.register(peer, "phone", true);
+        let (mut new, _) = hub.register(peer, "phone", true);
         hub.unregister(&peer, old_token);
         hub.remove("k1");
         assert_eq!(
             posted(&mut new),
             vec![NotifyMsg::Removed { key: "k1".into() }]
         );
+    }
+
+    #[test]
+    fn a_phone_is_rung_by_its_name_in_any_case() {
+        let hub = NotifyHub::default();
+        let (mut phone, _) = hub.register(PeerId::from_u128(1), "POCO X7 Pro", true);
+        assert_eq!(hub.ring("poco x7 pro", true).as_deref(), Ok("POCO X7 Pro"));
+        assert_eq!(posted(&mut phone), vec![NotifyMsg::Ring { on: true }]);
+    }
+
+    #[test]
+    fn a_phone_is_rung_by_its_id() {
+        let hub = NotifyHub::default();
+        let id = PeerId::from_u128(7);
+        let (mut phone, _) = hub.register(id, "Redmi", true);
+        assert!(hub.ring(&id.to_string(), false).is_ok());
+        assert_eq!(posted(&mut phone), vec![NotifyMsg::Ring { on: false }]);
+    }
+
+    #[test]
+    fn ringing_a_desktop_is_refused_rather_than_sent() {
+        let hub = NotifyHub::default();
+        let (mut desk, _) = hub.register(PeerId::from_u128(1), "Lightmoon", false);
+        let err = hub.ring("Lightmoon", true).unwrap_err();
+        assert!(err.contains("not a phone"), "{err}");
+        assert!(posted(&mut desk).is_empty());
+    }
+
+    #[test]
+    fn ringing_an_unknown_peer_names_the_phones_that_can_be_rung() {
+        let hub = NotifyHub::default();
+        let (_phone, _) = hub.register(PeerId::from_u128(1), "Redmi", true);
+        let (_desk, _) = hub.register(PeerId::from_u128(2), "Lightmoon", false);
+        let err = hub.ring("POCO", true).unwrap_err();
+        assert!(err.ends_with("phones that can: Redmi"), "{err}");
     }
 }

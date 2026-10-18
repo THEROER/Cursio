@@ -304,6 +304,7 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         .with(Box::new(cursio_core::notify_session::NotifyFactory {
             display: None,
             actor: Some(crate::notify::AndroidActor::shared()),
+            rings: false,
         }));
     for advert in modules.advertise() {
         tracing::info!(module = %advert.id, version = advert.version, "module available");

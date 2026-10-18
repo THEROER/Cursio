@@ -25,7 +25,9 @@ use crate::module::SessionModule;
 use crate::notify_hub::{hub, DisplayEvent, NotifyActor, NotifyDisplay};
 
 /// Version of [`NotifyMsg`]; peers run the module only on an exact match.
-pub const VERSION: u16 = 1;
+/// 2 added [`NotifyMsg::Ring`]: a version-1 phone would have dropped it as
+/// undecodable, so the two never agree and the ring is refused here, by name.
+pub const VERSION: u16 = 2;
 
 /// How often a desktop re-reads whether the user is here. The idle time is a
 /// session-bus call, cheap but not free, and a notification that lands on the
@@ -37,7 +39,9 @@ pub struct NotifyEngine {
     peer_name: String,
     display: Option<Arc<dyn NotifyDisplay>>,
     actor: Option<Arc<dyn NotifyActor>>,
-    posts: Option<(mpsc::UnboundedReceiver<NotifyMsg>, u64)>,
+    /// What this machine sends the peer outside a link's own traffic: a
+    /// phone's posts, a desktop's ring.
+    posts: (mpsc::UnboundedReceiver<NotifyMsg>, u64),
     events_tx: mpsc::UnboundedSender<DisplayEvent>,
     events_rx: mpsc::UnboundedReceiver<DisplayEvent>,
     here: Option<bool>,
@@ -50,10 +54,11 @@ impl NotifyEngine {
     pub fn new(
         peer: PeerId,
         peer_name: String,
+        peer_is_phone: bool,
         display: Option<Arc<dyn NotifyDisplay>>,
         actor: Option<Arc<dyn NotifyActor>>,
     ) -> Self {
-        let posts = actor.is_some().then(|| hub().register(peer));
+        let posts = hub().register(peer, &peer_name, peer_is_phone);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         NotifyEngine {
             peer,
@@ -117,6 +122,15 @@ impl NotifyEngine {
                     actor.invoke(&key, action, reply.as_deref());
                 }
             }
+            NotifyMsg::Ring { on } => match &self.actor {
+                Some(actor) => {
+                    tracing::info!(peer = %self.peer_name, on, "asked to ring");
+                    actor.ring(on);
+                }
+                None => {
+                    tracing::warn!(peer = %self.peer_name, "asked to ring, but this machine has no ringer")
+                }
+            },
         }
     }
 
@@ -162,10 +176,8 @@ impl SessionModule for NotifyEngine {
         while let Ok(event) = self.events_rx.try_recv() {
             self.on_event(event);
         }
-        if let Some((posts, _)) = &mut self.posts {
-            while let Ok(msg) = posts.try_recv() {
-                self.queued.push(msg);
-            }
+        while let Ok(msg) = self.posts.0.try_recv() {
+            self.queued.push(msg);
         }
         for msg in std::mem::take(&mut self.queued) {
             send(tx, &msg).await?;
@@ -190,9 +202,7 @@ impl SessionModule for NotifyEngine {
 
 impl Drop for NotifyEngine {
     fn drop(&mut self) {
-        if let Some((_, token)) = &self.posts {
-            hub().unregister(&self.peer, *token);
-        }
+        hub().unregister(&self.peer, self.posts.1);
         // Its buttons answer through this link, which is gone.
         if let Some(display) = &self.display {
             for key in self.shown.drain() {
@@ -206,6 +216,16 @@ impl Drop for NotifyEngine {
 pub struct NotifyFactory {
     pub display: Option<Arc<dyn NotifyDisplay>>,
     pub actor: Option<Arc<dyn NotifyActor>>,
+    /// This machine can ask a phone to ring. Enough on its own to run the
+    /// module: a desktop that cannot show a phone's notifications yet can
+    /// still find it.
+    pub rings: bool,
+}
+
+impl NotifyFactory {
+    fn runs(&self) -> bool {
+        self.display.is_some() || self.actor.is_some() || self.rings
+    }
 }
 
 impl crate::module::ModuleFactory for NotifyFactory {
@@ -214,18 +234,22 @@ impl crate::module::ModuleFactory for NotifyFactory {
     }
 
     fn advert(&self) -> Option<cursio_protocol::ModuleAdvert> {
-        (self.display.is_some() || self.actor.is_some())
+        self.runs()
             .then(|| cursio_protocol::ModuleAdvert::symmetric(ModuleId::NOTIFY, VERSION))
     }
 
     fn supported(&self) -> bool {
-        self.display.is_some() || self.actor.is_some()
+        self.runs()
     }
 
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         Ok(Box::new(NotifyEngine::new(
             ctx.peer.peer_id,
             ctx.peer_name().to_string(),
+            matches!(
+                ctx.peer.device_kind,
+                cursio_protocol::DeviceKind::Phone | cursio_protocol::DeviceKind::Tablet
+            ),
             self.display.clone(),
             self.actor.clone(),
         )))

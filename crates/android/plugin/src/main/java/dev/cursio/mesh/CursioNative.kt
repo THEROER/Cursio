@@ -137,4 +137,8 @@ object CursioNative {
     /** A desktop's user closed notification [key]: dismiss it here too. */
     @JvmStatic
     fun onNotificationDismiss(key: String) = CursioNotificationListener.dismiss(key)
+
+    /** A desktop wants this phone found: ring until it is, or stop. */
+    @JvmStatic
+    fun onRing(on: Boolean) = Ringer.ring(on)
 }

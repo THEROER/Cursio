@@ -21,6 +21,14 @@
 //! notification in place under the same key (a download's progress, a chat
 //! that gained a message), and the desktop replaces what it shows rather than
 //! stacking a new one each time.
+//!
+//! ## Ringing a lost phone
+//!
+//! The same link carries the one thing a desktop asks of a phone outright:
+//! ring, loud, until someone finds it ([`NotifyMsg::Ring`]). It is a device
+//! event like the rest, and riding this module means a phone that switched
+//! notifications off is also one nobody can make ring — which is the same
+//! choice, made once.
 
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +95,10 @@ pub enum NotifyMsg {
         action: u8,
         reply: Option<String>,
     },
+    /// Desktop -> phone: ring loudly until found (`on`), or stop ringing.
+    /// The phone stops by itself too, when the user answers it there or after
+    /// a while — a phone that is lost may never be reached to be told.
+    Ring { on: bool },
 }
 
 impl NotifyMsg {

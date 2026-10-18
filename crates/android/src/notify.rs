@@ -5,7 +5,8 @@
 //! [`hub`](cursio_core::notify_hub::hub). What a desktop's user does with one
 //! comes back as a call up into `CursioNative.onNotificationInvoke` or
 //! `onNotificationDismiss`, which press the button or dismiss it as if on this
-//! screen.
+//! screen. A desktop asking the phone to ring comes up the same way, into
+//! `CursioNative.onRing`.
 
 use std::sync::Arc;
 
@@ -59,6 +60,16 @@ impl NotifyActor for AndroidActor {
         });
         if let Err(e) = dismissed {
             tracing::warn!(error = %e, "could not dismiss a notification");
+        }
+    }
+
+    fn ring(&self, on: bool) {
+        let rung = crate::jvm::with_native(|env, class| {
+            env.call_static_method(class, "onRing", "(Z)V", &[JValue::Bool(u8::from(on))])?;
+            Ok(())
+        });
+        if let Err(e) = rung {
+            tracing::warn!(error = %e, on, "could not ring this phone");
         }
     }
 }

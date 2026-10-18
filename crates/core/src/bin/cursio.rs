@@ -123,6 +123,14 @@ enum Command {
         #[arg(long)]
         save: bool,
     },
+    /// Make a connected phone ring loudly, even on silent, until it is found.
+    ///
+    /// It stops when the phone is unlocked or its notification answered, or
+    /// by itself after a while. Goes through the running node.
+    Ring {
+        /// The phone's name or id, as `cursio status` shows it.
+        phone: String,
+    },
     /// List peers discovered on the LAN, then exit.
     Peers {
         #[arg(long, default_value_t = 5)]
@@ -1055,6 +1063,7 @@ async fn run() -> anyhow::Result<()> {
             copy,
             save,
         } => send_share(&target, &to, copy, save).await,
+        Command::Ring { phone } => ring_phone(&phone).await,
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Portal { action } => portal(action).await,
         Command::MountHelper { .. } => unreachable!("handled before the node starts"),
@@ -1613,6 +1622,7 @@ fn module_registry(
         .with(Box::new(cursio_core::notify_session::NotifyFactory {
             display: notify_display(),
             actor: None,
+            rings: true,
         }))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,
@@ -3188,6 +3198,29 @@ async fn send_share(target: &str, to: &str, copy: bool, save: bool) -> anyhow::R
         Reply::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!(
             "the running node does not know how to share ({other:?}); restart it with this version of Cursio"
+        ),
+    }
+}
+
+/// Ask the running node, which holds the links, to ring a phone.
+async fn ring_phone(phone: &str) -> anyhow::Result<()> {
+    use cursio_core::control::{Command, Reply};
+    let client = control_client().await.map_err(|e| {
+        anyhow::anyhow!("no running node to ring through ({e}); start `cursio mesh` first")
+    })?;
+    match client
+        .request(Command::Ring {
+            peer: phone.to_string(),
+        })
+        .await?
+    {
+        Reply::Done => {
+            println!("ringing {phone}");
+            Ok(())
+        }
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!(
+            "the running node does not know how to ring ({other:?}); restart it with this version of Cursio"
         ),
     }
 }

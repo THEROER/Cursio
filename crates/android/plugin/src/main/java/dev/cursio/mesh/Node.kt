@@ -48,6 +48,7 @@ object Node {
         if (loadError != null) return false
         return try {
             ShareReceiver.context = context.applicationContext
+            Ringer.context = context.applicationContext
             initialized = CursioNative.nativeInit(context.filesDir.absolutePath)
             if (!initialized) loadError = "the native node refused its data directory"
             initialized
