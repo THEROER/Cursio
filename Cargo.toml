@@ -11,6 +11,7 @@ members = [
     "crates/audio",
     "crates/files",
     "crates/usb",
+    "crates/bluetooth",
     "crates/core",
     "crates/android",
     "app",
@@ -29,6 +30,7 @@ repository = "https://github.com/THEROER/cursio"
 # Internal crates
 cursio-protocol = { path = "crates/protocol" }
 cursio-transport = { path = "crates/transport" }
+cursio-bluetooth = { path = "crates/bluetooth" }
 cursio-airplay = { path = "crates/airplay" }
 cursio-input = { path = "crates/input" }
 cursio-audio = { path = "crates/audio" }

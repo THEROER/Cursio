@@ -1,0 +1,19 @@
+[package]
+name = "cursio-bluetooth"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cursio-protocol.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+# BlueZ is reached over the system bus, and the RFCOMM and SCO sockets it
+# hands over are plain file descriptors — so zbus and libc, not a Bluetooth
+# library that would want to own the adapter alongside PipeWire.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

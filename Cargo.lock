@@ -1157,6 +1157,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cursio-bluetooth"
+version = "0.1.0"
+dependencies = [
+ "cursio-protocol",
+ "libc",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
 name = "cursio-core"
 version = "0.1.0"
 dependencies = [
