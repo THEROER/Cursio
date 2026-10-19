@@ -30,12 +30,14 @@ use windows_sys::Win32::Devices::Bluetooth::{
     BluetoothFindDeviceClose, BluetoothFindFirstDevice, BluetoothFindNextDevice, AF_BTH,
     BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BTHPROTO_RFCOMM, NS_BTH, SOCKADDR_BTH,
 };
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_NO_MORE_ITEMS};
+use windows_sys::Win32::Foundation::{
+    GetLastError, SetHandleInformation, ERROR_NO_MORE_ITEMS, HANDLE, HANDLE_FLAG_INHERIT,
+};
 use windows_sys::Win32::Networking::WinSock::{
-    accept, bind, connect, getsockname, listen, socket, WSAGetLastError, WSASetServiceW,
+    accept, bind, connect, getsockname, listen, WSAGetLastError, WSASetServiceW, WSASocketW,
     WSAStartup, CSADDR_INFO, INVALID_SOCKET, RNRSERVICE_REGISTER, SOCKADDR, SOCKET, SOCKET_ADDRESS,
     SOCK_STREAM, WSADATA, WSAEADDRINUSE, WSAECONNREFUSED, WSAEHOSTDOWN, WSAQUERYSETW,
-    WSASERVICE_NOT_FOUND,
+    WSASERVICE_NOT_FOUND, WSA_FLAG_NO_HANDLE_INHERIT,
 };
 
 use crate::{Address, BluetoothError, PairedDevice, MESH_CHANNEL};
@@ -107,6 +109,7 @@ impl MeshChannel {
                 }
                 // SAFETY: accept returned a socket nothing else owns.
                 let accepted = unsafe { OwnedSocket::from_raw_socket(accepted as RawSocket) };
+                not_inherited(&accepted);
                 let address = address_of(peer.btAddr);
                 tracing::info!(peer = %address, "a paired device opened the mesh's bluetooth channel");
                 if tx.send((address, accepted)).is_err() {
@@ -232,15 +235,43 @@ fn startup() -> Result<(), BluetoothError> {
     }
 }
 
+/// A new RFCOMM socket that no child process inherits.
+///
+/// Winsock sockets are inheritable by default, and the node starts children
+/// — the update helper, which starts the next node, and the drive helper. A
+/// listener inherited by them outlived the node that bound it: after one
+/// update switch the next node found the pinned channel held and fell back
+/// to another, and each switch after that took one more (measured on
+/// Windows: 23, then 4, then 5).
 fn rfcomm_socket() -> Result<OwnedSocket, BluetoothError> {
-    // SAFETY: plain socket(); the result is checked before it is owned.
-    let s = unsafe { socket(AF_BTH as i32, SOCK_STREAM, BTHPROTO_RFCOMM as i32) };
+    // SAFETY: plain WSASocketW with no protocol info; the result is checked
+    // before it is owned.
+    let s = unsafe {
+        WSASocketW(
+            AF_BTH as i32,
+            SOCK_STREAM,
+            BTHPROTO_RFCOMM as i32,
+            std::ptr::null(),
+            0,
+            WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
     if s == INVALID_SOCKET {
         let e = last_error();
         return Err(BluetoothError::Unavailable(e.to_string()));
     }
-    // SAFETY: s was just returned by socket() and nothing else owns it.
+    // SAFETY: s was just returned by WSASocketW and nothing else owns it.
     Ok(unsafe { OwnedSocket::from_raw_socket(s as RawSocket) })
+}
+
+/// Keep an accepted socket out of child processes too; whether it takes the
+/// listener's setting is not documented.
+fn not_inherited(socket: &OwnedSocket) {
+    // SAFETY: the socket is a live handle we own; only its inherit flag is
+    // changed.
+    if unsafe { SetHandleInformation(raw(socket) as HANDLE, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        tracing::debug!(error = %io::Error::last_os_error(), "an accepted bluetooth socket stays inheritable");
+    }
 }
 
 fn bind_port(socket: &OwnedSocket, port: u32) -> io::Result<()> {
