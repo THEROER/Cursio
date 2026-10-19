@@ -2537,12 +2537,15 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
         let held_for_cb = held.clone();
         let reg_for_secured = registry.clone();
         let identified_for_secured = identified.clone();
+        let control_for_secured = control.clone();
         let mut on_secured = move |resume: &cursio_transport::resume::ResumeHandle| {
             *held_for_cb.borrow_mut() = Some(resume.clone());
             if let Some(id) = *identified_for_secured.borrow() {
                 reg_for_secured
                     .borrow_mut()
                     .hold_session(id, resume.clone());
+                let control = control_for_secured.clone();
+                resume.on_paths(move |paths| control.link_paths(&id, paths));
             }
         };
         let session = run_pairing_and_session(

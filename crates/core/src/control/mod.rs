@@ -1049,6 +1049,31 @@ impl NodeState {
         self.changed();
     }
 
+    /// The session to `peer` now runs over `paths`. A link's path was the
+    /// kind of the connection that started it, so a session that moved to
+    /// Bluetooth when the network went still showed as on the network — in
+    /// the app, the GNOME menu and `cursio status` alike. With no path at
+    /// all (the session waiting for one) the last one shown stays.
+    pub fn link_paths(&self, peer: &PeerId, paths: cursio_transport::resume::Paths) {
+        let path = if paths.network {
+            LinkPath::Network
+        } else if paths.bluetooth {
+            LinkPath::Bluetooth
+        } else {
+            return;
+        };
+        let changed = match self.inner().links.get_mut(peer) {
+            Some((_, link)) if link.path != path => {
+                link.path = path;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
     /// A running link renegotiated: the peer moved, or the modules changed.
     /// The rest of what the link reported stays, the peer's latest status
     /// included.
@@ -1797,6 +1822,57 @@ mod tests {
         );
         node.link_down(&fresh);
         assert_eq!(node.status().peers.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_that_moves_to_bluetooth_shows_as_on_bluetooth() {
+        use cursio_transport::resume::Paths;
+
+        let dir = temp_dir("paths");
+        let node = state(&dir, Overrides::default());
+        let peer = PeerId::new_v4();
+        node.link_up(
+            peer,
+            "laptop",
+            LinkView {
+                position: Position::new(1, 0),
+                device_kind: DeviceKind::Desktop,
+                status: NodeStatus::unknown(),
+                modules: vec![],
+                skipped: vec![],
+                inapplicable: vec![],
+                since: SystemTime::now(),
+                path: LinkPath::Network,
+            },
+        );
+        let shown = |node: &NodeState| node.status().peers[0].link.as_ref().unwrap().path;
+        node.link_paths(
+            &peer,
+            Paths {
+                network: false,
+                bluetooth: true,
+            },
+        );
+        assert_eq!(shown(&node), LinkPath::Bluetooth);
+        node.link_paths(&peer, Paths::default());
+        assert_eq!(
+            shown(&node),
+            LinkPath::Bluetooth,
+            "waiting for a path keeps the last"
+        );
+        node.link_paths(
+            &peer,
+            Paths {
+                network: true,
+                bluetooth: true,
+            },
+        );
+        assert_eq!(
+            shown(&node),
+            LinkPath::Network,
+            "the network wins when both carry it"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
