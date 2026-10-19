@@ -500,7 +500,7 @@
     "callsInput": "Microphone",
     "callsDefault": "System default",
     "callsFailedSave": "Call settings were not changed",
-    "callsUnsupported": "A phone's call voice comes through a computer over Bluetooth on Linux only. Calls still show here, with the voice on the phone.",
+    "callsUnsupported": "Only a Linux computer can be a phone's Bluetooth headset. Calls still show here, and a call another computer carries can bring its voice to this one.",
     "standbyTitle": "Bluetooth",
     "standbyDescription": "When the network stops reaching a paired machine, the connection to it moves to Bluetooth instead of stopping.",
     "bluetoothMode": "Use Bluetooth for the mesh",

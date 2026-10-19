@@ -422,7 +422,7 @@ fn update_setup(change: impl FnOnce(&mut CallSetup)) {
 /// runtime") on every Linux machine with Bluetooth, and the update that
 /// carried it rolled back. See `session_bus` for the same trap.
 pub fn start() {
-    update_setup(|_| {});
+    update_setup(|s| s.headset = cfg!(target_os = "linux"));
     if let Err(e) = std::thread::Builder::new()
         .name("bluetooth-setup".into())
         .spawn(register)

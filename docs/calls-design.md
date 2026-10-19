@@ -257,7 +257,11 @@ shows them beside what this computer can do (`Status.call_setup`): whether
 unit and the speaker registered (with BlueZ's reason when not), the phones
 paired with it, and the outputs and microphones to pick from — read every
 twenty seconds on a thread of their own, since BlueZ's and PipeWire's
-blocking calls cannot run on the runtime.
+blocking calls cannot run on the runtime. `headset` says whether this
+computer can be a headset at all (Linux only, so far): where it cannot, the
+page says so in one line instead of offering a Linux command and three rows
+that can never turn green, and keeps the four settings above, since a call
+another computer carries can still send its voice here.
 
 ## Where it shows
 

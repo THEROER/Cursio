@@ -114,6 +114,13 @@ pub struct PhoneCalls {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CallSetup {
+    /// This machine can be a phone's headset and speaker at all (Linux, so
+    /// far). Without it the rows below about roles, services and pairing say
+    /// nothing true, while where a call's voice plays still matters: another
+    /// computer's call can be sent here. Absent from older nodes, which were
+    /// all ones that could.
+    #[serde(default = "headset_default")]
+    pub headset: bool,
     /// PipeWire has left the phone roles to Cursio (`cursio bluetooth
     /// install`); without it neither service can register.
     pub roles_taken: bool,
@@ -126,6 +133,10 @@ pub struct CallSetup {
     /// What a call can play on and record from here.
     pub outputs: Vec<AudioDevice>,
     pub inputs: Vec<AudioDevice>,
+}
+
+fn headset_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -902,6 +913,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use cursio_protocol::calls::{CallDirection, CallState};
+
+    #[test]
+    fn an_older_nodes_call_setup_reads_as_one_that_can_be_a_headset() {
+        let old: CallSetup = serde_json::from_str(r#"{"roles_taken":true}"#).unwrap();
+        assert!(old.headset);
+        let windows = CallSetup {
+            headset: false,
+            ..CallSetup::default()
+        };
+        let back: CallSetup =
+            serde_json::from_str(&serde_json::to_string(&windows).unwrap()).unwrap();
+        assert!(!back.headset);
+    }
 
     fn call(id: CallId, state: CallState) -> Call {
         Call {

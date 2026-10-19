@@ -401,7 +401,8 @@ async function restartNode() {
         </LpCard>
         <LpSkeleton v-else-if="!calls" rounded="card" class="h-48" />
         <LpCard v-else padded class="flex flex-col gap-4">
-          <ul class="flex flex-col divide-y divide-line">
+          <p v-if="callSetup.headset === false" class="text-sm text-muted">{{ t("settings.callsUnsupported") }}</p>
+          <ul v-else class="flex flex-col divide-y divide-line">
             <li class="flex flex-col gap-2 pb-3">
               <div class="flex items-center gap-4">
                 <p class="min-w-0 flex-1 text-sm font-medium">{{ t("settings.callsRoles") }}</p>

@@ -161,6 +161,8 @@ export type ServiceState = { state: "starting" } | { state: "running" } | { stat
 
 /** Mirrors `cursio_core::calls_hub::CallSetup`. */
 export interface CallSetup {
+  /** This machine can be a phone's headset at all; absent (an older node) means it can. */
+  headset?: boolean
   /** `cursio bluetooth install` handed the phone roles from PipeWire to Cursio. */
   roles_taken: boolean
   hands_free: ServiceState
