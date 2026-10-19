@@ -10,3 +10,9 @@ app/ui/dist
 
 # Per-checkout machine settings for xtask; .env.example lists the keys.
 .env
+
+# Downloaded toolchain installers and agent scratch output, never sources.
+/*.exe
+/*.msi
+.playwright-mcp/
+.claude/worktrees/
