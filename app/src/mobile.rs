@@ -133,6 +133,15 @@ pub struct PlaybackTarget {
     pub routed: bool,
 }
 
+/// A computer this phone's screen can be shown on.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenTarget {
+    pub name: String,
+    /// The computer the user was at last: the one offered first.
+    pub last_used: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PhoneAudioState {
     /// Linear, 0 to 1.
@@ -205,12 +214,36 @@ pub mod commands {
         cursio_android::set_playback_volume(volume).map_err(|e| e.to_string())
     }
 
-    /// Show this screen on every computer linked now (`true`), after the
-    /// system's consent, or stop showing it.
+    /// The computers linked now, for choosing whom to show this screen to.
     #[tauri::command]
-    pub async fn phone_screen_share(app: AppHandle, show: bool) -> Result<(), String> {
+    pub fn phone_screen_targets() -> Vec<ScreenTarget> {
+        let (linked, last) = cursio_core::phone_screen::targets();
+        linked
+            .into_iter()
+            .map(|name| ScreenTarget {
+                last_used: last.as_deref() == Some(name.as_str()),
+                name,
+            })
+            .collect()
+    }
+
+    /// Show this screen on `computers` (`show`), after the system's consent,
+    /// or stop showing it. With no computers named it goes to the one the
+    /// user was at last.
+    #[tauri::command]
+    pub async fn phone_screen_share(
+        app: AppHandle,
+        show: bool,
+        computers: Option<Vec<String>>,
+    ) -> Result<(), String> {
         let plugin = plugin(&app)?;
         let command = if show {
+            if let Some(computers) = computers {
+                if computers.is_empty() {
+                    return Err("choose a computer to show this screen on".into());
+                }
+                cursio_core::phone_screen::choose(computers);
+            }
             "startScreenShare"
         } else {
             "stopScreenShare"

@@ -89,9 +89,13 @@ struct Feed {
     parameters: Option<Arc<[u8]>>,
     /// Computers that asked to see the screen and have not closed it.
     viewers: HashSet<String>,
-    /// Computers linked to this phone right now, which the phone's own
-    /// "show on computers" shares with.
-    linked: HashSet<String>,
+    /// Computers linked to this phone right now, with how many links each:
+    /// while a better link replaces a worse one both are briefly up, and the
+    /// older one ending must not take the computer with it.
+    linked: HashMap<String, usize>,
+    /// Whom the phone's own "show on computers" shares with once the user
+    /// allows the capture, chosen in the window before the consent opens.
+    chosen: Option<Vec<String>>,
     generation: u64,
 }
 
@@ -114,7 +118,8 @@ fn shared() -> &'static Shared {
             running: None,
             parameters: None,
             viewers: HashSet::new(),
-            linked: HashSet::new(),
+            linked: HashMap::new(),
+            chosen: None,
             generation: 0,
         }),
         units: broadcast::channel(UNIT_BACKLOG).0,
@@ -215,25 +220,65 @@ pub fn requested(computer: &str, show: bool) {
     notify_changed();
 }
 
-/// Share with every linked computer, from the phone's own side, once the
-/// capture is up. Answers how many that is.
-pub fn share_with_linked() -> usize {
+/// The computers linked now, and the one the user was at last — the one to
+/// offer first. Sorted by name.
+pub fn targets() -> (Vec<String>, Option<String>) {
+    let mut linked: Vec<String> = feed().linked.keys().cloned().collect();
+    linked.sort_unstable();
+    let last = crate::notify_hub::hub()
+        .last_used_desktop()
+        .filter(|name| linked.contains(name));
+    (linked, last)
+}
+
+/// Whom the next share from the phone goes to, picked before Android's
+/// consent is asked for.
+pub fn choose(computers: Vec<String>) {
+    feed().chosen = Some(computers);
+}
+
+/// Share from the phone's own side, once the capture is up: with the
+/// computers [`choose`] named, else the one the user was at last, else —
+/// with nothing known of where the user is — every linked one. Answers how
+/// many computers watch now.
+///
+/// It was every linked computer always, so the screen opened on whichever
+/// machines happened to be up rather than the one the user was looking at.
+pub fn share_with_chosen() -> usize {
+    let last = crate::notify_hub::hub().last_used_desktop();
     let count = {
         let mut feed = feed();
-        let linked: Vec<String> = feed.linked.iter().cloned().collect();
-        feed.viewers.extend(linked);
+        let wanted = match feed.chosen.take() {
+            Some(chosen) => chosen,
+            None => match last.filter(|name| feed.linked.contains_key(name)) {
+                Some(last) => vec![last],
+                None => feed.linked.keys().cloned().collect(),
+            },
+        };
+        let wanted: Vec<String> = wanted
+            .into_iter()
+            .filter(|name| feed.linked.contains_key(name))
+            .collect();
+        tracing::info!(?wanted, "showing this phone's screen");
+        feed.viewers.extend(wanted);
         feed.viewers.len()
     };
     notify_changed();
     count
 }
 
-/// The link to `computer` ended: it watches nothing any more.
+/// One link to `computer` ended: with none left it watches nothing any more.
 fn unlinked(computer: &str) {
     {
         let mut feed = feed();
-        feed.linked.remove(computer);
-        feed.viewers.remove(computer);
+        let left = feed.linked.get_mut(computer).map(|links| {
+            *links = links.saturating_sub(1);
+            *links
+        });
+        if left.is_none_or(|left| left == 0) {
+            feed.linked.remove(computer);
+            feed.viewers.remove(computer);
+        }
     }
     release_if_unwatched();
     notify_changed();
@@ -284,7 +329,7 @@ pub fn spawn_trigger(
 
     let (tx, rx) = mpsc::unbounded_channel();
     let mut changed = shared().changed.subscribe();
-    feed().linked.insert(computer.clone());
+    *feed().linked.entry(computer.clone()).or_default() += 1;
     tokio::spawn(async move {
         let mut showing: Option<u64> = None;
         // The engine dropping its end is the link ending; whatever the
@@ -691,6 +736,7 @@ pub(crate) fn reset_for_test() {
     feed.parameters = None;
     feed.viewers.clear();
     feed.linked.clear();
+    feed.chosen = None;
     feed.backend = None;
 }
 
@@ -849,13 +895,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sharing_from_the_phone_reaches_every_linked_computer() {
+    async fn sharing_from_the_phone_goes_only_to_the_computer_chosen() {
+        let _turn = SERIAL.lock().await;
+        let _backend = fake();
+        let mut chosen = spawn_trigger("Nocturne".into(), "POCO".into());
+        let mut other = spawn_trigger("Lightmoon".into(), "POCO".into());
+        assert_eq!(
+            targets().0,
+            vec!["Lightmoon".to_string(), "Nocturne".to_string()]
+        );
+        choose(vec!["Nocturne".into()]);
+        started(100, 200);
+        assert_eq!(share_with_chosen(), 1);
+        assert!(matches!(
+            chosen.recv().await,
+            Some(TransferRequest::Send { .. })
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            other.try_recv().is_err(),
+            "an unchosen computer was sent the screen"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_link_ending_leaves_its_computer_watching() {
+        let _turn = SERIAL.lock().await;
+        let _backend = fake();
+        let older = spawn_trigger("Nocturne".into(), "POCO".into());
+        let _newer = spawn_trigger("Nocturne".into(), "POCO".into());
+        choose(vec!["Nocturne".into()]);
+        started(100, 200);
+        assert_eq!(share_with_chosen(), 1);
+        drop(older);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            wanted_by("Nocturne").is_some(),
+            "the computer stopped watching"
+        );
+    }
+
+    #[tokio::test]
+    async fn sharing_with_nothing_known_of_the_user_reaches_every_linked_computer() {
         let _turn = SERIAL.lock().await;
         let _backend = fake();
         let mut first = spawn_trigger("Nocturne".into(), "POCO".into());
         let mut second = spawn_trigger("Lightmoon".into(), "POCO".into());
         started(100, 200);
-        assert_eq!(share_with_linked(), 2);
+        assert_eq!(share_with_chosen(), 2);
         assert!(matches!(
             first.recv().await,
             Some(TransferRequest::Send { .. })

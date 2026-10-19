@@ -190,6 +190,23 @@ impl NotifyHub {
         }
     }
 
+    /// The desktop the user was at last: the one with the latest input, else
+    /// one saying the user is there. `None` while no desktop has said either.
+    pub fn last_used_desktop(&self) -> Option<String> {
+        let now = Instant::now();
+        let links = self.lock();
+        let desktops = || links.values().filter(|l| !l.phone && !l.tx.is_closed());
+        desktops()
+            .filter_map(|l| {
+                let (active, last) = l.activity?;
+                Some((if active { now } else { last }, l))
+            })
+            .max_by_key(|(last, _)| *last)
+            .map(|(_, l)| l)
+            .or_else(|| desktops().find(|l| l.here))
+            .map(|l| l.name.clone())
+    }
+
     /// What every desktop said about being in use, for [`crate::at_phone`].
     /// One in use right now had input "now": it keeps saying so only by not
     /// saying it stopped.
@@ -317,6 +334,28 @@ mod tests {
             posted(&mut at_laptop),
             vec![NotifyMsg::Posted(notification("k1"))]
         );
+    }
+
+    #[test]
+    fn the_last_used_desktop_is_the_one_with_the_latest_input() {
+        let hub = NotifyHub::default();
+        let (desk, laptop, phone) = (
+            PeerId::from_u128(1),
+            PeerId::from_u128(2),
+            PeerId::from_u128(3),
+        );
+        let _a = hub.register(desk, "desk", false);
+        let _b = hub.register(laptop, "laptop", false);
+        let _c = hub.register(phone, "phone", true);
+        assert_eq!(hub.last_used_desktop(), None);
+
+        hub.set_here(desk, true);
+        assert_eq!(hub.last_used_desktop().as_deref(), Some("desk"));
+
+        hub.set_activity(desk, false, Duration::from_secs(600));
+        hub.set_activity(laptop, false, Duration::from_secs(20));
+        hub.set_activity(phone, true, Duration::ZERO);
+        assert_eq!(hub.last_used_desktop().as_deref(), Some("laptop"));
     }
 
     #[test]

@@ -524,12 +524,15 @@
   },
   "phoneScreen": {
     "title": "This screen → computer",
-    "description": "Show this phone's screen in a window on your computers, and use it there with the mouse.",
-    "show": "Show on computers",
+    "description": "Show this phone's screen in a window on a computer you choose, and use it there with the mouse.",
+    "show": "Show",
     "stop": "Stop showing",
     "showing": "Showing this screen on your computers",
     "consent": "Android asks before anything of the screen leaves the phone.",
     "noTouch": "The computers can see the screen but not touch it: turn on control from a computer above.",
+    "choose": "Show it on:",
+    "lastUsed": "{computer} (used last)",
+    "noComputers": "No computer is connected to this phone right now.",
     "failed": "The screen is not shown"
   },
   "touchpad": {

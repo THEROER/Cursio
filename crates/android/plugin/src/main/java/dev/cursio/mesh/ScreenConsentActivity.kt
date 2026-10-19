@@ -76,9 +76,9 @@ class ScreenConsentActivity : Activity() {
         getSystemService(NotificationManager::class.java).cancel(PROMPT_ID)
         if (requestCode == REQUEST && resultCode == RESULT_OK && data != null) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) kept = Intent(data)
-            val everyone = intent.getBooleanExtra(EXTRA_EVERYONE, false)
+            val chosen = intent.getBooleanExtra(EXTRA_CHOSEN, false)
             try {
-                MeshService.startScreen(this, resultCode, data, everyone)
+                MeshService.startScreen(this, resultCode, data, chosen)
             } catch (e: IllegalStateException) {
                 Log.w(TAG, "Android refused to start showing the screen", e)
             }
@@ -93,7 +93,8 @@ class ScreenConsentActivity : Activity() {
         private const val REQUEST = 0x5343
         private const val CHANNEL_ID = "cursio-screen-ask"
         private const val PROMPT_ID = 0x53435245
-        const val EXTRA_EVERYONE = "dev.cursio.mesh.SCREEN_EVERYONE"
+        /** Shared from the window, to the computers chosen there. */
+        const val EXTRA_CHOSEN = "dev.cursio.mesh.SCREEN_CHOSEN"
 
         /** On a start from a kept consent: the computer to ask again for if it fails. */
         const val EXTRA_REUSED_FOR = "dev.cursio.mesh.SCREEN_REUSED_FOR"
@@ -106,11 +107,11 @@ class ScreenConsentActivity : Activity() {
         @Volatile
         var context: Context? = null
 
-        /** Open the consent from a window, to show the screen on every computer. */
+        /** Open the consent from a window, to show the screen on the computers chosen there. */
         fun open(context: Context) {
             context.startActivity(
                 Intent(context, ScreenConsentActivity::class.java)
-                    .putExtra(EXTRA_EVERYONE, true)
+                    .putExtra(EXTRA_CHOSEN, true)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
         }
@@ -156,7 +157,7 @@ class ScreenConsentActivity : Activity() {
         }
 
         private fun startKept(context: Context, consent: Intent, computer: String): Boolean = try {
-            MeshService.startScreen(context, RESULT_OK, consent, everyone = false, reusedFor = computer)
+            MeshService.startScreen(context, RESULT_OK, consent, chosen = false, reusedFor = computer)
             true
         } catch (e: IllegalStateException) {
             Log.w(TAG, "cannot start showing the screen from the kept consent", e)

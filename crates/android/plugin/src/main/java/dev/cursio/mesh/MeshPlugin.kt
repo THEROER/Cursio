@@ -191,7 +191,8 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     /**
-     * Show this screen on every computer linked now. The system asks the user
+     * Show this screen on the computers the window chose (the node holds the
+     * choice, made just before this). The system asks the user
      * first; this resolves once the dialog is open, and the screen appears on
      * the computers when it is allowed.
      */

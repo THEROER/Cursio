@@ -213,8 +213,8 @@ object CursioNative {
 
     external fun nativeScreenStopped()
 
-    /** Show the screen on every computer linked now; answers how many. */
-    external fun nativeScreenShareWithLinked(): Int
+    /** Show the screen on the computers chosen in the window; answers how many watch. */
+    external fun nativeScreenShareChosen(): Int
 
     /** A computer asked to see the screen; the user is asked on the phone. */
     @JvmStatic

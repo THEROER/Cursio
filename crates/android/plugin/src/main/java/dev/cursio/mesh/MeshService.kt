@@ -286,8 +286,8 @@ class MeshService : Service() {
                     handler.post { if (screen != null && screen === started) endScreen(fromForeground = false) }
                 }
                 screen = started
-                if (intent.getBooleanExtra(ScreenConsentActivity.EXTRA_EVERYONE, false)) {
-                    val computers = CursioNative.nativeScreenShareWithLinked()
+                if (intent.getBooleanExtra(ScreenConsentActivity.EXTRA_CHOSEN, false)) {
+                    val computers = CursioNative.nativeScreenShareChosen()
                     Log.i(TAG, "showing the screen on $computers computers")
                 }
                 notificationManager().notify(NOTIFICATION_ID, buildNotification(Node.statusLine()))
@@ -552,19 +552,20 @@ class MeshService : Service() {
 
         /**
          * Show this screen on computers, from a consent just given; with
-         * [everyone], on every computer linked now, otherwise on the ones
-         * that asked. Must run from the visible window or the consent
-         * activity: the projection type is claimed by this start.
+         * [chosen], on the computers chosen in the window (or the one the user
+         * was at last), otherwise on the ones that asked. Must run from the
+         * visible window or the consent activity: the projection type is
+         * claimed by this start.
          *
          * @throws IllegalStateException when Android refuses the start.
          */
-        fun startScreen(context: Context, resultCode: Int, data: Intent, everyone: Boolean, reusedFor: String? = null) {
+        fun startScreen(context: Context, resultCode: Int, data: Intent, chosen: Boolean, reusedFor: String? = null) {
             val intent = Intent(context, MeshService::class.java)
                 .setAction(ACTION_SCREEN)
                 .putExtra(EXTRA_FROM_FOREGROUND, true)
                 .putExtra(EXTRA_RESULT_CODE, resultCode)
                 .putExtra(EXTRA_PROJECTION, data)
-                .putExtra(ScreenConsentActivity.EXTRA_EVERYONE, everyone)
+                .putExtra(ScreenConsentActivity.EXTRA_CHOSEN, chosen)
                 .putExtra(ScreenConsentActivity.EXTRA_REUSED_FOR, reusedFor)
             context.startForegroundService(intent)
         }

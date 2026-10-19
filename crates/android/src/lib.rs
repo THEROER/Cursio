@@ -123,19 +123,20 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeScreenStopped(
     })
 }
 
-/// The phone's user shared the screen from the phone: show it on every
-/// computer linked now. Answers how many.
+/// The phone's user shared the screen from the phone: show it on the
+/// computers chosen in the window, or the one the user was at last. Answers
+/// how many watch.
 ///
 /// # Safety
 ///
 /// Called by the JVM with valid arguments; not callable from Rust.
 #[no_mangle]
-pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeScreenShareWithLinked(
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeScreenShareChosen(
     mut env: JNIEnv,
     _this: JObject,
 ) -> jint {
     guard(&mut env, 0, |_| {
-        let count = cursio_core::phone_screen::share_with_linked();
+        let count = cursio_core::phone_screen::share_with_chosen();
         Ok(jint::try_from(count).unwrap_or(jint::MAX))
     })
 }

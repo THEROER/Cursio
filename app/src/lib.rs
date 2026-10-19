@@ -301,6 +301,7 @@ pub fn run() {
             mobile::commands::phone_audio_route,
             mobile::commands::phone_audio_state,
             mobile::commands::phone_audio_volume,
+            mobile::commands::phone_screen_targets,
             mobile::commands::phone_screen_share,
             mobile::commands::phone_screen_answer,
         ]);

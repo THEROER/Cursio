@@ -812,8 +812,13 @@ renderer (`NoViewRenderer`) refuses an offer with that reason.
   a computer always allowed is not asked at all — the system's recording
   indicator still says so. From 14 every capture needs the system's own
   dialog, which an allowed request goes straight to.
-- **The phone**, from *Settings → This screen → computer*, shows it on every
-  computer linked at that moment.
+- **The phone**, from *Settings → This screen → computer*, shows it on the
+  computers ticked there (`phone_screen::choose`, before the consent opens).
+  The one the user was at last (`NotifyHub::last_used_desktop`, from the
+  presence each desktop already reports for notifications) is ticked first;
+  with nothing known of where the user is, every linked computer is. It was
+  every linked computer always, which opened the screen on whichever machines
+  happened to be up rather than the one being looked at.
 
 Either way the consent is the system's own dialog for the whole display. Once
 the capture is up, every computer that asked gets a window. When the last

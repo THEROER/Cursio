@@ -66,11 +66,20 @@ export interface PhoneAudioTarget {
 
 export const phoneAudioTargets = () => invoke<PhoneAudioTarget[]>("phone_audio_targets")
 
+export interface PhoneScreenTarget {
+  name: string
+  /** The computer the user was at last: the one offered first. */
+  lastUsed: boolean
+}
+
+export const phoneScreenTargets = () => invoke<PhoneScreenTarget[]>("phone_screen_targets")
+
 /**
- * Show this screen on every computer linked now, or stop. Starting resolves
- * once Android's consent dialog is open; the screen appears when it is allowed.
+ * Show this screen on `computers`, or stop. Starting resolves once Android's
+ * consent dialog is open; the screen appears when it is allowed.
  */
-export const phoneScreenShare = (show: boolean) => invoke<void>("phone_screen_share", { show })
+export const phoneScreenShare = (show: boolean, computers?: string[]) =>
+  invoke<void>("phone_screen_share", { show, computers: computers ?? null })
 
 /**
  * Send everything the phone plays to `target`, or stop with `null`. Resolves
