@@ -348,12 +348,33 @@ where
         );
     };
     let kind = path_kind(&transport);
-    let secure =
-        EncryptedTransport::establish(transport, &trusted.shared_key()?, plan.role).await?;
-    resume.attach(secure.into_path(kind)).await?;
+    // Bounded: a join that stalls holds its socket, and on Bluetooth that is
+    // the only channel between the two radios — the next call is refused as
+    // busy for as long as it lasts (seen: a call from Linux to Windows, both
+    // sides past `Hello`, neither ever joined). Ending it lets the dialler
+    // try again.
+    let joined = tokio::time::timeout(JOIN_DEADLINE, async {
+        let secure =
+            EncryptedTransport::establish(transport, &trusted.shared_key()?, plan.role).await?;
+        tracing::debug!(peer = %peer.display_name, ?kind, "joining: encrypted, attaching the path");
+        resume.attach(secure.into_path(kind)).await?;
+        anyhow::Ok(())
+    })
+    .await;
+    match joined {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!(
+            "joining the running session over {kind:?} took longer than {} s; the connection is closed so it can be tried again",
+            JOIN_DEADLINE.as_secs()
+        ),
+    }
     tracing::info!(peer = %peer.display_name, ?kind, "the connection joined the running session");
     Ok(())
 }
+
+/// The longest a connection may take to join a running session: a Noise
+/// handshake and one exchange of `RESUME`, seconds even over Bluetooth.
+const JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// What this node offers on a link.
 ///
