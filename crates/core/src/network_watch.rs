@@ -13,6 +13,7 @@
 //! runtime thread is a deadlock waiting to happen.
 
 /// `NM_STATE_CONNECTED_LOCAL`: below it this machine has no network at all.
+#[cfg(any(target_os = "linux", test))]
 const NM_STATE_CONNECTED_LOCAL: u32 = 50;
 
 /// Start watching NetworkManager, if it runs here.
@@ -58,6 +59,7 @@ fn watch() -> zbus::Result<()> {
 }
 
 /// The network was there and is not any more.
+#[cfg(any(target_os = "linux", test))]
 fn lost(previous: u32, now: u32) -> bool {
     previous >= NM_STATE_CONNECTED_LOCAL && now < NM_STATE_CONNECTED_LOCAL
 }
