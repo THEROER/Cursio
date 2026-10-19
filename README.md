@@ -23,6 +23,10 @@ launched on.**
 - Offer a peer's windows and monitors to Discord, OBS or a browser call here,
   without drawing them on this desktop
 - Receive iPhone/iPad screen mirroring as an AirPlay target for the whole mesh
+- Bring an Android phone in as a full peer: its notifications where you are,
+  its SMS, its calls with the voice on the computer (Cursio is the hands-free
+  unit, over Bluetooth), its sound and microphone, its storage and gallery, and
+  its whole screen in a window you drive with the mouse — scrcpy without ADB
 - Update itself: a signed build offered by a machine you trust installs side by
   side and rolls back if it does not come up
 
@@ -43,7 +47,7 @@ launched on.**
 | **Linux** (Wayland, X11) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Windows 11** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **macOS 13+** | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | serve only | ❌ | ✅ |
-| **Android** (arm64) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Android** (arm64) | touchpad | share sheet | its screen | ❌ | ❌ | ✅ | serve only | ❌ | ❌ |
 
 - **Linux**: capture goes through the `InputCapture` portal + libei on
   Wayland and evdev on X11. Window capture uses the ScreenCast portal, so what
@@ -60,9 +64,17 @@ launched on.**
   peers' remote-screen requests, and serves its own volumes but cannot mount a
   peer's. Input needs the
   Accessibility permission, window capture the Screen Recording one.
-- **Android**: the mesh core only — it pairs, holds links and appears as a
-  peer. No module has an Android backend yet, and its battery and network are
-  not read yet either (peers see them as unknown, not as zero).
+- **Android** (API 28+): the app in `app/` with the node linked in, kept alive
+  as a `connectedDevice` foreground service. It plays peers' sound and offers
+  its own and its microphone (AAudio), serves its shared storage and gallery,
+  shows its screen on the computers you pick — the one you were at last
+  first — and is driven from there through an accessibility service you turn
+  on once. Notifications reach only the computer you are at; SMS are read and
+  sent from a computer; calls ring there, and on Linux their voice too, with
+  Cursio as the phone's Bluetooth hands-free unit and speaker (`cursio
+  bluetooth install`). With the network gone it keeps the link over
+  Bluetooth. It reports battery and network; it does not view windows, mount
+  disks or share USB.
 
 ## Core concepts
 
@@ -227,7 +239,7 @@ cargo xtask install            # build + copy cursio, clipd, cursio-app to ~/.lo
 cargo xtask run                # build and run `cursio mesh --send-input --clipboard`, restarting on crash
 cargo xtask windows            # cross-compile the .exe(s) from Linux (MSVC)
 cargo xtask macos              # build on a Mac
-cargo xtask android            # the mesh core for arm64 (needs ANDROID_NDK_HOME, cargo-ndk)
+cargo xtask android            # the phone app as an arm64 APK (needs ANDROID_HOME, ANDROID_NDK_HOME, bun)
 cargo xtask stage ubuntu24     # an Ubuntu 24.04 build, in docker
 cargo xtask publish            # stage host + Windows + Ubuntu 24.04, sign, offer to the mesh
 cargo xtask logs --follow      # print the log dir and tail the current log
@@ -306,11 +318,14 @@ platform crates → binaries:
 - `crates/files` — serving volumes and mounting a peer's
 - `crates/usb` — USB/IP export and import, and who holds a device
 - `crates/clipboard-core` — clipboard backends, shared with `clipd`
-- `crates/android` — the JNI library an Android app loads to run a node
+- `crates/android` — the phone's node and its JNI entry points, plus the
+  Kotlin service, plugin and backends (`plugin/`)
+- `crates/bluetooth` — Cursio as a phone's hands-free unit and A2DP speaker,
+  and the mesh's Bluetooth channel
 - `crates/airplay` — the AirPlay receiver, deliberately outside the mesh
 - `crates/logging` — console + rotating-file logging shared by every binary
 - `crates/xtask` — build/install/cross-compile automation
-- `app` — the Tauri desktop UI
+- `app` — the Tauri UI: the desktop window and tray, and the whole phone app
 - `apps/clipd` — standalone Linux clipboard history popup (GTK4/libadwaita)
 - `native/` — vendored FairPlay C, the Windows audio driver, and the GNOME
   extension used for drag detection
@@ -322,6 +337,8 @@ Platform crates are **mechanism**; the matching `*_session.rs` in `core` is
 [platform](docs/platform-design.md), [input](docs/input-design.md),
 [audio](docs/audio-design.md), [clipboard](docs/clipboard-design.md),
 [window transfer](docs/window-transfer-design.md), [USB](docs/usb-design.md),
+[messages](docs/messages-design.md), [calls](docs/calls-design.md),
+[media](docs/media-design.md), [gallery](docs/gallery-design.md),
 [updates](docs/update-design.md), [live testing](docs/live-test.md).
 
 ## Limitations (v0.x)
@@ -336,12 +353,13 @@ Platform crates are **mechanism**; the matching `*_session.rs` in `core` is
 
 **Done** — encrypted mesh, input proxy, drag-to-edge window transfer,
 per-application audio, clipboard, file sharing, USB sharing, remote screens
-for screen-sharing apps, AirPlay receiver, signed self-update, the mesh core
-on Android.
+for screen-sharing apps, AirPlay receiver, signed self-update, the phone as a
+full peer (audio, microphone, storage, gallery, notifications, SMS, calls,
+media control, its screen driven from a computer, Bluetooth fallback).
 
-**Next** — displaying a peer's window on macOS, macOS audio, Android modules
-(input, clipboard, files) and battery/network status, VideoToolbox encoding,
-compositor integrations.
+**Next** — displaying a peer's window on macOS, macOS audio, the Windows audio
+driver in service, calls' voice on Windows, the phone's clipboard in the
+background, VideoToolbox encoding, compositor integrations.
 
 **Mounting a peer's disks on macOS** — through a localhost NFSv3 server inside
 Cursio, mounted by the system's own NFS client, rather than through FUSE:

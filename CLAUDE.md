@@ -120,7 +120,7 @@ Platform crates are **mechanism**; the matching `*_session.rs` in `core` is **po
 Every node listens for peers dialling in *and* dials the known peers that are down. `serve`/`connect` were two halves of one behaviour; `mesh` is that behaviour.
 
 - `registry.rs` — the durable known-peer set (seeded from the trust store) plus transient `PeerState`. A peer going away flips to `Offline`; it is never removed. Only the user removing a machine (`cursio forget`, the app's peer menu, `core/src/forget.rs`) takes one out, together with its trust-store key.
-- `mesh.rs` — dial targets, sweep interval, reconnection. `should_dial` breaks the tie so two nodes don't dial each other simultaneously.
+- `mesh.rs` — dial targets, sweep interval, reconnection. `should_dial` breaks the tie so two nodes don't dial each other simultaneously — but the waiting side still calls after `YIELD_GRACE`, so two links do form; `PeerRegistry::claim_link` keeps one per peer, chosen identically on both ends by `LinkShape::beats`, and only the link holding the peer may take it offline.
 - `link.rs` — everything between "there is a socket" and "a session can start": `Hello` → SPAKE2 pairing on first meeting (or the stored key) → Noise `NNpsk0` → module negotiation → cursor ownership.
 - `session.rs` — `Hello` version check, then the heartbeat/pump loop.
 
