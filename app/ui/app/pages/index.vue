@@ -49,16 +49,7 @@ function isPinned(key: ModuleSwitch) {
 
 const { battery, network } = useMachineText()
 
-/** What the peer's menu offers depends on what the link carries. */
-function peerRef(p: PeerView) {
-  const link = p.presence === "online" ? p.link : null
-  return {
-    id: p.id,
-    name: p.name,
-    presence: p.presence,
-    screen: link?.device_kind === "Phone" && link.modules.includes("window"),
-  }
-}
+const peerRef = peerRefOf
 
 function presenceTone(p: PeerView) {
   return p.presence === "online" ? "success" : p.presence === "connecting" ? "brand" : "neutral"

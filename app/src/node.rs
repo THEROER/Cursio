@@ -873,6 +873,13 @@ pub mod commands {
             .await
     }
 
+    /// Make a connected phone ring until it is found.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn node_ring(link: State<'_, NodeLink>, phone: String) -> Result<Reply, NodeError> {
+        link.request(Command::Ring { peer: phone }).await
+    }
+
     /// Off the window's thread: `systemctl` or a process spawn can take a
     /// noticeable moment, and a synchronous command would freeze the window
     /// for it.

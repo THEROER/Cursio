@@ -8,6 +8,21 @@ export interface PeerRef {
   presence?: "online" | "connecting" | "offline"
   /** A phone linked with the window module, whose screen can open here. */
   screen?: boolean
+  /** A phone linked with notifications, which can be rung to be found. */
+  ring?: boolean
+}
+
+/** What a peer's menu offers depends on what its link carries now. */
+export function peerRefOf(p: import("~/composables/useNode").PeerView): PeerRef {
+  const link = p.presence === "online" ? p.link : null
+  const phone = link?.device_kind === "Phone"
+  return {
+    id: p.id,
+    name: p.name,
+    presence: p.presence,
+    screen: phone && link!.modules.includes("window"),
+    ring: phone && link!.modules.includes("notify"),
+  }
 }
 
 // One removal at a time, whichever card, node or list asked for it: the
@@ -49,6 +64,20 @@ export function usePeerMenu() {
             toast.success(t("peerMenu.screenAsked", { name: peer.name }))
           } catch (e) {
             toast.failure(e, { title: t("peerMenu.screenFailed", { name: peer.name }) })
+          }
+        },
+      })
+    }
+    if (peer.ring && !isMobile.value) {
+      list.push({
+        label: t("peerMenu.ring"),
+        icon: "lucide:bell-ring",
+        onSelect: async () => {
+          try {
+            await invoke("node_ring", { phone: peer.name })
+            toast.success(t("peerMenu.ringing", { name: peer.name }))
+          } catch (e) {
+            toast.failure(e, { title: t("peerMenu.ringFailed", { name: peer.name }) })
           }
         },
       })

@@ -237,6 +237,7 @@ pub fn run() {
             node::commands::file_send,
             node::commands::node_call,
             node::commands::node_phone_screen,
+            node::commands::node_ring,
             node::commands::node_status,
             node::commands::node_config,
             node::commands::node_set_module,
