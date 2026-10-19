@@ -157,3 +157,7 @@ required-features = ["linux-probes"]
 [[example]]
 name = "portal_probe"
 required-features = ["linux-probes"]
+
+[[example]]
+name = "surrogate_cycle"
+required-features = ["linux-probes"]

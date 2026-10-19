@@ -27,6 +27,15 @@
 //! but [`Surrogate`] is driven from the session task. So GTK runs on a
 //! **dedicated thread** and only channels cross the boundary, the same shape as
 //! the capture side: frames in, input and acks out.
+//!
+//! **One** thread for the whole process, started with the first window and
+//! never ended. It was one per window, and GTK refuses that twice over: it may
+//! be initialised on one thread only, so every window after the first in a
+//! process panicked in `gtk::init` ("surrogate thread ended before signalling
+//! readiness"); and the first window, closed by ending its thread's loop, never
+//! left the screen — destroying it only queues the request to the compositor,
+//! and with no loop left to flush it the dead window stayed up until the node
+//! was killed. A window now ends by stopping its own tick; the loop goes on.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -298,20 +307,17 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
 
     let meta = meta.clone();
     let thread_meta = meta.clone();
-    std::thread::Builder::new()
-        .name(format!("cursio-surrogate-{}", meta.id))
-        .spawn(move || {
-            gtk_thread(
-                thread_meta,
-                cmd_rx,
-                input_tx,
-                presented_tx,
-                resized_tx,
-                ready_tx,
-                thread_wants_keyframe,
-            )
-        })
-        .map_err(|e| WindowError::Backend(format!("spawn surrogate thread: {e}")))?;
+    gtk_context()?.invoke(move || {
+        build_window(
+            thread_meta,
+            cmd_rx,
+            input_tx,
+            presented_tx,
+            resized_tx,
+            ready_tx,
+            thread_wants_keyframe,
+        )
+    });
 
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(GtkSurrogate {
@@ -329,9 +335,40 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
         }),
         Ok(Err(e)) => Err(WindowError::Backend(e)),
         Err(_) => Err(WindowError::Backend(
-            "surrogate thread ended before signalling readiness".into(),
+            "the gtk thread dropped the window before it was shown".into(),
         )),
     }
+}
+
+/// The main context of the process's one GTK thread, starting it on first use.
+///
+/// A failed start (no display yet, at login) is not remembered: GTK counts as
+/// initialised only once `gtk::init` succeeds, so the next window may try
+/// again on a new thread.
+fn gtk_context() -> Result<glib::MainContext, WindowError> {
+    static CONTEXT: std::sync::Mutex<Option<glib::MainContext>> = std::sync::Mutex::new(None);
+    let mut context = CONTEXT.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(context) = context.as_ref() {
+        return Ok(context.clone());
+    }
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("cursio-gtk".into())
+        .spawn(move || {
+            if let Err(e) = gtk::init() {
+                let _ = started_tx.send(Err(format!("gtk init: {e}")));
+                return;
+            }
+            let _ = started_tx.send(Ok(glib::MainContext::default()));
+            glib::MainLoop::new(None, false).run();
+        })
+        .map_err(|e| WindowError::Backend(format!("spawn the gtk thread: {e}")))?;
+    let started = started_rx
+        .recv()
+        .map_err(|_| WindowError::Backend("the gtk thread ended while starting".into()))?
+        .map_err(WindowError::Backend)?;
+    *context = Some(started.clone());
+    Ok(started)
 }
 
 /// A window's size for a picture of `width`×`height`: as large as the picture,
@@ -449,8 +486,12 @@ fn spawn_video(
     VideoThread { packets, pictures }
 }
 
-/// The GTK thread: owns the window, the framebuffer, and the main loop.
-fn gtk_thread(
+/// Build one window on the GTK thread, with the tick that feeds it.
+///
+/// The window lives as long as its tick: the tick owns the command receiver,
+/// the decoder and the senders back to the session, so ending it is what tells
+/// the session the window is gone.
+fn build_window(
     meta: WindowMeta,
     mut commands: mpsc::UnboundedReceiver<SurrogateCommand>,
     input_tx: mpsc::UnboundedSender<WindowInput>,
@@ -459,11 +500,6 @@ fn gtk_thread(
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
     wants_keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    if let Err(e) = gtk::init() {
-        let _ = ready_tx.send(Err(format!("gtk init: {e}")));
-        return;
-    }
-
     let id = meta.id;
     let fb = Rc::new(RefCell::new(Framebuffer::new(meta.width, meta.height)));
 
@@ -509,10 +545,9 @@ fn gtk_thread(
     // Started on the first video packet, so a purely lossless stream never
     // has one.
     let mut video: Option<VideoThread> = None;
-    // Created before the timeout so the tick can end the loop itself; `run()` is
-    // called further down once the window is up.
-    let quit = glib::MainLoop::new(None, false);
-    let quit_for_cmds = quit.clone();
+    // Raised when the user closes the window, so the tick ends with it.
+    let closed = Rc::new(std::cell::Cell::new(false));
+    let closed_for_tick = closed.clone();
     // Below GTK's input and redraw priorities. A phone's H.264 decoded here
     // takes a tick past 100 ms, and at the default priority — the same as
     // input — a tick re-armed every 4 ms kept the loop busy for good: the
@@ -527,6 +562,10 @@ fn gtk_thread(
             // the desktop's "wait / force quit" dialog reports. A threshold log names
             // the culprit instead of leaving "it froze" to guesswork.
             let tick_started = std::time::Instant::now();
+            if closed_for_tick.get() {
+                tracing::info!(id, "surrogate window closed here");
+                return glib::ControlFlow::Break;
+            }
 
             let mut painted = false;
             let mut presented_seq: Option<u32> = None;
@@ -562,17 +601,9 @@ fn gtk_thread(
                     }
                     Ok(SurrogateCommand::Close(reason)) => {
                         tracing::info!(?reason, id, "surrogate window closing");
-                        main_loop_window.close();
-                        // Quit the loop explicitly.
-                        //
-                        // `ControlFlow::Break` only stops THIS timeout, and
-                        // `window.close()` merely *requests* a close — it does not
-                        // raise `close-request`, which is what `quit()` was wired to.
-                        // So the GTK main loop kept running with nothing left to
-                        // service it: the window stayed on screen and stopped
-                        // answering the compositor, which the desktop reports as
-                        // "GTK Application is not responding" with wait/force-quit.
-                        quit_for_cmds.quit();
+                        // `destroy`, not `close`: a close is a request the window
+                        // may answer, and this one has to go.
+                        main_loop_window.destroy();
                         return glib::ControlFlow::Break;
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
@@ -580,8 +611,7 @@ fn gtk_thread(
                         // Session gone (peer disconnected, process shutting down):
                         // same teardown as an explicit Close.
                         tracing::info!(id, "surrogate command channel closed; tearing down");
-                        main_loop_window.close();
-                        quit_for_cmds.quit();
+                        main_loop_window.destroy();
                         return glib::ControlFlow::Break;
                     }
                 }
@@ -639,17 +669,12 @@ fn gtk_thread(
         },
     );
 
-    window.present();
-    let _ = ready_tx.send(Ok(()));
-
-    // Run until the window goes away (closed by us or by the user).
-    let quit_on_close = quit.clone();
     window.connect_close_request(move |_| {
-        quit_on_close.quit();
+        closed.set(true);
         glib::Propagation::Proceed
     });
-    quit.run();
-    tracing::info!(id, "surrogate GTK thread finished");
+    window.present();
+    let _ = ready_tx.send(Ok(()));
 }
 
 /// Wire pointer, scroll, and keyboard on the surrogate into [`WindowInput`].
