@@ -76,7 +76,9 @@ struct ViewState {
 
 /// What an idle view shows — seen only in a capture app's preview, which is
 /// exactly where someone wonders why the picture is empty.
-const VIEW_HINT: &str = "Choose what to show from the Cursio icon in the notification area";
+/// It names both places the choice lives: the view's own icon, and the app
+/// tray's "Show in Discord/OBS", which hides that icon while it is attached.
+const VIEW_HINT: &str = "Choose what to show: Cursio icon → Show in Discord/OBS";
 
 /// The menu command for "show nothing"; sources use their index plus one.
 const STOP_COMMAND: usize = 0xFFFF;

@@ -17,7 +17,7 @@
 //! brings them back when the app goes, so a node on its own keeps a selector.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use cursio_core::control::{Command, ModuleSwitch, Presence, Status};
 use cursio_core::screen_views::ScreenView;
@@ -142,7 +142,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         .default_window_icon()
         .cloned()
         .ok_or_else(|| tauri::Error::AssetNotFound("the bundle has no window icon".into()))?;
-    let items = Items {
+    let items = Arc::new(Items {
         app: app.clone(),
         menu: menu.clone(),
         summary,
@@ -150,7 +150,8 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         switches: switches.clone(),
         start,
         screens: Mutex::new((None, Vec::new())),
-    };
+    });
+    let clicked = items.clone();
 
     TrayIconBuilder::with_id("cursio")
         .icon(icon)
@@ -173,6 +174,13 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 }
                 "quit" => app.exit(0),
                 id if id.starts_with(SCREEN_ID) => {
+                    // The native menu ticks a check item on its own when it is
+                    // clicked, so the marks would show the click rather than
+                    // what the view shows — a pick that fails, or "Show
+                    // nothing" clicked while nothing is shown, changes no
+                    // state and so never rebuilds the menu. Rebuild it now;
+                    // the pick's outcome rebuilds it again.
+                    rebuild_screens(&clicked);
                     let Some((peer, source)) = parse_screen_id(id) else {
                         return;
                     };
@@ -290,6 +298,15 @@ fn refresh(items: &Items, status: Option<Status>) {
         let _ = item.set_checked(on);
         let _ = item.set_enabled(true);
     }
+}
+
+/// Rebuild the remote-screen submenu from the views it was last built from.
+fn rebuild_screens(items: &Items) {
+    let views = {
+        let mut held = items.screens.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut held.1)
+    };
+    refresh_screens(items, &views);
 }
 
 /// Rebuild the remote-screen submenu when the views or their sources change:
