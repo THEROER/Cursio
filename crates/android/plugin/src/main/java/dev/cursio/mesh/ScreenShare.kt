@@ -76,8 +76,7 @@ class ScreenShare private constructor(
         // Android 14 refuses a virtual display to a projection with no
         // callback registered first.
         projection.registerCallback(projectionStopped, handler)
-        val size = measure()
-        val surface = configure(size)
+        val (size, surface) = configureFitted()
         display = projection.createVirtualDisplay(
             "cursio-screen",
             size.width,
@@ -91,8 +90,17 @@ class ScreenShare private constructor(
         displays.registerDisplayListener(turned, handler)
     }
 
-    /** The display's size now, scaled so its long side fits [MAX_LONG_SIDE]. */
-    private fun measure(): Size {
+    /**
+     * The display's size now, scaled so its long side fits [MAX_LONG_SIDE],
+     * each side the nearest multiple of [step].
+     *
+     * Nearest, not rounded down: a 1220×2712 screen rounded down to 16 was
+     * encoded at 848×1920, 1.8% narrower than the screen, so Android
+     * letterboxed the picture into it — black bands on the computer, and a
+     * tap there landing that band's height away from where it was aimed.
+     * Nearest 8 gives 864×1920, what scrcpy picks.
+     */
+    private fun measure(step: Int): Size {
         val windows = context.getSystemService(WindowManager::class.java)
         val (width, height) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val bounds = windows.maximumWindowMetrics.bounds
@@ -104,10 +112,24 @@ class ScreenShare private constructor(
             metrics.widthPixels to metrics.heightPixels
         }
         val scale = minOf(1.0, MAX_LONG_SIDE.toDouble() / maxOf(width, height))
-        // Encoders take sizes in macroblocks; a multiple of 16 is accepted by
-        // every one, where some refuse a merely even size.
-        fun fit(side: Int) = maxOf(16, (side * scale).toInt() / 16 * 16)
+        fun fit(side: Int) = maxOf(step, Math.round(side * scale / step).toInt() * step)
         return Size(fit(width), fit(height), context.resources.displayMetrics.densityDpi)
+    }
+
+    /**
+     * Measure and build the encoder, at multiples of 8 and, if the encoder
+     * refuses that, of 16 — whole macroblocks, which every encoder takes, where
+     * some refuse a size merely even.
+     */
+    private fun configureFitted(): Pair<Size, Surface> {
+        val fine = measure(8)
+        return try {
+            fine to configure(fine)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "the encoder refused ${fine.width}x${fine.height}; using whole macroblocks", e)
+            val coarse = measure(16)
+            coarse to configure(coarse)
+        }
     }
 
     /** Build an encoder for [size], start it, and answer its input surface. */
@@ -152,8 +174,13 @@ class ScreenShare private constructor(
 
             override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {}
         }, handler)
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val surface = codec.createInputSurface()
+        val surface = try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.createInputSurface()
+        } catch (e: RuntimeException) {
+            codec.release()
+            throw e
+        }
         this.codec = codec
         this.size = size
         // Before the first unit: the node opens windows at this size.
@@ -164,14 +191,15 @@ class ScreenShare private constructor(
 
     private fun resizeIfTurned() {
         if (stopped) return
-        val now = measure()
         val was = size ?: return
-        if (now.width == was.width && now.height == was.height) return
-        Log.i(TAG, "the phone turned; screen ${now.width}x${now.height}")
+        // Either step: an encoder that refused multiples of 8 runs at 16.
+        val same = listOf(measure(8), measure(16)).any { it.width == was.width && it.height == was.height }
+        if (same) return
         val old = codec
         codec = null
         releaseCodec(old)
-        val surface = configure(now)
+        val (now, surface) = configureFitted()
+        Log.i(TAG, "the phone turned; screen ${now.width}x${now.height}")
         display?.resize(now.width, now.height, now.dpi)
         display?.surface = surface
     }
