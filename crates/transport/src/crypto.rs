@@ -455,9 +455,16 @@ impl<T: Transport> EncryptedTransport<T> {
         let mut buf = vec![0u8; 1024];
         let len = hs.write_message(&[], &mut buf)?;
         Self::send_raw(inner, &buf[..len]).await?;
+        // Each step said, because a handshake that stalls says nothing else:
+        // a Bluetooth join was seen to stop here, past `Hello`, for minutes.
+        tracing::debug!(
+            kind = inner.kind(),
+            "noise: first message sent, waiting for the answer"
+        );
 
         // <- e, ee, psk (msg2)
         let msg2 = Self::recv_raw(inner).await?;
+        tracing::debug!(kind = inner.kind(), "noise: answer received");
         let mut scratch = vec![0u8; 1024];
         hs.read_message(&msg2, &mut scratch)?;
 
@@ -471,7 +478,12 @@ impl<T: Transport> EncryptedTransport<T> {
         mut hs: HandshakeState,
     ) -> Result<(TransportState, Vec<u8>), CryptoError> {
         // -> e (msg1)
+        tracing::debug!(kind = inner.kind(), "noise: waiting for the first message");
         let msg1 = Self::recv_raw(inner).await?;
+        tracing::debug!(
+            kind = inner.kind(),
+            "noise: first message received, answering"
+        );
         let mut scratch = vec![0u8; 1024];
         hs.read_message(&msg1, &mut scratch)?;
 
