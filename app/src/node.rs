@@ -152,9 +152,10 @@ impl NodeLink {
             Some(client) => client,
             None => connect().await?.0,
         };
+        let asked = command_name(&command);
         match tokio::time::timeout(deadline, client.request(command)).await {
             Err(_) => Err(NodeError::failed(format!(
-                "the node did not answer within {} s",
+                "the node did not answer `{asked}` within {} s; it may be restarting, or busy with a peer",
                 deadline.as_secs()
             ))),
             Ok(Err(e)) => Err(NodeError::NotRunning {
@@ -189,6 +190,16 @@ impl NodeLink {
             other => Err(NodeError::failed(format!("unexpected reply {other:?}"))),
         }
     }
+}
+
+/// A command's wire name (`set_config`, `status`), for saying which one went
+/// unanswered without printing its whole payload.
+#[cfg(desktop)]
+fn command_name(command: &Command) -> String {
+    serde_json::to_value(command)
+        .ok()
+        .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "a command".into())
 }
 
 /// The node in this process, once the service has started it.

@@ -264,7 +264,20 @@ export type Reply =
   | { reply: string; [key: string]: unknown }
 
 /** What the Rust side reports when a request fails. Mirrors `node::NodeError`. */
-export type NodeError = { kind: "notRunning"; message: string } | { kind: "failed"; message: string }
+/**
+ * What the node answered with when a request failed. `command` and `args` are
+ * the request itself, attached by `call`, so a report copied from the toast
+ * says what was being done and not only what went wrong.
+ */
+export type NodeError = ({ kind: "notRunning"; message: string } | { kind: "failed"; message: string }) & {
+  command?: string
+  args?: Record<string, unknown>
+}
+
+/** The machine this window belongs to, as the node last reported it. */
+export function localNodeName(): string | null {
+  return status.value?.node.name ?? null
+}
 
 export function toMillis(t: SystemTime): number {
   return t.secs_since_epoch * 1000 + Math.floor(t.nanos_since_epoch / 1e6)
@@ -335,7 +348,7 @@ export function useNode() {
     try {
       return await invoke<T>(cmd, args)
     } catch (e) {
-      throw asNodeError(e)
+      throw { ...asNodeError(e), command: cmd, args }
     }
   }
 

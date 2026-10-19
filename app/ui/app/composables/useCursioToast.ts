@@ -1,4 +1,6 @@
+import { getVersion } from "@tauri-apps/api/app"
 import { useToast, type ToastAction } from "@leavepulse/ui"
+import { localNodeName, type NodeError } from "~/composables/useNode"
 
 /** A failure stays long enough to read the node's line and decide what to do. */
 const FAILURE_DURATION_MS = 9000
@@ -9,6 +11,35 @@ export function errorText(error: unknown): string {
     return String((error as { message: unknown }).message)
   }
   return String(error)
+}
+
+/**
+ * Everything worth pasting into a bug report: what was being done (the title,
+ * the command and its arguments — which peer, which module, which value),
+ * where (this machine, the page, the app's version), when, and the node's own
+ * line. The line alone ("the node did not answer within 5 s") says nothing of
+ * which of a dozen requests it was about.
+ */
+async function report(title: string, error: unknown, at: Date): Promise<string> {
+  const failure = (error && typeof error === "object" ? error : {}) as Partial<NodeError>
+  let version = "unknown"
+  try {
+    version = await getVersion()
+  } catch {
+    // Outside the Tauri shell (a browser preview) there is no app version.
+  }
+  const lines = [
+    `Cursio: ${title}`,
+    `error: ${errorText(error)}`,
+    failure.kind ? `kind: ${failure.kind}` : null,
+    failure.command ? `command: ${failure.command}` : null,
+    failure.args && Object.keys(failure.args).length ? `args: ${JSON.stringify(failure.args)}` : null,
+    `machine: ${localNodeName() ?? "unknown (the node has not reported)"}`,
+    typeof location !== "undefined" ? `page: ${location.pathname}${location.hash}` : null,
+    `app: ${version}`,
+    `at: ${at.toISOString()} (local ${at.toLocaleString()})`,
+  ]
+  return lines.filter((line): line is string => line !== null).join("\n")
 }
 
 /**
@@ -25,6 +56,8 @@ export function useCursioToast() {
 
   function failure(error: unknown, options: { title?: string; retry?: () => unknown } = {}) {
     const detail = errorText(error)
+    const title = options.title ?? t("toast.failed")
+    const at = new Date()
     const actions: ToastAction[] = []
     if (options.retry) {
       const retry = options.retry
@@ -35,13 +68,13 @@ export function useCursioToast() {
         label: t("toast.copy"),
         icon: "lucide:copy",
         onClick: async () => {
-          await navigator.clipboard.writeText(detail)
+          await navigator.clipboard.writeText(await report(title, error, at))
           toast.success(t("toast.copied"))
         },
       })
     }
     return toast.error(detail, {
-      title: options.title ?? t("toast.failed"),
+      title,
       duration: FAILURE_DURATION_MS,
       actions,
     })
