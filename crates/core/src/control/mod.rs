@@ -441,7 +441,9 @@ impl Command {
     /// a command is answered off the connection's loop, so the status pushes
     /// and quick requests behind it are not held for seconds.
     pub fn waits_on_peer(&self) -> bool {
-        self.messages_request().is_some() || self.gallery_ask().is_some()
+        self.messages_request().is_some()
+            || self.gallery_ask().is_some()
+            || matches!(self, Command::Ring { .. })
     }
 }
 
@@ -498,6 +500,18 @@ pub async fn handle_waiting(state: &NodeState, command: Command) -> Reply {
     use cursio_protocol::messages::MessagesResponse;
     if let Some(reply) = ask_gallery(&command).await {
         return reply;
+    }
+    if let Command::Ring { peer } = &command {
+        return match crate::notify_hub::hub().ring_confirmed(peer, true).await {
+            Ok(name) => {
+                tracing::info!(phone = %name, "the phone is ringing");
+                Reply::Done
+            }
+            Err(message) => {
+                tracing::warn!(%peer, %message, "the phone did not ring");
+                Reply::Error { message }
+            }
+        };
     }
     let Some((peer, request)) = command.messages_request() else {
         return state.handle(command);

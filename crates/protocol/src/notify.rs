@@ -120,6 +120,13 @@ pub enum NotifyMsg {
     /// decode it drops it and keeps deciding by `Presence` alone, which is
     /// exactly what it did before.
     Activity { active: bool, idle_ms: u64 },
+    /// Phone -> desktop, answering [`NotifyMsg::Ring`]: the ringer was told
+    /// (`refused` is `None`), or why it was not. Without it a ring the phone
+    /// never acted on looked exactly like one it did, and "ringing" was said
+    /// of a phone that stayed silent. Added without a version bump, as
+    /// `Activity` was: a desktop that cannot decode it drops it, and one that
+    /// waits for it from an older phone says it got no answer.
+    RingAnswer { on: bool, refused: Option<String> },
 }
 
 impl NotifyMsg {

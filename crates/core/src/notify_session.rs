@@ -167,15 +167,23 @@ impl NotifyEngine {
                     actor.invoke(&key, action, reply.as_deref());
                 }
             }
-            NotifyMsg::Ring { on } => match &self.actor {
-                Some(actor) => {
-                    tracing::info!(peer = %self.peer_name, on, "asked to ring");
-                    actor.ring(on);
-                }
-                None => {
-                    tracing::warn!(peer = %self.peer_name, "asked to ring, but this machine has no ringer")
-                }
-            },
+            NotifyMsg::Ring { on } => {
+                let refused = match &self.actor {
+                    Some(actor) => {
+                        tracing::info!(peer = %self.peer_name, on, "asked to ring");
+                        actor.ring(on);
+                        None
+                    }
+                    None => {
+                        tracing::warn!(peer = %self.peer_name, "asked to ring, but this machine has no ringer");
+                        Some("this machine has no ringer".to_string())
+                    }
+                };
+                self.queued.push(NotifyMsg::RingAnswer { on, refused });
+            }
+            NotifyMsg::RingAnswer { on, refused } => {
+                hub().ring_answered(self.peer, on, refused);
+            }
         }
     }
 
@@ -396,5 +404,64 @@ impl crate::module::ModuleFactory for NotifyFactory {
             self.display.clone(),
             self.actor.clone(),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct FakeRinger {
+        rung: Mutex<Vec<bool>>,
+    }
+
+    impl NotifyActor for FakeRinger {
+        fn invoke(&self, _key: &str, _action: u8, _reply: Option<&str>) {}
+        fn dismiss(&self, _key: &str) {}
+        fn ring(&self, on: bool) {
+            self.rung.lock().unwrap().push(on);
+        }
+    }
+
+    #[test]
+    fn a_phone_answers_a_ring_after_handing_it_to_its_ringer() {
+        let ringer = Arc::new(FakeRinger::default());
+        let mut phone = NotifyEngine::new(
+            PeerId::from_u128(0x5eed),
+            "Nocturne".into(),
+            false,
+            None,
+            Some(ringer.clone()),
+        );
+        phone.on_message(NotifyMsg::Ring { on: true });
+        assert_eq!(*ringer.rung.lock().unwrap(), vec![true]);
+        assert_eq!(
+            phone.queued,
+            vec![NotifyMsg::RingAnswer {
+                on: true,
+                refused: None
+            }]
+        );
+    }
+
+    #[test]
+    fn a_machine_without_a_ringer_says_so_instead_of_staying_silent() {
+        let mut desk = NotifyEngine::new(
+            PeerId::from_u128(0x5eee),
+            "Lightmoon".into(),
+            false,
+            None,
+            None,
+        );
+        desk.on_message(NotifyMsg::Ring { on: true });
+        assert!(matches!(
+            desk.queued.as_slice(),
+            [NotifyMsg::RingAnswer {
+                refused: Some(_),
+                ..
+            }]
+        ));
     }
 }

@@ -84,7 +84,12 @@ struct Link {
     /// Only a phone rings; a desktop asked to would say nothing, and silence
     /// reads as "it is ringing somewhere I cannot hear".
     phone: bool,
+    /// Who waits for this phone's answer to a ring.
+    ring_waiting: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 }
+
+/// How long a ring waits for the phone to say it rang.
+const RING_ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 /// This machine's notifications, on their way to its links.
 #[derive(Default)]
@@ -119,9 +124,43 @@ impl NotifyHub {
                 activity: None,
                 name: name.to_string(),
                 phone,
+                ring_waiting: None,
             },
         );
         (rx, token)
+    }
+
+    /// Ring `peer` (or stop it) and wait for the phone to say it did.
+    ///
+    /// "Ringing" used to be answered the moment the message was queued, so a
+    /// phone that never acted on it read as one ringing out of earshot.
+    pub async fn ring_confirmed(&self, peer: &str, on: bool) -> Result<String, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let name = self.ring_with(peer, on, Some(tx))?;
+        match tokio::time::timeout(RING_ANSWER_WAIT, rx).await {
+            Ok(Ok(Ok(()))) => Ok(name),
+            Ok(Ok(Err(refused))) => Err(format!("{name} refused to ring: {refused}")),
+            Ok(Err(_)) => Err(format!("the link to {name} closed before it answered")),
+            Err(_) => Err(format!(
+                "{name} did not answer within {} s: its Cursio may be older, or stuck — restarting the app on the phone brings it back",
+                RING_ANSWER_WAIT.as_secs()
+            )),
+        }
+    }
+
+    /// The phone answered a ring.
+    pub fn ring_answered(&self, peer: PeerId, on: bool, refused: Option<String>) {
+        let waiting = self
+            .lock()
+            .get_mut(&peer)
+            .and_then(|l| l.ring_waiting.take());
+        match &refused {
+            None => tracing::info!(%peer, on, "the phone confirmed the ring"),
+            Some(why) => tracing::warn!(%peer, on, %why, "the phone refused to ring"),
+        }
+        if let Some(waiting) = waiting {
+            let _ = waiting.send(refused.map_or(Ok(()), Err));
+        }
     }
 
     /// Ring `peer` (an id or a name), or stop it ringing.
@@ -130,17 +169,22 @@ impl NotifyHub {
     /// connected but missing here runs a Cursio too old to ring, or has
     /// notifications switched off — said rather than sent into nothing.
     pub fn ring(&self, peer: &str, on: bool) -> Result<String, String> {
-        let links = self.lock();
-        let link = links
-            .values()
-            .find(|l| l.name.eq_ignore_ascii_case(peer))
-            .or_else(|| {
-                links
-                    .iter()
-                    .find(|(id, _)| id.to_string() == peer)
-                    .map(|(_, l)| l)
-            })
-            .filter(|l| !l.tx.is_closed())
+        self.ring_with(peer, on, None)
+    }
+
+    fn ring_with(
+        &self,
+        peer: &str,
+        on: bool,
+        waiting: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> Result<String, String> {
+        let mut links = self.lock();
+        let id = links
+            .iter()
+            .find(|(_, l)| l.name.eq_ignore_ascii_case(peer))
+            .or_else(|| links.iter().find(|(id, _)| id.to_string() == peer))
+            .filter(|(_, l)| !l.tx.is_closed())
+            .map(|(id, _)| *id)
             .ok_or_else(|| {
                 let mut phones: Vec<&str> = links
                     .values()
@@ -158,12 +202,18 @@ impl NotifyHub {
                     }
                 )
             })?;
+        let Some(link) = links.get_mut(&id) else {
+            return Err(format!("{peer} has just gone"));
+        };
         if !link.phone {
             return Err(format!("{} is not a phone; only a phone rings", link.name));
         }
         link.tx
             .send(NotifyMsg::Ring { on })
             .map_err(|_| format!("the link to {} has just closed", link.name))?;
+        if waiting.is_some() {
+            link.ring_waiting = waiting;
+        }
         Ok(link.name.clone())
     }
 
@@ -334,6 +384,40 @@ mod tests {
             posted(&mut at_laptop),
             vec![NotifyMsg::Posted(notification("k1"))]
         );
+    }
+
+    #[tokio::test]
+    async fn a_ring_is_reported_only_once_the_phone_answers() {
+        let hub = NotifyHub::default();
+        let phone = PeerId::from_u128(7);
+        let (mut to_phone, _) = hub.register(phone, "POCO", true);
+        let (ringing, asked) = tokio::join!(hub.ring_confirmed("poco", true), async {
+            let asked = to_phone.recv().await;
+            hub.ring_answered(phone, true, None);
+            asked
+        });
+        assert_eq!(asked, Some(NotifyMsg::Ring { on: true }));
+        assert_eq!(ringing, Ok("POCO".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_phone_refusing_to_ring_says_why() {
+        let hub = NotifyHub::default();
+        let phone = PeerId::from_u128(7);
+        let (_to_phone, _) = hub.register(phone, "POCO", true);
+        let (ringing, ()) = tokio::join!(hub.ring_confirmed("POCO", true), async {
+            tokio::task::yield_now().await;
+            hub.ring_answered(phone, true, Some("this machine has no ringer".into()));
+        });
+        assert!(ringing.unwrap_err().contains("no ringer"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_phone_that_never_answers_a_ring_is_not_reported_ringing() {
+        let hub = NotifyHub::default();
+        let (_to_phone, _) = hub.register(PeerId::from_u128(7), "POCO", true);
+        let error = hub.ring_confirmed("POCO", true).await.unwrap_err();
+        assert!(error.contains("did not answer"), "{error}");
     }
 
     #[test]
