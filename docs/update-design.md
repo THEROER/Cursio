@@ -145,6 +145,13 @@ and sha256, and then installed into `versions/` through phase 1's `install`.
 The store keeps them, so the receiver can serve the next machine; a machine
 fetches only its own platform, and relays what it holds.
 
+An offered build already in `versions/` — installed by hand with `cursio update
+install`, or fetched by a run that stopped before switching — is not fetched
+again but is ready all the same, so policy switches to it. Skipping it, as the
+agent first did, left a machine on its older build for good. The exception is
+a build named by `previous`: that is where a rollback leaves the one that did
+not come up, and offering it again must not switch back to it.
+
 **A platform is where a build runs, not just an OS.** On Windows it is
 `windows-x86_64`. On Linux the node links the system's FFmpeg by soname, and
 that soname follows FFmpeg's major version: a build from Ubuntu 25.10

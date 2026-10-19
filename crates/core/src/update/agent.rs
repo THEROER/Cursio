@@ -182,6 +182,34 @@ impl Agent {
             }
         };
         let version = statement.version.clone();
+        let newest = self.newest_known();
+        let installed_here = self.layout.installed().contains(&version);
+        // A build already in `versions` but not running — put there by hand
+        // with `cursio update install`, or fetched by a run that stopped
+        // before switching — is not fetched again, and used to be skipped
+        // outright, so the node stayed on its older build for good. It is as
+        // ready as one just fetched. Not when it is `previous`: that is where
+        // a rollback leaves a build that did not come up, and switching to it
+        // again would only fail again.
+        if installed_here
+            && statement.published_at > newest
+            && self.layout.previous().as_deref() != Some(version.as_str())
+        {
+            let state = self.state();
+            let fresh = version != state.status.running
+                && !state.given_up.contains(&version)
+                && state
+                    .status
+                    .ready
+                    .as_ref()
+                    .is_none_or(|r| r.published_at < statement.published_at);
+            drop(state);
+            if fresh {
+                tracing::info!(%version, %from, "an offered build is already installed here; ready to switch to it");
+                self.mark_ready(&version, from, statement.published_at);
+            }
+            return Decision::Skip;
+        }
         let mut state = self.state();
         if state.given_up.contains(&version)
             || state.fetching.is_some()
@@ -245,18 +273,24 @@ impl Agent {
     /// Every file arrived and checked out: install it, then act on policy.
     pub fn installed(&self, statement: &Statement, from: &str) {
         let version = statement.version.clone();
+        release(&mut self.state(), &version);
+        diagnostics::clear(FAILED);
+        tracing::info!(%version, %from, "installed a build from the mesh");
+        self.mark_ready(&version, from, statement.published_at);
+    }
+
+    /// `version`, installed, is the one to switch to: under `auto` at the
+    /// next quiet moment, under `ask` when the person says so.
+    fn mark_ready(&self, version: &str, from: &str, published_at: u64) {
         {
             let mut state = self.state();
-            release(&mut state, &version);
             state.status.ready = Some(Ready {
-                version: version.clone(),
+                version: version.to_owned(),
                 from: from.to_owned(),
-                published_at: statement.published_at,
+                published_at,
             });
             state.status.last = Some(format!("installed {version} from {from}"));
         }
-        diagnostics::clear(FAILED);
-        tracing::info!(%version, %from, "installed a build from the mesh");
         if self.config().policy == UpdatePolicy::Ask {
             diagnostics::raise(Problem {
                 id: READY.into(),
@@ -512,6 +546,45 @@ mod tests {
         driving.set(true);
         assert_eq!(agent.tick(), None);
         assert!(agent.status().waiting_for.unwrap().contains("cursor"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A version directory as `cursio update install` leaves it.
+    fn install_by_hand(root: &std::path::Path, version: &str) {
+        let dir = root.join("versions").join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+    }
+
+    #[test]
+    fn a_build_installed_by_hand_is_switched_to_when_a_peer_offers_it() {
+        let root = scratch("by-hand");
+        let key = BuilderKey::from_seed([5; 32]);
+        let agent = agent_at(&root, &key, UpdatePolicy::Ask);
+        install_by_hand(&root, "0.4.0+d");
+        let o = offer(&key, "0.4.0+d", 9);
+        assert!(
+            matches!(agent.consider(&o, "a"), Decision::Skip),
+            "already installed: nothing to fetch"
+        );
+        assert_eq!(agent.status().ready.unwrap().version, "0.4.0+d");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_build_a_rollback_left_behind_is_not_switched_to_again() {
+        let root = scratch("rolled-back");
+        let key = BuilderKey::from_seed([5; 32]);
+        let agent = agent_at(&root, &key, UpdatePolicy::Auto);
+        install_by_hand(&root, "0.4.0+old");
+        install_by_hand(&root, "0.5.0+broken");
+        let layout = InstallLayout::at(&root);
+        layout.activate("0.5.0+broken").unwrap();
+        layout.activate("0.4.0+old").unwrap();
+        assert_eq!(layout.previous().as_deref(), Some("0.5.0+broken"));
+        let o = offer(&key, "0.5.0+broken", 9);
+        assert!(matches!(agent.consider(&o, "a"), Decision::Skip));
+        assert!(agent.status().ready.is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
