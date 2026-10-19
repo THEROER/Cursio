@@ -531,7 +531,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             let Some(surrogate) = self.viewed.get_mut(&id) else {
                 continue;
             };
-            let mut gone = false;
+            let mut gone = surrogate.is_gone();
             for _ in 0..MAX_INPUT_PER_PUMP {
                 match surrogate.input().try_recv() {
                     Ok(input) => outbound.push(Message::WindowInput(input)),
@@ -1780,6 +1780,32 @@ mod tests {
         let mut tx = RecordingTx::default();
         eng.pump(&mut tx).await.unwrap();
         assert!(tx.control().contains(&WindowMsg::KeyframeRequest { id: 9 }));
+    }
+
+    #[tokio::test]
+    async fn a_window_closed_while_its_input_is_held_still_tells_the_host() {
+        let (_frames_tx, frames_rx) = frame_channel();
+        let mut eng = engine(
+            FakeCapture::new(frames_rx, 640, 480),
+            FakeRenderer::default(),
+        );
+        eng.handle_message(&control_frame(WindowMsg::Offer(
+            cursio_protocol::WindowMeta {
+                id: 9,
+                title: "phone — screen".into(),
+                width: 864,
+                height: 1920,
+            },
+        )));
+        eng.viewed.get_mut(&9).unwrap().gone = true;
+
+        let mut tx = RecordingTx::default();
+        eng.pump(&mut tx).await.unwrap();
+        assert!(tx.control().contains(&WindowMsg::Close {
+            id: 9,
+            reason: WindowCloseReason::ViewerClosed,
+        }));
+        assert!(eng.viewed.is_empty());
     }
 
     #[test]

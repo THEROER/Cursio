@@ -61,14 +61,11 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(1));
         } else {
             println!("close window {id} with its own button");
-            // The tick ending drops the input sender, which is how the session
-            // learns the user closed the window.
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build a runtime");
-            runtime.block_on(async { while surrogate.input().recv().await.is_some() {} });
-            println!("window {id} closed by the user");
+            // What the session polls to tell the host the window is gone.
+            while !surrogate.is_gone() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            println!("window {id} closed by the user; the host would be told now");
         }
     }
 }

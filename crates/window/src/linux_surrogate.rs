@@ -174,6 +174,11 @@ impl Surrogate for GtkSurrogate {
         &mut self.input
     }
 
+    /// The window's tick owns the command receiver and ends with the window.
+    fn is_gone(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     fn take_ack(&mut self) -> Option<WindowFrameAck> {
         while let Ok(seq) = self.presented.try_recv() {
             self.acks.note_presented(seq);
@@ -260,6 +265,13 @@ impl Surrogate for LinuxSurrogate {
         match self {
             Self::Window(w) => w.input(),
             Self::Node(n) => n.input(),
+        }
+    }
+
+    fn is_gone(&self) -> bool {
+        match self {
+            Self::Window(w) => w.is_gone(),
+            Self::Node(n) => n.is_gone(),
         }
     }
 
@@ -527,8 +539,8 @@ fn build_window(
     // perform ourselves when adopting the host's geometry, which would bounce
     // a request straight back at the host for the size it just gave us.
     for property in ["default-width", "default-height"] {
-        let (tx, win) = (resized_tx.clone(), window.clone());
-        window.connect_notify_local(Some(property), move |_, _| {
+        let tx = resized_tx.clone();
+        window.connect_notify_local(Some(property), move |win, _| {
             let (w, h) = (win.default_width(), win.default_height());
             if w > 0 && h > 0 {
                 let _ = tx.send((w as u32, h as u32));
@@ -691,6 +703,10 @@ fn attach_input_controllers(
     input_tx: mpsc::UnboundedSender<WindowInput>,
     fb: Rc<RefCell<Framebuffer>>,
 ) {
+    // The handlers hold the picture weakly: a controller owned by the picture
+    // holding it strongly is a cycle, which kept a closed window — its
+    // framebuffer and the senders of its input — alive for the process's life.
+
     /// Map a widget-local point onto host pixels.
     fn to_host(
         picture: &gtk::Picture,
@@ -710,8 +726,9 @@ fn attach_input_controllers(
     // Pointer motion.
     let motion = gtk::EventControllerMotion::new();
     {
-        let (tx, pic, fb) = (input_tx.clone(), picture.clone(), fb.clone());
+        let (tx, pic, fb) = (input_tx.clone(), picture.downgrade(), fb.clone());
         motion.connect_motion(move |_, x, y| {
+            let Some(pic) = pic.upgrade() else { return };
             let (x, y) = to_host(&pic, &fb, x, y);
             let _ = tx.send(WindowInput::PointerMove { id, x, y });
         });
@@ -723,8 +740,9 @@ fn attach_input_controllers(
     let click = gtk::GestureClick::new();
     click.set_button(0);
     {
-        let (tx, pic, fb) = (input_tx.clone(), picture.clone(), fb.clone());
+        let (tx, pic, fb) = (input_tx.clone(), picture.downgrade(), fb.clone());
         click.connect_pressed(move |g, _, x, y| {
+            let Some(pic) = pic.upgrade() else { return };
             let (x, y) = to_host(&pic, &fb, x, y);
             // Traced at both ends (see windows_input.rs) so a button that does
             // nothing on the host can be told apart from one never sent.
@@ -745,8 +763,9 @@ fn attach_input_controllers(
         });
     }
     {
-        let (tx, pic, fb) = (input_tx.clone(), picture.clone(), fb.clone());
+        let (tx, pic, fb) = (input_tx.clone(), picture.downgrade(), fb.clone());
         click.connect_released(move |g, _, x, y| {
+            let Some(pic) = pic.upgrade() else { return };
             let (x, y) = to_host(&pic, &fb, x, y);
             if let Some(button) = map_button(g.current_button()) {
                 let _ = tx.send(WindowInput::PointerButton {

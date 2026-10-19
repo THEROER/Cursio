@@ -255,6 +255,15 @@ pub trait Surrogate {
     /// [`Message::WindowInput`](cursio_protocol::Message::WindowInput).
     fn input(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<WindowInput>;
 
+    /// Whether the user closed this surrogate's window, so the host should be
+    /// told and stop streaming. The input channel closing says the same, but
+    /// only once every sender of it is dropped — which a toolkit holding on to
+    /// a closed window's handlers may never do. Default `false`, for a backend
+    /// whose input channel is the whole answer.
+    fn is_gone(&self) -> bool {
+        false
+    }
+
     /// The ack this surrogate wants to send back for rate control, if one is due
     /// — the highest `seq` it has presented since the last ack. Returns `None`
     /// when nothing new is worth reporting, so the caller sends acks sparingly

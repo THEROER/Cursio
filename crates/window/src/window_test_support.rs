@@ -162,6 +162,9 @@ pub struct FakeSurrogate {
     pub node: Option<u32>,
     /// Set by a test to stand in for a decoder waiting for a keyframe.
     pub wants_keyframe: bool,
+    /// Set by a test to stand in for a window closed while a toolkit still
+    /// holds its input senders.
+    pub gone: bool,
 }
 
 impl FakeSurrogate {
@@ -172,6 +175,10 @@ impl FakeSurrogate {
 }
 
 impl Surrogate for FakeSurrogate {
+    fn is_gone(&self) -> bool {
+        self.gone
+    }
+
     fn take_keyframe_request(&mut self) -> bool {
         std::mem::take(&mut self.wants_keyframe)
     }
@@ -247,6 +254,7 @@ impl WindowRenderer for FakeRenderer {
             picks: VecDeque::new(),
             node: None,
             wants_keyframe: false,
+            gone: false,
         })
     }
 
