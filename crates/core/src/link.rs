@@ -29,6 +29,7 @@
 use cursio_protocol::{ModuleAdvert, ModuleId};
 use cursio_transport::discovery;
 use cursio_transport::pairing::{self, Role, TrustStore};
+use cursio_transport::resume::{PathKind, ResumableLink, ResumeHandle};
 use cursio_transport::{EncryptedTransport, Transport};
 
 use crate::module::{ModuleRegistry, SessionCtx, SessionModule};
@@ -69,6 +70,9 @@ pub struct Handshake<'a> {
     /// has nothing to send, whatever the flag said. A phone sets this without
     /// any capture at all — its input comes from a touch surface.
     pub sends_input: bool,
+    /// Every session this node holds open for resumption, with anyone —
+    /// [`PeerRegistry::resumable_tags`](crate::registry::PeerRegistry::resumable_tags).
+    pub resumable: Vec<cursio_protocol::SessionTag>,
 }
 
 /// A link whose peer has said hello but which is not yet encrypted.
@@ -98,6 +102,16 @@ impl<T> Identified<T> {
     }
 }
 
+/// What the mesh makes of a connection once its peer has said who it is.
+pub enum Admit {
+    /// Bring it up as a session of its own.
+    Session,
+    /// Close it: a better link to the peer already runs.
+    Refuse,
+    /// It is a new path for this session both ends hold ([`join`]).
+    Join(ResumeHandle),
+}
+
 /// A link that is authenticated, encrypted, and ready for a session.
 pub struct Link {
     pub transport: Box<dyn Transport>,
@@ -110,6 +124,8 @@ pub struct Link {
     /// positions. The caller points capture at it: the answer is only knowable
     /// once the peer has said hello, which is after capture exists.
     pub peer_edge: Option<cursio_protocol::Edge>,
+    /// Where a later connection joins this session, should this one drop.
+    pub resume: ResumeHandle,
 }
 
 /// Say hello and work out which modules can run.
@@ -130,6 +146,7 @@ where
         plan.position,
         plan.service,
         plan.status,
+        &plan.resumable,
     )
     .await
     {
@@ -269,8 +286,11 @@ where
     };
 
     tracing::info!("establishing encrypted channel (Noise)");
+    let kind = path_kind(&transport);
     let secure = EncryptedTransport::establish(transport, &shared_key, plan.role).await?;
     tracing::info!("encrypted channel up ({})", secure.kind());
+    let tag = secure.session_tag();
+    let (transport, resume) = ResumableLink::new(secure.into_path(kind), tag);
 
     // Built from what was *negotiated*, not from local flags alone: a module the
     // peer lacks would otherwise sit here advertising into a void.
@@ -290,11 +310,49 @@ where
 
     Ok(Link {
         peer_edge,
-        transport: Box::new(secure),
+        transport: Box::new(transport),
         peer,
         modules,
         cursor,
+        resume,
     })
+}
+
+/// What a connection runs over, as a path of a session.
+fn path_kind<T: Transport>(transport: &T) -> PathKind {
+    if transport.kind() == cursio_transport::stream::BLUETOOTH {
+        PathKind::Bluetooth
+    } else {
+        PathKind::Network
+    }
+}
+
+/// Join a connection to the session `resume` names, which both greetings
+/// offered: encrypt it with the pair's stored key and carry on over it. The
+/// session's modules are not built again — they never stopped.
+pub async fn join<T>(
+    link: Identified<T>,
+    plan: &Handshake<'_>,
+    resume: &ResumeHandle,
+) -> anyhow::Result<()>
+where
+    T: Transport + 'static,
+{
+    let Identified {
+        transport, peer, ..
+    } = link;
+    let Some(trusted) = TrustStore::load()?.get(&peer.peer_id).cloned() else {
+        anyhow::bail!(
+            "peer {} offered to resume a session but is not trusted",
+            peer.peer_id
+        );
+    };
+    let kind = path_kind(&transport);
+    let secure =
+        EncryptedTransport::establish(transport, &trusted.shared_key()?, plan.role).await?;
+    resume.attach(secure.into_path(kind)).await?;
+    tracing::info!(peer = %peer.display_name, ?kind, "the connection joined the running session");
+    Ok(())
 }
 
 /// What this node offers on a link.

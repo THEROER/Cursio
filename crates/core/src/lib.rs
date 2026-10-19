@@ -88,11 +88,11 @@ pub mod media_hub;
 /// This desktop's MPRIS players, and peers' players offered as MPRIS ones.
 #[cfg(target_os = "linux")]
 pub mod media_mpris;
+/// The media module on one link.
+pub mod media_session;
 /// This Windows machine's players, from the system media controls.
 #[cfg(target_os = "windows")]
 pub mod media_smtc;
-/// The media module on one link.
-pub mod media_session;
 pub mod mesh;
 /// Where a phone's messages are answered and a desktop's requests leave.
 pub mod messages_hub;
@@ -107,6 +107,8 @@ pub(crate) mod module_host;
 pub use module_host::modules_busy;
 /// The unelevated process that keeps a peer's drives where Explorer sees them.
 pub mod mount_helper;
+/// The system telling the sessions their network went away.
+pub mod network_watch;
 pub mod node_status;
 /// A phone's notifications shown through this desktop's notification server.
 /// Not showing a phone's copy of what a desktop client already showed.

@@ -145,6 +145,7 @@ fn greeting(id: &NodeIdentity, position: Position) -> PeerHello {
         position,
         service: ServiceOffer::none(),
         status: NodeStatus::unknown(),
+        resumable: Vec::new(),
     }
 }
 

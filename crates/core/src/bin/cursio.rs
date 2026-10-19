@@ -1792,6 +1792,7 @@ fn module_registry(
     }
     #[cfg(feature = "calls")]
     cursio_core::call_audio::start();
+    cursio_core::network_watch::start();
     // Players are read and shown over MPRIS. Windows' system media controls
     // are read but cannot be published to, so there the module only offers
     // this machine's players; elsewhere it is not advertised rather than
@@ -2330,34 +2331,47 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
         let reg_for_cb = registry.clone();
         let pairing_for_cb = pairing.clone();
         let live_for_cb = live.clone();
-        let mut on_identified = move |id: cursio_protocol::PeerId, name: &str| {
-            *seen.borrow_mut() = Some(id);
-            let mut reg = reg_for_cb.borrow_mut();
-            let Some(token) = reg.claim_link(id, shape, superseded_for_cb.clone()) else {
-                tracing::info!(peer = %name, ?shape, "already linked to this peer the way both sides keep; closing this second link");
-                return false;
-            };
-            claimed_for_cb.set(Some(token));
-            // An inbound peer we already trust is simply now online. One we
-            // don't know is refused by the key lookup right after this, so it
-            // never becomes a mesh member here.
-            if reg.is_known(&id) {
-                reg.set_state(id, cursio_core::registry::PeerState::Online);
-                tracing::info!(peer = %name, "peer online");
-                cursio_core::health::link_restored(id);
-            } else if pairing_for_cb.is_open() {
-                tracing::info!(peer = %name, %id, "unknown machine dialled in; pairing it");
-            } else if live_for_cb.is_forgotten(&id) {
-                // It still trusts us and calls every sweep; one line says why
-                // it gets nowhere, the rest would only bury the log.
-                if cursio_core::forget::note_refused_call(id) {
-                    tracing::info!(peer = %name, "a machine removed from this mesh keeps calling; refusing it until it is paired again");
+        // A connection that joined a running session hands over to it and
+        // leaves nothing of its own to clean up.
+        let joined = std::rc::Rc::new(std::cell::Cell::new(false));
+        let joined_for_cb = joined.clone();
+        let mut on_identified =
+            move |id: cursio_protocol::PeerId,
+                  name: &str,
+                  peer_tags: &[cursio_protocol::SessionTag]| {
+                *seen.borrow_mut() = Some(id);
+                let mut reg = reg_for_cb.borrow_mut();
+                if let cursio_core::registry::Greeted::Join(session) = reg.greeted(id, peer_tags) {
+                    reg.set_state(id, cursio_core::registry::PeerState::Online);
+                    tracing::info!(peer = %name, "the peer called back; resuming the session");
+                    joined_for_cb.set(true);
+                    return cursio_core::link::Admit::Join(session);
                 }
-            } else {
-                tracing::warn!(peer = %name, %id, "untrusted peer dialled in; not admitted");
-            }
-            true
-        };
+                let Some(token) = reg.claim_link(id, shape, superseded_for_cb.clone()) else {
+                    tracing::info!(peer = %name, ?shape, "already linked to this peer the way both sides keep; closing this second link");
+                    return cursio_core::link::Admit::Refuse;
+                };
+                claimed_for_cb.set(Some(token));
+                // An inbound peer we already trust is simply now online. One we
+                // don't know is refused by the key lookup right after this, so it
+                // never becomes a mesh member here.
+                if reg.is_known(&id) {
+                    reg.set_state(id, cursio_core::registry::PeerState::Online);
+                    tracing::info!(peer = %name, "peer online");
+                    cursio_core::health::link_restored(id);
+                } else if pairing_for_cb.is_open() {
+                    tracing::info!(peer = %name, %id, "unknown machine dialled in; pairing it");
+                } else if live_for_cb.is_forgotten(&id) {
+                    // It still trusts us and calls every sweep; one line says why
+                    // it gets nowhere, the rest would only bury the log.
+                    if cursio_core::forget::note_refused_call(id) {
+                        tracing::info!(peer = %name, "a machine removed from this mesh keeps calling; refusing it until it is paired again");
+                    }
+                } else {
+                    tracing::warn!(peer = %name, %id, "untrusted peer dialled in; not admitted");
+                }
+                cursio_core::link::Admit::Session
+            };
 
         // Whichever way the call went, the password only matters on a first
         // meeting: `link::establish` uses the trust store when it has an entry
@@ -2365,6 +2379,19 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
         // either can be the one that dialled a stranger — the mesh calls a
         // machine it has never met while `--pair` is open, and used to leave
         // this empty on the assumption that a dialled peer is always trusted.
+        let resumable = registry.borrow().resumable_tags();
+        let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let held_for_cb = held.clone();
+        let reg_for_secured = registry.clone();
+        let identified_for_secured = identified.clone();
+        let mut on_secured = move |resume: &cursio_transport::resume::ResumeHandle| {
+            *held_for_cb.borrow_mut() = Some(resume.clone());
+            if let Some(id) = *identified_for_secured.borrow() {
+                reg_for_secured
+                    .borrow_mut()
+                    .hold_session(id, resume.clone());
+            }
+        };
         let session = run_pairing_and_session(
             transport,
             identity,
@@ -2378,6 +2405,8 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
             &modules,
             offer,
             Some(&mut on_identified),
+            resumable,
+            &mut on_secured,
         );
         // Dropping the session is how a phone already leaves its Bluetooth
         // link for the network; a link replaced by a better one ends the same
@@ -2391,6 +2420,22 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
         };
 
         let who = *identified.borrow();
+        if joined.get() {
+            match &result {
+                Ok(()) => tracing::debug!("the connection now carries the running session"),
+                Err(e) => {
+                    tracing::info!(error = %e, "a connection could not join the running session")
+                }
+            }
+            return;
+        }
+        // The session is over, whichever way: nothing may join it now.
+        if let Some(resume) = held.borrow_mut().take() {
+            resume.end("the session ended");
+            if let Some(id) = who {
+                registry.borrow_mut().session_ended(id, resume.tag());
+            }
+        }
         let unlinked = who.is_none_or(|id| registry.borrow_mut().release_link(id, claimed.get()));
         match &result {
             Ok(()) => tracing::info!("peer session ended"),
@@ -2428,10 +2473,11 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
 /// Called once a session learns who the peer is (from the Hello handshake).
 /// The mesh uses it to mark an inbound peer online — until the handshake, a
 /// peer that dialled *us* is just an anonymous socket. Not `Send`: it reaches
-/// the mesh's own `Rc` state, which never leaves this thread. Answers `false`
-/// when the peer is already linked by a better connection, and this one
-/// should close.
-type IdentifiedCallback<'a> = dyn FnMut(cursio_protocol::PeerId, &str) -> bool + 'a;
+/// the mesh's own `Rc` state, which never leaves this thread. Given the
+/// sessions the peer holds, it answers whether this connection becomes a
+/// session, closes, or joins one already running.
+type IdentifiedCallback<'a> = dyn FnMut(cursio_protocol::PeerId, &str, &[cursio_protocol::SessionTag]) -> cursio_core::link::Admit
+    + 'a;
 
 /// Shared tail of `serve`/`connect`: Hello handshake, pair on first meeting,
 /// bring up a Noise-encrypted channel, then run heartbeats over it.
@@ -2471,6 +2517,10 @@ async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
     modules: &cursio_core::module::ModuleRegistry,
     offer: ServiceOffer,
     on_identified: Option<&mut IdentifiedCallback<'_>>,
+    // The sessions this node can resume, for the greeting.
+    resumable: Vec<cursio_protocol::SessionTag>,
+    // Told the session's resume handle once the link is secured.
+    on_secured: &mut dyn FnMut(&cursio_transport::resume::ResumeHandle),
 ) -> anyhow::Result<()> {
     // Handshake, pairing, Noise and module negotiation are the same five steps
     // for every node, so they live in `link` — the app and a phone run this
@@ -2491,6 +2541,7 @@ async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
         service: offer,
         status: status.borrow().current(),
         sends_input,
+        resumable,
     };
     let path = cursio_core::control::LinkPath::of(transport.kind());
     let identified = cursio_core::link::identify(transport, &plan).await?;
@@ -2498,8 +2549,13 @@ async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
     // inbound connection this is the first moment we know at all, and the mesh
     // wants such a peer marked online without waiting out pairing.
     if let Some(cb) = on_identified {
-        if !cb(identified.peer.peer_id, &identified.peer.display_name) {
-            return Ok(());
+        let peer = &identified.peer;
+        match cb(peer.peer_id, &peer.display_name, &peer.resumable) {
+            cursio_core::link::Admit::Session => {}
+            cursio_core::link::Admit::Refuse => return Ok(()),
+            cursio_core::link::Admit::Join(session) => {
+                return cursio_core::link::join(identified, &plan, &session).await;
+            }
         }
     }
     let stranger = !password.is_empty()
@@ -2532,6 +2588,7 @@ async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
         // Paired again after being removed: its links may stay up now.
         live.unforget(peer_id);
     }
+    on_secured(&link.resume);
     let peer = link.peer;
 
     // Now that the peer has said where it stands, capture can watch the edge

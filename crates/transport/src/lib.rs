@@ -21,6 +21,7 @@ pub mod dead_peer;
 pub mod discovery;
 pub mod pairing;
 pub mod priority;
+pub mod resume;
 mod send_backlog;
 pub mod stream;
 pub mod tcp;
@@ -165,6 +166,15 @@ pub trait TransportTx: Send {
     /// inside `send` — means the caller must share this one handle instead.
     fn clone_sender(&self) -> Option<Box<dyn TransportTx>> {
         None
+    }
+
+    /// Whether the link has lost its connection and is holding the session
+    /// open for a new one to resume it. A session hears nothing from its peer
+    /// meanwhile, which is not the peer being gone: it must not end itself
+    /// for that silence while this is true. Always `false` for a link over a
+    /// single connection, which cannot be resumed.
+    fn holding(&self) -> bool {
+        false
     }
 }
 

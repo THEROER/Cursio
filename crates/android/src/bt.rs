@@ -44,13 +44,16 @@ pub struct Dialer {
 impl Dialer {
     /// The devices to try now. `unreachable_for` is how long the longest-gone
     /// known computer has been off the network, `None` while all are on it.
+    /// `standby` asks for a Bluetooth path beside a working network one, so
+    /// it does not wait for the network to fail.
     pub fn due(
         &mut self,
         paired: &[Paired],
         unreachable_for: Option<Duration>,
+        standby: bool,
         now: Instant,
     ) -> Vec<Paired> {
-        if !unreachable_for.is_some_and(|gone| gone >= NETWORK_GRACE) {
+        if !standby && !unreachable_for.is_some_and(|gone| gone >= NETWORK_GRACE) {
             return Vec::new();
         }
         let due: Vec<Paired> = paired
@@ -165,7 +168,18 @@ mod tests {
     #[test]
     fn leaves_bluetooth_alone_while_the_network_reaches_everyone() {
         let mut dialer = Dialer::default();
-        assert!(dialer.due(&[pc("A")], None, Instant::now()).is_empty());
+        assert!(dialer
+            .due(&[pc("A")], None, false, Instant::now())
+            .is_empty());
+    }
+
+    #[test]
+    fn a_standby_is_dialled_while_the_network_still_works() {
+        let mut dialer = Dialer::default();
+        assert_eq!(
+            dialer.due(&[pc("A")], None, true, Instant::now()),
+            vec![pc("A")]
+        );
     }
 
     #[test]
@@ -173,10 +187,10 @@ mod tests {
         let mut dialer = Dialer::default();
         let now = Instant::now();
         assert!(dialer
-            .due(&[pc("A")], Some(Duration::from_secs(5)), now)
+            .due(&[pc("A")], Some(Duration::from_secs(5)), false, now)
             .is_empty());
         assert_eq!(
-            dialer.due(&[pc("A")], Some(NETWORK_GRACE), now),
+            dialer.due(&[pc("A")], Some(NETWORK_GRACE), false, now),
             vec![pc("A")]
         );
     }
@@ -186,18 +200,23 @@ mod tests {
         let mut dialer = Dialer::default();
         let now = Instant::now();
         let gone = Some(NETWORK_GRACE);
-        assert_eq!(dialer.due(&[pc("A")], gone, now).len(), 1);
+        assert_eq!(dialer.due(&[pc("A")], gone, false, now).len(), 1);
         assert!(dialer
-            .due(&[pc("A")], gone, now + Duration::from_secs(10))
+            .due(&[pc("A")], gone, false, now + Duration::from_secs(10))
             .is_empty());
-        assert_eq!(dialer.due(&[pc("A")], gone, now + RETRY).len(), 1);
+        assert_eq!(dialer.due(&[pc("A")], gone, false, now + RETRY).len(), 1);
     }
 
     #[test]
     fn does_not_dial_a_device_it_already_has_a_link_to() {
         let mut dialer = Dialer::default();
         dialer.set_linked("A", true);
-        let due = dialer.due(&[pc("A"), pc("B")], Some(NETWORK_GRACE), Instant::now());
+        let due = dialer.due(
+            &[pc("A"), pc("B")],
+            Some(NETWORK_GRACE),
+            false,
+            Instant::now(),
+        );
         assert_eq!(due, vec![pc("B")]);
     }
 

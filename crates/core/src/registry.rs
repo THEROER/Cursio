@@ -18,8 +18,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use cursio_protocol::PeerId;
+use cursio_protocol::{PeerId, SessionTag};
 use cursio_transport::pairing::TrustStore;
+use cursio_transport::resume::ResumeHandle;
 
 /// What we currently believe about one peer.
 #[derive(Debug, Clone)]
@@ -117,6 +118,28 @@ pub struct PeerRegistry {
     /// link was still up — which had the mesh dial it yet again.
     links: HashMap<PeerId, HeldLink>,
     next_link: u64,
+    /// The session each peer is reached by, held open while its connection
+    /// is down so a new one can join it.
+    sessions: HashMap<PeerId, HeldSession>,
+}
+
+/// A running session, as the registry holds it.
+struct HeldSession(ResumeHandle);
+
+impl std::fmt::Debug for HeldSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldSession")
+            .field("paths", &self.0.paths())
+            .finish()
+    }
+}
+
+/// What a greeting means for a peer's session.
+pub enum Greeted {
+    /// Both ends hold this session: the connection joins it.
+    Join(ResumeHandle),
+    /// No session both ends hold: the connection starts one.
+    Fresh,
 }
 
 impl PeerRegistry {
@@ -304,9 +327,84 @@ impl PeerRegistry {
     pub fn dial_candidates(&self) -> Vec<KnownPeer> {
         self.peers
             .values()
-            .filter(|p| p.dialable())
+            .filter(|p| {
+                p.dialable()
+                    || (p.addr.is_some()
+                        && self.needs_network_path(&p.peer_id)
+                        && !matches!(p.state, PeerState::Connecting))
+            })
             .cloned()
             .collect()
+    }
+
+    /// A session to `peer` is alive but has no network path: dial one, so it
+    /// resumes over the network rather than waiting out its hold or staying
+    /// on Bluetooth.
+    fn needs_network_path(&self, peer: &PeerId) -> bool {
+        self.sessions
+            .get(peer)
+            .is_some_and(|s| !s.0.is_ended() && !s.0.paths().network)
+    }
+
+    /// A session runs over the network with no Bluetooth standby beside it.
+    pub fn wants_bluetooth_standby(&self) -> bool {
+        self.sessions.values().any(|s| {
+            let paths = s.0.paths();
+            !s.0.is_ended() && paths.network && !paths.bluetooth
+        })
+    }
+
+    /// Hold `handle` as `peer`'s session.
+    pub fn hold_session(&mut self, peer: PeerId, handle: ResumeHandle) {
+        self.sessions.insert(peer, HeldSession(handle));
+    }
+
+    /// `peer`'s session tagged `tag` ended; forget it unless a newer one
+    /// replaced it already.
+    pub fn session_ended(&mut self, peer: PeerId, tag: SessionTag) {
+        if self.sessions.get(&peer).is_some_and(|s| s.0.tag() == tag) {
+            self.sessions.remove(&peer);
+        }
+    }
+
+    /// The sessions this node can resume, for its greeting.
+    pub fn resumable_tags(&self) -> Vec<SessionTag> {
+        self.sessions
+            .values()
+            .filter(|s| !s.0.is_ended())
+            .map(|s| s.0.tag())
+            .collect()
+    }
+
+    /// Decide what a connection from `peer`, holding `peer_tags`, is for.
+    ///
+    /// Both ends run this on the same two greetings, so they agree. A
+    /// session the peer no longer holds — it restarted, or gave up — is
+    /// ended here when it has no path left; one still carried by a path is
+    /// left to the duplicate rule, since the peer may simply have greeted
+    /// before that session existed.
+    pub fn greeted(&mut self, peer: PeerId, peer_tags: &[SessionTag]) -> Greeted {
+        let Some(ours) = self.sessions.get(&peer).map(|s| s.0.clone()) else {
+            return Greeted::Fresh;
+        };
+        if ours.is_ended() {
+            self.sessions.remove(&peer);
+            return Greeted::Fresh;
+        }
+        if peer_tags.contains(&ours.tag()) {
+            return Greeted::Join(ours);
+        }
+        let paths = ours.paths();
+        if !paths.network && !paths.bluetooth {
+            ours.end("the peer no longer holds this session");
+            self.sessions.remove(&peer);
+            // Its link stops holding the peer now, so the new one is not
+            // judged against a session that is over.
+            if let Some(held) = self.links.remove(&peer) {
+                held.superseded.notify_one();
+            }
+        }
+        Greeted::Fresh
     }
 
     pub fn all(&self) -> impl Iterator<Item = &KnownPeer> {
@@ -351,6 +449,86 @@ mod tests {
         let (a, b) = (peer(1), peer(2));
         assert!(should_dial(a, b));
         assert!(!should_dial(b, a));
+    }
+
+    /// A live session over a loopback connection, and the far end kept
+    /// alive beside it.
+    async fn held_session() -> (ResumeHandle, cursio_transport::resume::ResumableLink) {
+        use cursio_transport::pairing::Role;
+        use cursio_transport::resume::{PathKind, ResumableLink};
+        use cursio_transport::tcp::TcpTransport;
+        use cursio_transport::EncryptedTransport;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (dialled, accepted) = tokio::join!(TcpTransport::connect(addr), listener.accept());
+        let near = dialled.unwrap();
+        let far = TcpTransport::from_stream(accepted.unwrap().0).unwrap();
+        let key = b"both ends hold this";
+        let (near, far) = tokio::join!(
+            EncryptedTransport::establish(near, key, Role::Initiator),
+            EncryptedTransport::establish(far, key, Role::Responder),
+        );
+        let (near, far) = (near.unwrap(), far.unwrap());
+        let tag = near.session_tag();
+        let (_link, handle) = ResumableLink::new(near.into_path(PathKind::Network), tag);
+        let (far_link, _) = ResumableLink::new(far.into_path(PathKind::Network), tag);
+        (handle, far_link)
+    }
+
+    #[tokio::test]
+    async fn a_connection_joins_the_session_both_greetings_hold() {
+        let (session, _far) = held_session().await;
+        let mut reg = PeerRegistry::default();
+        reg.hold_session(peer(2), session.clone());
+        assert_eq!(reg.resumable_tags(), vec![session.tag()]);
+        assert!(matches!(
+            reg.greeted(peer(2), &[session.tag()]),
+            Greeted::Join(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_session_the_peer_lost_is_ended_once_it_has_no_path() {
+        let (session, _far) = held_session().await;
+        let mut reg = PeerRegistry::default();
+        reg.hold_session(peer(2), session.clone());
+        session.network_lost();
+        assert!(matches!(reg.greeted(peer(2), &[]), Greeted::Fresh));
+        assert!(session.is_ended(), "a session nobody can resume was kept");
+        assert!(reg.resumable_tags().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_session_still_carried_is_not_ended_by_a_greeting_that_crossed_it() {
+        let (session, _far) = held_session().await;
+        let mut reg = PeerRegistry::default();
+        reg.hold_session(peer(2), session.clone());
+        assert!(matches!(reg.greeted(peer(2), &[]), Greeted::Fresh));
+        assert!(
+            !session.is_ended(),
+            "the peer may have greeted before the session existed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_network_path_is_dialled_back() {
+        let (session, _far) = held_session().await;
+        let mut reg = PeerRegistry::default();
+        reg.admit(
+            peer(2),
+            "laptop".into(),
+            Some("127.0.0.1:9000".parse().unwrap()),
+        );
+        reg.set_state(peer(2), PeerState::Online);
+        reg.hold_session(peer(2), session.clone());
+        assert!(reg.dial_candidates().is_empty());
+        session.network_lost();
+        assert_eq!(
+            reg.dial_candidates().len(),
+            1,
+            "the session's path was not dialled back"
+        );
     }
 
     fn shape(dialled: bool, path: crate::control::LinkPath) -> LinkShape {

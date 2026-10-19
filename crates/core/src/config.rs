@@ -91,6 +91,20 @@ pub struct Config {
     pub files: FilesConfig,
     pub update: UpdateConfig,
     pub calls: CallsConfig,
+    pub bluetooth: BluetoothConfig,
+}
+
+/// A phone's Bluetooth path to its computers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BluetoothConfig {
+    /// Keep a Bluetooth path open beside the network one, so a session moves
+    /// to it within seconds when Wi-Fi drops instead of waiting for the
+    /// network to come back. Off by default: an open Bluetooth link costs
+    /// battery, and a busy one costs Wi-Fi on the shared 2.4 GHz antenna.
+    /// Without it Bluetooth still carries the session once the network has
+    /// been gone a while.
+    pub standby: bool,
 }
 
 /// Where a phone's call voice goes once this computer carries it. Read at
@@ -255,6 +269,7 @@ impl Default for Config {
             files: FilesConfig::default(),
             update: UpdateConfig::default(),
             calls: CallsConfig::default(),
+            bluetooth: BluetoothConfig::default(),
         }
     }
 }

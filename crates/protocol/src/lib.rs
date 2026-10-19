@@ -80,8 +80,16 @@ pub use window::{
 /// new builds over the frozen update lane instead of hanging up. v20 carries
 /// [`InputEvent::PointerScroll`] in [`input::SCROLL_NOTCH`]ths of a notch, so a
 /// touchpad's fractional scrolling survives the trip. v21 added
-/// [`InputEvent::GestureSwipe`] and [`InputEvent::GesturePinch`].
-pub const PROTOCOL_VERSION: u16 = 21;
+/// [`InputEvent::GestureSwipe`] and [`InputEvent::GesturePinch`]. v22 added
+/// [`Hello::resumable`] and the resumable link's sequenced frames under Noise,
+/// so a session survives its connection dropping and continues on a new one.
+pub const PROTOCOL_VERSION: u16 = 22;
+
+/// Names one live session between two nodes, the same on both ends: derived
+/// from the Noise handshake that opened it. Not a secret — a connection that
+/// offers it must still complete Noise with the pair's key before it can carry
+/// anything.
+pub type SessionTag = [u8; 16];
 
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
@@ -310,6 +318,15 @@ pub struct Hello {
     /// [`NodeStatus::unknown`], which reads as "no information" rather than as
     /// a flat battery. See [`node`].
     pub status: NodeStatus,
+    /// Every session this node is holding open for resumption, with any peer.
+    ///
+    /// Every one, not the one with the peer being greeted: a node accepting a
+    /// call does not know who is calling until this greeting arrives, and the
+    /// greetings cross. Each side looks for its own session with the other in
+    /// the other's list, so both decide the same: present on both, the
+    /// connection joins that session; missing on either, the side that held
+    /// one lets it go and a new session starts.
+    pub resumable: Vec<SessionTag>,
 }
 
 /// Payload of [`Message::Reconfigure`]: the parts of [`Hello`] a running node
@@ -343,6 +360,7 @@ impl Hello {
             position: Position::default(),
             service: ServiceOffer::none(),
             status: NodeStatus::unknown(),
+            resumable: Vec::new(),
         }
     }
 }
@@ -359,6 +377,29 @@ impl Message {
     /// Deserialize a message from raw bytes (payload without length prefix).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
         bincode::deserialize(bytes).map_err(|e| ProtocolError::Decode(e.to_string()))
+    }
+
+    /// Whether this message only describes the present, so a copy that missed
+    /// its moment is worth less than nothing: pointer motion, sound, pixels.
+    ///
+    /// A resumable link does not keep these for resending after a dropped
+    /// connection. Replayed, five seconds of buffered motion jump the cursor
+    /// by all of it at once and old sound plays over new — Mosh's lesson, that
+    /// a mobile link should deliver the latest state rather than the history.
+    /// A press or release is never lossy: one that is lost leaves a key held.
+    pub fn is_lossy(&self) -> bool {
+        use crate::window::WindowInput;
+        matches!(
+            self,
+            Message::AudioChunk(_)
+                | Message::WindowFrame(_)
+                | Message::Input(
+                    InputEvent::PointerMotion { .. } | InputEvent::PointerScroll { .. }
+                )
+                | Message::WindowInput(
+                    WindowInput::PointerMove { .. } | WindowInput::PointerScroll { .. }
+                )
+        )
     }
 
     /// Scheduling priority for this message on the shared channel.
@@ -585,10 +626,44 @@ mod tests {
                 network: Some(NetworkKind::Wifi),
                 signal_dbm: Some(-48),
             },
+            resumable: vec![[7; 16]],
         });
         let bytes = msg.to_bytes().unwrap();
         let back = Message::from_bytes(&bytes).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn only_fresh_state_is_lossy_and_every_press_and_release_is_not() {
+        use crate::window::{WindowFrame, WindowInput};
+        let motion = Message::Input(InputEvent::PointerMotion { dx: 1, dy: 1 });
+        let key = Message::Input(InputEvent::Key {
+            key: 30,
+            pressed: false,
+        });
+        let button = Message::Input(InputEvent::PointerButton {
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        assert!(motion.is_lossy());
+        assert!(!key.is_lossy());
+        assert!(!button.is_lossy());
+        assert!(Message::WindowInput(WindowInput::PointerMove { id: 1, x: 0, y: 0 }).is_lossy());
+        assert!(Message::WindowFrame(WindowFrame {
+            id: 1,
+            seq: 0,
+            dirty: crate::Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1
+            },
+            codec: crate::TileCodec::LossyVideo,
+            data: Vec::new(),
+        })
+        .is_lossy());
+        assert!(!Message::Heartbeat { nonce: 1 }.is_lossy());
+        assert!(!Message::Bye.is_lossy());
     }
 
     #[test]

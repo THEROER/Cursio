@@ -85,6 +85,16 @@ const BULK_STARVATION_LIMIT: u32 = 32;
 
 /// Map a [`Priority`] to a queue index, highest priority = lowest index so the
 /// drainer can scan `0..` and stop at the first non-empty class.
+/// [`class_index`] backwards.
+const CLASS_ORDER: [Priority; CLASS_COUNT] = [
+    Priority::Control,
+    Priority::Input,
+    Priority::Audio,
+    Priority::Video,
+    Priority::Metadata,
+    Priority::Bulk,
+];
+
 fn class_index(p: Priority) -> usize {
     match p {
         Priority::Control => 0,
@@ -190,6 +200,41 @@ impl DelayHistogram {
 struct Queued {
     frame: Vec<u8>,
     queued_at: Instant,
+    /// From a message that only matters fresh ([`Message::is_lossy`]).
+    lossy: bool,
+}
+
+/// A frame the drainer chose, on its way out.
+pub(crate) struct OutFrame {
+    pub tagged: Vec<u8>,
+    pub priority: Priority,
+    pub lossy: bool,
+}
+
+/// Where the drainer writes, one frame at a time, in the order it chose them.
+///
+/// Sealing a frame and writing it are one step here because Noise nonces must
+/// advance in exactly the order ciphertext reaches the wire. A plain link seals
+/// with its one connection's keys ([`Sealing`]); a resumable one numbers the
+/// frame, keeps it for resending, and seals it for whichever path is carrying
+/// the session at that moment ([`crate::resume`]).
+#[async_trait]
+pub(crate) trait FrameSink: Send {
+    async fn send_frame(&mut self, frame: OutFrame) -> Result<(), TransportError>;
+}
+
+/// The sink of a link over one connection.
+struct Sealing {
+    inner: Box<dyn TransportTx>,
+    noise: SharedNoise,
+}
+
+#[async_trait]
+impl FrameSink for Sealing {
+    async fn send_frame(&mut self, frame: OutFrame) -> Result<(), TransportError> {
+        let sealed = seal_frame(&self.noise, &frame.tagged)?;
+        self.inner.send(&sealed).await
+    }
 }
 
 /// The per-class frame queues, shared between the [`PrioritizedTx`] handles and
@@ -237,10 +282,15 @@ struct Queues {
 impl Queues {
     /// Queue one frame in `class`, keeping the byte count with it.
     fn push(&mut self, class: usize, frame: Vec<u8>) {
+        self.push_frame(class, frame, false);
+    }
+
+    fn push_frame(&mut self, class: usize, frame: Vec<u8>, lossy: bool) {
         self.queued_bytes[class] += frame.len();
         self.classes[class].push_back(Queued {
             frame,
             queued_at: Instant::now(),
+            lossy,
         });
     }
 
@@ -354,17 +404,54 @@ struct Shared {
 pub struct PrioritizedTx {
     shared: Arc<Shared>,
     _open: Arc<OpenHandle>,
+    /// Answers [`TransportTx::holding`] for a sink that can lose its
+    /// connection and wait for another.
+    holding: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Closes the queues when dropped, which happens once, with the last clone.
 struct OpenHandle(Arc<Shared>);
+
+/// Queues control frames of the link's own without holding the queue open:
+/// a resumable link's acknowledgements and keepalives, which must stop when
+/// the session drops its sender rather than keep the drainer alive forever.
+#[derive(Clone)]
+pub(crate) struct QueueKick(std::sync::Weak<Shared>);
+
+impl QueueKick {
+    /// Queue `tagged` ahead of everything; `false` once the queue is gone.
+    pub(crate) fn push_control(&self, tagged: Vec<u8>) -> bool {
+        let Some(shared) = self.0.upgrade() else {
+            return false;
+        };
+        {
+            let mut q = shared.queues.lock().unwrap();
+            if q.closed || q.terminal_error.is_some() {
+                return false;
+            }
+            q.push(class_index(Priority::Control), tagged);
+        }
+        shared.wake.notify_one();
+        true
+    }
+}
 
 impl PrioritizedTx {
     /// Wrap a raw inner tx + Noise state in a prioritized sender, spawning the
     /// drainer task that owns the socket. Returns the sender the session sends
     /// through; the drainer runs until the sender is dropped and the queues
     /// empty (or the socket errors).
-    pub fn spawn(mut inner: Box<dyn TransportTx>, noise: SharedNoise) -> Self {
+    pub fn spawn(inner: Box<dyn TransportTx>, noise: SharedNoise) -> Self {
+        Self::spawn_sink(Box::new(Sealing { inner, noise }))
+    }
+
+    /// A handle for queueing the link's own control frames; see [`QueueKick`].
+    pub(crate) fn kick_handle(&self) -> QueueKick {
+        QueueKick(Arc::downgrade(&self.shared))
+    }
+
+    /// As [`Self::spawn`], writing through `sink` rather than one connection.
+    pub(crate) fn spawn_sink(mut sink: Box<dyn FrameSink>) -> Self {
         let shared = Arc::new(Shared {
             queues: Mutex::new(Queues::default()),
             wake: Notify::new(),
@@ -392,18 +479,15 @@ impl PrioritizedTx {
                         let Queued {
                             frame: tagged,
                             queued_at,
+                            lossy,
                         } = queued;
                         let len = tagged.len();
-                        let sealed = match seal_frame(&noise, &tagged) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "sealing a queued frame failed");
-                                drain_shared.queues.lock().unwrap().fail(e.to_string());
-                                drain_shared.drained.notify_waiters();
-                                break;
-                            }
+                        let out = OutFrame {
+                            tagged,
+                            priority: CLASS_ORDER[class],
+                            lossy,
                         };
-                        if let Err(e) = inner.send(&sealed).await {
+                        if let Err(e) = sink.send_frame(out).await {
                             // The link is gone; nothing more can be sent. Stop.
                             tracing::debug!(error = %e, "prioritized drainer: link closed");
                             drain_shared.queues.lock().unwrap().fail(e.to_string());
@@ -442,7 +526,14 @@ impl PrioritizedTx {
         PrioritizedTx {
             _open: Arc::new(OpenHandle(shared.clone())),
             shared,
+            holding: None,
         }
+    }
+
+    /// Answer [`TransportTx::holding`] with `holding`.
+    pub(crate) fn with_holding(mut self, holding: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.holding = Some(holding);
+        self
     }
 }
 
@@ -491,6 +582,7 @@ impl TransportTx for PrioritizedTx {
         // the only work `send` does — no socket, no crypto — so the caller (the
         // session loop) returns at once and never blocks behind a bulk transfer.
         let idx = class_index(msg.priority());
+        let lossy = msg.is_lossy();
         let frames = chunk_plaintext(msg)?;
         {
             let mut q = self.shared.queues.lock().unwrap();
@@ -498,7 +590,7 @@ impl TransportTx for PrioritizedTx {
                 return Err(TransportError::Other(error.clone()));
             }
             for f in frames {
-                q.push(idx, f);
+                q.push_frame(idx, f, lossy);
             }
         }
         self.shared.wake.notify_one();
@@ -520,6 +612,10 @@ impl TransportTx for PrioritizedTx {
 
     fn clone_sender(&self) -> Option<Box<dyn TransportTx>> {
         Some(Box::new(self.clone()))
+    }
+
+    fn holding(&self) -> bool {
+        self.holding.as_ref().is_some_and(|holding| holding())
     }
 
     async fn flush(&mut self) {

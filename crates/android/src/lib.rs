@@ -405,6 +405,23 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeSmsChanged(
     })
 }
 
+/// Android lost the default network: sessions leave their network paths at
+/// once, for a Bluetooth standby where there is one.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeNetworkLost(
+    mut env: JNIEnv,
+    _this: JObject,
+) {
+    guard(&mut env, (), |_env| {
+        cursio_transport::resume::network_lost();
+        Ok(())
+    })
+}
+
 /// The phone's media sessions changed; `json` is `MediaBridge`'s list.
 ///
 /// # Safety

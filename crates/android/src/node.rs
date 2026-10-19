@@ -254,13 +254,17 @@ struct NodeCtx {
     control: NodeState,
     pairing: PairingWindow,
     shared: Arc<Shared>,
-    /// When each machine was last heard announcing itself on the network:
-    /// what tells a Bluetooth link that the network is back.
-    heard: RefCell<HashMap<PeerId, std::time::Instant>>,
     /// When to open Bluetooth links, and to which devices.
     bluetooth: RefCell<crate::bt::Dialer>,
     /// Since when each known computer has been off the network.
     unreachable_since: RefCell<HashMap<PeerId, std::time::Instant>>,
+}
+
+impl NodeCtx {
+    /// Whether the user asked for a Bluetooth standby beside the network.
+    fn standby(&self) -> bool {
+        self.control.running().bluetooth.standby
+    }
 }
 
 /// Listen, announce, dial, and run a session per link until asked to stop.
@@ -376,7 +380,6 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         control,
         pairing,
         shared: Arc::clone(&shared),
-        heard: RefCell::new(HashMap::new()),
         bluetooth: RefCell::new(crate::bt::Dialer::default()),
         unreachable_since: RefCell::new(HashMap::new()),
     });
@@ -415,7 +418,6 @@ async fn serve(node: Node) -> anyhow::Result<()> {
 
             Some(peer) = seen_rx.recv() => {
                 ctx.control.saw(peer.peer_id, &peer.display_name, peer.addr);
-                ctx.heard.borrow_mut().insert(peer.peer_id, std::time::Instant::now());
                 note_seen(&ctx.registry, &shared, &peer);
                 if !ctx.registry.borrow().is_known(&peer.peer_id) {
                     strangers.insert(peer.peer_id, Stranger {
@@ -529,12 +531,23 @@ struct LinkHold {
     token: std::cell::Cell<Option<u64>>,
     /// Woken when a better link to the same computer replaces this one.
     superseded: Rc<tokio::sync::Notify>,
+    /// This connection joined a running session, which now owns it.
+    joined: std::cell::Cell<bool>,
+    /// The session this connection started, ended with it.
+    session: RefCell<Option<cursio_transport::resume::ResumeHandle>>,
 }
 
 /// Take the computer offline after a session to it ended — unless another
 /// link to it is up, which is then its link.
 fn end_link(ctx: &NodeCtx, who: Option<PeerId>, hold: &LinkHold) {
+    if hold.joined.get() {
+        return;
+    }
     let Some(id) = who else { return };
+    if let Some(session) = hold.session.borrow_mut().take() {
+        session.end("the session ended");
+        ctx.registry.borrow_mut().session_ended(id, session.tag());
+    }
     if ctx.registry.borrow_mut().release_link(id, hold.token.get()) {
         ctx.registry.borrow_mut().mark_offline(id);
         ctx.control.link_down(&id);
@@ -563,6 +576,7 @@ async fn run_link<T: Transport + 'static>(
         // The touchpad: a phone has no capture, but its touch surface is input
         // for whichever peer it is pointed at.
         sends_input: true,
+        resumable: ctx.registry.borrow().resumable_tags(),
     };
     let path = cursio_core::control::LinkPath::of(transport.kind());
     let identified = cursio_core::link::identify(transport, &plan).await?;
@@ -570,6 +584,18 @@ async fn run_link<T: Transport + 'static>(
     let peer_name = identified.peer.display_name.clone();
     let negotiated = identified.negotiated().clone();
     who.set(Some(peer_id));
+    let greeted = ctx
+        .registry
+        .borrow_mut()
+        .greeted(peer_id, &identified.peer.resumable);
+    if let cursio_core::registry::Greeted::Join(session) = greeted {
+        hold.joined.set(true);
+        ctx.registry
+            .borrow_mut()
+            .set_state(peer_id, PeerState::Online);
+        tracing::info!(peer = %peer_name, "the computer called back; resuming the session");
+        return cursio_core::link::join(identified, &plan, &session).await;
+    }
     let shape = cursio_core::registry::LinkShape {
         dialled: matches!(role, Role::Initiator),
         path,
@@ -627,6 +653,10 @@ async fn run_link<T: Transport + 'static>(
             .set_state(peer_id, PeerState::Online);
         tracing::info!(peer = %peer_name, "paired");
     }
+    ctx.registry
+        .borrow_mut()
+        .hold_session(peer_id, link.resume.clone());
+    *hold.session.borrow_mut() = Some(link.resume.clone());
     let peer = link.peer.clone();
     let (skipped, inapplicable) = cursio_core::control::link_skips(&negotiated, peer.device_kind);
     ctx.control.link_up(
@@ -696,13 +726,17 @@ async fn dial_bluetooth(ctx: &Rc<NodeCtx>) {
         }
         since.values().map(|at| now.duration_since(*at)).max()
     };
-    if gone_for.is_none() {
+    let standby = ctx.standby() && ctx.registry.borrow().wants_bluetooth_standby();
+    if gone_for.is_none() && !standby {
         return;
     }
     let paired = tokio::task::spawn_blocking(crate::bt::paired_computers)
         .await
         .unwrap_or_default();
-    let due = ctx.bluetooth.borrow_mut().due(&paired, gone_for, now);
+    let due = ctx
+        .bluetooth
+        .borrow_mut()
+        .due(&paired, gone_for, standby, now);
     for device in due {
         let address = device.address.clone();
         let opened = tokio::task::spawn_blocking(move || crate::bt::connect(&address)).await;
@@ -740,13 +774,12 @@ fn spawn_bluetooth_session<T: Transport + 'static>(
     tokio::task::spawn_local(async move {
         let who = std::cell::Cell::new(None);
         let hold = LinkHold::default();
-        let started = std::time::Instant::now();
+        // The session this connection starts moves to the network when the
+        // computer calls back there; the Bluetooth path is then let go of,
+        // not the session.
         let ended = tokio::select! {
             result = run_link(transport, &ctx, Role::Initiator, None, &who, &hold) => result,
-            () = network_back(&ctx, &who, started) => {
-                tracing::info!("the network reaches this computer again; leaving bluetooth");
-                Ok(())
-            }
+            () = leave_bluetooth_once_the_network_carries(&hold, &address, &ctx) => Ok(()),
             () = hold.superseded.notified() => {
                 tracing::info!("the network link to this computer is up; leaving bluetooth");
                 Ok(())
@@ -761,26 +794,29 @@ fn spawn_bluetooth_session<T: Transport + 'static>(
     });
 }
 
-/// Resolve once the link's peer has been heard on the network since the link
-/// came up and answers a TCP connection there: hearing alone is not enough,
-/// a hotspot client hears the LAN it cannot dial.
-async fn network_back(
-    ctx: &NodeCtx,
-    who: &std::cell::Cell<Option<PeerId>>,
-    since: std::time::Instant,
-) {
+/// Let the Bluetooth path go once a network path carries the session, which
+/// happens when either side dials over the network again and the connection
+/// joins it. Never resolves: the session runs on in `run_link`. Kept as a
+/// standby instead when the user asked for one.
+async fn leave_bluetooth_once_the_network_carries(hold: &LinkHold, address: &str, ctx: &NodeCtx) {
+    let mut released = false;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let Some(id) = who.get() else { continue };
-        let heard = ctx.heard.borrow().get(&id).is_some_and(|at| *at > since);
-        if !heard {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if released {
             continue;
         }
-        let addr = ctx.registry.borrow().get(&id).and_then(|peer| peer.addr);
-        let Some(addr) = addr else { continue };
-        if let Ok(probe) = TcpTransport::connect(addr).await {
-            drop(probe);
-            return;
+        let Some(session) = hold.session.borrow().clone() else {
+            continue;
+        };
+        let paths = session.paths();
+        if paths.network && paths.bluetooth && !ctx.standby() {
+            tracing::info!("the network carries the session again; leaving bluetooth");
+            session.release(
+                cursio_transport::resume::PathKind::Bluetooth,
+                "the network carries the session",
+            );
+            ctx.bluetooth.borrow_mut().set_linked(address, false);
+            released = true;
         }
     }
 }

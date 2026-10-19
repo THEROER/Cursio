@@ -63,6 +63,9 @@ class DeviceStatus(context: Context) {
 
         override fun onLost(network: Network) {
             update(reading.copy(network = "", signalDbm = UNKNOWN_SIGNAL))
+            // Sessions leave the network path now rather than after its
+            // silence, so a Bluetooth standby takes over at once.
+            CursioNative.nativeNetworkLost()
         }
     }
 

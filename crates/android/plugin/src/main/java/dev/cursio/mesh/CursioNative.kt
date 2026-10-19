@@ -151,6 +151,9 @@ object CursioNative {
     /** The phone's messages changed: a desktop showing them should look again. */
     external fun nativeSmsChanged()
 
+    /** The default network was lost: every session leaves its network path. */
+    external fun nativeNetworkLost()
+
     /**
      * A desktop asked for this phone's messages. Called by the node, on its
      * own thread, with one JSON request; answers one JSON object, see [SmsStore].

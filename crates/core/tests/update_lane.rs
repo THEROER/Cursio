@@ -75,6 +75,7 @@ async fn greet(
         Position::new(0, 0),
         ServiceOffer::none(),
         NodeStatus::unknown(),
+        &[],
     )
     .await
 }

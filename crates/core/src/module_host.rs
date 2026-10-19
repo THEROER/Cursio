@@ -290,6 +290,13 @@ impl TransportTx for LinkTx {
             tx.flush().await;
         }
     }
+
+    fn holding(&self) -> bool {
+        self.slot
+            .try_lock()
+            .ok()
+            .is_some_and(|slot| slot.as_ref().is_some_and(|tx| tx.holding()))
+    }
 }
 
 /// Whether a module is pumped at the fast pace or the idle one.

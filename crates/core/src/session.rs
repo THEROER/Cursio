@@ -42,6 +42,9 @@ pub struct PeerHello {
     /// The peer's power and network state as of the greeting. Superseded by
     /// every [`Message::NodeStatus`] the session then reports.
     pub status: cursio_protocol::NodeStatus,
+    /// The sessions the peer is holding open, with anyone; see
+    /// [`cursio_protocol::Hello::resumable`].
+    pub resumable: Vec<cursio_protocol::SessionTag>,
 }
 
 impl PeerHello {
@@ -111,6 +114,7 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Both sides send their own `Hello` and read the other's; the order is
 /// symmetric because each `send` is independent of the peer's. A protocol
 /// version mismatch is a hard error so incompatible builds fail fast.
+#[allow(clippy::too_many_arguments)]
 pub async fn handshake<T: Transport + ?Sized>(
     transport: &mut T,
     local: &crate::NodeIdentity,
@@ -119,6 +123,7 @@ pub async fn handshake<T: Transport + ?Sized>(
     position: cursio_protocol::Position,
     service: cursio_protocol::ServiceOffer,
     status: cursio_protocol::NodeStatus,
+    resumable: &[cursio_protocol::SessionTag],
 ) -> Result<PeerHello, SessionError> {
     handshake_as(
         PROTOCOL_VERSION,
@@ -129,6 +134,7 @@ pub async fn handshake<T: Transport + ?Sized>(
         position,
         service,
         status,
+        resumable,
     )
     .await
 }
@@ -146,6 +152,7 @@ pub async fn handshake_as<T: Transport + ?Sized>(
     position: cursio_protocol::Position,
     service: cursio_protocol::ServiceOffer,
     status: cursio_protocol::NodeStatus,
+    resumable: &[cursio_protocol::SessionTag],
 ) -> Result<PeerHello, SessionError> {
     // The preamble goes first and alone, in the frozen lane encoding, so the
     // peer learns our version from a message no build can fail to read — and
@@ -192,6 +199,7 @@ pub async fn handshake_as<T: Transport + ?Sized>(
             position,
             service,
             status,
+            resumable: resumable.to_vec(),
         }))
         .await?;
 
@@ -215,6 +223,7 @@ pub async fn handshake_as<T: Transport + ?Sized>(
         position: hello.position,
         service: hello.service,
         status: hello.status,
+        resumable: hello.resumable,
     })
 }
 
@@ -815,6 +824,12 @@ where
                 // of the deadline.
                 let heard_at = Duration::from_millis(last_heard.load(Ordering::Relaxed));
                 let silent_for = epoch.elapsed().saturating_sub(heard_at);
+                // A resumable link that lost its connection is waiting for
+                // another; the silence is the gap, not the peer leaving. The
+                // link ends the session itself if none comes back.
+                if tx.holding() {
+                    continue;
+                }
                 if silent_for >= PEER_TIMEOUT {
                     tracing::warn!(?silent_for, "peer stopped responding; ending session");
                     break Err(SessionError::PeerTimeout(silent_for));

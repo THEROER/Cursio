@@ -60,6 +60,20 @@ mod frame_tag {
     pub const PART: u8 = 0x01;
 }
 
+/// Tags only a resumable link writes (see [`crate::resume`]); the plain
+/// transport never sees them.
+pub(crate) mod link_tag {
+    /// `[u64 seq][u8 flags][tagged frame]`: one frame of the session, numbered
+    /// so the receiver drops the copies a resend produces.
+    pub const SEQ: u8 = 0x02;
+    /// `[u64 delivered][u8 flags]`: the highest sequence number this side has
+    /// delivered. Doubles as the path's keepalive.
+    pub const ACK: u8 = 0x03;
+    /// `[u64 delivered]`: the first frame on a path joining a session, after
+    /// which each side resends whatever the other has not delivered.
+    pub const RESUME: u8 = 0x04;
+}
+
 /// Header on every `PART` frame: which message, which piece, how many total.
 /// Fixed 8 bytes, big-endian, right after [`frame_tag::PART`].
 const PART_HEADER_LEN: usize = 4 + 2 + 2;
@@ -205,7 +219,10 @@ fn seal_chunked(noise: &SharedNoise, msg: &Message) -> Result<Vec<Message>, Tran
 }
 
 /// Decrypt one inbound `Opaque` frame to its tagged plaintext.
-fn open_frame(noise: &SharedNoise, incoming: Message) -> Result<Vec<u8>, TransportError> {
+pub(crate) fn open_frame(
+    noise: &SharedNoise,
+    incoming: Message,
+) -> Result<Vec<u8>, TransportError> {
     let ciphertext = match incoming {
         Message::Opaque(c) => c,
         _ => return Err(CryptoError::Noise("expected opaque ciphertext frame".into()).into()),
@@ -229,9 +246,19 @@ fn open_frame(noise: &SharedNoise, incoming: Message) -> Result<Vec<u8>, Transpo
 /// scheduling deliberately interleaves high-priority frames between large
 /// lower-priority messages, so partials are tracked independently by id.
 #[derive(Default)]
-struct Reassembler {
+pub(crate) struct Reassembler {
     in_progress: HashMap<u32, Partial>,
     buffered_bytes: usize,
+}
+
+/// The chunked message id a tagged `PART` frame belongs to, if it is one.
+pub(crate) fn part_message_id(tagged: &[u8]) -> Option<u32> {
+    if tagged.first() != Some(&frame_tag::PART) || tagged.len() < 1 + PART_HEADER_LEN {
+        return None;
+    }
+    Some(u32::from_be_bytes([
+        tagged[1], tagged[2], tagged[3], tagged[4],
+    ]))
 }
 
 /// Accumulated pieces of one chunked message.
@@ -245,10 +272,19 @@ struct Partial {
 }
 
 impl Reassembler {
+    /// Give up on a chunked message whose remaining pieces will never come —
+    /// a lossy one cut off by a connection that dropped.
+    pub(crate) fn forget(&mut self, msg_id: u32) {
+        if let Some(partial) = self.in_progress.remove(&msg_id) {
+            let held: usize = partial.parts.iter().flatten().map(Vec::len).sum();
+            self.buffered_bytes -= held;
+        }
+    }
+
     /// Feed one decrypted tagged plaintext. Returns `Some(msg)` when a complete
     /// message is available (a whole frame, or the final piece of a chunked
     /// one), or `None` when more pieces are still needed.
-    fn accept(&mut self, tagged: &[u8]) -> Result<Option<Message>, TransportError> {
+    pub(crate) fn accept(&mut self, tagged: &[u8]) -> Result<Option<Message>, TransportError> {
         let (&tag, rest) = tagged
             .split_first()
             .ok_or_else(|| CryptoError::Noise("empty frame".into()))?;
@@ -338,6 +374,9 @@ pub struct EncryptedTransport<T: Transport> {
     noise: SharedNoise,
     /// Receive-side reassembly state for chunked messages.
     reasm: Reassembler,
+    /// The Noise handshake hash, identical on both ends and unique to this
+    /// connection: what names a session for resumption.
+    handshake_hash: Vec<u8>,
 }
 
 impl<T: Transport> EncryptedTransport<T> {
@@ -363,7 +402,7 @@ impl<T: Transport> EncryptedTransport<T> {
             Role::Responder => builder.build_responder()?,
         };
 
-        let noise = match role {
+        let (noise, handshake_hash) = match role {
             Role::Initiator => Self::handshake_initiator(&mut inner, handshake).await?,
             Role::Responder => Self::handshake_responder(&mut inner, handshake).await?,
         };
@@ -372,14 +411,35 @@ impl<T: Transport> EncryptedTransport<T> {
             inner,
             noise: std::sync::Arc::new(std::sync::Mutex::new(noise)),
             reasm: Reassembler::default(),
+            handshake_hash,
         })
+    }
+
+    /// The tag a session started on this connection is known by, on both ends.
+    pub fn session_tag(&self) -> cursio_protocol::SessionTag {
+        let mut tag = [0u8; 16];
+        let hash = Sha256::digest(&self.handshake_hash);
+        tag.copy_from_slice(&hash[..16]);
+        tag
+    }
+
+    /// Take the connection apart into a path a resumable link can carry a
+    /// session over: the raw halves, and the Noise state that seals for them.
+    pub fn into_path(self, kind: crate::resume::PathKind) -> crate::resume::Path {
+        let (tx, rx) = Box::new(self.inner).split();
+        crate::resume::Path {
+            tx,
+            rx,
+            noise: self.noise,
+            kind,
+        }
     }
 
     /// Initiator side of the 2-message `NNpsk0` handshake: send msg1, read msg2.
     async fn handshake_initiator(
         inner: &mut T,
         mut hs: HandshakeState,
-    ) -> Result<TransportState, CryptoError> {
+    ) -> Result<(TransportState, Vec<u8>), CryptoError> {
         // -> e (msg1)
         let mut buf = vec![0u8; 1024];
         let len = hs.write_message(&[], &mut buf)?;
@@ -390,14 +450,15 @@ impl<T: Transport> EncryptedTransport<T> {
         let mut scratch = vec![0u8; 1024];
         hs.read_message(&msg2, &mut scratch)?;
 
-        Ok(hs.into_transport_mode()?)
+        let hash = hs.get_handshake_hash().to_vec();
+        Ok((hs.into_transport_mode()?, hash))
     }
 
     /// Responder side: read msg1, send msg2.
     async fn handshake_responder(
         inner: &mut T,
         mut hs: HandshakeState,
-    ) -> Result<TransportState, CryptoError> {
+    ) -> Result<(TransportState, Vec<u8>), CryptoError> {
         // -> e (msg1)
         let msg1 = Self::recv_raw(inner).await?;
         let mut scratch = vec![0u8; 1024];
@@ -408,7 +469,8 @@ impl<T: Transport> EncryptedTransport<T> {
         let len = hs.write_message(&[], &mut buf)?;
         Self::send_raw(inner, &buf[..len]).await?;
 
-        Ok(hs.into_transport_mode()?)
+        let hash = hs.get_handshake_hash().to_vec();
+        Ok((hs.into_transport_mode()?, hash))
     }
 
     /// Send raw handshake bytes as one length-prefixed frame on the inner
