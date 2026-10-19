@@ -125,6 +125,18 @@ function setGateMode(mode: string) {
 const calls = ref<CallsConfig | null>(null)
 const callsBusy = ref(false)
 const callSetup = computed(() => status.value?.call_setup ?? null)
+/**
+ * Phones linked over the mesh that this computer has no Bluetooth pairing
+ * with: their calls ring here, but their voice cannot come through, and
+ * nothing else on the page says why they are missing from the list above.
+ * Matched by name, as `calls_hub` does, since Android hides its address.
+ */
+const unpairedPhones = computed(() => {
+  const paired = new Set((callSetup.value?.phones ?? []).map((phone) => phone.name.toLowerCase()))
+  return (status.value?.peers ?? [])
+    .filter((peer) => peer.link?.device_kind === "Phone" && !paired.has(peer.name.toLowerCase()))
+    .map((peer) => peer.name)
+})
 
 /** "No device chosen", as a value the select can hold: it takes no empty string. */
 const DEFAULT_DEVICE = "cursio:default"
@@ -349,6 +361,9 @@ async function restartNode() {
                 <span class="font-mono text-xs text-muted">{{ phone.address }}</span>
                 <LpBadge v-if="phone.connected" tone="success" dot size="sm">{{ t("settings.callsConnected") }}</LpBadge>
               </div>
+              <p v-if="unpairedPhones.length" class="text-xs text-muted">
+                {{ t("settings.callsUnpaired", { phones: unpairedPhones.join(", ") }) }}
+              </p>
             </li>
           </ul>
 

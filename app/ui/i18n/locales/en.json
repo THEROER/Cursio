@@ -465,6 +465,7 @@
     "callsFailed": "Unavailable",
     "callsPhones": "Paired phones",
     "callsNoPhones": "No phone is paired with this computer over Bluetooth.",
+    "callsUnpaired": "Not paired over Bluetooth: {phones}. Their calls ring here, but the voice stays on the phone until you pair it with this computer in the system's Bluetooth settings.",
     "callsConnected": "Connected",
     "callsAnswerMoves": "Answering here brings the voice here",
     "callsAnswerMovesHint": "As on Phone Link: answer or dial from a computer and the call's voice comes to it. Answer on the phone and it stays there.",
