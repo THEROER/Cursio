@@ -618,7 +618,10 @@ unprompted copy of its sound only to those profiles. They are not this path.)
   computers it is paired with in the system's Bluetooth settings (class of
   device "computer") and asks each for the Cursio service. Which mesh peer
   answered is learned from `Hello`, as on TCP, and the registry remembers it
-  per address (`PeerRegistry::note_bluetooth`).
+  per address (`PeerRegistry::note_bluetooth`) — and so does the trust store
+  (`TrustedPeer::bluetooth`), so a restarted node does not page every paired
+  computer, the ones on the network included, to learn again whose radio is
+  whose.
 - **The network wins.** A known machine's address is called once *its* peer
   has been off the network for 20 s (`bluetooth_link::NETWORK_GRACE`); an
   address nobody has answered on yet, while any peer is missing, which is how
@@ -646,7 +649,10 @@ unprompted copy of its sound only to those profiles. They are not this path.)
   simply go slowly.
 - **Visible.** A link's path is `LinkView::path` (`network` or `bluetooth`,
   control v12): `cursio status` shows `bluetooth` for such a peer, the GNOME
-  menu a Bluetooth icon, the app a badge.
+  menu a Bluetooth icon, the app a badge. It follows the session, not the
+  connection that started it (`ResumeHandle::on_paths` →
+  `NodeState::link_paths`): a session that moved to Bluetooth when the
+  network went shows Bluetooth, and the network again once it carries it.
 
 On macOS the computer's half is not built yet and says so in the log; peers
 reach a Mac over the network only.
