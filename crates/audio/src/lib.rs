@@ -36,6 +36,8 @@ pub mod android_backend;
 mod declick;
 #[cfg(target_os = "linux")]
 pub mod pipewire_backend;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod playout;
 /// Drives the Cursio virtual audio driver, which is what gives Windows the
 /// same per-device parity Linux gets from PipeWire.
 #[cfg(target_os = "windows")]

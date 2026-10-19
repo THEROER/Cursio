@@ -33,7 +33,9 @@ ndk = { version = "0.9", features = ["audio", "api-level-28"] }
 # virtual output, and playback nodes. `pipewire` is the official Rust binding;
 # it links against the system libpipewire-0.3 (present on the dev box).
 [target.'cfg(target_os = "linux")'.dependencies]
-pipewire = "0.10"
+# `v0_3_49` for `Buffer::requested`: how much a playback cycle wants, which the
+# mapped buffer's size is not.
+pipewire = { version = "0.10", features = ["v0_3_49"] }
 
 # Windows audio via WASAPI: render/loopback + process loopback for per-app
 # capture (Win10 2004+). The `windows` crate gives COM wrappers for the WASAPI

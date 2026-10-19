@@ -1714,7 +1714,8 @@ fn plan_app_links(
 // Playback (sink) side
 // ---------------------------------------------------------------------------
 
-/// Target for the jitter buffer to fill before playback starts, in bytes.
+/// What the jitter buffer holds beyond one graph cycle before playback
+/// starts, in bytes; see `playout` for why it is on top of the cycle.
 ///
 /// A few chunks' worth (~20-30ms at 256-frame chunks) absorbs network jitter so
 /// a late packet doesn't underrun. Small on purpose — audio favors freshness,
@@ -1743,6 +1744,20 @@ const JITTER_MAX_BYTES: usize = 48_000 / 5 * BYTES_PER_FRAME;
 /// live PipeWire daemon — `play` calls exactly this.
 fn queue_is_full(queued: &AtomicUsize) -> bool {
     queued.load(Ordering::Relaxed) > JITTER_MAX_BYTES
+}
+
+/// How many frames of a playback buffer holding `capacity` to fill: what the
+/// graph asked for this cycle, or the whole buffer when it named no amount.
+///
+/// The mapped buffer is not the cycle. A virtual microphone's buffer holds
+/// 12288 frames, and filling all of it every cycle meant 256 ms a cycle —
+/// past the jitter ceiling, so every cycle was 200 ms of a peer's voice and
+/// 56 ms of padding, heard as the microphone cutting out four times a second.
+fn frames_to_write(requested: u64, capacity: usize) -> usize {
+    match usize::try_from(requested) {
+        Ok(0) | Err(_) => capacity,
+        Ok(requested) => requested.min(capacity),
+    }
 }
 
 /// A running PipeWire playback node (the **sink** side).
@@ -1953,7 +1968,6 @@ fn run_playback_loop(
     listening: Arc<AtomicBool>,
 ) {
     use std::cell::RefCell;
-    use std::collections::VecDeque;
 
     let setup = (|| -> Result<_, String> {
         let main_loop = MainLoopRc::new(None).map_err(|e| format!("main loop: {e}"))?;
@@ -2004,10 +2018,12 @@ fn run_playback_loop(
         }
     };
 
-    // Jitter buffer: raw bytes waiting to be played, and whether we've prefilled
-    // enough to start (so the first underrun-y moments don't stutter).
-    let jitter: RefCell<VecDeque<u8>> = RefCell::new(VecDeque::new());
-    let started = std::cell::Cell::new(false);
+    let playout = RefCell::new(crate::playout::Playout::new(
+        SAMPLE_RATE,
+        CHANNELS as usize,
+        JITTER_MAX_BYTES,
+        JITTER_PREFILL_BYTES,
+    ));
     // Start/underrun counters, logged on each transition. Cheap enough for the
     // RT callback (a Cell bump plus a `debug!` that costs nothing when the level
     // is off) and they turn "it stutters for the first few seconds" into a
@@ -2015,8 +2031,6 @@ fn run_playback_loop(
     let starts = std::cell::Cell::new(0u32);
     let underruns = std::cell::Cell::new(0u32);
     let node_label = node_name.clone();
-    let fade = crate::declick::fade_frames(SAMPLE_RATE);
-    let declick = RefCell::new(crate::declick::Declick::new(fade));
     // Atomics, not `Cell`s: with RT_PROCESS the callback runs on PipeWire's data
     // thread, while the loop below reads these from this one.
     let stopping = Arc::new(AtomicBool::new(false));
@@ -2042,116 +2056,62 @@ fn run_playback_loop(
             }
         })
         .process(move |stream, ()| {
-            // Pull any newly arrived chunks into the jitter buffer first.
-            {
-                let mut jb = jitter.borrow_mut();
-                while let Ok(bytes) = feed_rx.try_recv() {
-                    queued.fetch_sub(bytes.len(), Ordering::Relaxed);
-                    jb.extend(bytes);
-                }
-                // Cap the backlog: drop the OLDEST audio, keep the newest.
-                //
-                // Without this a sustained arrival-rate surplus becomes permanent
-                // latency — the queue only ever grows, so playback falls further
-                // behind for as long as the session lasts. Trimming here bounds
-                // the delay to JITTER_MAX_BYTES no matter what the sender does.
-                if jb.len() > JITTER_MAX_BYTES {
-                    let excess = jb.len() - JITTER_MAX_BYTES;
-                    // Drop whole frames only, so the stream stays sample-aligned
-                    // and channels don't swap.
-                    let excess = excess - (excess % BYTES_PER_FRAME);
-                    if excess > 0 {
-                        crate::declick::skip_crossfaded(
-                            &mut jb,
-                            excess,
-                            CHANNELS as usize,
-                            fade,
-                        );
-                        tracing::debug!(
-                            dropped_bytes = excess,
-                            "jitter buffer over its limit; dropped stale audio to keep latency bounded"
-                        );
-                    }
-                }
-                if started.get() {
-                    crate::declick::settle_backlog(
-                        &mut jb,
-                        BYTES_PER_FRAME,
-                        SAMPLE_RATE as usize,
-                        CHANNELS as usize,
-                        fade,
-                    );
-                }
-                if !started.get() && jb.len() >= JITTER_PREFILL_BYTES {
-                    started.set(true);
-                    // Log every start, not just the first: a stream that keeps
-                    // re-starting is the buffer running dry and re-prefilling,
-                    // which is heard as audio cutting in and out. Pairing this
-                    // with the underrun below gives the on/off period directly.
-                    starts.set(starts.get() + 1);
-                    tracing::debug!(
-                        node = %node_label,
-                        start = starts.get(),
-                        buffered = jb.len(),
-                        "jitter buffer prefilled; playback starting"
-                    );
-                }
+            let mut playout = playout.borrow_mut();
+            let mut trimmed = 0;
+            while let Ok(bytes) = feed_rx.try_recv() {
+                queued.fetch_sub(bytes.len(), Ordering::Relaxed);
+                trimmed += playout.push(&bytes);
             }
 
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            let requested = buffer.requested();
             let datas = buffer.datas_mut();
-            let Some(data) = datas.first_mut() else { return };
+            let Some(data) = datas.first_mut() else {
+                return;
+            };
             let Some(slice) = data.data() else { return };
 
-            // How many whole frames fit in the buffer PipeWire gave us.
-            let cap_frames = slice.len() / stride;
-            let want_bytes = cap_frames * stride;
-
-            let mut jb = jitter.borrow_mut();
-            let mut declick = declick.borrow_mut();
-            let stopping = stopping_cb.load(Ordering::Relaxed);
-            let filled = if started.get() && !(stopping && declick.is_silent()) {
-                let take = want_bytes.min(jb.len());
-                for (i, byte) in jb.drain(..take).enumerate() {
-                    slice[i] = byte;
-                }
-                // Emptying the buffer means the next callback is silence (the
-                // prefill re-arms below), so this one has to end at zero.
-                declick.apply(&mut slice[..take], CHANNELS as usize, stopping || jb.is_empty());
-                // Apply the logical gain to the samples we just wrote. Read the
-                // atomic once per buffer (not per sample) — it changes at knob
-                // speed, not audio speed. Skip the multiply at unity so the
-                // common case stays a plain copy; the samples are f32LE, so we
-                // scale each 4-byte lane in place over the frames we filled.
-                let g = f32::from_bits(gain.load(Ordering::Relaxed));
-                if (g - 1.0).abs() > f32::EPSILON {
-                    for s in slice[..take].as_chunks_mut::<4>().0 {
-                        *s = (f32::from_le_bytes(*s) * g).to_le_bytes();
-                    }
-                }
-                take
-            } else {
-                0
-            };
-            faded_out_cb.store(declick.is_silent(), Ordering::Relaxed);
-            // Zero-fill the remainder (underrun / not started yet) so we output
-            // silence rather than garbage or a stall.
-            for b in slice.iter_mut().take(want_bytes).skip(filled) {
-                *b = 0;
+            let want_bytes = frames_to_write(requested, slice.len() / stride) * stride;
+            // Read once per buffer: the gain changes at knob speed, not audio
+            // speed.
+            let g = f32::from_bits(gain.load(Ordering::Relaxed));
+            let fill = playout.fill(
+                &mut slice[..want_bytes],
+                g,
+                stopping_cb.load(Ordering::Relaxed),
+            );
+            faded_out_cb.store(playout.is_silent(), Ordering::Relaxed);
+            trimmed += fill.trimmed;
+            if trimmed > 0 {
+                tracing::debug!(
+                    node = %node_label,
+                    dropped_bytes = trimmed,
+                    "jitter buffer over its limit; dropped stale audio to keep latency bounded"
+                );
             }
-            // If we drained the buffer dry after starting, re-arm prefill so a
-            // sustained gap doesn't produce choppy single-frame outputs.
-            if started.get() && jb.is_empty() {
-                started.set(false);
+            // Log every start, not just the first: a stream that keeps
+            // re-starting is the buffer running dry and re-prefilling, which is
+            // heard as audio cutting in and out. Pairing this with the underrun
+            // below gives the on/off period directly.
+            if fill.started {
+                starts.set(starts.get() + 1);
+                tracing::debug!(
+                    node = %node_label,
+                    start = starts.get(),
+                    wanted_bytes = want_bytes,
+                    "jitter buffer prefilled; playback starting"
+                );
+            }
+            if fill.ran_dry {
                 underruns.set(underruns.get() + 1);
                 // `filled` says whether this buffer was satisfied or padded with
                 // silence, which separates "arrived just in time" from a real gap.
                 tracing::debug!(
                     node = %node_label,
                     underrun = underruns.get(),
-                    filled_bytes = filled,
+                    filled_bytes = fill.played,
                     wanted_bytes = want_bytes,
                     "jitter buffer ran dry; muting until it prefills again"
                 );
@@ -2203,6 +2163,21 @@ fn run_playback_loop(
 mod tests {
     use super::*;
     use pipewire::spa::{pod::deserialize::PodDeserializer, sys::SPA_FORMAT_AUDIO_position};
+
+    #[test]
+    fn a_playback_cycle_fills_what_the_graph_requested_not_the_whole_buffer() {
+        assert_eq!(frames_to_write(1024, 12_288), 1024);
+        assert_eq!(
+            frames_to_write(0, 12_288),
+            12_288,
+            "no request names no amount"
+        );
+        assert_eq!(
+            frames_to_write(20_000, 12_288),
+            12_288,
+            "never past the buffer"
+        );
+    }
 
     fn port(id: u32, serial: u64, channel: &str) -> LinkPort {
         LinkPort {

@@ -25,9 +25,8 @@ use windows::Win32::Media::Audio::{
     IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
     IAudioRenderClient, IAudioSessionControl, IAudioSessionControl2, IAudioSessionManager2,
-    ISimpleAudioVolume,
-    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+    IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, StructuredStorage::PropVariantToStringAlloc,
@@ -240,7 +239,9 @@ pub fn set_app_volume(process: &str, volume: f32) -> Result<(), AudioError> {
     let _com = ComGuard::new()?;
     let sessions = sessions_of(process)?;
     if sessions.is_empty() {
-        return Err(AudioError::Backend(format!("{process} is not playing anything")));
+        return Err(AudioError::Backend(format!(
+            "{process} is not playing anything"
+        )));
     }
     for session in sessions {
         // SAFETY: COM is initialized on this thread for the guard's life.
@@ -1573,6 +1574,7 @@ fn run_render_loop(
                     mix.nSamplesPerSec as usize,
                     channels,
                     fade,
+                    0,
                 );
             }
             if !started && jitter.len() >= RENDER_PREFILL_BYTES {

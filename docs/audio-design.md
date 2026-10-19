@@ -119,6 +119,15 @@ playback clock causes crackle or growing lag.
   stream. WASAPI also writes only 40 ms ahead of the device rather than filling
   its 200 ms endpoint buffer, which, kept full with keep-alive, put every
   arriving sample 200 ms behind.
+
+  On the pull-model backends (PipeWire, AAudio, `playout.rs`) each of those
+  numbers sits *on top of one device cycle*: the prefill is a cycle plus
+  ~21 ms, the settle point is a cycle plus 100 ms, the ceiling never falls
+  below a cycle plus the prefill. A PipeWire playback cycle is
+  `pw_buffer.requested` frames, not the mapped buffer — a virtual microphone's
+  buffer holds 12288 frames, and filling all of it made every cycle 256 ms
+  against a 200 ms ceiling, heard as a peer microphone cutting out four times
+  a second.
 - **Clock:** the receiver resamples to its own device clock to absorb drift
   (details are a backend concern; the protocol carries timestamps/seq to make it
   possible).

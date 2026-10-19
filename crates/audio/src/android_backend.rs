@@ -17,13 +17,13 @@
 //! out of the capture callback over an unbounded channel it never waits on —
 //! the same arrangement the PipeWire backend uses inside its process callback.
 //!
-//! Playback keeps the PipeWire backend's jitter discipline exactly — a short
-//! prefill, a hard ceiling that drops the *oldest* audio, short ramps at every
-//! edge — because a phone on Wi-Fi sees more jitter than a desktop on a cable,
-//! not less, and the reasons those rules exist (latency that grows without
-//! bound, clicks at every underrun) are not platform-specific.
+//! Playback plays from the PipeWire backend's jitter buffer, `playout` — a
+//! short margin beyond one callback, a hard ceiling that drops the *oldest*
+//! audio, short ramps at every edge — because a phone on Wi-Fi sees more
+//! jitter than a desktop on a cable, not less, and the reasons those rules
+//! exist (latency that grows without bound, clicks at every underrun) are not
+//! platform-specific.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -48,7 +48,8 @@ pub(crate) const PHONE_OUTPUT: &str = "phone-output";
 /// The one input: the microphone the system picks (built-in, or a headset's).
 pub(crate) const PHONE_INPUT: &str = "phone-input";
 
-/// Prefill before playback starts: ~21 ms, as on the PipeWire backend.
+/// Queued beyond one callback before playback starts: ~21 ms, as on the
+/// PipeWire backend.
 const JITTER_PREFILL_BYTES: usize = 4 * 256 * BYTES_PER_FRAME;
 /// Ceiling on queued playback: ~200 ms. Past it the oldest audio goes, for the
 /// reason given on the PipeWire backend's `JITTER_MAX_BYTES`.
@@ -569,10 +570,12 @@ impl AndroidSink {
             let feed_rx = Arc::clone(&feed_rx);
             let queued = Arc::clone(&thread_queued);
             let gain = Arc::clone(&thread_gain);
-            let fade = crate::declick::fade_frames(SAMPLE_RATE);
-            let mut declick = crate::declick::Declick::new(fade);
-            let mut jitter: VecDeque<u8> = VecDeque::with_capacity(JITTER_MAX_BYTES * 2);
-            let mut started = false;
+            let mut playout = crate::playout::Playout::new(
+                SAMPLE_RATE,
+                CHANNELS,
+                JITTER_MAX_BYTES,
+                JITTER_PREFILL_BYTES,
+            );
             let builder = AudioStreamBuilder::new()
                 .map_err(|e| format!("aaudio builder: {e}"))?
                 .direction(AudioDirection::Output)
@@ -592,43 +595,11 @@ impl AndroidSink {
                     if let Ok(rx) = feed_rx.try_lock() {
                         while let Ok(bytes) = rx.try_recv() {
                             queued.fetch_sub(bytes.len(), Ordering::Relaxed);
-                            jitter.extend(bytes);
+                            playout.push(&bytes);
                         }
                     }
-                    if jitter.len() > JITTER_MAX_BYTES {
-                        let excess = jitter.len() - JITTER_MAX_BYTES;
-                        let excess = excess - excess % BYTES_PER_FRAME;
-                        crate::declick::skip_crossfaded(&mut jitter, excess, CHANNELS, fade);
-                    }
-                    if started {
-                        crate::declick::settle_backlog(
-                            &mut jitter,
-                            BYTES_PER_FRAME,
-                            SAMPLE_RATE as usize,
-                            CHANNELS,
-                            fade,
-                        );
-                    }
-                    if !started && jitter.len() >= JITTER_PREFILL_BYTES {
-                        started = true;
-                    }
-                    let take = if started { want.min(jitter.len()) } else { 0 };
-                    for (slot, byte) in out.iter_mut().zip(jitter.drain(..take)) {
-                        *slot = byte;
-                    }
-                    declick.apply(&mut out[..take], CHANNELS, jitter.is_empty());
                     let g = f32::from_bits(gain.load(Ordering::Relaxed));
-                    if (g - 1.0).abs() > f32::EPSILON {
-                        for s in out[..take].as_chunks_mut::<4>().0 {
-                            *s = (f32::from_le_bytes(*s) * g).to_le_bytes();
-                        }
-                    }
-                    out[take..].fill(0);
-                    // Ran dry: prefill again rather than play single frames as
-                    // they trickle in, which is heard as crackle.
-                    if started && jitter.is_empty() {
-                        started = false;
-                    }
+                    playout.fill(out, g, false);
                     AudioCallbackResult::Continue
                 }));
             let stream = builder
