@@ -185,9 +185,15 @@ impl PeerRegistry {
                 )
             })
             .collect();
+        let bluetooth = store
+            .peers()
+            .filter(|t| t.peer_id != local)
+            .filter_map(|t| Some((t.bluetooth.clone()?, t.peer_id)))
+            .collect();
         Self {
             peers,
             local: Some(local),
+            bluetooth,
             ..Default::default()
         }
     }
@@ -378,12 +384,14 @@ impl PeerRegistry {
     }
 
     /// `peer` greeted over the Bluetooth device at `address`; `dialled` when
-    /// this node placed that call.
-    pub fn note_bluetooth(&mut self, address: &str, peer: PeerId, dialled: bool) {
-        self.bluetooth.insert(address.to_string(), peer);
+    /// this node placed that call. Answers whether the address is new for
+    /// that peer, so the caller knows to remember it past a restart.
+    pub fn note_bluetooth(&mut self, address: &str, peer: PeerId, dialled: bool) -> bool {
+        let new = self.bluetooth.insert(address.to_string(), peer) != Some(peer);
         if dialled {
             self.bluetooth_dialled.insert(peer);
         }
+        new
     }
 
     /// The peer that answered on `address`, once one has.
@@ -557,7 +565,11 @@ mod tests {
         let (_far_link, far_session) = ResumableLink::new(far, tag);
         let mut reg = PeerRegistry::default();
         reg.hold_session(peer(2), session.clone());
-        reg.note_bluetooth("04:68:74:98:F7:C6", peer(2), true);
+        assert!(reg.note_bluetooth("04:68:74:98:F7:C6", peer(2), true));
+        assert!(
+            !reg.note_bluetooth("04:68:74:98:F7:C6", peer(2), true),
+            "the same address again is nothing new to remember"
+        );
         assert_eq!(reg.bluetooth_peer("04:68:74:98:F7:C6"), Some(peer(2)));
         assert!(
             reg.bluetooth_paths_to_release().is_empty(),

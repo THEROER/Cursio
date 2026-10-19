@@ -215,6 +215,12 @@ pub struct TrustedPeer {
     /// loadable.
     #[serde(default)]
     pub last_addr: Option<std::net::SocketAddr>,
+    /// The Bluetooth address this peer last greeted from. Nothing else ties
+    /// a radio to a mesh identity, and without it a restarted node had to
+    /// call every paired computer once to learn whose radio was whose —
+    /// paging machines that were on the network all along.
+    #[serde(default)]
+    pub bluetooth: Option<String>,
 }
 
 impl TrustedPeer {
@@ -265,6 +271,7 @@ impl TrustStore {
                 display_name: paired.display_name.clone(),
                 shared_key_hex: hex_encode(&paired.shared_key),
                 last_addr: None,
+                bluetooth: None,
             },
         );
         self.save()
@@ -282,6 +289,22 @@ impl TrustStore {
         if let Some(peer) = self.peers.get_mut(peer_id) {
             if peer.last_addr != Some(addr) {
                 peer.last_addr = Some(addr);
+                return self.save();
+            }
+        }
+        Ok(())
+    }
+
+    /// Remember the Bluetooth address `peer_id` greeted from; writes only
+    /// when it changed.
+    pub fn remember_bluetooth(
+        &mut self,
+        peer_id: &PeerId,
+        address: &str,
+    ) -> Result<(), PairingError> {
+        if let Some(peer) = self.peers.get_mut(peer_id) {
+            if peer.bluetooth.as_deref() != Some(address) {
+                peer.bluetooth = Some(address.to_owned());
                 return self.save();
             }
         }
@@ -464,8 +487,23 @@ mod tests {
             display_name: "x".into(),
             shared_key_hex: "0a0b0c".into(),
             last_addr: None,
+            bluetooth: None,
         };
         assert_eq!(peer.shared_key().unwrap(), vec![0x0a, 0x0b, 0x0c]);
+    }
+
+    #[test]
+    fn a_trust_entry_keeps_the_peers_bluetooth_address_and_older_ones_still_load() {
+        let old = r#"{"peer_id":"00000000-0000-0000-0000-000000000000","display_name":"x","shared_key_hex":"00"}"#;
+        let peer: TrustedPeer = serde_json::from_str(old).unwrap();
+        assert_eq!(peer.bluetooth, None);
+        let with = TrustedPeer {
+            bluetooth: Some("04:68:74:98:F7:C6".into()),
+            ..peer
+        };
+        let back: TrustedPeer =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.bluetooth.as_deref(), Some("04:68:74:98:F7:C6"));
     }
 
     #[cfg(unix)]
@@ -513,6 +551,7 @@ mod tests {
                     display_name: name.into(),
                     shared_key_hex: "00".into(),
                     last_addr: None,
+                    bluetooth: None,
                 },
             );
         }

@@ -2484,7 +2484,15 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
                 *seen.borrow_mut() = Some(id);
                 let mut reg = reg_for_cb.borrow_mut();
                 if let Some(address) = &bluetooth {
-                    reg.note_bluetooth(address, id, shape.dialled);
+                    // Kept past a restart, like the network address after a
+                    // dial: best-effort, a failed write must not stop the link.
+                    if reg.note_bluetooth(address, id, shape.dialled) {
+                        if let Ok(mut store) = TrustStore::load() {
+                            if let Err(e) = store.remember_bluetooth(&id, address) {
+                                tracing::debug!(error = %e, "could not remember the peer's bluetooth address");
+                            }
+                        }
+                    }
                 }
                 if let cursio_core::registry::Greeted::Join(session) = reg.greeted(id, peer_tags) {
                     reg.set_state(id, cursio_core::registry::PeerState::Online);
