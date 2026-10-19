@@ -375,6 +375,7 @@
     "unknownNetwork": "Unrecognised link",
     "cannotSay": "Cannot say",
     "overBluetooth": "Bluetooth",
+    "overBluetoothFor": "Bluetooth · {minutes} min",
     "overBluetoothHint": "Connected over Bluetooth because the network does not reach it: everything but screens and large files works, more slowly.",
     "skipped": "{module} off on this link: {why}",
     "skippedLacks": "Not running with {peer}: it is switched off there, or {peer} runs an older Cursio — update it",

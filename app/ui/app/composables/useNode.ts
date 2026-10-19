@@ -32,6 +32,8 @@ export interface LinkView {
   since: SystemTime
   /** What carries the link; absent from a node older than control v12. */
   path?: "network" | "bluetooth"
+  /** Since when `path` holds, once it changed; absent from older nodes. */
+  path_since?: SystemTime | null
 }
 
 /**

@@ -718,6 +718,11 @@ pub struct LinkView {
     /// network.
     #[serde(default)]
     pub path: LinkPath,
+    /// When `path` last changed, so a window can say how long a machine has
+    /// been held over Bluetooth. `None` while it is the one the link started
+    /// on, and from an older node.
+    #[serde(default)]
+    pub path_since: Option<SystemTime>,
 }
 
 /// What carries a link: the same mesh either way, at very different speeds.
@@ -1065,6 +1070,7 @@ impl NodeState {
         let changed = match self.inner().links.get_mut(peer) {
             Some((_, link)) if link.path != path => {
                 link.path = path;
+                link.path_since = Some(SystemTime::now());
                 true
             }
             _ => false,
@@ -1810,6 +1816,7 @@ mod tests {
                 inapplicable: vec![],
                 since: SystemTime::now(),
                 path: LinkPath::Network,
+                path_since: None,
             },
         );
         let peers = node.status().peers;
@@ -1844,6 +1851,7 @@ mod tests {
                 inapplicable: vec![],
                 since: SystemTime::now(),
                 path: LinkPath::Network,
+                path_since: None,
             },
         );
         let shown = |node: &NodeState| node.status().peers[0].link.as_ref().unwrap().path;
@@ -1855,6 +1863,15 @@ mod tests {
             },
         );
         assert_eq!(shown(&node), LinkPath::Bluetooth);
+        assert!(
+            node.status().peers[0]
+                .link
+                .as_ref()
+                .unwrap()
+                .path_since
+                .is_some(),
+            "a window can say since when"
+        );
         node.link_paths(&peer, Paths::default());
         assert_eq!(
             shown(&node),

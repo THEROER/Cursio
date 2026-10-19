@@ -1,7 +1,25 @@
 <script setup lang="ts">
-import type { ModuleSwitch, PeerView } from "~/composables/useNode"
+import { toMillis, type ModuleSwitch, type PeerView } from "~/composables/useNode"
 
 const { t } = useI18n()
+
+/** Ticks once a minute, for "on Bluetooth for N min". */
+const now = ref(Date.now())
+const clock = setInterval(() => (now.value = Date.now()), 60_000)
+onUnmounted(() => clearInterval(clock))
+
+/**
+ * How a peer held over Bluetooth is labelled: with how long, once the node
+ * says since when, since a machine on Bluetooth for a minute and one for an
+ * hour are different stories — the second has a network that is not coming
+ * back by itself.
+ */
+function overBluetooth(peer: PeerView): string {
+  const since = peer.link?.path_since
+  if (!since) return t("peer.overBluetooth")
+  const minutes = Math.floor((now.value - toMillis(since)) / 60_000)
+  return minutes < 1 ? t("peer.overBluetooth") : t("peer.overBluetoothFor", { minutes })
+}
 const { status, error, setModule, pendingSwitches, restart } = useNode()
 const { latency: latencyHistory, uptime } = useHistory()
 const { isMobile } = usePlatform()
@@ -186,7 +204,7 @@ function presenceTone(p: PeerView) {
                 <p class="min-w-0 flex-1 truncate font-medium">{{ peer.name }}</p>
                 <LpBadge :tone="presenceTone(peer)" dot size="sm">{{ t(`presence.${peer.presence}`) }}</LpBadge>
                 <LpTooltip v-if="peer.link?.path === 'bluetooth'" :content="t('peer.overBluetoothHint')">
-                  <LpBadge size="sm" tone="outline">{{ t("peer.overBluetooth") }}</LpBadge>
+                  <LpBadge size="sm" tone="outline">{{ overBluetooth(peer) }}</LpBadge>
                 </LpTooltip>
                 <PeerMenuButton :peer="peerRef(peer)" />
               </div>

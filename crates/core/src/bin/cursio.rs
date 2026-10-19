@@ -2783,6 +2783,7 @@ async fn run_pairing_and_session<T: cursio_transport::Transport + 'static>(
             inapplicable,
             since: std::time::SystemTime::now(),
             path,
+            path_since: None,
         },
     );
     let mut secure = link.transport;
