@@ -138,8 +138,10 @@ playback clock causes crackle or growing lag.
     peak, just above the dither floor; an adaptive threshold would chop the
     quiet passages of music;
   - *microphones* ask "is someone speaking?" — `audio.mic_gate` (`--mic-gate`):
-    `auto` (default) tracks the mic's own noise floor (slow rise, fast fall)
-    and opens 9 dB above it, bounded to -72…-42 dBFS RMS; a number such as
+    `auto` (default) takes the mic's noise floor as the quietest moment of
+    the last 5 s (minimum statistics) and opens 6 dB above it, bounded to
+    -72…-42 dBFS RMS — the earlier slow-rise floor and 9 dB margin dropped
+    quietly spoken words while the keyboard's clicks came through; a number such as
     `-55` fixes the RMS threshold; `off` sends everything while something on
     the peer records from the mic. It applies live, without a restart, and the
     health line logs the floor and threshold every 30 s.

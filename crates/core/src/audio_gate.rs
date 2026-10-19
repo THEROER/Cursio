@@ -13,9 +13,9 @@
 //! A **microphone** asks "is someone speaking?", and an absolute level cannot
 //! answer that: the same voice lands 20 dB apart on two microphones at two input
 //! gains. At -60 dBFS a quiet speaker on a modestly set mic was below the line
-//! for whole words. So a mic's threshold follows its own noise floor — tracked
-//! slow-rise/fast-fall, the usual VAD noise estimator, so a dip between words
-//! pulls it down at once while speech raises it only gradually — and sits a
+//! for whole words. So a mic's threshold follows its own noise floor — the
+//! quietest moment of the last few seconds (minimum statistics), so neither a
+//! long sentence nor typing beside the mic lifts it into the voice — and sits a
 //! margin above it, inside bounds that keep it from either passing hiss or
 //! cutting ordinary speech in a loud room. libopus' own DTX judges activity the
 //! same way, against the signal's own level rather than an absolute one; it is
@@ -56,17 +56,28 @@ const HANGOVER_SECS: f32 = 1.0;
 const HANGOVER: usize = (HANGOVER_SECS * BYTES_PER_SECOND) as usize;
 
 /// How far above the noise floor a microphone must rise to count as speech.
-const MIC_MARGIN_DB: f32 = 9.0;
+///
+/// 6 dB, down from 9: on a desk mic with a -55 dBFS floor the threshold sat
+/// at -46, a quietly spoken word at -50 was dropped whole, and the keyboard's
+/// clicks at -30 went through — the user heard the typing and not the voice.
+/// The hangover already keeps a gate opened by noise from flickering, so a
+/// lower margin costs at most a second of sent background.
+const MIC_MARGIN_DB: f32 = 6.0;
 /// Lowest automatic threshold. A muted or digitally silent mic drives the floor
 /// to nothing; below this the gate would open on dither.
 const MIC_THRESHOLD_MIN_DB: f32 = -72.0;
 /// Highest automatic threshold. Conversational speech sits around -30 dBFS RMS;
 /// past this a noisy room would start gating a normal voice.
 const MIC_THRESHOLD_MAX_DB: f32 = -42.0;
-/// How fast the noise floor may rise while the level stays above it. Slow
-/// enough that a sentence does not lift it into the voice, fast enough that a
-/// fan switched on is learned within seconds.
-const FLOOR_RISE_DB_PER_SEC: f32 = 1.5;
+/// How far back the noise floor looks: it is the quietest chunk heard in this
+/// long. Speech pauses between words many times a window, so however long and
+/// quiet a sentence runs the floor stays at the room under it; a fan switched
+/// on fills the whole window, and is learned once it has.
+const FLOOR_WINDOW_SECS: f32 = 5.0;
+/// The window is kept as this many slots' minima, so it slides without
+/// keeping every chunk.
+const FLOOR_SLOTS: usize = 10;
+const FLOOR_SLOT: usize = (FLOOR_WINDOW_SECS / FLOOR_SLOTS as f32 * BYTES_PER_SECOND) as usize;
 /// Level reported for a chunk of pure zeros, which has no logarithm.
 const LEVEL_OF_ZEROS_DB: f32 = -120.0;
 
@@ -136,6 +147,10 @@ pub struct Gate {
     quiet: Option<usize>,
     /// The mic's estimated noise floor in dBFS, once it has heard a chunk.
     floor_db: Option<f32>,
+    /// The quietest level of each finished slot of the floor's window.
+    slots: std::collections::VecDeque<f32>,
+    /// The quietest level of the slot being filled, and its bytes so far.
+    slot: Option<(f32, usize)>,
 }
 
 impl Gate {
@@ -176,12 +191,31 @@ impl Gate {
         self.floor_db
     }
 
+    /// Minimum statistics, the noise estimator VADs use: the floor is the
+    /// quietest chunk of the last [`FLOOR_WINDOW_SECS`].
+    ///
+    /// It replaced a floor that rose 1.5 dB/s whenever the level stood above
+    /// it, which typing and a long quiet sentence both lifted towards the voice.
     fn track_floor(&mut self, level: f32, bytes: usize) {
-        let rise = FLOOR_RISE_DB_PER_SEC * bytes as f32 / BYTES_PER_SECOND;
-        self.floor_db = Some(match self.floor_db {
-            Some(floor) if level > floor => (floor + rise).min(level),
-            _ => level,
-        });
+        let (quietest, filled) = match self.slot {
+            Some((quietest, filled)) => (quietest.min(level), filled + bytes),
+            None => (level, bytes),
+        };
+        if filled >= FLOOR_SLOT {
+            self.slots.push_back(quietest);
+            if self.slots.len() > FLOOR_SLOTS {
+                self.slots.pop_front();
+            }
+            self.slot = None;
+        } else {
+            self.slot = Some((quietest, filled));
+        }
+        self.floor_db = self
+            .slots
+            .iter()
+            .copied()
+            .chain(self.slot.map(|(quietest, _)| quietest))
+            .reduce(f32::min);
     }
 }
 
@@ -345,6 +379,25 @@ mod tests {
             5 * CHUNKS_PER_SEC,
             "five seconds of unbroken speech stays open"
         );
+    }
+
+    /// The second report: quiet speech cut while the keyboard came through.
+    #[test]
+    fn quiet_speech_between_keystrokes_passes_for_a_whole_minute() {
+        let mut gate = Gate::default();
+        let kind = GateKind::Mic(MicGate::Auto);
+        // 7 dB over the room: under the old 9 dB margin, and cut there.
+        let (room, voice, click) = (tone(-55.0), tone(-48.0), tone(-25.0));
+        feed(&mut gate, kind, &room, 2 * CHUNKS_PER_SEC);
+        let mut voiced = 0;
+        let mut admitted = 0;
+        for _ in 0..(60 * CHUNKS_PER_SEC / 40) {
+            voiced += 30;
+            admitted += feed(&mut gate, kind, &voice, 30);
+            feed(&mut gate, kind, &room, 8);
+            feed(&mut gate, kind, &click, 2);
+        }
+        assert_eq!(admitted, voiced, "a quietly spoken word was dropped");
     }
 
     #[test]
