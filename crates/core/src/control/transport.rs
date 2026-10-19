@@ -256,6 +256,12 @@ async fn push<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Just the request id of an answer, read when the rest of it cannot be.
+#[derive(serde::Deserialize)]
+struct AnswerId {
+    id: u64,
+}
+
 type Pending = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Reply>>>,
 >;
@@ -290,9 +296,30 @@ impl Client {
         tokio::spawn(async move {
             let mut read = BufReader::new(read);
             while let Ok(Some(line)) = read_line(&mut read).await {
-                let Ok(response) = serde_json::from_str::<Response>(&line) else {
-                    tracing::debug!("unreadable line from the node; skipping it");
-                    continue;
+                let response = match serde_json::from_str::<Response>(&line) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        // Most often a node newer than this client, answering
+                        // with a field or variant this build does not know.
+                        // Dropping the line left the request to time out as
+                        // "the node did not answer"; the request it belonged
+                        // to is told the real cause at once instead.
+                        tracing::warn!(error = %e, "unreadable answer from the node");
+                        if let Ok(AnswerId { id }) = serde_json::from_str::<AnswerId>(&line) {
+                            let waiter = waiting
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(&id);
+                            if let Some(waiter) = waiter {
+                                let _ = waiter.send(Reply::Error {
+                                    message: format!(
+                                        "the node answered in a form this build cannot read ({e}); it most likely runs a newer build, so restart this app"
+                                    ),
+                                });
+                            }
+                        }
+                        continue;
+                    }
                 };
                 if response.id == super::PUSH_ID {
                     if let Reply::Error { message } = &response.reply {
@@ -613,6 +640,36 @@ mod tests {
             panic!("expected status");
         };
         assert_eq!(status.node.name, "desk");
+    }
+
+    #[tokio::test]
+    async fn an_answer_this_build_cannot_read_fails_its_request_at_once() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        // A newer node: it answers with a reply kind this build lacks.
+        tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_side);
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let request = lines.next_line().await.unwrap().unwrap();
+            let id = serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"]
+                .as_u64()
+                .unwrap();
+            let answer = format!("{{\"id\":{id},\"reply\":\"from_the_future\"}}\n");
+            write.write_all(answer.as_bytes()).await.unwrap();
+            let _ = lines.next_line().await;
+        });
+        let (client, _pushes) = Client::start(client_side);
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.request(Command::Ping),
+        )
+        .await
+        .expect("answered at once, not left to time out");
+        let Ok(Reply::Error { message }) = answered else {
+            panic!("expected an error reply, got {answered:?}");
+        };
+        assert!(message.contains("restart this app"), "{message}");
     }
 
     /// Several requests in flight on one connection each get their own
