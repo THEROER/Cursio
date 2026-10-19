@@ -7,7 +7,9 @@
 //! Every connection, dialled or accepted, has its kernel send backlog bounded
 //! before the first byte is written ([`crate::send_backlog`]): the priority
 //! drainer's ordering only holds if the socket does not keep a deep queue of
-//! its own.
+//! its own — and how long sent data may go unacknowledged bounded too
+//! ([`crate::dead_peer`]), so a peer that vanished mid-write is let go of in
+//! seconds rather than after minutes of retransmission.
 
 use std::net::SocketAddr;
 
@@ -55,6 +57,7 @@ impl TcpTransport {
     /// Wrap an already-accepted connection (server side).
     pub fn from_stream(stream: TcpStream) -> Result<Self, TransportError> {
         crate::send_backlog::bound(&stream);
+        crate::dead_peer::bound(&stream);
         Self::wrap(stream)
     }
 

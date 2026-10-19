@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use cursio_protocol::Message;
 
 pub mod crypto;
+pub mod dead_peer;
 pub mod discovery;
 pub mod pairing;
 pub mod priority;
