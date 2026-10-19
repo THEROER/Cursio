@@ -18,6 +18,9 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, BLACK_BRUSH, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HALFTONE, HBRUSH,
     PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 
 use crate::SourcePick;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -30,13 +33,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     MA_NOACTIVATE, MSG, PM_REMOVE, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
-    SW_SHOW, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    SW_SHOW, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WMSZ_BOTTOM, WMSZ_TOP, WMSZ_TOPLEFT,
+    WMSZ_TOPRIGHT, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SIZING, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
-use crate::framebuffer::Framebuffer;
+use crate::framebuffer::{contained_to_host, refit, Framebuffer};
 use crate::video_decoder_win::VideoDecoder;
 
 use super::{unseen, SurrogateCommand};
@@ -175,31 +179,35 @@ unsafe fn show_source_menu(hwnd: HWND, view: &ViewState) {
 /// Map a click's `lParam` to host pixel coordinates.
 ///
 /// GDI gives client-area coordinates, which match the host's pixels only while
-/// the surrogate is shown unscaled. Rescaling by the ratio between the client
-/// area and the framebuffer keeps clicks landing where the user aims after a
-/// resize — the same correction the GTK surrogate makes.
+/// the surrogate is shown unscaled. The picture is letterboxed into the client
+/// area, so the click is mapped through the same fit — the correction the GTK
+/// surrogate makes.
 fn to_host(hwnd: HWND, state: &WindowState, lparam: LPARAM) -> (u32, u32) {
     let x = (lparam.0 & 0xFFFF) as i16 as f64;
     let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f64;
     let fb = state.fb.borrow();
+    let (cw, ch) = client_size(hwnd).unwrap_or((fb.width as i32, fb.height as i32));
+    contained_to_host((cw as f64, ch as f64), (fb.width, fb.height), x, y)
+}
 
+fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
     let mut rect = RECT::default();
-    let client_ok = unsafe { GetClientRect(hwnd, &mut rect) }.is_ok();
-    let (cw, ch) = if client_ok {
-        (
-            (rect.right - rect.left) as f64,
-            (rect.bottom - rect.top) as f64,
-        )
-    } else {
-        (fb.width as f64, fb.height as f64)
-    };
-    if cw <= 0.0 || ch <= 0.0 {
-        return (0, 0);
-    }
+    unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
+    Some((rect.right - rect.left, rect.bottom - rect.top))
+}
 
-    let hx = (x / cw * fb.width as f64).clamp(0.0, fb.width.saturating_sub(1) as f64);
-    let hy = (y / ch * fb.height as f64).clamp(0.0, fb.height.saturating_sub(1) as f64);
-    (hx as u32, hy as u32)
+/// The work area — the monitor less the taskbar — of the monitor holding
+/// `hwnd`.
+unsafe fn work_area(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+        return None;
+    }
+    let work = info.rcWork;
+    Some((work.right - work.left, work.bottom - work.top))
 }
 
 /// Windows virtual-key code → the evdev code the protocol speaks.
@@ -278,25 +286,36 @@ fn evdev_from_vk(vk: u16) -> Option<u16> {
 }
 
 /// Size the window so its *client area* is exactly `width` × `height` device
-/// pixels — the host's own resolution, blitted 1:1.
+/// pixels.
 ///
 /// `CreateWindowExW` takes the outer size, which includes the frame and the
 /// title bar. Passing the picture's size there leaves a client area some 16 by
 /// 39 pixels smaller, so every frame arrived downscaled by an arbitrary,
 /// non-integer ratio: text lost strokes and edges crawled, on a link that had
-/// just carried the pixels perfectly. The frame is measured at the window's own
-/// DPI rather than the system's, because the two differ on any mixed-scale
-/// desktop.
+/// just carried the pixels perfectly.
 unsafe fn fit_client(hwnd: HWND, width: u32, height: u32) {
     if width == 0 || height == 0 {
         return;
     }
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: width as i32,
-        bottom: height as i32,
+    let Some((fw, fh)) = frame(hwnd) else {
+        return;
     };
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        width as i32 + fw,
+        height as i32 + fh,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+}
+
+/// How much wider and taller the window is than its client area. Measured at
+/// the window's own DPI rather than the system's, because the two differ on
+/// any mixed-scale desktop.
+unsafe fn frame(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rect = RECT::default();
     let dpi = GetDpiForWindow(hwnd);
     if dpi == 0
         || AdjustWindowRectExForDpi(
@@ -308,17 +327,58 @@ unsafe fn fit_client(hwnd: HWND, width: u32, height: u32) {
         )
         .is_err()
     {
+        return None;
+    }
+    Some((rect.right - rect.left, rect.bottom - rect.top))
+}
+
+/// Size the client area for a picture of `picture` that was `old` until now.
+///
+/// A view keeps the source's own size: nobody sees it, and at that size the
+/// capture app records it 1:1. A surrogate is fitted to its monitor's work
+/// area keeping the picture's shape, and on a change of shape — a phone
+/// turning — keeps the scale it was shown at, as scrcpy does: a phone's
+/// 1920-high screen left at its own size is cut to the monitor by Windows,
+/// which then stretched the picture across the cut window.
+unsafe fn size_for(hwnd: HWND, is_view: bool, old: (u32, u32), picture: (u32, u32)) {
+    if is_view {
+        fit_client(hwnd, picture.0, picture.1);
         return;
     }
-    let _ = SetWindowPos(
-        hwnd,
-        None,
-        0,
-        0,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-    );
+    let room = work_area(hwnd).and_then(|(w, h)| {
+        let (fw, fh) = frame(hwnd)?;
+        Some((w - fw, h - fh))
+    });
+    let shown = client_size(hwnd).unwrap_or((0, 0));
+    let (w, h) = refit(shown, old, picture, room);
+    fit_client(hwnd, w as u32, h as u32);
+}
+
+/// Keep a surrogate's client area the picture's shape while the user drags
+/// its border, so the picture fills it instead of gaining bars.
+///
+/// `rect` is the proposed outer rectangle; the side being dragged decides
+/// which dimension follows the other, and which edge moves to make it so.
+unsafe fn keep_shape(hwnd: HWND, edge: u32, rect: &mut RECT, picture: (u32, u32)) {
+    let (Some((fw, fh)), (pw, ph)) = (frame(hwnd), picture) else {
+        return;
+    };
+    if pw == 0 || ph == 0 {
+        return;
+    }
+    let (pw, ph) = (pw as i64, ph as i64);
+    let cw = (rect.right - rect.left - fw).max(1) as i64;
+    let ch = (rect.bottom - rect.top - fh).max(1) as i64;
+    if edge == WMSZ_TOP || edge == WMSZ_BOTTOM {
+        rect.right = rect.left + (ch * pw / ph) as i32 + fw;
+    } else {
+        let h = (cw * ph / pw) as i32 + fh;
+        if edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT {
+            rect.top = rect.bottom - h;
+        } else {
+            rect.bottom = rect.top + h;
+        }
+    }
 }
 
 /// The window procedure: painting and input.
@@ -377,6 +437,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 
     match msg {
+        WM_SIZING if state.view.is_none() => {
+            let fb = state.fb.borrow();
+            keep_shape(
+                hwnd,
+                wparam.0 as u32,
+                &mut *(lparam.0 as *mut RECT),
+                (fb.width, fb.height),
+            );
+            LRESULT(1)
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
@@ -388,9 +458,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 (client.right - client.left).max(0) as u32,
                 (client.bottom - client.top).max(0) as u32,
             );
-            // A view letterboxes rather than resizing itself to each source,
-            // so the bars are painted here — nothing else covers them.
-            let (dx, dy, dw, dh) = if state.view.is_some() {
+            // Letterboxed, never stretched: a view keeps one window while its
+            // source changes shape, and a surrogate's client area can lose the
+            // picture's shape to a maximize or to Windows cutting it to the
+            // monitor. Nothing else covers the bars, so they are painted here.
+            let (dx, dy, dw, dh) = {
                 let (x, y, w, h) = crate::framebuffer::letterbox(fb.width, fb.height, cw, ch);
                 // Only the bars, never the whole client first: DWM composes a
                 // redirected window whenever it likes, and a capture taken
@@ -430,8 +502,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
                 (x as u32, y as u32, w as u32, h as u32)
-            } else {
-                (0, 0, cw, ch)
             };
             if fb.width > 0 && fb.height > 0 {
                 let info = BITMAPINFO {
@@ -449,9 +519,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     },
                     ..Default::default()
                 };
-                // The client area is kept at the host's resolution, so this is
-                // normally a straight copy. It stops being one the moment the
-                // user resizes the surrogate, and GDI's default stretch mode
+                // The client area is kept at the host's resolution where the
+                // monitor has room, so this is normally a straight copy. It
+                // stops being one for a picture taller than the monitor, or the
+                // moment the user resizes the surrogate, and GDI's default stretch mode
                 // (`BLACKONWHITE`) then *drops* whole rows and columns rather
                 // than resampling — which is what turned a scaled window into
                 // broken text and jagged edges. `HALFTONE` averages instead,
@@ -669,7 +740,7 @@ pub(crate) fn run(
         // Only now can the frame be measured at this window's DPI, so the size
         // passed to `CreateWindowExW` is corrected here rather than guessed
         // above.
-        fit_client(hwnd, meta.width, meta.height);
+        size_for(hwnd, is_view, (0, 0), (meta.width, meta.height));
 
         if is_view {
             unseen::hide(hwnd);
@@ -731,14 +802,14 @@ pub(crate) fn run(
                                 for pic in pictures {
                                     let mut fb = state.fb.borrow_mut();
                                     if fb.width != pic.width || fb.height != pic.height {
+                                        let old = (fb.width, fb.height);
                                         fb.resize(pic.width, pic.height);
                                         // The encoder changed resolution
-                                        // mid-stream; follow it, or every frame
-                                        // from here is scaled to the old size.
-                                        // A view follows too: nobody sees
-                                        // it, and at the source's own size
-                                        // the capture app records it 1:1.
-                                        fit_client(hwnd, pic.width, pic.height);
+                                        // mid-stream — a phone turned, or a
+                                        // quality change; follow it, or every
+                                        // frame from here is squeezed into the
+                                        // old shape.
+                                        size_for(hwnd, is_view, old, (pic.width, pic.height));
                                     }
                                     let full = Rect {
                                         x: 0,
@@ -770,16 +841,25 @@ pub(crate) fn run(
                     }
                     Ok(SurrogateCommand::Resize { width, height }) => {
                         let state = &*state_ptr;
-                        state.fb.borrow_mut().resize(width, height);
-                        // The host's window was resized, so this one follows it
-                        // and keeps showing the pixels at their own size.
-                        fit_client(hwnd, width, height);
+                        let old = {
+                            let mut fb = state.fb.borrow_mut();
+                            let old = (fb.width, fb.height);
+                            fb.resize(width, height);
+                            old
+                        };
+                        // The host's window was resized, so this one follows it.
+                        size_for(hwnd, is_view, old, (width, height));
                         painted = true;
                     }
                     Ok(SurrogateCommand::Grow { width, height }) => {
                         let state = &*state_ptr;
-                        state.fb.borrow_mut().grow_to(width, height);
-                        fit_client(hwnd, width, height);
+                        let old = {
+                            let mut fb = state.fb.borrow_mut();
+                            let old = (fb.width, fb.height);
+                            fb.grow_to(width, height);
+                            old
+                        };
+                        size_for(hwnd, is_view, old, (width, height));
                         painted = true;
                     }
                     Ok(SurrogateCommand::Restart { title }) => {

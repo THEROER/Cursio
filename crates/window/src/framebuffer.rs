@@ -154,6 +154,77 @@ pub fn letterbox(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32, u
     ((dst_w - w) / 2, (dst_h - h) / 2, w, h)
 }
 
+/// Kept clear of a monitor's edges by a picture's window, on each axis:
+/// scrcpy's margin, for the title bar and whatever panel `room` still counts.
+const ROOM_MARGIN: i32 = 96;
+
+/// A window's picture area for a picture of `width`×`height`: as large as
+/// the picture, but scaled down, keeping its shape, to fit `room`.
+///
+/// A phone's screen is 1920 high, taller than most monitors. Left at its own
+/// size, the window manager cuts the window to the monitor, and whatever then
+/// draws into the cut window either stretches the picture or letterboxes it
+/// with bars far wider than the picture's own margins.
+pub fn fit_into(width: u32, height: u32, room: Option<(i32, i32)>) -> (i32, i32) {
+    optimal(
+        (width.max(1) as i32, height.max(1) as i32),
+        (width, height),
+        room,
+    )
+}
+
+/// The picture area for a picture that changed from `old` to `new` while
+/// shown in a `shown`-sized area: scaled by how much the picture changed, so
+/// a phone turning sideways keeps the size the user gave its window, then
+/// fitted to `room` with the new shape — what scrcpy does on a rotation.
+pub fn refit(
+    shown: (i32, i32),
+    old: (u32, u32),
+    new: (u32, u32),
+    room: Option<(i32, i32)>,
+) -> (i32, i32) {
+    if old.0 == 0 || old.1 == 0 || shown.0 <= 0 || shown.1 <= 0 {
+        return fit_into(new.0, new.1, room);
+    }
+    let target = (
+        (shown.0 as i64 * new.0 as i64 / old.0 as i64) as i32,
+        (shown.1 as i64 * new.1 as i64 / old.1 as i64) as i32,
+    );
+    optimal(target, new, room)
+}
+
+/// `target` cut to `room` less its margin, then narrowed on one axis to the
+/// picture's shape, so the area leaves no bars.
+fn optimal(target: (i32, i32), picture: (u32, u32), room: Option<(i32, i32)>) -> (i32, i32) {
+    let (mut w, mut h) = target;
+    if let Some((room_w, room_h)) = room {
+        w = w.min((room_w - ROOM_MARGIN).max(1));
+        h = h.min((room_h - ROOM_MARGIN).max(1));
+    }
+    let (pw, ph) = (picture.0.max(1) as i64, picture.1.max(1) as i64);
+    if w as i64 * ph > h as i64 * pw {
+        w = (h as i64 * pw / ph) as i32;
+    } else {
+        h = (w as i64 * ph / pw) as i32;
+    }
+    (w.max(1), h.max(1))
+}
+
+/// Map a point in a `widget`-sized area showing a `host`-sized picture
+/// letterboxed (scaled by one factor and centred) onto host pixels. A point in
+/// the bars clamps to the nearest edge.
+pub fn contained_to_host(widget: (f64, f64), host: (u32, u32), x: f64, y: f64) -> (u32, u32) {
+    let ((w, h), (fw, fh)) = (widget, host);
+    if w <= 0.0 || h <= 0.0 || fw == 0 || fh == 0 {
+        return (0, 0);
+    }
+    let scale = (w / fw as f64).min(h / fh as f64);
+    let (ox, oy) = ((w - fw as f64 * scale) / 2.0, (h - fh as f64 * scale) / 2.0);
+    let hx = ((x - ox) / scale).clamp(0.0, (fw - 1) as f64);
+    let hy = ((y - oy) / scale).clamp(0.0, (fh - 1) as f64);
+    (hx as u32, hy as u32)
+}
+
 /// Draw `src` into the tightly packed `dst_w` × `dst_h` BGRA buffer `dst`,
 /// letterboxed, with black bars.
 ///
@@ -232,6 +303,57 @@ mod tests {
     #[test]
     fn a_matching_shape_fills_the_area() {
         assert_eq!(letterbox(1280, 720, 1920, 1080), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn a_phone_screen_taller_than_the_monitor_is_scaled_down_keeping_its_shape() {
+        assert_eq!(fit_into(864, 1920, Some((3840, 1080))), (442, 984));
+        assert_eq!(fit_into(800, 600, Some((3840, 1080))), (800, 600));
+        assert_eq!(fit_into(800, 600, None), (800, 600));
+    }
+
+    #[test]
+    fn a_phone_turning_sideways_keeps_its_window_scale() {
+        // Portrait shown at half size; landscape at half size fits a 4K room.
+        assert_eq!(
+            refit((432, 960), (864, 1920), (1920, 864), Some((3840, 2160))),
+            (960, 432)
+        );
+        // A window fitted to a 1080p monitor's height keeps that scale sideways.
+        assert_eq!(
+            refit((442, 984), (864, 1920), (1920, 864), Some((1920, 1080))),
+            (982, 441)
+        );
+    }
+
+    #[test]
+    fn a_picture_with_no_previous_size_is_fitted_afresh() {
+        assert_eq!(
+            refit((0, 0), (0, 0), (864, 1920), Some((3840, 1080))),
+            fit_into(864, 1920, Some((3840, 1080)))
+        );
+    }
+
+    #[test]
+    fn a_click_in_a_letterboxed_picture_lands_on_the_same_host_pixel() {
+        // A 100×200 host shown in a 300×200 widget: scale 1, 100 px bars each side.
+        assert_eq!(
+            contained_to_host((300.0, 200.0), (100, 200), 150.0, 100.0),
+            (50, 100)
+        );
+        assert_eq!(
+            contained_to_host((300.0, 200.0), (100, 200), 10.0, 0.0),
+            (0, 0)
+        );
+        // Half size: the widget's 50,100 is the host's 100,200 - clamped to the last pixel.
+        assert_eq!(
+            contained_to_host((50.0, 100.0), (100, 200), 50.0, 100.0),
+            (99, 199)
+        );
+        assert_eq!(
+            contained_to_host((50.0, 100.0), (100, 200), 25.0, 50.0),
+            (50, 100)
+        );
     }
 
     #[test]

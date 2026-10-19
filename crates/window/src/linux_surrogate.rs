@@ -50,7 +50,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     codec::decode_tile,
-    framebuffer::{geometry_of, Framebuffer, Geometry},
+    framebuffer::{contained_to_host, fit_into, geometry_of, refit, Framebuffer, Geometry},
     presentation_ack::PresentationAcks,
     video_decoder::VideoDecoder,
     Surrogate, WindowError, WindowRenderer,
@@ -383,47 +383,28 @@ fn gtk_context() -> Result<glib::MainContext, WindowError> {
     Ok(started)
 }
 
-/// A window's size for a picture of `width`×`height`: as large as the picture,
-/// but scaled down, keeping its shape, to fit the largest monitor with room
-/// for the title bar and panels.
-fn fitted(width: u32, height: u32) -> (i32, i32) {
-    use gtk::prelude::*;
-    let room = gtk::gdk::Display::default().and_then(|display| {
+/// The window's default size for a picture of `width`×`height`: the picture
+/// fitted to the largest monitor, plus the title bar.
+///
+/// A GTK 4 window's default size includes its title bar, so a window sized to
+/// the picture alone gives the picture that many rows less than it needs, and
+/// `Contain` fills the difference with bars down both sides of a phone.
+fn fitted(width: u32, height: u32, titlebar: i32) -> (i32, i32) {
+    let (w, h) = fit_into(width, height, largest_monitor());
+    (w, h + titlebar)
+}
+
+/// The largest monitor's size. Wayland tells a client nothing about panels or
+/// where its window is, so this is the best `room` there is.
+fn largest_monitor() -> Option<(i32, i32)> {
+    gtk::gdk::Display::default().and_then(|display| {
         let monitors = display.monitors();
         (0..monitors.n_items())
             .filter_map(|i| monitors.item(i)?.downcast::<gtk::gdk::Monitor>().ok())
             .map(|m| m.geometry())
             .map(|g| (g.width(), g.height()))
             .max_by_key(|(w, h)| w * h)
-    });
-    fit_into(width, height, room)
-}
-
-fn fit_into(width: u32, height: u32, room: Option<(i32, i32)>) -> (i32, i32) {
-    let (w, h) = (width.max(1) as f64, height.max(1) as f64);
-    let Some((room_w, room_h)) = room else {
-        return (w as i32, h as i32);
-    };
-    // A tenth kept back: the top bar, a dock, and the window's own title bar.
-    let scale = (room_w as f64 * 0.9 / w)
-        .min(room_h as f64 * 0.9 / h)
-        .min(1.0);
-    ((w * scale).round() as i32, (h * scale).round() as i32)
-}
-
-/// Map a point in a `Contain`-fitted picture onto host pixels: the picture is
-/// scaled by one factor and centred, so a point in the letterbox clamps to
-/// the nearest edge.
-fn contained_to_host(widget: (f64, f64), host: (u32, u32), x: f64, y: f64) -> (u32, u32) {
-    let ((w, h), (fw, fh)) = (widget, host);
-    if w <= 0.0 || h <= 0.0 || fw == 0 || fh == 0 {
-        return (0, 0);
-    }
-    let scale = (w / fw as f64).min(h / fh as f64);
-    let (ox, oy) = ((w - fw as f64 * scale) / 2.0, (h - fh as f64 * scale) / 2.0);
-    let hx = ((x - ox) / scale).clamp(0.0, (fw - 1) as f64);
-    let hy = ((y - oy) / scale).clamp(0.0, (fh - 1) as f64);
-    (hx as u32, hy as u32)
+    })
 }
 
 /// One window's H.264 decoder, on a thread of its own.
@@ -524,13 +505,17 @@ fn build_window(
         .build();
     picture.set_paintable(Some(&to_texture(&fb.borrow())));
 
-    let (width, height) = fitted(meta.width, meta.height);
     let window = gtk::Window::builder()
         .title(&meta.title)
-        .default_width(width)
-        .default_height(height)
         .child(&picture)
         .build();
+    // An explicit header bar, the same one GTK would draw, so its height can
+    // be measured and added to the picture's.
+    let header = gtk::HeaderBar::new();
+    window.set_titlebar(Some(&header));
+    let titlebar = header.measure(gtk::Orientation::Vertical, -1).1;
+    let (width, height) = fitted(meta.width, meta.height, titlebar);
+    window.set_default_size(width, height);
 
     attach_input_controllers(&window, &picture, id, input_tx, fb.clone());
     // Report the size the user drags this window to, so the host can resize
@@ -541,7 +526,7 @@ fn build_window(
     for property in ["default-width", "default-height"] {
         let tx = resized_tx.clone();
         window.connect_notify_local(Some(property), move |win, _| {
-            let (w, h) = (win.default_width(), win.default_height());
+            let (w, h) = (win.default_width(), win.default_height() - titlebar);
             if w > 0 && h > 0 {
                 let _ = tx.send((w as u32, h as u32));
             }
@@ -601,13 +586,13 @@ fn build_window(
                     }
                     Ok(SurrogateCommand::Resize { width, height }) => {
                         fb_for_frames.borrow_mut().resize(width, height);
-                        let (w, h) = fitted(width, height);
+                        let (w, h) = fitted(width, height, titlebar);
                         main_loop_window.set_default_size(w, h);
                         painted = true;
                     }
                     Ok(SurrogateCommand::Grow { width, height }) => {
                         fb_for_frames.borrow_mut().grow_to(width, height);
-                        let (w, h) = fitted(width, height);
+                        let (w, h) = fitted(width, height, titlebar);
                         main_loop_window.set_default_size(w, h);
                         painted = true;
                     }
@@ -642,9 +627,14 @@ fn build_window(
                 // not shown scaled into the old window's size for the rest of the
                 // session.
                 if fb.width != pic.width || fb.height != pic.height {
+                    let (w, h) = refit(
+                        (picture_for_frames.width(), picture_for_frames.height()),
+                        (fb.width, fb.height),
+                        (pic.width, pic.height),
+                        largest_monitor(),
+                    );
                     fb.resize(pic.width, pic.height);
-                    let (w, h) = fitted(pic.width, pic.height);
-                    main_loop_window.set_default_size(w, h);
+                    main_loop_window.set_default_size(w, h + titlebar);
                 }
                 let full = Rect {
                     x: 0,
@@ -874,37 +864,6 @@ mod input_tests {
         assert_eq!(map_button(8), Some(MouseButton::Back));
         assert_eq!(map_button(9), Some(MouseButton::Forward));
         assert_eq!(map_button(42), None);
-    }
-
-    #[test]
-    fn a_phone_screen_taller_than_the_monitor_is_scaled_down_keeping_its_shape() {
-        let (w, h) = fit_into(848, 1920, Some((3840, 1080)));
-        assert_eq!(h, 972);
-        assert_eq!(w, (848.0_f64 * 972.0 / 1920.0).round() as i32);
-        assert_eq!(fit_into(800, 600, Some((3840, 1080))), (800, 600));
-        assert_eq!(fit_into(800, 600, None), (800, 600));
-    }
-
-    #[test]
-    fn a_click_in_a_letterboxed_picture_lands_on_the_same_host_pixel() {
-        // A 100×200 host shown in a 300×200 widget: scale 1, 100 px bars each side.
-        assert_eq!(
-            contained_to_host((300.0, 200.0), (100, 200), 150.0, 100.0),
-            (50, 100)
-        );
-        assert_eq!(
-            contained_to_host((300.0, 200.0), (100, 200), 10.0, 0.0),
-            (0, 0)
-        );
-        // Half size: the widget's 50,100 is the host's 100,200 - clamped to the last pixel.
-        assert_eq!(
-            contained_to_host((50.0, 100.0), (100, 200), 50.0, 100.0),
-            (99, 199)
-        );
-        assert_eq!(
-            contained_to_host((50.0, 100.0), (100, 200), 25.0, 50.0),
-            (50, 100)
-        );
     }
 }
 
