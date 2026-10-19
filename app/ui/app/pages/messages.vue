@@ -18,7 +18,7 @@ import { PAGE } from "~/composables/useMessages"
  * conversation below the fold.
  */
 const { t } = useI18n()
-const { status } = useNode()
+const { status, callAction } = useNode()
 const messages = useMessages()
 const toast = useCursioToast()
 
@@ -100,6 +100,31 @@ function choose(c: Conversation) {
     // Refused unless Cursio is the phone's default SMS app; the phone's own
     // app marks it read when the user next opens it there, so this stays quiet.
     messages.markRead(phoneId.value, c.thread_id).catch(() => undefined)
+  }
+}
+
+/**
+ * The phone places calls for this computer when its calls module is up and
+ * not refusing; the voice then comes here if `[calls] answer_moves_voice`.
+ */
+const canCall = computed(() => {
+  const phone = (status.value?.calls ?? []).find((p) => p.name === phoneName.value)
+  return !!phone && !phone.unavailable
+})
+/** One number to call: a group thread or several typed recipients have none. */
+const callNumber = computed(() => (recipients.value.length === 1 ? recipients.value[0]! : null))
+const calling = ref(false)
+
+async function dial() {
+  const number = callNumber.value
+  if (!number || calling.value) return
+  calling.value = true
+  try {
+    await callAction(phoneName.value, { action: "dial", number })
+  } catch (e) {
+    toast.failure(e, { title: t("messages.callFailed") })
+  } finally {
+    calling.value = false
   }
 }
 
@@ -380,6 +405,17 @@ const showList = computed(() => !(open.value || composingNew.value))
                 </p>
               </div>
             </template>
+            <LpButton
+              v-if="canCall"
+              variant="soft"
+              size="sm"
+              :loading="calling"
+              :disabled="!callNumber"
+              :aria-label="t('messages.call')"
+              @click="dial"
+            >
+              <LpIcon name="lucide:phone" :size="16" />
+            </LpButton>
           </header>
 
           <div ref="scroller" class="min-h-0 flex-1 overflow-y-auto px-4 py-3" aria-live="polite">

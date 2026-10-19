@@ -269,6 +269,9 @@ blocking calls cannot run on the runtime.
   for the app and the GNOME menu.
 - **The CLI**: `cursio call list | answer | decline | hangup | dial | mute |
   audio`.
+- **The app's Messages page** dials: a call button on a conversation with one
+  number, and on a new message once one number is typed — the phone places
+  the call, and the voice comes here as for any call dialled from a computer.
 
 ## Not here yet
 

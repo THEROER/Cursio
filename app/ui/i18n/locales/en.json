@@ -103,7 +103,9 @@
     "unknown": "Unknown",
     "handedOver": "Handed to the phone to send",
     "loadFailed": "Could not read the phone's messages",
-    "sendFailed": "The phone did not send it"
+    "sendFailed": "The phone did not send it",
+    "call": "Call from the phone",
+    "callFailed": "The phone did not place the call"
   },
   "node": {
     "running": "Node running",
