@@ -120,6 +120,7 @@ const SETTINGS: SettingsSection[] = [
   { anchor: "calls", label: "settings.callsTitle", icon: "lucide:phone", keywords: ["bluetooth", "headset", "hands-free", "voice", "звонки", "блютуз", "гарнитура", "дзвінки", "гарнітура"], only: "desktop" },
   { anchor: "phone-audio", label: "phoneAudio.title", icon: "lucide:speaker", keywords: ["sound", "speaker", "звук", "колонка"], only: "mobile" },
   { anchor: "phone-screen", label: "phoneScreen.title", icon: "lucide:cast", keywords: ["screen", "mirror", "cast", "экран", "трансляция", "екран"], only: "mobile" },
+  { anchor: "standby", label: "settings.standbyTitle", icon: "lucide:bluetooth", keywords: ["bluetooth", "wifi", "backup", "резерв", "блютуз", "вайфай"], only: "mobile" },
   { anchor: "playing", label: "streams.title", icon: "lucide:volume-2", keywords: ["volume", "sound", "громкость", "звук", "гучність"] },
   { anchor: "microphones", label: "streams.microphones", icon: "lucide:mic", keywords: ["микрофоны", "мікрофони"] },
   { anchor: "autostart", label: "settings.autostartTitle", icon: "lucide:power", keywords: ["login", "boot", "tray", "startup", "автозапуск", "автозавантаження"], only: "desktop" },

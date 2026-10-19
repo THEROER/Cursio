@@ -484,6 +484,25 @@ pub mod commands {
         link.request(Command::SetConfig { config }).await
     }
 
+    /// Keep a Bluetooth path open beside the network, or not: the config
+    /// file's `[bluetooth] standby`, like [`node_set_calls`].
+    #[tauri::command]
+    pub async fn node_set_bluetooth_standby(
+        link: State<'_, NodeLink>,
+        on: bool,
+    ) -> Result<Reply, NodeError> {
+        let mut config = match link.request(Command::Config).await? {
+            Reply::Config { file, .. } => *file,
+            other => {
+                return Err(NodeError::failed(format!(
+                    "the node answered a config request with {other:?}"
+                )));
+            }
+        };
+        config.bluetooth.standby = on;
+        link.request(Command::SetConfig { config }).await
+    }
+
     #[tauri::command]
     pub async fn node_pair_show(link: State<'_, NodeLink>) -> Result<Reply, NodeError> {
         link.request(Command::PairShow).await

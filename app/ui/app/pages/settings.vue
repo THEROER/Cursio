@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core"
 import type { CallsConfig, Reply, ServiceState } from "~/composables/useNode"
 
 const { t } = useI18n()
-const { status, restart, config, setMicGate, setName, setCalls } = useNode()
+const { status, restart, config, setMicGate, setName, setCalls, setBluetoothStandby } = useNode()
 const { isMobile, ready } = usePlatform()
 const toast = useCursioToast()
 
@@ -214,6 +214,45 @@ async function saveCalls(change: Partial<CallsConfig>) {
     toast.failure(e, { title: t("settings.callsFailedSave"), retry: () => saveCalls(change) })
   } finally {
     callsBusy.value = false
+  }
+}
+
+/**
+ * A phone's Bluetooth path kept open beside the network, so its session moves
+ * there within seconds when Wi-Fi drops. `null` until read.
+ */
+const standby = ref<boolean | null>(null)
+const standbyBusy = ref(false)
+
+async function loadStandby() {
+  try {
+    const reply = await config()
+    if (reply.reply !== "config") return
+    const { file } = reply as Extract<Reply, { reply: "config" }>
+    standby.value = file.bluetooth?.standby ?? false
+  } catch (e) {
+    toast.failure(e, { title: t("settings.standbyFailed") })
+  }
+}
+
+watch(
+  [() => !!status.value, isMobile],
+  ([up, mobile]) => {
+    if (up && mobile && standby.value === null) void loadStandby()
+  },
+  { immediate: true },
+)
+
+async function saveStandby(on: boolean) {
+  standbyBusy.value = true
+  try {
+    await setBluetoothStandby(on)
+    standby.value = on
+    toast.success(t("settings.saved"))
+  } catch (e) {
+    toast.failure(e, { title: t("settings.standbyFailed"), retry: () => saveStandby(on) })
+  } finally {
+    standbyBusy.value = false
   }
 }
 
@@ -435,6 +474,23 @@ async function restartNode() {
       <section v-if="status && isMobile" id="phone-screen" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('phoneScreen.title')" :description="t('phoneScreen.description')" icon="lucide:cast" />
         <PhoneScreenCard />
+      </section>
+
+      <section v-if="status && isMobile" id="standby" class="flex scroll-mt-4 flex-col gap-3">
+        <LpSection :title="t('settings.standbyTitle')" :description="t('settings.standbyDescription')" icon="lucide:bluetooth" />
+        <LpSkeleton v-if="standby === null" rounded="card" class="h-16" />
+        <LpCard v-else padded class="flex items-center gap-4">
+          <div class="min-w-0 flex-1">
+            <p class="text-sm font-medium">{{ t("settings.standbyToggle") }}</p>
+            <p class="text-xs text-muted">{{ t("settings.standbyHint") }}</p>
+          </div>
+          <LpSwitch
+            :model-value="standby"
+            :disabled="standbyBusy"
+            :aria-label="t('settings.standbyToggle')"
+            @update:model-value="(v: boolean) => saveStandby(v)"
+          />
+        </LpCard>
       </section>
 
       <section v-if="status" id="playing" class="flex scroll-mt-4 flex-col gap-3">

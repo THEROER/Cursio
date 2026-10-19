@@ -238,6 +238,8 @@ export interface NodeConfig {
   audio: { render_device: string | null; mic_gate: string | null }
   /** Absent from a node older than control v16. */
   calls?: CallsConfig
+  /** Absent from a node before resumable sessions. */
+  bluetooth?: { standby: boolean }
   [key: string]: unknown
 }
 
@@ -349,6 +351,7 @@ export function useNode() {
     config: () => call<Reply>("node_config"),
     setMicGate: (value: string) => call<Reply>("node_set_mic_gate", { value }),
     setCalls: (calls: CallsConfig) => call<Reply>("node_set_calls", { calls }),
+    setBluetoothStandby: (on: boolean) => call<Reply>("node_set_bluetooth_standby", { on }),
     setStreamVolume: (stream: number, volume: number, muted: boolean) =>
       call<Reply>("node_set_stream_volume", { stream, volume, muted }),
     pairShow: () => call<Reply>("node_pair_show"),
