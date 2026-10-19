@@ -10,6 +10,20 @@ const toast = useCursioToast()
 /** `identity::MAX_NAME_CHARS`; the node refuses anything longer. */
 const NAME_MAX = 40
 
+// The palette links to a section (`/settings#calls`). Most sections wait for
+// the node's status, so the router's own jump finds nothing to land on;
+// this one waits for the section to exist, then scrolls to it.
+const route = useRoute()
+watch(
+  [() => route.hash, () => !!status.value],
+  async ([hash]) => {
+    if (!hash) return
+    await nextTick()
+    document.getElementById(hash.slice(1))?.scrollIntoView({ behavior: "smooth", block: "start" })
+  },
+  { immediate: true },
+)
+
 const nameDraft = ref("")
 const nameBusy = ref(false)
 
@@ -253,7 +267,7 @@ async function restartNode() {
 <template>
   <DesktopShell>
     <div class="flex flex-col gap-6">
-      <section v-if="status" class="flex flex-col gap-3">
+      <section v-if="status" id="name" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('settings.nameTitle')" :description="t('settings.nameDescription')" icon="lucide:tag" />
         <LpCard padded class="flex flex-col gap-3">
           <form class="flex flex-wrap items-end gap-3" @submit.prevent="saveName">
@@ -275,14 +289,14 @@ async function restartNode() {
         </LpCard>
       </section>
 
-      <section class="flex flex-col gap-3">
+      <section id="theme" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('settings.themeTitle')" :description="t('settings.themeDescription')" icon="lucide:palette" />
         <LpCard padded>
           <LpThemeSwitcher variant="swatch" show-label :aria-label="t('settings.themeTitle')" />
         </LpCard>
       </section>
 
-      <section v-if="status" class="flex flex-col gap-3">
+      <section v-if="status" id="audio" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('settings.audioTitle')" icon="lucide:mic" />
         <LpSkeleton v-if="!gateMode" rounded="card" class="h-24" />
         <LpCard v-else padded class="flex flex-col gap-3">
@@ -318,7 +332,7 @@ async function restartNode() {
         </LpCard>
       </section>
 
-      <section v-if="status && !isMobile" class="flex flex-col gap-3">
+      <section v-if="status && !isMobile" id="calls" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('settings.callsTitle')" :description="t('settings.callsDescription')" icon="lucide:phone" />
         <LpCard v-if="!callSetup" padded>
           <p class="text-sm text-muted">{{ t("settings.callsUnsupported") }}</p>
@@ -413,31 +427,31 @@ async function restartNode() {
         </LpCard>
       </section>
 
-      <section v-if="status && isMobile" class="flex flex-col gap-3">
+      <section v-if="status && isMobile" id="phone-audio" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('phoneAudio.title')" :description="t('phoneAudio.description')" icon="lucide:speaker" />
         <PhoneAudioCard />
       </section>
 
-      <section v-if="status && isMobile" class="flex flex-col gap-3">
+      <section v-if="status && isMobile" id="phone-screen" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('phoneScreen.title')" :description="t('phoneScreen.description')" icon="lucide:cast" />
         <PhoneScreenCard />
       </section>
 
-      <section v-if="status" class="flex flex-col gap-3">
+      <section v-if="status" id="playing" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('streams.title')" :description="t('streams.description')" icon="lucide:volume-2" />
         <LpCard padded>
           <PlayingStreams show="sound" />
         </LpCard>
       </section>
 
-      <section v-if="status?.streams?.some((s) => s.kind === 'microphone')" class="flex flex-col gap-3">
+      <section v-if="status?.streams?.some((s) => s.kind === 'microphone')" id="microphones" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('streams.microphones')" :description="t('streams.microphonesDescription')" icon="lucide:mic" />
         <LpCard padded>
           <PlayingStreams show="microphones" />
         </LpCard>
       </section>
 
-      <section v-if="!isMobile" class="flex flex-col gap-3">
+      <section v-if="!isMobile" id="autostart" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection
           :title="t('settings.autostartTitle')"
           :description="t('settings.autostartDescription')"
@@ -474,7 +488,7 @@ async function restartNode() {
         </LpCard>
       </section>
 
-      <section class="flex flex-col gap-3">
+      <section id="node" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('settings.nodeTitle')" icon="lucide:server" />
         <LpCard padded class="flex flex-col gap-3">
           <template v-if="status">

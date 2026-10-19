@@ -185,6 +185,53 @@ watch(revision, () => {
   if (open.value) void loadThread()
 })
 
+/**
+ * What the palette opened this page for: a conversation (`thread`, with the
+ * `address` and `name` it found it under, for a thread older than the list's
+ * first page) or a new message to `to`. Applied once the phone's list is in,
+ * since choosing the phone resets the open conversation, then dropped from the
+ * URL so a revision reload does not apply it again.
+ */
+const route = useRoute()
+const router = useRouter()
+const pending = ref<Record<string, string> | null>(null)
+watch(
+  () => route.query,
+  (query) => {
+    const asked = Object.fromEntries(
+      Object.entries(query).flatMap(([k, v]) => (typeof v === "string" ? [[k, v]] : [])),
+    )
+    if (!asked.thread && !asked.to) return
+    pending.value = asked
+    if (asked.phone && phones.value.some((p) => p.peer === asked.phone)) phoneId.value = asked.phone
+  },
+  { immediate: true },
+)
+watch([pending, listLoaded], ([asked, loaded]) => {
+  if (!asked || !loaded || (asked.phone && asked.phone !== phoneId.value)) return
+  pending.value = null
+  void router.replace({ query: {} })
+  if (asked.to) {
+    startNew()
+    draftTo.value = asked.to
+    focusComposer()
+    return
+  }
+  const id = Number(asked.thread)
+  const found = list.value.find((c) => c.thread_id === id)
+  const address = asked.address ?? ""
+  choose(
+    found ?? {
+      thread_id: id,
+      addresses: address ? [address] : [],
+      names: [asked.name || address].filter(Boolean),
+      snippet: "",
+      date_ms: 0,
+      unread: false,
+    },
+  )
+})
+
 function who(c: Conversation): string {
   return (c.names.length ? c.names : c.addresses).join(", ") || t("messages.unknown")
 }
