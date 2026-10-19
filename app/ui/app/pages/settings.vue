@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core"
-import type { CallsConfig, Reply, ServiceState } from "~/composables/useNode"
+import type { BluetoothMesh, CallsConfig, Reply, ServiceState } from "~/composables/useNode"
 
 const { t } = useI18n()
-const { status, restart, config, setMicGate, setName, setCalls, setBluetoothStandby } = useNode()
+const { status, restart, config, setMicGate, setName, setCalls, setBluetoothStandby, applyConfigEdit } =
+  useNode()
 const { isMobile, ready } = usePlatform()
 const toast = useCursioToast()
 
@@ -218,11 +219,19 @@ async function saveCalls(change: Partial<CallsConfig>) {
 }
 
 /**
- * A phone's Bluetooth path kept open beside the network, so its session moves
- * there within seconds when Wi-Fi drops. `null` until read.
+ * The mesh's Bluetooth path: whether this machine uses it at all, and whether
+ * it is kept open beside the network so a session moves there within seconds
+ * when Wi-Fi drops. `null` until read.
  */
 const standby = ref<boolean | null>(null)
 const standbyBusy = ref(false)
+const bluetoothMesh = ref<BluetoothMesh>("auto")
+
+const meshModes = computed(() => [
+  { value: "auto", label: t("settings.bluetoothAuto") },
+  { value: "on", label: t("settings.bluetoothOn") },
+  { value: "off", label: t("settings.bluetoothOff") },
+])
 
 async function loadStandby() {
   try {
@@ -230,18 +239,32 @@ async function loadStandby() {
     if (reply.reply !== "config") return
     const { file } = reply as Extract<Reply, { reply: "config" }>
     standby.value = file.bluetooth?.standby ?? false
+    bluetoothMesh.value = file.bluetooth?.mesh ?? "auto"
   } catch (e) {
     toast.failure(e, { title: t("settings.standbyFailed") })
   }
 }
 
 watch(
-  [() => !!status.value, isMobile],
-  ([up, mobile]) => {
-    if (up && mobile && standby.value === null) void loadStandby()
+  () => !!status.value,
+  (up) => {
+    if (up && standby.value === null) void loadStandby()
   },
   { immediate: true },
 )
+
+async function saveMesh(mode: BluetoothMesh) {
+  standbyBusy.value = true
+  try {
+    await applyConfigEdit({ bluetooth_mesh: mode })
+    bluetoothMesh.value = mode
+    toast.success(t("settings.saved"))
+  } catch (e) {
+    toast.failure(e, { title: t("settings.standbyFailed"), retry: () => saveMesh(mode) })
+  } finally {
+    standbyBusy.value = false
+  }
+}
 
 async function saveStandby(on: boolean) {
   standbyBusy.value = true
@@ -476,10 +499,23 @@ async function restartNode() {
         <PhoneScreenCard />
       </section>
 
-      <section v-if="status && isMobile" id="standby" class="flex scroll-mt-4 flex-col gap-3">
+      <section v-if="status" id="standby" class="flex scroll-mt-4 flex-col gap-3">
         <LpSection :title="t('settings.standbyTitle')" :description="t('settings.standbyDescription')" icon="lucide:bluetooth" />
         <LpSkeleton v-if="standby === null" rounded="card" class="h-16" />
-        <LpCard v-else padded class="flex items-center gap-4">
+        <LpCard v-if="standby !== null" padded class="flex items-center gap-4">
+          <div class="min-w-0 flex-1">
+            <p class="text-sm font-medium">{{ t("settings.bluetoothMode") }}</p>
+            <p class="text-xs text-muted">{{ t("settings.bluetoothModeHint") }}</p>
+          </div>
+          <LpSegmented
+            :model-value="bluetoothMesh"
+            :options="meshModes"
+            :disabled="standbyBusy"
+            size="sm"
+            @update:model-value="(v: string) => saveMesh(v as BluetoothMesh)"
+          />
+        </LpCard>
+        <LpCard v-if="standby !== null && bluetoothMesh !== 'off'" padded class="flex items-center gap-4">
           <div class="min-w-0 flex-1">
             <p class="text-sm font-medium">{{ t("settings.standbyToggle") }}</p>
             <p class="text-xs text-muted">{{ t("settings.standbyHint") }}</p>

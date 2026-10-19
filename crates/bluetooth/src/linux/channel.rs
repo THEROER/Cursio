@@ -6,10 +6,12 @@
 //! crosses it is the mesh — `Hello`, Noise, modules — exactly as over TCP.
 //!
 //! BlueZ owns the adapter and SDP, so the listener is an external profile:
-//! `RegisterProfile` with the server role makes BlueZ pick a channel, publish
-//! the record and hand every accepted socket to `NewConnection`. The phone
-//! dials, never this side: Android does not tell its own Bluetooth address,
-//! so the computer has nothing to dial until the phone has said hello.
+//! `RegisterProfile` with the server role makes BlueZ listen, publish the
+//! record and hand every accepted socket to `NewConnection`. It listens on
+//! [`crate::MESH_CHANNEL`], so that another computer can call without an SDP
+//! lookup (`rfcomm.rs` says why it has to). A phone is never called: Android
+//! does not tell its own Bluetooth address and keeps no listener, so it
+//! dials.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -79,6 +81,16 @@ impl MeshChannel {
         let mut options: HashMap<&str, Value> = HashMap::new();
         options.insert("Name", Value::from("Cursio"));
         options.insert("Role", Value::from("server"));
+        let adapter = super::property(&bus, "/org/bluez/hci0", "org.bluez.Adapter1", "Address");
+        let pinned = super::rfcomm::channel_free(crate::MESH_CHANNEL, adapter.as_deref());
+        if pinned {
+            options.insert("Channel", Value::U16(u16::from(crate::MESH_CHANNEL)));
+        } else {
+            tracing::warn!(
+                channel = crate::MESH_CHANNEL,
+                "another program holds the mesh's bluetooth channel; phones and Windows machines still reach this one, Linux machines cannot"
+            );
+        }
         // Only a device the user paired may open it, and the link is
         // encrypted by the radio as well as by Noise above it.
         options.insert("RequireAuthentication", Value::Bool(true));
@@ -92,7 +104,7 @@ impl MeshChannel {
             &(path, crate::MESH_UUID, options),
         )
         .map_err(|e| BluetoothError::RegisterChannel(e.to_string()))?;
-        tracing::info!("paired phones can reach this machine over bluetooth");
+        tracing::info!("paired devices can reach this machine over bluetooth");
         Ok((MeshChannel { _bus: bus }, rx))
     }
 }

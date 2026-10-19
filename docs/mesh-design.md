@@ -584,8 +584,9 @@ cross.
 ## Two paths, one mesh: the network and Bluetooth
 
 A phone with Wi-Fi off, or out of the house's range, or on a hotspot the
-computer is not on, is still the same peer — so it keeps the same link, carried
-by Bluetooth. **Bluetooth is a second path, not a second protocol**: the bytes
+computer is not on, is still the same peer — and so is a laptop whose Wi-Fi
+card claims to be connected while passing nothing. Each keeps the same link,
+carried by Bluetooth. **Bluetooth is a second path, not a second protocol**: the bytes
 on it are the mesh's own, the same `Hello`, stored key (or pairing), Noise
 `NNpsk0`, module negotiation and priority classes as over TCP. Only the socket
 differs: `cursio_transport::stream::StreamTransport` frames messages over any
@@ -594,25 +595,51 @@ above it can tell. (HFP and A2DP, Cursio as a phone's headset and speaker, are
 the deliberate exceptions, like AirPlay: Android hands a call's voice and an
 unprompted copy of its sound only to those profiles. They are not this path.)
 
-- **The phone dials, the computer listens.** Android keeps an app from learning
-  its own Bluetooth address, so the computer has nothing to call until the
-  phone has. The computer registers a BlueZ external profile under Cursio's own
-  UUID (`cursio_bluetooth::MESH_UUID`, `MeshChannel`): BlueZ picks the RFCOMM
-  channel, publishes the SDP record and hands each accepted socket to
-  `NewConnection`, and the mesh loop runs it like an accepted TCP connection.
-  Only paired devices may open it (`RequireAuthentication`).
-- **Finding the computer** needs no discovery protocol: the phone lists the
-  computers it is paired with in the system's Bluetooth settings and asks each
-  for the Cursio service. Which mesh peer answered is learned from `Hello`, as
-  on TCP.
-- **The network wins.** The phone dials over Bluetooth once a known computer
-  has been off the network for 20 s (`bt::NETWORK_GRACE`), each device at most
-  every 30 s — or at once, as a standby, with `[bluetooth] standby = true`.
-  Either way the Bluetooth connection is a *path* of the session, not a session
-  of its own (see "A session outlives its connection" above): when either side
-  dials over the network again, that connection joins the same session and
-  carries it, and the Bluetooth path is let go of unless it is kept as the
-  standby.
+- **A phone dials; computers listen and dial each other.** Android keeps an app
+  from learning its own Bluetooth address and keeps no listener, so a phone is
+  never called. Every computer listens under Cursio's own UUID
+  (`cursio_bluetooth::MESH_UUID`, `MeshChannel`) on a pinned RFCOMM channel
+  (`MESH_CHANNEL`, 23), and the mesh loop runs each accepted socket like an
+  accepted TCP connection. On Linux that is a BlueZ external profile (only
+  paired devices may open it, `RequireAuthentication`); on Windows a Winsock
+  `AF_BTH` listener with an SDP record from `WSASetService`, its sockets pumped
+  by two threads each rather than handed to Tokio, since nothing documents
+  Winsock's Bluetooth provider under readiness polling.
+- **Why the channel is pinned.** A Linux machine calls a raw RFCOMM socket,
+  which takes a channel, not a UUID. BlueZ's own by-UUID call
+  (`Device1.ConnectProfile`) consults the service list cached at pairing and
+  answers "profile unavailable" for a service the other machine started
+  offering afterwards — every machine paired before this existed. Windows dials
+  by UUID instead (it queries SDP on every connect), so a Windows machine still
+  reaches a Linux one whose channel was taken. BlueZ registers a profile even
+  when its channel is in use, with no listener behind it, so the channel is
+  bound once first to see.
+- **Finding the machine** needs no discovery protocol: each node lists the
+  computers it is paired with in the system's Bluetooth settings (class of
+  device "computer") and asks each for the Cursio service. Which mesh peer
+  answered is learned from `Hello`, as on TCP, and the registry remembers it
+  per address (`PeerRegistry::note_bluetooth`).
+- **The network wins.** A known machine's address is called once *its* peer
+  has been off the network for 20 s (`bluetooth_link::NETWORK_GRACE`); an
+  address nobody has answered on yet, while any peer is missing, which is how
+  it gets learned — or every one at once, as a standby, with
+  `[bluetooth] standby = true`. Either way the Bluetooth connection is a *path*
+  of the session, not a session of its own (see "A session outlives its
+  connection" above): when either side dials over the network again, that
+  connection joins the same session and carries it, and the side that placed
+  the Bluetooth path lets it go unless it is kept as the standby.
+- **Radio time is rationed.** Paging a device that is not there holds the radio
+  for seconds, which on a shared antenna is seconds of Wi-Fi gone. A device
+  that does not answer is retried after 30 s, doubling to 5 min; one that
+  answers with no mesh channel after 30 min; one call at a time
+  (`bluetooth_link::Dialer`).
+- **A machine can be left out.** `[bluetooth] mesh = "auto" | "on" | "off"`,
+  read on every turn of the dialler. `auto` is on unless the Wi-Fi card is one
+  known to drop off the network while Bluetooth is busy (Broadcom `b43` on
+  Linux, `bluetooth_link::radio_conflict`); then it is off and a problem says
+  so, with *OK* (`off`) and *Use bluetooth anyway* (`on`) as buttons
+  (`Problem::actions`), so answering it also ends it. The other machines simply
+  reach that one over the network only.
 - **What fits.** RFCOMM carries a few hundred kilobytes a second. The priority
   classes already keep input, notifications, messages, calls' control and Opus
   audio ahead of screens and files, so those keep working and the bulk classes
@@ -621,8 +648,8 @@ unprompted copy of its sound only to those profiles. They are not this path.)
   control v12): `cursio status` shows `bluetooth` for such a peer, the GNOME
   menu a Bluetooth icon, the app a badge.
 
-On Windows and macOS the computer's half is not built yet and says so in the
-log; phones reach those machines over the network only.
+On macOS the computer's half is not built yet and says so in the log; peers
+reach a Mac over the network only.
 
 ## Where it lives
 

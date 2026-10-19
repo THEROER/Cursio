@@ -30,8 +30,8 @@ pub mod audio_relay;
 #[cfg(feature = "audio")]
 pub mod audio_session;
 /// Handing a paired phone's headset and speaker roles from PipeWire to Cursio.
-/// The mesh's channel over Bluetooth, for a paired phone off the network.
-#[cfg(all(feature = "bluetooth", unix))]
+/// The mesh's channel over Bluetooth, for a peer the network does not reach.
+#[cfg(feature = "bluetooth")]
 pub mod bluetooth_link;
 #[cfg(all(target_os = "linux", feature = "calls"))]
 pub mod bluetooth_setup;

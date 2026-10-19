@@ -15,5 +15,15 @@ thiserror.workspace = true
 zbus.workspace = true
 libc.workspace = true
 
+# Winsock speaks RFCOMM itself, so the mesh channel needs nothing but the
+# system's own socket and Bluetooth APIs.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Devices_Bluetooth",
+    "Win32_Networking_WinSock",
+    "Win32_System_Com",
+] }
+
 [dev-dependencies]
 tracing-subscriber.workspace = true

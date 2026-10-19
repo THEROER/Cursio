@@ -503,6 +503,25 @@ pub mod commands {
         link.request(Command::SetConfig { config }).await
     }
 
+    /// Make one change a problem offers, or a settings control names: the
+    /// config file read, edited and written back like the setters above.
+    #[tauri::command]
+    pub async fn node_apply_config_edit(
+        link: State<'_, NodeLink>,
+        edit: cursio_core::config::ConfigEdit,
+    ) -> Result<Reply, NodeError> {
+        let mut config = match link.request(Command::Config).await? {
+            Reply::Config { file, .. } => *file,
+            other => {
+                return Err(NodeError::failed(format!(
+                    "the node answered a config request with {other:?}"
+                )));
+            }
+        };
+        edit.apply(&mut config);
+        link.request(Command::SetConfig { config }).await
+    }
+
     #[tauri::command]
     pub async fn node_pair_show(link: State<'_, NodeLink>) -> Result<Reply, NodeError> {
         link.request(Command::PairShow).await
@@ -757,7 +776,10 @@ pub mod commands {
         use tauri_plugin_dialog::DialogExt;
         // The dialog blocks until answered, so it waits off the runtime.
         let picked = tauri::async_runtime::spawn_blocking(move || {
-            app.dialog().file().set_file_name(&name).blocking_save_file()
+            app.dialog()
+                .file()
+                .set_file_name(&name)
+                .blocking_save_file()
         })
         .await
         .map_err(NodeError::failed)?;
@@ -768,7 +790,10 @@ pub mod commands {
             .into_path()
             .map_err(|e| NodeError::failed(format!("not a place on this computer: {e}")))?;
         let (Some(dir), Some(name)) = (picked.parent(), picked.file_name()) else {
-            return Err(NodeError::failed(format!("{} names no file", picked.display())));
+            return Err(NodeError::failed(format!(
+                "{} names no file",
+                picked.display()
+            )));
         };
         let reply = gallery(
             link,

@@ -14,7 +14,7 @@
 //! durable set, so "who is up" is a local observation each node makes for
 //! itself, not something a coordinator hands down.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -121,6 +121,15 @@ pub struct PeerRegistry {
     /// The session each peer is reached by, held open while its connection
     /// is down so a new one can join it.
     sessions: HashMap<PeerId, HeldSession>,
+    /// Which peer answered on each Bluetooth address. Learned from the
+    /// greeting, since nothing else ties a radio to a mesh identity: the
+    /// dialler calls an address only when its own peer is missing, not
+    /// whenever any peer is.
+    bluetooth: HashMap<String, PeerId>,
+    /// Peers whose Bluetooth path this node placed. The side that dialled is
+    /// the one that lets it go once the network carries the session again;
+    /// a phone that keeps a standby open must not have it closed from here.
+    bluetooth_dialled: HashSet<PeerId>,
 }
 
 /// A running session, as the registry holds it.
@@ -354,6 +363,56 @@ impl PeerRegistry {
         })
     }
 
+    /// Whether `peer`'s session has a network path now.
+    pub fn network_reaches(&self, peer: &PeerId) -> bool {
+        self.sessions
+            .get(peer)
+            .is_some_and(|s| !s.0.is_ended() && s.0.paths().network)
+    }
+
+    /// Whether `peer`'s session has a Bluetooth path now.
+    pub fn bluetooth_reaches(&self, peer: &PeerId) -> bool {
+        self.sessions
+            .get(peer)
+            .is_some_and(|s| !s.0.is_ended() && s.0.paths().bluetooth)
+    }
+
+    /// `peer` greeted over the Bluetooth device at `address`; `dialled` when
+    /// this node placed that call.
+    pub fn note_bluetooth(&mut self, address: &str, peer: PeerId, dialled: bool) {
+        self.bluetooth.insert(address.to_string(), peer);
+        if dialled {
+            self.bluetooth_dialled.insert(peer);
+        }
+    }
+
+    /// The peer that answered on `address`, once one has.
+    pub fn bluetooth_peer(&self, address: &str) -> Option<PeerId> {
+        self.bluetooth.get(address).copied()
+    }
+
+    /// The sessions whose Bluetooth path this node placed and the network now
+    /// carries as well: those paths are to be let go of. Forgets a placed
+    /// path that is gone anyway.
+    pub fn bluetooth_paths_to_release(&mut self) -> Vec<ResumeHandle> {
+        let mut release = Vec::new();
+        let sessions = &self.sessions;
+        self.bluetooth_dialled.retain(|peer| {
+            let Some(session) = sessions.get(peer).filter(|s| !s.0.is_ended()) else {
+                return false;
+            };
+            let paths = session.0.paths();
+            // Kept while the session lives even with no Bluetooth path: the
+            // greeting is noted before the path it arrived on joins.
+            if paths.network && paths.bluetooth {
+                release.push(session.0.clone());
+                return false;
+            }
+            true
+        });
+        release
+    }
+
     /// Hold `handle` as `peer`'s session.
     pub fn hold_session(&mut self, peer: PeerId, handle: ResumeHandle) {
         self.sessions.insert(peer, HeldSession(handle));
@@ -454,8 +513,23 @@ mod tests {
     /// A live session over a loopback connection, and the far end kept
     /// alive beside it.
     async fn held_session() -> (ResumeHandle, cursio_transport::resume::ResumableLink) {
-        use cursio_transport::pairing::Role;
         use cursio_transport::resume::{PathKind, ResumableLink};
+
+        let (near, far, tag) = path_pair(PathKind::Network).await;
+        let (_link, handle) = ResumableLink::new(near, tag);
+        let (far_link, _) = ResumableLink::new(far, tag);
+        (handle, far_link)
+    }
+
+    /// An encrypted loopback connection of `kind`, both ends as paths.
+    async fn path_pair(
+        kind: cursio_transport::resume::PathKind,
+    ) -> (
+        cursio_transport::resume::Path,
+        cursio_transport::resume::Path,
+        cursio_protocol::SessionTag,
+    ) {
+        use cursio_transport::pairing::Role;
         use cursio_transport::tcp::TcpTransport;
         use cursio_transport::EncryptedTransport;
 
@@ -471,9 +545,52 @@ mod tests {
         );
         let (near, far) = (near.unwrap(), far.unwrap());
         let tag = near.session_tag();
-        let (_link, handle) = ResumableLink::new(near.into_path(PathKind::Network), tag);
-        let (far_link, _) = ResumableLink::new(far.into_path(PathKind::Network), tag);
-        (handle, far_link)
+        (near.into_path(kind), far.into_path(kind), tag)
+    }
+
+    #[tokio::test]
+    async fn a_bluetooth_path_this_node_placed_is_let_go_once_the_network_carries_too() {
+        use cursio_transport::resume::{PathKind, ResumableLink};
+
+        let (near, far, tag) = path_pair(PathKind::Network).await;
+        let (_near_link, session) = ResumableLink::new(near, tag);
+        let (_far_link, far_session) = ResumableLink::new(far, tag);
+        let mut reg = PeerRegistry::default();
+        reg.hold_session(peer(2), session.clone());
+        reg.note_bluetooth("04:68:74:98:F7:C6", peer(2), true);
+        assert_eq!(reg.bluetooth_peer("04:68:74:98:F7:C6"), Some(peer(2)));
+        assert!(
+            reg.bluetooth_paths_to_release().is_empty(),
+            "the Bluetooth path has not joined yet"
+        );
+
+        let (near, far, _) = path_pair(PathKind::Bluetooth).await;
+        let (a, b) = tokio::join!(session.attach(near), far_session.attach(far));
+        a.unwrap();
+        b.unwrap();
+        assert!(reg.network_reaches(&peer(2)) && reg.bluetooth_reaches(&peer(2)));
+        assert_eq!(reg.bluetooth_paths_to_release().len(), 1);
+        assert!(
+            reg.bluetooth_paths_to_release().is_empty(),
+            "released once, not on every turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bluetooth_path_the_peer_placed_is_left_to_the_peer() {
+        use cursio_transport::resume::{PathKind, ResumableLink};
+
+        let (near, far, tag) = path_pair(PathKind::Network).await;
+        let (_near_link, session) = ResumableLink::new(near, tag);
+        let (_far_link, far_session) = ResumableLink::new(far, tag);
+        let mut reg = PeerRegistry::default();
+        reg.hold_session(peer(2), session.clone());
+        reg.note_bluetooth("04:68:74:98:F7:C6", peer(2), false);
+        let (near, far, _) = path_pair(PathKind::Bluetooth).await;
+        let (a, b) = tokio::join!(session.attach(near), far_session.attach(far));
+        a.unwrap();
+        b.unwrap();
+        assert!(reg.bluetooth_paths_to_release().is_empty());
     }
 
     #[tokio::test]

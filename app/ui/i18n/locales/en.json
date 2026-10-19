@@ -156,7 +156,8 @@
     "markAllRead": "Mark all as seen",
     "markRead": "Mark as seen",
     "markUnread": "Mark as not seen",
-    "open": "Show"
+    "open": "Show",
+    "actionFailed": "The change was not made"
   },
   "severity": {
     "Info": "Info",
@@ -500,10 +501,15 @@
     "callsDefault": "System default",
     "callsFailedSave": "Call settings were not changed",
     "callsUnsupported": "A phone's call voice comes through a computer over Bluetooth on Linux only. Calls still show here, with the voice on the phone.",
-    "standbyTitle": "Bluetooth standby",
-    "standbyDescription": "When Wi-Fi drops, the connection to your computers moves to Bluetooth within seconds instead of stopping.",
+    "standbyTitle": "Bluetooth",
+    "standbyDescription": "When the network stops reaching a paired machine, the connection to it moves to Bluetooth instead of stopping.",
+    "bluetoothMode": "Use Bluetooth for the mesh",
+    "bluetoothModeHint": "Automatic leaves it off on a machine whose Wi-Fi card is known to lose the network while Bluetooth is busy.",
+    "bluetoothAuto": "Automatic",
+    "bluetoothOn": "On",
+    "bluetoothOff": "Off",
     "standbyToggle": "Keep a Bluetooth link ready",
-    "standbyHint": "Uses a little battery, and can slow Wi-Fi on 2.4 GHz. Without it, Bluetooth still takes over once Wi-Fi has been gone for 20 seconds. The computer has to be paired with this phone and run Linux.",
+    "standbyHint": "Moves within seconds when Wi-Fi drops, at the cost of a little battery and some Wi-Fi speed on 2.4 GHz. Without it, Bluetooth takes over once Wi-Fi has been gone for 20 seconds. Machines have to be paired over Bluetooth.",
     "standbyFailed": "The Bluetooth standby was not changed",
     "nodeTitle": "Node",
     "configFile": "Config file",

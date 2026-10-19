@@ -255,7 +255,7 @@ struct NodeCtx {
     pairing: PairingWindow,
     shared: Arc<Shared>,
     /// When to open Bluetooth links, and to which devices.
-    bluetooth: RefCell<crate::bt::Dialer>,
+    bluetooth: RefCell<cursio_core::bluetooth_link::Dialer>,
     /// Since when each known computer has been off the network.
     unreachable_since: RefCell<HashMap<PeerId, std::time::Instant>>,
 }
@@ -380,7 +380,7 @@ async fn serve(node: Node) -> anyhow::Result<()> {
         control,
         pairing,
         shared: Arc::clone(&shared),
-        bluetooth: RefCell::new(crate::bt::Dialer::default()),
+        bluetooth: RefCell::new(cursio_core::bluetooth_link::Dialer::default()),
         unreachable_since: RefCell::new(HashMap::new()),
     });
 
@@ -710,6 +710,11 @@ async fn run_link<T: Transport + 'static>(
 /// Open Bluetooth links to paired computers the network has not reached for
 /// a while; see [`crate::bt`].
 async fn dial_bluetooth(ctx: &Rc<NodeCtx>) {
+    // A phone's radio clashes with nothing the core knows of, so only the
+    // person's own "off" holds it back.
+    if ctx.control.running().bluetooth.mesh == cursio_core::config::BluetoothMesh::Off {
+        return;
+    }
     let now = std::time::Instant::now();
     let offline: Vec<PeerId> = ctx
         .registry

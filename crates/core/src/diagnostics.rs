@@ -39,6 +39,8 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::ConfigEdit;
+
 /// How much a problem matters. Ordered so that `Error` sorts highest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Severity {
@@ -61,8 +63,20 @@ pub struct Problem {
     pub summary: String,
     /// What to run or change, when there is something.
     pub hint: Option<String>,
+    /// Changes the person can make from where the problem is shown, each a
+    /// button. A problem that is a decision the node made on the person's
+    /// behalf offers both ways out, so answering it also ends it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ProblemAction>,
     /// When the condition was first seen. Kept across repeated raises.
     pub since: SystemTime,
+}
+
+/// One button on a problem: what it says, and the config change it makes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProblemAction {
+    pub label: String,
+    pub edit: ConfigEdit,
 }
 
 static PROBLEMS: Mutex<Vec<Problem>> = Mutex::new(Vec::new());
@@ -87,10 +101,12 @@ pub fn raise(problem: Problem) {
             Some(existing) => {
                 let changed = existing.severity != problem.severity
                     || existing.summary != problem.summary
-                    || existing.hint != problem.hint;
+                    || existing.hint != problem.hint
+                    || existing.actions != problem.actions;
                 existing.severity = problem.severity;
                 existing.summary = problem.summary.clone();
                 existing.hint = problem.hint.clone();
+                existing.actions = problem.actions.clone();
                 changed
             }
             None => {
@@ -143,6 +159,7 @@ fn log(problem: &Problem) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BluetoothMesh;
     use std::time::Duration;
 
     /// The registry is process-wide and tests run in parallel, so each test
@@ -160,6 +177,7 @@ mod tests {
             severity,
             summary: format!("{id} is wrong"),
             hint: None,
+            actions: Vec::new(),
             since,
         }
     }
@@ -226,6 +244,10 @@ mod tests {
             severity: Severity::Error,
             summary: "POCO X7 Pro is held by adb.exe (PID 42)".into(),
             hint: Some("run `adb kill-server`".into()),
+            actions: vec![ProblemAction {
+                label: "Keep it off".into(),
+                edit: ConfigEdit::BluetoothMesh(BluetoothMesh::Off),
+            }],
             since: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         };
         let json = serde_json::to_string(&p).expect("serialises");

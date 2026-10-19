@@ -1161,6 +1161,7 @@ fn refusal(error: &cursio_usb::UsbBackendError, busid: &str, label: Option<&str>
         severity: crate::diagnostics::Severity::Error,
         summary: format!("{summary}, so a peer could not attach it"),
         hint: Some(hint.clone()),
+        actions: Vec::new(),
         since: std::time::SystemTime::now(),
     });
     UsbError::Backend(format!("{summary}; on that machine, {hint}"))
@@ -1209,6 +1210,7 @@ fn report_usbipd_exposure() {
             "the next usb setup prompt closes it; to do it now, in an administrator shell: {}",
             cursio_usb::windows::close_to_network_command()
         )),
+        actions: Vec::new(),
         since: std::time::SystemTime::now(),
     });
 }

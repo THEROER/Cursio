@@ -1953,18 +1953,42 @@ async fn run_mesh(
     local
         .run_until(async move {
             let mut sweep = tokio::time::interval(cursio_core::mesh::sweep_interval());
-            let mut bluetooth = BluetoothListener::start();
-            loop {
-                tokio::select! {
-                    // A paired phone off the network opened the mesh's
-                    // Bluetooth channel. Same handshake, same session: only
-                    // the path differs.
-                    Some((device, transport)) = bluetooth.accept() => {
-                        tracing::info!(%device, "peer dialled in over bluetooth");
+            // Read once: the card does not change while the node runs.
+            let radio_conflict = std::rc::Rc::new(cursio_core::bluetooth_link::radio_conflict());
+            let decide = {
+                let control = control.clone();
+                let radio_conflict = radio_conflict.clone();
+                std::rc::Rc::new(move || {
+                    cursio_core::bluetooth_link::decide(
+                        control.running().bluetooth.mesh,
+                        radio_conflict.as_deref(),
+                    )
+                })
+            };
+            let mut decided = decide();
+            cursio_core::bluetooth_link::report(&decided);
+            let mut bluetooth = if decided.is_on() {
+                cursio_core::bluetooth_link::listen()
+            } else {
+                tracing::info!(?decided, "the mesh does not use bluetooth on this machine");
+                cursio_core::bluetooth_link::Listener::idle()
+            };
+            let mut listening = decided.is_on();
+            let open_bluetooth = {
+                let identity = identity.clone();
+                let registry = registry.clone();
+                let pairing = pairing.clone();
+                let control = control.clone();
+                let capture = capture.clone();
+                let status = status.clone();
+                let live = live.clone();
+                let modules = modules.clone();
+                std::rc::Rc::new(
+                    move |transport: cursio_core::bluetooth_link::Link, device: String, role: Role| {
                         spawn_peer_session(
                             transport,
                             identity.clone(),
-                            Role::Responder,
+                            role,
                             None,
                             registry.clone(),
                             pairing.clone(),
@@ -1974,7 +1998,32 @@ async fn run_mesh(
                             live.clone(),
                             modules.clone(),
                             offer,
+                            Some(device),
                         );
+                    },
+                )
+            };
+            #[cfg(any(target_os = "linux", windows))]
+            tokio::task::spawn_local(dial_over_bluetooth(
+                registry.clone(),
+                control.clone(),
+                decide.clone(),
+                open_bluetooth.clone(),
+            ));
+            loop {
+                tokio::select! {
+                    // A paired device off the network opened the mesh's
+                    // Bluetooth channel. Same handshake, same session: only
+                    // the path differs.
+                    Some((device, transport)) = bluetooth.accept() => {
+                        // A listener stays registered until the node stops,
+                        // so turning Bluetooth off is honoured here.
+                        if !decide().is_on() {
+                            tracing::debug!(%device, "bluetooth is off for the mesh; closing a connection");
+                            continue;
+                        }
+                        tracing::info!(%device, "peer dialled in over bluetooth");
+                        open_bluetooth(transport, device, Role::Responder);
                     }
 
                     // A peer dialled us. We don't know who until the handshake,
@@ -2001,6 +2050,7 @@ async fn run_mesh(
                             live.clone(),
                             modules.clone(),
                             offer,
+                            None,
                         );
                     }
 
@@ -2033,6 +2083,15 @@ async fn run_mesh(
 
                     // Time to dial whoever is known, offline, and ours to call.
                     _ = sweep.tick() => {
+                        let now_decided = decide();
+                        if now_decided != decided {
+                            cursio_core::bluetooth_link::report(&now_decided);
+                            if now_decided.is_on() && !listening {
+                                bluetooth = cursio_core::bluetooth_link::listen();
+                                listening = true;
+                            }
+                            decided = now_decided;
+                        }
                         // Before the dial below and the publish, so a machine
                         // the user just removed is neither called again nor
                         // shown for one more sweep.
@@ -2081,6 +2140,7 @@ async fn run_mesh(
                                     live.clone(),
                                     modules.clone(),
                                     offer,
+                                    None,
                                 );
                             }
                         }
@@ -2122,6 +2182,7 @@ async fn run_mesh(
                                 live.clone(),
                                 modules.clone(),
                                 offer,
+                                None,
                             );
                         }
                     }
@@ -2243,41 +2304,100 @@ fn start_control(state: cursio_core::control::NodeState) {
     });
 }
 
-/// The mesh's Bluetooth channel where this build has one, and on Windows a
-/// listener that never accepts, so the mesh loop reads the same either way.
-struct BluetoothListener {
-    #[cfg(unix)]
-    inner: cursio_core::bluetooth_link::Listener,
-}
+/// Call paired computers over Bluetooth when the network stops reaching them,
+/// and let go of a Bluetooth path once it reaches them again; see
+/// `cursio_core::bluetooth_link`.
+///
+/// Its own task, because a call holds the radio for seconds and the mesh
+/// loop must keep accepting meanwhile. One call at a time, which is also all
+/// one radio does well.
+#[cfg(any(target_os = "linux", windows))]
+async fn dial_over_bluetooth(
+    registry: cursio_core::mesh::SharedRegistry,
+    control: cursio_core::control::NodeState,
+    decide: std::rc::Rc<dyn Fn() -> cursio_core::bluetooth_link::Decision>,
+    open: std::rc::Rc<dyn Fn(cursio_core::bluetooth_link::Link, String, Role)>,
+) {
+    use cursio_core::bluetooth_link::{self as bt, Known};
+    use std::time::Instant;
 
-impl BluetoothListener {
-    fn start() -> Self {
-        #[cfg(unix)]
-        {
-            BluetoothListener {
-                inner: cursio_core::bluetooth_link::listen(),
+    let mut dialer = bt::Dialer::default();
+    let mut missing_since: std::collections::HashMap<cursio_protocol::PeerId, Instant> =
+        std::collections::HashMap::new();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        tick.tick().await;
+        if !decide().is_on() {
+            continue;
+        }
+        let standby = control.running().bluetooth.standby;
+        if !standby {
+            for session in registry.borrow_mut().bluetooth_paths_to_release() {
+                tracing::info!("the network carries the session again; leaving bluetooth");
+                session.release(
+                    cursio_transport::resume::PathKind::Bluetooth,
+                    "the network carries the session",
+                );
             }
         }
-        #[cfg(not(unix))]
-        {
-            tracing::warn!("the mesh's bluetooth channel is not implemented on this platform; phones reach it over the network only");
-            BluetoothListener {}
+
+        let now = Instant::now();
+        let anyone_missing = {
+            let reg = registry.borrow();
+            let peers: Vec<_> = reg.all().map(|peer| peer.peer_id).collect();
+            missing_since.retain(|id, _| peers.contains(id) && !reg.network_reaches(id));
+            for id in peers {
+                if !reg.network_reaches(&id) {
+                    missing_since.entry(id).or_insert(now);
+                }
+            }
+            missing_since
+                .values()
+                .any(|since| now.duration_since(*since) >= bt::NETWORK_GRACE)
+        };
+        if !anyone_missing && !standby {
+            continue;
         }
-    }
 
-    #[cfg(unix)]
-    async fn accept(
-        &mut self,
-    ) -> Option<(
-        String,
-        cursio_transport::stream::StreamTransport<tokio::net::UnixStream>,
-    )> {
-        self.inner.accept().await
-    }
-
-    #[cfg(not(unix))]
-    async fn accept(&mut self) -> Option<(String, TcpTransport)> {
-        std::future::pending().await
+        let paired = bt::paired_computers().await;
+        let wanted = {
+            let reg = registry.borrow();
+            for device in &paired {
+                if let Some(peer) = reg.bluetooth_peer(&device.address) {
+                    dialer.set_linked(&device.address, reg.bluetooth_reaches(&peer));
+                }
+            }
+            bt::select(
+                &paired,
+                |address| {
+                    let peer = reg.bluetooth_peer(address);
+                    Known {
+                        peer,
+                        bluetooth_up: peer.is_some_and(|p| reg.bluetooth_reaches(&p)),
+                        gone_for: peer
+                            .and_then(|p| missing_since.get(&p))
+                            .map(|since| now.duration_since(*since)),
+                    }
+                },
+                anyone_missing,
+                standby,
+            )
+        };
+        for device in dialer.pace(&wanted, now) {
+            match bt::dial(device.address.clone()).await {
+                Ok(link) => {
+                    // Linked or not is read from the session on the next
+                    // turn, once the peer has greeted; a handshake that
+                    // fails leaves the address to the ordinary retry.
+                    tracing::info!(device = %device.name, "reached a computer over bluetooth");
+                    open(link, device.address, Role::Initiator);
+                }
+                Err(e) => {
+                    tracing::debug!(device = %device.name, reason = %e.reason, "no mesh over bluetooth to this device");
+                    dialer.failed(&device.address, e.refused);
+                }
+            }
+        }
     }
 }
 
@@ -2307,6 +2427,9 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
     // (see the mesh module's threading note).
     modules: std::rc::Rc<cursio_core::module::ModuleRegistry>,
     offer: ServiceOffer,
+    // The device's address for a Bluetooth connection, so the peer that
+    // greets on it is remembered as that radio's.
+    bluetooth: Option<String>,
 ) {
     let shape = cursio_core::registry::LinkShape {
         dialled: matches!(role, Role::Initiator),
@@ -2341,6 +2464,9 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
                   peer_tags: &[cursio_protocol::SessionTag]| {
                 *seen.borrow_mut() = Some(id);
                 let mut reg = reg_for_cb.borrow_mut();
+                if let Some(address) = &bluetooth {
+                    reg.note_bluetooth(address, id, shape.dialled);
+                }
                 if let cursio_core::registry::Greeted::Join(session) = reg.greeted(id, peer_tags) {
                     reg.set_state(id, cursio_core::registry::PeerState::Online);
                     tracing::info!(peer = %name, "the peer called back; resuming the session");

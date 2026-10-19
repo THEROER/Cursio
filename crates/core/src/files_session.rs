@@ -744,6 +744,7 @@ fn report_walk(event: &cursio_files::walk::WalkEvent) {
             severity: crate::diagnostics::Severity::Warning,
             summary: walk_summary(walker),
             hint: Some(walk_hint(walker.pid)),
+            actions: Vec::new(),
             since: std::time::SystemTime::now(),
         }),
         WalkEvent::Ended(walker) => crate::diagnostics::clear(&id(walker)),

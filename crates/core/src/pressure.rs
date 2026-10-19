@@ -311,6 +311,7 @@ fn apply(findings: &[Finding], was: &[&'static str]) -> Vec<&'static str> {
             severity: finding.severity,
             summary: finding.summary.clone(),
             hint: Some(finding.hint.to_string()),
+            actions: Vec::new(),
             since: std::time::SystemTime::now(),
         });
     }

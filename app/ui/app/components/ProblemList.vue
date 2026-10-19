@@ -1,9 +1,30 @@
 <script setup lang="ts">
-import type { Problem } from "~/composables/useNode"
+import type { Problem, ProblemAction } from "~/composables/useNode"
 
 defineProps<{ problems: Problem[] }>()
 
 const { t } = useI18n()
+const { applyConfigEdit } = useNode()
+const toast = useCursioToast()
+
+/** The problem whose button is being answered, so it is pressed once. */
+const busy = ref<string | null>(null)
+
+/**
+ * A button is a config change the node offered; making it ends the problem,
+ * which disappears with the next status the node pushes.
+ */
+async function act(problem: Problem, action: ProblemAction) {
+  busy.value = problem.id
+  try {
+    await applyConfigEdit(action.edit)
+    toast.success(t("settings.saved"))
+  } catch (e) {
+    toast.failure(e, { title: t("problems.actionFailed"), retry: () => act(problem, action) })
+  } finally {
+    busy.value = null
+  }
+}
 
 /**
  * A hint is prose that often ends in the command that fixes it ("…in an
@@ -51,6 +72,18 @@ const badge = { Info: "brand", Warning: "warning", Error: "danger" } as const
               wrap
             />
           </template>
+          <div v-if="problem.actions?.length" class="flex flex-wrap gap-2">
+            <LpButton
+              v-for="(action, i) in problem.actions"
+              :key="action.label"
+              size="sm"
+              :variant="i === 0 ? 'solid' : 'soft'"
+              :disabled="busy === problem.id"
+              @click="act(problem, action)"
+            >
+              {{ action.label }}
+            </LpButton>
+          </div>
         </div>
         <LpTooltip :content="problem.id">
           <LpBadge size="sm" :tone="badge[problem.severity]" class="shrink-0 self-start">

@@ -7,80 +7,13 @@
 //! pair made here and the node reads the other end like any socket.
 //!
 //! The phone dials and the computer listens, because Android keeps the
-//! phone's own address from apps. [`Dialer`] decides when: only computers the
-//! phone is paired with, only once the network has failed to reach a known
-//! computer for [`NETWORK_GRACE`], and not more often than [`RETRY`] per
-//! device, since each attempt is a few seconds of radio time.
+//! phone's own address from apps. When to dial is the core's
+//! [`cursio_core::bluetooth_link::Dialer`], shared with the computers'.
 
-use std::collections::{HashMap, HashSet};
 use std::os::fd::{IntoRawFd, OwnedFd};
-use std::time::{Duration, Instant};
 
+use cursio_core::bluetooth_link::Paired;
 use jni::objects::{JObject, JString, JValue};
-
-/// How long a known computer must have been unreachable over the network
-/// before Bluetooth is tried. Long enough that a reconnect after the Wi-Fi
-/// blinks happens on Wi-Fi, short enough that walking out of range is felt
-/// as a pause rather than as the phone vanishing.
-pub const NETWORK_GRACE: Duration = Duration::from_secs(20);
-
-/// The least time between two attempts at the same device.
-pub const RETRY: Duration = Duration::from_secs(30);
-
-/// A computer this phone is paired with over Bluetooth.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Paired {
-    pub address: String,
-    pub name: String,
-}
-
-/// When to open a Bluetooth link, kept apart from the radio so it is tested.
-#[derive(Default)]
-pub struct Dialer {
-    tried: HashMap<String, Instant>,
-    linked: HashSet<String>,
-}
-
-impl Dialer {
-    /// The devices to try now. `unreachable_for` is how long the longest-gone
-    /// known computer has been off the network, `None` while all are on it.
-    /// `standby` asks for a Bluetooth path beside a working network one, so
-    /// it does not wait for the network to fail.
-    pub fn due(
-        &mut self,
-        paired: &[Paired],
-        unreachable_for: Option<Duration>,
-        standby: bool,
-        now: Instant,
-    ) -> Vec<Paired> {
-        if !standby && !unreachable_for.is_some_and(|gone| gone >= NETWORK_GRACE) {
-            return Vec::new();
-        }
-        let due: Vec<Paired> = paired
-            .iter()
-            .filter(|device| !self.linked.contains(&device.address))
-            .filter(|device| {
-                self.tried
-                    .get(&device.address)
-                    .is_none_or(|at| now.duration_since(*at) >= RETRY)
-            })
-            .cloned()
-            .collect();
-        for device in &due {
-            self.tried.insert(device.address.clone(), now);
-        }
-        due
-    }
-
-    /// A link to `address` is up, or has ended.
-    pub fn set_linked(&mut self, address: &str, up: bool) {
-        if up {
-            self.linked.insert(address.to_string());
-        } else {
-            self.linked.remove(address);
-        }
-    }
-}
 
 /// The computers this phone is paired with, or none without the permission
 /// or an adapter. Asked of the app each time: pairing happens in the system's
@@ -157,68 +90,6 @@ pub fn connect(address: &str) -> Result<OwnedFd, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pc(address: &str) -> Paired {
-        Paired {
-            address: address.into(),
-            name: "desk".into(),
-        }
-    }
-
-    #[test]
-    fn leaves_bluetooth_alone_while_the_network_reaches_everyone() {
-        let mut dialer = Dialer::default();
-        assert!(dialer
-            .due(&[pc("A")], None, false, Instant::now())
-            .is_empty());
-    }
-
-    #[test]
-    fn a_standby_is_dialled_while_the_network_still_works() {
-        let mut dialer = Dialer::default();
-        assert_eq!(
-            dialer.due(&[pc("A")], None, true, Instant::now()),
-            vec![pc("A")]
-        );
-    }
-
-    #[test]
-    fn waits_out_a_short_network_blip_before_trying_bluetooth() {
-        let mut dialer = Dialer::default();
-        let now = Instant::now();
-        assert!(dialer
-            .due(&[pc("A")], Some(Duration::from_secs(5)), false, now)
-            .is_empty());
-        assert_eq!(
-            dialer.due(&[pc("A")], Some(NETWORK_GRACE), false, now),
-            vec![pc("A")]
-        );
-    }
-
-    #[test]
-    fn does_not_retry_a_device_sooner_than_the_retry_interval() {
-        let mut dialer = Dialer::default();
-        let now = Instant::now();
-        let gone = Some(NETWORK_GRACE);
-        assert_eq!(dialer.due(&[pc("A")], gone, false, now).len(), 1);
-        assert!(dialer
-            .due(&[pc("A")], gone, false, now + Duration::from_secs(10))
-            .is_empty());
-        assert_eq!(dialer.due(&[pc("A")], gone, false, now + RETRY).len(), 1);
-    }
-
-    #[test]
-    fn does_not_dial_a_device_it_already_has_a_link_to() {
-        let mut dialer = Dialer::default();
-        dialer.set_linked("A", true);
-        let due = dialer.due(
-            &[pc("A"), pc("B")],
-            Some(NETWORK_GRACE),
-            false,
-            Instant::now(),
-        );
-        assert_eq!(due, vec![pc("B")]);
-    }
 
     #[test]
     fn reads_the_apps_list_of_paired_computers() {

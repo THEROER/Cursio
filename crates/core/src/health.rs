@@ -31,6 +31,7 @@ fn raise(id: String, severity: Severity, summary: String, hint: Option<String>) 
         severity,
         summary,
         hint,
+        actions: Vec::new(),
         since: SystemTime::now(),
     });
 }

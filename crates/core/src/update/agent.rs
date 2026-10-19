@@ -173,6 +173,7 @@ impl Agent {
                             "{from} offered build {version}, and it was refused: {refusal}"
                         ),
                         hint: None,
+                        actions: Vec::new(),
                         since: SystemTime::now(),
                     });
                     state.status.last = Some(format!("refused {version} from {from}: {refusal}"));
@@ -231,6 +232,7 @@ impl Agent {
             severity: Severity::Warning,
             summary: format!("build {version} from {from} could not be installed: {reason}"),
             hint: None,
+            actions: Vec::new(),
             since: SystemTime::now(),
         });
     }
@@ -263,6 +265,7 @@ impl Agent {
                 hint: Some(
                     "switch from the app, or run `cursio update apply` on this machine".into(),
                 ),
+                actions: Vec::new(),
                 since: SystemTime::now(),
             });
         }

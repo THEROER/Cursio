@@ -76,7 +76,19 @@ export interface Problem {
   severity: "Info" | "Warning" | "Error"
   summary: string
   hint: string | null
+  /** Buttons that answer the problem; absent from a node before them. */
+  actions?: ProblemAction[]
   since: SystemTime
+}
+
+export type BluetoothMesh = "auto" | "on" | "off"
+
+/** One change to the node's config, as `cursio_core::config::ConfigEdit`. */
+export type ConfigEdit = { bluetooth_mesh: BluetoothMesh }
+
+export interface ProblemAction {
+  label: string
+  edit: ConfigEdit
 }
 
 export interface PairingState {
@@ -239,7 +251,7 @@ export interface NodeConfig {
   /** Absent from a node older than control v16. */
   calls?: CallsConfig
   /** Absent from a node before resumable sessions. */
-  bluetooth?: { standby: boolean }
+  bluetooth?: { standby: boolean; mesh?: BluetoothMesh }
   [key: string]: unknown
 }
 
@@ -352,6 +364,7 @@ export function useNode() {
     setMicGate: (value: string) => call<Reply>("node_set_mic_gate", { value }),
     setCalls: (calls: CallsConfig) => call<Reply>("node_set_calls", { calls }),
     setBluetoothStandby: (on: boolean) => call<Reply>("node_set_bluetooth_standby", { on }),
+    applyConfigEdit: (edit: ConfigEdit) => call<Reply>("node_apply_config_edit", { edit }),
     setStreamVolume: (stream: number, volume: number, muted: boolean) =>
       call<Reply>("node_set_stream_volume", { stream, volume, muted }),
     pairShow: () => call<Reply>("node_pair_show"),

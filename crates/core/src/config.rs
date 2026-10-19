@@ -94,10 +94,14 @@ pub struct Config {
     pub bluetooth: BluetoothConfig,
 }
 
-/// A phone's Bluetooth path to its computers.
+/// The mesh's Bluetooth path: a phone's to its computers, and a computer's to
+/// the computers it is paired with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BluetoothConfig {
+    /// Whether this machine carries the mesh over Bluetooth at all. Read on
+    /// every turn of the dialler, so a change needs no restart.
+    pub mesh: BluetoothMesh,
     /// Keep a Bluetooth path open beside the network one, so a session moves
     /// to it within seconds when Wi-Fi drops instead of waiting for the
     /// network to come back. Off by default: an open Bluetooth link costs
@@ -105,6 +109,35 @@ pub struct BluetoothConfig {
     /// Without it Bluetooth still carries the session once the network has
     /// been gone a while.
     pub standby: bool,
+}
+
+/// Whether the mesh may use this machine's Bluetooth radio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BluetoothMesh {
+    /// On, unless the Wi-Fi card is one known to lose the network while
+    /// Bluetooth is busy on the antenna they share; then off, with a note
+    /// saying so and offering to turn it on regardless.
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// One change to the config a problem offers to make, so a person can act on
+/// the problem where they read it rather than in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigEdit {
+    BluetoothMesh(BluetoothMesh),
+}
+
+impl ConfigEdit {
+    pub fn apply(self, config: &mut Config) {
+        match self {
+            ConfigEdit::BluetoothMesh(mode) => config.bluetooth.mesh = mode,
+        }
+    }
 }
 
 /// Where a phone's call voice goes once this computer carries it. Read at
@@ -511,6 +544,20 @@ mod tests {
         assert_eq!(c.update.policy, UpdatePolicy::Auto);
         assert_eq!(c.update.channel, UpdateChannel::Dev);
         assert_eq!(c.update.trusted_builders[0].name, "nocturne");
+    }
+
+    #[test]
+    fn bluetooth_is_decided_by_the_machine_unless_the_file_says_otherwise() {
+        assert_eq!(parse("").bluetooth.mesh, BluetoothMesh::Auto);
+        let mut c = parse("[bluetooth]\nstandby = true\n");
+        assert_eq!(c.bluetooth.mesh, BluetoothMesh::Auto);
+        ConfigEdit::BluetoothMesh(BluetoothMesh::Off).apply(&mut c);
+        assert_eq!(c.bluetooth.mesh, BluetoothMesh::Off);
+        assert!(c.bluetooth.standby, "an edit touches only what it names");
+        assert_eq!(
+            parse("[bluetooth]\nmesh = \"on\"\n").bluetooth.mesh,
+            BluetoothMesh::On
+        );
     }
 
     #[test]

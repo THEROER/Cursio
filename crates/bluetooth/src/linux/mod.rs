@@ -13,12 +13,25 @@
 mod channel;
 mod devices;
 mod media;
+mod rfcomm;
 mod sbc;
 mod sco;
 
 pub use channel::MeshChannel;
-pub use devices::paired_phones;
+pub use devices::{paired_computers, paired_phones};
 pub use media::MediaSinkService;
+
+/// Call `address`'s mesh channel. Blocking for as long as the radio pages
+/// the device; see [`rfcomm::dial`].
+pub fn dial(address: &str) -> Result<OwnedFd, BluetoothError> {
+    // A page that has not answered in this long is a device out of range;
+    // the kernel's own page timeout is shorter, this only bounds a stall.
+    rfcomm::dial(
+        address,
+        crate::MESH_CHANNEL,
+        std::time::Duration::from_secs(15),
+    )
+}
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
