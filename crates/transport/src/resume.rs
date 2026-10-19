@@ -395,7 +395,7 @@ impl Inner {
 }
 
 fn seq_frame(seq: u64, lossy: bool, tagged: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(10 + tagged.len());
+    let mut frame = Vec::with_capacity(link_tag::SEQ_HEADER_LEN + tagged.len());
     frame.push(link_tag::SEQ);
     frame.extend_from_slice(&seq.to_be_bytes());
     frame.push(if lossy { SEQ_LOSSY } else { 0 });
@@ -1030,6 +1030,20 @@ mod tests {
         }
         b.tx.send(&Message::Bye).await.unwrap();
         assert_eq!(next(&mut a).await, Message::Bye);
+    }
+
+    #[tokio::test]
+    async fn a_message_cut_into_full_frames_crosses_and_is_resent_whole() {
+        let (mut a, mut b) = session().await;
+        let big = Message::Opaque(vec![0x5A; 300_000]);
+        a.tx.send(&big).await.unwrap();
+        assert_eq!(next(&mut b).await, big);
+        cut(&a, &b).await;
+        a.tx.send(&big).await.unwrap();
+        rejoin(&a, &b).await;
+        assert_eq!(next(&mut b).await, big);
+        a.tx.send(&key(1)).await.unwrap();
+        assert_eq!(next(&mut b).await, key(1));
     }
 
     #[tokio::test]

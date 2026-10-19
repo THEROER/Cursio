@@ -72,7 +72,17 @@ pub(crate) mod link_tag {
     /// `[u64 delivered]`: the first frame on a path joining a session, after
     /// which each side resends whatever the other has not delivered.
     pub const RESUME: u8 = 0x04;
+    /// What `SEQ` puts in front of a tagged frame: the tag, the number and
+    /// the flags.
+    pub const SEQ_HEADER_LEN: usize = 1 + 8 + 1;
 }
+
+/// The most of a Noise message a tagged frame may fill. A resumable link
+/// wraps every frame in a `SEQ` header before sealing it, so a frame cut to
+/// the whole Noise budget no longer fits once wrapped: the seal fails, the
+/// path drops, and the same frame waits at the head of the resend buffer to
+/// end every path that joins after it.
+const MAX_TAGGED_PLAINTEXT: usize = MAX_NOISE_PLAINTEXT - link_tag::SEQ_HEADER_LEN;
 
 /// Header on every `PART` frame: which message, which piece, how many total.
 /// Fixed 8 bytes, big-endian, right after [`frame_tag::PART`].
@@ -93,9 +103,10 @@ pub(crate) fn has_more_parts(tagged: &[u8]) -> bool {
     idx.saturating_add(1) < count
 }
 
-/// Usable payload per `PART` frame: the Noise budget minus the 1-byte tag and
-/// the part header. What's left is how much of the message each frame carries.
-const MAX_CHUNK_PAYLOAD: usize = MAX_NOISE_PLAINTEXT - 1 - PART_HEADER_LEN;
+/// Usable payload per `PART` frame: the tagged-frame budget minus the 1-byte
+/// tag and the part header. What's left is how much of the message each frame
+/// carries.
+const MAX_CHUNK_PAYLOAD: usize = MAX_TAGGED_PLAINTEXT - 1 - PART_HEADER_LEN;
 
 /// Largest logical message accepted by the encrypted transport.
 const MAX_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -183,7 +194,7 @@ pub(crate) fn chunk_plaintext(msg: &Message) -> Result<Vec<Vec<u8>>, TransportEr
     }
 
     // Fast path: fits whole. Tag byte + body in one frame.
-    if body.len() < MAX_NOISE_PLAINTEXT {
+    if body.len() < MAX_TAGGED_PLAINTEXT {
         let mut tagged = Vec::with_capacity(body.len() + 1);
         tagged.push(frame_tag::WHOLE);
         tagged.extend_from_slice(&body);
