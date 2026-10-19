@@ -123,6 +123,7 @@ Every node listens for peers dialling in *and* dials the known peers that are do
 - `mesh.rs` — dial targets, sweep interval, reconnection. `should_dial` breaks the tie so two nodes don't dial each other simultaneously — but the waiting side still calls after `YIELD_GRACE`, so two links do form; `PeerRegistry::claim_link` keeps one per peer, chosen identically on both ends by `LinkShape::beats`, and only the link holding the peer may take it offline.
 - `link.rs` — everything between "there is a socket" and "a session can start": `Hello` → SPAKE2 pairing on first meeting (or the stored key) → Noise `NNpsk0` → module negotiation → cursor ownership.
 - `session.rs` — `Hello` version check, then the heartbeat/pump loop.
+- A session outlives its connection: it rides a `ResumableLink` (`transport/src/resume.rs`) whose connections are *paths*. Frames are numbered, acknowledged and resent after a dropped connection (XEP-0198's model); a new connection whose `Hello::resumable` names the session joins it (`link::join`) instead of building modules again, and lossy messages (`Message::is_lossy`: motion, sound, pixels) are never replayed. A Bluetooth path is a standby beside the network one. See "A session outlives its connection" in `docs/mesh-design.md`.
 
 **Sessions are `!Send`; modules are not on the session.** The input path shares its injector and cursor via `Rc` deliberately, so peer sessions are spawned with `spawn_local` onto a `LocalSet` and the registry is `Rc<RefCell<_>>`. Do not "fix" this with `Arc`/`Mutex` — it is single-threaded by design. What that loop holds is only what is `!Send` and ordering-sensitive: input forwarding and injection, `CursorRole`/ownership, edge crossing, the hotkey, heartbeat/liveness and `NodeStatus`. Every `SessionModule` runs on its own OS thread (`core/src/module_host.rs`), so nothing a module waits on can reach the cursor.
 
@@ -265,7 +266,7 @@ This is the second class of thing on the channel — **state and events of a dev
 
 ### Wire compatibility
 
-Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 21) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
+Bump `PROTOCOL_VERSION` in `protocol/src/lib.rs` (currently 22) whenever the shared vocabulary changes; a module's own message set is versioned separately through `ModuleAdvert`. Framing is a 4-byte big-endian length prefix plus that many payload bytes.
 
 **Never** change the update lane (`protocol/src/update.rs`): its bytes are pinned by tests, `Message::Hello` stays variant 0 and `Message::Update` variant 17, and every connection opens with its `Preamble`. It is the one thing two builds of any age can still exchange, which is how the one that is behind gets updated. Add a new kind instead; old builds skip kinds they do not know.
 

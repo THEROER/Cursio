@@ -525,6 +525,62 @@ decode it drops it and keeps deciding by `Presence` alone, which is exactly
 what it did before. Everything here rides the notify module; there is no
 second channel.
 
+## A session outlives its connection
+
+A session used to be one TCP connection. Wi-Fi gone for two seconds meant
+fifteen seconds of silence before the session noticed, then every module torn
+down — disks unmounted, streams closed, the cursor sent home — and rebuilt once
+the mesh dialled again. dark, on a b43 radio that loses its access point about
+once an hour for a median of eight seconds, paid that every time.
+
+Now the session rides a `ResumableLink` (`transport/src/resume.rs`) and
+connections are *paths* under it:
+
+- **Sequenced, acknowledged, resent.** XMPP's stream management (XEP-0198) is
+  the model. Inside Noise, every frame of the session is numbered (`SEQ`); each
+  side keeps saying the highest number it has delivered (`ACK`, also the
+  path's keepalive, every second); a sender keeps what is unacknowledged. A
+  path joining the session opens with `RESUME` and the number delivered, each
+  side resends the rest, and the receiver drops anything not past what it
+  delivered — so every frame reaches the session at most once, which for a key
+  press is the difference between typing once and twice.
+- **Fresh state is not replayed.** Pointer motion, scroll, sound and pixels
+  (`Message::is_lossy`) are numbered but never kept: replayed after a gap,
+  motion would jump the cursor by everything it moved meanwhile and old sound
+  would play over new — Mosh's lesson. Presses and releases are never lossy.
+- **Which connection joins.** `Hello::resumable` lists every session a node
+  holds open (it cannot list the one with the caller: it does not know who is
+  calling until the greetings cross). Each side looks for its session with the
+  other in the other's list (`PeerRegistry::greeted`): present in both, the
+  connection joins it (`link::join`, Noise with the stored key, then
+  `ResumeHandle::attach`) and no module is built; missing from the peer's, the
+  peer restarted or gave up, and a session of ours with no path left is ended
+  so a fresh one starts. Session tags come from the Noise handshake hash, the
+  same on both ends; they are not secret, since a joining connection must still
+  complete Noise with the pair's key.
+- **Path health.** A path silent for 3 s (45 s for a standby, whose keepalive
+  is every 15 s) is let go of; so is any connection whose sent data stays
+  unacknowledged for 10 s (`TCP_USER_TIMEOUT`, `transport/src/dead_peer.rs` —
+  keepalive alone never fires while data is queued). A carrying path whose
+  frames stay unacknowledged for 3 s while another path exists is *degraded*
+  for 10 s and the session moves — the stale-subflow idea from multipath TCP,
+  with a hold so a marginal Wi-Fi does not make it flap. The system's own word
+  ends network paths at once: NetworkManager's state on Linux
+  (`core/src/network_watch.rs`), `NetworkCallback.onLost` on Android
+  (`resume::network_lost`).
+- **Holding.** With no path the session keeps running and its loop does not
+  time the peer out (`TransportTx::holding`); the registry offers the peer for
+  dialling again (`needs_network_path`), and after 60 s (`resume::HOLD`) with
+  nothing back the link ends the session as before.
+- **Bounds.** At most one network and one Bluetooth path; a newer one replaces
+  the older. Over Bluetooth, pixels are not sent at all. Past 64 MiB kept for
+  resending, the peer has stopped acknowledging for far longer than any path
+  survives, and the session can no longer be resumed.
+
+Two halves of one session no longer race: a session both ends hold is never
+also brought up fresh. `claim_link` still settles two *fresh* connections that
+cross.
+
 ## Two paths, one mesh: the network and Bluetooth
 
 A phone with Wi-Fi off, or out of the house's range, or on a hotspot the
@@ -549,12 +605,14 @@ unprompted copy of its sound only to those profiles. They are not this path.)
   computers it is paired with in the system's Bluetooth settings and asks each
   for the Cursio service. Which mesh peer answered is learned from `Hello`, as
   on TCP.
-- **The network wins.** The phone dials over Bluetooth only once a known
-  computer has been off the network for 20 s (`bt::NETWORK_GRACE`), each device
-  at most every 30 s. A Bluetooth link ends itself once its computer is heard
-  on the network again *and* answers a TCP connection there — hearing alone is
-  not enough, a hotspot's client hears a LAN it cannot reach — and the ordinary
-  dial takes over at network speed.
+- **The network wins.** The phone dials over Bluetooth once a known computer
+  has been off the network for 20 s (`bt::NETWORK_GRACE`), each device at most
+  every 30 s — or at once, as a standby, with `[bluetooth] standby = true`.
+  Either way the Bluetooth connection is a *path* of the session, not a session
+  of its own (see "A session outlives its connection" above): when either side
+  dials over the network again, that connection joins the same session and
+  carries it, and the Bluetooth path is let go of unless it is kept as the
+  standby.
 - **What fits.** RFCOMM carries a few hundred kilobytes a second. The priority
   classes already keep input, notifications, messages, calls' control and Opus
   audio ahead of screens and files, so those keep working and the bulk classes
