@@ -141,7 +141,23 @@ class CursioNotificationListener : NotificationListenerService() {
                 if (intent != null && intent == action.actionIntent) roles[role] = index
             }
         }
+        if (roles.all { it < 0 }) titledRoles(n, roles)
         return roles
+    }
+
+    /**
+     * Roles read from the buttons' words, for a call not posted as `CallStyle`
+     * — Discord's is a plain notification with "Accept"/"Decline", or
+     * "Disconnect" once up, and without this its buttons could not be pressed
+     * from a computer at all. Only for apps that left the intents out, and
+     * only exact words, so a button merely mentioning a call is not pressed.
+     */
+    private fun titledRoles(n: Notification, roles: IntArray) {
+        n.actions.orEmpty().forEachIndexed { index, action ->
+            val title = action.title?.toString()?.trim()?.lowercase() ?: return@forEachIndexed
+            val role = TITLE_ROLES.entries.firstOrNull { (_, words) -> title in words }?.key
+            if (role != null && roles[role] < 0) roles[role] = index
+        }
     }
 
     private fun send(sbn: StatusBarNotification) {
@@ -223,6 +239,19 @@ class CursioNotificationListener : NotificationListenerService() {
             "com.samsung.android.incallui",
             "com.android.server.telecom",
             "com.android.phone",
+        )
+
+        /**
+         * Button words by role (0 answer, 1 decline, 2 hang up), lowercase, in
+         * the languages this phone's apps speak to it in.
+         */
+        private val TITLE_ROLES = mapOf(
+            0 to setOf("accept", "answer", "join", "принять", "ответить", "присоединиться"),
+            1 to setOf("decline", "reject", "ignore", "отклонить", "игнорировать"),
+            2 to setOf(
+                "hang up", "end call", "end", "disconnect", "leave", "leave call",
+                "завершить", "завершить звонок", "отключиться", "покинуть", "положить трубку",
+            ),
         )
 
         @Volatile
