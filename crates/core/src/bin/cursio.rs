@@ -2145,6 +2145,24 @@ async fn run_mesh(
                             }
                         }
                         let targets = cursio_core::mesh::next_dial_targets(self_id, &registry);
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        // Off the loop: a peer that has gone holds its dial for
+                        // the connect timeout, and a Bluetooth call that peer
+                        // placed meanwhile waited that long to be accepted —
+                        // 17 s, measured, every sweep's worth end to end. The
+                        // targets are `Connecting` now, so no sweep dials them
+                        // twice.
+                        let identity = identity.clone();
+                        let registry = registry.clone();
+                        let pairing = pairing.clone();
+                        let control = control.clone();
+                        let capture = capture.clone();
+                        let status = status.clone();
+                        let live = live.clone();
+                        let modules = modules.clone();
+                        tokio::task::spawn_local(async move {
                         for (target, dialled) in cursio_core::mesh::dial(targets).await {
                             let transport = match dialled {
                                 Ok(t) => t,
@@ -2185,6 +2203,7 @@ async fn run_mesh(
                                 None,
                             );
                         }
+                        });
                     }
                 }
             }

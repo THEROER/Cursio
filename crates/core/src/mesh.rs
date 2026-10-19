@@ -134,11 +134,12 @@ fn next_dial_targets_at(
 
 /// Dial every target of one sweep at once, answering each with its outcome.
 ///
-/// The sweep runs in the node's own loop, the one that also accepts peers
-/// dialling in. Dialled one after another, a few addresses that no longer
-/// lead anywhere held that loop for their timeouts end to end, and a peer
-/// whose call had already connected waited 50 s to be accepted. Together they
-/// cost one timeout at most.
+/// Dialled one after another, a few addresses that no longer lead anywhere
+/// held the node's loop for their timeouts end to end, and a peer whose call
+/// had already connected waited 50 s to be accepted. Together they cost one
+/// timeout at most — and the loop awaits none of it: the CLI runs each
+/// sweep's dial as a task of its own, since even one timeout held up a
+/// Bluetooth call by seconds.
 pub async fn dial(
     targets: Vec<DialTarget>,
 ) -> Vec<(
