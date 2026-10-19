@@ -59,12 +59,64 @@ impl KnownPeer {
     }
 }
 
+/// How one link to a peer was made: which side called, and over what.
+///
+/// Two links to one peer happen whenever both sides call at once — the side
+/// [`should_dial`] tells to wait calls anyway after a grace, and a phone hands
+/// over from Bluetooth to the network — and each half of the pair sees both.
+/// Both halves must then keep the *same* one, which they can decide alone
+/// only from what both know about each link: see [`LinkShape::beats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkShape {
+    /// This node placed the call.
+    pub dialled: bool,
+    pub path: crate::control::LinkPath,
+}
+
+impl LinkShape {
+    /// Whether a new link of this shape should replace a `held` one to
+    /// `remote`, from `local`'s side.
+    ///
+    /// The network beats Bluetooth, which is only kept for when the network is
+    /// not there. Then the call [`should_dial`] says the lower id places —
+    /// the remote side sees the same link with `dialled` the other way round
+    /// and `should_dial` the other way round, so it agrees. Two links of one
+    /// shape are one side calling twice; the newer wins, since the older is
+    /// most likely a socket that died without either side noticing yet.
+    pub fn beats(self, held: LinkShape, local: Option<PeerId>, remote: PeerId) -> bool {
+        use crate::control::LinkPath;
+        if self.path != held.path {
+            return self.path == LinkPath::Network;
+        }
+        match local {
+            Some(local) if self.dialled != held.dialled => {
+                self.dialled == should_dial(local, remote)
+            }
+            _ => true,
+        }
+    }
+}
+
+/// The link a peer is reached by, and how to end it if a better one arrives.
+#[derive(Debug)]
+struct HeldLink {
+    token: u64,
+    shape: LinkShape,
+    superseded: std::rc::Rc<tokio::sync::Notify>,
+}
+
 /// Every peer this node knows, keyed by its stable id.
 #[derive(Debug, Default)]
 pub struct PeerRegistry {
     peers: HashMap<PeerId, KnownPeer>,
     /// This node's own id, so it can never end up as a peer of itself.
     local: Option<PeerId>,
+    /// The one link each peer is reached by. Every session runs the whole
+    /// module set, so a second one to a peer showed its window twice, opened
+    /// its microphone twice and, ending, marked a peer offline whose other
+    /// link was still up — which had the mesh dial it yet again.
+    links: HashMap<PeerId, HeldLink>,
+    next_link: u64,
 }
 
 impl PeerRegistry {
@@ -104,6 +156,7 @@ impl PeerRegistry {
         Self {
             peers,
             local: Some(local),
+            ..Default::default()
         }
     }
 
@@ -183,6 +236,55 @@ impl PeerRegistry {
         );
     }
 
+    /// Take `peer`'s one link for a session that has just learnt who it talks
+    /// to, answering the token to [`release_link`](Self::release_link) it
+    /// with — or `None` when the link already held is the better one and this
+    /// session should end.
+    ///
+    /// Replacing a held link wakes its `superseded`, which that session waits
+    /// on alongside its own run.
+    pub fn claim_link(
+        &mut self,
+        peer: PeerId,
+        shape: LinkShape,
+        superseded: std::rc::Rc<tokio::sync::Notify>,
+    ) -> Option<u64> {
+        if let Some(held) = self.links.get(&peer) {
+            if !shape.beats(held.shape, self.local, peer) {
+                return None;
+            }
+            held.superseded.notify_one();
+        }
+        self.next_link += 1;
+        let token = self.next_link;
+        self.links.insert(
+            peer,
+            HeldLink {
+                token,
+                shape,
+                superseded,
+            },
+        );
+        Some(token)
+    }
+
+    /// A session to `peer` ended. Answers whether the peer is now unlinked —
+    /// whether this session, ending, is what takes it offline.
+    ///
+    /// `token` is what [`claim_link`](Self::claim_link) gave it; `None` for a
+    /// session that never held the link (it ended before learning who it
+    /// talked to, or lost to the one held).
+    pub fn release_link(&mut self, peer: PeerId, token: Option<u64>) -> bool {
+        match (self.links.get(&peer).map(|held| held.token), token) {
+            (Some(held), Some(mine)) if held == mine => {
+                self.links.remove(&peer);
+                true
+            }
+            (Some(_), _) => false,
+            (None, _) => true,
+        }
+    }
+
     /// Drop a peer the user removed from the mesh, so it is neither dialled
     /// nor shown. Not for a peer that went away — see [`Self::mark_offline`].
     pub fn forget(&mut self, peer_id: &PeerId) -> Option<KnownPeer> {
@@ -251,6 +353,92 @@ mod tests {
         assert!(!should_dial(b, a));
     }
 
+    fn shape(dialled: bool, path: crate::control::LinkPath) -> LinkShape {
+        LinkShape { dialled, path }
+    }
+
+    /// Both ends of a doubled link must drop the same socket, or each keeps
+    /// the one the other closed and the pair ends up with none.
+    #[test]
+    fn both_sides_of_a_dial_collision_keep_the_same_link() {
+        use crate::control::LinkPath::Network;
+        let (low, high) = (peer(1), peer(2));
+        // The call `low` placed, as each side sees it, and the call `high` placed.
+        let (low_call_at_low, low_call_at_high) = (shape(true, Network), shape(false, Network));
+        let (high_call_at_low, high_call_at_high) = (shape(false, Network), shape(true, Network));
+
+        assert!(low_call_at_low.beats(high_call_at_low, Some(low), high));
+        assert!(!high_call_at_low.beats(low_call_at_low, Some(low), high));
+        assert!(low_call_at_high.beats(high_call_at_high, Some(high), low));
+        assert!(!high_call_at_high.beats(low_call_at_high, Some(high), low));
+    }
+
+    #[test]
+    fn the_network_replaces_bluetooth_and_never_the_other_way() {
+        use crate::control::LinkPath::{Bluetooth, Network};
+        let (local, remote) = (peer(1), peer(2));
+        assert!(shape(false, Network).beats(shape(true, Bluetooth), Some(local), remote));
+        assert!(!shape(true, Bluetooth).beats(shape(false, Network), Some(local), remote));
+    }
+
+    #[test]
+    fn a_better_link_wakes_the_held_one_whose_end_then_leaves_the_peer_linked() {
+        use crate::control::LinkPath::Network;
+        let (local, remote) = (peer(1), peer(2));
+        let mut reg = PeerRegistry {
+            local: Some(local),
+            ..Default::default()
+        };
+        let first = std::rc::Rc::new(tokio::sync::Notify::new());
+        let held = reg.claim_link(remote, shape(false, Network), first.clone());
+        let better = reg.claim_link(
+            remote,
+            shape(true, Network),
+            std::rc::Rc::new(tokio::sync::Notify::new()),
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), first.notified())
+                .await
+                .expect("the replaced link was not told to end");
+        });
+        assert!(
+            !reg.release_link(remote, held),
+            "the replaced link took the peer offline"
+        );
+        assert!(reg.release_link(remote, better));
+    }
+
+    #[test]
+    fn a_link_losing_to_the_held_one_is_refused_and_leaves_the_peer_linked() {
+        use crate::control::LinkPath::Network;
+        let (local, remote) = (peer(1), peer(2));
+        let mut reg = PeerRegistry {
+            local: Some(local),
+            ..Default::default()
+        };
+        let held = std::rc::Rc::new(tokio::sync::Notify::new());
+        let token = reg.claim_link(remote, shape(true, Network), held);
+        assert!(token.is_some());
+
+        let refused = reg.claim_link(
+            remote,
+            shape(false, Network),
+            std::rc::Rc::new(tokio::sync::Notify::new()),
+        );
+        assert_eq!(refused, None);
+        assert!(!reg.release_link(remote, refused));
+        assert!(reg.release_link(remote, token));
+        assert!(
+            reg.release_link(remote, None),
+            "a peer with no link is unlinked"
+        );
+    }
+
     /// A peer that goes offline must stay *known* — that is the whole point:
     /// the laptop dying must not make the PC forget it exists.
     #[test]
@@ -291,8 +479,8 @@ mod tests {
     fn a_node_is_never_its_own_peer() {
         let me = peer(42);
         let mut reg = PeerRegistry {
-            peers: Default::default(),
             local: Some(me),
+            ..Default::default()
         };
 
         reg.admit(me, "myself".into(), Some("127.0.0.1:9000".parse().unwrap()));

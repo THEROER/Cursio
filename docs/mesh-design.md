@@ -117,6 +117,19 @@ A node dials every known peer and listens at the same time. Two nodes dialing
 each other simultaneously is resolved by the same PeerId rule: the lower id
 keeps its outbound attempt, the higher one drops it in favour of the inbound.
 
+That rule only says who *should* call; it cannot stop two links forming. The
+side told to wait calls anyway after `YIELD_GRACE`, so a slow side and an
+impatient one meet halfway, and a phone moving from Bluetooth to the network
+briefly has both. Two links ran two whole sessions — the phone's screen opened
+twice, its microphone was offered twice, and either link ending marked the
+peer offline while the other was still up, which had the mesh dial it again.
+So each session, the moment it learns who it talks to, claims the peer's one
+link (`PeerRegistry::claim_link`), and both ends keep the same one without
+asking each other (`LinkShape::beats`): the network over Bluetooth, then the
+call the lower id placed, then — two calls from one side — the newer. A link
+that loses closes at once; a held link that is beaten is woken and closes too.
+Only the link that holds the peer takes it offline when it ends.
+
 ## Meeting a machine for the first time
 
 The sweep above only auto-dials machines already in the trust store. Meeting a

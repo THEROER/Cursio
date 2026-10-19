@@ -340,7 +340,9 @@ async fn serve(node: Node) -> anyhow::Result<()> {
             view: true,
         }))
         // The phone's screen, shown on a computer and driven from it.
-        .with(Box::new(cursio_core::window_session::WindowFactory::default()));
+        .with(Box::new(
+            cursio_core::window_session::WindowFactory::default(),
+        ));
     cursio_core::media_hub::hub().set_backend(crate::media::AndroidBackend::shared());
     cursio_core::media_hub::hub().set_display(crate::media::AndroidDisplay::shared());
     cursio_core::phone_screen::set_backend(crate::screen::AndroidScreen::shared());
@@ -503,17 +505,40 @@ fn spawn_session<T: Transport + 'static>(
             ctx.registry.borrow_mut().set_state(id, PeerState::Online);
         }
         let who = std::cell::Cell::new(expected);
-        let result = run_link(transport, &ctx, role, addr, &who).await;
+        let hold = LinkHold::default();
+        let result = tokio::select! {
+            result = run_link(transport, &ctx, role, addr, &who, &hold) => result,
+            () = hold.superseded.notified() => {
+                tracing::info!("a better link to this computer came up; closing this one");
+                Ok(())
+            }
+        };
         match &result {
             Ok(()) => tracing::info!("peer session ended"),
             Err(e) => tracing::warn!(error = %e, "peer session ended with error"),
         }
-        if let Some(id) = who.get() {
-            ctx.registry.borrow_mut().mark_offline(id);
-            ctx.control.link_down(&id);
-        }
+        end_link(&ctx, who.get(), &hold);
         publish(&ctx);
     });
+}
+
+/// A session's hold on its peer's one link; see
+/// [`PeerRegistry::claim_link`](cursio_core::registry::PeerRegistry::claim_link).
+#[derive(Default)]
+struct LinkHold {
+    token: std::cell::Cell<Option<u64>>,
+    /// Woken when a better link to the same computer replaces this one.
+    superseded: Rc<tokio::sync::Notify>,
+}
+
+/// Take the computer offline after a session to it ended — unless another
+/// link to it is up, which is then its link.
+fn end_link(ctx: &NodeCtx, who: Option<PeerId>, hold: &LinkHold) {
+    let Some(id) = who else { return };
+    if ctx.registry.borrow_mut().release_link(id, hold.token.get()) {
+        ctx.registry.borrow_mut().mark_offline(id);
+        ctx.control.link_down(&id);
+    }
 }
 
 /// Greet, pair if this is a first meeting, secure, and run the session.
@@ -524,6 +549,7 @@ async fn run_link<T: Transport + 'static>(
     // `None` over Bluetooth, which has no address the network could dial.
     addr: Option<SocketAddr>,
     who: &std::cell::Cell<Option<PeerId>>,
+    hold: &LinkHold,
 ) -> anyhow::Result<()> {
     let password = ctx.pairing.password();
     let plan = cursio_core::link::Handshake {
@@ -544,6 +570,21 @@ async fn run_link<T: Transport + 'static>(
     let peer_name = identified.peer.display_name.clone();
     let negotiated = identified.negotiated().clone();
     who.set(Some(peer_id));
+    let shape = cursio_core::registry::LinkShape {
+        dialled: matches!(role, Role::Initiator),
+        path,
+    };
+    let claimed = ctx
+        .registry
+        .borrow_mut()
+        .claim_link(peer_id, shape, hold.superseded.clone());
+    match claimed {
+        Some(token) => hold.token.set(Some(token)),
+        None => {
+            tracing::info!(peer = %peer_name, ?shape, "already linked to this computer the way both sides keep; closing this second link");
+            return Ok(());
+        }
+    }
     if ctx.registry.borrow().is_known(&peer_id) {
         ctx.registry
             .borrow_mut()
@@ -698,11 +739,16 @@ fn spawn_bluetooth_session<T: Transport + 'static>(
 ) {
     tokio::task::spawn_local(async move {
         let who = std::cell::Cell::new(None);
+        let hold = LinkHold::default();
         let started = std::time::Instant::now();
         let ended = tokio::select! {
-            result = run_link(transport, &ctx, Role::Initiator, None, &who) => result,
+            result = run_link(transport, &ctx, Role::Initiator, None, &who, &hold) => result,
             () = network_back(&ctx, &who, started) => {
                 tracing::info!("the network reaches this computer again; leaving bluetooth");
+                Ok(())
+            }
+            () = hold.superseded.notified() => {
+                tracing::info!("the network link to this computer is up; leaving bluetooth");
                 Ok(())
             }
         };
@@ -710,10 +756,7 @@ fn spawn_bluetooth_session<T: Transport + 'static>(
             tracing::warn!(error = %e, "bluetooth session ended with error");
         }
         ctx.bluetooth.borrow_mut().set_linked(&address, false);
-        if let Some(id) = who.get() {
-            ctx.registry.borrow_mut().mark_offline(id);
-            ctx.control.link_down(&id);
-        }
+        end_link(&ctx, who.get(), &hold);
         publish(&ctx);
     });
 }
