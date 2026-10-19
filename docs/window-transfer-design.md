@@ -828,7 +828,10 @@ notification ends it from the phone.
 
 ### Size, rate and turning
 
-The long side is held to 1920 px (in macroblocks of 16), 60 fps, starting at
+The long side is held to 1920 px, each side the nearest multiple of 8 (of 16
+where the encoder refuses that) so the stream keeps the screen's shape — sides
+rounded down to 16 made a 1220×2712 screen 848×1920, letterboxed, with every
+tap landing off by the band. 60 fps, starting at
 6 Mbit/s. The encoder repeats the last frame after 200 ms of a still screen,
 so a viewer joining late still gets pictures. Keyframes are sent on request —
 a window that just opened, a viewer whose decoder lost its place, or one that
