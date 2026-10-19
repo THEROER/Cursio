@@ -107,6 +107,7 @@ const title = computed(() => {
     </template>
 
     <NodeDownAlert />
+    <WindowStaleAlert />
     <slot />
 
     <template #overlays>

@@ -136,7 +136,11 @@
     "minimize": "Minimize",
     "maximize": "Maximize",
     "close": "Close to the tray",
-    "failed": "The window did not respond"
+    "failed": "The window did not respond",
+    "staleTitle": "This window is older than Cursio",
+    "staleBody": "The window runs {window}, the node already runs {node}. Some pages may not load until the window is the same version.",
+    "relaunch": "Restart the window",
+    "relaunchFailed": "The window could not restart"
   },
   "stats": {
     "peers": "Peers online",

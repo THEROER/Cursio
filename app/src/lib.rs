@@ -31,6 +31,9 @@ mod logs;
 mod mobile;
 /// The line to the running node.
 mod node;
+/// Restarting this window as the version the install now names.
+#[cfg(desktop)]
+mod relaunch;
 /// Driving a peer's cursor from a phone's touch surface.
 #[cfg(mobile)]
 mod touchpad;
@@ -159,6 +162,10 @@ pub fn run() {
             Err(e) => tracing::warn!(error = %e, "could not load node identity"),
         }
 
+        // Started to replace an older window: let it go before the
+        // single-instance check below would hand it this launch instead.
+        relaunch::wait_for_predecessor(&std::env::args().collect::<Vec<_>>());
+
         // Started at login by autostart: come up as the tray alone.
         (log, std::env::args().any(|a| a == "--hidden"))
     };
@@ -260,6 +267,7 @@ pub fn run() {
             autostart::commands::autostart_set,
             install::commands::install_status,
             install::commands::install_rollback,
+            relaunch::commands::app_relaunch,
             logs::commands::log_tail,
         ]);
 

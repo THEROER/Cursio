@@ -19,6 +19,9 @@ pub struct InstallView {
     previous: Option<String>,
     /// Oldest first, as the layout lists them.
     installed: Vec<String>,
+    /// The version this window runs, when it runs from the install: compared
+    /// with the node's, it says the window is older than what it talks to.
+    app: Option<String>,
 }
 
 pub fn view() -> InstallView {
@@ -28,12 +31,14 @@ pub fn view() -> InstallView {
             current: layout.current(),
             previous: layout.previous(),
             installed: layout.installed(),
+            app: crate::relaunch::own_version(),
         },
         Err(_) => InstallView {
             root: None,
             current: None,
             previous: None,
             installed: Vec::new(),
+            app: None,
         },
     }
 }

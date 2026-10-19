@@ -6,6 +6,8 @@ export interface InstallView {
   current: string | null
   previous: string | null
   installed: string[]
+  /** The version this window runs; absent from an older app, null outside an install. */
+  app?: string | null
 }
 
 const install = ref<InstallView | null>(null)
@@ -28,5 +30,6 @@ export function useInstall() {
     install,
     refreshInstall,
     rollBack: (nodePid: number) => invoke<void>("install_rollback", { nodePid }),
+    relaunch: () => invoke<void>("app_relaunch"),
   }
 }
