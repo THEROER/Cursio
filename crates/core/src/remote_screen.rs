@@ -201,9 +201,14 @@ impl ScreenHost {
             return;
         };
         let (tx, rx) = std_mpsc::channel();
+        // A phone's source spawns its forwarding task while opening; on a bare
+        // thread that `tokio::spawn` panicked, the viewer heard only "the
+        // capture thread died", and picking a phone never showed anything.
+        let runtime = tokio::runtime::Handle::try_current().ok();
         let spawned = std::thread::Builder::new()
             .name("cursio-screen-open".into())
             .spawn(move || {
+                let _entered = runtime.as_ref().map(tokio::runtime::Handle::enter);
                 let _ = tx.send(open_source(sources.as_ref(), id));
             });
         match spawned {
@@ -1166,6 +1171,41 @@ mod tests {
             m,
             WindowMsg::SourceEnded { reason } if reason.contains("cancelled")
         )));
+        assert_eq!(pair.host.showing(), Some(0x8000_0000));
+    }
+
+    /// Opens through a task of its own, as a phone's screen does.
+    struct SpawningSources(FakeScreenSources);
+
+    impl ScreenSources for SpawningSources {
+        fn list(&self) -> Result<Vec<ScreenSource>, WindowError> {
+            self.0.list()
+        }
+
+        fn open(
+            &self,
+            id: cursio_protocol::WindowId,
+            source: &ScreenSource,
+        ) -> Result<Box<dyn CaptureSession + Send>, WindowError> {
+            tokio::spawn(async {});
+            self.0.open(id, source)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_that_spawns_a_task_while_opening_is_shown() {
+        let sources = lightmoon();
+        let mut pair = Pair::new(&sources);
+        pair.host = ScreenHost::serving(Arc::new(SpawningSources(sources.clone())));
+
+        let traffic = pair.settle().await;
+
+        assert!(
+            !traffic
+                .iter()
+                .any(|m| matches!(m, WindowMsg::SourceEnded { .. })),
+            "{traffic:?}"
+        );
         assert_eq!(pair.host.showing(), Some(0x8000_0000));
     }
 
