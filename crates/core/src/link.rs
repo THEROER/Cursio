@@ -298,6 +298,11 @@ where
     let kind = path_kind(&transport);
     let secure = EncryptedTransport::establish(transport, &shared_key, plan.role).await?;
     tracing::info!("encrypted channel up ({})", secure.kind());
+    // Only now is the greeting's name the peer's own: the channel came up on
+    // the key it was paired with.
+    if let Err(e) = store.remember_name(&peer.peer_id, &peer.display_name) {
+        tracing::warn!(error = %e, "could not remember the peer's new name; it shows by its old one after a restart");
+    }
     let tag = secure.session_tag();
     let (transport, resume) = ResumableLink::new(secure.into_path(kind), tag);
 

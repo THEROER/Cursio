@@ -245,7 +245,13 @@ impl NodeState {
                 link.status = status;
             }
             match peers.iter_mut().find(|p| p.id == *id) {
+                // The name the peer greeted this link with, not the one the
+                // registry was seeded with: a phone paired under its model
+                // number and renamed since kept showing the model number,
+                // because only mDNS refreshed the registry and a hotspot's
+                // multicast never reaches it.
                 Some(p) => {
+                    p.name = name.clone();
                     p.presence = Presence::Online;
                     p.link = Some(link);
                 }
@@ -417,6 +423,35 @@ mod tests {
         );
         node.link_down(&fresh);
         assert_eq!(node.status().peers.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_linked_peer_is_shown_by_the_name_it_greeted_with() {
+        let dir = temp_dir("renamed");
+        let node = state(&dir, Overrides::default());
+        let phone = PeerId::new_v4();
+        node.set_known(vec![KnownPeerView {
+            id: phone,
+            name: "2412DPC0AG".into(),
+            presence: Presence::Offline,
+        }]);
+        node.link_up(
+            phone,
+            "POCO X7 Pro",
+            LinkView {
+                position: Position::new(1, 0),
+                device_kind: DeviceKind::Phone,
+                status: NodeStatus::unknown(),
+                modules: vec![],
+                skipped: vec![],
+                inapplicable: vec![],
+                since: SystemTime::now(),
+                path: LinkPath::Network,
+                path_since: None,
+            },
+        );
+        assert_eq!(node.status().peers[0].name, "POCO X7 Pro");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

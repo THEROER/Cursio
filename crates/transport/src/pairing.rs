@@ -302,6 +302,19 @@ impl TrustStore {
         Ok(())
     }
 
+    /// Remember the name `peer_id` now goes by; writes only when it changed.
+    /// Call it only once the peer has proven its key — a greeting's name is
+    /// anyone's to claim before that.
+    pub fn remember_name(&mut self, peer_id: &PeerId, name: &str) -> Result<(), PairingError> {
+        if let Some(peer) = self.peers.get_mut(peer_id) {
+            if peer.display_name != name {
+                peer.display_name = name.to_owned();
+                return self.save();
+            }
+        }
+        Ok(())
+    }
+
     /// Remember the Bluetooth address `peer_id` greeted from; writes only
     /// when it changed.
     pub fn remember_bluetooth(
