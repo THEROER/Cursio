@@ -63,6 +63,7 @@ mod pace;
 mod router;
 
 pub use pace::modules_busy;
+#[cfg(feature = "files")]
 pub(crate) use pace::MODULE_PUMP_INTERVAL;
 
 /// Warn when a single pump takes at least this long.
