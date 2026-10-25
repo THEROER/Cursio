@@ -152,11 +152,11 @@ into the ownership loop.
 `crates/core/src/module.rs`, with a factory beside each engine.*
 
 
-`crates/core/src/bin/cursio.rs:607-675` builds the module vector inline: an `if`
-per module, `#[cfg]` blocks per platform, constructor arguments threaded through
+The binary used to build the module vector inline: an `if` per module,
+`#[cfg]` blocks per platform, constructor arguments threaded through
 `run_pairing_and_session`'s already-`too_many_arguments` signature. Adding a
-module means editing the binary, the CLI enum, and that function's parameter
-list.
+module meant editing the binary, the CLI enum, and that function's parameter
+list. (The registry is now built once in `crates/core/src/bin/cursio/modules.rs`.)
 
 **Fix — a `ModuleFactory` registry.**
 
