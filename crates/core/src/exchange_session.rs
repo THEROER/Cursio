@@ -6,13 +6,13 @@
 //! them from its store on the blocking pool — a provider query or a photo
 //! decode must not hold the link's other answers behind it — and says
 //! "changed" once per change of that store. The *asking* half carries this
-//! machine's requests from the module's [`RequestHub`] to the peer, numbered,
+//! machine's requests from the module's [`RequestHub`](crate::request_hub::RequestHub) to the peer, numbered,
 //! and hands each answer back to whoever is waiting. Nothing but "changed"
 //! is ever sent unasked.
 //!
 //! What differs between the modules is what is asked, how a request is
 //! bounded, which class each message rides in and how many requests the store
-//! may work on at once; [`Exchange`] names those.
+//! may work on at once; [`Exchange`](crate::exchange_session::Exchange) names those.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

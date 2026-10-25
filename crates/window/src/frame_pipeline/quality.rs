@@ -297,7 +297,7 @@ impl AdaptiveQuality {
     /// capture has queued up to `sent_seq`.
     ///
     /// The gap is counted in frames because the pipeline numbers only frames
-    /// it actually queued (see [`CapturePipeline`]), and only frames older
+    /// it actually queued (see [`CapturePipeline`](crate::frame_pipeline::CapturePipeline)), and only frames older
     /// than [`IN_FLIGHT_GRACE`] count. An ack that is not news
     /// is ignored: one no newer than an earlier ack says nothing the ladders
     /// have not already acted on, and one newer than anything sent belongs to

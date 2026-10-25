@@ -15,8 +15,8 @@
 //! a specific window past the edge, and being re-asked each time would make the
 //! feature unusable.
 //!
-//! So we request [`PersistMode::ExplicitlyRevoked`], which makes the portal
-//! return a **restore token**. We persist that token ([`restore_token_path`])
+//! So we request [`PersistMode::ExplicitlyRevoked`](ashpd::desktop::PersistMode::ExplicitlyRevoked), which makes the portal
+//! return a **restore token**. We persist that token ([`restore_token_path`](portal::restore_token_path))
 //! and pass it back on the next `Start`, and the portal restores the same source
 //! **without showing the dialog**. Net effect: one prompt the first time on a
 //! machine, silence forever after (until the user revokes it in system
@@ -274,7 +274,7 @@ fn spawn_capture(
 /// The capture thread: portal setup (async), then the PipeWire loop (blocking).
 ///
 /// Both halves are pinned here because neither is `Send`. The portal `Session`
-/// inside [`PortalCast`] must outlive the stream, so it stays in scope for the
+/// inside [`PortalCast`](portal::PortalCast) must outlive the stream, so it stays in scope for the
 /// whole function.
 #[allow(clippy::too_many_arguments)]
 fn capture_thread(

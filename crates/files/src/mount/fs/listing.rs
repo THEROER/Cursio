@@ -112,7 +112,7 @@ impl RemoteFs {
     /// serves the whole listing.
     ///
     /// Unlike `readdir`, an entry here **does** hand the kernel a reference, so
-    /// each one sent is counted — see [`InodeTable::lookup`]. The reference is
+    /// each one sent is counted — see [`InodeTable::lookup`](crate::mount::inode::InodeTable::lookup). The reference is
     /// taken at the moment the entry goes into the buffer, never before: an
     /// entry that does not fit is one the kernel never received, and counting
     /// it would leak an inode that nothing will ever forget. `.` and `..` are

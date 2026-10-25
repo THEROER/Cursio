@@ -3,9 +3,9 @@
 //! Messages and the gallery work the same way: the module on each link
 //! registers here when it starts, anything on this machine that wants an
 //! answer from a peer — the control socket, a phone's in-process window —
-//! [`ask`](RequestHub::ask)s by the peer's name or id, and the link carries the
+//! [`ask`](crate::request_hub::RequestHub::ask)s by the peer's name or id, and the link carries the
 //! request and hands the answer back. The peer's "look again" is counted per
-//! link ([`peers`](RequestHub::peers) shows it as a revision), and this
+//! link ([`peers`](crate::request_hub::RequestHub::peers) shows it as a revision), and this
 //! machine's own changes as a generation every link announces once.
 //!
 //! Process-wide because those callers are: the control socket and the JNI

@@ -77,7 +77,7 @@ pub struct FilesEngine {
     ///
     /// Never locked on the session loop. The workers take it for every request
     /// the peer makes, and a worker that ends up holding it across the disk —
-    /// which a request did until recently, see [`run_request`] — turns a slow
+    /// which a request did until recently, see [`run_request`](serve::run_request) — turns a slow
     /// disk into a frozen cursor. Seen live under heavy I/O pressure: the
     /// loop's once-a-second rescan hand-over waited out 0.3–1.9 s reads every
     /// two seconds. What the loop needs from the server is kept in
@@ -194,7 +194,7 @@ pub struct FilesEngine {
     /// the link. See where it is filled for why this matters.
     peer_volumes: Vec<Volume>,
     /// When the local volume set was last re-read, so a stick plugged in after
-    /// the session started is noticed. See [`VOLUME_RESCAN`].
+    /// the session started is noticed. See [`VOLUME_RESCAN`](mounts::VOLUME_RESCAN).
     last_rescan: Instant,
     /// Set while a rescan is running on a worker, so the once-a-second timer
     /// cannot stack a second one behind a scan that is still stuck.

@@ -1,7 +1,7 @@
 //! Session handshake and liveness.
 //!
 //! Once a [`Transport`] is connected (and, for a first meeting, pairing has
-//! run), a session begins with a [`Hello`] exchange — each side advertises its
+//! run), a session begins with a [`Hello`](cursio_protocol::Hello) exchange — each side advertises its
 //! protocol version and identity, and a version mismatch is rejected up front.
 //! The greeting is preceded by the update lane's frozen preamble, so a
 //! mismatch is learned from a message every build can read, and ends in

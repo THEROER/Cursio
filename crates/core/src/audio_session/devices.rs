@@ -101,7 +101,7 @@ impl AudioEngine {
 
     /// Set a playback's gain from both knobs that govern it: the owner's
     /// (`AudioGain`, kept in `gains`) and this machine's listener's (the
-    /// [`LocalMixer`]). Multiplied, so neither overrides the other.
+    /// [`LocalMixer`](crate::mixer::LocalMixer)). Multiplied, so neither overrides the other.
     pub(super) fn apply_gain(&self, id: u32) {
         let Some(p) = self.playbacks.get(&id) else {
             return;

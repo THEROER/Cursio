@@ -117,7 +117,7 @@ pub struct AudioEngine {
     routed_app_names: HashMap<u32, String>,
     /// When each routed node was first tapped, so a departure can be read as a
     /// pause or as the app discarding a node it barely opened. See
-    /// [`NODE_SETTLED_AGE`].
+    /// [`NODE_SETTLED_AGE`](relay::NODE_SETTLED_AGE).
     routed_app_since: HashMap<u32, std::time::Instant>,
     /// Taps being opened on a worker thread, and the channel they land on.
     ///
@@ -161,7 +161,7 @@ pub struct AudioEngine {
     playback_ready_tx: tokio::sync::mpsc::UnboundedSender<OpenedPlayback>,
     playback_ready_rx: tokio::sync::mpsc::UnboundedReceiver<OpenedPlayback>,
     /// Apps whose tunnel is open but whose node is currently absent, and since
-    /// when. Cleared when the app comes back; see [`TUNNEL_IDLE_TIMEOUT`].
+    /// when. Cleared when the app comes back; see [`TUNNEL_IDLE_TIMEOUT`](relay::TUNNEL_IDLE_TIMEOUT).
     tunnel_idle_since: HashMap<String, std::time::Instant>,
     /// Playback ends for the peer's streams, opened lazily (see below).
     playbacks: HashMap<u32, cursio_audio::Playback>,
@@ -230,7 +230,7 @@ pub struct AudioEngine {
     sent: u64,
     played: u64,
     /// Streams the peer has told us nothing is playing, so we capture but do not
-    /// send them. See [`AudioMsg::StreamDemand`].
+    /// send them. See [`AudioMsg::StreamDemand`](cursio_protocol::AudioMsg::StreamDemand).
     unwanted_streams: std::collections::HashSet<u32>,
     /// What we last told the peer about each inbound stream's local demand, so
     /// only changes go on the wire.
@@ -300,7 +300,7 @@ pub struct AudioEngine {
     /// link, and judging it again on the old evidence repeats the last verdict.
     sent_since_adapt: std::collections::HashSet<u32>,
     /// How many consecutive evaluations each outbound stream has found the link
-    /// caught up; see [`BITRATE_RAISE_AFTER`].
+    /// caught up; see [`BITRATE_RAISE_AFTER`](send::BITRATE_RAISE_AFTER).
     caught_up_streak: HashMap<u32, u32>,
     /// Highest chunk `seq` the peer reports having *played* per outbound stream,
     /// from [`Message::AudioFrameAck`]. See [`AudioEngine::on_ack`] /
@@ -511,6 +511,6 @@ impl crate::module::ModuleFactory for AudioFactory {
     }
 }
 
-/// Version of this module's wire vocabulary ([`AudioMsg`]). Bump when those
+/// Version of this module's wire vocabulary ([`AudioMsg`](cursio_protocol::AudioMsg)). Bump when those
 /// types change shape; peers run the module only on an exact match.
 pub const VERSION: u16 = 1;

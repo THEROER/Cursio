@@ -6,7 +6,7 @@ use cursio_protocol::{DeviceKind, PeerId};
 /// A request to move the shared cursor to the other machine, delivered to a
 /// running session from outside (e.g. a hotkey handler in the binary).
 ///
-/// A request to change ownership, fed to [`run_session`] on its command channel.
+/// A request to change ownership, fed to [`run_session`](super::run_session) on its command channel.
 ///
 /// [`Toggle`](OwnershipCmd::Toggle) is the symmetric hotkey handoff (flip
 /// whichever side we're on). [`HandoffToPeer`](OwnershipCmd::HandoffToPeer) is
@@ -110,7 +110,7 @@ impl CursorRole {
         }
     }
 
-    /// Adopt the state the peer dictates with [`Message::Grab`].
+    /// Adopt the state the peer dictates with [`Message::Grab`](cursio_protocol::Message::Grab).
     pub fn adopt(&mut self, active: bool) {
         self.active = active;
     }

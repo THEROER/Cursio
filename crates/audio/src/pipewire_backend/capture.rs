@@ -59,14 +59,14 @@ impl PwSource {
 
     /// Record a real microphone / line-in, so the peer can use it as an input.
     ///
-    /// `target` is the source node name from [`list_input_devices`]; `None`
+    /// `target` is the source node name from [`list_input_devices`](crate::list_input_devices); `None`
     /// records the system default input.
     pub fn mic_tap(id: AudioStreamId, target: Option<String>) -> Result<Self, AudioError> {
         Self::with_mode(id, CaptureMode::MicTap { target })
     }
 
     /// Start capturing **one application's** audio, by its PipeWire node id (as
-    /// returned by [`list_app_streams`]). The stream is advertised with
+    /// returned by [`list_app_streams`](crate::list_app_streams)). The stream is advertised with
     /// `app_name` set, so the peer creates a per-app node for it.
     pub fn app_tap(
         id: AudioStreamId,

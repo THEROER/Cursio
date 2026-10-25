@@ -8,7 +8,7 @@ use cursio_protocol::{Message, Priority, WindowCloseReason, WindowId, WindowMsg}
 use cursio_transport::{TransportError, TransportTx};
 use cursio_window::{CaptureSession, Surrogate, WindowCapture, WindowRenderer};
 
-/// Most frames to forward in one [`SessionModule::pump`] call.
+/// Most frames to forward in one [`SessionModule::pump`](crate::module::SessionModule::pump) call.
 ///
 /// The session cannot reach its inbound branch while a module pumps, so a module
 /// that drains a busy channel dry starves the peer's messages — the discipline

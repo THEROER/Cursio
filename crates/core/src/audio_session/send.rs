@@ -92,7 +92,7 @@ pub(super) const BITRATE_STEP: u32 = 24_000;
 /// [`DEFAULT_BITRATE`]: cursio_audio::codec::DEFAULT_BITRATE
 pub(super) const BITRATE_START: u32 = 48_000;
 
-/// Most chunks to send in one [`SessionModule::pump`] call, across **all**
+/// Most chunks to send in one [`SessionModule::pump`](crate::module::SessionModule::pump) call, across **all**
 /// streams together.
 ///
 /// This used to be a per-*stream* limit of 4, which stops limiting anything as
