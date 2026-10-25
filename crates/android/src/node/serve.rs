@@ -236,7 +236,9 @@ async fn sweep_once(ctx: &Rc<NodeCtx>, self_id: PeerId, strangers: &mut HashMap<
             Ok(t) => {
                 tracing::info!(peer = %target.display_name, addr = %target.addr, "dialled peer");
                 if let Ok(mut store) = TrustStore::load() {
-                    let _ = store.remember_addr(&target.peer_id, target.addr);
+                    if let Err(e) = store.remember_addr(&target.peer_id, target.addr) {
+                        tracing::debug!(error = %e, "could not cache peer address");
+                    }
                 }
                 let addr = Some(target.addr);
                 spawn_session(
