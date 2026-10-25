@@ -38,9 +38,12 @@ fn parse_paired(text: &str) -> Vec<Paired> {
     text.lines()
         .filter_map(|line| {
             let (address, name) = line.split_once('\t')?;
+            // The app lists bonded devices, not live connections: a phone
+            // cannot tell its dialler that a computer just came back.
             Some(Paired {
                 address: address.to_string(),
                 name: name.to_string(),
+                connected: false,
             })
         })
         .collect()
@@ -98,11 +101,13 @@ mod tests {
             vec![
                 Paired {
                     address: "AA:BB".into(),
-                    name: "Nocturne".into()
+                    name: "Nocturne".into(),
+                    connected: false,
                 },
                 Paired {
                     address: "CC:DD".into(),
-                    name: "dark".into()
+                    name: "dark".into(),
+                    connected: false,
                 },
             ]
         );
