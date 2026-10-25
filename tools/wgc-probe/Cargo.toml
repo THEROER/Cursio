@@ -2,6 +2,8 @@
 name = "wgc-probe"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 # A standalone Windows probe, deliberately NOT an example inside cursio-window:

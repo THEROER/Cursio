@@ -2,6 +2,8 @@
 name = "clipd"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Clipboard history for Linux — a Win+V that works on Wayland/GNOME"
 
 [lib]

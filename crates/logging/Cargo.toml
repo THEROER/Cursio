@@ -2,6 +2,8 @@
 name = "cursio-log"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # Deliberately tiny: console + rotating-file logging setup, shared by every
 # Cursio binary (cursio, clipd, cursio-app). Kept out of cursio-core so clipd

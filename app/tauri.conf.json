@@ -28,6 +28,8 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "copyright": "Copyright (C) 2026 the Cursio contributors",
+    "licenseFile": "../LICENSE",
     "android": {
       "minSdkVersion": 28
     },

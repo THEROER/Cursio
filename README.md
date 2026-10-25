@@ -322,13 +322,14 @@ platform crates → binaries:
   Kotlin service, plugin and backends (`plugin/`)
 - `crates/bluetooth` — Cursio as a phone's hands-free unit and A2DP speaker,
   and the mesh's Bluetooth channel
-- `crates/airplay` — the AirPlay receiver, deliberately outside the mesh
+- `crates/airplay` — the AirPlay receiver, deliberately outside the mesh, with
+  the vendored FairPlay C in `native/playfair`
 - `crates/logging` — console + rotating-file logging shared by every binary
 - `crates/xtask` — build/install/cross-compile automation
 - `app` — the Tauri UI: the desktop window and tray, and the whole phone app
 - `apps/clipd` — standalone Linux clipboard history popup (GTK4/libadwaita)
-- `native/` — vendored FairPlay C, the Windows audio driver, and the GNOME
-  extension used for drag detection
+- `native/` — the Windows audio driver and the GNOME extension (drag
+  detection and the quick-settings tile)
 
 Platform crates are **mechanism**; the matching `*_session.rs` in `core` is
 **policy**. A feature is added as a module, never by branching in the CLI.
@@ -382,5 +383,17 @@ of 1 MiB.
 
 ## License
 
-Not yet chosen (`license = "TBD"`). Until one is added, no usage rights are
-granted.
+Cursio is free software: you can redistribute it and/or modify it under the
+terms of the [GNU General Public License](LICENSE), version 3 or (at your
+option) any later version. It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY.
+
+The GPL is not a preference stated on top of the code: the FairPlay setup an
+iPhone needs and the WinFsp bindings a Windows mount needs are both GPL-3.0, so
+every desktop binary already is. [THIRD-PARTY.md](THIRD-PARTY.md) lists the
+vendored code and its licenses — the Windows audio driver in
+`native/cursio-vad` stays under Microsoft's MS-PL, as a separate program.
+
+AirPlay and FairPlay are trademarks of Apple Inc. Cursio is not affiliated with
+or endorsed by Apple; it implements the receiver side of the protocol for
+interoperability.
