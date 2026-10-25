@@ -9,8 +9,6 @@ use crate::worker::{OnDrop, Worker};
 use crate::AudioError;
 use cursio_protocol::{AudioChunk, AudioStreamId};
 use pipewire::{
-    context::ContextRc,
-    main_loop::MainLoopRc,
     properties::properties,
     spa::{pod::Pod, utils::Direction},
     stream::{StreamFlags, StreamRc},
@@ -213,11 +211,7 @@ pub(super) fn run_playback_loop(
     use std::cell::RefCell;
 
     let setup = (|| -> Result<_, String> {
-        let main_loop = MainLoopRc::new(None).map_err(|e| format!("main loop: {e}"))?;
-        let context = ContextRc::new(&main_loop, None).map_err(|e| format!("context: {e}"))?;
-        let core = context
-            .connect_rc(None)
-            .map_err(|e| format!("connect: {e}"))?;
+        let (main_loop, core) = super::connect()?;
 
         let mut props = properties! {
             *pipewire::keys::MEDIA_TYPE => "Audio",

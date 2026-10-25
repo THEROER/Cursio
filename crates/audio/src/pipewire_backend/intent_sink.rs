@@ -4,7 +4,6 @@
 use crate::worker::{OnDrop, Worker};
 use crate::AudioError;
 use cursio_protocol::AudioStreamId;
-use pipewire::{context::ContextRc, main_loop::MainLoopRc};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
@@ -79,11 +78,7 @@ pub(super) fn run_intent_sink_loop(
     use std::rc::Rc;
 
     let setup = (|| -> Result<_, String> {
-        let main_loop = MainLoopRc::new(None).map_err(|e| format!("main loop: {e}"))?;
-        let context = ContextRc::new(&main_loop, None).map_err(|e| format!("context: {e}"))?;
-        let core = context
-            .connect_rc(None)
-            .map_err(|e| format!("connect: {e}"))?;
+        let (main_loop, core) = super::connect()?;
 
         // A null-audio-sink is a real Audio/Sink the system lists as an output, but
         // it discards whatever is played into it — exactly a silent funnel. We do

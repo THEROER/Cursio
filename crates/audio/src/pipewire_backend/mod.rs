@@ -98,6 +98,21 @@ fn format_param_pod() -> Vec<u8> {
     )
 }
 
+/// A main loop and a connection to the PipeWire server through it: where every
+/// stream, listing and monitor here starts. The core keeps its context alive,
+/// so the context is not handed back.
+pub(super) fn connect() -> Result<(pipewire::main_loop::MainLoopRc, pipewire::core::CoreRc), String>
+{
+    let main_loop =
+        pipewire::main_loop::MainLoopRc::new(None).map_err(|e| format!("main loop: {e}"))?;
+    let context =
+        pipewire::context::ContextRc::new(&main_loop, None).map_err(|e| format!("context: {e}"))?;
+    let core = context
+        .connect_rc(None)
+        .map_err(|e| format!("connect: {e}"))?;
+    Ok((main_loop, core))
+}
+
 /// Serialize `obj`, a param built here from fixed fields, which cannot fail
 /// to serialize; `what` names it if that ever stops being true.
 pub(super) fn pod_bytes(obj: Object, what: &str) -> Vec<u8> {

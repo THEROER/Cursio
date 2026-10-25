@@ -2,7 +2,6 @@
 //! applications playing sound now.
 
 use crate::AudioError;
-use pipewire::{context::ContextRc, main_loop::MainLoopRc};
 use std::time::Duration;
 
 /// List PipeWire sink (output) nodes, for mirroring to the peer.
@@ -40,13 +39,7 @@ pub(super) fn list_devices_of_class(
 
     let media_class = media_class.to_string();
 
-    let main_loop =
-        MainLoopRc::new(None).map_err(|e| AudioError::Backend(format!("main loop: {e}")))?;
-    let context = ContextRc::new(&main_loop, None)
-        .map_err(|e| AudioError::Backend(format!("context: {e}")))?;
-    let core = context
-        .connect_rc(None)
-        .map_err(|e| AudioError::Backend(format!("connect: {e}")))?;
+    let (main_loop, core) = super::connect().map_err(AudioError::Backend)?;
     let registry = core
         .get_registry_rc()
         .map_err(|e| AudioError::Backend(format!("registry: {e}")))?;
@@ -107,13 +100,7 @@ pub fn list_app_streams() -> Result<Vec<crate::AppStream>, AudioError> {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    let main_loop =
-        MainLoopRc::new(None).map_err(|e| AudioError::Backend(format!("main loop: {e}")))?;
-    let context = ContextRc::new(&main_loop, None)
-        .map_err(|e| AudioError::Backend(format!("context: {e}")))?;
-    let core = context
-        .connect_rc(None)
-        .map_err(|e| AudioError::Backend(format!("connect: {e}")))?;
+    let (main_loop, core) = super::connect().map_err(AudioError::Backend)?;
     let registry = core
         .get_registry_rc()
         .map_err(|e| AudioError::Backend(format!("registry: {e}")))?;

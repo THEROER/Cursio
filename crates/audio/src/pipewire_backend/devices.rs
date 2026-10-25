@@ -3,13 +3,9 @@
 
 use crate::worker::{OnDrop, Worker};
 use crate::{AudioError, DeviceChange, DeviceCommand};
-use pipewire::{
-    context::ContextRc,
-    main_loop::MainLoopRc,
-    spa::{
-        pod::{Object, Pod, Property, PropertyFlags, Value, ValueArray},
-        sys::{SPA_PARAM_Props, SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_TYPE_OBJECT_Props},
-    },
+use pipewire::spa::{
+    pod::{Object, Pod, Property, PropertyFlags, Value, ValueArray},
+    sys::{SPA_PARAM_Props, SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_TYPE_OBJECT_Props},
 };
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
@@ -96,11 +92,7 @@ pub(super) fn run_device_monitor_loop(
     use std::rc::Rc;
 
     let setup = (|| -> Result<_, String> {
-        let main_loop = MainLoopRc::new(None).map_err(|e| format!("main loop: {e}"))?;
-        let context = ContextRc::new(&main_loop, None).map_err(|e| format!("context: {e}"))?;
-        let core = context
-            .connect_rc(None)
-            .map_err(|e| format!("connect: {e}"))?;
+        let (main_loop, core) = super::connect()?;
         let registry = core
             .get_registry_rc()
             .map_err(|e| format!("registry: {e}"))?;
