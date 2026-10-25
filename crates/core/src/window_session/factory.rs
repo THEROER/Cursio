@@ -2,12 +2,12 @@
 //! platform has, the remote-screen sources it offers, and the drag and AirPlay
 //! triggers that start a transfer.
 
-use crate::window_session::VERSION;
 use crate::module::SessionModule;
 use crate::remote_screen::ScreenHost;
 use crate::screen_hub::ScreenHub;
 use crate::window_session::TransferRequest;
 use crate::window_session::WindowEngine;
+use crate::window_session::VERSION;
 use cursio_protocol::ModuleId;
 use cursio_window::{WindowCapture, WindowRenderer};
 

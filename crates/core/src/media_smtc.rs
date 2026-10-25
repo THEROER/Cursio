@@ -78,10 +78,9 @@ impl SmtcBackend {
     }
 
     fn session(&self, player: &str) -> Option<Session> {
-        self.sessions().into_iter().find(|s| {
-            s.SourceAppUserModelId()
-                .is_ok_and(|id| id == player)
-        })
+        self.sessions()
+            .into_iter()
+            .find(|s| s.SourceAppUserModelId().is_ok_and(|id| id == player))
     }
 
     fn poll(&self) {
