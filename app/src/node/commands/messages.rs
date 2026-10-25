@@ -4,7 +4,6 @@ use crate::node::*;
 use tauri::State;
 
 /// A phone's conversations, newest first. `peer` is its id.
-#[cfg(desktop)]
 #[tauri::command]
 pub async fn messages_conversations(
     link: State<'_, NodeLink>,
@@ -24,7 +23,6 @@ pub async fn messages_conversations(
 }
 
 /// One conversation's messages, newest first.
-#[cfg(desktop)]
 #[tauri::command]
 pub async fn messages_thread(
     link: State<'_, NodeLink>,
@@ -45,7 +43,6 @@ pub async fn messages_thread(
     .await
 }
 
-#[cfg(desktop)]
 #[tauri::command]
 pub async fn messages_send(
     link: State<'_, NodeLink>,
@@ -64,7 +61,6 @@ pub async fn messages_send(
     .await
 }
 
-#[cfg(desktop)]
 #[tauri::command]
 pub async fn messages_mark_read(
     link: State<'_, NodeLink>,

@@ -19,7 +19,13 @@ mod capacity;
 mod detect;
 mod io;
 
-pub(crate) use capacity::{capacity_of, FALLBACK_FREE, FALLBACK_TOTAL};
+pub(crate) use capacity::capacity_of;
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "windows", target_env = "msvc"),
+    test
+))]
+pub(crate) use capacity::{FALLBACK_FREE, FALLBACK_TOTAL};
 
 /// A volume this machine offers, and where it actually lives.
 #[derive(Clone)]

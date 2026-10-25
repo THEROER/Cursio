@@ -2,6 +2,7 @@
 //! and starting the node itself.
 
 use crate::node::*;
+#[cfg(desktop)]
 use tauri::State;
 
 /// Answer, decline, end or move the voice of a phone's call. `phone` is

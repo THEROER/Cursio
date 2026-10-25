@@ -4,21 +4,18 @@ use crate::node::*;
 use tauri::State;
 
 /// Open a file on this computer in its default application.
-#[cfg(desktop)]
 #[tauri::command]
 pub fn file_open(path: String) -> Result<(), NodeError> {
     crate::gallery_files::open(std::path::Path::new(&path)).map_err(NodeError::failed)
 }
 
 /// Show a file on this computer selected in the file manager.
-#[cfg(desktop)]
 #[tauri::command]
 pub fn file_reveal(path: String) -> Result<(), NodeError> {
     crate::gallery_files::reveal(std::path::Path::new(&path)).map_err(NodeError::failed)
 }
 
 /// Put files on this computer's clipboard as files.
-#[cfg(desktop)]
 #[tauri::command]
 pub async fn files_copy(paths: Vec<String>) -> Result<(), NodeError> {
     let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
@@ -31,7 +28,6 @@ pub async fn files_copy(paths: Vec<String>) -> Result<(), NodeError> {
 
 /// Send a file on this computer to a peer's downloads. `peer` is its id or
 /// its name.
-#[cfg(desktop)]
 #[tauri::command]
 pub async fn file_send(
     link: State<'_, NodeLink>,

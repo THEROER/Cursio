@@ -5,10 +5,12 @@
 use crate::module::SessionModule;
 use crate::remote_screen::ScreenHost;
 use crate::screen_hub::ScreenHub;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use crate::window_session::TransferRequest;
 use crate::window_session::WindowEngine;
 use crate::window_session::VERSION;
 use cursio_protocol::ModuleId;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use cursio_window::{WindowCapture, WindowRenderer};
 
 /// Builds [`WindowEngine`] when window transfer is enabled *and* this platform
