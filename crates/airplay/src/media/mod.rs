@@ -1,29 +1,33 @@
 //! Per-control-connection AirPlay media setup and mirroring transport.
 
-use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plist::{Dictionary, Value};
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::audio::{self, AudioDecryptor, AudioStreamRequest};
 use crate::crypto::{CryptoSession, MirrorDecryptor};
-use crate::mirror::{AvcConfig, MirrorPacket, MirrorPacketDecoder, PayloadType};
+use crate::media::setup::parse_volume;
+use crate::media::setup::teardown_stream_types;
+use crate::media::setup::SetupRequest;
+use crate::media::stream::hardware_video_sink;
+use crate::media::stream::serve_mirror;
+use crate::media::stream::DiscardingSink;
+use crate::media::stream::VideoSink;
+use crate::media::timing::run_timing;
 use crate::rtsp::{Request, Response};
 use crate::AirPlayError;
 
-const MIRROR_STREAM_TYPE: u64 = 110;
-const TIMING_PACKET_BYTES: usize = 32;
-const NTP_UNIX_EPOCH_OFFSET: u64 = 2_208_988_800;
-/// How long the advertised `dataPort` waits for the sender before giving the
-/// listener and the video window back.
-const MIRROR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+mod setup;
+mod stream;
+mod timing;
 
+pub(crate) use setup::plist_u64_bits;
+
+const MIRROR_STREAM_TYPE: u64 = 110;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConnectionContext {
     pub local_addr: SocketAddr,
@@ -407,343 +411,9 @@ impl MediaSession {
     }
 }
 
-/// Read `volume: <decibels>` out of a `SET_PARAMETER` body.
-///
-/// AirPlay states volume in decibels: 0 is full, negative is quieter, and
-/// -144 means muted.
-fn parse_volume(body: &[u8]) -> Option<f32> {
-    std::str::from_utf8(body)
-        .ok()?
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("volume:"))
-        .and_then(|value| value.trim().parse::<f32>().ok())
-}
-
-/// The stream types a `TEARDOWN` names, or `None` when it names none and
-/// therefore ends the session.
-fn teardown_stream_types(body: &[u8]) -> Option<Vec<u64>> {
-    let value = Value::from_reader(Cursor::new(body)).ok()?;
-    let streams = value.as_dictionary()?.get("streams")?.as_array()?;
-    if streams.is_empty() {
-        return None;
-    }
-    Some(
-        streams
-            .iter()
-            .filter_map(Value::as_dictionary)
-            .filter_map(|stream| stream.get("type"))
-            .filter_map(plist_u64_bits)
-            .collect(),
-    )
-}
-
 impl Drop for MediaSession {
     fn drop(&mut self) {
         self.stop();
-    }
-}
-
-struct SetupKeys {
-    encrypted_key: Vec<u8>,
-    /// The audio stream's CBC initialisation vector, reused for every packet.
-    iv: [u8; 16],
-    remote_timing_port: u16,
-}
-
-struct SetupRequest {
-    keys: Option<SetupKeys>,
-    mirror_stream_id: Option<u64>,
-    audio: Option<AudioStreamRequest>,
-}
-
-impl SetupRequest {
-    fn parse(body: &[u8]) -> Result<Self, &'static str> {
-        let value =
-            Value::from_reader(Cursor::new(body)).map_err(|_| "invalid AirPlay SETUP plist")?;
-        let root = value
-            .as_dictionary()
-            .ok_or("AirPlay SETUP root is not a dictionary")?;
-
-        let encrypted_key = root.get("ekey").and_then(Value::as_data);
-        let encrypted_iv = root.get("eiv").and_then(Value::as_data);
-        let keys = match (encrypted_key, encrypted_iv) {
-            (None, None) => None,
-            (Some(key), Some(iv)) if !key.is_empty() && key.len() <= 1024 && iv.len() == 16 => {
-                let timing_port = root
-                    .get("timingPort")
-                    .and_then(Value::as_unsigned_integer)
-                    .and_then(|port| u16::try_from(port).ok())
-                    .filter(|port| *port != 0)
-                    .ok_or("AirPlay SETUP has an invalid timingPort")?;
-                Some(SetupKeys {
-                    encrypted_key: key.to_vec(),
-                    iv: iv.try_into().expect("length checked above"),
-                    remote_timing_port: timing_port,
-                })
-            }
-            _ => return Err("AirPlay SETUP has invalid ekey/eiv fields"),
-        };
-
-        let mut mirror_stream_id = None;
-        let mut audio = None;
-        if let Some(streams) = root.get("streams") {
-            for stream in streams
-                .as_array()
-                .ok_or("AirPlay SETUP streams is not an array")?
-            {
-                let stream = stream
-                    .as_dictionary()
-                    .ok_or("AirPlay SETUP stream is not a dictionary")?;
-                if stream.get("type").and_then(Value::as_unsigned_integer)
-                    == Some(MIRROR_STREAM_TYPE)
-                {
-                    if mirror_stream_id.is_some() {
-                        return Err("AirPlay SETUP contains multiple mirror streams");
-                    }
-                    mirror_stream_id = Some(
-                        stream
-                            .get("streamConnectionID")
-                            .and_then(plist_u64_bits)
-                            .ok_or("mirror stream has no streamConnectionID")?,
-                    );
-                } else if stream.get("type").and_then(Value::as_unsigned_integer)
-                    == Some(audio::AUDIO_STREAM_TYPE)
-                {
-                    if audio.is_some() {
-                        return Err("AirPlay SETUP contains multiple audio streams");
-                    }
-                    audio = Some(AudioStreamRequest::parse(stream));
-                }
-            }
-        }
-
-        Ok(Self {
-            keys,
-            mirror_stream_id,
-            audio,
-        })
-    }
-}
-
-/// Binary plists do not tag integers as signed or unsigned. Values with their
-/// high bit set are decoded by some plist producers/readers as negative i64,
-/// while AirPlay defines streamConnectionID as an opaque u64. Preserve the
-/// original two's-complement bits in either representation.
-pub(crate) fn plist_u64_bits(value: &Value) -> Option<u64> {
-    value
-        .as_unsigned_integer()
-        .or_else(|| value.as_signed_integer().map(|value| value as u64))
-}
-
-async fn run_timing(socket: UdpSocket) {
-    let mut interval = tokio::time::interval(Duration::from_secs(3));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut response = [0_u8; 128];
-    loop {
-        interval.tick().await;
-        let request = timing_request();
-        if socket.send(&request).await.is_err() {
-            return;
-        }
-        let _ = tokio::time::timeout(Duration::from_millis(500), socket.recv(&mut response)).await;
-    }
-}
-
-fn timing_request() -> [u8; TIMING_PACKET_BYTES] {
-    let mut request = [0_u8; TIMING_PACKET_BYTES];
-    request[..4].copy_from_slice(&[0x80, 0xd2, 0x00, 0x07]);
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let seconds = elapsed.as_secs().saturating_add(NTP_UNIX_EPOCH_OFFSET);
-    let fraction = (u128::from(elapsed.subsec_nanos()) << 32) / 1_000_000_000_u128;
-    let timestamp = (seconds << 32) | fraction as u64;
-    request[24..].copy_from_slice(&timestamp.to_be_bytes());
-    request
-}
-
-trait VideoSink: Send {
-    fn push(&mut self, access_unit: &[u8]) -> Result<(), AirPlayError>;
-}
-
-/// Accepts access units and draws nothing.
-///
-/// For a machine that receives the phone's screen only to pass it to peers.
-/// The units still have to travel this far — the tap is fed from the same
-/// processor, and every payload must cross the decryptor in wire order or the
-/// AES-CTR keystream desynchronises — but nothing here has a window to put
-/// them in.
-struct DiscardingSink;
-
-impl VideoSink for DiscardingSink {
-    fn push(&mut self, _access_unit: &[u8]) -> Result<(), AirPlayError> {
-        Ok(())
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-struct HardwareSink(crate::video::HardwareVideoPipeline);
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-impl VideoSink for HardwareSink {
-    fn push(&mut self, access_unit: &[u8]) -> Result<(), AirPlayError> {
-        self.0.push_access_unit(access_unit, None)
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn hardware_video_sink(size: crate::video::ScreenSize) -> Result<Box<dyn VideoSink>, AirPlayError> {
-    Ok(Box::new(HardwareSink(
-        crate::video::HardwareVideoPipeline::new(crate::video::VideoCodec::H264, size)?,
-    )))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn hardware_video_sink(
-    _size: crate::video::ScreenSize,
-) -> Result<Box<dyn VideoSink>, AirPlayError> {
-    Err(AirPlayError::Video(
-        "AirPlay hardware video output is supported on Linux and Windows".into(),
-    ))
-}
-
-async fn serve_mirror(
-    listener: TcpListener,
-    peer_ip: IpAddr,
-    decryptor: Box<dyn MirrorDecryptor>,
-    sink: Box<dyn VideoSink>,
-    tap: Option<crate::MirrorTap>,
-) -> Result<(), AirPlayError> {
-    let mut stream = loop {
-        let accepted = tokio::time::timeout(MIRROR_CONNECT_TIMEOUT, listener.accept())
-            .await
-            .map_err(|_| {
-                AirPlayError::Video("the AirPlay sender never opened the mirror stream".into())
-            })??;
-        let (stream, peer) = accepted;
-        if peer.ip() == peer_ip {
-            break stream;
-        }
-        tracing::warn!(%peer, expected = %peer_ip, "rejected foreign AirPlay media connection");
-    };
-    stream.set_nodelay(true)?;
-    let mut processor = MirrorProcessor::new(decryptor, sink, tap);
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = stream.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(());
-        }
-        processor.push(&buffer[..count])?;
-    }
-}
-
-struct MirrorProcessor {
-    decoder: MirrorPacketDecoder,
-    decryptor: Box<dyn MirrorDecryptor>,
-    sink: Box<dyn VideoSink>,
-    /// Where the mesh listens in, when the receiver was given a tap.
-    tap: Option<crate::MirrorTap>,
-    avc: Option<AvcConfig>,
-    plaintext: Vec<u8>,
-    access_unit: Vec<u8>,
-    skipped: u64,
-}
-
-impl MirrorProcessor {
-    fn new(
-        decryptor: Box<dyn MirrorDecryptor>,
-        sink: Box<dyn VideoSink>,
-        tap: Option<crate::MirrorTap>,
-    ) -> Self {
-        Self {
-            decoder: MirrorPacketDecoder::new(),
-            decryptor,
-            sink,
-            tap,
-            avc: None,
-            plaintext: Vec::new(),
-            access_unit: Vec::new(),
-            skipped: 0,
-        }
-    }
-
-    fn push(&mut self, bytes: &[u8]) -> Result<(), AirPlayError> {
-        self.decoder
-            .push(bytes)
-            .map_err(|error| AirPlayError::Video(error.to_string()))?;
-        while let Some(packet) = self
-            .decoder
-            .next_packet()
-            .map_err(|error| AirPlayError::Video(error.to_string()))?
-        {
-            // Framing errors above desynchronize the stream and end it. A
-            // single undecodable payload does not: iOS recovers on its own at
-            // the next IDR, so skipping keeps the session alive instead of
-            // freezing the picture until the user reconnects.
-            if let Err(error) = self.process(&packet) {
-                // Not a fault to skip past: there is nothing left to show it
-                // on, and the caller ends the session so the sender stops.
-                if matches!(error, AirPlayError::ScreenClosed) {
-                    return Err(error);
-                }
-                self.skipped += 1;
-                // One line per skipped frame is one line per 16 ms once
-                // something goes persistently wrong, which buries whatever
-                // else the log was about to say.
-                if self.skipped.is_power_of_two() {
-                    tracing::warn!(
-                        %error,
-                        payload_type = ?packet.payload_type,
-                        skipped = self.skipped,
-                        "skipped an AirPlay mirror packet"
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn process(&mut self, packet: &MirrorPacket) -> Result<(), AirPlayError> {
-        match packet.payload_type {
-            PayloadType::CodecConfig => {
-                let config = AvcConfig::parse(&packet.payload)
-                    .map_err(|error| AirPlayError::Video(error.to_string()))?;
-                self.sink.push(config.parameter_sets())?;
-                if let Some(tap) = self.tap.as_ref() {
-                    tap.publish_parameter_sets(config.parameter_sets());
-                }
-                self.avc = Some(config);
-            }
-            PayloadType::Video => {
-                // The AES-CTR keystream spans the whole connection, so every
-                // video payload has to be decrypted in wire order even when it
-                // cannot be rendered. Skipping one before decryption would
-                // desynchronize the cipher for the rest of the session.
-                self.plaintext.clear();
-                self.decryptor
-                    .decrypt(&packet.payload, &mut self.plaintext)?;
-                if self.plaintext.len() != packet.payload.len() {
-                    return Err(AirPlayError::Crypto(
-                        "mirror decryptor returned a different payload length".into(),
-                    ));
-                }
-                let config = self.avc.as_ref().ok_or_else(|| {
-                    AirPlayError::Video("video arrived before AVC configuration".into())
-                })?;
-                self.access_unit.clear();
-                config
-                    .convert_access_unit_into(&self.plaintext, &mut self.access_unit)
-                    .map_err(|error| AirPlayError::Video(error.to_string()))?;
-                self.sink.push(&self.access_unit)?;
-                // Only pay for the copy when a peer is actually watching.
-                if let Some(tap) = self.tap.as_ref().filter(|tap| tap.has_readers()) {
-                    tap.publish_access_unit(&self.access_unit);
-                }
-            }
-            PayloadType::Heartbeat | PayloadType::Unknown(_) => {}
-        }
-        Ok(())
     }
 }
 
@@ -753,6 +423,13 @@ mod tests {
 
     use super::*;
     use crate::crypto::CryptoEndpoint;
+    use crate::media::setup::parse_volume;
+    use crate::media::setup::teardown_stream_types;
+    use crate::media::setup::SetupRequest;
+    use crate::media::stream::MirrorProcessor;
+    use crate::media::stream::VideoSink;
+
+    use std::io::Cursor;
 
     fn test_volume() -> tokio::sync::watch::Sender<f32> {
         tokio::sync::watch::Sender::new(0.0)
