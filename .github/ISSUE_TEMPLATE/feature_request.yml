@@ -1,0 +1,21 @@
+name: Feature or platform request
+description: Something Cursio should do, or a platform it should reach
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you are trying to do
+      description: The situation, not the solution — which machines, and what should happen between them.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What happens today
+      description: What Cursio does instead, or what you use for this now.
+  - type: textarea
+    id: idea
+    attributes:
+      label: How it could work
+      description: Optional. New capability is added as a module on the session (see CONTRIBUTING.md).

@@ -1,0 +1,50 @@
+name: Bug report
+description: Something Cursio does wrong between two (or more) machines
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most Cursio bugs are a disagreement between two nodes, and one side's
+        log rarely shows it. Please attach the log from **every** machine
+        involved — `cargo xtask logs` (or `cursio config`) prints where it is.
+
+        A security problem goes through
+        [a private advisory](https://github.com/THEROER/cursio/security/advisories/new),
+        not an issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: machines
+    attributes:
+      label: Machines
+      description: Each machine's OS and version, desktop (GNOME/KDE, Wayland/X11) where it applies, and its `--at` position.
+      placeholder: |
+        Ubuntu 25.10, GNOME 49 Wayland, --at 0,0
+        Windows 11 24H2, --at 1,0
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Cursio version or commit
+      description: "`cursio update status` shows the installed version."
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Settings
+      description: Output of `cursio config` on each machine, or the flags `mesh` ran with.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The log of every machine involved, around the time it happened. Drag the files in.
+    validations:
+      required: true
