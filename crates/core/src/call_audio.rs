@@ -485,7 +485,7 @@ fn register() {
     match MediaSinkService::start(Arc::new(MusicFactory)) {
         // Lives as long as the process: dropping it unregisters the speaker.
         Ok(service) => {
-            std::mem::forget(service);
+            Box::leak(Box::new(service));
             update_setup(|s| s.speaker = ServiceState::Running);
         }
         Err(e) => {
