@@ -862,7 +862,7 @@ pub fn view_title(peer_name: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::RecordingTx;
-    use cursio_protocol::{Rect, TileCodec};
+    use cursio_protocol::{ModuleId, Rect, TileCodec};
     use cursio_window::window_test_support::{FakeRenderer, FakeScreenSources, FakeSurrogate};
 
     fn source(id: SourceId, kind: SourceKind, title: &str, picked_on_host: bool) -> ScreenSource {
