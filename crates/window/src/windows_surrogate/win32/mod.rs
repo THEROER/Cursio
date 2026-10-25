@@ -18,32 +18,37 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, BLACK_BRUSH, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HALFTONE, HBRUSH,
     PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
 
 use crate::SourcePick;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    AdjustWindowRectExForDpi, GetDpiForWindow, SetProcessDpiAwarenessContext,
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
-    MA_NOACTIVATE, MSG, PM_REMOVE, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
-    SW_SHOW, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WMSZ_BOTTOM, WMSZ_TOP, WMSZ_TOPLEFT,
-    WMSZ_TOPRIGHT, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SIZING, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, MA_NOACTIVATE, MSG,
+    PM_REMOVE, SIZE_MINIMIZED, SW_SHOW, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SIZE, WM_SIZING, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
-use crate::framebuffer::{contained_to_host, refit, Framebuffer};
+use crate::framebuffer::Framebuffer;
 use crate::video_decoder_win::VideoDecoder;
 
 use super::{unseen, SurrogateCommand, Win32Command};
+use crate::windows_surrogate::win32::geometry::keep_shape;
+use crate::windows_surrogate::win32::geometry::size_for;
+use crate::windows_surrogate::win32::geometry::to_host;
+use crate::windows_surrogate::win32::keys::evdev_from_vk;
+use crate::windows_surrogate::win32::menu::show_source_menu;
+use crate::windows_surrogate::win32::menu::VIEW_HINT;
+
+mod geometry;
+mod keys;
+mod menu;
 
 /// State the window procedure needs, reached through `GWLP_USERDATA`.
 ///
@@ -72,315 +77,6 @@ struct ViewState {
     tip: String,
     /// Explorer's restart broadcast, after which the icon must be re-added.
     taskbar_created: u32,
-}
-
-/// What an idle view shows — seen only in a capture app's preview, which is
-/// exactly where someone wonders why the picture is empty.
-/// It names both places the choice lives: the view's own icon, and the app
-/// tray's "Show in Discord/OBS", which hides that icon while it is attached.
-const VIEW_HINT: &str = "Choose what to show: Cursio icon → Show in Discord/OBS";
-
-/// The menu command for "show nothing"; sources use their index plus one.
-const STOP_COMMAND: usize = 0xFFFF;
-
-/// One line of the view's context menu.
-#[derive(Debug, PartialEq, Eq)]
-enum MenuEntry {
-    Item { command: usize, label: String },
-    Disabled(String),
-    Separator,
-}
-
-/// The view's menu: screens, then windows, then a way to show nothing.
-fn menu_entries(sources: &[ScreenSource]) -> Vec<MenuEntry> {
-    use cursio_protocol::SourceKind;
-    let mut out = Vec::new();
-    for kind in [SourceKind::Monitor, SourceKind::Window] {
-        let before = out.len();
-        for (index, source) in sources.iter().enumerate().filter(|(_, s)| s.kind == kind) {
-            out.push(MenuEntry::Item {
-                command: index + 1,
-                label: source.title.clone(),
-            });
-        }
-        if out.len() > before {
-            out.push(MenuEntry::Separator);
-        }
-    }
-    if sources.is_empty() {
-        out.push(MenuEntry::Disabled("Waiting for the peer's list…".into()));
-        out.push(MenuEntry::Separator);
-    }
-    out.push(MenuEntry::Item {
-        command: STOP_COMMAND,
-        label: "Show nothing".into(),
-    });
-    out
-}
-
-/// Show the view's context menu at the cursor and report the choice.
-///
-/// `TrackPopupMenu` opens a window of its own (class `#32768`), and window
-/// capture records only the captured `HWND`, so the menu stays out of what a
-/// screen-sharing application sends.
-unsafe fn show_source_menu(hwnd: HWND, view: &ViewState) {
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow,
-        TrackPopupMenu, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    };
-
-    let Ok(menu) = CreatePopupMenu() else {
-        return;
-    };
-    let sources = view.sources.borrow().clone();
-    for entry in menu_entries(&sources) {
-        let appended = match entry {
-            MenuEntry::Item { command, label } => {
-                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-                AppendMenuW(menu, MF_STRING, command, PCWSTR(wide.as_ptr()))
-            }
-            MenuEntry::Disabled(label) => {
-                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-                AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide.as_ptr()))
-            }
-            MenuEntry::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()),
-        };
-        if let Err(e) = appended {
-            tracing::debug!(error = %e, "could not build the source menu");
-        }
-    }
-    let mut at = POINT::default();
-    let _ = GetCursorPos(&mut at);
-    // Without this the menu does not close when the user clicks elsewhere — a
-    // documented `TrackPopupMenu` quirk.
-    let _ = SetForegroundWindow(hwnd);
-    let chosen = TrackPopupMenu(
-        menu,
-        TPM_RETURNCMD | TPM_RIGHTBUTTON,
-        at.x,
-        at.y,
-        None,
-        hwnd,
-        None,
-    )
-    .0 as usize;
-    let _ = DestroyMenu(menu);
-
-    let pick = match chosen {
-        0 => return,
-        STOP_COMMAND => SourcePick::Stop,
-        n => match sources.get(n - 1) {
-            Some(source) => SourcePick::Source(source.id),
-            None => return,
-        },
-    };
-    let _ = view.picks.send(pick);
-}
-
-/// Map a click's `lParam` to host pixel coordinates.
-///
-/// GDI gives client-area coordinates, which match the host's pixels only while
-/// the surrogate is shown unscaled. The picture is letterboxed into the client
-/// area, so the click is mapped through the same fit — the correction the GTK
-/// surrogate makes.
-fn to_host(hwnd: HWND, state: &WindowState, lparam: LPARAM) -> (u32, u32) {
-    let x = (lparam.0 & 0xFFFF) as i16 as f64;
-    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f64;
-    let fb = state.fb.borrow();
-    let (cw, ch) = client_size(hwnd).unwrap_or((fb.width as i32, fb.height as i32));
-    contained_to_host((cw as f64, ch as f64), (fb.width, fb.height), x, y)
-}
-
-fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
-    let mut rect = RECT::default();
-    unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
-    Some((rect.right - rect.left, rect.bottom - rect.top))
-}
-
-/// The work area — the monitor less the taskbar — of the monitor holding
-/// `hwnd`.
-unsafe fn work_area(hwnd: HWND) -> Option<(i32, i32)> {
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
-        return None;
-    }
-    let work = info.rcWork;
-    Some((work.right - work.left, work.bottom - work.top))
-}
-
-/// Windows virtual-key code → the evdev code the protocol speaks.
-///
-/// The inverse of the host-side table in
-/// [`windows_input`](crate::windows_input): the wire format is evdev
-/// everywhere, so Windows is the side that translates — going out here, coming
-/// in there.
-fn evdev_from_vk(vk: u16) -> Option<u16> {
-    Some(match vk {
-        0x1B => 1,                       // ESC
-        0x31..=0x39 => (vk - 0x31) + 2,  // '1'..'9'
-        0x30 => 11,                      // '0'
-        0xBD => 12,                      // minus
-        0xBB => 13,                      // equal
-        0x08 => 14,                      // backspace
-        0x09 => 15,                      // tab
-        0x51 => 16,                      // q
-        0x57 => 17,                      // w
-        0x45 => 18,                      // e
-        0x52 => 19,                      // r
-        0x54 => 20,                      // t
-        0x59 => 21,                      // y
-        0x55 => 22,                      // u
-        0x49 => 23,                      // i
-        0x4F => 24,                      // o
-        0x50 => 25,                      // p
-        0xDB => 26,                      // [
-        0xDD => 27,                      // ]
-        0x0D => 28,                      // enter
-        0x11 => 29,                      // ctrl
-        0x41 => 30,                      // a
-        0x53 => 31,                      // s
-        0x44 => 32,                      // d
-        0x46 => 33,                      // f
-        0x47 => 34,                      // g
-        0x48 => 35,                      // h
-        0x4A => 36,                      // j
-        0x4B => 37,                      // k
-        0x4C => 38,                      // l
-        0xBA => 39,                      // ;
-        0xDE => 40,                      // '
-        0xC0 => 41,                      // `
-        0x10 => 42,                      // shift
-        0xDC => 43,                      // backslash
-        0x5A => 44,                      // z
-        0x58 => 45,                      // x
-        0x43 => 46,                      // c
-        0x56 => 47,                      // v
-        0x42 => 48,                      // b
-        0x4E => 49,                      // n
-        0x4D => 50,                      // m
-        0xBC => 51,                      // ,
-        0xBE => 52,                      // .
-        0xBF => 53,                      // /
-        0x12 => 56,                      // alt
-        0x20 => 57,                      // space
-        0x14 => 58,                      // caps lock
-        0x70..=0x79 => (vk - 0x70) + 59, // F1..F10
-        0x7A => 87,                      // F11
-        0x7B => 88,                      // F12
-        0x24 => 102,                     // home
-        0x26 => 103,                     // up
-        0x21 => 104,                     // page up
-        0x25 => 105,                     // left
-        0x27 => 106,                     // right
-        0x23 => 107,                     // end
-        0x28 => 108,                     // down
-        0x22 => 109,                     // page down
-        0x2D => 110,                     // insert
-        0x2E => 111,                     // delete
-        0x5B => 125,                     // left Windows key
-        0x5C => 126,                     // right Windows key
-        _ => return None,
-    })
-}
-
-/// Size the window so its *client area* is exactly `width` × `height` device
-/// pixels.
-///
-/// `CreateWindowExW` takes the outer size, which includes the frame and the
-/// title bar. Passing the picture's size there leaves a client area some 16 by
-/// 39 pixels smaller, so every frame arrived downscaled by an arbitrary,
-/// non-integer ratio: text lost strokes and edges crawled, on a link that had
-/// just carried the pixels perfectly.
-unsafe fn fit_client(hwnd: HWND, width: u32, height: u32) {
-    if width == 0 || height == 0 {
-        return;
-    }
-    let Some((fw, fh)) = frame(hwnd) else {
-        return;
-    };
-    let _ = SetWindowPos(
-        hwnd,
-        None,
-        0,
-        0,
-        width as i32 + fw,
-        height as i32 + fh,
-        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-    );
-}
-
-/// How much wider and taller the window is than its client area. Measured at
-/// the window's own DPI rather than the system's, because the two differ on
-/// any mixed-scale desktop.
-unsafe fn frame(hwnd: HWND) -> Option<(i32, i32)> {
-    let mut rect = RECT::default();
-    let dpi = GetDpiForWindow(hwnd);
-    if dpi == 0
-        || AdjustWindowRectExForDpi(
-            &mut rect,
-            WS_OVERLAPPEDWINDOW,
-            false,
-            WINDOW_EX_STYLE(0),
-            dpi,
-        )
-        .is_err()
-    {
-        return None;
-    }
-    Some((rect.right - rect.left, rect.bottom - rect.top))
-}
-
-/// Size the client area for a picture of `picture` that was `old` until now.
-///
-/// A view keeps the source's own size: nobody sees it, and at that size the
-/// capture app records it 1:1. A surrogate is fitted to its monitor's work
-/// area keeping the picture's shape, and on a change of shape — a phone
-/// turning — keeps the scale it was shown at, as scrcpy does: a phone's
-/// 1920-high screen left at its own size is cut to the monitor by Windows,
-/// which then stretched the picture across the cut window.
-unsafe fn size_for(hwnd: HWND, is_view: bool, old: (u32, u32), picture: (u32, u32)) {
-    if is_view {
-        fit_client(hwnd, picture.0, picture.1);
-        return;
-    }
-    let room = work_area(hwnd).and_then(|(w, h)| {
-        let (fw, fh) = frame(hwnd)?;
-        Some((w - fw, h - fh))
-    });
-    let shown = client_size(hwnd).unwrap_or((0, 0));
-    let (w, h) = refit(shown, old, picture, room);
-    fit_client(hwnd, w as u32, h as u32);
-}
-
-/// Keep a surrogate's client area the picture's shape while the user drags
-/// its border, so the picture fills it instead of gaining bars.
-///
-/// `rect` is the proposed outer rectangle; the side being dragged decides
-/// which dimension follows the other, and which edge moves to make it so.
-unsafe fn keep_shape(hwnd: HWND, edge: u32, rect: &mut RECT, picture: (u32, u32)) {
-    let (Some((fw, fh)), (pw, ph)) = (frame(hwnd), picture) else {
-        return;
-    };
-    if pw == 0 || ph == 0 {
-        return;
-    }
-    let (pw, ph) = (pw as i64, ph as i64);
-    let cw = (rect.right - rect.left - fw).max(1) as i64;
-    let ch = (rect.bottom - rect.top - fh).max(1) as i64;
-    if edge == WMSZ_TOP || edge == WMSZ_BOTTOM {
-        rect.right = rect.left + (ch * pw / ph) as i32 + fw;
-    } else {
-        let h = (cw * ph / pw) as i32 + fh;
-        if edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT {
-            rect.top = rect.bottom - h;
-        } else {
-            rect.bottom = rect.top + h;
-        }
-    }
 }
 
 /// The window procedure: painting and input.
@@ -926,63 +622,5 @@ pub(crate) fn run(
         // can reach a freed pointer.
         drop(Box::from_raw(state_ptr));
         tracing::info!(id = meta.id, "surrogate window thread finished");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn vk_to_evdev_round_trips_with_the_host_table() {
-        // These must be the inverse of `windows_input::vk_from_evdev`, or a key
-        // typed on the surrogate would arrive as a different key on the host.
-        assert_eq!(evdev_from_vk(0x41), Some(30)); // 'A' -> KEY_A
-        assert_eq!(evdev_from_vk(0x5A), Some(44)); // 'Z' -> KEY_Z
-        assert_eq!(evdev_from_vk(0x31), Some(2)); // '1' -> KEY_1
-        assert_eq!(evdev_from_vk(0x30), Some(11)); // '0' -> KEY_0
-        assert_eq!(evdev_from_vk(0x70), Some(59)); // F1
-        assert_eq!(evdev_from_vk(0x7B), Some(88)); // F12
-    }
-
-    #[test]
-    fn the_view_menu_lists_screens_before_windows_and_ends_with_show_nothing() {
-        use cursio_protocol::SourceKind;
-        let source = |id, kind, title: &str| ScreenSource {
-            id,
-            kind,
-            title: title.into(),
-            width: 0,
-            height: 0,
-            picked_on_host: false,
-        };
-        let entries = menu_entries(&[
-            source(7, SourceKind::Window, "Firefox"),
-            source(0x8000_0000, SourceKind::Monitor, "Screen 1"),
-        ]);
-        assert_eq!(
-            entries,
-            vec![
-                MenuEntry::Item {
-                    command: 2,
-                    label: "Screen 1".into()
-                },
-                MenuEntry::Separator,
-                MenuEntry::Item {
-                    command: 1,
-                    label: "Firefox".into()
-                },
-                MenuEntry::Separator,
-                MenuEntry::Item {
-                    command: STOP_COMMAND,
-                    label: "Show nothing".into()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn unmapped_keys_are_dropped() {
-        assert_eq!(evdev_from_vk(0xFF), None);
     }
 }
