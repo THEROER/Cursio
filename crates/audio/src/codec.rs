@@ -73,16 +73,22 @@ mod ffi {
     }
 
     // On Android libopus comes from `audiopus_sys` under its own names; every
-    // other platform links the copy `shiguredo_opus` built and renamed.
-    #[cfg(target_os = "android")]
+    // other platform links the copy `shiguredo_opus` built and renamed, and
+    // decodes through that crate's wrapper instead.
     extern "C" {
+        #[cfg_attr(
+            not(target_os = "android"),
+            link_name = "shiguredo_opus_encoder_create"
+        )]
         pub fn opus_encoder_create(
             fs: i32,
             channels: c_int,
             application: c_int,
             error: *mut c_int,
         ) -> *mut OpusEncoder;
+        #[cfg_attr(not(target_os = "android"), link_name = "shiguredo_opus_encoder_ctl")]
         pub fn opus_encoder_ctl(st: *mut OpusEncoder, request: c_int, ...) -> c_int;
+        #[cfg_attr(not(target_os = "android"), link_name = "shiguredo_opus_encode_float")]
         pub fn opus_encode_float(
             st: *mut OpusEncoder,
             pcm: *const f32,
@@ -90,9 +96,15 @@ mod ffi {
             data: *mut c_uchar,
             max_data_bytes: i32,
         ) -> i32;
+        #[cfg_attr(
+            not(target_os = "android"),
+            link_name = "shiguredo_opus_encoder_destroy"
+        )]
         pub fn opus_encoder_destroy(st: *mut OpusEncoder);
+        #[cfg(target_os = "android")]
         pub fn opus_decoder_create(fs: i32, channels: c_int, error: *mut c_int)
             -> *mut OpusDecoder;
+        #[cfg(target_os = "android")]
         pub fn opus_decode_float(
             st: *mut OpusDecoder,
             data: *const c_uchar,
@@ -101,30 +113,8 @@ mod ffi {
             frame_size: c_int,
             decode_fec: c_int,
         ) -> c_int;
+        #[cfg(target_os = "android")]
         pub fn opus_decoder_destroy(st: *mut OpusDecoder);
-    }
-
-    #[cfg(not(target_os = "android"))]
-    extern "C" {
-        #[link_name = "shiguredo_opus_encoder_create"]
-        pub fn opus_encoder_create(
-            fs: i32,
-            channels: c_int,
-            application: c_int,
-            error: *mut c_int,
-        ) -> *mut OpusEncoder;
-        #[link_name = "shiguredo_opus_encoder_ctl"]
-        pub fn opus_encoder_ctl(st: *mut OpusEncoder, request: c_int, ...) -> c_int;
-        #[link_name = "shiguredo_opus_encode_float"]
-        pub fn opus_encode_float(
-            st: *mut OpusEncoder,
-            pcm: *const f32,
-            frame_size: c_int,
-            data: *mut c_uchar,
-            max_data_bytes: i32,
-        ) -> i32;
-        #[link_name = "shiguredo_opus_encoder_destroy"]
-        pub fn opus_encoder_destroy(st: *mut OpusEncoder);
     }
 }
 
