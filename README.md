@@ -381,6 +381,11 @@ noresvport,locallocks` (`nolocks` makes `flock` fail with `ENOTSUP`), `intr`
 and a `deadtimeout` so a crashed node does not wedge callers, and rsize/wsize
 of 1 MiB.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security problems go through
+[SECURITY.md](SECURITY.md), not public issues.
+
 ## License
 
 Cursio is free software: you can redistribute it and/or modify it under the
