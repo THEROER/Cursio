@@ -7,7 +7,7 @@ repository.workspace = true
 
 [[bin]]
 name = "cursio"
-path = "src/bin/cursio.rs"
+path = "src/bin/cursio/main.rs"
 # The CLI drives every platform module, so it exists only in a build that has
 # them. A phone links the library into an app; there is no terminal to run this
 # from and nothing on Android that `--send-input` could capture.
