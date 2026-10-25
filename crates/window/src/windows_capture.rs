@@ -104,6 +104,10 @@ impl CaptureSession for WgcCaptureSession {
             .map_err(|_| WindowError::Backend("capture thread is gone".into()))
     }
 
+    fn set_network_budget(&mut self, bits_per_second: u32, congested: bool) {
+        self.quality.set_network_budget(bits_per_second, congested);
+    }
+
     fn on_ack(&mut self, ack: WindowFrameAck) {
         let sent = self.last_seq.load(Ordering::Relaxed);
         if let Some((gap, threshold)) = self.quality.on_ack(ack.acked_seq, sent) {

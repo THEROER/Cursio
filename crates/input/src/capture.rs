@@ -43,7 +43,7 @@ use crate::{CaptureHandle, InputError};
 /// Cursio's own virtual devices so we never capture what we inject (which would
 /// loop). Returns an error only if no capturable device could be opened.
 pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = crate::event_channel();
     let (grab, grab_rx) = crate::GrabControl::new();
     let (edges_tx, edges_rx) = mpsc::unbounded_channel();
     // Where the pointer is comes from the X server when there is one; without
@@ -121,7 +121,7 @@ pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
 /// local machine; flipping back to `false` ungrabs it.
 fn start_reader(
     device: Device,
-    tx: mpsc::UnboundedSender<InputEvent>,
+    tx: crate::EventSender,
     mut grab_rx: tokio::sync::watch::Receiver<crate::InputMode>,
 ) -> Result<(), InputError> {
     let mut stream = device.into_event_stream()?;

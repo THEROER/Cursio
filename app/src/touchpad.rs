@@ -24,7 +24,6 @@ use std::sync::Mutex;
 
 use cursio_core::session::CapturedInput;
 use cursio_protocol::{GesturePhase, InputEvent, MouseButton, GESTURE_SCALE_ONE};
-use tokio::sync::mpsc::UnboundedSender;
 
 /// What the UI is told, so the screen can say something true rather than
 /// pretending every tap landed.
@@ -47,7 +46,7 @@ pub struct Touchpad {
     /// The driven peer's session channel. Present only while that link is up:
     /// quietly buffering strokes that will never arrive is worse than dropping
     /// them.
-    events: Mutex<Option<UnboundedSender<CapturedInput>>>,
+    events: Mutex<Option<cursio_core::session::InputSender>>,
     status: Mutex<Status>,
 }
 
@@ -88,7 +87,7 @@ impl Touchpad {
         sent
     }
 
-    fn attach(&self, tx: UnboundedSender<CapturedInput>) {
+    fn attach(&self, tx: cursio_core::session::InputSender) {
         *self.events.lock().expect("touchpad channel") = Some(tx);
     }
 }

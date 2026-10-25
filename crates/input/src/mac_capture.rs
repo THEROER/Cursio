@@ -60,7 +60,7 @@ pub(crate) const INJECTED_TAG: i64 = 0x0C_09_50_10;
 /// from [`crate::watched_edges`] on every event, so it follows a peer that
 /// greets us long after the tap is running.
 pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
-    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    let (events_tx, events) = crate::event_channel();
     let (edges_tx, edges) = tokio::sync::mpsc::unbounded_channel::<EdgeCrossing>();
 
     let (grab, mode_rx) = GrabControl::new();
@@ -145,7 +145,7 @@ fn spawn_mode_mirror(
 
 /// What the tap callback needs, handed to it as its user pointer.
 struct TapState {
-    events: tokio::sync::mpsc::UnboundedSender<InputEvent>,
+    events: crate::EventSender,
     edges: tokio::sync::mpsc::UnboundedSender<EdgeCrossing>,
     /// Where the displays end. Read once: a monitor being plugged in mid-session
     /// is rare, and re-reading it per mouse event would be a syscall at a

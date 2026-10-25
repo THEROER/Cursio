@@ -446,7 +446,16 @@ cannot drift from its clear:
 module turn (`module_host.rs`); it is the one place that can tell a module that
 fell behind from one that has caught up.
 
-## One link, priority end to end
+## One session, independent delivery lanes
+
+Session protocol v23 replaces the shared TCP connection with four independently
+encrypted TCP lanes, each with its own delivery watermarks and bounded queues.
+The current design, budgets, pacing and recovery rules are in
+[transport-design.md](transport-design.md). The measurements below describe why
+the previous single-socket scheduler needed bounded kernel queues; those socket
+bounds still apply separately to every lane.
+
+### Historical single-socket scheduling
 
 Every module rides one Noise-over-TCP link, so the order bytes leave in is the
 latency each module gets. `transport/src/priority.rs` queues frames per class —
@@ -572,7 +581,7 @@ connections are *paths* under it:
   time the peer out (`TransportTx::holding`); the registry offers the peer for
   dialling again (`needs_network_path`), and after 60 s (`resume::HOLD`) with
   nothing back the link ends the session as before.
-- **Bounds.** At most one network and one Bluetooth path; a newer one replaces
+- **Bounds (before v23).** At most one network and one Bluetooth path; a newer one replaces
   the older. Over Bluetooth, pixels are not sent at all. Past 64 MiB kept for
   resending, the peer has stopped acknowledging for far longer than any path
   survives, and the session can no longer be resumed.

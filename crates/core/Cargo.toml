@@ -50,6 +50,7 @@ gallery = ["dep:image"]
 airplay = ["dep:cursio-airplay", "window"]
 
 [dependencies]
+cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-transport.workspace = true
 cursio-airplay = { workspace = true, optional = true }
@@ -79,6 +80,7 @@ tokio.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
+bincode.workspace = true
 
 thiserror.workspace = true
 anyhow.workspace = true

@@ -16,9 +16,11 @@
 use async_trait::async_trait;
 use cursio_protocol::Message;
 
+mod congestion;
 pub mod crypto;
 pub mod dead_peer;
 pub mod discovery;
+pub mod lane;
 pub mod pairing;
 pub mod priority;
 pub mod resume;
@@ -137,6 +139,11 @@ pub trait TransportTx: Send {
     /// [`Self::queue_depth`]: nothing waits in a queue it does not have.
     fn queue_delay(&self, _priority: cursio_protocol::Priority) -> QueueDelay {
         QueueDelay::default()
+    }
+
+    /// Age of the oldest queued or currently sending frame, for live control.
+    fn queue_age(&self, _priority: cursio_protocol::Priority) -> std::time::Duration {
+        std::time::Duration::ZERO
     }
 
     /// How much of `priority` is queued here and how much has left.

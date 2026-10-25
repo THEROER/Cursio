@@ -76,7 +76,7 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
     });
 
     // Feed N motion events into the client's capture channel.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = session::input_channel();
     for i in 0..N {
         tx.send(session::CapturedInput::from(InputEvent::PointerMotion {
             dx: (i % 7) as i32 + 1,

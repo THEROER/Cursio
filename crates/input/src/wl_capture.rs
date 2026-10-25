@@ -126,7 +126,7 @@ const BTN_EXTRA: u32 = 0x114;
 /// [`PORTAL_ANSWER_WAIT`]. With no edge watched yet the portal is not asked at
 /// all until one is.
 pub fn spawn_wayland_capture() -> Result<CaptureHandle, InputError> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = crate::event_channel();
     let (edges_tx, edges_rx) = mpsc::unbounded_channel();
     let (grab, grab_rx) = crate::GrabControl::new();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -581,7 +581,7 @@ fn outer_edge_barriers(
 /// while enabled translate libei events onto the capture channel.
 async fn capture_loop(
     portal: Portal,
-    tx: mpsc::UnboundedSender<InputEvent>,
+    tx: crate::EventSender,
     edges_tx: mpsc::UnboundedSender<crate::EdgeCrossing>,
     mut grab_rx: tokio::sync::watch::Receiver<crate::InputMode>,
     mut edge_rx: tokio::sync::watch::Receiver<EdgeSet>,
@@ -890,7 +890,7 @@ const EDGE_NUDGE_PX: i32 = 12;
 /// have on Wayland (no absolute warp from a uinput device), but it's enough:
 /// the cursor is pinned against the edge, so moving inward always lands it off
 /// the barrier.
-fn nudge_off_edge(tx: &mpsc::UnboundedSender<InputEvent>, peer_edge: Option<Edge>) {
+fn nudge_off_edge(tx: &crate::EventSender, peer_edge: Option<Edge>) {
     let (dx, dy) = match peer_edge {
         Some(Edge::Right) => (-EDGE_NUDGE_PX, 0),
         Some(Edge::Left) => (EDGE_NUDGE_PX, 0),
@@ -1018,7 +1018,7 @@ impl ScrollFrame {
 /// seat capabilities the first time a seat appears).
 fn handle_ei_event(
     event: EiEvent,
-    tx: &mpsc::UnboundedSender<InputEvent>,
+    tx: &crate::EventSender,
     context: &ei::Context,
     remainder: &mut MotionRemainder,
     scroll: &mut ScrollFrame,

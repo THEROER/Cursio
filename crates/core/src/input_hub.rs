@@ -46,7 +46,7 @@ use crate::session::{CapturedInput, OwnershipCmd};
 /// The two channels a session reads its local input and ownership requests
 /// from — what it used to borrow from capture directly.
 pub struct LinkPorts {
-    pub events: UnboundedReceiver<CapturedInput>,
+    pub events: crate::session::InputReceiver,
     pub commands: UnboundedReceiver<OwnershipCmd>,
     /// Names this attachment in every later call.
     pub token: LinkToken,
@@ -92,7 +92,7 @@ pub struct MachineInput {
 struct Link {
     token: LinkToken,
     placement: Placement,
-    events: UnboundedSender<CapturedInput>,
+    events: crate::session::InputSender,
     commands: UnboundedSender<OwnershipCmd>,
 }
 
@@ -138,7 +138,7 @@ impl InputHub {
     /// A peer already present — a reconnect racing the old session's teardown
     /// — is replaced, so input never goes to a session that is on its way out.
     pub fn attach(&self, peer: PeerId, placement: Placement) -> (LinkPorts, MachineInput) {
-        let (events_tx, events) = unbounded_channel();
+        let (events_tx, events) = crate::session::input_channel();
         let (commands_tx, commands) = unbounded_channel();
         let mut routes = self.routes();
         routes.next_generation += 1;

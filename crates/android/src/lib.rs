@@ -218,9 +218,7 @@ pub fn input_targets() -> Vec<(cursio_protocol::PeerId, String)> {
 }
 
 /// A channel into one peer's session for the touchpad's events.
-pub fn input_to(
-    peer: &cursio_protocol::PeerId,
-) -> Option<tokio::sync::mpsc::UnboundedSender<cursio_core::session::CapturedInput>> {
+pub fn input_to(peer: &cursio_protocol::PeerId) -> Option<cursio_core::session::InputSender> {
     slot().as_ref().and_then(|node| node.input_to(peer))
 }
 

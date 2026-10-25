@@ -97,10 +97,14 @@ struct Feed {
     /// allows the capture, chosen in the window before the consent opens.
     chosen: Option<Vec<String>>,
     generation: u64,
+    rate_targets: HashMap<u64, u32>,
+    next_rate_id: u64,
+    applied_rate: Option<u32>,
 }
 
 struct Shared {
     feed: Mutex<Feed>,
+    rate_update: Mutex<()>,
     units: broadcast::Sender<Unit>,
     /// Woken whenever the running state or the viewer set changes.
     changed: watch::Sender<u64>,
@@ -121,7 +125,11 @@ fn shared() -> &'static Shared {
             linked: HashMap::new(),
             chosen: None,
             generation: 0,
+            rate_targets: HashMap::new(),
+            next_rate_id: 0,
+            applied_rate: None,
         }),
+        rate_update: Mutex::new(()),
         units: broadcast::channel(UNIT_BACKLOG).0,
         changed: watch::channel(0).0,
     })
@@ -133,6 +141,31 @@ fn feed() -> std::sync::MutexGuard<'static, Feed> {
 
 fn notify_changed() {
     shared().changed.send_modify(|n| *n = n.wrapping_add(1));
+}
+
+fn set_rate_target(id: u64, target: Option<u32>) {
+    let _update = shared()
+        .rate_update
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let change = {
+        let mut feed = feed();
+        if let Some(target) = target {
+            feed.rate_targets.insert(id, target);
+        } else {
+            feed.rate_targets.remove(&id);
+        }
+        let rate = feed.rate_targets.values().copied().min();
+        if feed.applied_rate == rate {
+            None
+        } else {
+            feed.applied_rate = rate;
+            rate.and_then(|rate| feed.backend.clone().map(|backend| (backend, rate)))
+        }
+    };
+    if let Some((backend, rate)) = change {
+        backend.set_bitrate(rate);
+    }
 }
 
 /// Install the phone's half. Without one, requests are answered by nothing.
@@ -409,6 +442,8 @@ pub struct PhoneScreenSession {
     /// for a remote-screen view, which a capture app opens and closes.
     computer: Option<String>,
     bitrate: Bitrate,
+    network_budget: u32,
+    rate_id: u64,
     /// The seq of the newest frame handed to the session, for the gap the
     /// viewer's acks are measured against.
     sent: Arc<AtomicU32>,
@@ -431,6 +466,12 @@ impl PhoneScreenSession {
         if let Some(backend) = backend() {
             backend.keyframe();
         }
+        let rate_id = {
+            let mut feed = feed();
+            feed.next_rate_id += 1;
+            feed.next_rate_id
+        };
+        set_rate_target(rate_id, Some(BITRATE_START));
         Self {
             meta: WindowMeta {
                 id,
@@ -443,6 +484,8 @@ impl PhoneScreenSession {
             mapper: GestureMapper::new(running.width, running.height),
             computer,
             bitrate: Bitrate::default(),
+            network_budget: u32::MAX,
+            rate_id,
             sent,
         }
     }
@@ -522,15 +565,25 @@ impl CaptureSession for PhoneScreenSession {
         Ok(())
     }
 
+    fn set_network_budget(&mut self, bits_per_second: u32, _congested: bool) {
+        self.network_budget = bits_per_second.max(64_000);
+        set_rate_target(
+            self.rate_id,
+            Some(self.bitrate.current.min(self.network_budget)),
+        );
+    }
+
     fn on_ack(&mut self, ack: WindowFrameAck) {
         let sent = self.sent.load(Ordering::Relaxed);
-        if let Some(rate) = self
+        if self
             .bitrate
             .on_ack(ack.acked_seq, sent, std::time::Instant::now())
+            .is_some()
         {
-            if let Some(backend) = backend() {
-                backend.set_bitrate(rate);
-            }
+            set_rate_target(
+                self.rate_id,
+                Some(self.bitrate.current.min(self.network_budget)),
+            );
         }
     }
 
@@ -619,6 +672,7 @@ impl Bitrate {
 
 impl Drop for PhoneScreenSession {
     fn drop(&mut self) {
+        set_rate_target(self.rate_id, None);
         self.forward.abort();
     }
 }
@@ -738,6 +792,8 @@ pub(crate) fn reset_for_test() {
     feed.linked.clear();
     feed.chosen = None;
     feed.backend = None;
+    feed.rate_targets.clear();
+    feed.applied_rate = None;
 }
 
 #[cfg(test)]
@@ -754,6 +810,7 @@ mod tests {
         asked: Mutex<Vec<String>>,
         stops: Mutex<u32>,
         gestures: Mutex<Vec<Gesture>>,
+        rates: Mutex<Vec<u32>>,
     }
 
     impl ScreenBackend for FakeBackend {
@@ -764,7 +821,9 @@ mod tests {
             *self.stops.lock().unwrap() += 1;
         }
         fn keyframe(&self) {}
-        fn set_bitrate(&self, _bits_per_second: u32) {}
+        fn set_bitrate(&self, bits_per_second: u32) {
+            self.rates.lock().unwrap().push(bits_per_second);
+        }
         fn gesture(&self, gesture: Gesture) {
             self.gestures.lock().unwrap().push(gesture);
         }
@@ -775,6 +834,23 @@ mod tests {
         let backend = Arc::new(FakeBackend::default());
         set_backend(backend.clone());
         backend
+    }
+
+    #[tokio::test]
+    async fn the_shared_encoder_obeys_the_slowest_view_and_releases_its_limit() {
+        let _turn = SERIAL.lock().await;
+        let backend = fake();
+        started(100, 200);
+        let running = feed().running.unwrap();
+        let mut slow = PhoneScreenSession::open(1, "slow".into(), running, None);
+        let mut fast = PhoneScreenSession::open(2, "fast".into(), running, None);
+        slow.set_network_budget(1_500_000, true);
+        fast.set_network_budget(8_000_000, false);
+        assert_eq!(backend.rates.lock().unwrap().last(), Some(&1_500_000));
+        drop(slow);
+        assert_eq!(backend.rates.lock().unwrap().last(), Some(&BITRATE_START));
+        fast.set_network_budget(3_000_000, false);
+        assert_eq!(backend.rates.lock().unwrap().last(), Some(&3_000_000));
     }
 
     #[tokio::test]
@@ -941,8 +1017,8 @@ mod tests {
     async fn sharing_with_nothing_known_of_the_user_reaches_every_linked_computer() {
         let _turn = SERIAL.lock().await;
         let _backend = fake();
-        let mut first = spawn_trigger("Nocturne".into(), "POCO".into());
-        let mut second = spawn_trigger("Lightmoon".into(), "POCO".into());
+        let mut first = spawn_trigger("screen-test-first".into(), "POCO".into());
+        let mut second = spawn_trigger("screen-test-second".into(), "POCO".into());
         started(100, 200);
         assert_eq!(share_with_chosen(), 2);
         assert!(matches!(

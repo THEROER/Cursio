@@ -1,9 +1,9 @@
 # Cursio
 
-A LAN-only mesh of trusted personal devices sharing one encrypted channel.
+A LAN-only mesh of trusted personal devices sharing encrypted, resumable sessions.
 
-Input, audio, clipboard, window transfer and file sharing are **modules** on that
-channel — not separate products. Applications never migrate; only pixels,
+Input, audio, clipboard, window transfer and file sharing are **modules** on those
+sessions — not separate products. Applications never migrate; only pixels,
 samples, events and file requests cross the link.
 
 The goal is simple: **it should not matter which machine an application was
@@ -88,9 +88,13 @@ pixels — nothing needs to know how wide anybody's screen is. A side cannot
 express order, and a designated centre would make every machine depend on one
 being up, which is what the mesh exists to avoid.
 
-**One encrypted channel, five priority classes.** Everything rides one Noise
-link, scheduled `Control` > `Input` > `Audio` > `Video` > `Bulk`, so an input
-event queued mid-file-transfer jumps ahead of that transfer's remaining chunks.
+**One session, four independent delivery lanes.** Each pair of peers uses
+separate encrypted TCP connections for interactive traffic, audio, video and
+bulk data. The six priority classes remain `Control` > `Input` > `Audio` >
+`Video` > `Metadata` > `Bulk`; a blocked file connection cannot block input.
+Queues have byte budgets and backpressure, bulk traffic is paced against
+interactive RTT, and video encoders share an adaptive budget. Connections can
+be replaced without recreating modules. See [transport design](docs/transport-design.md).
 
 **Input is relative.** Mouse motion crosses the wire as `dx`/`dy`, never as an
 absolute position — absolute positioning teleports the cursor and breaks games

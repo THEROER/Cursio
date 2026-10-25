@@ -78,6 +78,34 @@ pub enum SessionError {
     PeerTimeout(Duration),
 }
 
+/// Bounded input supplied by the desktop hub or the Android touchpad.
+pub type InputSender = crate::queue::Sender<CapturedInput>;
+pub type InputReceiver = crate::queue::Receiver<CapturedInput>;
+
+pub fn input_channel() -> (InputSender, InputReceiver) {
+    crate::queue::channel(
+        "captured input",
+        4096,
+        512 * 1024,
+        |_| std::mem::size_of::<CapturedInput>(),
+        |previous, next| crate::queue::merge_motion(&mut previous.event, &next.event),
+    )
+}
+
+type Incoming = (Message, std::time::Instant);
+fn inbound_channel() -> (
+    crate::queue::Sender<Incoming>,
+    crate::queue::Receiver<Incoming>,
+) {
+    crate::queue::channel(
+        "session inbound",
+        4096,
+        4 * 1024 * 1024,
+        |(message, _)| crate::queue::message_bytes(message),
+        |previous, next| crate::queue::merge_messages(&mut previous.0, &next.0),
+    )
+}
+
 /// How often to send a heartbeat while a session is idle.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -97,7 +125,10 @@ const SLOW_TURN_WARN: Duration = Duration::from_millis(250);
 /// A bound only so a peer streaming input faster than it can be read cannot
 /// hold the loop inside one turn; draining costs nanoseconds a message, so in
 /// practice a batch ends where the queue does.
-const RECEIVED_INPUT_BATCH: usize = 1024;
+const RECEIVED_INPUT_BATCH: usize = 128;
+const CAPTURED_INPUT_BATCH: usize = 128;
+const INPUT_PUMP_BUDGET: Duration = Duration::from_millis(2);
+const SESSION_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How long to wait for *any* inbound traffic before declaring the peer gone.
 ///
@@ -574,6 +605,57 @@ impl LatencyWindow {
     }
 }
 
+/// Round trips over the actual interactive session, including both endpoint loops.
+/// This is not a one-way input-to-injection measurement.
+struct InteractiveProbe {
+    peer: Option<PeerId>,
+    pending: std::collections::VecDeque<(u64, std::time::Instant)>,
+    latency: LatencyWindow,
+}
+
+impl InteractiveProbe {
+    fn new(peer: Option<PeerId>) -> Self {
+        Self {
+            peer,
+            pending: std::collections::VecDeque::new(),
+            latency: LatencyWindow::new("interactive RTT"),
+        }
+    }
+
+    fn sent(&mut self, nonce: u64, at: std::time::Instant) {
+        if self.pending.len() == 8 {
+            self.pending.pop_front();
+        }
+        self.pending.push_back((nonce, at));
+    }
+
+    fn echo(&mut self, nonce: u64, now: std::time::Instant) {
+        let nonce = nonce & !cursio_protocol::HEARTBEAT_ECHO;
+        if let Some(index) = self.pending.iter().position(|(id, _)| *id == nonce) {
+            let (_, sent) = self.pending.remove(index).unwrap();
+            self.latency.record(now.saturating_duration_since(sent));
+        }
+    }
+
+    fn report(&mut self) {
+        if self.latency.started.elapsed() < INPUT_LATENCY_WINDOW {
+            return;
+        }
+        if let Some((p50, p99, maximum)) = self.latency.percentiles() {
+            tracing::info!(
+                peer = ?self.peer,
+                samples = self.latency.total,
+                p50_ms = p50.as_secs_f64() * 1000.0,
+                p99_ms = p99.as_secs_f64() * 1000.0,
+                max_ms = maximum.as_secs_f64() * 1000.0,
+                outstanding = self.pending.len(),
+                "interactive round trip"
+            );
+        }
+        self.latency = LatencyWindow::new("interactive RTT");
+    }
+}
+
 /// Run the session loop until the peer leaves or the link drops.
 ///
 /// Ownership model — **one global active machine** (MWB shared cursor):
@@ -622,7 +704,7 @@ impl LatencyWindow {
 pub async fn run_session<F, G, H>(
     transport: Box<dyn Transport>,
     cursor: CursorSetup,
-    captured: Option<&mut tokio::sync::mpsc::UnboundedReceiver<CapturedInput>>,
+    captured: Option<&mut InputReceiver>,
     on_input: F,
     commands: Option<&mut tokio::sync::mpsc::UnboundedReceiver<OwnershipCmd>>,
     on_ownership: G,
@@ -665,7 +747,7 @@ pub async fn run_session_live<F, G, H>(
     // Borrowed, not owned: the capture that feeds these outlives any single
     // session (it holds a portal permission that must not be re-acquired per
     // connection), so a session reads from them and hands them back.
-    mut captured: Option<&mut tokio::sync::mpsc::UnboundedReceiver<CapturedInput>>,
+    mut captured: Option<&mut InputReceiver>,
     mut on_input: F,
     mut commands: Option<&mut tokio::sync::mpsc::UnboundedReceiver<OwnershipCmd>>,
     mut report_ownership: G,
@@ -687,7 +769,8 @@ where
     // stall input on the shared channel. Falls back to a plain split for
     // transports that don't override it.
     let (tx, mut rx) = transport.split_prioritized();
-    let mut tx = LinkTx::new(tx);
+    let tx = LinkTx::new(tx);
+    let mut outbox = crate::session_outbox::SessionOutbox::new(tx.fork());
 
     // Each module on its own thread, sending through its own handle onto the
     // queue. Started before the reader so nothing it is sent can arrive before
@@ -727,7 +810,7 @@ where
     // flood of file or window traffic never sits between two input events.
     let router = module_host::router_for(&hosts);
     let reader_router = router.clone();
-    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (inbound_tx, mut inbound_rx) = inbound_channel();
     let reader_heard = last_heard.clone();
     let reader = tokio::spawn(async move {
         tracing::debug!("session reader task started");
@@ -735,9 +818,15 @@ where
         // main task observes as the channel closing (a dropped link).
         while let Ok(msg) = rx.recv().await {
             reader_heard.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-            if let Some(msg) = reader_router.route(msg) {
+            let session_message = reader_router.route(msg);
+            if let Some(error) = reader_router.error() {
+                tracing::error!(%error, "session receive queue failed");
+                inbound_tx.abort();
+                break;
+            }
+            if let Some(msg) = session_message {
                 if inbound_tx.send((msg, std::time::Instant::now())).is_err() {
-                    break; // main task gone
+                    break;
                 }
             }
         }
@@ -745,6 +834,7 @@ where
 
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut nonce: u64 = 0;
+    let mut interactive_probe = InteractiveProbe::new(peer);
 
     // Power and network state. Separate from the heartbeat because the two ask
     // different questions at different rates: liveness every five seconds,
@@ -792,9 +882,18 @@ where
     // The injector's own share of the figure above. What is left over is
     // queueing, and the two call for different fixes.
     let mut inject_call = LatencyWindow::new("injector call");
-    let mut forward_latency = LatencyWindow::new("captured->sent");
+    let mut forward_latency = LatencyWindow::new("captured->queued");
 
+    let mut prefer_local = true;
     let result = loop {
+        if let Some(error) = router.error() {
+            break Err(SessionError::Transport(TransportError::Other(error)));
+        }
+        if inbound_rx.stats().failed || captured.as_ref().is_some_and(|rx| rx.stats().failed) {
+            break Err(SessionError::Transport(TransportError::Other(
+                "input receive queue overloaded".into(),
+            )));
+        }
         if let Some(woke) = working_since.take() {
             let turn = woke.elapsed();
             if turn >= SLOW_TURN_WARN {
@@ -814,11 +913,16 @@ where
             // above it fire on their own schedule, so nothing starves.
             biased;
 
+            result = outbox.finished() => {
+                break Err(SessionError::Transport(result.err().unwrap_or(TransportError::Closed)));
+            }
+
             _ = ticker.tick() => {
                 working_since = Some(tokio::time::Instant::now());
                 inject_latency.report_if_due();
                 inject_call.report_if_due();
                 forward_latency.report_if_due();
+                interactive_probe.report();
                 // Has the peer gone quiet? Checked on the heartbeat tick, so
                 // detection costs nothing extra and lands within one interval
                 // of the deadline.
@@ -845,10 +949,12 @@ where
                         "peer is slow to respond; input and audio may lag or stutter"
                     );
                 }
-                nonce = nonce.wrapping_add(1);
-                if let Err(e) = tx.send(&Message::Heartbeat { nonce }).await {
+                nonce = nonce.wrapping_add(1) & !cursio_protocol::HEARTBEAT_ECHO;
+                let sent_at = std::time::Instant::now();
+                if let Err(e) = outbox.send(&Message::Heartbeat { nonce }).await {
                     break Err(SessionError::from(e));
                 }
+                interactive_probe.sent(nonce, sent_at);
                 tracing::trace!(nonce, "sent heartbeat");
             }
             _ = status_ticker.tick() => {
@@ -859,7 +965,7 @@ where
                 // life of the session.
                 if let Some(status) = poll_status() {
                     tracing::info!(%status, "local status changed; telling peer");
-                    if let Err(e) = tx.send(&Message::NodeStatus(status)).await {
+                    if let Err(e) = outbox.send(&Message::NodeStatus(status)).await {
                         break Err(SessionError::from(e));
                     }
                 }
@@ -883,13 +989,13 @@ where
                         am_active = role.active();
                         on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
                     }
-                    let _ = tx.send(&Message::Bye).await;
+                    let _ = outbox.send(&Message::Bye).await;
                     break Ok(());
                 }
                 let was_on = r.input_on();
                 if let Some((msg, restart)) = r.local(&latest) {
                     tracing::info!("settings changed; telling the peer");
-                    if let Err(e) = tx.send(&msg).await {
+                    if let Err(e) = outbox.send(&msg).await {
                         break Err(SessionError::from(e));
                     }
                     r.reconcile(
@@ -911,7 +1017,7 @@ where
                     am_active = role.active();
                     tracing::info!("input sharing turned off; the cursor is back on this machine");
                     on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
-                    if let Err(e) = tx.send(&Message::Grab { active: false }).await {
+                    if let Err(e) = outbox.send(&Message::Grab { active: false }).await {
                         break Err(SessionError::from(e));
                     }
                 }
@@ -961,7 +1067,7 @@ where
                         tracing::info!(am_active, driving = role.driving(), "hotkey toggled ownership");
                         on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
                         // Peer takes the opposite of our new state.
-                        if let Err(e) = tx.send(&Message::Grab { active: !am_active }).await {
+                        if let Err(e) = outbox.send(&Message::Grab { active: !am_active }).await {
                             break Err(SessionError::from(e));
                         }
                     }
@@ -992,7 +1098,7 @@ where
                             on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
                             // Peer becomes active, entering on its opposite edge.
                             let msg = Message::CrossEdge { edge: edge.opposite(), pos_norm };
-                            if let Err(e) = tx.send(&msg).await {
+                            if let Err(e) = outbox.send(&msg).await {
                                 break Err(SessionError::from(e));
                             }
                         } else {
@@ -1014,12 +1120,14 @@ where
                         role.panic();
                         am_active = role.active();
                         on_ownership(Ownership { active: am_active, panic: true, driving: role.driving() });
-                        let _ = tx.send(&Message::Grab { active: false }).await;
+                        let _ = outbox.send(&Message::Grab { active: false }).await;
                     }
                     None => commands = None,
                 }
             }
-            local = recv_maybe(&mut captured) => {
+            local = recv_captured(&mut captured),
+                if prefer_local || (inbound_rx.is_empty() && held_back.is_none()) => {
+                prefer_local = false;
                 working_since = Some(tokio::time::Instant::now());
                 match local {
                     // Forwarded only while actually driving the peer. The
@@ -1032,16 +1140,23 @@ where
                             // `captured` is an Option<&mut _>, so reborrow through
                             // it rather than handing over an &mut &mut.
                             if let Err(e) =
-                                forward_captured(&mut tx, event, captured.as_deref_mut(), &mut forward_latency).await
+                                forward_captured(&mut outbox, event, captured.as_deref_mut(), &mut forward_latency).await
                             {
                                 break Err(e);
                             }
                         }
                     }
-                    None => captured = None,
+                    None => {
+                        if captured.as_ref().is_some_and(|rx| rx.stats().failed) {
+                            break Err(SessionError::Transport(TransportError::Other("captured input queue overloaded".into())));
+                        }
+                        captured = None;
+                    },
                 }
             }
-            incoming = next_inbound(&mut held_back, &mut inbound_rx) => {
+            incoming = next_inbound(&mut held_back, &mut inbound_rx),
+                if !prefer_local || captured.as_ref().is_none_or(|rx| rx.is_empty()) => {
+                prefer_local = true;
                 working_since = Some(tokio::time::Instant::now());
                 let (incoming, read_at) = match incoming {
                     Some((msg, read_at)) => (Some(msg), read_at),
@@ -1050,11 +1165,14 @@ where
                 match incoming {
                     Some(Message::Heartbeat { nonce }) => {
                         tracing::trace!(nonce, "peer heartbeat");
+                        if nonce & cursio_protocol::HEARTBEAT_ECHO != 0 {
+                            interactive_probe.echo(nonce, std::time::Instant::now());
+                        }
                         if nonce & cursio_protocol::HEARTBEAT_ECHO == 0 {
                             let echo = Message::Heartbeat {
                                 nonce: nonce | cursio_protocol::HEARTBEAT_ECHO,
                             };
-                            if let Err(e) = tx.send(&echo).await {
+                            if let Err(e) = outbox.send(&echo).await {
                                 break Err(SessionError::from(e));
                             }
                         }
@@ -1180,6 +1298,11 @@ where
     // warning naming it, rather than holding up the reconnect. Each module's
     // handle onto the link is closed either way, so the link closes when this
     // session is done with it.
+    on_ownership(Ownership {
+        active: true,
+        panic: false,
+        driving: false,
+    });
     tracing::info!("session ending; shutting down modules");
     module_host::shut_down(hosts, module_host::MODULE_SHUTDOWN_GRACE).await;
 
@@ -1187,7 +1310,7 @@ where
     // message may still be waiting. Flush it to the wire before dropping `tx`,
     // or the drainer task gets cancelled with the goodbye still queued. No-op
     // for a plain (synchronous) sender.
-    tx.flush().await;
+    outbox.finish(SESSION_DRAIN_DEADLINE).await;
     tx.close().await;
     reader.abort();
     tracing::info!("session teardown complete");
@@ -1211,7 +1334,7 @@ where
 async fn forward_captured(
     tx: &mut dyn cursio_transport::TransportTx,
     first: CapturedInput,
-    captured: Option<&mut tokio::sync::mpsc::UnboundedReceiver<CapturedInput>>,
+    captured: Option<&mut InputReceiver>,
     latency: &mut LatencyWindow,
 ) -> Result<(), SessionError> {
     use cursio_protocol::InputEvent;
@@ -1255,8 +1378,12 @@ async fn forward_captured(
     ) -> Result<(), SessionError> {
         match input.event {
             InputEvent::PointerMotion { dx, dy } => {
-                pending.dx += dx;
-                pending.dy += dy;
+                let (x, y) = (pending.dx.checked_add(dx), pending.dy.checked_add(dy));
+                if x.is_none() || y.is_none() {
+                    flush(tx, pending, latency).await?;
+                }
+                pending.dx = pending.dx.checked_add(dx).expect("accumulator was flushed");
+                pending.dy = pending.dy.checked_add(dy).expect("accumulator was flushed");
                 pending.oldest.get_or_insert(input.at);
                 Ok(())
             }
@@ -1284,7 +1411,11 @@ async fn forward_captured(
 
     // Drain everything already queued without blocking, coalescing as we go.
     if let Some(rx) = captured {
-        loop {
+        let started = std::time::Instant::now();
+        for _ in 1..CAPTURED_INPUT_BATCH {
+            if started.elapsed() >= INPUT_PUMP_BUDGET {
+                break;
+            }
             match rx.try_recv() {
                 Ok(input) => handle(tx, input, &mut pending, latency).await?,
                 Err(TryRecvError::Empty) => break,
@@ -1303,7 +1434,7 @@ async fn forward_captured(
 /// received input first, then whatever the reader forwards.
 async fn next_inbound(
     held_back: &mut Option<(Message, std::time::Instant)>,
-    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<(Message, std::time::Instant)>,
+    inbound: &mut crate::queue::Receiver<Incoming>,
 ) -> Option<(Message, std::time::Instant)> {
     match held_back.take() {
         Some(held) => Some(held),
@@ -1334,7 +1465,7 @@ async fn next_inbound(
 fn drain_received_input(
     first: cursio_protocol::InputEvent,
     read_at: std::time::Instant,
-    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<(Message, std::time::Instant)>,
+    inbound: &mut crate::queue::Receiver<Incoming>,
     held_back: &mut Option<(Message, std::time::Instant)>,
 ) -> Vec<(cursio_protocol::InputEvent, std::time::Instant)> {
     let mut batch = Vec::new();
@@ -1365,9 +1496,11 @@ fn merge_received(
     if let (PointerMotion { dx, dy }, Some((PointerMotion { dx: sx, dy: sy }, _))) =
         (event, batch.last_mut())
     {
-        *sx = sx.saturating_add(dx);
-        *sy = sy.saturating_add(dy);
-        return;
+        if let (Some(x), Some(y)) = (sx.checked_add(dx), sy.checked_add(dy)) {
+            *sx = x;
+            *sy = y;
+            return;
+        }
     }
     batch.push((event, at));
 }
@@ -1380,6 +1513,13 @@ async fn recv_maybe<T>(
 ) -> Option<T> {
     match channel {
         Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_captured(channel: &mut Option<&mut InputReceiver>) -> Option<CapturedInput> {
+    match channel {
+        Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
     }
 }
@@ -1448,6 +1588,135 @@ mod tests {
         PeerId::from_bytes([byte; 16])
     }
 
+    struct RecordingSender(Vec<Message>);
+    #[async_trait::async_trait]
+    impl TransportTx for RecordingSender {
+        async fn send(&mut self, message: &Message) -> Result<(), TransportError> {
+            self.0.push(message.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_forwarding_yields_before_exhausting_a_large_nonmergeable_backlog() {
+        let (sender, mut receiver) = input_channel();
+        for _ in 0..1000 {
+            sender
+                .send(CapturedInput::from(cursio_protocol::InputEvent::Key {
+                    key: 1,
+                    pressed: true,
+                }))
+                .unwrap();
+        }
+        let first = receiver.try_recv().unwrap();
+        let mut output = RecordingSender(Vec::new());
+        forward_captured(
+            &mut output,
+            first,
+            Some(&mut receiver),
+            &mut LatencyWindow::new("test"),
+        )
+        .await
+        .unwrap();
+        assert!(!receiver.is_empty());
+        assert!(output.0.len() <= CAPTURED_INPUT_BATCH);
+    }
+
+    #[test]
+    fn relative_motion_overflow_splits_instead_of_losing_displacement() {
+        let now = std::time::Instant::now();
+        let mut batch = vec![(motion(i32::MAX, 0), now)];
+        merge_received(&mut batch, motion(1, 0), now);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].0, motion(i32::MAX, 0));
+        assert_eq!(batch[1].0, motion(1, 0));
+    }
+
+    struct BlockedWire {
+        incoming: tokio::sync::mpsc::Receiver<Message>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+    struct BlockedSend(Arc<tokio::sync::Notify>);
+    struct ReceiveWire(tokio::sync::mpsc::Receiver<Message>);
+    #[async_trait::async_trait]
+    impl TransportTx for BlockedSend {
+        async fn send(&mut self, _: &Message) -> Result<(), TransportError> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+    #[async_trait::async_trait]
+    impl cursio_transport::TransportRx for ReceiveWire {
+        async fn recv(&mut self) -> Result<Message, TransportError> {
+            self.0.recv().await.ok_or(TransportError::Closed)
+        }
+    }
+    #[async_trait::async_trait]
+    impl Transport for BlockedWire {
+        async fn send(&mut self, _: &Message) -> Result<(), TransportError> {
+            std::future::pending().await
+        }
+        async fn recv(&mut self) -> Result<Message, TransportError> {
+            self.incoming.recv().await.ok_or(TransportError::Closed)
+        }
+        fn kind(&self) -> &'static str {
+            "blocked-test"
+        }
+        fn split(
+            self: Box<Self>,
+        ) -> (Box<dyn TransportTx>, Box<dyn cursio_transport::TransportRx>) {
+            (
+                Box::new(BlockedSend(self.entered)),
+                Box::new(ReceiveWire(self.incoming)),
+            )
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_sender_does_not_prevent_receiving_goodbye_or_boundless_flush() {
+        let (send, incoming) = tokio::sync::mpsc::channel(1);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let wire = BlockedWire {
+            incoming,
+            entered: entered.clone(),
+        };
+        let start = tokio::time::Instant::now();
+        let (result, ()) = tokio::join!(run_heartbeat(Box::new(wire)), async {
+            entered.notified().await;
+            send.send(Message::Bye).await.unwrap();
+        });
+        assert!(matches!(result, Err(SessionError::PeerLeft)));
+        assert!(start.elapsed() <= SESSION_DRAIN_DEADLINE + Duration::from_millis(1));
+    }
+
+    #[test]
+    fn interactive_probes_match_echoes_once_and_bound_unanswered_requests() {
+        let start = std::time::Instant::now();
+        let mut probe = InteractiveProbe::new(None);
+        for nonce in 0..100 {
+            probe.sent(nonce, start);
+        }
+        assert_eq!(probe.pending.len(), 8);
+        probe.echo(
+            cursio_protocol::HEARTBEAT_ECHO | 1,
+            start + Duration::from_millis(99),
+        );
+        assert_eq!(probe.latency.total, 0);
+        probe.echo(
+            cursio_protocol::HEARTBEAT_ECHO | 99,
+            start + Duration::from_millis(12),
+        );
+        probe.echo(
+            cursio_protocol::HEARTBEAT_ECHO | 99,
+            start + Duration::from_millis(30),
+        );
+        assert_eq!(probe.latency.total, 1);
+        assert_eq!(
+            probe.latency.percentiles().unwrap().2,
+            Duration::from_millis(12)
+        );
+    }
+
     /// The figures a lag report quotes are the real percentiles of what was
     /// recorded: a single slow event shows as the max, not as the typical case.
     #[test]
@@ -1494,7 +1763,7 @@ mod tests {
             button: cursio_protocol::MouseButton::Left,
             pressed: true,
         };
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = inbound_channel();
         let first_at = std::time::Instant::now();
         for event in [motion(2, 1), click, motion(-1, 0), motion(-2, 5)] {
             tx.send((Message::Input(event), std::time::Instant::now()))
@@ -1513,7 +1782,7 @@ mod tests {
     /// the input after a `Grab` is injected at all depends on the `Grab`.
     #[test]
     fn a_handoff_ends_a_batch_of_received_input() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = inbound_channel();
         let now = std::time::Instant::now();
         tx.send((Message::Input(motion(1, 0)), now)).unwrap();
         tx.send((Message::Grab { active: false }, now)).unwrap();

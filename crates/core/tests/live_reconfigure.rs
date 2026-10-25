@@ -176,7 +176,7 @@ fn run_side(
         let registry = ModuleRegistry::new()
             .with_switches(live.switches())
             .with(Box::new(CountedFactory { census }));
-        let (_capture, mut captured) = tokio::sync::mpsc::unbounded_channel();
+        let (_capture, mut captured) = session::input_channel();
         let advertised = cursio_core::link::advertise(&registry, input);
         let negotiated = peer.negotiate(&advertised);
         let ctx = SessionCtx {

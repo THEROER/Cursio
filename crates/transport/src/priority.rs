@@ -1,14 +1,9 @@
-//! Priority multiplexing for the shared encrypted channel.
+//! Bounded priority queues for encrypted delivery.
 //!
-//! Everything — input, audio, window pixels, clipboard, files — rides one Noise
-//! link. Without scheduling, a large payload (a clipboard image, a file) sent as
-//! many back-to-back frames would sit in front of the next mouse event and the
-//! pointer would visibly lag. [`PrioritizedTx`] fixes that: [`send`] does not
-//! write to the socket, it *chunks and queues* the message by
-//! [`Message::priority`] and returns immediately. A background **drainer** owns
-//! the real socket and always emits a frame from the highest non-empty class,
-//! re-checking between every frame — so an input frame queued while a bulk
-//! transfer is draining jumps ahead of that transfer's remaining chunks.
+//! Messages are chunked and queued atomically by priority. Reliable producers
+//! wait when their class is full. A plain encrypted transport has one drainer;
+//! a resumable session has one per independent lane. Within a lane the next
+//! frame is selected by priority, so metadata cannot sit ahead of input.
 //!
 //! [`send`]: cursio_transport::TransportTx::send
 //!
@@ -22,17 +17,18 @@
 //!
 //! ## Starvation
 //!
-//! Strict priority is broken on purpose in one place: when bulk traffic has
+//! On the plain single-socket transport, strict priority is broken in one place: when bulk traffic has
 //! waited out `BULK_STARVATION_LIMIT` frames of the classes above it, one
 //! whole bulk message goes next. Control and input are exempt and still go
 //! first; see `Queues::pop_highest`.
 //!
 //! ## Latency vs. buffering
 //!
-//! Queues are unbounded but drained continuously, so steady traffic (input,
-//! audio) never accumulates — latency stays minimal, which is the whole point.
-//! Only a genuine bulk transfer builds depth, and only in its own low-priority
-//! class where it can't delay anything above it.
+//! Each class has a byte budget. Reliable producers await space; messages are
+//! admitted atomically so cancellation never leaves half a message queued.
+//! One oversized message may occupy an otherwise empty class. Independent
+//! session lanes have independent drainers, so a blocked bulk socket cannot
+//! hold the input drainer.
 //!
 //! ## Where priority stops
 //!
@@ -67,10 +63,19 @@ use tokio::sync::Notify;
 use tracing::Instrument;
 
 use crate::crypto::{chunk_plaintext, has_more_parts, seal_frame, SharedNoise};
+use crate::lane::Lane;
 use crate::{QueueDelay, TransportError, TransportTx};
 
 /// Number of priority classes (see [`Priority`]). Kept as an array index space.
 const CLASS_COUNT: usize = 6;
+const QUEUE_BYTES: [usize; CLASS_COUNT] = [
+    256 * 1024,
+    256 * 1024,
+    512 * 1024,
+    4 * 1024 * 1024,
+    1024 * 1024,
+    8 * 1024 * 1024,
+];
 
 /// Frames of higher-priority traffic that may go ahead of a waiting bulk frame
 /// before one is let through regardless.
@@ -242,6 +247,8 @@ impl FrameSink for Sealing {
 #[derive(Default)]
 struct Queues {
     classes: [VecDeque<Queued>; CLASS_COUNT],
+    in_flight: usize,
+    in_flight_at: [Option<Instant>; CLASS_COUNT],
     /// Bytes waiting in each class, kept alongside the queues so a producer can
     /// read its own backlog without walking a `VecDeque` of frames.
     queued_bytes: [usize; CLASS_COUNT],
@@ -319,6 +326,20 @@ impl Queues {
     ///
     /// Returns the class alongside the frame so the drainer can credit the
     /// bytes to it once they are on the wire.
+    fn pop_lane(&mut self, lane: Option<Lane>) -> Option<(usize, Queued)> {
+        let Some(lane) = lane else {
+            return self.pop_highest();
+        };
+        let (idx, frame) = self
+            .classes
+            .iter_mut()
+            .enumerate()
+            .filter(|(idx, _)| Lane::for_priority(CLASS_ORDER[*idx]) == lane)
+            .find_map(|(idx, queue)| queue.pop_front().map(|frame| (idx, frame)))?;
+        self.queued_bytes[idx] -= frame.frame.len();
+        Some((idx, frame))
+    }
+
     fn pop_highest(&mut self) -> Option<(usize, Queued)> {
         // A bulk frame forced through after `BULK_STARVATION_LIMIT` frames of
         // higher-priority traffic went ahead of it. One in every few dozen is
@@ -390,7 +411,7 @@ impl Queues {
 /// lets `flush` wait until the drainer has emptied the queues.
 struct Shared {
     queues: Mutex<Queues>,
-    wake: Notify,
+    wake: [Notify; Lane::COUNT],
     drained: Notify,
 }
 
@@ -419,19 +440,30 @@ struct OpenHandle(Arc<Shared>);
 pub(crate) struct QueueKick(std::sync::Weak<Shared>);
 
 impl QueueKick {
-    /// Queue `tagged` ahead of everything; `false` once the queue is gone.
-    pub(crate) fn push_control(&self, tagged: Vec<u8>) -> bool {
+    /// Queue a lane's maintenance without keeping the scheduler alive.
+    pub(crate) fn push_lane_control(&self, tagged: Vec<u8>, lane: Lane) -> bool {
         let Some(shared) = self.0.upgrade() else {
             return false;
+        };
+        let priority = match lane {
+            Lane::Interactive => Priority::Control,
+            Lane::Audio => Priority::Audio,
+            Lane::Video => Priority::Video,
+            Lane::Bulk => Priority::Bulk,
         };
         {
             let mut q = shared.queues.lock().unwrap();
             if q.closed || q.terminal_error.is_some() {
                 return false;
             }
-            q.push(class_index(Priority::Control), tagged);
+            let index = class_index(priority);
+            // Maintenance is cumulative; don't grow it behind a blocked path.
+            if q.queued_bytes[index] >= QUEUE_BYTES[index] {
+                return false;
+            }
+            q.push(index, tagged);
         }
-        shared.wake.notify_one();
+        shared.wake[lane as usize].notify_one();
         true
     }
 }
@@ -451,78 +483,90 @@ impl PrioritizedTx {
     }
 
     /// As [`Self::spawn`], writing through `sink` rather than one connection.
-    pub(crate) fn spawn_sink(mut sink: Box<dyn FrameSink>) -> Self {
+    pub(crate) fn spawn_sink(sink: Box<dyn FrameSink>) -> Self {
+        Self::spawn_workers(vec![(None, sink)])
+    }
+
+    pub(crate) fn spawn_lanes(sinks: Vec<Box<dyn FrameSink>>) -> Self {
+        Self::spawn_workers(
+            Lane::ALL
+                .into_iter()
+                .zip(sinks)
+                .map(|(lane, sink)| (Some(lane), sink))
+                .collect(),
+        )
+    }
+
+    fn spawn_workers(workers: Vec<(Option<Lane>, Box<dyn FrameSink>)>) -> Self {
         let shared = Arc::new(Shared {
             queues: Mutex::new(Queues::default()),
-            wake: Notify::new(),
+            wake: std::array::from_fn(|_| Notify::new()),
             drained: Notify::new(),
         });
-        let drain_shared = shared.clone();
-
-        // Carried into the task so the delay report names the link it is
-        // about; a spawned task otherwise starts with no span at all.
-        let span = tracing::Span::current();
-        let drainer = async move {
-            loop {
-                // Take the next frame under the lock, then release it before any
-                // await (sealing is CPU-only; the socket write is the await).
-                let (frame, closed) = {
-                    let mut q = drain_shared.queues.lock().unwrap();
-                    match q.pop_highest() {
-                        Some(f) => (Some(f), false),
-                        None => (None, q.closed),
-                    }
-                };
-
-                match frame {
-                    Some((class, queued)) => {
-                        let Queued {
-                            frame: tagged,
-                            queued_at,
-                            lossy,
-                        } = queued;
-                        let len = tagged.len();
-                        let out = OutFrame {
-                            tagged,
-                            priority: CLASS_ORDER[class],
-                            lossy,
-                        };
-                        if let Err(e) = sink.send_frame(out).await {
-                            // The link is gone; nothing more can be sent. Stop.
-                            tracing::debug!(error = %e, "prioritized drainer: link closed");
-                            drain_shared.queues.lock().unwrap().fail(e.to_string());
-                            drain_shared.drained.notify_waiters();
-                            break;
+        for (lane, mut sink) in workers {
+            let drain_shared = shared.clone();
+            let span = tracing::Span::current();
+            let drainer = async move {
+                let wake_index = lane.unwrap_or(Lane::Interactive) as usize;
+                loop {
+                    let wake = drain_shared.wake[wake_index].notified();
+                    let (frame, closed) = {
+                        let mut q = drain_shared.queues.lock().unwrap();
+                        let frame = q.pop_lane(lane);
+                        if let Some((class, queued)) = &frame {
+                            q.in_flight += 1;
+                            q.in_flight_at[*class] = Some(queued.queued_at);
                         }
-                        // Credited only now: a producer pacing itself against
-                        // this rate must see bytes the socket has taken, not
-                        // bytes we merely intended to write. The wait is
-                        // measured to the same point, since the socket
-                        // refusing more is part of what a frame waits for.
+                        (frame, q.closed)
+                    };
+                    if let Some((class, queued)) = frame {
+                        drain_shared.drained.notify_waiters();
+                        let len = queued.frame.len();
+                        let maintenance =
+                            queued.frame.first() == Some(&crate::crypto::link_tag::ACK);
+                        let out = OutFrame {
+                            tagged: queued.frame,
+                            priority: CLASS_ORDER[class],
+                            lossy: queued.lossy,
+                        };
+                        let result = sink.send_frame(out).await;
                         let finished = {
                             let mut q = drain_shared.queues.lock().unwrap();
-                            q.sent_bytes[class] += len as u64;
-                            q.record_sent(class, queued_at, Instant::now())
+                            q.in_flight -= 1;
+                            q.in_flight_at[class] = None;
+                            match result {
+                                Ok(()) if !maintenance => {
+                                    q.sent_bytes[class] += len as u64;
+                                    q.record_sent(class, queued.queued_at, Instant::now())
+                                }
+                                Ok(()) => None,
+                                Err(ref error) => {
+                                    q.fail(error.to_string());
+                                    None
+                                }
+                            }
                         };
+                        drain_shared.drained.notify_waiters();
+                        if result.is_err() {
+                            for wake in &drain_shared.wake {
+                                wake.notify_one();
+                            }
+                            break;
+                        }
                         if let Some(window) = finished {
                             log_window(&window);
                         }
-                    }
-                    None => {
-                        // Queues are empty: wake anyone blocked in `flush`.
+                    } else {
                         drain_shared.drained.notify_waiters();
                         if closed {
-                            break; // sender dropped and nothing left to flush
+                            break;
                         }
-                        // Nothing to do: park until woken by a send or close.
-                        drain_shared.wake.notified().await;
+                        wake.await;
                     }
                 }
-            }
-            drain_shared.drained.notify_waiters();
-        };
-        tokio::spawn(drainer.instrument(span));
-
+            };
+            tokio::spawn(drainer.instrument(span));
+        }
         PrioritizedTx {
             _open: Arc::new(OpenHandle(shared.clone())),
             shared,
@@ -577,24 +621,47 @@ fn log_window(window: &[QueueDelay; CLASS_COUNT]) {
 #[async_trait]
 impl TransportTx for PrioritizedTx {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        // Chunk to tagged-plaintext frames (may be one, or many for a big
-        // payload), then drop them into this message's priority class. This is
-        // the only work `send` does — no socket, no crypto — so the caller (the
-        // session loop) returns at once and never blocks behind a bulk transfer.
         let idx = class_index(msg.priority());
         let lossy = msg.is_lossy();
         let frames = chunk_plaintext(msg)?;
-        {
-            let mut q = self.shared.queues.lock().unwrap();
-            if let Some(error) = &q.terminal_error {
-                return Err(TransportError::Other(error.clone()));
+        let size: usize = frames.iter().map(Vec::len).sum();
+        loop {
+            let available = self.shared.drained.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            {
+                let mut q = self.shared.queues.lock().unwrap();
+                if let Some(error) = &q.terminal_error {
+                    return Err(TransportError::Other(error.clone()));
+                }
+                if q.closed {
+                    return Err(TransportError::Closed);
+                }
+                if q.queued_bytes[idx] + size <= QUEUE_BYTES[idx].max(size) {
+                    for frame in frames {
+                        q.push_frame(idx, frame, lossy);
+                    }
+                    // Plain encrypted transports have only the interactive
+                    // worker; resumable transports also wake the lane's worker.
+                    self.shared.wake[0].notify_one();
+                    self.shared.wake[Lane::for_priority(msg.priority()) as usize].notify_one();
+                    return Ok(());
+                }
             }
-            for f in frames {
-                q.push_frame(idx, f, lossy);
-            }
+            available.await;
         }
-        self.shared.wake.notify_one();
-        Ok(())
+    }
+
+    fn queue_age(&self, priority: Priority) -> Duration {
+        let q = self.shared.queues.lock().unwrap();
+        let index = class_index(priority);
+        q.classes[index]
+            .front()
+            .map(|f| f.queued_at)
+            .into_iter()
+            .chain(q.in_flight_at[index])
+            .min()
+            .map_or(Duration::ZERO, |at| at.elapsed())
     }
 
     fn queue_depth(&self, priority: cursio_protocol::Priority) -> crate::QueueDepth {
@@ -625,14 +692,16 @@ impl TransportTx for PrioritizedTx {
             let drained = self.shared.drained.notified();
             let done = {
                 let q = self.shared.queues.lock().unwrap();
-                q.pop_is_empty() || q.terminal_error.is_some()
+                (q.pop_is_empty() && q.in_flight == 0) || q.terminal_error.is_some()
             };
             if done {
                 return;
             }
             // Make sure the drainer is running, then wait for it to empty the
             // queues (or for the link to die, which also ends draining).
-            self.shared.wake.notify_one();
+            for wake in &self.shared.wake {
+                wake.notify_one();
+            }
             drained.await;
         }
     }
@@ -645,7 +714,9 @@ impl Drop for OpenHandle {
         if let Ok(mut q) = self.0.queues.lock() {
             q.closed = true;
         }
-        self.0.wake.notify_one();
+        for wake in &self.0.wake {
+            wake.notify_one();
+        }
     }
 }
 
@@ -935,6 +1006,61 @@ mod tests {
     use crate::test_util::MemTransport;
     use crate::{Transport, TransportRx};
     use cursio_protocol::{InputEvent, Message};
+
+    struct GatedSink(Arc<tokio::sync::Semaphore>);
+
+    #[async_trait]
+    impl FrameSink for GatedSink {
+        async fn send_frame(&mut self, _: OutFrame) -> Result<(), TransportError> {
+            self.0.acquire().await.unwrap().forget();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_backpressures_only_its_producer_and_cancellation_is_atomic() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut tx = PrioritizedTx::spawn_sink(Box::new(GatedSink(gate.clone())));
+        let message = Message::Opaque(vec![0; 1024 * 1024]);
+        tx.send(&message).await.unwrap();
+        tokio::task::yield_now().await; // the first frame is now blocked in the sink
+                                        // Eight messages minus that first frame fit; a ninth does not.
+        for _ in 0..7 {
+            tx.send(&message).await.unwrap();
+        }
+        let before = tx.queue_depth(Priority::Bulk).queued_bytes;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), tx.send(&message))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tx.queue_depth(Priority::Bulk).queued_bytes,
+            before,
+            "a cancelled admission must not queue a partial message"
+        );
+        // A bulk producer waiting for space must not hold a mutex needed by input.
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tx.send(&Message::Input(InputEvent::Key {
+                key: 1,
+                pressed: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(tx.queue_age(Priority::Bulk) >= Duration::from_millis(20));
+        // The final frame has been removed from its queue but is still blocked.
+        assert!(tokio::time::timeout(Duration::from_millis(20), tx.flush())
+            .await
+            .is_err());
+        gate.add_permits(1000);
+        tokio::time::timeout(Duration::from_secs(1), tx.flush())
+            .await
+            .unwrap();
+        assert_eq!(tx.queue_depth(Priority::Bulk).queued_bytes, 0);
+    }
 
     /// Priority-scheduled sends must still decode correctly on the far side: a
     /// bulk payload and an input event both round-trip intact through the

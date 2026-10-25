@@ -186,6 +186,16 @@ pub fn input_capture_started() {
     diagnostics::clear("input.capture");
 }
 
+/// A capture callback cannot wait for its consumer; fail safely on overload.
+pub fn capture_overloaded() {
+    raise(
+        "input.capture-overloaded".into(),
+        Severity::Warning,
+        "input capture stopped because its event queue was overloaded".into(),
+        Some("local input was released; restart Cursio to resume sharing input".into()),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

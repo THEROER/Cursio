@@ -61,6 +61,29 @@ pub use win::WinInjector;
 #[cfg(target_os = "windows")]
 pub use win_cursor::WinCursor;
 
+pub type EventSender = cursio_queue::Sender<InputEvent>;
+pub type EventReceiver = cursio_queue::Receiver<InputEvent>;
+
+fn event_channel() -> (EventSender, EventReceiver) {
+    cursio_queue::channel(
+        "raw capture",
+        4096,
+        512 * 1024,
+        |_| std::mem::size_of::<InputEvent>(),
+        |previous, next| {
+            use InputEvent::PointerMotion;
+            if let (PointerMotion { dx, dy }, PointerMotion { dx: nx, dy: ny }) = (previous, next) {
+                if let (Some(x), Some(y)) = (dx.checked_add(*nx), dy.checked_add(*ny)) {
+                    *dx = x;
+                    *dy = y;
+                    return true;
+                }
+            }
+            false
+        },
+    )
+}
+
 /// Start Windows RawInput capture. Same signature as the other platforms so
 /// callers stay platform-agnostic; the jump-zone watch lives in the mouse hook
 /// and reads the edges armed by [`set_watched_edges`].
@@ -200,7 +223,7 @@ pub struct EdgeCrossing {
 /// Both platform capture backends return this.
 pub struct CaptureHandle {
     /// Receives neutral input events from all captured devices.
-    pub events: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    pub events: EventReceiver,
     /// Receives edge-crossing signals (cursor pushed off a screen edge). Empty
     /// on backends without edge detection.
     pub edges: tokio::sync::mpsc::UnboundedReceiver<EdgeCrossing>,

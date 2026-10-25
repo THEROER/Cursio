@@ -111,6 +111,7 @@ struct HostedWindow<S> {
     /// its frames, but sending needs a transport, so `share_window` only starts
     /// the capture and the next `pump` sends this.
     offer_sent: bool,
+    last_frame: Option<std::time::Instant>,
 }
 
 /// Window transfer for one session, in whichever role(s) it ends up playing.
@@ -162,6 +163,7 @@ pub struct WindowEngine<C: WindowCapture, R: WindowRenderer> {
     /// What the peer's decoder takes, from its [`WindowMsg::VideoCaps`].
     /// Only the High profile until it says otherwise.
     peer_video: VideoCaps,
+    video_budget: crate::video_budget::VideoBudget,
     /// The user here asked to see (or stop seeing) the peer's whole screen;
     /// sent on as [`WindowMsg::RequestScreen`]. Set for a link to a phone.
     screen_asks: Option<tokio::sync::mpsc::UnboundedReceiver<bool>>,
@@ -198,6 +200,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             screen_host: ScreenHost::refusing("this machine has no remote-screen capture backend"),
             screen_view: None,
             peer_video: VideoCaps::default(),
+            video_budget: Default::default(),
             screen_asks: None,
             on_screen_request: None,
         }
@@ -335,6 +338,7 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             HostedWindow {
                 session,
                 offer_sent: false,
+                last_frame: None,
             },
         );
         Ok(id)
@@ -482,7 +486,10 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                 // the normal case (a static window emits nothing), and awaiting
                 // it here would block the whole session loop on an idle window.
                 match hosted.session.frames().try_recv() {
-                    Ok(frame) => tx.send(&Message::WindowFrame(frame)).await?,
+                    Ok(frame) => {
+                        hosted.last_frame = Some(std::time::Instant::now());
+                        tx.send(&Message::WindowFrame(frame)).await?;
+                    }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         // The capture backend ended on its own (window closed,
@@ -638,6 +645,37 @@ where
             tracing::info!(id = meta.id, "offering window to the peer");
             send_control(tx, WindowMsg::Offer(meta)).await?;
         }
+        let now = std::time::Instant::now();
+        let active: Vec<WindowId> = self
+            .hosted
+            .iter_mut()
+            .filter_map(|(id, hosted)| {
+                (!hosted.session.frames().is_empty()
+                    || hosted.last_frame.is_some_and(|at| {
+                        now.duration_since(at) < std::time::Duration::from_secs(1)
+                    }))
+                .then_some(*id)
+            })
+            .collect();
+        let screens = usize::from(self.screen_host.has_capture());
+        let count = (active.len() + screens).max(1) as u32;
+        let age = tx.queue_age(Priority::Video);
+        let bits = self.video_budget.observe(
+            tx.queue_depth(Priority::Video).sent_bytes,
+            age,
+            !active.is_empty() || screens > 0,
+            now,
+        );
+        let congested = self.video_budget.congested(now);
+        for (id, hosted) in &mut self.hosted {
+            let share = if active.contains(id) {
+                bits / count
+            } else {
+                bits
+            };
+            hosted.session.set_network_budget(share, congested);
+        }
+        self.screen_host.set_network_budget(bits / count, congested);
         self.pump_frames(tx).await?;
         self.pump_viewer(tx).await?;
         self.screen_host.pump(tx).await?;

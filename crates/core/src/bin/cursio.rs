@@ -2481,6 +2481,8 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
         // leaves nothing of its own to clean up.
         let joined = std::rc::Rc::new(std::cell::Cell::new(false));
         let joined_for_cb = joined.clone();
+        let resumable = registry.borrow().resumable_tags();
+        let offered_tags = resumable.clone();
         let mut on_identified =
             move |id: cursio_protocol::PeerId,
                   name: &str,
@@ -2498,7 +2500,9 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
                         }
                     }
                 }
-                if let cursio_core::registry::Greeted::Join(session) = reg.greeted(id, peer_tags) {
+                if let cursio_core::registry::Greeted::Join(session) =
+                    reg.greeted(id, peer_tags, &offered_tags)
+                {
                     reg.set_state(id, cursio_core::registry::PeerState::Online);
                     tracing::info!(peer = %name, "the peer called back; resuming the session");
                     joined_for_cb.set(true);
@@ -2536,7 +2540,6 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
         // either can be the one that dialled a stranger — the mesh calls a
         // machine it has never met while `--pair` is open, and used to leave
         // this empty on the assumption that a dialled peer is always trusted.
-        let resumable = registry.borrow().resumable_tags();
         let held = std::rc::Rc::new(std::cell::RefCell::new(None));
         let held_for_cb = held.clone();
         let reg_for_secured = registry.clone();
@@ -3060,7 +3063,7 @@ const KEY_ESC: u16 = 1;
 /// stray "g" doesn't reach the peer. Toggling alternates Take/Release; the
 /// session ignores a redundant one, so we don't track remote state here.
 fn spawn_hotkey_filter(
-    mut upstream: tokio::sync::mpsc::UnboundedReceiver<cursio_protocol::InputEvent>,
+    mut upstream: cursio_input::EventReceiver,
     hub: InputHub,
     grab: cursio_input::GrabControl,
 ) {
@@ -3160,6 +3163,11 @@ fn spawn_hotkey_filter(
                 }
             }
             hub.route_event(session::CapturedInput::from(event));
+        }
+        if upstream.stats().failed {
+            grab.set_mode(cursio_input::InputMode::Idle);
+            cursio_input::set_watched_edges(hub.panic().edges);
+            cursio_core::health::capture_overloaded();
         }
     });
 }
@@ -3391,7 +3399,7 @@ struct PersistentCapture {
 struct HubLink<'c> {
     capture: &'c PersistentCapture,
     token: cursio_core::input_hub::LinkToken,
-    events: tokio::sync::mpsc::UnboundedReceiver<session::CapturedInput>,
+    events: session::InputReceiver,
     commands: tokio::sync::mpsc::UnboundedReceiver<session::OwnershipCmd>,
 }
 

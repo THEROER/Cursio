@@ -248,7 +248,7 @@ async fn a_blocked_module_delays_neither_forwarded_input_nor_another_modules_sen
     audio.announce = Some(42);
     let modules: Vec<Box<dyn SessionModule>> = vec![Box::new(files), Box::new(audio)];
 
-    let (capture_tx, capture_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (capture_tx, capture_rx) = session::input_channel();
     let server_task = tokio::spawn(async move {
         let mut capture_rx = capture_rx;
         let _ = session::run_session(

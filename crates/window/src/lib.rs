@@ -180,6 +180,10 @@ pub trait CaptureSession {
     /// here from the start so the adaptive loop needs no protocol change later.
     fn on_ack(&mut self, ack: WindowFrameAck);
 
+    /// Aggregate network budget allocated to this capture, in bits/second.
+    /// Backends with adaptive encoders apply it in addition to presentation ACKs.
+    fn set_network_budget(&mut self, _bits_per_second: u32, _congested: bool) {}
+
     /// Resize the real window, because the viewer resized its surrogate.
     ///
     /// Advisory in both directions: the host may clamp the request to what the

@@ -42,14 +42,12 @@ use cursio_core::module::ModuleRegistry;
 use cursio_core::node_status::NodeStatusMonitor;
 use cursio_core::pairing_window::PairingWindow;
 use cursio_core::registry::PeerState;
-use cursio_core::session::CapturedInput;
 use cursio_core::NodeIdentity;
 use cursio_protocol::{PeerId, Position, ServiceOffer};
 use cursio_transport::discovery;
 use cursio_transport::pairing::{Role, TrustStore};
 use cursio_transport::tcp::{TcpListenerHandle, TcpTransport};
 use cursio_transport::Transport;
-use tokio::sync::mpsc::UnboundedSender;
 
 /// Where the phone stands in the layout. It never takes the cursor
 /// (`DeviceKind::Phone`), so no edge of it is ever crossed; the position only
@@ -68,7 +66,7 @@ struct Shared {
     /// Each live link's input channel, by peer: what the touchpad writes to.
     /// A phone never holds the cursor, so its session forwards everything on
     /// this channel to the peer — a touch surface needs nothing more.
-    inputs: Mutex<HashMap<PeerId, (String, UnboundedSender<CapturedInput>)>>,
+    inputs: Mutex<HashMap<PeerId, (String, cursio_core::session::InputSender)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -181,7 +179,7 @@ impl NodeHandle {
 
     /// A channel into one peer's session, for the touchpad. `None` when that
     /// peer has no live link.
-    pub fn input_to(&self, peer: &PeerId) -> Option<UnboundedSender<CapturedInput>> {
+    pub fn input_to(&self, peer: &PeerId) -> Option<cursio_core::session::InputSender> {
         lock(&self.shared.inputs)
             .get(peer)
             .map(|(_, tx)| tx.clone())
@@ -584,10 +582,10 @@ async fn run_link<T: Transport + 'static>(
     let peer_name = identified.peer.display_name.clone();
     let negotiated = identified.negotiated().clone();
     who.set(Some(peer_id));
-    let greeted = ctx
-        .registry
-        .borrow_mut()
-        .greeted(peer_id, &identified.peer.resumable);
+    let greeted =
+        ctx.registry
+            .borrow_mut()
+            .greeted(peer_id, &identified.peer.resumable, &plan.resumable);
     if let cursio_core::registry::Greeted::Join(session) = greeted {
         hold.joined.set(true);
         ctx.registry
@@ -683,7 +681,7 @@ async fn run_link<T: Transport + 'static>(
     // Offered to the touchpad only when the peer has a cursor to move. Another
     // phone has none — it injects nothing — so listing it made a target whose
     // strokes went nowhere.
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (input_tx, mut input_rx) = cursio_core::session::input_channel();
     if link.cursor.peer_takes_cursor {
         lock(&ctx.shared.inputs).insert(peer.peer_id, (peer.display_name.clone(), input_tx));
     }

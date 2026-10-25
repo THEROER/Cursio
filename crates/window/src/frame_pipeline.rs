@@ -319,6 +319,8 @@ pub struct AdaptiveQuality {
     /// size, moved by [`BitrateLadder`] on the session thread and read by the
     /// capture thread per encoded frame.
     bitrate_pct: std::sync::atomic::AtomicU32,
+    network_budget: std::sync::atomic::AtomicU32,
+    network_congested: std::sync::atomic::AtomicBool,
     acks: std::sync::Mutex<AckState>,
     /// When the capture thread last encoded video, in milliseconds since
     /// `epoch`; how the ladder tells an idle source from a congested link.
@@ -336,6 +338,8 @@ impl Default for AdaptiveQuality {
             threshold_pct: std::sync::atomic::AtomicU32::new(ThresholdLadder::MAX_PCT),
             lossless: std::sync::atomic::AtomicBool::new(false),
             bitrate_pct: std::sync::atomic::AtomicU32::new(BitrateLadder::START_PCT),
+            network_budget: std::sync::atomic::AtomicU32::new(u32::MAX),
+            network_congested: std::sync::atomic::AtomicBool::new(false),
             acks: std::sync::Mutex::new(AckState::default()),
             last_video_ms: std::sync::atomic::AtomicU64::new(0),
             sent_at: (0..SENT_TIMES_KEPT)
@@ -350,7 +354,20 @@ impl AdaptiveQuality {
     /// The bitrate a lossy stream of this size should run at now.
     pub fn bitrate(&self, width: u32, height: u32) -> u32 {
         let pct = self.bitrate_pct.load(std::sync::atomic::Ordering::Relaxed) as u64;
-        (lossy_bitrate(width, height) as u64 * pct / 100) as u32
+        let adaptive = (lossy_bitrate(width, height) as u64 * pct / 100) as u32;
+        adaptive.min(
+            self.network_budget
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    pub fn set_network_budget(&self, bits_per_second: u32, congested: bool) {
+        self.network_budget.store(
+            bits_per_second.max(64_000),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.network_congested
+            .store(congested, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The capture thread just sent a video frame.
@@ -402,6 +419,9 @@ impl AdaptiveQuality {
     /// Whether the video path may use a lossless stream.
     pub fn lossless(&self) -> bool {
         self.lossless.load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .network_congested
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record what the viewer's decoder takes.
@@ -1067,6 +1087,19 @@ mod differ_tests {
     fn put(frame: &mut [u8], w: u32, x: u32, y: u32, c: u8) {
         let i = ((y * w + x) * 4) as usize;
         frame[i..i + 4].copy_from_slice(&[c, c, c, 0xFF]);
+    }
+
+    #[test]
+    fn network_budget_caps_the_encoder_and_congestion_disables_lossless() {
+        let quality = AdaptiveQuality::default();
+        quality.set_peer_video(cursio_protocol::VideoCaps { lossless: true });
+        assert!(quality.lossless());
+        quality.set_network_budget(800_000, true);
+        assert_eq!(quality.bitrate(1920, 1080), 800_000);
+        assert!(!quality.lossless());
+        quality.set_network_budget(8_000_000, false);
+        assert_eq!(quality.bitrate(1920, 1080), 8_000_000);
+        assert!(quality.lossless());
     }
 
     #[test]

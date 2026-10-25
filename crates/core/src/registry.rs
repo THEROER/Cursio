@@ -288,6 +288,12 @@ impl PeerRegistry {
         superseded: std::rc::Rc<tokio::sync::Notify>,
     ) -> Option<u64> {
         if let Some(held) = self.links.get(&peer) {
+            // Extra lane greetings can have been sent before the session was
+            // created. Such a duplicate must not replace an authenticated
+            // session merely because its socket is newer.
+            if shape == held.shape && self.sessions.get(&peer).is_some_and(|s| !s.0.is_ended()) {
+                return None;
+            }
             if !shape.beats(held.shape, self.local, peer) {
                 return None;
             }
@@ -352,13 +358,12 @@ impl PeerRegistry {
             .collect()
     }
 
-    /// A session to `peer` is alive but has no network path: dial one, so it
-    /// resumes over the network rather than waiting out its hold or staying
-    /// on Bluetooth.
+    /// A session to `peer` is missing a healthy network lane. Dial through
+    /// the ordinary listener; the encrypted resume exchange selects the lane.
     fn needs_network_path(&self, peer: &PeerId) -> bool {
         self.sessions
             .get(peer)
-            .is_some_and(|s| !s.0.is_ended() && !s.0.paths().network)
+            .is_some_and(|s| !s.0.is_ended() && !s.0.network_complete())
     }
 
     /// A session runs over the network with no Bluetooth standby beside it.
@@ -450,7 +455,12 @@ impl PeerRegistry {
     /// ended here when it has no path left; one still carried by a path is
     /// left to the duplicate rule, since the peer may simply have greeted
     /// before that session existed.
-    pub fn greeted(&mut self, peer: PeerId, peer_tags: &[SessionTag]) -> Greeted {
+    pub fn greeted(
+        &mut self,
+        peer: PeerId,
+        peer_tags: &[SessionTag],
+        offered_tags: &[SessionTag],
+    ) -> Greeted {
         let Some(ours) = self.sessions.get(&peer).map(|s| s.0.clone()) else {
             return Greeted::Fresh;
         };
@@ -459,7 +469,14 @@ impl PeerRegistry {
             return Greeted::Fresh;
         }
         if peer_tags.contains(&ours.tag()) {
-            return Greeted::Join(ours);
+            // Use the tags actually sent in this connection's Hello. Looking
+            // only at the registry after the await can make one end send
+            // RESUME while the other creates a fresh session.
+            return if offered_tags.contains(&ours.tag()) {
+                Greeted::Join(ours)
+            } else {
+                Greeted::Fresh
+            };
         }
         let paths = ours.paths();
         if !paths.network && !paths.bluetooth {
@@ -525,7 +542,13 @@ mod tests {
 
         let (near, far, tag) = path_pair(PathKind::Network).await;
         let (_link, handle) = ResumableLink::new(near, tag);
-        let (far_link, _) = ResumableLink::new(far, tag);
+        let (far_link, far_handle) = ResumableLink::new(far, tag);
+        for _ in 1..cursio_transport::lane::Lane::COUNT {
+            let (near, far, _) = path_pair(PathKind::Network).await;
+            let (a, b) = tokio::join!(handle.attach(near), far_handle.attach(far));
+            a.unwrap();
+            b.unwrap();
+        }
         (handle, far_link)
     }
 
@@ -612,9 +635,49 @@ mod tests {
         reg.hold_session(peer(2), session.clone());
         assert_eq!(reg.resumable_tags(), vec![session.tag()]);
         assert!(matches!(
-            reg.greeted(peer(2), &[session.tag()]),
+            reg.greeted(peer(2), &[session.tag()], &[session.tag()]),
             Greeted::Join(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_crossed_lane_greeting_does_not_join_or_replace_a_new_session() {
+        let (session, _far) = held_session().await;
+        let mut reg = PeerRegistry::default();
+        let shape = LinkShape {
+            dialled: true,
+            path: crate::control::LinkPath::Network,
+        };
+        let stop = std::rc::Rc::new(tokio::sync::Notify::new());
+        let token = reg.claim_link(peer(2), shape, stop.clone()).unwrap();
+        reg.hold_session(peer(2), session.clone());
+        assert!(matches!(
+            reg.greeted(peer(2), &[session.tag()], &[]),
+            Greeted::Fresh
+        ));
+        assert!(reg.claim_link(peer(2), shape, stop.clone()).is_none());
+        assert!(!session.is_ended());
+        assert!(reg.release_link(peer(2), Some(token)));
+    }
+
+    #[tokio::test]
+    async fn a_lost_peer_session_can_replace_the_same_shape_after_path_loss() {
+        let (session, _far) = held_session().await;
+        let mut reg = PeerRegistry::default();
+        let shape = LinkShape {
+            dialled: true,
+            path: crate::control::LinkPath::Network,
+        };
+        let stop = std::rc::Rc::new(tokio::sync::Notify::new());
+        reg.claim_link(peer(2), shape, stop.clone()).unwrap();
+        reg.hold_session(peer(2), session.clone());
+        session.network_lost();
+        assert!(matches!(
+            reg.greeted(peer(2), &[], &[session.tag()]),
+            Greeted::Fresh
+        ));
+        assert!(session.is_ended());
+        assert!(reg.claim_link(peer(2), shape, stop).is_some());
     }
 
     #[tokio::test]
@@ -623,7 +686,10 @@ mod tests {
         let mut reg = PeerRegistry::default();
         reg.hold_session(peer(2), session.clone());
         session.network_lost();
-        assert!(matches!(reg.greeted(peer(2), &[]), Greeted::Fresh));
+        assert!(matches!(
+            reg.greeted(peer(2), &[], &[session.tag()]),
+            Greeted::Fresh
+        ));
         assert!(session.is_ended(), "a session nobody can resume was kept");
         assert!(reg.resumable_tags().is_empty());
     }
@@ -633,7 +699,7 @@ mod tests {
         let (session, _far) = held_session().await;
         let mut reg = PeerRegistry::default();
         reg.hold_session(peer(2), session.clone());
-        assert!(matches!(reg.greeted(peer(2), &[]), Greeted::Fresh));
+        assert!(matches!(reg.greeted(peer(2), &[], &[]), Greeted::Fresh));
         assert!(
             !session.is_ended(),
             "the peer may have greeted before the session existed"

@@ -37,6 +37,8 @@ pub struct Summary {
     pub latency: Vec<Latency>,
     /// `input_p99` of each send-queue report, in µs.
     pub queue_input_p99_us: Vec<f64>,
+    pub process_input_age_us: Vec<f64>,
+    pub process_queue_failures: usize,
     /// `video_p99` of each send-queue report that carried video, in µs.
     pub queue_video_p99_us: Vec<f64>,
     /// Stalls of the shared session loop: every link's input waited.
@@ -98,7 +100,21 @@ fn scan_line(s: &mut Summary, line: &str) {
     let took = || num(line, "took_ms").unwrap_or(0.0);
     let module = || field(line, "module").unwrap_or("?").to_string();
 
-    if has(" input latency") {
+    if has("process queue overloaded") {
+        s.process_queue_failures += 1;
+    }
+    if has("process queue health") {
+        if matches!(
+            field(line, "queue"),
+            Some("raw capture" | "captured input" | "session inbound" | "session outbound")
+        ) {
+            s.process_input_age_us.push(
+                num(line, "oldest_us")
+                    .unwrap_or(0.0)
+                    .max(num(line, "max_age_us").unwrap_or(0.0)),
+            );
+        }
+    } else if has(" input latency") {
         if let (Some(path), Some(p99)) = (field(line, "path"), num(line, "p99_us")) {
             s.latency.push(Latency {
                 path: path.to_string(),
@@ -282,10 +298,16 @@ fn latency_rows(rows: &mut Vec<Row>, m: &Machine) {
         (
             "captured->sent",
             CAPTURE_P99_MAX_US,
-            "input captured->sent p99",
+            "input captured->sent/queued p99",
         ),
     ] {
-        let reports: Vec<&Latency> = s.latency.iter().filter(|l| l.path == path).collect();
+        let reports: Vec<&Latency> = s
+            .latency
+            .iter()
+            .filter(|l| {
+                l.path == path || (path == "captured->sent" && l.path == "captured->queued")
+            })
+            .collect();
         let worst = max_of(reports.iter().map(|l| l.p99_us));
         let events: u64 = reports.iter().map(|l| l.events).sum();
         let limit_text = format!("< {:.1} ms", limit / 1000.0);
@@ -313,7 +335,23 @@ fn latency_rows(rows: &mut Vec<Row>, m: &Machine) {
             ),
         });
     }
+    rows.push(row(
+        "process queue overloads",
+        m.name,
+        s.process_queue_failures.to_string(),
+        "0".into(),
+        if s.process_queue_failures == 0 {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+    ));
     for (values, limit, name) in [
+        (
+            &s.process_input_age_us,
+            50_000.0,
+            "process input queue max age",
+        ),
         (
             &s.queue_input_p99_us,
             QUEUE_INPUT_P99_MAX_US,
@@ -669,6 +707,35 @@ mod tests {
     fn cumulative_counters_count_a_session_restart_in_full() {
         assert_eq!(growth([4.0, 10.0, 3.0, 5.0]), 6.0 + 3.0 + 2.0);
         assert_eq!(growth([7.0]), 0.0);
+    }
+
+    #[test]
+    fn process_queue_age_and_overload_are_not_hidden_by_fast_admission() {
+        let summary = summarize([
+            "t DEBUG q: process queue health queue=\"session outbound\" oldest_us=10 max_age_us=70000",
+            "t DEBUG q: process queue health queue=\"module inbox\" oldest_us=900000 max_age_us=900000",
+            "t ERROR q: process queue overloaded; terminating its stream queue=\"raw capture\"",
+            "t INFO s: input latency path=\"captured->queued\" events=128 p50_us=1 p99_us=2",
+        ]);
+        assert_eq!(summary.process_input_age_us, vec![70_000.0]);
+        assert_eq!(summary.process_queue_failures, 1);
+        let rows = evaluate(
+            &[Machine {
+                name: "m",
+                summary: &summary,
+                expects_input: Some("captured->sent"),
+            }],
+            &Probes::default(),
+        );
+        assert_eq!(
+            status_of(&rows, "process input queue max age", "m"),
+            Status::Fail
+        );
+        assert_eq!(
+            status_of(&rows, "process queue overloads", "m"),
+            Status::Fail
+        );
+        assert_eq!(status_of(&rows, "input captured->sent", "m"), Status::Pass);
     }
 
     fn status_of(rows: &[Row], check: &str, machine: &str) -> Status {

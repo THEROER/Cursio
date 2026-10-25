@@ -85,7 +85,7 @@ thread_local! {
     /// Sender for the capture window's thread. Set before the message loop
     /// starts so the window procedure (which runs on this same thread) can push
     /// translated events without threading a pointer through `WM_INPUT`.
-    static SENDER: RefCell<Option<mpsc::UnboundedSender<InputEvent>>> = const { RefCell::new(None) };
+    static SENDER: RefCell<Option<crate::EventSender>> = const { RefCell::new(None) };
 
     /// Sender for edge crossings, on the same capture thread as the hooks (the
     /// mouse hook runs on the thread that installed it). Set before the loop so
@@ -116,7 +116,7 @@ type Ready = std::sync::mpsc::Sender<Result<u32, String>>;
 /// [`crate::set_watched_edges`], so a cursor shoved off any of them fires an
 /// [`EdgeCrossing`]; with none armed, nothing fires.
 pub fn spawn_capture() -> Result<CaptureHandle, InputError> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = crate::event_channel();
     let (edges_tx, edges_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
 

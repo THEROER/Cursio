@@ -305,6 +305,16 @@ impl ScreenHost {
     }
 
     /// Send what is owed: list updates, a finished switch, then frames.
+    pub(crate) fn has_capture(&self) -> bool {
+        self.current.is_some()
+    }
+
+    pub(crate) fn set_network_budget(&mut self, bits_per_second: u32, congested: bool) {
+        if let Some((_, session)) = &mut self.current {
+            session.set_network_budget(bits_per_second, congested);
+        }
+    }
+
     pub async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
         for msg in std::mem::take(&mut self.outbox) {
             send_control(tx, msg).await?;

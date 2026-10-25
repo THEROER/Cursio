@@ -106,6 +106,7 @@ pub mod module;
 pub(crate) mod module_host;
 pub use module_host::modules_busy;
 /// The unelevated process that keeps a peer's drives where Explorer sees them.
+#[cfg(feature = "files")]
 pub mod mount_helper;
 /// The system telling the sessions their network went away.
 pub mod network_watch;
@@ -136,6 +137,7 @@ pub mod portal_setup;
 /// Whether the user is at this machine: where a phone's notification goes.
 pub mod presence;
 pub mod pressure;
+pub mod queue;
 /// Renegotiating a running link when either side's settings change.
 pub mod reconfigure;
 pub mod registry;
@@ -152,6 +154,7 @@ pub mod session;
 /// The session bus, from a thread outside the runtime.
 #[cfg(target_os = "linux")]
 pub mod session_bus;
+mod session_outbox;
 pub mod share_session;
 pub mod share_sink;
 /// Versions side by side, a `current` pointer, and the helper that switches it.
@@ -160,6 +163,8 @@ pub mod update;
 pub mod usb_node;
 #[cfg(feature = "usb")]
 pub mod usb_session;
+#[cfg(feature = "window")]
+mod video_budget;
 #[cfg(feature = "window")]
 pub mod window_session;
 

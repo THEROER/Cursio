@@ -46,7 +46,7 @@
 //! session loop and never sits between two input events.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -126,14 +126,6 @@ const SLOW_HANDLE_WARN: Duration = Duration::from_millis(20);
 /// what sends them.
 const INBOX_BATCH: usize = 64;
 
-/// Unhandled messages in one inbox that are worth a warning.
-///
-/// Inboxes are unbounded because the reader must never block — it carries the
-/// heartbeat and the cursor too — and dropping a module's message silently
-/// would be worse than holding it. A backlog this deep means the module is
-/// wedged or far behind, and memory is growing on its behalf.
-const INBOX_BACKLOG_WARN: usize = 4096;
-
 /// How long teardown waits for every module to shut down before leaving the
 /// stragglers behind.
 ///
@@ -194,6 +186,7 @@ type Slot = Arc<tokio::sync::Mutex<Option<Box<dyn TransportTx>>>>;
 pub(crate) struct LinkTx {
     slot: Slot,
     open: Arc<AtomicBool>,
+    closed: Arc<tokio::sync::Notify>,
     /// Whether `slot` belongs to this holder alone. A shared one must stay
     /// filled when one holder closes, because the others still send through
     /// it.
@@ -207,6 +200,7 @@ impl LinkTx {
         Self {
             slot: Arc::new(tokio::sync::Mutex::new(Some(tx))),
             open: Arc::new(AtomicBool::new(true)),
+            closed: Arc::new(tokio::sync::Notify::new()),
             own: true,
             sent: 0,
         }
@@ -225,6 +219,7 @@ impl LinkTx {
             None => Self {
                 slot: self.slot.clone(),
                 open: Arc::new(AtomicBool::new(true)),
+                closed: Arc::new(tokio::sync::Notify::new()),
                 own: false,
                 sent: 0,
             },
@@ -232,10 +227,11 @@ impl LinkTx {
     }
 
     /// Another reference to the same handle, for closing it from outside.
-    fn closer(&self) -> Self {
+    pub(crate) fn closer(&self) -> Self {
         Self {
             slot: self.slot.clone(),
             open: self.open.clone(),
+            closed: self.closed.clone(),
             own: self.own,
             sent: 0,
         }
@@ -243,10 +239,11 @@ impl LinkTx {
 
     /// Refuse every later send, and let go of the queue if it is ours alone.
     ///
-    /// Bounded: a module holds the slot only for the length of one `send`,
-    /// which on the priority multiplexer never waits for the socket.
+    /// Closing cancels a send awaiting queue capacity before taking its slot.
+    /// Atomic scheduler admission makes that cancellation safe.
     pub(crate) async fn close(&self) {
         self.open.store(false, Ordering::Release);
+        self.closed.notify_waiters();
         if !self.own {
             return;
         }
@@ -264,14 +261,39 @@ impl LinkTx {
 #[async_trait]
 impl TransportTx for LinkTx {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
+        let closed = self.closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
         if !self.open.load(Ordering::Acquire) {
             return Err(TransportError::Closed);
         }
-        let mut slot = self.slot.lock().await;
-        let tx = slot.as_mut().ok_or(TransportError::Closed)?;
-        tx.send(msg).await?;
+        tokio::select! {
+            biased;
+            () = &mut closed => return Err(TransportError::Closed),
+            result = async {
+                let mut slot = self.slot.lock().await;
+                let tx = slot.as_mut().ok_or(TransportError::Closed)?;
+                tx.send(msg).await
+            } => result?,
+        }
         self.sent = self.sent.wrapping_add(1);
         Ok(())
+    }
+
+    fn queue_age(&self, priority: Priority) -> Duration {
+        self.slot
+            .try_lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|tx| tx.queue_age(priority)))
+            .unwrap_or_default()
+    }
+
+    fn queue_delay(&self, priority: Priority) -> cursio_transport::QueueDelay {
+        self.slot
+            .try_lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|tx| tx.queue_delay(priority)))
+            .unwrap_or_default()
     }
 
     fn queue_depth(&self, priority: Priority) -> QueueDepth {
@@ -395,8 +417,7 @@ pub(crate) struct ModuleFailure {
 #[derive(Clone)]
 struct Inbox {
     name: &'static str,
-    tx: mpsc::UnboundedSender<Message>,
-    backlog: Arc<AtomicUsize>,
+    tx: crate::queue::Sender<Message>,
 }
 
 /// Most messages held for one module that is not running yet.
@@ -410,6 +431,7 @@ struct Routes {
     inboxes: HashMap<ModuleId, Inbox>,
     /// Messages for a module not running here yet, in arrival order.
     parked: HashMap<ModuleId, Vec<Message>>,
+    error: Option<String>,
 }
 
 /// The reader's routing table: each module's messages to that module alone.
@@ -440,18 +462,38 @@ impl Router {
             return Some(msg);
         };
         let mut routes = self.routes();
+        if routes.error.is_some() {
+            return None;
+        }
         match routes.inboxes.get(&id) {
-            Some(inbox) => deliver(inbox, msg),
+            Some(inbox) => {
+                if let Err(error) = deliver(inbox, msg) {
+                    routes.error = Some(error.to_string());
+                }
+            }
             None => {
-                let parked = routes.parked.entry(id).or_default();
-                if parked.len() < PARKED_PER_MODULE {
-                    parked.push(msg);
+                let count: usize = routes.parked.values().map(Vec::len).sum();
+                let bytes: usize = routes
+                    .parked
+                    .values()
+                    .flatten()
+                    .map(crate::queue::message_bytes)
+                    .sum();
+                if count >= PARKED_PER_MODULE
+                    || bytes.saturating_add(crate::queue::message_bytes(&msg))
+                        > 64 * 1024 * 1024 + 256
+                {
+                    routes.error = Some(format!("parked module queue overloaded for {id}"));
                 } else {
-                    tracing::debug!(module = %id, kind = message_kind(&msg), "message for a module not running here");
+                    routes.parked.entry(id).or_default().push(msg);
                 }
             }
         }
         None
+    }
+
+    pub(crate) fn error(&self) -> Option<String> {
+        self.routes().error.clone()
     }
 
     /// Start delivering `id`'s messages to `inbox`.
@@ -465,7 +507,10 @@ impl Router {
         let parked = routes.parked.remove(&id).unwrap_or_default();
         if keep_parked {
             for msg in parked {
-                deliver(&inbox, msg);
+                if let Err(error) = deliver(&inbox, msg) {
+                    routes.error = Some(error.to_string());
+                    break;
+                }
             }
         }
         if routes.inboxes.insert(id, inbox).is_some() {
@@ -480,19 +525,37 @@ impl Router {
     }
 }
 
-fn deliver(inbox: &Inbox, msg: Message) {
-    let depth = inbox.backlog.fetch_add(1, Ordering::Relaxed) + 1;
-    if depth == INBOX_BACKLOG_WARN {
-        tracing::warn!(
-            module = inbox.name,
-            depth,
-            "module is not keeping up with the peer's messages; they are queueing"
-        );
+/// Only an overflowing inbox ends the session. A module that has already
+/// ended (its inbox closed, not failed) cannot act on anything sent after it,
+/// and ending every other module's link over that would turn one module's
+/// exit into a reconnect.
+fn deliver(inbox: &Inbox, msg: Message) -> Result<(), TransportError> {
+    if inbox.tx.send(msg).is_ok() {
+        return Ok(());
     }
-    if inbox.tx.send(msg).is_err() {
-        inbox.backlog.fetch_sub(1, Ordering::Relaxed);
-        tracing::debug!(module = inbox.name, "message for a module that has ended");
+    if inbox.tx.stats().failed {
+        return Err(TransportError::Other(format!(
+            "{} receive queue overloaded",
+            inbox.name
+        )));
     }
+    tracing::debug!(module = inbox.name, "message for a module that has ended");
+    Ok(())
+}
+
+fn module_inbox(
+    name: &'static str,
+) -> (
+    crate::queue::Sender<Message>,
+    crate::queue::Receiver<Message>,
+) {
+    crate::queue::channel(
+        name,
+        4096,
+        64 * 1024 * 1024 + 256,
+        crate::queue::message_bytes,
+        |_, _| false,
+    )
 }
 
 /// One module running on its own thread.
@@ -519,17 +582,15 @@ impl ModuleHost {
     ) -> std::io::Result<Self> {
         let name = module.name();
         let id = module.id();
-        let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
-        let backlog = Arc::new(AtomicUsize::new(0));
+        let (inbox_tx, inbox_rx) = module_inbox(name);
         let (stop_tx, stop_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
         let closer = tx.closer();
         let runtime = tokio::runtime::Handle::current();
-        let host_backlog = backlog.clone();
         let thread = std::thread::Builder::new()
             .name(format!("cursio-{name}"))
             .spawn(move || {
-                runtime.block_on(drive(module, tx, inbox_rx, host_backlog, stop_rx, failures));
+                runtime.block_on(drive(module, tx, inbox_rx, stop_rx, failures));
                 // After `drive` has dropped the module: a module's drop joins
                 // its own threads (PipeWire streams, a capture), and the next
                 // session with this peer should not start beside them.
@@ -538,11 +599,7 @@ impl ModuleHost {
         Ok(Self {
             name,
             id,
-            inbox: Inbox {
-                name,
-                tx: inbox_tx,
-                backlog,
-            },
+            inbox: Inbox { name, tx: inbox_tx },
             stop: Some(stop_tx),
             done: done_rx,
             tx: closer,
@@ -624,8 +681,7 @@ pub(crate) async fn shut_down(hosts: Vec<ModuleHost>, grace: Duration) {
 async fn drive(
     mut module: Box<dyn SessionModule>,
     mut tx: LinkTx,
-    mut inbox: mpsc::UnboundedReceiver<Message>,
-    backlog: Arc<AtomicUsize>,
+    mut inbox: crate::queue::Receiver<Message>,
     mut stop: oneshot::Receiver<()>,
     failures: mpsc::UnboundedSender<ModuleFailure>,
 ) {
@@ -682,7 +738,6 @@ async fn drive(
                 let mut next = Some(first);
                 let mut handled = 0;
                 while let Some(msg) = next.take() {
-                    backlog.fetch_sub(1, Ordering::Relaxed);
                     let started = tokio::time::Instant::now();
                     let claimed = module.handle_message(&msg);
                     let took = started.elapsed();
@@ -726,16 +781,82 @@ async fn drive(
 mod tests {
     use super::*;
 
-    fn inbox(name: &'static str) -> (Inbox, mpsc::UnboundedReceiver<Message>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (
-            Inbox {
-                name,
-                tx,
-                backlog: Arc::default(),
-            },
-            rx,
-        )
+    struct WaitingSender;
+
+    #[async_trait]
+    impl TransportTx for WaitingSender {
+        async fn send(&mut self, _: &Message) -> Result<(), TransportError> {
+            std::future::pending().await
+        }
+        fn queue_age(&self, _: Priority) -> Duration {
+            Duration::from_millis(123)
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_holder_cancels_a_send_waiting_for_queue_capacity() {
+        let mut sender = LinkTx::new(Box::new(WaitingSender));
+        assert_eq!(
+            sender.queue_age(Priority::Video),
+            Duration::from_millis(123)
+        );
+        let closer = sender.closer();
+        let pending = tokio::spawn(async move { sender.send(&Message::Bye).await });
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_millis(100), closer.close())
+            .await
+            .unwrap();
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    fn inbox(name: &'static str) -> (Inbox, crate::queue::Receiver<Message>) {
+        let (tx, rx) = module_inbox(name);
+        (Inbox { name, tx }, rx)
+    }
+
+    #[test]
+    fn a_module_overload_is_visible_to_the_session_instead_of_growing_memory() {
+        let (tx, mut rx) = crate::queue::channel(
+            "small module",
+            2,
+            1024,
+            crate::queue::message_bytes,
+            |_, _| false,
+        );
+        let router = Router::default();
+        router.insert(ModuleId::FILES, Inbox { name: "files", tx }, false);
+        for _ in 0..3 {
+            router.route(envelope(ModuleId::FILES));
+        }
+        assert!(router.error().is_some());
+        assert!(rx.stats().failed);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_message_for_a_module_that_has_ended_does_not_end_the_session() {
+        let (files, files_rx) = inbox("files");
+        let router = Router::default();
+        router.insert(ModuleId::FILES, files, false);
+        drop(files_rx);
+        assert!(router.route(envelope(ModuleId::FILES)).is_none());
+        assert!(router.error().is_none());
+    }
+
+    #[test]
+    fn parked_modules_have_an_aggregate_limit() {
+        let router = Router::default();
+        for _ in 0..=PARKED_PER_MODULE {
+            router.route(envelope(ModuleId::FILES));
+        }
+        assert!(router.error().is_some());
+        assert_eq!(
+            router.routes().parked.values().map(Vec::len).sum::<usize>(),
+            PARKED_PER_MODULE
+        );
     }
 
     fn envelope(module: ModuleId) -> Message {
@@ -795,12 +916,12 @@ mod tests {
     #[test]
     fn a_routed_message_counts_against_its_modules_backlog() {
         let (files, _rx) = inbox("files");
-        let backlog = files.backlog.clone();
+        let backlog = files.tx.clone();
         let router = Router::default();
         router.insert(ModuleId::FILES, files, false);
         router.route(envelope(ModuleId::FILES));
         router.route(envelope(ModuleId::FILES));
-        assert_eq!(backlog.load(Ordering::Relaxed), 2);
+        assert_eq!(backlog.stats().items, 2);
     }
 
     /// A module the peer announced gets what it sent ahead of the announcement

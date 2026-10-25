@@ -35,12 +35,10 @@
 //!
 //! ## Paths
 //!
-//! At most one network and one Bluetooth path at once; a newer one of a kind
-//! replaces the older (nginx's QUIC rework bounds tracked paths the same way).
-//! The network carries the session whenever it is up and healthy; Bluetooth is
-//! the standby, kept alive by a sparse keepalive because a busy Bluetooth radio
-//! costs a phone's Wi-Fi on the shared 2.4 GHz antenna and its battery. Over
-//! Bluetooth, pixels are not sent at all.
+//! Each lane has one network path, with a shared Bluetooth standby. Each
+//! lane numbers and acknowledges its own frames so an independent socket can
+//! make progress without waiting for another lane. A newer path replaces the
+//! older one for that lane. Bluetooth does not carry pixels.
 //!
 //! A path is let go of when it falls silent: three seconds for the one
 //! carrying the session, which hears an `ACK` every second, and longer for a
@@ -50,7 +48,7 @@
 //! only after a while, so a marginal link does not make it flap. That is what
 //! Linux's multipath TCP learned to do with its stale subflows.
 //!
-//! With no path left, the link holds the session for [`HOLD`] and then ends
+//! With no interactive path left, the link holds the session for [`HOLD`] and ends
 //! it, as the old link ended on a dead connection.
 
 use std::collections::{HashSet, VecDeque};
@@ -61,10 +59,11 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use async_trait::async_trait;
-use cursio_protocol::{Message, Priority, SessionTag};
+use cursio_protocol::{Message, SessionTag};
 use tokio::sync::{mpsc, Notify};
 
 use crate::crypto::{link_tag, open_frame, part_message_id, seal_frame, Reassembler, SharedNoise};
+use crate::lane::Lane;
 use crate::priority::{FrameSink, OutFrame, PrioritizedTx, QueueKick};
 use crate::{Transport, TransportError, TransportRx, TransportTx};
 
@@ -93,10 +92,9 @@ const DEGRADED_FOR: Duration = Duration::from_secs(10);
 /// How long a joining path waits for the other side's `RESUME`.
 const RESUME_WAIT: Duration = Duration::from_secs(5);
 
-/// Most bytes kept for resending. Past this the peer has stopped
-/// acknowledging for far longer than any path survives, and the session can
-/// no longer be resumed faithfully: it ends with its path, as before.
-const RESEND_CAP: usize = 64 * 1024 * 1024;
+/// Reliable bytes retained per lane. The lane waits for ACKs at this bound;
+/// other lane workers keep running.
+const RESEND_CAP: usize = 16 * 1024 * 1024;
 
 /// How often the supervisor looks at the paths.
 const TICK: Duration = Duration::from_millis(100);
@@ -113,6 +111,30 @@ pub enum PathKind {
     Network,
     /// RFCOMM to a paired device.
     Bluetooth,
+    NetworkAudio,
+    NetworkVideo,
+    NetworkBulk,
+}
+
+impl PathKind {
+    fn lane(self) -> Option<Lane> {
+        match self {
+            Self::Network => Some(Lane::Interactive),
+            Self::NetworkAudio => Some(Lane::Audio),
+            Self::NetworkVideo => Some(Lane::Video),
+            Self::NetworkBulk => Some(Lane::Bulk),
+            Self::Bluetooth => None,
+        }
+    }
+
+    fn for_lane(lane: Lane) -> Self {
+        match lane {
+            Lane::Interactive => Self::Network,
+            Lane::Audio => Self::NetworkAudio,
+            Lane::Video => Self::NetworkVideo,
+            Lane::Bulk => Self::NetworkBulk,
+        }
+    }
 }
 
 /// One connection, Noise already established, ready to carry a session.
@@ -153,6 +175,8 @@ struct PathSlot {
     last_heard: Instant,
     degraded_until: Option<Instant>,
     attached_at: Instant,
+    probe: Option<(u64, Instant)>,
+    last_probe: Instant,
     tasks: Vec<tokio::task::AbortHandle>,
 }
 
@@ -165,15 +189,17 @@ impl Drop for PathSlot {
 }
 
 #[derive(Default)]
-struct State {
+struct Delivery {
     next_seq: u64,
     unacked: VecDeque<Kept>,
     unacked_bytes: usize,
-    /// False once the resend buffer overflowed: the session can no longer
-    /// survive losing its path.
-    resendable: bool,
     peer_delivered: u64,
     delivered: u64,
+}
+
+#[derive(Default)]
+struct State {
+    lanes: [Delivery; Lane::COUNT],
     ack_due: bool,
     paths: Vec<PathSlot>,
     next_path_id: u64,
@@ -181,17 +207,23 @@ struct State {
     ended: Option<String>,
     kick: Option<QueueKick>,
     reported: Paths,
+    bulk_active: Option<Instant>,
+    next_probe: u64,
 }
 
 impl State {
-    /// The path the session is sent on: healthy before degraded, the network
-    /// before Bluetooth, the newest of a kind first.
-    fn carrying(&self, now: Instant) -> Option<&PathSlot> {
-        self.paths.iter().min_by_key(|p| {
-            let degraded = p.degraded_until.is_some_and(|until| until > now);
-            let bluetooth = p.kind == PathKind::Bluetooth;
-            (degraded, bluetooth, std::cmp::Reverse(p.attached_at))
-        })
+    fn carrying(&self, lane: Lane, now: Instant) -> Option<&PathSlot> {
+        self.paths
+            .iter()
+            .filter(|p| p.kind.lane() == Some(lane) || p.kind == PathKind::Bluetooth)
+            .min_by_key(|p| {
+                let degraded = p.degraded_until.is_some_and(|until| until > now);
+                (
+                    degraded,
+                    p.kind == PathKind::Bluetooth,
+                    std::cmp::Reverse(p.attached_at),
+                )
+            })
     }
 
     fn summary(&self) -> Paths {
@@ -201,21 +233,41 @@ impl State {
         }
     }
 
-    /// The peer delivered everything up to `delivered`: stop keeping it.
-    fn acknowledged(&mut self, delivered: u64) {
-        if delivered <= self.peer_delivered {
-            return;
+    fn acknowledged(&mut self, lane: Lane, delivered: u64) -> Option<Duration> {
+        let delivery = &mut self.lanes[lane as usize];
+        // An ACK must never acknowledge data this end has not numbered.
+        if delivered <= delivery.peer_delivered || delivered > delivery.next_seq {
+            return None;
         }
-        self.peer_delivered = delivered;
-        while self.unacked.front().is_some_and(|k| k.seq <= delivered) {
-            if let Some(kept) = self.unacked.pop_front() {
-                self.unacked_bytes -= kept.frame.len();
+        delivery.peer_delivered = delivered;
+        let mut rtt = None;
+        while delivery.unacked.front().is_some_and(|k| k.seq <= delivered) {
+            if let Some(kept) = delivery.unacked.pop_front() {
+                delivery.unacked_bytes -= kept.frame.len();
+                if let Some(at) = kept.sent_at {
+                    rtt = Some(at.elapsed());
+                }
             }
         }
+        rtt
+    }
+
+    fn delivered(&self) -> [u64; Lane::COUNT] {
+        std::array::from_fn(|i| self.lanes[i].delivered)
+    }
+
+    fn missing_lane(&self) -> Option<Lane> {
+        Lane::ALL.into_iter().find(|lane| {
+            !self.paths.iter().any(|path| {
+                path.kind.lane() == Some(*lane)
+                    && path
+                        .degraded_until
+                        .is_none_or(|until| until <= Instant::now())
+            })
+        })
     }
 }
 
-/// Told the paths whenever they change.
 type PathsObserver = Box<dyn Fn(Paths) + Send + Sync>;
 
 struct Inner {
@@ -223,9 +275,10 @@ struct Inner {
     /// Woken when the path set changes or the link ends.
     changed: Notify,
     /// Every path's reader feeds this; the session's receiver drains it.
-    inbound: mpsc::UnboundedSender<(u64, Vec<u8>)>,
+    inbound: [mpsc::Sender<(u64, Vec<u8>)>; Lane::COUNT],
     tag: SessionTag,
     observer: Mutex<Option<PathsObserver>>,
+    congestion: Mutex<crate::congestion::BackgroundRate>,
 }
 
 impl Inner {
@@ -236,7 +289,9 @@ impl Inner {
     fn kick(&self, flags: u8) {
         let kick = self.lock().kick.clone();
         if let Some(kick) = kick {
-            kick.push_control(ack_frame(0, flags));
+            for lane in Lane::ALL {
+                kick.push_lane_control(ack_frame([0; Lane::COUNT], flags), lane);
+            }
         }
     }
 
@@ -273,7 +328,11 @@ impl Inner {
             let before = state.paths.len();
             state.paths.retain(|p| p.id != id);
             let removed = state.paths.len() != before;
-            if removed && state.paths.is_empty() && state.ended.is_none() {
+            if removed
+                && state.carrying(Lane::Interactive, Instant::now()).is_none()
+                && state.ended.is_none()
+                && state.pathless_since.is_none()
+            {
                 state.pathless_since = Some(Instant::now());
             }
             removed
@@ -300,6 +359,48 @@ impl Inner {
         }
         self.changed.notify_waiters();
         self.report();
+    }
+
+    fn probe(&self, id: u64, tagged: &[u8]) {
+        let Some(nonce) = tagged
+            .get(1..)
+            .filter(|bytes| bytes.len() == 8)
+            .and_then(read_u64)
+        else {
+            return;
+        };
+        let mut state = self.lock();
+        let active = state
+            .bulk_active
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1));
+        let Some(path) = state.paths.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        if tagged[0] == link_tag::PING {
+            let mut pong = vec![link_tag::PONG];
+            pong.extend_from_slice(&nonce.to_be_bytes());
+            let _ = path.writer.try_send(pong);
+        } else if let Some((expected, at)) = path.probe {
+            if expected == nonce {
+                path.probe = None;
+                self.congestion
+                    .lock()
+                    .unwrap()
+                    .observe(at.elapsed(), Instant::now(), active);
+            }
+        }
+    }
+
+    fn acknowledge(&self, bytes: &[u8]) -> Result<(), TransportError> {
+        let delivered = read_delivered(bytes)?;
+        {
+            let mut state = self.lock();
+            for lane in Lane::ALL {
+                state.acknowledged(lane, delivered[lane as usize]);
+            }
+        }
+        self.changed.notify_waiters();
+        Ok(())
     }
 
     /// Start a path's reader and writer and add it to the session.
@@ -348,7 +449,29 @@ impl Inner {
                         if let Some(slot) = inner.lock().paths.iter_mut().find(|p| p.id == id) {
                             slot.last_heard = Instant::now();
                         }
-                        if inbound.send((id, tagged)).is_err() {
+                        if matches!(
+                            tagged.first(),
+                            Some(&link_tag::PING) | Some(&link_tag::PONG)
+                        ) {
+                            inner.probe(id, &tagged);
+                            continue;
+                        }
+                        if tagged.first() == Some(&link_tag::ACK) {
+                            if let Err(error) = inner.acknowledge(&tagged[1..]) {
+                                inner.path_failed(id, &error.to_string());
+                                return;
+                            }
+                            continue;
+                        }
+                        let Some(lane) = tagged.get(1).and_then(|v| Lane::decode(*v)) else {
+                            inner.path_failed(id, "invalid delivery lane");
+                            return;
+                        };
+                        if kind.lane().is_some_and(|expected| expected != lane) {
+                            inner.path_failed(id, "frame arrived on the wrong lane");
+                            return;
+                        }
+                        if inbound[lane as usize].send((id, tagged)).await.is_err() {
                             return;
                         }
                     }
@@ -374,9 +497,13 @@ impl Inner {
                 last_heard: now,
                 degraded_until: None,
                 attached_at: now,
+                probe: None,
+                last_probe: now,
                 tasks: vec![write.abort_handle(), read.abort_handle()],
             });
-            state.pathless_since = None;
+            if state.carrying(Lane::Interactive, now).is_some() {
+                state.pathless_since = None;
+            }
             old
         };
         for old in &replaced {
@@ -387,6 +514,9 @@ impl Inner {
             );
         }
         drop(replaced);
+        if matches!(kind, PathKind::Network | PathKind::Bluetooth) {
+            *self.congestion.lock().unwrap() = crate::congestion::BackgroundRate::default();
+        }
         tracing::info!(path = id, ?kind, "a path joined the session");
         self.changed.notify_waiters();
         self.kick(0);
@@ -394,28 +524,42 @@ impl Inner {
     }
 }
 
-fn seq_frame(seq: u64, lossy: bool, tagged: &[u8]) -> Vec<u8> {
+fn seq_frame(lane: Lane, seq: u64, lossy: bool, tagged: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(link_tag::SEQ_HEADER_LEN + tagged.len());
     frame.push(link_tag::SEQ);
+    frame.push(lane as u8);
     frame.extend_from_slice(&seq.to_be_bytes());
     frame.push(if lossy { SEQ_LOSSY } else { 0 });
     frame.extend_from_slice(tagged);
     frame
 }
 
-fn ack_frame(delivered: u64, flags: u8) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(10);
-    frame.push(link_tag::ACK);
-    frame.extend_from_slice(&delivered.to_be_bytes());
-    frame.push(flags);
+fn snapshot_frame(tag: u8, delivered: [u64; Lane::COUNT], flag: u8) -> Vec<u8> {
+    let mut frame = vec![tag];
+    for seq in delivered {
+        frame.extend_from_slice(&seq.to_be_bytes());
+    }
+    frame.push(flag);
     frame
 }
 
-fn resume_frame(delivered: u64) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(9);
-    frame.push(link_tag::RESUME);
-    frame.extend_from_slice(&delivered.to_be_bytes());
-    frame
+fn ack_frame(delivered: [u64; Lane::COUNT], flags: u8) -> Vec<u8> {
+    snapshot_frame(link_tag::ACK, delivered, flags)
+}
+
+fn resume_frame(delivered: [u64; Lane::COUNT], lane: Option<Lane>) -> Vec<u8> {
+    snapshot_frame(
+        link_tag::RESUME,
+        delivered,
+        lane.map_or(u8::MAX, |lane| lane as u8),
+    )
+}
+
+fn read_delivered(bytes: &[u8]) -> Result<[u64; Lane::COUNT], TransportError> {
+    if bytes.len() != Lane::COUNT * 8 + 1 {
+        return Err(TransportError::Other("invalid delivery snapshot".into()));
+    }
+    Ok(std::array::from_fn(|i| read_u64(&bytes[i * 8..]).unwrap()))
 }
 
 fn read_u64(bytes: &[u8]) -> Option<u64> {
@@ -426,96 +570,122 @@ fn read_u64(bytes: &[u8]) -> Option<u64> {
 /// reliable ones, and writes on whichever path carries the session.
 struct ResumableSink {
     inner: Arc<Inner>,
-    /// The path the last frame went out on; a different one now means the
-    /// session moved, and what the peer has not acknowledged goes again.
+    lane: Lane,
     last_path: Option<u64>,
+    next_bulk: Instant,
 }
 
 #[async_trait]
 impl FrameSink for ResumableSink {
     async fn send_frame(&mut self, out: OutFrame) -> Result<(), TransportError> {
+        debug_assert_eq!(Lane::for_priority(out.priority), self.lane);
+        let ack = out.tagged.first() == Some(&link_tag::ACK);
+        if !ack && !out.lossy {
+            loop {
+                let changed = self.inner.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                {
+                    let state = self.inner.lock();
+                    if let Some(why) = &state.ended {
+                        return Err(TransportError::Other(why.clone()));
+                    }
+                    if state.lanes[self.lane as usize].unacked_bytes
+                        + out.tagged.len()
+                        + link_tag::SEQ_HEADER_LEN
+                        <= RESEND_CAP
+                    {
+                        break;
+                    }
+                }
+                changed.await;
+            }
+        }
         let now = Instant::now();
-        let mut writes: Vec<(mpsc::Sender<Vec<u8>>, u64, Vec<u8>)> = Vec::new();
+        let mut writes = Vec::new();
         {
             let mut state = self.inner.lock();
             if let Some(why) = &state.ended {
                 return Err(TransportError::Other(why.clone()));
             }
-
-            let ack = out.tagged.first() == Some(&link_tag::ACK);
             let carrying = state
-                .carrying(now)
+                .carrying(self.lane, now)
                 .map(|p| (p.id, p.kind, p.writer.clone()));
-
-            // Moved to another path: resend what the peer has not delivered.
             if let Some((id, _, writer)) = &carrying {
                 if self.last_path != Some(*id) {
                     self.last_path = Some(*id);
-                    for kept in state.unacked.iter_mut() {
-                        kept.sent_at = Some(now);
-                        kept.sent_on = Some(*id);
+                    for kept in &mut state.lanes[self.lane as usize].unacked {
+                        kept.sent_at = None;
+                        kept.sent_on = None;
                         writes.push((writer.clone(), *id, kept.frame.clone()));
                     }
-                    if !writes.is_empty() {
-                        tracing::info!(
-                            path = id,
-                            frames = writes.len(),
-                            "resending what the peer has not delivered"
-                        );
-                    }
-                }
-            }
-
-            if ack {
-                let flags = out.tagged.get(9).copied().unwrap_or(0);
-                let frame = ack_frame(state.delivered, flags);
-                state.ack_due = false;
-                if flags & ACK_ALL_PATHS != 0 {
-                    for path in &state.paths {
-                        writes.push((path.writer.clone(), path.id, frame.clone()));
-                    }
-                } else if let Some((id, _, writer)) = &carrying {
-                    writes.push((writer.clone(), *id, frame));
                 }
             } else {
-                state.next_seq += 1;
-                let seq = state.next_seq;
-                let frame = seq_frame(seq, out.lossy, &out.tagged);
-                if !out.lossy && state.resendable {
-                    state.unacked_bytes += frame.len();
-                    state.unacked.push_back(Kept {
-                        seq,
-                        frame: frame.clone(),
-                        sent_at: carrying.as_ref().map(|_| now),
-                        sent_on: carrying.as_ref().map(|(id, _, _)| *id),
+                self.last_path = None;
+            }
+            if ack {
+                if self.lane == Lane::Interactive {
+                    let flags = out.tagged.get(1 + Lane::COUNT * 8).copied().unwrap_or(0);
+                    let frame = ack_frame(state.delivered(), flags);
+                    state.ack_due = false;
+                    let bluetooth_active = Lane::ALL.into_iter().any(|lane| {
+                        state
+                            .carrying(lane, now)
+                            .is_some_and(|p| p.kind == PathKind::Bluetooth)
                     });
-                    if state.unacked_bytes > RESEND_CAP {
-                        tracing::warn!(
-                            bytes = state.unacked_bytes,
-                            "the peer has stopped acknowledging; this session can no longer survive losing its connection"
-                        );
-                        state.resendable = false;
-                        state.unacked.clear();
-                        state.unacked_bytes = 0;
+                    // Cumulative snapshots may be retried, without waiting on a
+                    // full data writer. A Bluetooth standby stays quiet.
+                    for path in &state.paths {
+                        if path.kind != PathKind::Bluetooth
+                            || bluetooth_active
+                            || flags & ACK_ALL_PATHS != 0
+                        {
+                            let _ = path.writer.try_send(frame.clone());
+                        }
                     }
                 }
-                match &carrying {
-                    // Pixels do not fit through Bluetooth; the window waits
-                    // for the network and asks for a whole picture then.
-                    Some((_, PathKind::Bluetooth, _))
-                        if out.lossy && out.priority == Priority::Video => {}
-                    Some((id, _, writer)) => writes.push((writer.clone(), *id, frame)),
-                    // No path: a reliable frame waits in the resend buffer,
-                    // a lossy one is gone.
+            } else {
+                if self.lane == Lane::Bulk {
+                    state.bulk_active = Some(now);
+                }
+                let delivery = &mut state.lanes[self.lane as usize];
+                delivery.next_seq += 1;
+                let frame = seq_frame(self.lane, delivery.next_seq, out.lossy, &out.tagged);
+                if !out.lossy {
+                    delivery.unacked_bytes += frame.len();
+                    delivery.unacked.push_back(Kept {
+                        seq: delivery.next_seq,
+                        frame: frame.clone(),
+                        sent_at: None,
+                        sent_on: None,
+                    });
+                }
+                match carrying {
+                    Some((_, PathKind::Bluetooth, _)) if out.lossy && self.lane == Lane::Video => {}
+                    Some((id, _, writer)) => writes.push((writer, id, frame)),
                     None => {}
                 }
             }
         }
-
         for (writer, id, frame) in writes {
+            if self.lane == Lane::Bulk {
+                tokio::time::sleep(self.next_bulk.saturating_duration_since(Instant::now())).await;
+                let rate = self.inner.congestion.lock().unwrap().bytes_per_second();
+                self.next_bulk =
+                    Instant::now() + Duration::from_secs_f64(frame.len() as f64 / rate);
+                self.inner.lock().bulk_active = Some(Instant::now());
+            }
+            if let Some(seq) = frame.get(2..).and_then(read_u64) {
+                if let Some(kept) = self.inner.lock().lanes[self.lane as usize]
+                    .unacked
+                    .iter_mut()
+                    .find(|kept| kept.seq == seq)
+                {
+                    kept.sent_at = Some(Instant::now());
+                    kept.sent_on = Some(id);
+                }
+            }
             if writer.send(frame).await.is_err() {
-                // The writer ended with its path; what it was given is kept
-                // and goes again on the next one.
                 self.inner.path_failed(id, "its writer stopped");
             }
         }
@@ -526,12 +696,12 @@ impl FrameSink for ResumableSink {
 /// The session's receiving end: frames from every path, in order, once each.
 pub struct ResumableRx {
     inner: Arc<Inner>,
-    inbound: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
-    reasm: Reassembler,
+    inbound: [mpsc::Receiver<(u64, Vec<u8>)>; Lane::COUNT],
+    reasm: [Reassembler; Lane::COUNT],
     /// Chunked lossy messages part-way through reassembly.
-    lossy_parts: HashSet<u32>,
+    lossy_parts: [HashSet<u32>; Lane::COUNT],
     /// The path the last numbered frame came on.
-    last_path: Option<u64>,
+    last_path: [Option<u64>; Lane::COUNT],
 }
 
 impl ResumableRx {
@@ -544,44 +714,48 @@ impl ResumableRx {
         };
         match tag {
             link_tag::SEQ => {
-                let seq =
-                    read_u64(rest).ok_or_else(|| TransportError::Other("truncated SEQ".into()))?;
-                let lossy = rest.get(8).is_some_and(|f| f & SEQ_LOSSY != 0);
-                let frame = rest.get(9..).unwrap_or_default();
+                let lane = rest
+                    .first()
+                    .and_then(|v| Lane::decode(*v))
+                    .ok_or_else(|| TransportError::Other("invalid SEQ lane".into()))?;
+                if rest.len() < 10 {
+                    return Err(TransportError::Other("truncated SEQ".into()));
+                }
+                let seq = read_u64(&rest[1..]).unwrap();
+                let lossy = rest[9] & SEQ_LOSSY != 0;
+                let frame = &rest[10..];
+                let index = lane as usize;
                 {
                     let mut state = self.inner.lock();
-                    if seq <= state.delivered {
+                    let delivery = &mut state.lanes[index];
+                    if seq <= delivery.delivered {
                         return Ok(None);
                     }
-                    state.delivered = seq;
+                    delivery.delivered = seq;
                     state.ack_due = true;
                 }
-                if self.last_path.is_some_and(|last| last != path) {
-                    // Whatever lossy message was mid-way on the old path
-                    // will never be finished.
-                    for id in self.lossy_parts.drain() {
-                        self.reasm.forget(id);
+                if self.last_path[index].is_some_and(|last| last != path) {
+                    for id in self.lossy_parts[index].drain() {
+                        self.reasm[index].forget(id);
                     }
                 }
-                self.last_path = Some(path);
+                self.last_path[index] = Some(path);
                 let part = part_message_id(frame);
                 if lossy {
                     if let Some(id) = part {
-                        self.lossy_parts.insert(id);
+                        self.lossy_parts[index].insert(id);
                     }
                 }
-                let message = self.reasm.accept(frame)?;
+                let message = self.reasm[index].accept(frame)?;
                 if message.is_some() {
                     if let Some(id) = part {
-                        self.lossy_parts.remove(&id);
+                        self.lossy_parts[index].remove(&id);
                     }
                 }
                 Ok(message)
             }
             link_tag::ACK | link_tag::RESUME => {
-                if let Some(delivered) = read_u64(rest) {
-                    self.inner.lock().acknowledged(delivered);
-                }
+                self.inner.acknowledge(rest)?;
                 Ok(None)
             }
             other => Err(TransportError::Other(format!(
@@ -597,29 +771,34 @@ impl TransportRx for ResumableRx {
         loop {
             let inner = self.inner.clone();
             let changed = inner.changed.notified();
-            match self.inbound.try_recv() {
-                Ok((path, tagged)) => {
-                    if let Some(msg) = self.accept(path, &tagged)? {
-                        return Ok(msg);
-                    }
-                    continue;
+            let item = self
+                .inbound
+                .iter_mut()
+                .find_map(|queue| queue.try_recv().ok());
+            if let Some((path, tagged)) = item {
+                if let Some(msg) = self.accept(path, &tagged)? {
+                    return Ok(msg);
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => return Err(TransportError::Closed),
-                Err(mpsc::error::TryRecvError::Empty) => {}
+                continue;
             }
             if self.inner.lock().ended.is_some() {
                 return Err(TransportError::Closed);
             }
-            tokio::select! {
-                item = self.inbound.recv() => match item {
-                    Some((path, tagged)) => {
-                        if let Some(msg) = self.accept(path, &tagged)? {
-                            return Ok(msg);
-                        }
-                    }
-                    None => return Err(TransportError::Closed),
-                },
-                () = changed => {}
+            let [interactive, audio, video, bulk] = &mut self.inbound;
+            let item = tokio::select! {
+                biased;
+                item = interactive.recv() => item,
+                item = audio.recv() => item,
+                item = video.recv() => item,
+                item = bulk.recv() => item,
+                () = changed => continue,
+            };
+            if let Some((path, tagged)) = item {
+                if let Some(msg) = self.accept(path, &tagged)? {
+                    return Ok(msg);
+                }
+            } else {
+                return Err(TransportError::Closed);
             }
         }
     }
@@ -644,9 +823,12 @@ async fn supervise(weak: Weak<Inner>) {
             if state.ended.is_some() {
                 return;
             }
-            let carrying = state.carrying(now).map(|p| p.id);
+            let carrying: Vec<u64> = Lane::ALL
+                .into_iter()
+                .filter_map(|lane| state.carrying(lane, now).map(|p| p.id))
+                .collect();
             for path in &state.paths {
-                let limit = if Some(path.id) == carrying {
+                let limit = if carrying.contains(&path.id) {
                     ACTIVE_SILENCE
                 } else {
                     STANDBY_SILENCE
@@ -656,9 +838,9 @@ async fn supervise(weak: Weak<Inner>) {
                     silent.push((path.id, quiet));
                 }
             }
-            if let Some(id) = carrying {
+            for id in carrying {
                 let stalled = state.paths.len() > 1
-                    && state.unacked.iter().any(|k| {
+                    && state.lanes.iter().flat_map(|d| d.unacked.iter()).any(|k| {
                         k.sent_on == Some(id)
                             && k.sent_at.is_some_and(|at| now.duration_since(at) > STALL)
                     });
@@ -669,20 +851,48 @@ async fn supervise(weak: Weak<Inner>) {
                     }
                 }
             }
-            if state.paths.is_empty() {
-                if !state.resendable {
-                    end = Some(
-                        "its connection dropped with more unacknowledged than can be kept"
-                            .to_string(),
-                    );
-                } else if state
+            if state.carrying(Lane::Interactive, now).is_none()
+                && state
                     .pathless_since
                     .is_some_and(|since| now.duration_since(since) > HOLD)
+            {
+                end = Some(format!(
+                    "no connection came back within {} s",
+                    HOLD.as_secs()
+                ));
+            }
+            let interval = if state
+                .bulk_active
+                .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+            {
+                Duration::from_millis(200)
+            } else {
+                ACK_EVERY
+            };
+            let probe_path = state.carrying(Lane::Interactive, now).map(|p| p.id);
+            state.next_probe += 1;
+            let nonce = state.next_probe;
+            if let Some(path) = state.paths.iter_mut().find(|p| Some(p.id) == probe_path) {
+                if let Some((_, at)) = path.probe {
+                    if interval < ACK_EVERY && now.duration_since(at) > interval {
+                        inner
+                            .congestion
+                            .lock()
+                            .unwrap()
+                            .observe(now.duration_since(at), now, true);
+                    }
+                }
+                if now.duration_since(path.last_probe) >= interval
+                    && path
+                        .probe
+                        .is_none_or(|(_, at)| now.duration_since(at) > STALL)
                 {
-                    end = Some(format!(
-                        "no connection came back within {} s",
-                        HOLD.as_secs()
-                    ));
+                    let mut ping = vec![link_tag::PING];
+                    ping.extend_from_slice(&nonce.to_be_bytes());
+                    if path.writer.try_send(ping).is_ok() {
+                        path.probe = Some((nonce, now));
+                        path.last_probe = now;
+                    }
                 }
             }
             ack_due = state.ack_due;
@@ -753,6 +963,18 @@ impl ResumeHandle {
         self.0.lock().summary()
     }
 
+    pub fn network_complete(&self) -> bool {
+        let state = self.0.lock();
+        Lane::ALL.into_iter().all(|lane| {
+            state.paths.iter().any(|path| {
+                path.kind.lane() == Some(lane)
+                    && path
+                        .degraded_until
+                        .is_none_or(|until| until <= Instant::now())
+            })
+        })
+    }
+
     pub fn is_ended(&self) -> bool {
         self.0.lock().ended.is_some()
     }
@@ -770,7 +992,12 @@ impl ResumeHandle {
     /// The system says the network went away: let the network path go now
     /// instead of after its silence, so a standby takes over at once.
     pub fn network_lost(&self) {
-        self.release(PathKind::Network, "the system reported the network gone");
+        for lane in Lane::ALL {
+            self.release(
+                PathKind::for_lane(lane),
+                "the system reported the network gone",
+            );
+        }
     }
 
     /// Let every path of `kind` go: a Bluetooth path once the network carries
@@ -798,15 +1025,16 @@ impl ResumeHandle {
             noise,
             kind,
         } = path;
-        let delivered = {
+        let (delivered, proposed) = {
             let state = self.0.lock();
             if let Some(why) = &state.ended {
                 return Err(TransportError::Other(format!("the session is over: {why}")));
             }
-            state.delivered
+            (state.delivered(), state.missing_lane())
         };
-        tx.send(&seal_frame(&noise, &resume_frame(delivered))?)
-            .await?;
+        let mut resume = resume_frame(delivered, proposed);
+        resume.extend_from_slice(&self.tag());
+        tx.send(&seal_frame(&noise, &resume)?).await?;
         let answer = tokio::time::timeout(RESUME_WAIT, rx.recv())
             .await
             .map_err(|_| {
@@ -818,15 +1046,34 @@ impl ResumeHandle {
                 "the joining path did not open with RESUME".into(),
             ));
         }
-        let peer_delivered = read_u64(&tagged[1..])
-            .ok_or_else(|| TransportError::Other("truncated RESUME".into()))?;
-        tracing::info!(
-            delivered,
-            peer_delivered,
-            ?kind,
-            "resuming the session on a new path"
-        );
-        self.0.lock().acknowledged(peer_delivered);
+        const SNAPSHOT_LEN: usize = 1 + Lane::COUNT * 8 + 1;
+        if tagged.len() != SNAPSHOT_LEN + self.tag().len() || tagged[SNAPSHOT_LEN..] != self.tag() {
+            return Err(TransportError::Other(
+                "the path belongs to a different session".into(),
+            ));
+        }
+        let peer_delivered = read_delivered(&tagged[1..SNAPSHOT_LEN])?;
+        let peer_proposed = tagged[SNAPSHOT_LEN - 1];
+        if peer_proposed != u8::MAX && Lane::decode(peer_proposed).is_none() {
+            return Err(TransportError::Other("invalid resume lane".into()));
+        }
+        // A complete peer proposes 255, not lane zero: when just one end
+        // noticed a failed bulk path, that must still select the bulk lane.
+        let selected = proposed
+            .map_or(u8::MAX, |lane| lane as u8)
+            .min(peer_proposed);
+        let lane = Lane::decode(selected).unwrap_or(Lane::Interactive);
+        let kind = if kind == PathKind::Bluetooth {
+            kind
+        } else {
+            PathKind::for_lane(lane)
+        };
+        {
+            let mut state = self.0.lock();
+            for lane in Lane::ALL {
+                state.acknowledged(lane, peer_delivered[lane as usize]);
+            }
+        }
         self.0.install(Path {
             tx,
             rx,
@@ -848,16 +1095,17 @@ impl ResumableLink {
     /// Start a session over `first`, known to both ends as `tag`. Spawns its
     /// tasks, so it must run inside the runtime the session will.
     pub fn new(first: Path, tag: SessionTag) -> (Self, ResumeHandle) {
-        let (inbound_tx, inbound) = mpsc::unbounded_channel();
+        let channels = std::array::from_fn::<_, { Lane::COUNT }, _>(|_| mpsc::channel(16));
+        let (senders, receivers): (Vec<_>, Vec<_>) = channels.into_iter().unzip();
+        let inbound_tx = senders.try_into().ok().unwrap();
+        let inbound = receivers.try_into().ok().unwrap();
         let inner = Arc::new(Inner {
-            state: Mutex::new(State {
-                resendable: true,
-                ..State::default()
-            }),
+            state: Mutex::new(State::default()),
             changed: Notify::new(),
             inbound: inbound_tx,
             tag,
             observer: Mutex::new(None),
+            congestion: Mutex::new(crate::congestion::BackgroundRate::default()),
         });
         inner.install(first);
         live_links()
@@ -868,9 +1116,9 @@ impl ResumableLink {
         let rx = ResumableRx {
             inner: inner.clone(),
             inbound,
-            reasm: Reassembler::default(),
-            lossy_parts: HashSet::new(),
-            last_path: None,
+            reasm: std::array::from_fn(|_| Reassembler::default()),
+            lossy_parts: std::array::from_fn(|_| HashSet::new()),
+            last_path: [None; Lane::COUNT],
         };
         let handle = ResumeHandle(inner.clone());
         (
@@ -884,18 +1132,25 @@ impl ResumableLink {
     }
 
     fn sender(&mut self) -> Box<dyn TransportTx> {
-        let sink = ResumableSink {
-            inner: self.inner.clone(),
-            last_path: None,
-        };
+        let sinks: Vec<Box<dyn FrameSink>> = Lane::ALL
+            .into_iter()
+            .map(|lane| {
+                Box::new(ResumableSink {
+                    inner: self.inner.clone(),
+                    lane,
+                    last_path: None,
+                    next_bulk: Instant::now(),
+                }) as Box<dyn FrameSink>
+            })
+            .collect();
         let weak = Arc::downgrade(&self.inner);
         let holding = Arc::new(move || {
             weak.upgrade().is_some_and(|inner| {
                 let state = inner.lock();
-                state.ended.is_none() && state.paths.is_empty()
+                state.ended.is_none() && state.carrying(Lane::Interactive, Instant::now()).is_none()
             })
         });
-        let tx = PrioritizedTx::spawn_sink(Box::new(sink)).with_holding(holding);
+        let tx = PrioritizedTx::spawn_lanes(sinks).with_holding(holding);
         self.inner.lock().kick = Some(tx.kick_handle());
         Box::new(tx)
     }
@@ -974,6 +1229,12 @@ mod tests {
         let (a, b, tag) = path_pair(PathKind::Network).await;
         let (link_a, handle_a) = ResumableLink::new(a, tag);
         let (link_b, handle_b) = ResumableLink::new(b, tag);
+        for _ in 1..Lane::COUNT {
+            let (pa, pb, _) = path_pair(PathKind::Network).await;
+            let (ra, rb) = tokio::join!(handle_a.attach(pa), handle_b.attach(pb));
+            ra.unwrap();
+            rb.unwrap();
+        }
         let (tx_a, rx_a) = Box::new(link_a).split_prioritized();
         let (tx_b, rx_b) = Box::new(link_b).split_prioritized();
         (
@@ -1010,6 +1271,12 @@ mod tests {
         let (ra, rb) = tokio::join!(a.handle.attach(pa), b.handle.attach(pb));
         ra.unwrap();
         rb.unwrap();
+        while !a.handle.network_complete() {
+            let (pa, pb, _) = path_pair(PathKind::Network).await;
+            let (ra, rb) = tokio::join!(a.handle.attach(pa), b.handle.attach(pb));
+            ra.unwrap();
+            rb.unwrap();
+        }
     }
 
     async fn next(end: &mut End) -> Message {
@@ -1017,6 +1284,155 @@ mod tests {
             .await
             .expect("a message within five seconds")
             .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_maintenance_does_not_look_like_video_or_bulk_payload() {
+        let (a, _b) = session().await;
+        tokio::time::sleep(ACK_EVERY + TICK).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            a.tx.queue_depth(cursio_protocol::Priority::Video)
+                .sent_bytes,
+            0
+        );
+        assert_eq!(
+            a.tx.queue_depth(cursio_protocol::Priority::Bulk).sent_bytes,
+            0
+        );
+    }
+
+    struct BlockedTx;
+
+    #[async_trait]
+    impl TransportTx for BlockedTx {
+        async fn send(&mut self, _: &Message) -> Result<(), TransportError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_bulk_socket_does_not_block_input_audio_or_video() {
+        let (mut a, mut b) = session().await;
+        let (mut pa, pb, _) = path_pair(PathKind::NetworkBulk).await;
+        pa.tx = Box::new(BlockedTx);
+        a.handle.0.install(pa);
+        b.handle.0.install(pb);
+        a.tx.send(&Message::Opaque(vec![7; 1_000_000]))
+            .await
+            .unwrap();
+        // Enough frames to block both the socket writer and its bounded inbox.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let audio = Message::module(
+            cursio_protocol::ModuleId::AUDIO,
+            cursio_protocol::Priority::Audio,
+            &42u32,
+        )
+        .unwrap();
+        let video = Message::module(
+            cursio_protocol::ModuleId::WINDOW,
+            cursio_protocol::Priority::Video,
+            &43u32,
+        )
+        .unwrap();
+        a.tx.send(&key(8)).await.unwrap();
+        a.tx.send(&audio).await.unwrap();
+        a.tx.send(&video).await.unwrap();
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            received.push(
+                tokio::time::timeout(Duration::from_millis(500), b.rx.recv())
+                    .await
+                    .expect("another lane waited on the bulk socket")
+                    .unwrap(),
+            );
+        }
+        assert!(received.contains(&key(8)));
+        assert!(received.contains(&audio));
+        assert!(received.contains(&video));
+        assert!(!a.handle.is_ended());
+    }
+
+    #[tokio::test]
+    async fn losing_only_the_bulk_path_preserves_and_resumes_its_data() {
+        let (mut a, mut b) = session().await;
+        a.handle.release(PathKind::NetworkBulk, "test");
+        b.handle.release(PathKind::NetworkBulk, "test");
+        assert!(!a.handle.network_complete());
+        assert!(!a.tx.holding(), "the interactive path is still up");
+        let data = Message::Opaque(vec![9; 200_000]);
+        a.tx.send(&data).await.unwrap();
+        a.tx.send(&key(11)).await.unwrap();
+        assert_eq!(next(&mut b).await, key(11));
+        rejoin(&a, &b).await;
+        assert_eq!(next(&mut b).await, data);
+        assert!(a.handle.network_complete());
+    }
+
+    #[tokio::test]
+    async fn a_lane_missing_at_only_one_end_is_selected_without_replacing_control() {
+        let (a, b) = session().await;
+        let control = b
+            .handle
+            .0
+            .lock()
+            .paths
+            .iter()
+            .find(|p| p.kind == PathKind::Network)
+            .unwrap()
+            .id;
+        // Keep the old far path alive so only the near side knows it is gone.
+        let old = {
+            let mut state = a.handle.0.lock();
+            let index = state
+                .paths
+                .iter()
+                .position(|p| p.kind == PathKind::NetworkBulk)
+                .unwrap();
+            state.paths.remove(index)
+        };
+        let (pa, pb, _) = path_pair(PathKind::Network).await;
+        let (ra, rb) = tokio::join!(a.handle.attach(pa), b.handle.attach(pb));
+        ra.unwrap();
+        rb.unwrap();
+        assert!(a.handle.network_complete() && b.handle.network_complete());
+        assert_eq!(
+            b.handle
+                .0
+                .lock()
+                .paths
+                .iter()
+                .find(|p| p.kind == PathKind::Network)
+                .unwrap()
+                .id,
+            control
+        );
+        drop(old);
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_path_cannot_join_a_different_session() {
+        let (a, _) = session().await;
+        let (b, _) = session().await;
+        let (pa, pb, _) = path_pair(PathKind::Network).await;
+        let (ra, rb) = tokio::join!(a.handle.attach(pa), b.handle.attach(pb));
+        assert!(ra.is_err() && rb.is_err());
+    }
+
+    #[tokio::test]
+    async fn independent_sequence_spaces_do_not_discard_a_slower_lane() {
+        let (mut a, mut b) = session().await;
+        for n in 0..100 {
+            a.tx.send(&key(n)).await.unwrap();
+        }
+        for n in 0..100 {
+            assert_eq!(next(&mut b).await, key(n));
+        }
+        let bulk = Message::Opaque(vec![1, 2, 3]);
+        a.tx.send(&bulk).await.unwrap();
+        assert_eq!(next(&mut b).await, bulk);
     }
 
     #[tokio::test]
@@ -1149,20 +1565,20 @@ mod tests {
         let (_a, b) = session().await;
         let End { rx, handle, .. } = b;
         drop(rx);
-        let (_tx, inbound) = mpsc::unbounded_channel();
+        let inbound = std::array::from_fn(|_| mpsc::channel(16).1);
         let mut rx = ResumableRx {
             inner: handle.0.clone(),
             inbound,
-            reasm: Reassembler::default(),
-            lossy_parts: HashSet::new(),
-            last_path: None,
+            reasm: std::array::from_fn(|_| Reassembler::default()),
+            lossy_parts: std::array::from_fn(|_| HashSet::new()),
+            last_path: [None; Lane::COUNT],
         };
         let whole = |msg: &Message| {
             let mut tagged = vec![0u8];
             tagged.extend(msg.to_bytes().unwrap());
             tagged
         };
-        let frame = seq_frame(1, false, &whole(&key(1)));
+        let frame = seq_frame(Lane::Interactive, 1, false, &whole(&key(1)));
         assert_eq!(rx.accept(1, &frame).unwrap(), Some(key(1)));
         assert_eq!(
             rx.accept(2, &frame).unwrap(),

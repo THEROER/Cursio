@@ -1187,6 +1187,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "bincode",
  "clap",
  "clipboard-core",
  "cursio-airplay",
@@ -1196,6 +1197,7 @@ dependencies = [
  "cursio-input",
  "cursio-log",
  "cursio-protocol",
+ "cursio-queue",
  "cursio-transport",
  "cursio-usb",
  "cursio-window",
@@ -1250,6 +1252,7 @@ version = "0.1.0"
 dependencies = [
  "ashpd",
  "cursio-protocol",
+ "cursio-queue",
  "evdev",
  "futures-util",
  "reis",
@@ -1281,6 +1284,15 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "uuid",
+]
+
+[[package]]
+name = "cursio-queue"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

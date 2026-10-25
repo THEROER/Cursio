@@ -63,18 +63,20 @@ mod frame_tag {
 /// Tags only a resumable link writes (see [`crate::resume`]); the plain
 /// transport never sees them.
 pub(crate) mod link_tag {
-    /// `[u64 seq][u8 flags][tagged frame]`: one frame of the session, numbered
+    /// `[u8 lane][u64 seq][u8 flags][tagged frame]`: one frame of the session, numbered
     /// so the receiver drops the copies a resend produces.
     pub const SEQ: u8 = 0x02;
-    /// `[u64 delivered][u8 flags]`: the highest sequence number this side has
+    /// `[u64 delivered; 4][u8 flags]`: the highest sequence number this side has
     /// delivered. Doubles as the path's keepalive.
     pub const ACK: u8 = 0x03;
-    /// `[u64 delivered]`: the first frame on a path joining a session, after
+    /// `[u64 delivered; 4][u8 lane][u8 session_tag; 16]`: the first frame on a path joining a session, after
     /// which each side resends whatever the other has not delivered.
     pub const RESUME: u8 = 0x04;
+    pub const PING: u8 = 0x05;
+    pub const PONG: u8 = 0x06;
     /// What `SEQ` puts in front of a tagged frame: the tag, the number and
     /// the flags.
-    pub const SEQ_HEADER_LEN: usize = 1 + 8 + 1;
+    pub const SEQ_HEADER_LEN: usize = 1 + 1 + 8 + 1;
 }
 
 /// The most of a Noise message a tagged frame may fill. A resumable link
@@ -107,6 +109,9 @@ pub(crate) fn has_more_parts(tagged: &[u8]) -> bool {
 /// tag and the part header. What's left is how much of the message each frame
 /// carries.
 const MAX_CHUNK_PAYLOAD: usize = MAX_TAGGED_PLAINTEXT - 1 - PART_HEADER_LEN;
+// The frozen update lane still receives plain encrypted frames from older
+// sessions, whose smaller SEQ header left a larger chunk budget.
+const MAX_ACCEPTED_CHUNK_PAYLOAD: usize = MAX_NOISE_PLAINTEXT - 1 - PART_HEADER_LEN;
 
 /// Largest logical message accepted by the encrypted transport.
 const MAX_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -319,7 +324,7 @@ impl Reassembler {
             return Err(CryptoError::Noise("bad chunk indices".into()).into());
         }
 
-        if usize::from(part_count) > MAX_PARTS || chunk.len() > MAX_CHUNK_PAYLOAD {
+        if usize::from(part_count) > MAX_PARTS || chunk.len() > MAX_ACCEPTED_CHUNK_PAYLOAD {
             return Err(
                 CryptoError::MessageTooLarge(usize::from(part_count) * MAX_CHUNK_PAYLOAD).into(),
             );
@@ -390,6 +395,9 @@ pub struct EncryptedTransport<T: Transport> {
     handshake_hash: Vec<u8>,
 }
 
+/// A half-open handshake must not reserve a peer's session indefinitely.
+const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 impl<T: Transport> EncryptedTransport<T> {
     /// Run the Noise `NNpsk0` handshake over `inner`, then return an encrypted
     /// transport ready for application messages.
@@ -413,10 +421,21 @@ impl<T: Transport> EncryptedTransport<T> {
             Role::Responder => builder.build_responder()?,
         };
 
-        let (noise, handshake_hash) = match role {
-            Role::Initiator => Self::handshake_initiator(&mut inner, handshake).await?,
-            Role::Responder => Self::handshake_responder(&mut inner, handshake).await?,
+        let kind = inner.kind();
+        let handshake = async {
+            match role {
+                Role::Initiator => Self::handshake_initiator(&mut inner, handshake).await,
+                Role::Responder => Self::handshake_responder(&mut inner, handshake).await,
+            }
         };
+        let (noise, handshake_hash) = tokio::time::timeout(NOISE_HANDSHAKE_TIMEOUT, handshake)
+            .await
+            .map_err(|_| {
+                CryptoError::Noise(format!(
+                    "Noise handshake over {kind} timed out after {} seconds",
+                    NOISE_HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            })??;
 
         Ok(Self {
             inner,
@@ -642,6 +661,20 @@ mod tests {
     use cursio_protocol::{Hello, PeerId};
     use tokio::sync::mpsc;
 
+    #[tokio::test(start_paused = true)]
+    async fn an_unresponsive_noise_peer_times_out_and_releases_the_transport_in_both_roles() {
+        for role in [Role::Initiator, Role::Responder] {
+            let (local, mut remote) = MemTransport::pair();
+            let started = tokio::time::Instant::now();
+            let result = EncryptedTransport::establish(local, b"paired secret", role).await;
+            assert!(
+                matches!(result, Err(CryptoError::Noise(message)) if message.contains("timed out"))
+            );
+            assert_eq!(started.elapsed(), NOISE_HANDSHAKE_TIMEOUT);
+            assert!(remote.send(&Message::Heartbeat { nonce: 1 }).await.is_err());
+        }
+    }
+
     #[test]
     fn psk_derivation_is_deterministic_and_32_bytes() {
         let k1 = derive_psk(b"some-shared-secret");
@@ -794,6 +827,25 @@ mod tests {
             init_res.is_err() || resp.is_err(),
             "handshake should fail with mismatched PSKs"
         );
+    }
+
+    #[test]
+    fn the_update_lane_accepts_chunks_from_before_the_session_header_grew() {
+        let message = Message::Opaque(vec![7; 200_000]);
+        let body = message.to_bytes().unwrap();
+        let old_chunk_size = MAX_CHUNK_PAYLOAD + 1;
+        let count = body.len().div_ceil(old_chunk_size);
+        let mut reassembler = Reassembler::default();
+        let mut received = None;
+        for (index, chunk) in body.chunks(old_chunk_size).enumerate() {
+            let mut tagged = vec![frame_tag::PART];
+            tagged.extend_from_slice(&1u32.to_be_bytes());
+            tagged.extend_from_slice(&(index as u16).to_be_bytes());
+            tagged.extend_from_slice(&(count as u16).to_be_bytes());
+            tagged.extend_from_slice(chunk);
+            received = reassembler.accept(&tagged).unwrap().or(received);
+        }
+        assert_eq!(received, Some(message));
     }
 
     /// A message far larger than one Noise frame must survive a round-trip,

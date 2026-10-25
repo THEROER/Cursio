@@ -64,7 +64,9 @@ played, no video) is `SKIP`, never `PASS`.
 | check | source | limit |
 |---|---|---|
 | input received->injected p99 | `input latency path="received->injected"` | < 5 ms |
-| input captured->sent p99 | `input latency path="captured->sent"` | < 5 ms |
+| input captured->queued p99 | `input latency path="captured->queued"` (legacy: `captured->sent`) | < 5 ms |
+| process input queue max age | raw capture, captured input, session inbound/outbound queue reports | < 50 ms |
+| process queue overloads | explicit queue overload errors | 0 |
 | send queue input p99 | `send queue delay` / `input waited long enough` | < 5 ms |
 | send queue video p99 (screen) | same lines, `video_p99` | < 200 ms |
 | session loop stalls | `session loop turn was slow`, `... blocked the session loop` | none > 50 ms |
@@ -96,3 +98,8 @@ reported and abandoned rather than hanging the test.
 
 What `live-test` cannot drive yet: audio and the remote screen are only judged
 from traffic the user produces during the window.
+
+`captured->queued` ends at the session outbox admission, not at physical network
+transmission. The outbox's age and transport queue delays are measured separately;
+their percentiles must not be added to claim an end-to-end percentile. Process
+queue peaks and ages describe each ten-second reporting window.

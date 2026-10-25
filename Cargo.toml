@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/queue",
     "crates/logging",
     "crates/clipboard-core",
     "crates/transport",
@@ -28,6 +29,7 @@ repository = "https://github.com/THEROER/cursio"
 
 [workspace.dependencies]
 # Internal crates
+cursio-queue = { path = "crates/queue" }
 cursio-protocol = { path = "crates/protocol" }
 cursio-transport = { path = "crates/transport" }
 cursio-bluetooth = { path = "crates/bluetooth" }

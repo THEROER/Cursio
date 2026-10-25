@@ -83,7 +83,9 @@ pub use window::{
 /// [`InputEvent::GestureSwipe`] and [`InputEvent::GesturePinch`]. v22 added
 /// [`Hello::resumable`] and the resumable link's sequenced frames under Noise,
 /// so a session survives its connection dropping and continues on a new one.
-pub const PROTOCOL_VERSION: u16 = 22;
+/// v23 split that session over four independent lanes, each with its own
+/// connection, sequence numbers and acknowledgements (`docs/transport-design.md`).
+pub const PROTOCOL_VERSION: u16 = 23;
 
 /// Names one live session between two nodes, the same on both ends: derived
 /// from the Noise handshake that opened it. Not a secret — a connection that
