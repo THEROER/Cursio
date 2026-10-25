@@ -31,15 +31,11 @@ pub struct MirrorPacket {
     pub payload: Vec<u8>,
 }
 
-/// Consumed packets are released by advancing `start` rather than by draining
-/// the front of the buffer: at 60 fps the stream delivers thousands of packets
-/// a second, and re-copying the remainder each time dominates the decode path.
-/// The buffer is compacted once the consumed prefix is at least as large as
-/// what is left, which keeps the amortized cost per byte constant.
+/// Reads through a [`CursorBuffer`](crate::cursor_buffer::CursorBuffer): at
+/// 60 fps the stream delivers thousands of packets a second.
 #[derive(Debug, Default)]
 pub struct MirrorPacketDecoder {
-    buffered: Vec<u8>,
-    start: usize,
+    buf: crate::cursor_buffer::CursorBuffer,
 }
 
 impl MirrorPacketDecoder {
@@ -48,11 +44,9 @@ impl MirrorPacketDecoder {
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), MirrorError> {
-        if self.pending().len().saturating_add(bytes.len()) > MAX_BUFFERED_BYTES {
+        if !self.buf.push(bytes, MAX_BUFFERED_BYTES) {
             return Err(MirrorError::BufferTooLarge);
         }
-        self.compact();
-        self.buffered.extend_from_slice(bytes);
         Ok(())
     }
 
@@ -82,7 +76,7 @@ impl MirrorPacketDecoder {
         let timestamp =
             u64::from_le_bytes(pending[8..16].try_into().expect("eight-byte timestamp"));
         let payload = pending[MIRROR_HEADER_BYTES..packet_len].to_vec();
-        self.start += packet_len;
+        self.buf.consume(packet_len);
         Ok(Some(MirrorPacket {
             payload_type,
             flags,
@@ -92,20 +86,7 @@ impl MirrorPacketDecoder {
     }
 
     fn pending(&self) -> &[u8] {
-        &self.buffered[self.start..]
-    }
-
-    fn compact(&mut self) {
-        if self.start == 0 {
-            return;
-        }
-        if self.start == self.buffered.len() {
-            self.buffered.clear();
-            self.start = 0;
-        } else if self.start >= self.buffered.len() - self.start {
-            self.buffered.drain(..self.start);
-            self.start = 0;
-        }
+        self.buf.pending()
     }
 }
 
@@ -289,7 +270,7 @@ mod tests {
             assert_eq!(decoded.payload, [index as u8; 200]);
             assert!(decoder.next_packet().unwrap().is_none());
         }
-        assert!(decoder.buffered.len() <= 2 * (MIRROR_HEADER_BYTES + 200));
+        assert!(decoder.buf.held() <= 2 * (MIRROR_HEADER_BYTES + 200));
     }
 
     #[test]

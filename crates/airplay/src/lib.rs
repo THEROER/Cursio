@@ -11,6 +11,7 @@ mod audio;
 mod bonjour;
 mod config;
 pub mod crypto;
+mod cursor_buffer;
 pub mod discovery;
 mod media;
 pub mod mirror;

@@ -57,13 +57,11 @@ impl Request {
 
 /// Incremental decoder for a persistent control connection.
 ///
-/// Consumed requests are released by advancing `start`; the buffer is compacted
-/// only once the consumed prefix outgrows the remainder, so pipelined requests
-/// do not each pay for a memmove of everything behind them.
+/// Reads through a [`CursorBuffer`](crate::cursor_buffer::CursorBuffer), so
+/// pipelined requests do not each pay for a memmove of everything behind them.
 #[derive(Debug, Default)]
 pub struct RequestDecoder {
-    buffered: Vec<u8>,
-    start: usize,
+    buf: crate::cursor_buffer::CursorBuffer,
 }
 
 impl RequestDecoder {
@@ -72,11 +70,9 @@ impl RequestDecoder {
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
-        if self.pending().len().saturating_add(bytes.len()) > MAX_BUFFERED_BYTES {
+        if !self.buf.push(bytes, MAX_BUFFERED_BYTES) {
             return Err(ProtocolError::BufferTooLarge);
         }
-        self.compact();
-        self.buffered.extend_from_slice(bytes);
         Ok(())
     }
 
@@ -158,7 +154,7 @@ impl RequestDecoder {
         }
 
         let body = self.pending()[header_len..request_len].to_vec();
-        self.start += request_len;
+        self.buf.consume(request_len);
         Ok(Some(Request {
             method,
             target,
@@ -173,20 +169,7 @@ impl RequestDecoder {
     }
 
     fn pending(&self) -> &[u8] {
-        &self.buffered[self.start..]
-    }
-
-    fn compact(&mut self) {
-        if self.start == 0 {
-            return;
-        }
-        if self.start == self.buffered.len() {
-            self.buffered.clear();
-            self.start = 0;
-        } else if self.start >= self.buffered.len() - self.start {
-            self.buffered.drain(..self.start);
-            self.start = 0;
-        }
+        self.buf.pending()
     }
 }
 
