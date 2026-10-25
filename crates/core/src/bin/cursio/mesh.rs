@@ -240,7 +240,7 @@ pub(crate) async fn run_mesh(
                                 tracing::info!(peer = %gone.display_name, "no longer dialling a removed machine");
                             }
                         }
-                        publish_mesh(&control, &registry, &status);
+                        control.publish_mesh(&registry, status.borrow().current());
                         // A machine that is not trusted yet, while the window is
                         // open. This is what `join` used to be: the mesh only
                         // ever dials the trust store, so somebody has to make
@@ -351,40 +351,6 @@ pub(crate) async fn run_mesh(
             }
         })
         .await
-}
-
-/// Run one peer session on the local task set, keeping the registry's view of
-/// that peer up to date for its whole life.
-///
-/// `expected` is the peer's id when we dialled it; `None` for an inbound
-/// connection, where the identity is only known after the handshake. Either way
-/// the peer ends up `Offline` when the session finishes, so the next sweep can
-/// reconnect it.
-/// Hand the control socket what the mesh loop knows. Once per sweep: the
-/// registry is `!Send` and this is the loop that owns it.
-pub(crate) fn publish_mesh(
-    control: &cursio_core::control::NodeState,
-    registry: &cursio_core::mesh::SharedRegistry,
-    status: &SharedNodeStatus,
-) {
-    use cursio_core::control::{KnownPeerView, Presence};
-    use cursio_core::registry::PeerState;
-    control.set_local_status(status.borrow().current());
-    control.set_known(
-        registry
-            .borrow()
-            .all()
-            .map(|peer| KnownPeerView {
-                id: peer.peer_id,
-                name: peer.display_name.clone(),
-                presence: match peer.state {
-                    PeerState::Online => Presence::Online,
-                    PeerState::Connecting => Presence::Connecting,
-                    PeerState::Offline { .. } => Presence::Offline,
-                },
-            })
-            .collect(),
-    );
 }
 
 /// Serve the control socket for this node.
@@ -553,15 +519,7 @@ pub(crate) async fn start_node(
 
     // Announce ourselves so other nodes can find us. Pin mDNS to the real LAN
     // interface so VPN/virtual interfaces don't break it.
-    let instance = discovery::mdns_label(&identity.display_name, "cursio-node");
-    let announcement = discovery::announce_with(
-        identity.peer_id,
-        &identity.display_name,
-        &instance,
-        bound.port(),
-        &cursio_core::link::discovery_config(),
-    )?;
-    tracing::info!("announced on the LAN as {instance}");
+    let announcement = cursio_core::link::announce(identity, bound.port())?;
 
     // Capture comes up ONCE here, before any session: the portal permission is
     // asked a single time and survives peers coming and going. See

@@ -419,6 +419,22 @@ pub fn discovery_config() -> discovery::DiscoveryConfig {
     discovery::DiscoveryConfig::lan()
 }
 
+/// Announce this node on the LAN at `port`, pinned to the LAN interface as
+/// [`discovery_config`] pins it. The record is withdrawn when the returned
+/// announcement drops.
+pub fn announce(identity: &NodeIdentity, port: u16) -> anyhow::Result<discovery::Announcement> {
+    let instance = discovery::mdns_label(&identity.display_name, "cursio-node");
+    let announcement = discovery::announce_with(
+        identity.peer_id,
+        &identity.display_name,
+        &instance,
+        port,
+        &discovery_config(),
+    )?;
+    tracing::info!("announced on the LAN as {instance}");
+    Ok(announcement)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

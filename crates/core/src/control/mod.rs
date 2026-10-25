@@ -313,6 +313,29 @@ impl NodeState {
         }
     }
 
+    /// Publish this machine's status and every known peer as the registry
+    /// now has them. The CLI's mesh loop and the phone's node both call it
+    /// each sweep.
+    pub fn publish_mesh(&self, registry: &crate::mesh::SharedRegistry, local: NodeStatus) {
+        use crate::registry::PeerState;
+        self.set_local_status(local);
+        self.set_known(
+            registry
+                .borrow()
+                .all()
+                .map(|peer| KnownPeerView {
+                    id: peer.peer_id,
+                    name: peer.display_name.clone(),
+                    presence: match peer.state {
+                        PeerState::Online => Presence::Online,
+                        PeerState::Connecting => Presence::Connecting,
+                        PeerState::Offline { .. } => Presence::Offline,
+                    },
+                })
+                .collect(),
+        );
+    }
+
     pub fn link_up(&self, peer: PeerId, name: &str, link: LinkView) {
         crate::metrics::note_peer_status(peer, link.status);
         self.inner().links.insert(peer, (name.to_owned(), link));

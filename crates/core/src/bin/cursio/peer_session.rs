@@ -18,6 +18,13 @@ use cursio_transport::pairing::{Role, TrustStore};
 use cursio_transport::Transport;
 use std::time::Duration;
 
+/// Run one peer session on the local task set, keeping the registry's view of
+/// that peer up to date for its whole life.
+///
+/// `expected` is the peer's id when we dialled it; `None` for an inbound
+/// connection, where the identity is only known after the handshake. Either way
+/// the peer ends up `Offline` when the session finishes, so the next sweep can
+/// reconnect it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
     transport: T,

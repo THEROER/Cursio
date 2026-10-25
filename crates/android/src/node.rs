@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use cursio_core::audio_gate::MicGate;
 use cursio_core::audio_session::AudioFactory;
 use cursio_core::config::{Config, Overrides};
-use cursio_core::control::{KnownPeerView, LinkView, ModuleSwitch, NodeState, Presence};
+use cursio_core::control::{LinkView, ModuleSwitch, NodeState, Presence};
 use cursio_core::live::Shared as LiveShared;
 use cursio_core::mesh::SharedRegistry;
 use cursio_core::module::ModuleRegistry;
@@ -282,19 +282,10 @@ async fn serve(node: Node) -> anyhow::Result<()> {
     *lock(&shared.bound) = Some(bound);
     tracing::info!(%bound, "listening for peers");
 
-    let config = cursio_core::link::discovery_config();
-    let instance = discovery::mdns_label(&identity.display_name, "cursio-node");
     // Held for its `Drop`, which withdraws the mDNS record: a phone that walks
     // out of the room should stop being advertised rather than linger as an
     // address nobody can reach.
-    let _announcement = discovery::announce_with(
-        identity.peer_id,
-        &identity.display_name,
-        &instance,
-        bound.port(),
-        &config,
-    )?;
-    tracing::info!("announced on the LAN as {instance}");
+    let _announcement = cursio_core::link::announce(&identity, bound.port())?;
 
     let registry = cursio_core::mesh::registry_from_trust(identity.peer_id)?;
     for peer in registry.borrow().all() {
@@ -356,7 +347,7 @@ async fn serve(node: Node) -> anyhow::Result<()> {
 
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
     let self_id = identity.peer_id;
-    let browse_config = config.clone();
+    let browse_config = cursio_core::link::discovery_config();
     // Discovery blocks its thread, so it gets one of its own rather than the
     // only thread this runtime has.
     std::thread::Builder::new()
@@ -808,22 +799,8 @@ async fn leave_bluetooth_once_the_network_carries(hold: &LinkHold, address: &str
 
 /// Hand the control state what the mesh loop knows.
 fn publish(ctx: &NodeCtx) {
-    ctx.control.set_local_status(ctx.status.borrow().current());
-    ctx.control.set_known(
-        ctx.registry
-            .borrow()
-            .all()
-            .map(|peer| KnownPeerView {
-                id: peer.peer_id,
-                name: peer.display_name.clone(),
-                presence: match peer.state {
-                    PeerState::Online => Presence::Online,
-                    PeerState::Connecting => Presence::Connecting,
-                    PeerState::Offline { .. } => Presence::Offline,
-                },
-            })
-            .collect(),
-    );
+    ctx.control
+        .publish_mesh(&ctx.registry, ctx.status.borrow().current());
 }
 
 /// Record a sighting, and keep the notification's list current.
