@@ -4,6 +4,7 @@
  * nowhere but the phone. Phone only — the commands exist only there.
  */
 import type { PhoneAudioState, PhoneAudioTarget } from "~/composables/usePhone"
+import { gainFromSlider, sliderFromGain } from "~/utils/loudness"
 
 const OFF = "off"
 
@@ -49,13 +50,15 @@ async function refresh() {
   }
 }
 
-const percent = computed(() => Math.round((state.value?.volume ?? 1) * 100))
+/** In percent of loudness, not of gain (`utils/loudness.ts`). */
+const percent = computed(() => Math.round(sliderFromGain(state.value?.volume ?? 1)))
 
 /** Applied while dragging: the point is to hear the level change, not guess it. */
 async function setVolume(value: number) {
-  if (state.value) state.value.volume = value / 100
+  const gain = gainFromSlider(value)
+  if (state.value) state.value.volume = gain
   try {
-    await phoneAudioVolume(value / 100)
+    await phoneAudioVolume(gain)
   } catch (e) {
     toast.failure(e, { title: t("phoneAudio.volumeFailed") })
   }

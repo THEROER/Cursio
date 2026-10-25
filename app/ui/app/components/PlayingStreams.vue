@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { MAX_STREAM_VOLUME, type PlayingStream, type StreamKind } from "~/composables/useNode"
+import { gainFromSlider, sliderFromGain } from "~/utils/loudness"
 
 /**
  * `sound` is what plays out of this machine; `microphones` are peers'
@@ -25,7 +26,8 @@ const { status, setStreamVolume } = useNode()
 const { isMobile } = usePlatform()
 const toast = useCursioToast()
 
-const MAX_PERCENT = Math.round(MAX_STREAM_VOLUME * 100)
+/** The thumb's travel, in percent of loudness (`utils/loudness.ts`), not of gain. */
+const MAX_PERCENT = Math.floor(sliderFromGain(MAX_STREAM_VOLUME))
 /** Sends while dragging at most this often; the release always sends at once. */
 const DRAG_SEND_MS = 120
 const SETTLE_MS = 3000
@@ -52,7 +54,7 @@ const sendTimers = new Map<number, ReturnType<typeof setTimeout>>()
 const settleTimers = new Map<number, ReturnType<typeof setTimeout>>()
 
 function percentOf(s: PlayingStream): number {
-  return draftVolume.value[s.id] ?? Math.round(s.volume * 100)
+  return draftVolume.value[s.id] ?? Math.round(sliderFromGain(s.volume))
 }
 
 function mutedOf(s: PlayingStream): boolean {
@@ -72,7 +74,7 @@ function dropDraft(id: number) {
 
 async function send(s: PlayingStream) {
   sendTimers.delete(s.id)
-  const volume = percentOf(s) / 100
+  const volume = gainFromSlider(percentOf(s))
   const muted = mutedOf(s)
   try {
     await setStreamVolume(s.id, volume, muted)
@@ -125,7 +127,7 @@ watch(streams, (now) => {
     if (sendTimers.has(id)) continue
     const volume = draftVolume.value[id]
     const muted = draftMuted.value[id]
-    const volumeArrived = volume === undefined || Math.abs(s.volume * 100 - volume) < 0.5
+    const volumeArrived = volume === undefined || Math.abs(sliderFromGain(s.volume) - volume) < 0.5
     const muteArrived = muted === undefined || s.muted === muted
     if (volumeArrived && muteArrived) dropDraft(id)
   }
