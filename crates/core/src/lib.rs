@@ -145,6 +145,8 @@ pub mod registry;
 /// screen-sharing software here without being drawn on this desktop.
 #[cfg(feature = "window")]
 pub mod remote_screen;
+/// Where a request-and-answer module meets the rest of the node.
+pub mod request_hub;
 /// Where a capture app's request for a peer's screen meets that peer's link.
 #[cfg(feature = "window")]
 pub mod screen_hub;
