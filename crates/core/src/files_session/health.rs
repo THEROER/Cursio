@@ -20,6 +20,13 @@ pub(super) const SLOW_SERVE_WARN: Duration = Duration::from_millis(1500);
 /// interleaves the two at the same cadence.
 pub(super) const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Whether a refusal from the owner is a fault rather than an answer about
+/// the filesystem as it stands. See [`Health::refused`].
+pub(super) fn is_fault(error: &cursio_protocol::FileError) -> bool {
+    use cursio_protocol::FileError;
+    matches!(error, FileError::Io(_) | FileError::BadHandle)
+}
+
 /// What the link is measured to be doing, as opposed to what it is asked to do.
 ///
 /// Every field here answers a question that cost real time to answer by hand:
@@ -47,9 +54,15 @@ pub(super) struct Health {
     /// Bytes carried in each direction since the last report.
     pub(super) read_bytes: u64,
     pub(super) written_bytes: u64,
-    /// Requests answered, and requests that failed.
+    /// Requests answered; those that failed for a fault — the owner's I/O, a
+    /// handle it does not know — and those it turned down as the filesystem
+    /// stands: no such file, permission, an existing name. A program probing
+    /// for files that are not there is ordinary work, and counting it with
+    /// the faults made every health report after a file manager opened a
+    /// mount read as trouble.
     pub(super) answered: u64,
     pub(super) failed: u64,
+    pub(super) refused: u64,
     /// Where a write's round trip is actually spent, summed since the last
     /// report, with the count so a mean can be taken.
     ///
@@ -153,6 +166,7 @@ impl Health {
             .retain(|_, at| now.saturating_duration_since(*at) < deadline);
         self.answered = 0;
         self.failed = 0;
+        self.refused = 0;
         self.by_kind.clear();
         // An answer that never came would otherwise hold its entry for the life
         // of the session. The mount gives up after `BULK_OP_TIMEOUT` at the
@@ -236,7 +250,10 @@ impl FilesEngine {
         // Serving the peer counts as activity too. Judging by our own requests
         // alone made the module silent through exactly the case worth watching:
         // a download onto our disk, where every request is inbound.
-        let idle = self.health.answered == 0 && self.health.failed == 0 && self.served.is_empty();
+        let idle = self.health.answered == 0
+            && self.health.failed == 0
+            && self.health.refused == 0
+            && self.served.is_empty();
         if idle {
             // Nothing to report, but the clock still rolls — otherwise the next
             // burst of traffic would report against a window of hours.
@@ -281,6 +298,7 @@ impl FilesEngine {
             grows = self.pace.grows,
             ops = self.health.answered,
             failed = self.health.failed,
+            refused = self.health.refused,
             in_flight = self.pending.len(),
             // What was asked, not just how much: the mix is what says which
             // round trip to attack next.
@@ -348,5 +366,15 @@ mod tests {
         assert!(!crate::diagnostics::snapshot()
             .iter()
             .any(|p| p.id.starts_with("files.walk.4000001.")));
+    }
+
+    #[test]
+    fn a_missing_file_is_an_answer_and_an_io_error_a_fault() {
+        use cursio_protocol::FileError;
+        assert!(!is_fault(&FileError::NotFound));
+        assert!(!is_fault(&FileError::Denied));
+        assert!(!is_fault(&FileError::Exists));
+        assert!(is_fault(&FileError::Io("disk gone".into())));
+        assert!(is_fault(&FileError::BadHandle));
     }
 }

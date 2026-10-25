@@ -388,7 +388,11 @@ impl FilesEngine {
             self.health.read_bytes += bytes.plain_len() as u64;
         }
         if let FilesMsg::Failed { error, .. } = &msg {
-            self.health.failed += 1;
+            if super::health::is_fault(error) {
+                self.health.failed += 1;
+            } else {
+                self.health.refused += 1;
+            }
             // Logged, not just counted. A failure rate says something is wrong;
             // only the reason says what, and an operation the peer refuses
             // leaves no trace on this side otherwise — the count alone had me

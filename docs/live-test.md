@@ -73,7 +73,7 @@ played, no video) is `SKIP`, never `PASS`.
 | module thread stalls | `module pump was slow`, `module was slow handling a message` | none > 500 ms |
 | peer session drops | `peer session ended`, `peer is slow to respond` | 0 |
 | audio continuity | `audio from the peer stalled`, `audio health` `stale_dropped` growth, jitter-buffer drops | 0 |
-| file sharing health | `file sharing health` `failed`/`served_slow`/`rtt_max_ms`, hung-call warnings | 0, rtt < 500 ms |
+| file sharing health | `file sharing health` `failed`/`served_slow`/`rtt_max_ms`, hung-call warnings (`failed` is the owner's I/O errors and unknown handles; a missing file or a permission is `refused` and not judged) | 0, rtt < 500 ms |
 | screen/window errors | encoder failures, blocked surrogate, failed remote-screen view | 0 |
 | file roundtrip on peer mount | harness | ok |
 | memory/io pressure (full) | `/proc/pressure/{memory,io}` over the window | < 5 % / < 10 % |
