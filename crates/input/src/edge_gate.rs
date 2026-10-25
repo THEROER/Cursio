@@ -62,6 +62,9 @@ pub(crate) struct Crossing {
 pub(crate) struct EdgeGate {
     zone: Zone,
     last: Option<(i32, i32)>,
+    /// The part of each edge (by `edge_index`) that crosses; outside it the
+    /// edge is an ordinary wall.
+    pub(crate) spans: [(f32, f32); 4],
 }
 
 impl Default for EdgeGate {
@@ -69,6 +72,7 @@ impl Default for EdgeGate {
         Self {
             zone: Zone::Outside,
             last: None,
+            spans: [(0.0, 1.0); 4],
         }
     }
 }
@@ -106,7 +110,8 @@ impl EdgeGate {
                 Edge::Top => (pt.1 <= vy + ZONE, frac(pt.0 - vx, vw)),
                 Edge::Bottom => (pt.1 >= vy + vh - 1 - ZONE, frac(pt.0 - vx, vw)),
             };
-            in_zone.then_some(Crossing { edge, pos_norm })
+            let (from, to) = self.spans[crate::edge_index(edge)];
+            (in_zone && (from..=to).contains(&pos_norm)).then_some(Crossing { edge, pos_norm })
         });
 
         let Some(crossing) = hit else {
@@ -245,6 +250,20 @@ mod tests {
         gate.on_move((1900, 540), DESK, left());
         assert_eq!(gate.on_move((1919, 540), DESK, left()), None);
         assert_eq!(gate.on_move((0, 540), DESK, EdgeSet::EMPTY), None);
+    }
+
+    #[test]
+    fn a_narrowed_edge_crosses_only_inside_its_span() {
+        let mut gate = EdgeGate::default();
+        gate.spans[crate::edge_index(Edge::Left)] = (0.5, 1.0);
+        gate.on_move((5, 100), DESK, left());
+        assert_eq!(
+            gate.on_move((0, 100), DESK, left()),
+            None,
+            "above the span is a wall"
+        );
+        gate.on_move((5, 900), DESK, left());
+        assert!(gate.on_move((0, 900), DESK, left()).is_some());
     }
 
     #[test]

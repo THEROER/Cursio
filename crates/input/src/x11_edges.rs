@@ -163,7 +163,7 @@ fn watch(
             Touch::Away => crossed = false,
             Touch::Resting => {}
             Touch::Pushed { edge, pos_norm } => {
-                if crossed {
+                if crossed || !crate::crosses_at(edge, pos_norm) {
                     continue;
                 }
                 crossed = true;

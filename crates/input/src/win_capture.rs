@@ -648,8 +648,12 @@ fn check_jump_zone(pt: POINT) {
         )
     };
     let watched = crate::watched_edges();
-    let Some(crossing) = GATE.with(|gate| gate.borrow_mut().on_move((pt.x, pt.y), bounds, watched))
-    else {
+    let spans = crate::crossing_spans();
+    let Some(crossing) = GATE.with(|gate| {
+        let mut gate = gate.borrow_mut();
+        gate.spans = spans;
+        gate.on_move((pt.x, pt.y), bounds, watched)
+    }) else {
         return;
     };
     crate::note_crossed(crossing.edge);

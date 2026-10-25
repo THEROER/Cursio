@@ -194,6 +194,30 @@ Monitors of different heights on one side are measured as one span, leaving and
 coming in alike (`fraction_along`, `entry_position`): two monitors stacked
 against the peer map its top half to the upper one.
 
+## Crossing on part of an edge
+
+An edge that faces a peer is also an edge of this desktop, and the desktop may
+want it. GNOME reveals its dock when the pointer presses the bottom edge; with
+a peer below, the barrier there took the pointer at first touch, and the dock
+never showed. `[input.crossing]` narrows any edge to the part that crosses,
+in percent along it (left to right, top to bottom):
+
+```toml
+[input.crossing]
+bottom = [67, 100]   # only the right third of the bottom edge crosses
+```
+
+The app's settings page offers halves and thirds of each edge. The change
+applies at once (`live.rs`): Wayland re-places its barriers, covering only
+that part, and the other backends check the crossing point against it on the
+next move. The rest of the edge is a plain wall. A crossing is still measured
+along the whole edge, so the peer still places the pointer by its true height.
+
+A pressure threshold (beamer's "resistance") was weighed instead and left out
+for this. On Wayland the portal grabs the pointer the moment it meets the
+barrier, so the desktop never sees the press, however long crossing then waits.
+A narrowed edge leaves that part to the desktop entirely.
+
 ## Several peers: one mouse, one hub
 
 A machine with a neighbour to the right and another below has one mouse and

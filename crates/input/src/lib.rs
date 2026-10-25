@@ -202,6 +202,60 @@ pub fn last_crossed_edge() -> Option<cursio_protocol::Edge> {
     }
 }
 
+/// The part of each edge (`Edge as usize`) that sends the cursor on, as
+/// fractions along it: the whole edge unless the config narrows it. The rest
+/// of the edge is a plain wall, left to the desktop — GNOME's dock is revealed
+/// by pressing the bottom edge, which a barrier there would take first.
+static CROSSING_SPANS: std::sync::Mutex<[(f32, f32); 4]> = std::sync::Mutex::new([(0.0, 1.0); 4]);
+
+pub(crate) fn edge_index(edge: cursio_protocol::Edge) -> usize {
+    use cursio_protocol::Edge;
+    match edge {
+        Edge::Left => 0,
+        Edge::Right => 1,
+        Edge::Top => 2,
+        Edge::Bottom => 3,
+    }
+}
+
+/// Let only `from..=to` of `edge` (fractions along it, left to right or top to
+/// bottom) hand the cursor on. Applied at once: Wayland re-places its barriers,
+/// the other backends read it on the next move.
+pub fn set_crossing_span(edge: cursio_protocol::Edge, from: f32, to: f32) {
+    let span = (from.clamp(0.0, 1.0), to.clamp(0.0, 1.0));
+    let before = std::mem::replace(
+        &mut CROSSING_SPANS.lock().unwrap_or_else(|p| p.into_inner())[edge_index(edge)],
+        span,
+    );
+    if before != span {
+        tracing::info!(
+            ?edge,
+            from = span.0,
+            to = span.1,
+            "crossing narrowed to part of an edge"
+        );
+        #[cfg(target_os = "linux")]
+        wl_capture::set_watched_edges(watched_edges());
+    }
+}
+
+/// Every edge's crossing part, by [`edge_index`].
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
+pub(crate) fn crossing_spans() -> [(f32, f32); 4] {
+    *CROSSING_SPANS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Whether a pointer pressing `edge` at `pos_norm` along it crosses. Windows
+/// asks its `EdgeGate` instead, which holds a copy per hook thread.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn crosses_at(edge: cursio_protocol::Edge, pos_norm: f32) -> bool {
+    let (from, to) = crossing_spans()[edge_index(edge)];
+    (from..=to).contains(&pos_norm)
+}
+
 /// Where the pointer is to come in when this machine next takes the cursor:
 /// which of *its* edges and how far along, as the peer measured the pointer
 /// leaving its own desktop. `None` for a handoff that crossed no edge (the

@@ -675,6 +675,21 @@ fn parse_video_profile(spec: &str) -> Result<Quality, String> {
 /// layers because it is not a property of any session: there is one keyboard
 /// per machine, settled before the first peer connects, exactly like the
 /// capture backend.
+/// Narrow each edge to the part of it that crosses (`[input.crossing]`). Like
+/// the modifier map, a property of this machine's desktop rather than of any
+/// link, so it goes straight to capture.
+fn apply_crossing(crossing: &cursio_core::config::CrossingConfig) {
+    use cursio_protocol::Edge;
+    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+        let span = crossing.span(edge);
+        cursio_input::set_crossing_span(
+            edge,
+            f32::from(span.from) / 100.0,
+            f32::from(span.to) / 100.0,
+        );
+    }
+}
+
 fn apply_modifier_map(spec: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -955,6 +970,9 @@ async fn run() -> anyhow::Result<()> {
                             tracing::warn!(%error, "keeping the running modifier map");
                         }
                     }
+                    if let Some(crossing) = &plan.crossing {
+                        apply_crossing(crossing);
+                    }
                     tracing::info!(
                         switches = ?plan.switches,
                         position = ?plan.position,
@@ -996,6 +1014,7 @@ async fn run() -> anyhow::Result<()> {
             let airplay_interface = airplay_config.interface;
             let mac_modifiers = input_config.mac_modifiers;
             apply_modifier_map(&mac_modifiers)?;
+            apply_crossing(&input_config.crossing);
             let airplay =
                 AirPlayMode::parse(&airplay).map_err(|e| anyhow::anyhow!("--airplay: {e}"))?;
             // Checked here rather than with clap's `requires`, which cannot see

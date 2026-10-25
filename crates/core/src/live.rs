@@ -216,6 +216,8 @@ pub struct Plan {
     pub files_share_changed: bool,
     pub render_device: Option<Option<String>>,
     pub mac_modifiers: Option<String>,
+    /// Handed to capture, which narrows its edges at once.
+    pub crossing: Option<crate::config::CrossingConfig>,
     /// Read by a running audio module on every pump, so it needs no restart.
     pub mic_gate: Option<Option<String>>,
     /// Read at every call, so it needs no restart either.
@@ -250,6 +252,9 @@ pub fn plan(running: &Config, next: &Config) -> Plan {
     }
     if running.input.mac_modifiers != next.input.mac_modifiers {
         plan.mac_modifiers = Some(next.input.mac_modifiers.clone());
+    }
+    if running.input.crossing != next.input.crossing {
+        plan.crossing = Some(next.input.crossing.clone());
     }
     if running.audio.mic_gate != next.audio.mic_gate {
         plan.mic_gate = Some(next.audio.mic_gate.clone());
@@ -303,6 +308,17 @@ pub fn restart_needed(started: &Config, current: &Config) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrowing_an_edge_applies_live_without_restarting_anything() {
+        let running = Config::default();
+        let mut next = running.clone();
+        next.input.crossing.bottom = Some(crate::config::EdgeSpan { from: 66, to: 100 });
+        let plan = plan(&running, &next);
+        assert_eq!(plan.crossing, Some(next.input.crossing.clone()));
+        assert!(plan.switches.is_empty() && plan.restart.is_empty());
+        assert!(restart_needed(&running, &next).is_empty());
+    }
 
     #[test]
     fn a_module_toggle_is_a_switch_and_nothing_else() {

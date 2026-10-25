@@ -230,12 +230,6 @@ impl TapState {
         }) else {
             return;
         };
-        if self.crossed {
-            return;
-        }
-        self.crossed = true;
-        crate::note_crossed(edge);
-
         // Where along the edge, as a fraction: the peer uses it to bring the
         // cursor in at the same height it left at, rather than in a corner.
         let pos_norm = if edge.is_horizontal() {
@@ -243,6 +237,11 @@ impl TapState {
         } else {
             fraction(at.y, self.bounds.min_y, self.bounds.max_y)
         };
+        if self.crossed || !crate::crosses_at(edge, pos_norm) {
+            return;
+        }
+        self.crossed = true;
+        crate::note_crossed(edge);
         let _ = self.edges.send(EdgeCrossing { edge, pos_norm });
     }
 

@@ -85,8 +85,16 @@ export interface Problem {
 
 export type BluetoothMesh = "auto" | "on" | "off"
 
+/** One of this machine's edges, as `cursio_protocol::Edge` names it. */
+export type Edge = "Left" | "Right" | "Top" | "Bottom"
+
+/** `[from, to]` in percent along an edge, as `cursio_core::config::EdgeSpan`. */
+export type EdgeSpan = [number, number]
+
 /** One change to the node's config, as `cursio_core::config::ConfigEdit`. */
-export type ConfigEdit = { bluetooth_mesh: BluetoothMesh }
+export type ConfigEdit =
+  | { bluetooth_mesh: BluetoothMesh }
+  | { crossing: { edge: Edge; span: EdgeSpan | null } }
 
 export interface ProblemAction {
   label: string
@@ -256,6 +264,8 @@ export interface NodeConfig {
   calls?: CallsConfig
   /** Absent from a node before resumable sessions. */
   bluetooth?: { standby: boolean; mesh?: BluetoothMesh }
+  /** `crossing` is absent from a node before edges could be narrowed. */
+  input?: { crossing?: Partial<Record<"left" | "right" | "top" | "bottom", EdgeSpan>> }
   [key: string]: unknown
 }
 

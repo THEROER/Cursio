@@ -356,7 +356,7 @@ async fn place_barriers(
     zone_set: u32,
     edges: EdgeSet,
 ) -> HashMap<u32, BarrierInfo> {
-    let (barriers, barrier_info) = outer_edge_barriers(rects, edges);
+    let (barriers, barrier_info) = outer_edge_barriers(rects, edges, &crate::crossing_spans());
     tracing::info!(count = barriers.len(), edges = ?edges.iter().collect::<Vec<_>>(), "placing edge barriers");
     match ic
         .set_pointer_barriers(session, &barriers, zone_set, Default::default())
@@ -533,13 +533,30 @@ fn is_outer_edge(rect: Rect, edge: Edge, rects: &[Rect]) -> bool {
 /// its own edge, so an activation says which way the cursor left. Returns the
 /// id -> [`BarrierInfo`] map used to recover the edge + normalized position on
 /// activation.
+///
+/// `spans` (by `Edge as usize`) narrows each edge to the part of it that
+/// crosses, as fractions of all its outer segments together; a barrier covers
+/// only that part, and the rest of the edge is the desktop's own. Each
+/// barrier's [`BarrierInfo`] still records its monitor's whole segment, so a
+/// crossing is measured along the whole edge, the way the peer places it.
 fn outer_edge_barriers(
     rects: &[Rect],
     edges: EdgeSet,
+    spans: &[(f32, f32); 4],
 ) -> (Vec<Barrier>, HashMap<u32, BarrierInfo>) {
     let mut barriers = Vec::new();
     let mut info = HashMap::new();
     let mut next_id = 1u32;
+
+    let along =
+        |edge: Edge, &(x, y, w, h): &Rect| if edge.is_horizontal() { (x, w) } else { (y, h) };
+    let window = |edge: Edge| -> Option<(i32, i32)> {
+        let outer = rects.iter().filter(|&&r| is_outer_edge(r, edge, rects));
+        let (start, end) = edge_span(outer.map(|r| along(edge, r)))?;
+        let (from, to) = spans[crate::edge_index(edge)];
+        let at = |f: f32| start + (f * (end - start) as f32).round() as i32;
+        Some((at(from), at(to)))
+    };
 
     for (peer_edge, &(x, y, w, h)) in edges
         .iter()
@@ -553,12 +570,20 @@ fn outer_edge_barriers(
             continue;
         }
 
-        // The barrier line + (origin, length) span for the chosen edge only.
-        let (pos, origin, length) = match peer_edge {
-            Edge::Left => (BarrierPosition::new(x, y, x, y + h - 1), y, h),
-            Edge::Right => (BarrierPosition::new(x + w, y, x + w, y + h - 1), y, h),
-            Edge::Top => (BarrierPosition::new(x, y, x + w - 1, y), x, w),
-            Edge::Bottom => (BarrierPosition::new(x, y + h, x + w - 1, y + h), x, w),
+        // This monitor's segment of the edge, cut to the part that crosses.
+        let (origin, length) = along(peer_edge, &(x, y, w, h));
+        let Some((lo, hi)) = window(peer_edge) else {
+            continue;
+        };
+        let (a, b) = (origin.max(lo), (origin + length).min(hi));
+        if b <= a {
+            continue;
+        }
+        let pos = match peer_edge {
+            Edge::Left => BarrierPosition::new(x, a, x, b - 1),
+            Edge::Right => BarrierPosition::new(x + w, a, x + w, b - 1),
+            Edge::Top => BarrierPosition::new(a, y, b - 1, y),
+            Edge::Bottom => BarrierPosition::new(a, y + h, b - 1, y + h),
         };
 
         if let Some(id) = BarrierID::new(next_id) {
@@ -628,6 +653,7 @@ async fn capture_loop(
     // never starts — no seat binding, no libei events, and input silently stops
     // reaching the peer even though barriers still fire. Cost an afternoon.
     let mut state = CaptureState::default();
+    let mut spans = crate::crossing_spans();
     // Sub-pixel motion carried between libei events, so small moves aren't lost
     // to rounding (see [`MotionRemainder`]).
     let mut remainder = MotionRemainder::default();
@@ -744,8 +770,11 @@ async fn capture_loop(
                 // tearing capture down over it.
                 if changed.is_ok() {
                     let wanted = *edge_rx.borrow_and_update();
-                    if wanted != edges {
+                    // A narrowed span is poked through this same channel with
+                    // the edges unchanged; the barriers move all the same.
+                    if wanted != edges || crate::crossing_spans() != spans {
                         edges = wanted;
+                        spans = crate::crossing_spans();
                         barrier_info = replace_barriers(
                             &ic, &session, &rects, zone_set, edges, &mut state,
                         )
@@ -1203,6 +1232,41 @@ mod tests {
         EdgeSet::EMPTY.with(edge)
     }
 
+    fn whole_edge_barriers(
+        rects: &[Rect],
+        edges: EdgeSet,
+    ) -> (Vec<Barrier>, HashMap<u32, BarrierInfo>) {
+        outer_edge_barriers(rects, edges, &[(0.0, 1.0); 4])
+    }
+
+    fn bottom_only(from: f32, to: f32) -> [(f32, f32); 4] {
+        let mut spans = [(0.0, 1.0); 4];
+        spans[crate::edge_index(Edge::Bottom)] = (from, to);
+        spans
+    }
+
+    #[test]
+    fn a_narrowed_edge_gets_a_barrier_only_where_it_crosses() {
+        let (barriers, info) = outer_edge_barriers(
+            &[(0, 0, 1920, 1080)],
+            only(Edge::Bottom),
+            &bottom_only(0.66, 1.0),
+        );
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].position().as_tuple(), (1267, 1080, 1919, 1080));
+        // Still measured along the whole edge, as the peer places a pointer.
+        let bi = *info.values().next().unwrap();
+        assert_eq!((bi.origin, bi.length), (0, 1920));
+    }
+
+    #[test]
+    fn a_span_that_misses_a_monitor_leaves_that_monitor_without_a_barrier() {
+        let desk = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
+        let (barriers, _) = outer_edge_barriers(&desk, only(Edge::Bottom), &bottom_only(0.75, 1.0));
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].position().as_tuple().0, 2880);
+    }
+
     #[test]
     fn sub_pixel_motion_accumulates_instead_of_vanishing() {
         // A slow drag straight up: each step is well under a pixel, which plain
@@ -1250,7 +1314,7 @@ mod tests {
     /// hand side, spanning the full height.
     #[test]
     fn a_barrier_lands_on_the_edge_that_borders_the_peer() {
-        let (barriers, info) = outer_edge_barriers(&[(0, 0, 1920, 1080)], only(Edge::Right));
+        let (barriers, info) = whole_edge_barriers(&[(0, 0, 1920, 1080)], only(Edge::Right));
         assert_eq!(barriers.len(), 1);
         assert_eq!(barriers[0].position().as_tuple(), (1920, 0, 1920, 1079));
         let bi = info.values().next().unwrap();
@@ -1264,7 +1328,7 @@ mod tests {
     #[test]
     fn two_neighbours_arm_two_edges_that_each_name_themselves() {
         let edges: EdgeSet = [Edge::Right, Edge::Bottom].into_iter().collect();
-        let (barriers, info) = outer_edge_barriers(&[(0, 0, 1920, 1080)], edges);
+        let (barriers, info) = whole_edge_barriers(&[(0, 0, 1920, 1080)], edges);
         assert_eq!(barriers.len(), 2);
         let mut placed: Vec<Edge> = info.values().map(|bi| bi.edge).collect();
         placed.sort_by_key(|edge| format!("{edge:?}"));
@@ -1279,7 +1343,7 @@ mod tests {
     /// for a crossing the session then discards as "no peer that way".
     #[test]
     fn no_barrier_is_placed_without_an_edge_to_watch() {
-        let (barriers, info) = outer_edge_barriers(&[(0, 0, 1920, 1080)], EdgeSet::EMPTY);
+        let (barriers, info) = whole_edge_barriers(&[(0, 0, 1920, 1080)], EdgeSet::EMPTY);
         assert!(barriers.is_empty());
         assert!(info.is_empty());
     }
@@ -1294,7 +1358,7 @@ mod tests {
     #[test]
     fn a_seam_between_two_monitors_gets_no_barrier() {
         let desktop = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
-        let (barriers, info) = outer_edge_barriers(&desktop, only(Edge::Right));
+        let (barriers, info) = whole_edge_barriers(&desktop, only(Edge::Right));
         assert_eq!(barriers.len(), 1, "the seam must not be offered");
         assert_eq!(info.len(), 1);
         let line = barriers[0].position().as_tuple().0;
@@ -1311,7 +1375,7 @@ mod tests {
     #[test]
     fn a_partly_covered_edge_keeps_its_barrier() {
         let desktop = [(0, 0, 2560, 1440), (2560, 0, 1920, 1080)];
-        let (barriers, _) = outer_edge_barriers(&desktop, only(Edge::Right));
+        let (barriers, _) = whole_edge_barriers(&desktop, only(Edge::Right));
         let lines: Vec<i32> = barriers.iter().map(|b| b.position().as_tuple().0).collect();
         assert!(
             lines.contains(&2560),
@@ -1325,7 +1389,7 @@ mod tests {
     #[test]
     fn a_seam_on_another_axis_does_not_suppress_a_barrier() {
         let desktop = [(0, 0, 1920, 1080), (0, 1080, 1920, 1080)];
-        let (barriers, _) = outer_edge_barriers(&desktop, only(Edge::Right));
+        let (barriers, _) = whole_edge_barriers(&desktop, only(Edge::Right));
         assert_eq!(barriers.len(), 2, "both right edges face off the desktop");
     }
 
@@ -1334,9 +1398,9 @@ mod tests {
     #[test]
     fn a_horizontal_edge_spans_the_width_and_a_vertical_one_the_height() {
         let screen = [(0, 0, 1920, 1080)];
-        let (_, top) = outer_edge_barriers(&screen, only(Edge::Top));
+        let (_, top) = whole_edge_barriers(&screen, only(Edge::Top));
         assert_eq!(top.values().next().unwrap().length, 1920);
-        let (_, left) = outer_edge_barriers(&screen, only(Edge::Left));
+        let (_, left) = whole_edge_barriers(&screen, only(Edge::Left));
         assert_eq!(left.values().next().unwrap().length, 1080);
     }
 
@@ -1345,7 +1409,7 @@ mod tests {
     /// crossing halfway down it reports a position off the end of the edge.
     #[test]
     fn an_offset_monitor_normalizes_against_its_own_span() {
-        let (_, info) = outer_edge_barriers(&[(1920, 200, 2560, 1440)], only(Edge::Right));
+        let (_, info) = whole_edge_barriers(&[(1920, 200, 2560, 1440)], only(Edge::Right));
         let bi = *info.values().next().unwrap();
         assert_eq!((bi.origin, bi.length), (200, 1440));
     }
@@ -1364,7 +1428,7 @@ mod tests {
     #[test]
     fn stacked_monitors_share_one_edge_both_leaving_and_coming_back() {
         let desk = [(0, 0, 1920, 1080), (0, 1080, 1920, 1080)];
-        let (_, info) = outer_edge_barriers(&desk, only(Edge::Right));
+        let (_, info) = whole_edge_barriers(&desk, only(Edge::Right));
         let out = fraction_along(Edge::Right, 1620.0, &info);
         assert!((out - 0.75).abs() < 1e-6, "left at {out}");
         assert_eq!(

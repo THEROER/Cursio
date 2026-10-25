@@ -41,7 +41,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use cursio_protocol::Position;
+use cursio_protocol::{Edge, Position};
 use serde::{Deserialize, Serialize};
 
 /// Why a config could not be read or written.
@@ -130,12 +130,27 @@ pub enum BluetoothMesh {
 #[serde(rename_all = "snake_case")]
 pub enum ConfigEdit {
     BluetoothMesh(BluetoothMesh),
+    /// Narrow one edge to the part that crosses; `None` gives it back whole.
+    Crossing {
+        edge: Edge,
+        span: Option<EdgeSpan>,
+    },
 }
 
 impl ConfigEdit {
     pub fn apply(self, config: &mut Config) {
         match self {
             ConfigEdit::BluetoothMesh(mode) => config.bluetooth.mesh = mode,
+            ConfigEdit::Crossing { edge, span } => {
+                let span = span.filter(|s| *s != EdgeSpan::WHOLE);
+                let crossing = &mut config.input.crossing;
+                match edge {
+                    Edge::Left => crossing.left = span,
+                    Edge::Right => crossing.right = span,
+                    Edge::Top => crossing.top = span,
+                    Edge::Bottom => crossing.bottom = span,
+                }
+            }
         }
     }
 }
@@ -280,6 +295,82 @@ pub struct InputConfig {
     /// Where a peer's modifiers land on a Mac: `positional`, `swapped`, or
     /// `from=to` pairs. Ignored elsewhere.
     pub mac_modifiers: String,
+    /// Which part of each edge sends the cursor on.
+    pub crossing: CrossingConfig,
+}
+
+/// Which part of each of this machine's edges hands the cursor to the peer
+/// beyond it. An edge left out crosses along its whole length.
+///
+/// The rest of the edge stays an ordinary wall. That is what an edge shared
+/// with something of the desktop's own needs: GNOME reveals its dock when the
+/// pointer presses the bottom edge, and on Wayland a barrier there takes the
+/// pointer at first touch, so with a peer below the dock never showed. A span
+/// of `[67, 100]` keeps the edge under the dock to the desktop and crosses only
+/// in its right third.
+///
+/// No pressure threshold instead, deliberately: the portal grabs the pointer
+/// the moment it meets the barrier, so the desktop never sees the press
+/// however long crossing waits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CrossingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<EdgeSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<EdgeSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top: Option<EdgeSpan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<EdgeSpan>,
+}
+
+impl CrossingConfig {
+    /// The span of `edge` that crosses, in percent along it.
+    pub fn span(&self, edge: Edge) -> EdgeSpan {
+        let span = match edge {
+            Edge::Left => self.left,
+            Edge::Right => self.right,
+            Edge::Top => self.top,
+            Edge::Bottom => self.bottom,
+        };
+        span.unwrap_or(EdgeSpan::WHOLE)
+    }
+}
+
+/// `[from, to]` in percent along an edge: left to right along the top or
+/// bottom one, top to bottom along a side. Whole percents are enough for a
+/// hand to aim at, and keep the file readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "[u8; 2]", into = "[u8; 2]")]
+pub struct EdgeSpan {
+    pub from: u8,
+    pub to: u8,
+}
+
+impl EdgeSpan {
+    pub const WHOLE: Self = Self { from: 0, to: 100 };
+}
+
+impl TryFrom<[u8; 2]> for EdgeSpan {
+    type Error = String;
+
+    fn try_from([from, to]: [u8; 2]) -> Result<Self, Self::Error> {
+        if from < to && to <= 100 {
+            Ok(Self { from, to })
+        } else {
+            Err(format!(
+                "a crossing span is [from, to] in percent along the edge, \
+                 from below to and to at most 100; got [{from}, {to}]"
+            ))
+        }
+    }
+}
+
+impl From<EdgeSpan> for [u8; 2] {
+    fn from(span: EdgeSpan) -> Self {
+        [span.from, span.to]
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -338,6 +429,7 @@ impl Default for InputConfig {
     fn default() -> Self {
         Self {
             mac_modifiers: "positional".into(),
+            crossing: CrossingConfig::default(),
         }
     }
 }
@@ -597,6 +689,53 @@ mod tests {
     fn an_unknown_key_is_refused_rather_than_ignored() {
         let err = Config::parse("[modules]\naudoi = true\n", Path::new("x.toml")).unwrap_err();
         assert!(err.to_string().contains("audoi"), "{err}");
+    }
+
+    #[test]
+    fn an_edge_crosses_along_its_whole_length_unless_a_span_is_given() {
+        let c = parse("[input.crossing]\nbottom = [66, 100]\n");
+        assert_eq!(
+            c.input.crossing.span(Edge::Bottom),
+            EdgeSpan { from: 66, to: 100 }
+        );
+        assert_eq!(c.input.crossing.span(Edge::Left), EdgeSpan::WHOLE);
+        assert_eq!(parse(&c.to_toml().unwrap()), c);
+        assert_eq!(
+            Config::default().input.crossing.span(Edge::Top),
+            EdgeSpan::WHOLE
+        );
+    }
+
+    #[test]
+    fn the_app_narrows_an_edge_and_gives_it_back_whole() {
+        let mut c = Config::default();
+        let edit: ConfigEdit =
+            serde_json::from_str(r#"{"crossing":{"edge":"Bottom","span":[66,100]}}"#).unwrap();
+        edit.apply(&mut c);
+        assert_eq!(
+            c.input.crossing.bottom,
+            Some(EdgeSpan { from: 66, to: 100 })
+        );
+        let whole: ConfigEdit =
+            serde_json::from_str(r#"{"crossing":{"edge":"Bottom","span":[0,100]}}"#).unwrap();
+        whole.apply(&mut c);
+        assert_eq!(
+            c.input.crossing,
+            CrossingConfig::default(),
+            "a whole edge is written as none"
+        );
+    }
+
+    #[test]
+    fn a_span_that_covers_nothing_is_refused_with_what_it_should_be() {
+        for bad in ["[50, 50]", "[70, 20]", "[0, 120]"] {
+            let err = Config::parse(
+                &format!("[input.crossing]\ntop = {bad}\n"),
+                Path::new("x.toml"),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("percent along the edge"), "{err}");
+        }
     }
 
     #[test]

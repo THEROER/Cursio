@@ -540,6 +540,27 @@
     "namePhoneHint": "Renaming restarts Cursio on this phone; its links drop for a few seconds.",
     "nameWaits": "Peers still see the old name until the node restarts."
   },
+  "crossing": {
+    "title": "Edge crossing",
+    "description": "Which part of each screen edge sends the cursor to the machine beyond it. The rest of the edge stays this desktop's, for a dock or a hot corner there.",
+    "edgeLeft": "Left edge",
+    "edgeRight": "Right edge",
+    "edgeTop": "Top edge",
+    "edgeBottom": "Bottom edge",
+    "whole": "Whole edge",
+    "halfLeft": "Left half",
+    "halfRight": "Right half",
+    "halfTop": "Upper half",
+    "halfBottom": "Lower half",
+    "thirdLeft": "Left third",
+    "thirdRight": "Right third",
+    "thirdTop": "Top third",
+    "thirdBottom": "Bottom third",
+    "thirdMiddle": "Middle third",
+    "custom": "{from}–{to}% (from the config file)",
+    "hint": "Only an edge that faces another machine crosses at all. On GNOME, keep the part under the dock out, or the dock never shows.",
+    "failed": "The edge crossing was not changed"
+  },
   "phoneAudio": {
     "title": "Phone audio → computer",
     "description": "Play what this phone plays on one of your machines' outputs.",
