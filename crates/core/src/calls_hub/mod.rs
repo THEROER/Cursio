@@ -42,19 +42,27 @@
 //!
 //! [`CallsEngine`]: crate::calls_session::CallsEngine
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use cursio_protocol::calls::{Call, CallDirection, CallId, CallState, CallsMsg};
-use cursio_protocol::notify::Notification;
+use cursio_protocol::calls::{Call, CallId, CallsMsg};
 use cursio_protocol::PeerId;
 
-use crate::notify_hub::{CallRoles, DisplayEvent};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::calls_hub::desk::Desk;
+use crate::calls_hub::desk::HandsFreePhone;
+use crate::calls_hub::desk::MeshPhone;
+use crate::calls_hub::desk::PhoneSide;
 use crate::config::CallsConfig;
+
+mod desk;
+mod messenger;
+mod setup;
+mod voice;
+
+pub use setup::{AudioDevice, CallSetup, PairedPhone, ServiceState};
 
 /// What a computer's user asked of a phone's calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,291 +115,6 @@ pub struct PhoneCalls {
     pub hands_free: bool,
     /// Why this phone cannot report calls, when it said.
     pub unavailable: Option<String>,
-}
-
-/// This computer as a phone's Bluetooth headset and speaker, for the
-/// settings: whether it can be, and with what.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CallSetup {
-    /// This machine can be a phone's headset and speaker at all (Linux, so
-    /// far). Without it the rows below about roles, services and pairing say
-    /// nothing true, while where a call's voice plays still matters: another
-    /// computer's call can be sent here. Absent from older nodes, which were
-    /// all ones that could.
-    #[serde(default = "headset_default")]
-    pub headset: bool,
-    /// PipeWire has left the phone roles to Cursio (`cursio bluetooth
-    /// install`); without it neither service can register.
-    pub roles_taken: bool,
-    /// The hands-free unit: calls' voice through this computer.
-    pub hands_free: ServiceState,
-    /// The A2DP sink: the phone's sound through this computer.
-    pub speaker: ServiceState,
-    /// Phones paired with this computer over Bluetooth.
-    pub phones: Vec<PairedPhone>,
-    /// What a call can play on and record from here.
-    pub outputs: Vec<AudioDevice>,
-    pub inputs: Vec<AudioDevice>,
-}
-
-fn headset_default() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum ServiceState {
-    #[default]
-    Starting,
-    Running,
-    Failed {
-        reason: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairedPhone {
-    pub name: String,
-    pub address: String,
-    pub connected: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AudioDevice {
-    /// What `[calls] output`/`input` holds to pick it.
-    pub id: String,
-    pub name: String,
-}
-
-#[derive(Default)]
-struct PhoneSide {
-    status: Option<CallsMsg>,
-    calls: Vec<Call>,
-    links: Vec<(u64, mpsc::UnboundedSender<CallsMsg>)>,
-}
-
-struct MeshPhone {
-    token: u64,
-    name: String,
-    bluetooth_name: Option<String>,
-    unavailable: Option<String>,
-    calls: Vec<Call>,
-    tx: mpsc::UnboundedSender<CallsMsg>,
-}
-
-#[derive(Default)]
-struct HandsFreePhone {
-    name: String,
-    calls: Vec<Call>,
-    audio_here: bool,
-    voice_on: Option<String>,
-    voice: VoicePolicy,
-}
-
-/// How long after a call starts this computer keeps putting its voice where
-/// the call was taken. The phone opens and closes the audio link on its own
-/// for a moment around answering; past this window a move is the user's.
-const STEER_FOR: Duration = Duration::from_secs(8);
-
-/// Where the voice of a hands-free phone's call should be, decided once as
-/// the call starts.
-#[derive(Debug, Default)]
-struct VoicePolicy {
-    /// Where the voice belongs and until when this computer steers it there.
-    /// `None` until the call is taken somewhere.
-    steer: Option<(bool, Instant)>,
-    /// The last move asked of the phone, so a stream of call updates while
-    /// the phone gets round to it does not ask again for each.
-    asked: Option<bool>,
-}
-
-impl VoicePolicy {
-    /// Answered or dialled from this computer: the voice comes here.
-    fn taken_here(&mut self, now: Instant) {
-        self.steer = Some((true, now + STEER_FOR));
-        self.asked = None;
-    }
-
-    /// The user moved the voice: theirs from now on, nothing is steered.
-    fn moved_by_user(&mut self) {
-        self.steer = Some((false, Instant::now()));
-        self.asked = None;
-    }
-
-    /// The phone's calls changed. A call that is up, or being placed, without
-    /// having been taken here was taken at this desk if the user's hand was
-    /// on it just then (`at_desk`, asked only at that moment), and on the
-    /// phone otherwise, where its voice stays; with no call left everything
-    /// starts over. Not `steering`, nothing is put anywhere.
-    fn calls(
-        &mut self,
-        calls: &[Call],
-        now: Instant,
-        steering: bool,
-        at_desk: impl FnOnce() -> bool,
-    ) {
-        if calls.is_empty() {
-            *self = VoicePolicy::default();
-            return;
-        }
-        let started = calls.iter().any(|c| !c.state.is_incoming_offer());
-        if started && self.steer.is_none() {
-            if steering {
-                self.steer = Some((at_desk(), now + STEER_FOR));
-            } else {
-                self.moved_by_user();
-            }
-        }
-    }
-
-    /// The move to ask of the phone now, if the voice is not where it
-    /// belongs and this computer is still steering it.
-    fn correction(&mut self, audio_here: bool, now: Instant) -> Option<bool> {
-        let (want, until) = self.steer?;
-        if now >= until || audio_here == want || self.asked == Some(want) {
-            return None;
-        }
-        self.asked = Some(want);
-        Some(want)
-    }
-}
-
-/// A messenger's call, from a phone's notification.
-struct MessengerCall {
-    /// The phone's name, which places the call with its other calls.
-    phone: String,
-    key: String,
-    /// Shown as the call's name: who, and through which app.
-    label: String,
-    id: CallId,
-    roles: CallRoles,
-    /// The notify module's way back to the phone: a button pressed here.
-    events: mpsc::UnboundedSender<DisplayEvent>,
-}
-
-impl MessengerCall {
-    /// Ringing while the phone offers a way to answer it.
-    fn ringing(&self) -> bool {
-        self.roles.answer.is_some()
-    }
-
-    fn as_call(&self) -> Call {
-        Call {
-            id: self.id,
-            direction: CallDirection::Incoming,
-            state: if self.ringing() {
-                CallState::Ringing
-            } else {
-                CallState::Active
-            },
-            number: None,
-            name: Some(self.label.clone()),
-        }
-    }
-
-    fn press(&self, button: Option<u8>) -> Result<(), String> {
-        let action = button.ok_or_else(|| format!("{} offers no button for that", self.label))?;
-        self.events
-            .send(DisplayEvent::Invoked {
-                key: self.key.clone(),
-                action,
-                reply: None,
-            })
-            .map_err(|_| format!("the link to {} just closed", self.phone))
-    }
-}
-
-/// Ids for messenger calls, apart from the phone's own (small, from `+CLCC`
-/// or the call monitor).
-const MESSENGER_IDS: CallId = 0x4000_0000;
-
-#[derive(Default)]
-struct Desk {
-    mesh: HashMap<PeerId, MeshPhone>,
-    hands_free: HashMap<String, HandsFreePhone>,
-    messenger: Vec<MessengerCall>,
-    control: Option<Arc<dyn HandsFreeControl>>,
-    on_change: Option<OnChange>,
-    /// Phones whose call voice a peer relays to play here: the phone's name
-    /// as that peer knows it, and the peers relaying it.
-    relayed: Vec<(String, String)>,
-}
-
-impl Desk {
-    /// Every phone once, its hands-free link standing in for its mesh link.
-    fn phones(&self) -> Vec<PhoneCalls> {
-        let mut out: Vec<PhoneCalls> = self
-            .hands_free
-            .values()
-            .map(|p| PhoneCalls {
-                name: p.name.clone(),
-                calls: p.calls.clone(),
-                audio_here: p.audio_here,
-                voice_on: p.voice_on.clone(),
-                hands_free: true,
-                unavailable: None,
-            })
-            .collect();
-        for phone in self.mesh.values() {
-            if self.hands_free_of(phone).is_none() {
-                let names = [Some(&phone.name), phone.bluetooth_name.as_ref()];
-                let relayed_here = self.relayed.iter().any(|(relayed, _)| {
-                    names
-                        .iter()
-                        .flatten()
-                        .any(|n| n.eq_ignore_ascii_case(relayed))
-                });
-                out.push(PhoneCalls {
-                    name: phone.name.clone(),
-                    calls: phone.calls.clone(),
-                    audio_here: relayed_here && !phone.calls.is_empty(),
-                    voice_on: None,
-                    hands_free: false,
-                    unavailable: phone.unavailable.clone(),
-                });
-            }
-        }
-        for call in &self.messenger {
-            let at = match out
-                .iter()
-                .position(|p| p.name.eq_ignore_ascii_case(&call.phone))
-            {
-                Some(at) => at,
-                None => {
-                    out.push(PhoneCalls {
-                        name: call.phone.clone(),
-                        calls: Vec::new(),
-                        audio_here: false,
-                        voice_on: None,
-                        hands_free: false,
-                        unavailable: None,
-                    });
-                    out.len() - 1
-                }
-            };
-            let phone = &mut out[at];
-            // The hands-free link sees the same call as a "virtual call" with
-            // no number or name; the messenger's own says who it is.
-            phone
-                .calls
-                .retain(|c| c.number.is_some() || c.name.is_some());
-            phone.calls.push(call.as_call());
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
-    }
-
-    fn hands_free_of(&self, phone: &MeshPhone) -> Option<&String> {
-        let names = [Some(&phone.name), phone.bluetooth_name.as_ref()];
-        self.hands_free.iter().find_map(|(address, hf)| {
-            names
-                .iter()
-                .flatten()
-                .any(|n| n.eq_ignore_ascii_case(&hf.name))
-                .then_some(address)
-        })
-    }
 }
 
 #[derive(Default)]
@@ -662,114 +385,6 @@ impl CallsHub {
         }
     }
 
-    /// A phone posted (or updated) a messenger's call. `events` is how a
-    /// button pressed here reaches the phone.
-    pub fn messenger_posted(
-        &self,
-        phone: &str,
-        notification: &Notification,
-        events: mpsc::UnboundedSender<DisplayEvent>,
-    ) {
-        let label = match (notification.title.trim(), notification.app_name.trim()) {
-            ("", app) => app.to_string(),
-            (who, "") => who.to_string(),
-            (who, app) => format!("{who} · {app}"),
-        };
-        {
-            let mut desk = lock(&self.desk);
-            match desk
-                .messenger
-                .iter_mut()
-                .find(|c| c.phone == phone && c.key == notification.key)
-            {
-                Some(call) => {
-                    call.label = label;
-                    call.events = events;
-                }
-                None => {
-                    let id = MESSENGER_IDS + desk.messenger.len() as CallId;
-                    desk.messenger.push(MessengerCall {
-                        phone: phone.to_string(),
-                        key: notification.key.clone(),
-                        label,
-                        id,
-                        roles: CallRoles::default(),
-                        events,
-                    });
-                }
-            }
-        }
-        self.changed();
-    }
-
-    /// Which buttons of a messenger's call answer, decline and end it.
-    pub fn messenger_buttons(&self, phone: &str, key: &str, roles: CallRoles) {
-        {
-            let mut desk = lock(&self.desk);
-            let Some(call) = desk
-                .messenger
-                .iter_mut()
-                .find(|c| c.phone == phone && c.key == key)
-            else {
-                return;
-            };
-            call.roles = roles;
-        }
-        self.changed();
-    }
-
-    /// The phone took a messenger's call notification down: the call ended,
-    /// or became something else.
-    pub fn messenger_removed(&self, phone: &str, key: &str) {
-        let removed = {
-            let mut desk = lock(&self.desk);
-            let before = desk.messenger.len();
-            desk.messenger
-                .retain(|c| !(c.phone == phone && c.key == key));
-            desk.messenger.len() != before
-        };
-        if removed {
-            self.changed();
-        }
-    }
-
-    /// Act on a messenger's call of `phone` when the action is for one: an
-    /// answer or decline while one rings and no telephony call does, an end
-    /// while one is up. `None` when the action is for a telephony call.
-    fn messenger_act(&self, phone: &str, action: &CallAction) -> Option<Result<(), String>> {
-        let desk = lock(&self.desk);
-        let theirs = || {
-            desk.messenger
-                .iter()
-                .filter(|c| c.phone.eq_ignore_ascii_case(phone))
-        };
-        let phones = desk.phones();
-        let telephony: Vec<&Call> = phones
-            .iter()
-            .filter(|p| p.name.eq_ignore_ascii_case(phone))
-            .flat_map(|p| p.calls.iter())
-            .filter(|c| c.id < MESSENGER_IDS)
-            .collect();
-        let telephony_ringing = telephony.iter().any(|c| c.state.is_incoming_offer());
-        let telephony_up = telephony.iter().any(|c| !c.state.is_incoming_offer());
-        let result = match action {
-            CallAction::Answer | CallAction::Decline if !telephony_ringing => {
-                let call = theirs().find(|c| c.ringing())?;
-                let button = match action {
-                    CallAction::Answer => call.roles.answer,
-                    _ => call.roles.decline.or(call.roles.hang_up),
-                };
-                call.press(button)
-            }
-            CallAction::HangUp if !telephony_up => {
-                let call = theirs().find(|c| !c.ringing())?;
-                call.press(call.roles.hang_up.or(call.roles.decline))
-            }
-            _ => return None,
-        };
-        Some(result)
-    }
-
     /// Every phone this computer can see calls of.
     pub fn phones(&self) -> Vec<PhoneCalls> {
         lock(&self.desk).phones()
@@ -912,7 +527,12 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calls_hub::voice::VoicePolicy;
+    use crate::calls_hub::voice::STEER_FOR;
+    use crate::notify_hub::CallRoles;
+    use crate::notify_hub::DisplayEvent;
     use cursio_protocol::calls::{CallDirection, CallState};
+    use cursio_protocol::notify::Notification;
 
     #[test]
     fn an_older_nodes_call_setup_reads_as_one_that_can_be_a_headset() {
