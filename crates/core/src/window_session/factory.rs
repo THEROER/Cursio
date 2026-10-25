@@ -323,17 +323,17 @@ pub(super) fn spawn_drag_trigger(
     tokio::spawn(async move {
         #[cfg(target_os = "linux")]
         let (mut watcher, screen) = (
-            cursio_window::linux_drag::DragWatcher::spawn(),
+            cursio_window::linux_drag::watch(),
             cursio_window::linux_drag::screen_size().await,
         );
         #[cfg(target_os = "windows")]
         let (mut watcher, screen) = (
-            cursio_window::windows_drag::DragWatcher::spawn(),
+            cursio_window::windows_drag::watch(),
             cursio_window::windows_drag::screen_size(),
         );
         #[cfg(target_os = "macos")]
         let (mut watcher, screen) = (
-            cursio_window::macos_drag::DragWatcher::spawn(),
+            cursio_window::macos_drag::watch(),
             cursio_window::macos_drag::screen_size(),
         );
 

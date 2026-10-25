@@ -13,50 +13,17 @@
 //! own grab-op signals on the session bus.
 //!
 //! **The extension is optional.** Its absence disables drag transfer but must
-//! not break the rest of a session. That is why [`DragWatcher::spawn`] cannot
+//! not break the rest of a session. That is why [`watch`] cannot
 //! fail: it reports what happened through the log and simply yields no events.
 
 use tokio::sync::mpsc;
 
-use crate::drag::{DragEvent, PointerPos};
+use crate::drag::{DragEvent, DragWatcher, PointerPos};
 
-/// Receives [`DragEvent`]s for as long as it is held.
-///
-/// Dropping it stops the background listener.
-pub struct DragWatcher {
-    events: mpsc::UnboundedReceiver<DragEvent>,
-    /// Dropped with the watcher, which ends the listener task.
-    _cancel: tokio::sync::oneshot::Sender<()>,
-}
-
-impl DragWatcher {
-    /// Start listening for drags, if the extension is there.
-    ///
-    /// Never fails: without the extension this returns a watcher that simply
-    /// never yields, which is exactly how a machine with no drag detection
-    /// should behave.
-    pub fn spawn() -> Self {
-        let (tx, events) = mpsc::unbounded_channel();
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = listen(tx) => {}
-                // The watcher was dropped; stop listening.
-                _ = cancel_rx => {}
-            }
-        });
-
-        Self {
-            events,
-            _cancel: cancel_tx,
-        }
-    }
-
-    /// The next drag event, or `None` once the listener has stopped.
-    pub async fn next(&mut self) -> Option<DragEvent> {
-        self.events.recv().await
-    }
+/// Start listening for drags through the GNOME Shell extension. Without it
+/// the watcher simply never yields.
+pub fn watch() -> DragWatcher {
+    DragWatcher::run(listen)
 }
 
 /// The desktop's total size, for deciding what counts as "at the edge".

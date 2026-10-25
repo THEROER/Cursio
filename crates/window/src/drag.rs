@@ -6,8 +6,52 @@
 //! Both report *this* vocabulary, so the session logic that turns a drag into a
 //! transfer is written once and neither backend leaks into it.
 //!
-//! See [`windows_drag`](crate::windows_drag) and
-//! [`linux_drag`](crate::linux_drag) for the detectors.
+//! See [`windows_drag`](crate::windows_drag),
+//! [`linux_drag`](crate::linux_drag) and [`macos_drag`](crate::macos_drag) for
+//! the detectors.
+
+use tokio::sync::mpsc;
+
+/// Receives [`DragEvent`]s for as long as it is held; dropping it stops the
+/// detector behind it.
+///
+/// Built by each platform's `watch`, which never fails: drag detection is an
+/// optional accelerator for a transfer, so a detector that cannot run costs
+/// the drag trigger and nothing else — the watcher simply never yields.
+pub struct DragWatcher {
+    events: mpsc::UnboundedReceiver<DragEvent>,
+    /// Dropped with the watcher, which ends the detector's task.
+    _cancel: tokio::sync::oneshot::Sender<()>,
+}
+
+impl DragWatcher {
+    /// Run `detect` on the runtime until the watcher is dropped, receiving
+    /// what it reports.
+    pub(crate) fn run<F, Fut>(detect: F) -> Self
+    where
+        F: FnOnce(mpsc::UnboundedSender<DragEvent>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (tx, events) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let detector = detect(tx);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = detector => {}
+                _ = cancel_rx => {}
+            }
+        });
+        Self {
+            events,
+            _cancel: cancel_tx,
+        }
+    }
+
+    /// The next drag event, or `None` once the detector has stopped.
+    pub async fn next(&mut self) -> Option<DragEvent> {
+        self.events.recv().await
+    }
+}
 
 /// Where the pointer is, in whole desktop pixels.
 ///

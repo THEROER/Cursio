@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::drag::{DragEvent, PointerPos};
+use crate::drag::{DragEvent, DragWatcher, PointerPos};
 
 unsafe extern "C" {
     /// See `native/macos/window_drag.m`. Returns 1 while a window is being
@@ -46,35 +46,10 @@ const POLL: Duration = Duration::from_millis(16);
 /// across an FFI boundary would not be worth the byte it saved.
 const MAX_TITLE_BYTES: usize = 512;
 
-/// Watches for windows being dragged on macOS.
-pub struct DragWatcher {
-    events: mpsc::UnboundedReceiver<DragEvent>,
-    _cancel: tokio::sync::oneshot::Sender<()>,
-}
-
-impl DragWatcher {
-    /// Start watching. Never fails, matching the other two platforms.
-    pub fn spawn() -> Self {
-        let (tx, events) = mpsc::unbounded_channel();
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = poll_loop(tx) => {}
-                _ = cancel_rx => {}
-            }
-        });
-
-        Self {
-            events,
-            _cancel: cancel_tx,
-        }
-    }
-
-    /// The next drag event, or `None` once the watcher has stopped.
-    pub async fn next(&mut self) -> Option<DragEvent> {
-        self.events.recv().await
-    }
+/// Start watching for windows being dragged, inferred from the window
+/// server's list.
+pub fn watch() -> DragWatcher {
+    DragWatcher::run(poll_loop)
 }
 
 /// One sample of what the window server says.

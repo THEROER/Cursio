@@ -40,47 +40,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GUI_INMOVESIZE,
 };
 
-use crate::drag::{DragEvent, PointerPos};
+use crate::drag::{DragEvent, DragWatcher, PointerPos};
 
 /// How often the move-size state is sampled. Matches the GNOME extension's
 /// poll so a drag feels the same on both machines.
 const POLL: Duration = Duration::from_millis(30);
 
-/// Receives [`DragEvent`]s for as long as it is held.
-///
-/// Dropping it stops the background poller.
-pub struct DragWatcher {
-    events: mpsc::UnboundedReceiver<DragEvent>,
-    _cancel: tokio::sync::oneshot::Sender<()>,
-}
-
-impl DragWatcher {
-    /// Start watching for window drags.
-    ///
-    /// Never fails, matching the Linux watcher: drag detection is an optional
-    /// accelerator for a feature that also works from the command line, so a
-    /// problem here must cost the drag trigger and nothing else.
-    pub fn spawn() -> Self {
-        let (tx, events) = mpsc::unbounded_channel();
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = poll_loop(tx) => {}
-                _ = cancel_rx => {}
-            }
-        });
-
-        Self {
-            events,
-            _cancel: cancel_tx,
-        }
-    }
-
-    /// The next drag event, or `None` once the watcher has stopped.
-    pub async fn next(&mut self) -> Option<DragEvent> {
-        self.events.recv().await
-    }
+/// Start watching for window drags by sampling the move-size loop.
+pub fn watch() -> DragWatcher {
+    DragWatcher::run(poll_loop)
 }
 
 /// The desktop's total size, for deciding what counts as "at the edge".
