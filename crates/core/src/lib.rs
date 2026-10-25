@@ -161,6 +161,8 @@ pub mod session_bus;
 mod session_outbox;
 pub mod share_session;
 pub mod share_sink;
+#[cfg(test)]
+mod test_support;
 /// Versions side by side, a `current` pointer, and the helper that switches it.
 pub mod update;
 #[cfg(feature = "usb")]

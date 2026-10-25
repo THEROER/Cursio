@@ -268,6 +268,7 @@ impl AudioEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_session::test_support::demands;
     use crate::audio_session::test_support::engine;
     use crate::audio_session::test_support::route;
     use crate::audio_session::test_support::RecordingTx;
@@ -402,7 +403,7 @@ mod tests {
             .expect("reporting demand must not fail");
 
         assert_eq!(
-            tx.demands(),
+            demands(&tx),
             vec![(476800, false)],
             "a stream that failed to open must be refused, not passed over in silence"
         );
@@ -415,7 +416,7 @@ mod tests {
             .await
             .expect("reporting demand must not fail");
         assert!(
-            again.demands().is_empty(),
+            demands(&again).is_empty(),
             "an unchanged demand must not be resent"
         );
     }

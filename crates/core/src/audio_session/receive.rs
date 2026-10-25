@@ -464,6 +464,7 @@ impl AudioEngine {
 mod tests {
     use super::*;
     use crate::audio_session::test_support::capture_meta;
+    use crate::audio_session::test_support::demands;
     use crate::audio_session::test_support::engine;
     use crate::audio_session::test_support::RecordingTx;
     use crate::module::SessionModule;
@@ -608,7 +609,7 @@ mod tests {
             .expect("reporting demand must not fail");
 
         assert!(
-            tx.demands().is_empty(),
+            demands(&tx).is_empty(),
             "a stream still waiting for its first chunk must not be refused"
         );
     }

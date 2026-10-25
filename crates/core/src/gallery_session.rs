@@ -136,27 +136,12 @@ impl crate::module::ModuleFactory for GalleryFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use cursio_protocol::Message;
+    use crate::test_support::RecordingTx;
+
     use cursio_protocol::PeerId;
-    use cursio_transport::TransportError;
-    use cursio_transport::TransportTx;
 
     type Answer = Result<GalleryResponse, String>;
     use cursio_protocol::gallery::{MediaFilter, MediaItem, MediaKind};
-
-    #[derive(Default)]
-    struct RecordingTx {
-        sent: Vec<Message>,
-    }
-
-    #[async_trait]
-    impl TransportTx for RecordingTx {
-        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-            self.sent.push(msg.clone());
-            Ok(())
-        }
-    }
 
     struct Roll;
 

@@ -586,46 +586,13 @@ pub const VERSION: u16 = 6;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::RecordingTx;
     use crate::window_session::pump::MAX_FRAMES_PER_PUMP;
     use crate::window_session::pump::VIDEO_QUEUE_HIGH_WATER_BYTES;
     use cursio_protocol::{Rect, TileCodec, WindowFrame, WindowInput, WindowMeta};
     use cursio_transport::QueueDepth;
     use cursio_window::window_test_support::*;
     use tokio::sync::mpsc;
-
-    /// Collects what the module sends, standing in for the transport.
-    #[derive(Default)]
-    struct RecordingTx {
-        sent: Vec<Message>,
-        video_depth: QueueDepth,
-    }
-
-    #[async_trait]
-    impl TransportTx for RecordingTx {
-        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-            self.sent.push(msg.clone());
-            Ok(())
-        }
-
-        fn queue_depth(&self, priority: Priority) -> QueueDepth {
-            if priority == Priority::Video {
-                self.video_depth
-            } else {
-                QueueDepth::default()
-            }
-        }
-    }
-
-    impl RecordingTx {
-        /// The control messages sent, decoded out of their envelopes — the same
-        /// way the peer's module sees them.
-        fn control(&self) -> Vec<WindowMsg> {
-            self.sent
-                .iter()
-                .filter_map(|m| m.decode_module::<WindowMsg>(ModuleId::WINDOW).unwrap())
-                .collect()
-        }
-    }
 
     /// Wrap a control message the way the peer would send it, for feeding to
     /// `handle_message`.
@@ -679,7 +646,10 @@ mod tests {
         eng.pump(&mut tx).await.unwrap();
 
         // Dragging a window to the edge must offer it, with no separate call.
-        assert!(matches!(tx.control().first(), Some(WindowMsg::Offer(_))));
+        assert!(matches!(
+            tx.decoded::<WindowMsg>(ModuleId::WINDOW).first(),
+            Some(WindowMsg::Offer(_))
+        ));
     }
 
     #[tokio::test]
@@ -707,7 +677,7 @@ mod tests {
         // `Returned` (not `Closed`) is what tells the peer the window went
         // home rather than died, so its surrogate disappears quietly.
         assert!(matches!(
-            tx.control().first(),
+            tx.decoded::<WindowMsg>(ModuleId::WINDOW).first(),
             Some(WindowMsg::Close {
                 reason: WindowCloseReason::Returned,
                 ..
@@ -884,7 +854,7 @@ mod tests {
 
         let mut tx = RecordingTx {
             sent: Vec::new(),
-            video_depth: QueueDepth {
+            depth: QueueDepth {
                 queued_bytes: VIDEO_QUEUE_HIGH_WATER_BYTES,
                 sent_bytes: 0,
             },
@@ -895,7 +865,7 @@ mod tests {
             .iter()
             .all(|message| !matches!(message, Message::WindowFrame(_))));
 
-        tx.video_depth = QueueDepth::default();
+        tx.depth = QueueDepth::default();
         eng.pump(&mut tx).await.unwrap();
         assert!(tx
             .sent
@@ -983,13 +953,16 @@ mod tests {
         let mut tx = RecordingTx::default();
         eng.pump(&mut tx).await.unwrap();
 
-        assert!(tx.control().iter().any(|m| matches!(
-            m,
-            WindowMsg::Close {
-                reason: WindowCloseReason::HostClosed,
-                ..
-            }
-        )));
+        assert!(tx
+            .decoded::<WindowMsg>(ModuleId::WINDOW)
+            .iter()
+            .any(|m| matches!(
+                m,
+                WindowMsg::Close {
+                    reason: WindowCloseReason::HostClosed,
+                    ..
+                }
+            )));
         assert!(eng.hosted.is_empty());
     }
 
@@ -1046,7 +1019,7 @@ mod tests {
         let mut tx = RecordingTx::default();
         eng.start(&mut tx).await.unwrap();
         assert_eq!(
-            tx.control().first(),
+            tx.decoded::<WindowMsg>(ModuleId::WINDOW).first(),
             Some(&WindowMsg::VideoCaps(cursio_window::LOCAL_VIDEO_CAPS))
         );
     }
@@ -1141,7 +1114,9 @@ mod tests {
 
         let mut tx = RecordingTx::default();
         eng.pump(&mut tx).await.unwrap();
-        assert!(tx.control().contains(&WindowMsg::KeyframeRequest { id: 9 }));
+        assert!(tx
+            .decoded::<WindowMsg>(ModuleId::WINDOW)
+            .contains(&WindowMsg::KeyframeRequest { id: 9 }));
     }
 
     #[tokio::test]
@@ -1163,10 +1138,12 @@ mod tests {
 
         let mut tx = RecordingTx::default();
         eng.pump(&mut tx).await.unwrap();
-        assert!(tx.control().contains(&WindowMsg::Close {
-            id: 9,
-            reason: WindowCloseReason::ViewerClosed,
-        }));
+        assert!(tx
+            .decoded::<WindowMsg>(ModuleId::WINDOW)
+            .contains(&WindowMsg::Close {
+                id: 9,
+                reason: WindowCloseReason::ViewerClosed,
+            }));
         assert!(eng.viewed.is_empty());
     }
 }

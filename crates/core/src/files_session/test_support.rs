@@ -7,30 +7,10 @@ use crate::files_session::pacer::Pacer;
 use crate::files_session::FilesEngine;
 use cursio_files::bridge::{Op, PeerLink};
 use cursio_files::{FileServer, Workers};
-use cursio_protocol::{FilesMsg, Message, ModuleId};
-use cursio_transport::{QueueDepth, TransportError, TransportTx};
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// Collects what the module sends, standing in for the transport, and
-/// reports whatever backlog the test wants the link to have.
-#[derive(Default)]
-pub(super) struct RecordingTx {
-    pub(super) sent: Vec<FilesMsg>,
-    depth: QueueDepth,
-}
-#[async_trait::async_trait]
-impl TransportTx for RecordingTx {
-    async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        if let Ok(Some(msg)) = msg.decode_module::<FilesMsg>(ModuleId::FILES) {
-            self.sent.push(msg);
-        }
-        Ok(())
-    }
-    fn queue_depth(&self, _priority: cursio_protocol::Priority) -> QueueDepth {
-        self.depth
-    }
-}
+pub(super) use crate::test_support::RecordingTx;
 
 /// An engine with no mount attached: the client half is driven directly
 /// through its operation channel, which is all these tests need and avoids

@@ -188,7 +188,7 @@ mod tests {
     use crate::session::forward::CAPTURED_INPUT_BATCH;
     use crate::session::latency::LatencyWindow;
     use crate::session::test_support::motion;
-    use crate::session::test_support::RecordingSender;
+    use crate::test_support::RecordingTx;
     use cursio_protocol::Message;
     use cursio_transport::TransportTx;
     use std::sync::Arc;
@@ -204,7 +204,7 @@ mod tests {
                 .unwrap();
         }
         let first = receiver.try_recv().unwrap();
-        let mut output = RecordingSender(Vec::new());
+        let mut output = RecordingTx::default();
         forward_captured(
             &mut output,
             first,
@@ -214,7 +214,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!receiver.is_empty());
-        assert!(output.0.len() <= CAPTURED_INPUT_BATCH);
+        assert!(output.sent.len() <= CAPTURED_INPUT_BATCH);
     }
 
     #[test]

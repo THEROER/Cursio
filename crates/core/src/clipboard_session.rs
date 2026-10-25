@@ -698,22 +698,8 @@ pub const VERSION: u16 = 1;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::RecordingTx;
     use cursio_protocol::ClipboardFormatOffer;
-
-    /// A `TransportTx` that records every message sent through it, so tests can
-    /// assert on what the engine put on the wire.
-    #[derive(Default)]
-    struct RecordingTx {
-        sent: Vec<Message>,
-    }
-
-    #[async_trait]
-    impl TransportTx for RecordingTx {
-        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-            self.sent.push(msg.clone());
-            Ok(())
-        }
-    }
 
     fn offer(
         generation: ClipboardGeneration,

@@ -1,40 +1,22 @@
-//! What the engine's tests share: a transport that records what was sent,
-//! and an engine to send through it.
+//! What the engine's tests share: an engine to send through, and readings of
+//! what it sent.
 
 use crate::audio_gate::MicGate;
 use crate::audio_session::send::record_sent;
 use crate::audio_session::AudioEngine;
 use crate::mixer::LocalMixer;
-use cursio_protocol::{AudioMsg, Message, ModuleId, PeerId};
-use cursio_transport::{TransportError, TransportTx};
+pub(super) use crate::test_support::RecordingTx;
+use cursio_protocol::{AudioMsg, ModuleId, PeerId};
 
-/// A transport that keeps what was sent, so a test can assert on the wire
-/// traffic rather than on the engine's internals.
-#[derive(Default)]
-pub(super) struct RecordingTx {
-    sent: Vec<Message>,
-}
-impl RecordingTx {
-    /// The `(id, listening)` pairs of every demand report sent, in order.
-    pub(super) fn demands(&self) -> Vec<(u32, bool)> {
-        self.sent
-            .iter()
-            .filter_map(|m| match m.decode_module::<AudioMsg>(ModuleId::AUDIO) {
-                Ok(Some(AudioMsg::StreamDemand { id, listening })) => Some((id, listening)),
-                _ => None,
-            })
-            .collect()
-    }
-}
-#[async_trait::async_trait]
-impl TransportTx for RecordingTx {
-    async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        self.sent.push(msg.clone());
-        Ok(())
-    }
-    fn queue_depth(&self, _priority: cursio_protocol::Priority) -> cursio_transport::QueueDepth {
-        cursio_transport::QueueDepth::default()
-    }
+/// The `(id, listening)` pairs of every demand report sent, in order.
+pub(super) fn demands(tx: &RecordingTx) -> Vec<(u32, bool)> {
+    tx.decoded::<AudioMsg>(ModuleId::AUDIO)
+        .into_iter()
+        .filter_map(|msg| match msg {
+            AudioMsg::StreamDemand { id, listening } => Some((id, listening)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Build a receiver holding `n` chunks, seq 0..n, for the backlog tests.

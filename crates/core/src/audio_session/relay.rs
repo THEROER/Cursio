@@ -176,6 +176,7 @@ mod tests {
     use super::*;
     use crate::audio_session::test_support::advertised;
     use crate::audio_session::test_support::closed;
+    use crate::audio_session::test_support::demands;
     use crate::audio_session::test_support::engine;
     use crate::audio_session::test_support::RecordingTx;
     use cursio_protocol::PeerId;
@@ -378,7 +379,7 @@ mod tests {
         let mut tx = RecordingTx::default();
         e.pump_relays(&mut tx).await.unwrap();
         e.pump_demand(&mut tx).await.unwrap();
-        assert_eq!(tx.demands(), vec![(476800, true)]);
+        assert_eq!(demands(&tx), vec![(476800, true)]);
     }
 
     /// The tunnel is kept for a pause, but not forever: an app that was quit

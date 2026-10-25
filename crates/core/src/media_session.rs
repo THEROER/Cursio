@@ -225,6 +225,7 @@ impl crate::module::ModuleFactory for MediaFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::RecordingTx;
     use cursio_protocol::media::Player;
     use std::sync::Mutex;
 
@@ -242,19 +243,7 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct Sent(Vec<MediaMsg>);
-    #[async_trait]
-    impl TransportTx for Sent {
-        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-            if let Ok(Some(m)) = msg.decode_module::<MediaMsg>(ModuleId::MEDIA) {
-                self.0.push(m);
-            }
-            Ok(())
-        }
-    }
-
-    async fn settle(engine: &mut MediaEngine, tx: &mut Sent) {
+    async fn settle(engine: &mut MediaEngine, tx: &mut RecordingTx) {
         for _ in 0..50 {
             engine.pump(tx).await.unwrap();
             if !engine.has_pending_work() {
@@ -273,7 +262,7 @@ mod tests {
             Some(fake.clone()),
             false,
         );
-        let mut tx = Sent::default();
+        let mut tx = RecordingTx::default();
         engine.on_message(MediaMsg::Command {
             player: "spotify".into(),
             command: MediaCommand::Next,
@@ -283,7 +272,10 @@ mod tests {
             *fake.0.lock().unwrap(),
             vec![("spotify".to_string(), MediaCommand::Next)]
         );
-        assert!(matches!(tx.0.first(), Some(MediaMsg::Players(_))));
+        assert!(matches!(
+            tx.decoded::<MediaMsg>(ModuleId::MEDIA).first(),
+            Some(MediaMsg::Players(_))
+        ));
     }
 
     #[tokio::test]
@@ -295,14 +287,14 @@ mod tests {
             Some(fake),
             false,
         );
-        let mut tx = Sent::default();
+        let mut tx = RecordingTx::default();
         engine.on_message(MediaMsg::ArtRequest {
             player: "p".into(),
             art: 5,
         });
         settle(&mut engine, &mut tx).await;
         assert!(tx
-            .0
+            .decoded::<MediaMsg>(ModuleId::MEDIA)
             .iter()
             .any(|m| matches!(m, MediaMsg::Art { art: 5, bytes, .. } if bytes.len() == 4)));
     }

@@ -872,36 +872,9 @@ pub fn view_title(peer_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+    use crate::test_support::RecordingTx;
     use cursio_protocol::{Rect, TileCodec};
-    use cursio_transport::QueueDepth;
     use cursio_window::window_test_support::{FakeRenderer, FakeScreenSources, FakeSurrogate};
-
-    #[derive(Default)]
-    struct RecordingTx {
-        sent: Vec<Message>,
-    }
-
-    #[async_trait]
-    impl TransportTx for RecordingTx {
-        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-            self.sent.push(msg.clone());
-            Ok(())
-        }
-
-        fn queue_depth(&self, _priority: Priority) -> QueueDepth {
-            QueueDepth::default()
-        }
-    }
-
-    impl RecordingTx {
-        fn control(&self) -> Vec<WindowMsg> {
-            self.sent
-                .iter()
-                .filter_map(|m| m.decode_module::<WindowMsg>(ModuleId::WINDOW).unwrap())
-                .collect()
-        }
-    }
 
     fn source(id: SourceId, kind: SourceKind, title: &str, picked_on_host: bool) -> ScreenSource {
         ScreenSource {
@@ -958,7 +931,7 @@ mod tests {
         async fn exchange(&mut self) -> RecordingTx {
             let mut up = RecordingTx::default();
             self.viewer.pump(&mut up).await.unwrap();
-            for msg in up.control() {
+            for msg in up.decoded::<WindowMsg>(ModuleId::WINDOW) {
                 self.host.handle(&msg);
             }
             let mut down = RecordingTx::default();
@@ -983,9 +956,9 @@ mod tests {
         async fn settle(&mut self) -> Vec<WindowMsg> {
             let mut seen = Vec::new();
             for _ in 0..400 {
-                seen.extend(self.exchange().await.control());
+                seen.extend(self.exchange().await.decoded::<WindowMsg>(ModuleId::WINDOW));
                 if host_idle(&self.host) && self.viewer.outbox.is_empty() {
-                    let extra = self.exchange().await.control();
+                    let extra = self.exchange().await.decoded::<WindowMsg>(ModuleId::WINDOW);
                     seen.extend(extra);
                     if host_idle(&self.host) {
                         return seen;
@@ -1038,7 +1011,7 @@ mod tests {
         host.next_poll = Instant::now();
         pump_settled(&mut host, &mut tx).await;
         let lists = |tx: &RecordingTx| {
-            tx.control()
+            tx.decoded::<WindowMsg>(ModuleId::WINDOW)
                 .iter()
                 .filter(|m| matches!(m, WindowMsg::Sources(_)))
                 .count()
@@ -1072,12 +1045,12 @@ mod tests {
             started.elapsed() < Duration::from_millis(50),
             "the pump waited on the enumeration"
         );
-        assert!(tx.control().is_empty());
+        assert!(tx.decoded::<WindowMsg>(ModuleId::WINDOW).is_empty());
 
         sources.set_list_stalled(false);
         pump_settled(&mut host, &mut tx).await;
         assert!(matches!(
-            tx.control().as_slice(),
+            tx.decoded::<WindowMsg>(ModuleId::WINDOW).as_slice(),
             [WindowMsg::Sources(list)] if list.len() == 3
         ));
     }
@@ -1090,12 +1063,12 @@ mod tests {
 
         let mut up = RecordingTx::default();
         viewer.pump(&mut up).await.unwrap();
-        for msg in up.control() {
+        for msg in up.decoded::<WindowMsg>(ModuleId::WINDOW) {
             host.handle(&msg);
         }
         let mut down = RecordingTx::default();
         host.pump(&mut down).await.unwrap();
-        let answers = down.control();
+        let answers = down.decoded::<WindowMsg>(ModuleId::WINDOW);
         assert!(matches!(
             answers.as_slice(),
             [WindowMsg::SourcesRefused { reason }] if reason.contains("--no-screen-host")
@@ -1311,7 +1284,7 @@ mod tests {
         pump_settled(&mut host, &mut tx).await;
 
         assert!(matches!(
-            tx.control().as_slice(),
+            tx.decoded::<WindowMsg>(ModuleId::WINDOW).as_slice(),
             [WindowMsg::SourceEnded { reason }] if reason.contains("no longer exists")
         ));
     }

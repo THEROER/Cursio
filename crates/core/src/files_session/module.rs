@@ -374,7 +374,7 @@ mod tests {
             "the pump waited {took:?} on a lock held by a slow worker"
         );
         assert!(
-            tx.sent
+            tx.decoded::<FilesMsg>(ModuleId::FILES)
                 .iter()
                 .any(|m| matches!(m, FilesMsg::Volumes(v) if v == &vec![stick.clone()])),
             "the new volume set is still announced"

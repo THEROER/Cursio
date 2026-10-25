@@ -169,29 +169,14 @@ impl crate::module::ModuleFactory for MessagesFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use cursio_protocol::Message;
+    use crate::test_support::RecordingTx;
+
     use cursio_protocol::PeerId;
-    use cursio_transport::TransportError;
-    use cursio_transport::TransportTx;
 
     type Answer = Result<MessagesResponse, String>;
     use crate::messages_hub::MemoryStore;
     use cursio_protocol::messages::Conversation;
     use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct RecordingTx {
-        sent: Vec<Message>,
-    }
-
-    #[async_trait]
-    impl TransportTx for RecordingTx {
-        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-            self.sent.push(msg.clone());
-            Ok(())
-        }
-    }
 
     fn conversation(thread_id: i64) -> Conversation {
         Conversation {
