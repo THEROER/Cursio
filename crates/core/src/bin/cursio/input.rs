@@ -54,18 +54,14 @@ pub(crate) fn apply_modifier_map(spec: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Ownership hotkey = Ctrl + Alt + G held together. evdev keycodes (the neutral
-// namespace both platforms map to). We accept either left or right Ctrl/Alt so
-// laptops without a right Ctrl still work.
-pub(crate) const KEY_LEFTCTRL: u16 = 29;
-pub(crate) const KEY_RIGHTCTRL: u16 = 97;
-pub(crate) const KEY_LEFTALT: u16 = 56;
-pub(crate) const KEY_RIGHTALT: u16 = 100;
-/// The non-modifier "trigger" key of the combo. `G` for "grab".
-pub(crate) const KEY_G: u16 = 34;
-/// Panic / emergency-release trigger: **Ctrl+Alt+Esc**. Slams control back to
-/// this machine no matter the session state (evdev `KEY_ESC` = 1).
-pub(crate) const KEY_ESC: u16 = 1;
+// Ownership hotkey = Ctrl + Alt + G held together, in the wire's evdev codes
+// (the neutral namespace every platform maps to); `G` for "grab". Either Ctrl
+// and either Alt count, so laptops without a right Ctrl still work. Panic /
+// emergency release is Ctrl+Alt+Esc: it slams control back to this machine no
+// matter the session state.
+use cursio_protocol::keys::{
+    KEY_ESC, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL,
+};
 
 /// Spawn a task that hands captured events to the hub, but watches for the
 /// ownership hotkey (**Ctrl+Alt+G**) and emits an [`OwnershipCmd`] instead of

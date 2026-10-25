@@ -25,13 +25,8 @@ fn main() {
     use std::time::Duration;
 
     use cursio_input::{InputInjector, MacInjector};
+    use cursio_protocol::keys::{KEY_A, KEY_H, KEY_I, KEY_LEFTCTRL};
     use cursio_protocol::InputEvent;
-
-    // evdev codes for the keys used below.
-    const KEY_A: u16 = 30;
-    const KEY_I: u16 = 23;
-    const KEY_H: u16 = 35;
-    const KEY_LEFTCTRL: u16 = 29;
 
     tracing_subscriber::fmt()
         .with_env_filter(
