@@ -45,67 +45,25 @@
 //! module's inbox ([`Router`]), so module traffic never passes through the
 //! session loop and never sits between two input events.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use cursio_protocol::{Message, ModuleId, Priority};
-use cursio_transport::{QueueDepth, TransportError, TransportTx};
+use cursio_protocol::{Message, ModuleId};
+use cursio_transport::TransportError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::module::SessionModule;
+pub(super) use crate::module_host::link_tx::LinkTx;
+use crate::module_host::pace::Pace;
+use crate::module_host::router::module_inbox;
+use crate::module_host::router::Inbox;
+pub(super) use crate::module_host::router::Router;
 
-/// How often a module is pumped while it has traffic.
-///
-/// Sized just under the audio chunk cadence (~10 ms) so a steady stream is
-/// pumped smoothly rather than in bursts. Without a pace a module was pumped
-/// only when something else woke the loop, which turned continuous audio into
-/// one clump every heartbeat.
-pub(crate) const MODULE_PUMP_INTERVAL: Duration = Duration::from_millis(5);
+mod link_tx;
+mod pace;
+mod router;
 
-/// The pace a module falls back to once it has been quiet for
-/// [`IDLE_PUMP_AFTER`] consecutive pumps.
-///
-/// 200 wakeups a second buy nothing when nothing streams, but they keep the
-/// core out of its deeper idle states — a steady draw on an always-on node, per
-/// module now rather than per link. 50 ms still bounds how long a module that
-/// starts producing between ticks waits for its first pump.
-pub(crate) const IDLE_PUMP_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Consecutive silent pumps before dropping to [`IDLE_PUMP_INTERVAL`].
-///
-/// Several rather than one: audio chunks do not arrive on a perfect grid, so
-/// one empty tick is normal mid-stream. At the fast pace this is 100 ms of
-/// silence before the pace changes at all.
-pub(crate) const IDLE_PUMP_AFTER: u32 = 20;
-
-/// The pace of a module that has been quiet for long, after
-/// [`DEEP_IDLE_AFTER`] pumps at [`IDLE_PUMP_INTERVAL`].
-///
-/// Even 50 ms is a wakeup per module per link twenty times a second: a phone
-/// with eight modules on four links woke ~640 times a second with nothing
-/// happening, and held the CPU awake to do it. What arrives from the peer
-/// wakes a module through its inbox at once, whatever its pace; only a module
-/// that has to notice something local — a capture that started producing, a
-/// copy — waits, and a second is a fair price for that once it has been
-/// quiet this long.
-pub(crate) const DEEP_IDLE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Pumps at [`IDLE_PUMP_INTERVAL`] before dropping to [`DEEP_IDLE_INTERVAL`]:
-/// two seconds of nothing.
-pub(crate) const DEEP_IDLE_AFTER: u32 = 40;
-
-/// How many modules, across every link of this process, are at the fast pace
-/// now — that is, have traffic. Zero means the node is idle, which a phone
-/// uses to let its CPU and radio sleep; see [`modules_busy`].
-static FAST_MODULES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Whether any module of any link is moving data or owes an answer now.
-pub fn modules_busy() -> bool {
-    FAST_MODULES.load(std::sync::atomic::Ordering::Relaxed) > 0
-}
+pub use pace::modules_busy;
+pub(crate) use pace::MODULE_PUMP_INTERVAL;
 
 /// Warn when a single pump takes at least this long.
 ///
@@ -174,234 +132,6 @@ pub(crate) fn message_kind(msg: &Message) -> &'static str {
     }
 }
 
-type Slot = Arc<tokio::sync::Mutex<Option<Box<dyn TransportTx>>>>;
-
-/// One holder's way onto the link: the session's own, or one module's.
-///
-/// Closable from outside, which is what lets teardown finish while a module is
-/// wedged: its handle onto the queue is taken away, so the link closes when
-/// the session is done with it rather than when the module lets go, and
-/// anything the module sends afterwards fails instead of reaching a peer that
-/// has moved on.
-pub(crate) struct LinkTx {
-    slot: Slot,
-    open: Arc<AtomicBool>,
-    closed: Arc<tokio::sync::Notify>,
-    /// Whether `slot` belongs to this holder alone. A shared one must stay
-    /// filled when one holder closes, because the others still send through
-    /// it.
-    own: bool,
-    /// Messages this handle has sent — what a module's pace follows.
-    sent: u64,
-}
-
-impl LinkTx {
-    pub(crate) fn new(tx: Box<dyn TransportTx>) -> Self {
-        Self {
-            slot: Arc::new(tokio::sync::Mutex::new(Some(tx))),
-            open: Arc::new(AtomicBool::new(true)),
-            closed: Arc::new(tokio::sync::Notify::new()),
-            own: true,
-            sent: 0,
-        }
-    }
-
-    /// A handle for a module: a clone of the queue where the sender has one,
-    /// or this very sender, shared, where it does not.
-    pub(crate) fn fork(&self) -> Self {
-        let cloned = self
-            .slot
-            .try_lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().and_then(|tx| tx.clone_sender()));
-        match cloned {
-            Some(tx) => Self::new(tx),
-            None => Self {
-                slot: self.slot.clone(),
-                open: Arc::new(AtomicBool::new(true)),
-                closed: Arc::new(tokio::sync::Notify::new()),
-                own: false,
-                sent: 0,
-            },
-        }
-    }
-
-    /// Another reference to the same handle, for closing it from outside.
-    pub(crate) fn closer(&self) -> Self {
-        Self {
-            slot: self.slot.clone(),
-            open: self.open.clone(),
-            closed: self.closed.clone(),
-            own: self.own,
-            sent: 0,
-        }
-    }
-
-    /// Refuse every later send, and let go of the queue if it is ours alone.
-    ///
-    /// Closing cancels a send awaiting queue capacity before taking its slot.
-    /// Atomic scheduler admission makes that cancellation safe.
-    pub(crate) async fn close(&self) {
-        self.open.store(false, Ordering::Release);
-        self.closed.notify_waiters();
-        if !self.own {
-            return;
-        }
-        match tokio::time::timeout(Duration::from_millis(250), self.slot.lock()).await {
-            Ok(mut slot) => drop(slot.take()),
-            Err(_) => tracing::warn!("a module held its sender through teardown; leaving it"),
-        }
-    }
-
-    pub(crate) fn sent(&self) -> u64 {
-        self.sent
-    }
-}
-
-#[async_trait]
-impl TransportTx for LinkTx {
-    async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        let closed = self.closed.notified();
-        tokio::pin!(closed);
-        closed.as_mut().enable();
-        if !self.open.load(Ordering::Acquire) {
-            return Err(TransportError::Closed);
-        }
-        tokio::select! {
-            biased;
-            () = &mut closed => return Err(TransportError::Closed),
-            result = async {
-                let mut slot = self.slot.lock().await;
-                let tx = slot.as_mut().ok_or(TransportError::Closed)?;
-                tx.send(msg).await
-            } => result?,
-        }
-        self.sent = self.sent.wrapping_add(1);
-        Ok(())
-    }
-
-    fn queue_age(&self, priority: Priority) -> Duration {
-        self.slot
-            .try_lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|tx| tx.queue_age(priority)))
-            .unwrap_or_default()
-    }
-
-    fn queue_delay(&self, priority: Priority) -> cursio_transport::QueueDelay {
-        self.slot
-            .try_lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|tx| tx.queue_delay(priority)))
-            .unwrap_or_default()
-    }
-
-    fn queue_depth(&self, priority: Priority) -> QueueDepth {
-        // Only this holder and teardown ever take the lock, so a miss means
-        // teardown has it and the figure no longer matters.
-        self.slot
-            .try_lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|tx| tx.queue_depth(priority)))
-            .unwrap_or_default()
-    }
-
-    async fn flush(&mut self) {
-        let mut slot = self.slot.lock().await;
-        if let Some(tx) = slot.as_mut() {
-            tx.flush().await;
-        }
-    }
-
-    fn holding(&self) -> bool {
-        self.slot
-            .try_lock()
-            .ok()
-            .is_some_and(|slot| slot.as_ref().is_some_and(|tx| tx.holding()))
-    }
-}
-
-/// Whether a module is pumped at the fast pace or the idle one.
-///
-/// Per module now, which is what the shared loop could never be: a file
-/// transfer used to hold every module at 200 wakeups a second, and an idle
-/// clipboard now sleeps beside a live audio stream.
-struct Pace {
-    interval: tokio::time::Interval,
-    fast: bool,
-    /// Past [`DEEP_IDLE_AFTER`] at the idle pace.
-    deep: bool,
-    silent_pumps: u32,
-    last_sent: u64,
-}
-
-impl Pace {
-    fn new() -> Self {
-        FAST_MODULES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self {
-            interval: Self::interval(MODULE_PUMP_INTERVAL),
-            fast: true,
-            deep: false,
-            silent_pumps: 0,
-            last_sent: 0,
-        }
-    }
-
-    fn interval(period: Duration) -> tokio::time::Interval {
-        let mut interval = tokio::time::interval(period);
-        // A missed tick fires once and carries on; replaying the backlog as a
-        // burst is the very clumping the pace exists to prevent.
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval
-    }
-
-    /// Follow the module's traffic after a pump.
-    ///
-    /// Sent anything, received anything, or owes an answer: stay fast. A mount
-    /// serving a download sends little and receives a lot, and judging that
-    /// idle put 50 ms between each request and the answer that had just
-    /// arrived. Answers `true` when the pace changed.
-    fn follow(&mut self, sent: u64, busy: bool) -> bool {
-        let active = sent != self.last_sent || busy;
-        self.last_sent = sent;
-        if active {
-            self.silent_pumps = 0;
-            self.deep = false;
-            if !self.fast {
-                self.interval = Self::interval(MODULE_PUMP_INTERVAL);
-                self.fast = true;
-                FAST_MODULES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return true;
-            }
-        } else if self.fast {
-            self.silent_pumps = self.silent_pumps.saturating_add(1);
-            if self.silent_pumps >= IDLE_PUMP_AFTER {
-                self.interval = Self::interval(IDLE_PUMP_INTERVAL);
-                self.fast = false;
-                self.silent_pumps = 0;
-                FAST_MODULES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                return true;
-            }
-        } else if !self.deep {
-            self.silent_pumps = self.silent_pumps.saturating_add(1);
-            if self.silent_pumps >= DEEP_IDLE_AFTER {
-                self.interval = Self::interval(DEEP_IDLE_INTERVAL);
-                self.deep = true;
-                return true;
-            }
-        }
-        false
-    }
-}
-
-impl Drop for Pace {
-    fn drop(&mut self) {
-        if self.fast {
-            FAST_MODULES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
 /// A module that stopped being able to talk to the peer.
 ///
 /// Reported to the session rather than handled here: a failed send means the
@@ -411,151 +141,6 @@ impl Drop for Pace {
 pub(crate) struct ModuleFailure {
     pub module: &'static str,
     pub error: TransportError,
-}
-
-/// What the reader holds for one module: where its messages go.
-#[derive(Clone)]
-struct Inbox {
-    name: &'static str,
-    tx: crate::queue::Sender<Message>,
-}
-
-/// Most messages held for one module that is not running yet.
-///
-/// Enough for a module's opening exchange; a peer streaming into a module this
-/// side never starts cannot grow it past this.
-const PARKED_PER_MODULE: usize = 256;
-
-#[derive(Default)]
-struct Routes {
-    inboxes: HashMap<ModuleId, Inbox>,
-    /// Messages for a module not running here yet, in arrival order.
-    parked: HashMap<ModuleId, Vec<Message>>,
-    error: Option<String>,
-}
-
-/// The reader's routing table: each module's messages to that module alone.
-///
-/// Shared between the reader task, which routes, and the session loop, which
-/// adds and removes modules when the link is reconfigured. The lock is held
-/// for one lookup and one channel send; the session takes it only when a
-/// module starts or stops.
-#[derive(Clone, Default)]
-pub(crate) struct Router {
-    routes: Arc<std::sync::Mutex<Routes>>,
-}
-
-impl Router {
-    fn routes(&self) -> std::sync::MutexGuard<'_, Routes> {
-        self.routes.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Deliver `msg` to its module, or hand it back when it is the session's.
-    ///
-    /// A message for a module not running here is held, up to a bound. The
-    /// peer starts a module right after announcing it in a reconfiguration,
-    /// and the reader routes its first message before the session loop has
-    /// read the announcement and started the module on this side; dropping it
-    /// lost that module's opening exchange.
-    pub(crate) fn route(&self, msg: Message) -> Option<Message> {
-        let Some(id) = msg.module_id() else {
-            return Some(msg);
-        };
-        let mut routes = self.routes();
-        if routes.error.is_some() {
-            return None;
-        }
-        match routes.inboxes.get(&id) {
-            Some(inbox) => {
-                if let Err(error) = deliver(inbox, msg) {
-                    routes.error = Some(error.to_string());
-                }
-            }
-            None => {
-                let count: usize = routes.parked.values().map(Vec::len).sum();
-                let bytes: usize = routes
-                    .parked
-                    .values()
-                    .flatten()
-                    .map(crate::queue::message_bytes)
-                    .sum();
-                if count >= PARKED_PER_MODULE
-                    || bytes.saturating_add(crate::queue::message_bytes(&msg))
-                        > 64 * 1024 * 1024 + 256
-                {
-                    routes.error = Some(format!("parked module queue overloaded for {id}"));
-                } else {
-                    routes.parked.entry(id).or_default().push(msg);
-                }
-            }
-        }
-        None
-    }
-
-    pub(crate) fn error(&self) -> Option<String> {
-        self.routes().error.clone()
-    }
-
-    /// Start delivering `id`'s messages to `inbox`.
-    ///
-    /// `keep_parked` is whether what arrived before now belongs to it: yes
-    /// when the peer announced the module first, since it sends nothing for a
-    /// module before announcing it; no when this side started it, since then
-    /// anything held is from an instance the peer has since stopped.
-    fn insert(&self, id: ModuleId, inbox: Inbox, keep_parked: bool) {
-        let mut routes = self.routes();
-        let parked = routes.parked.remove(&id).unwrap_or_default();
-        if keep_parked {
-            for msg in parked {
-                if let Err(error) = deliver(&inbox, msg) {
-                    routes.error = Some(error.to_string());
-                    break;
-                }
-            }
-        }
-        if routes.inboxes.insert(id, inbox).is_some() {
-            tracing::warn!(module = %id, "two modules claim one id; the later one receives");
-        }
-    }
-
-    fn remove(&self, id: ModuleId) {
-        let mut routes = self.routes();
-        routes.inboxes.remove(&id);
-        routes.parked.remove(&id);
-    }
-}
-
-/// Only an overflowing inbox ends the session. A module that has already
-/// ended (its inbox closed, not failed) cannot act on anything sent after it,
-/// and ending every other module's link over that would turn one module's
-/// exit into a reconnect.
-fn deliver(inbox: &Inbox, msg: Message) -> Result<(), TransportError> {
-    if inbox.tx.send(msg).is_ok() {
-        return Ok(());
-    }
-    if inbox.tx.stats().failed {
-        return Err(TransportError::Other(format!(
-            "{} receive queue overloaded",
-            inbox.name
-        )));
-    }
-    tracing::debug!(module = inbox.name, "message for a module that has ended");
-    Ok(())
-}
-
-fn module_inbox(
-    name: &'static str,
-) -> (
-    crate::queue::Sender<Message>,
-    crate::queue::Receiver<Message>,
-) {
-    crate::queue::channel(
-        name,
-        4096,
-        64 * 1024 * 1024 + 256,
-        crate::queue::message_bytes,
-        |_, _| false,
-    )
 }
 
 /// One module running on its own thread.
@@ -780,37 +365,11 @@ async fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module_host::router::module_inbox;
+    use crate::module_host::router::Inbox;
+    use crate::module_host::router::PARKED_PER_MODULE;
 
-    struct WaitingSender;
-
-    #[async_trait]
-    impl TransportTx for WaitingSender {
-        async fn send(&mut self, _: &Message) -> Result<(), TransportError> {
-            std::future::pending().await
-        }
-        fn queue_age(&self, _: Priority) -> Duration {
-            Duration::from_millis(123)
-        }
-    }
-
-    #[tokio::test]
-    async fn closing_a_holder_cancels_a_send_waiting_for_queue_capacity() {
-        let mut sender = LinkTx::new(Box::new(WaitingSender));
-        assert_eq!(
-            sender.queue_age(Priority::Video),
-            Duration::from_millis(123)
-        );
-        let closer = sender.closer();
-        let pending = tokio::spawn(async move { sender.send(&Message::Bye).await });
-        tokio::task::yield_now().await;
-        tokio::time::timeout(Duration::from_millis(100), closer.close())
-            .await
-            .unwrap();
-        assert!(matches!(
-            pending.await.unwrap(),
-            Err(TransportError::Closed)
-        ));
-    }
+    use cursio_protocol::Priority;
 
     fn inbox(name: &'static str) -> (Inbox, crate::queue::Receiver<Message>) {
         let (tx, rx) = module_inbox(name);
@@ -951,62 +510,5 @@ mod tests {
         assert_eq!(message_kind(&envelope(ModuleId::AUDIO)), "Module(audio)");
         assert_eq!(message_kind(&envelope(ModuleId::FILES)), "Module(files)");
         assert_eq!(message_kind(&Message::Bye), "Bye");
-    }
-
-    /// The idle pace is slower, and a stream with gaps cannot trip it.
-    #[test]
-    fn the_idle_pace_is_slower_and_slow_to_engage() {
-        assert!(IDLE_PUMP_INTERVAL > MODULE_PUMP_INTERVAL);
-        assert!(MODULE_PUMP_INTERVAL * IDLE_PUMP_AFTER >= Duration::from_millis(100));
-    }
-
-    /// A module that sends, receives or owes an answer stays fast; one that
-    /// does none of those for long enough drops to the idle pace, and comes
-    /// back the moment it sends again.
-    #[tokio::test]
-    async fn a_modules_pace_follows_its_own_traffic() {
-        let mut pace = Pace::new();
-        for _ in 0..IDLE_PUMP_AFTER - 1 {
-            assert!(!pace.follow(0, false));
-        }
-        assert!(pace.fast, "one pump short of the threshold is still fast");
-        assert!(pace.follow(0, false));
-        assert!(!pace.fast, "quiet long enough drops to the idle pace");
-
-        assert!(pace.follow(1, false), "sending restores the fast pace");
-        assert!(pace.fast);
-
-        for _ in 0..IDLE_PUMP_AFTER * 2 {
-            pace.follow(1, true);
-        }
-        assert!(
-            pace.fast,
-            "a module owed an answer is busy however little it sends"
-        );
-    }
-
-    /// Quiet at the idle pace for long, a module sleeps a second between
-    /// pumps; anything it sends brings it straight back to the fast pace.
-    #[tokio::test]
-    async fn a_long_quiet_module_drops_to_the_deep_idle_pace() {
-        let mut pace = Pace::new();
-        for _ in 0..IDLE_PUMP_AFTER {
-            pace.follow(0, false);
-        }
-        assert!(!pace.fast && !pace.deep);
-        for _ in 0..DEEP_IDLE_AFTER - 1 {
-            assert!(!pace.follow(0, false));
-        }
-        assert!(
-            !pace.deep,
-            "one pump short of the threshold is not deep yet"
-        );
-        assert!(pace.follow(0, false));
-        assert!(pace.deep);
-        assert_eq!(pace.interval.period(), DEEP_IDLE_INTERVAL);
-
-        assert!(pace.follow(1, false), "sending wakes it");
-        assert!(pace.fast && !pace.deep);
-        assert_eq!(pace.interval.period(), MODULE_PUMP_INTERVAL);
     }
 }
