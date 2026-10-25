@@ -1,6 +1,5 @@
 {
   "productName": "Cursio",
-  "version": "0.9.0",
   "identifier": "com.cursio.dev",
   "build": {
     "beforeDevCommand": "bun run --cwd ui dev",

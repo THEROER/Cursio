@@ -726,6 +726,15 @@ fn android(release: bool) -> Result<()> {
     let mut cmd = Command::new(&bun);
     cmd.args(["run", "tauri", "android", "build", "--apk"]);
     cmd.args(["--target", ANDROID_TAURI_TARGET]);
+    // The version lives once, in the workspace's Cargo.toml. The desktop app
+    // reads it from there when tauri.conf.json names none, but the Android
+    // build does not: it keeps whatever `tauri.properties` held from an
+    // earlier build, so the phone reported 0.1.0 after the release was
+    // renumbered.
+    cmd.args([
+        "--config",
+        &format!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION")),
+    ]);
     if !release {
         cmd.arg("--debug");
     }
