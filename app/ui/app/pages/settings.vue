@@ -266,17 +266,21 @@ async function saveMesh(mode: BluetoothMesh) {
   }
 }
 
+/**
+ * The switches below save themselves (the kit's `action`): they show the
+ * change at once, spin while it is sent, and go back on their own when it
+ * fails. What is left here is the saving, and the failure with its retry —
+ * the switch is back where it was by then, so the retry is the other value.
+ */
 async function saveStandby(on: boolean) {
-  standbyBusy.value = true
-  try {
-    await setBluetoothStandby(on)
-    standby.value = on
-    toast.success(t("settings.saved"))
-  } catch (e) {
-    toast.failure(e, { title: t("settings.standbyFailed"), retry: () => saveStandby(on) })
-  } finally {
-    standbyBusy.value = false
-  }
+  await setBluetoothStandby(on)
+  standby.value = on
+  toast.success(t("settings.saved"))
+}
+
+function standbyFailed(e: unknown) {
+  const on = !standby.value
+  toast.failure(e, { title: t("settings.standbyFailed"), retry: () => saveStandby(on) })
 }
 
 interface Autostart {
@@ -285,7 +289,6 @@ interface Autostart {
 }
 
 const autostart = ref<Autostart | null>(null)
-const busy = ref(false)
 
 onMounted(async () => {
   // A phone's node is started by its foreground service, at boot or by the
@@ -298,15 +301,17 @@ onMounted(async () => {
   }
 })
 
-async function setAutostart(next: Autostart) {
-  busy.value = true
-  try {
-    autostart.value = await invoke<Autostart>("autostart_set", { node: next.node, tray: next.tray })
-    toast.success(t("settings.saved"))
-  } catch (e) {
-    toast.failure(e, { title: t("settings.autostartFailed"), retry: () => setAutostart(next) })
-  } finally {
-    busy.value = false
+/** One login item switched; the other is sent as it stands. */
+async function setAutostart(which: keyof Autostart, on: boolean) {
+  const next = { ...autostart.value!, [which]: on }
+  autostart.value = await invoke<Autostart>("autostart_set", { node: next.node, tray: next.tray })
+  toast.success(t("settings.saved"))
+}
+
+function autostartFailed(which: keyof Autostart) {
+  return (e: unknown) => {
+    const on = !autostart.value![which]
+    toast.failure(e, { title: t("settings.autostartFailed"), retry: () => setAutostart(which, on) })
   }
 }
 
@@ -527,10 +532,11 @@ async function restartNode() {
             <p class="text-xs text-muted">{{ t("settings.standbyHint") }}</p>
           </div>
           <LpSwitch
-            :model-value="standby"
+            v-model="standby"
+            :action="saveStandby"
             :disabled="standbyBusy"
             :aria-label="t('settings.standbyToggle')"
-            @update:model-value="(v: boolean) => saveStandby(v)"
+            @error="standbyFailed"
           />
         </LpCard>
       </section>
@@ -564,10 +570,10 @@ async function restartNode() {
                 <p class="text-xs text-muted">{{ t("settings.autostartNodeHint") }}</p>
               </div>
               <LpSwitch
-                :model-value="autostart.node"
-                :disabled="busy"
+                v-model="autostart.node"
+                :action="(on: boolean) => setAutostart('node', on)"
                 :aria-label="t('settings.autostartNode')"
-                @update:model-value="(v: boolean) => setAutostart({ ...autostart!, node: v })"
+                @error="autostartFailed('node')"
               />
             </li>
             <li class="flex items-center gap-4 pt-3">
@@ -576,10 +582,10 @@ async function restartNode() {
                 <p class="text-xs text-muted">{{ t("settings.autostartTrayHint") }}</p>
               </div>
               <LpSwitch
-                :model-value="autostart.tray"
-                :disabled="busy"
+                v-model="autostart.tray"
+                :action="(on: boolean) => setAutostart('tray', on)"
                 :aria-label="t('settings.autostartTray')"
-                @update:model-value="(v: boolean) => setAutostart({ ...autostart!, tray: v })"
+                @error="autostartFailed('tray')"
               />
             </li>
           </ul>

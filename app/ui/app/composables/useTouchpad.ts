@@ -1,3 +1,4 @@
+import { usePersisted } from "@leavepulse/ui"
 import { invoke } from "@tauri-apps/api/core"
 
 /**
@@ -34,14 +35,9 @@ const SPEED_KEY = "cursio.touchpad.speed"
 export const POINTER_SPEED_MIN = 0.4
 export const POINTER_SPEED_MAX = 2.5
 
-function loadSpeed(): number {
-  try {
-    const saved = Number(localStorage.getItem(SPEED_KEY))
-    if (saved >= POINTER_SPEED_MIN && saved <= POINTER_SPEED_MAX) return saved
-  } catch {
-    // Storage refused (private mode, cleared data): the default is right.
-  }
-  return 1
+/** A speed from storage, in range; anything else reads as the default. */
+function isSpeed(value: unknown): value is number {
+  return typeof value === "number" && value >= POINTER_SPEED_MIN && value <= POINTER_SPEED_MAX
 }
 
 /**
@@ -95,14 +91,9 @@ export function useTouchpad() {
     return targets.value.find((t) => t.id === drivenId.value) ?? targets.value.find((t) => t.name === s.peer) ?? null
   })
 
-  const speed = ref(loadSpeed())
-  watch(speed, (value) => {
-    try {
-      localStorage.setItem(SPEED_KEY, String(value))
-    } catch {
-      // Not kept; it still applies until the app closes.
-    }
-  })
+  // Not kept when storage refuses (private mode, cleared data); it still
+  // applies until the app closes.
+  const speed = usePersisted(SPEED_KEY, 1, { validate: isSpeed })
 
   let pendingX = 0
   let pendingY = 0

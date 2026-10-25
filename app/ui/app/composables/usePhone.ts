@@ -1,3 +1,4 @@
+import { usePersisted } from "@leavepulse/ui"
 import { invoke } from "@tauri-apps/api/core"
 
 /** Mirrors `mobile::Setup`. Each grant is `true` once given. */
@@ -108,16 +109,14 @@ export const phoneAudioVolume = (volume: number) => invoke<void>("phone_audio_vo
  */
 const AUTOSTART_DONE_KEY = "cursio.phone.autostartDone"
 
-function readAutostartDone(): boolean {
-  try {
-    return localStorage.getItem(AUTOSTART_DONE_KEY) === "1"
-  } catch {
-    return false
-  }
+/** Kept as JSON now; before the kit kept it, it was the text "1", which reads as 1. */
+function isDone(value: unknown): value is boolean {
+  return typeof value === "boolean" || value === 1
 }
 
 const setup = ref<PhoneSetup | null>(null)
-const autostartDone = ref(readAutostartDone())
+// Storage refused: the hint shows again at the next launch, nothing worse.
+const autostartDone = usePersisted(AUTOSTART_DONE_KEY, false, { validate: isDone })
 const failure = ref<unknown>(null)
 let users = 0
 
@@ -158,12 +157,6 @@ export function usePhone() {
 
   function markAutostartDone(done: boolean) {
     autostartDone.value = done
-    try {
-      if (done) localStorage.setItem(AUTOSTART_DONE_KEY, "1")
-      else localStorage.removeItem(AUTOSTART_DONE_KEY)
-    } catch {
-      // Storage refused: the hint shows again at the next launch, nothing worse.
-    }
   }
 
   /** Something the node needs that the user has not given yet. */
