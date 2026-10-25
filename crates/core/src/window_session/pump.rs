@@ -15,14 +15,14 @@ use cursio_window::{CaptureSession, Surrogate, WindowCapture, WindowRenderer};
 /// the trait documents. A capture at 60 fps produces roughly one frame per
 /// 16 ms while `pump` runs far more often than that, so a small bound keeps
 /// latency low and still never monopolises the loop.
-pub(super) const MAX_FRAMES_PER_PUMP: usize = 4;
+pub(crate) const MAX_FRAMES_PER_PUMP: usize = 4;
 
 /// Stop pulling capture packets once this much video is waiting for the socket.
 ///
 /// `PriorityTransport::send` only enqueues, so without this gate the session
 /// drains one queue into another and can still accumulate seconds of stale
 /// video. Backpressure now reaches the bounded capture channel instead.
-pub(super) const VIDEO_QUEUE_HIGH_WATER_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const VIDEO_QUEUE_HIGH_WATER_BYTES: usize = 2 * 1024 * 1024;
 
 /// Most input events to forward per pump, viewer→host.
 ///

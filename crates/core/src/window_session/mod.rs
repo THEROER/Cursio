@@ -40,6 +40,8 @@ use cursio_protocol::SCREEN_STREAM_ID;
 mod factory;
 mod pump;
 
+pub(crate) use pump::{MAX_FRAMES_PER_PUMP, VIDEO_QUEUE_HIGH_WATER_BYTES};
+
 #[cfg(feature = "airplay")]
 pub use factory::AirPlayShare;
 pub use factory::WindowFactory;
@@ -49,7 +51,10 @@ pub use factory::WindowFactory;
 /// Only control traffic goes through here. Frames and surrogate input stay
 /// first-class `Message` variants and are sent directly — see
 /// [`WindowMsg`](cursio_protocol::WindowMsg) for why that split exists.
-async fn send_control(tx: &mut dyn TransportTx, msg: WindowMsg) -> Result<(), TransportError> {
+pub(crate) async fn send_control(
+    tx: &mut dyn TransportTx,
+    msg: WindowMsg,
+) -> Result<(), TransportError> {
     let framed = Message::module(ModuleId::WINDOW, msg.priority(), &msg)?;
     tx.send(&framed).await
 }

@@ -50,12 +50,13 @@
 //! The host's half is [`ScreenHost`], the viewer's [`ScreenViewer`]; the window
 //! module owns one of each and hands them the messages that are theirs.
 
+use crate::window_session::{send_control, MAX_FRAMES_PER_PUMP, VIDEO_QUEUE_HIGH_WATER_BYTES};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cursio_protocol::{
-    Message, ModuleId, Priority, ScreenSource, SourceId, SourceKind, VideoCaps, WindowCloseReason,
+    Message, Priority, ScreenSource, SourceId, SourceKind, VideoCaps, WindowCloseReason,
     WindowFrame, WindowFrameAck, WindowMeta, WindowMsg, SCREEN_STREAM_ID,
 };
 use cursio_transport::{TransportError, TransportTx};
@@ -73,23 +74,11 @@ use crate::window_session::KeyframeRequests;
 /// current without the enumeration showing up anywhere.
 const SOURCE_POLL: Duration = Duration::from_secs(2);
 
-/// Frames forwarded per pump — the same starvation bound transfers use.
-const MAX_FRAMES_PER_PUMP: usize = 4;
-
-/// Stop pulling frames once this much video waits for the socket; see the
-/// window module's identical gate.
-const VIDEO_QUEUE_HIGH_WATER_BYTES: usize = 2 * 1024 * 1024;
-
 /// Size a new view opens at, before any source has told it otherwise.
 ///
 /// The view letterboxes rather than following its source, so this is only a
 /// starting size the user is free to change.
 const VIEW_SIZE: (u32, u32) = (1280, 720);
-
-async fn send_control(tx: &mut dyn TransportTx, msg: WindowMsg) -> Result<(), TransportError> {
-    let framed = Message::module(ModuleId::WINDOW, msg.priority(), &msg)?;
-    tx.send(&framed).await
-}
 
 /// The source that opened and its capture, or why the viewer gets nothing.
 type OpenResult = Result<(ScreenSource, Box<dyn CaptureSession + Send>), String>;
