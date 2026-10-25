@@ -77,6 +77,8 @@ pub mod linux_drag;
 #[cfg(target_os = "linux")]
 mod linux_capture;
 #[cfg(target_os = "linux")]
+mod pipewire_pod;
+#[cfg(target_os = "linux")]
 pub use linux_capture::{PortalCaptureSession, PortalScreenSources, PortalWindowCapture};
 
 #[cfg(target_os = "macos")]

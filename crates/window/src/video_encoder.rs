@@ -59,7 +59,6 @@
 //! decodes it ([`Fidelity`]), and every other viewer gets a lossy High-profile
 //! stream at a bitrate.
 
-
 use crate::WindowError;
 
 /// Which encoder backend a [`VideoEncoder`] ended up on.

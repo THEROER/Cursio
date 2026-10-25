@@ -7,7 +7,7 @@ use pipewire::{
     context::ContextRc,
     main_loop::MainLoopRc,
     spa::{
-        pod::{serialize::PodSerializer, Object, Pod, Property, PropertyFlags, Value, ValueArray},
+        pod::{Object, Pod, Property, PropertyFlags, Value, ValueArray},
         sys::{SPA_PARAM_Props, SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_TYPE_OBJECT_Props},
     },
 };
@@ -65,15 +65,14 @@ pub(super) fn props_pod(channels: usize, cubic: Option<f32>, mute: Option<bool>)
             value: Value::Bool(mute),
         });
     }
-    let value = Value::Object(Object {
-        type_: SPA_TYPE_OBJECT_Props,
-        id: SPA_PARAM_Props,
-        properties,
-    });
-    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &value)
-        .expect("serialize props pod")
-        .0
-        .into_inner()
+    super::pod_bytes(
+        Object {
+            type_: SPA_TYPE_OBJECT_Props,
+            id: SPA_PARAM_Props,
+            properties,
+        },
+        "props",
+    )
 }
 
 /// One device the monitor is tracking: its proxy (kept alive to receive param

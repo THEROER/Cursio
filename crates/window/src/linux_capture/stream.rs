@@ -41,7 +41,7 @@ pub(super) fn format_param_pod() -> Vec<u8> {
             video::VideoFormat,
             ParamType,
         },
-        pod::{object, property, serialize::PodSerializer, Value},
+        pod::{object, property},
         utils::{Fraction, Rectangle, SpaTypes},
     };
 
@@ -87,10 +87,7 @@ pub(super) fn format_param_pod() -> Vec<u8> {
         ),
     );
 
-    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
-        .expect("serializing a static format pod cannot fail")
-        .0
-        .into_inner()
+    crate::pipewire_pod::pod_bytes(obj, "format")
 }
 
 /// Attach a PipeWire stream to the portal's node and pump frames until stopped.

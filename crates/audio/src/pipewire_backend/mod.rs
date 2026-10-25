@@ -88,13 +88,21 @@ fn format_param_pod() -> Vec<u8> {
     position[1] = SPA_AUDIO_CHANNEL_FR;
     info.set_position(position);
 
-    let value = Value::Object(Object {
-        type_: SPA_TYPE_OBJECT_Format,
-        id: SPA_PARAM_EnumFormat,
-        properties: info.into(),
-    });
-    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &value)
-        .expect("serialize audio format pod")
+    pod_bytes(
+        Object {
+            type_: SPA_TYPE_OBJECT_Format,
+            id: SPA_PARAM_EnumFormat,
+            properties: info.into(),
+        },
+        "audio format",
+    )
+}
+
+/// Serialize `obj`, a param built here from fixed fields, which cannot fail
+/// to serialize; `what` names it if that ever stops being true.
+pub(super) fn pod_bytes(obj: Object, what: &str) -> Vec<u8> {
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+        .unwrap_or_else(|e| panic!("serializing a {what} pod cannot fail: {e:?}"))
         .0
         .into_inner()
 }

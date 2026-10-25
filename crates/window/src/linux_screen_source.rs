@@ -229,7 +229,7 @@ fn format_pod(width: u32, height: u32) -> Vec<u8> {
             video::VideoFormat,
             ParamType,
         },
-        pod::{object, property, serialize::PodSerializer, Value},
+        pod::{object, property},
         utils::{Fraction, Rectangle, SpaTypes},
     };
     let obj = object!(
@@ -266,10 +266,7 @@ fn format_pod(width: u32, height: u32) -> Vec<u8> {
             Fraction { num: 60, denom: 1 }
         ),
     );
-    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
-        .expect("serializing a static format pod cannot fail")
-        .0
-        .into_inner()
+    crate::pipewire_pod::pod_bytes(obj, "format")
 }
 
 /// Buffer requirements, answered once the format is fixed. Shared memory
@@ -278,7 +275,7 @@ fn format_pod(width: u32, height: u32) -> Vec<u8> {
 fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
     use pipewire::spa::{
         param::ParamType,
-        pod::{serialize::PodSerializer, Object, Property, PropertyFlags, Value},
+        pod::{Object, Property, PropertyFlags, Value},
         sys,
         utils::SpaTypes,
     };
@@ -299,10 +296,7 @@ fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
             int(sys::SPA_PARAM_BUFFERS_dataType, 1 << sys::SPA_DATA_MemFd),
         ],
     };
-    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
-        .expect("serializing a static buffers pod cannot fail")
-        .0
-        .into_inner()
+    crate::pipewire_pod::pod_bytes(obj, "buffers")
 }
 
 /// The PipeWire thread: owns the node, the decoder and the picture.
