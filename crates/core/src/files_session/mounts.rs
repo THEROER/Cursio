@@ -2,6 +2,7 @@
 //! and keeping the mounts in step with what the peer shares.
 
 use crate::files_session::FilesEngine;
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
 use cursio_files::bridge::PeerLink;
 use cursio_files::FileServer;
 use cursio_protocol::Volume;
@@ -118,11 +119,6 @@ pub(super) fn mount_is_alive(mount: &Mount) -> bool {
         Mount::Helper(relayed) => relayed.is_alive(),
     }
 }
-
-/// Uninhabited where no mount implementation exists, so `Option<Mount>` is
-/// always `None` and every path that reads it stays compiled and honest.
-#[cfg(not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))))]
-pub(super) enum Mount {}
 
 /// Mount one of the peer's volumes with whatever this platform provides.
 ///

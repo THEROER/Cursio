@@ -466,12 +466,11 @@ pub(super) fn spawn_airplay_trigger(
     rx
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "airplay"))]
 mod tests {
     use super::*;
     use crate::window_session::TransferRequest;
 
-    #[cfg(feature = "airplay")]
     fn airplay_offer(
         fitness: cursio_protocol::Fitness,
         wanted: Option<cursio_protocol::Quality>,
@@ -483,7 +482,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "airplay")]
     #[tokio::test]
     async fn airplay_window_transfer_follows_host_and_quality_changes() {
         let local = cursio_protocol::PeerId::from_u128(1);

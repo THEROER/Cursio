@@ -53,6 +53,7 @@ use crate::files_session::client::PendingMap;
 use crate::files_session::health::report_walk;
 use crate::files_session::health::Health;
 use crate::files_session::mounts::excluded_paths;
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
 use crate::files_session::mounts::Mount;
 use crate::files_session::pacer::Pacer;
 use crate::files_session::serve::CODEC_THREADS;

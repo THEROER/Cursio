@@ -358,6 +358,7 @@ impl CallPause {
 
 /// Whether two lists differ in anything a remote control shows. A position
 /// counts only when it jumped: a second's drift is a track playing.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn players_changed(old: &[Player], new: &[Player]) -> bool {
     if old.len() != new.len() {
         return true;
@@ -385,6 +386,7 @@ pub(crate) fn players_changed(old: &[Player], new: &[Player]) -> bool {
 }
 
 /// The id a cover is asked for by: a hash of whatever names it on this machine.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn art_hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
