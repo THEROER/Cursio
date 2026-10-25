@@ -75,11 +75,8 @@ pub fn paired_phones() -> Result<Vec<PairedDevice>, BluetoothError> {
 /// machine's channel among everything else the computer offers.
 pub const MESH_UUID: &str = "8a3f6c2e-0b4d-4e8a-9c1f-43757273696f";
 
-/// The RFCOMM channel every computer's mesh listener asks for, so another
-/// computer can call it without an SDP lookup. Linux cannot look a channel up
-/// by UUID from a socket, and BlueZ's own lookup trusts a service list cached
-/// at pairing (see `linux/rfcomm.rs`). Stacks hand channels out from the
-/// bottom, so one this high is free on an ordinary machine.
+/// Preferred RFCOMM listener channel. Other programs may hold it, so clients
+/// use the service's actual SDP channel and retain this as a discovery fallback.
 pub const MESH_CHANNEL: u8 = 23;
 
 /// A connected mesh channel socket, as the platform owns one.
@@ -102,7 +99,7 @@ pub enum BluetoothError {
     Register(String),
     #[error("bluez refused the mesh's bluetooth channel: {0}")]
     RegisterChannel(String),
-    #[error("{0} answers over bluetooth but offers no mesh channel; Cursio is not running there, or has bluetooth off")]
+    #[error("{0} has no available advertised Cursio RFCOMM channel")]
     NoService(String),
     #[error("no bluetooth adapter to use: {0}")]
     Unavailable(String),

@@ -1172,6 +1172,7 @@ version = "0.1.0"
 dependencies = [
  "cursio-protocol",
  "libc",
+ "quick-xml",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

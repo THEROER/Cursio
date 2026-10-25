@@ -2,11 +2,9 @@
 //!
 //! Windows has no BlueZ to hand sockets over, but Winsock speaks RFCOMM
 //! directly (`AF_BTH`), so this side listens and dials itself. The listener
-//! binds the channel every Cursio computer pins ([`crate::MESH_CHANNEL`]),
-//! because a Linux machine dials that channel without asking SDP (see
-//! `linux/rfcomm.rs`), and publishes an SDP record under [`crate::MESH_UUID`]
-//! so a phone, which looks the service up by UUID, finds it too. The record
-//! lives as long as the process does.
+//! prefers [`crate::MESH_CHANNEL`] and publishes the allocated channel in an
+//! SDP record under [`crate::MESH_UUID`], so computers and phones can find it
+//! by service UUID. The record lives as long as the process does.
 //!
 //! Dialling goes by UUID instead: Windows runs the SDP query itself on every
 //! connect, so a computer whose channel landed elsewhere is still reached.
@@ -37,7 +35,7 @@ use windows_sys::Win32::Networking::WinSock::{
     accept, bind, connect, getsockname, listen, WSAGetLastError, WSASetServiceW, WSASocketW,
     WSAStartup, CSADDR_INFO, INVALID_SOCKET, RNRSERVICE_REGISTER, SOCKADDR, SOCKET, SOCKET_ADDRESS,
     SOCK_STREAM, WSADATA, WSAEADDRINUSE, WSAECONNREFUSED, WSAEHOSTDOWN, WSAQUERYSETW,
-    WSASERVICE_NOT_FOUND, WSA_FLAG_NO_HANDLE_INHERIT,
+    WSASERVICE_NOT_FOUND, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
 
 use crate::{Address, BluetoothError, PairedDevice, MESH_CHANNEL};
@@ -243,6 +241,9 @@ fn startup() -> Result<(), BluetoothError> {
 /// update switch the next node found the pinned channel held and fell back
 /// to another, and each switch after that took one more (measured on
 /// Windows: 23, then 4, then 5).
+/// Keep OVERLAPPED as well: without it, a pending blocking receive can hold
+/// up the other thread's send. socket() enables it by default; WSASocketW
+/// does not. The socket still uses blocking calls on the two pump threads.
 fn rfcomm_socket() -> Result<OwnedSocket, BluetoothError> {
     // SAFETY: plain WSASocketW with no protocol info; the result is checked
     // before it is owned.
@@ -253,7 +254,7 @@ fn rfcomm_socket() -> Result<OwnedSocket, BluetoothError> {
             BTHPROTO_RFCOMM as i32,
             std::ptr::null(),
             0,
-            WSA_FLAG_NO_HANDLE_INHERIT,
+            WSA_FLAG_NO_HANDLE_INHERIT | WSA_FLAG_OVERLAPPED,
         )
     };
     if s == INVALID_SOCKET {

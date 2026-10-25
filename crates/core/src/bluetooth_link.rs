@@ -10,8 +10,8 @@
 //!
 //! **Who calls whom.** A phone calls its computers and is never called:
 //! Android does not let an app learn its own Bluetooth address, and keeps no
-//! listener. Two computers call each other, each listening on the RFCOMM
-//! channel every Cursio computer pins (`cursio_bluetooth::MESH_CHANNEL`).
+//! listener. Two computers call each other, using the RFCOMM channel each
+//! listener advertises through SDP.
 //! Which peer a Bluetooth address belongs to is known only once it has
 //! greeted, so the registry remembers it ([`crate::registry::PeerRegistry::
 //! note_bluetooth`]) and from then on an address is called only when *its*
@@ -23,8 +23,8 @@
 //! radio for seconds, and on a card that shares its antenna with Wi-Fi that is
 //! seconds of Wi-Fi lost. So [`Dialer`] backs off: doubling up to
 //! [`MAX_RETRY`] for a device that does not answer, and [`REFUSED_RETRY`] for
-//! one that answers with no mesh channel (Cursio not running there, or
-//! Bluetooth switched off in it). And a machine whose card is known to lose
+//! an unknown device with no mesh channel. Known peers retry after [`RETRY`],
+//! and a new OS connection clears the backoff once. A machine whose card is known to lose
 //! the network while Bluetooth is busy does not use Bluetooth at all unless
 //! the person says so ([`decide`]).
 //!
@@ -64,6 +64,7 @@ pub const REFUSED_RETRY: Duration = Duration::from_secs(30 * 60);
 pub struct Paired {
     pub address: String,
     pub name: String,
+    pub connected: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,9 +78,23 @@ struct Attempt {
 pub struct Dialer {
     tried: HashMap<String, Attempt>,
     linked: HashSet<String>,
+    connected: HashSet<String>,
 }
 
 impl Dialer {
+    /// A device coming back is fresh evidence, independent of a cached refusal.
+    pub fn observe(&mut self, paired: &[Paired]) {
+        let connected: HashSet<_> = paired
+            .iter()
+            .filter(|device| device.connected)
+            .map(|device| device.address.clone())
+            .collect();
+        for address in connected.difference(&self.connected) {
+            self.tried.remove(address);
+        }
+        self.connected = connected;
+    }
+
     /// The devices to try now. `unreachable_for` is how long the longest-gone
     /// known peer has been off the network, `None` while all are on it.
     /// `standby` asks for a Bluetooth path beside a working network one, so
@@ -124,13 +139,18 @@ impl Dialer {
 
     /// The attempt at `address` failed: `refused` when the device answered
     /// with no mesh channel, otherwise it did not answer at all.
-    pub fn failed(&mut self, address: &str, refused: bool) {
+    pub fn failed(&mut self, address: &str, refused: bool, known_peer: bool) -> Duration {
         if let Some(tried) = self.tried.get_mut(address) {
-            tried.wait = if refused {
+            tried.wait = if refused && known_peer {
+                RETRY
+            } else if refused {
                 REFUSED_RETRY
             } else {
                 (tried.wait * 2).min(MAX_RETRY)
             };
+            tried.wait
+        } else {
+            RETRY
         }
     }
 
@@ -318,11 +338,24 @@ pub fn transport(socket: std::os::windows::io::OwnedSocket) -> std::io::Result<L
         .name("bluetooth-rx".into())
         .spawn(move || {
             let mut buf = vec![0u8; 16 * 1024];
+            let mut reads = 0;
             loop {
                 let n = match (&*radio).read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(error) => {
+                        tracing::debug!(%error, "bluetooth socket read ended");
+                        break;
+                    }
                     Ok(n) => n,
                 };
+                reads += 1;
+                if reads <= 4 {
+                    tracing::debug!(
+                        bytes = n,
+                        reads,
+                        "bluetooth socket received handshake bytes"
+                    );
+                }
                 if handle.block_on(to_node.write_all(&buf[..n])).is_err() {
                     break;
                 }
@@ -334,13 +367,26 @@ pub fn transport(socket: std::os::windows::io::OwnedSocket) -> std::io::Result<L
         .name("bluetooth-tx".into())
         .spawn(move || {
             let mut buf = vec![0u8; 16 * 1024];
+            let mut writes = 0;
             loop {
                 let n = match runtime.block_on(from_node.read(&mut buf)) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
-                if (&*socket).write_all(&buf[..n]).is_err() {
+                writes += 1;
+                if writes <= 4 {
+                    tracing::debug!(
+                        bytes = n,
+                        writes,
+                        "bluetooth socket sending handshake bytes"
+                    );
+                }
+                if let Err(error) = (&*socket).write_all(&buf[..n]) {
+                    tracing::debug!(%error, "bluetooth socket write ended");
                     break;
+                }
+                if writes <= 4 {
+                    tracing::debug!(bytes = n, writes, "bluetooth socket sent handshake bytes");
                 }
             }
             let _ = socket.shutdown(Shutdown::Both);
@@ -476,6 +522,7 @@ pub async fn paired_computers() -> Vec<Paired> {
             .map(|d| Paired {
                 address: d.address,
                 name: d.name,
+                connected: d.connected,
             })
             .collect(),
         Ok(Err(e)) => {
@@ -496,6 +543,7 @@ mod tests {
     fn pc(address: &str) -> Paired {
         Paired {
             address: address.into(),
+            connected: false,
             name: "desk".into(),
         }
     }
@@ -574,12 +622,12 @@ mod tests {
         let mut dialer = Dialer::default();
         let start = Instant::now();
         assert_eq!(dialer.pace(&[pc("A")], start).len(), 1);
-        dialer.failed("A", false);
+        dialer.failed("A", false, false);
         assert!(dialer.pace(&[pc("A")], start + RETRY).is_empty());
         let second = start + RETRY * 2;
         assert_eq!(dialer.pace(&[pc("A")], second).len(), 1);
         for _ in 0..10 {
-            dialer.failed("A", false);
+            dialer.failed("A", false, false);
         }
         assert!(dialer
             .pace(&[pc("A")], second + MAX_RETRY - Duration::from_secs(1))
@@ -592,9 +640,44 @@ mod tests {
         let mut dialer = Dialer::default();
         let start = Instant::now();
         dialer.pace(&[pc("A")], start);
-        dialer.failed("A", true);
+        dialer.failed("A", true, false);
         assert!(dialer.pace(&[pc("A")], start + MAX_RETRY).is_empty());
         assert_eq!(dialer.pace(&[pc("A")], start + REFUSED_RETRY).len(), 1);
+    }
+
+    #[test]
+    fn a_known_peer_starting_its_listener_is_retried_without_a_thirty_minute_penalty() {
+        let mut dialer = Dialer::default();
+        let start = Instant::now();
+        dialer.pace(&[pc("A")], start);
+        assert_eq!(dialer.failed("A", true, true), RETRY);
+        assert!(dialer
+            .pace(&[pc("A")], start + RETRY - Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(dialer.pace(&[pc("A")], start + RETRY).len(), 1);
+    }
+
+    #[test]
+    fn a_radio_reconnection_clears_backoff_once_without_creating_a_dial_storm() {
+        let mut dialer = Dialer::default();
+        let start = Instant::now();
+        let mut device = pc("A");
+        dialer.observe(&[device.clone()]);
+        dialer.pace(&[device.clone()], start);
+        dialer.failed("A", true, false);
+        device.connected = true;
+        dialer.observe(&[device.clone()]);
+        assert_eq!(
+            dialer
+                .pace(&[device.clone()], start + Duration::from_secs(1))
+                .len(),
+            1
+        );
+        dialer.failed("A", true, true);
+        dialer.observe(&[device.clone()]);
+        assert!(dialer
+            .pace(&[device], start + Duration::from_secs(2))
+            .is_empty());
     }
 
     #[test]
@@ -602,7 +685,7 @@ mod tests {
         let mut dialer = Dialer::default();
         let start = Instant::now();
         dialer.pace(&[pc("A")], start);
-        dialer.failed("A", true);
+        dialer.failed("A", true, false);
         dialer.set_linked("A", true);
         dialer.set_linked("A", false);
         assert_eq!(dialer.pace(&[pc("A")], start).len(), 1);

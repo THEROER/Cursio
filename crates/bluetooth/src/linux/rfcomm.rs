@@ -5,8 +5,9 @@
 //! pairing, and refreshes that cache on no schedule anyone can rely on. A
 //! computer that started offering the channel after it was paired — every
 //! machine paired before this existed — is then "not available" until the
-//! pairing is redone. So the call goes straight to the channel every Cursio
-//! computer pins ([`crate::MESH_CHANNEL`]), with no SDP lookup at all.
+//! pairing is redone. The caller queries fresh SDP records, then passes the
+//! advertised channel to this socket. The preferred channel is only a fallback
+//! when fresh discovery is unavailable.
 //!
 //! The socket asks for an authenticated, encrypted link, as the listener
 //! does: only a device the user paired gets through, and the radio encrypts

@@ -15,6 +15,7 @@ thiserror.workspace = true
 # library that would want to own the adapter alongside PipeWire.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
+quick-xml.workspace = true
 libc.workspace = true
 
 # Winsock speaks RFCOMM itself, so the mesh channel needs nothing but the

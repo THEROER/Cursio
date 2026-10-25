@@ -598,22 +598,28 @@ unprompted copy of its sound only to those profiles. They are not this path.)
 - **A phone dials; computers listen and dial each other.** Android keeps an app
   from learning its own Bluetooth address and keeps no listener, so a phone is
   never called. Every computer listens under Cursio's own UUID
-  (`cursio_bluetooth::MESH_UUID`, `MeshChannel`) on a pinned RFCOMM channel
-  (`MESH_CHANNEL`, 23), and the mesh loop runs each accepted socket like an
+  (`cursio_bluetooth::MESH_UUID`, `MeshChannel`), preferring RFCOMM channel
+  23 (`MESH_CHANNEL`) and advertising the actual allocation through SDP.
+  The mesh loop runs each accepted socket like an
   accepted TCP connection. On Linux that is a BlueZ external profile (only
   paired devices may open it, `RequireAuthentication`); on Windows a Winsock
   `AF_BTH` listener with an SDP record from `WSASetService`, its sockets pumped
   by two threads each rather than handed to Tokio, since nothing documents
-  Winsock's Bluetooth provider under readiness polling.
-- **Why the channel is pinned.** A Linux machine calls a raw RFCOMM socket,
-  which takes a channel, not a UUID. BlueZ's own by-UUID call
-  (`Device1.ConnectProfile`) consults the service list cached at pairing and
-  answers "profile unavailable" for a service the other machine started
-  offering afterwards — every machine paired before this existed. Windows dials
-  by UUID instead (it queries SDP on every connect), so a Windows machine still
-  reaches a Linux one whose channel was taken. BlueZ registers a profile even
-  when its channel is in use, with no listener behind it, so the channel is
-  bound once first to see.
+  Winsock's Bluetooth provider under readiness polling. `WSASocketW` keeps both
+  `WSA_FLAG_NO_HANDLE_INHERIT` and `WSA_FLAG_OVERLAPPED`: the first prevents
+  child processes retaining listeners, while the second preserves concurrent
+  send/receive capability that `socket()` enabled by default. The pump still
+  uses blocking calls; omitting OVERLAPPED can stall a send behind a pending
+  receive even after the greeting succeeded.
+- **Discovering the channel.** Linux queries fresh records using BlueZ's
+  `sdptool browse --xml`, then opens a raw RFCOMM socket on the channel in the
+  Cursio service's protocol descriptor. Discovery is bounded to eight seconds
+  and 64 KiB of output; discovery and connect share a fifteen-second deadline.
+  The preferred channel is a fallback when the helper or query is unavailable.
+  This bypasses `Device1.ConnectProfile`'s pairing-time service cache and reaches
+  Windows listeners that allocate another channel. Windows queries SDP by UUID.
+  Linux probes a channel before registering its profile because BlueZ can
+  register an occupied channel without providing a working listener.
 - **Finding the machine** needs no discovery protocol: each node lists the
   computers it is paired with in the system's Bluetooth settings (class of
   device "computer") and asks each for the Cursio service. Which mesh peer
@@ -634,8 +640,10 @@ unprompted copy of its sound only to those profiles. They are not this path.)
 - **Radio time is rationed.** Paging a device that is not there holds the radio
   for seconds, which on a shared antenna is seconds of Wi-Fi gone. A device
   that does not answer is retried after 30 s, doubling to 5 min; one that
-  answers with no mesh channel after 30 min; one call at a time
-  (`bluetooth_link::Dialer`).
+  answers with no mesh channel after 30 min if unknown, or 30 s if already a
+  known Cursio peer. A new OS Bluetooth connection clears the backoff once;
+  one call runs at a time (`bluetooth_link::Dialer`). Noise establishment has a
+  twenty-second deadline, so a stalled greeting cannot hold a path forever.
 - **A machine can be left out.** `[bluetooth] mesh = "auto" | "on" | "off"`,
   read on every turn of the dialler. `auto` is on unless the Wi-Fi card is one
   known to drop off the network while Bluetooth is busy (Broadcom `b43` on

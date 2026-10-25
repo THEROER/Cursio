@@ -8,8 +8,8 @@
 //! BlueZ owns the adapter and SDP, so the listener is an external profile:
 //! `RegisterProfile` with the server role makes BlueZ listen, publish the
 //! record and hand every accepted socket to `NewConnection`. It listens on
-//! [`crate::MESH_CHANNEL`], so that another computer can call without an SDP
-//! lookup (`rfcomm.rs` says why it has to). A phone is never called: Android
+//! [`crate::MESH_CHANNEL`] when available and advertises the allocated channel
+//! through SDP. A phone is never called: Android
 //! does not tell its own Bluetooth address and keeps no listener, so it
 //! dials.
 
@@ -88,7 +88,7 @@ impl MeshChannel {
         } else {
             tracing::warn!(
                 channel = crate::MESH_CHANNEL,
-                "another program holds the mesh's bluetooth channel; phones and Windows machines still reach this one, Linux machines cannot"
+                "another program holds the preferred mesh channel; clients must discover the allocated channel through SDP"
             );
         }
         // Only a device the user paired may open it, and the link is

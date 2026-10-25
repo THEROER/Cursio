@@ -16,6 +16,7 @@ mod media;
 mod rfcomm;
 mod sbc;
 mod sco;
+mod sdp;
 
 pub use channel::MeshChannel;
 pub use devices::{paired_computers, paired_phones};
@@ -24,13 +25,34 @@ pub use media::MediaSinkService;
 /// Call `address`'s mesh channel. Blocking for as long as the radio pages
 /// the device; see [`rfcomm::dial`].
 pub fn dial(address: &str) -> Result<OwnedFd, BluetoothError> {
-    // A page that has not answered in this long is a device out of range;
-    // the kernel's own page timeout is shorter, this only bounds a stall.
-    rfcomm::dial(
-        address,
-        crate::MESH_CHANNEL,
-        std::time::Duration::from_secs(15),
-    )
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let channels = match sdp::channels(address) {
+        Ok(channels) if channels.is_empty() => {
+            return Err(BluetoothError::NoService(address.into()))
+        }
+        Ok(channels) => channels,
+        Err(error) => {
+            tracing::debug!(%address, %error, "fresh SDP lookup unavailable; trying the fixed mesh channel");
+            vec![crate::MESH_CHANNEL]
+        }
+    };
+    let mut last = BluetoothError::NoService(address.into());
+    for channel in channels {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "bluetooth discovery and connect timed out",
+            )
+            .into());
+        }
+        tracing::debug!(%address, channel, "dialling the advertised mesh channel");
+        match rfcomm::dial(address, channel, remaining) {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
 }
 
 use std::collections::HashMap;

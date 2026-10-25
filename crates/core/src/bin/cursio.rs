@@ -2379,6 +2379,7 @@ async fn dial_over_bluetooth(
         }
 
         let paired = bt::paired_computers().await;
+        dialer.observe(&paired);
         let wanted = {
             let reg = registry.borrow();
             for device in &paired {
@@ -2412,8 +2413,11 @@ async fn dial_over_bluetooth(
                     open(link, device.address, Role::Initiator);
                 }
                 Err(e) => {
-                    tracing::debug!(device = %device.name, reason = %e.reason, "no mesh over bluetooth to this device");
-                    dialer.failed(&device.address, e.refused);
+                    let known_peer = registry.borrow().bluetooth_peer(&device.address).is_some();
+                    let retry = dialer.failed(&device.address, e.refused, known_peer);
+                    tracing::debug!(device = %device.name, reason = %e.reason,
+                        known_peer, retry_in_secs = retry.as_secs(),
+                        "no mesh over bluetooth to this device");
                 }
             }
         }
