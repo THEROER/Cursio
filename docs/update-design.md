@@ -134,6 +134,13 @@ builds skip; an existing kind never changes. The one gap is history: a build
 from before v19 opens with its old `Hello`, is recognised by it, and has to be
 updated by hand once.
 
+Such a link is also a problem in the status (`health::version_skew`), and the
+problem says which machine is behind and how it catches up. "Protocol 22 vs 23"
+left a person to work out both: the older machine takes the newer one's build
+once it trusts that machine as a builder, so the hint names the exact
+`cursio update trust-builder` to run, and where. It clears when the two greet
+on one protocol.
+
 **Offer, then pull, a window at a time.** A node offers every build it holds
 (`store/<version>/offer` plus the platforms it has in full) when a link comes
 up and again every 30 s. A receiver that wants one asks for 1 MiB of a file at

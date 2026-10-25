@@ -62,6 +62,64 @@ pub fn link_restored(peer: PeerId) {
     diagnostics::clear(&link_id(peer));
 }
 
+fn skew_id(peer: PeerId) -> String {
+    format!("peer.{peer}.version")
+}
+
+/// What to tell a person about two machines on different protocols: which
+/// one is behind, and how that one gets the other's build. "Protocol 22 vs
+/// 23" alone left them to work out which machine to update, and from where.
+fn skew_text(
+    name: &str,
+    here: &str,
+    ours: u16,
+    theirs: u16,
+    their_build: &str,
+) -> (String, String) {
+    if theirs < ours {
+        (
+            format!(
+                "{name} runs an older Cursio ({their_build}, protocol {theirs}; this machine \
+                 speaks {ours}), so only updates cross between them"
+            ),
+            format!(
+                "update {name}: once it trusts this machine as a builder \
+                 (`cursio update trust-builder {here}` on {name}), `cargo xtask publish` here \
+                 offers it this build; or install this version on {name} by hand"
+            ),
+        )
+    } else {
+        (
+            format!(
+                "this machine runs an older Cursio than {name} (protocol {ours}; {name} runs \
+                 {their_build}, protocol {theirs}), so only updates cross between them"
+            ),
+            format!(
+                "update this machine: `cursio update trust-builder {name}` here lets it take \
+                 {name}'s build when it is offered; or install {their_build} here by hand"
+            ),
+        )
+    }
+}
+
+/// `peer` speaks another session protocol: the link can carry builds only.
+pub fn version_skew(
+    peer: PeerId,
+    name: &str,
+    here: &str,
+    ours: u16,
+    theirs: u16,
+    their_build: &str,
+) {
+    let (summary, hint) = skew_text(name, here, ours, theirs, their_build);
+    raise(skew_id(peer), Severity::Warning, summary, Some(hint));
+}
+
+/// `peer` greeted on this machine's protocol, so whichever was behind caught up.
+pub fn version_matched(peer: PeerId) {
+    diagnostics::clear(&skew_id(peer));
+}
+
 fn module_id(module: &str, peer: &str) -> String {
     format!("module.{module}.{peer}.stalled")
 }
@@ -199,6 +257,23 @@ pub fn capture_overloaded() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_skew_names_the_machine_that_is_behind_and_how_it_catches_up() {
+        let (summary, hint) = skew_text("dark", "Nocturne", 23, 22, "0.9.0+abc");
+        assert!(
+            summary.starts_with("dark runs an older Cursio"),
+            "{summary}"
+        );
+        assert!(hint.contains("trust-builder Nocturne` on dark"), "{hint}");
+
+        let (summary, hint) = skew_text("dark", "Nocturne", 22, 23, "0.9.0+def");
+        assert!(
+            summary.starts_with("this machine runs an older Cursio than dark"),
+            "{summary}"
+        );
+        assert!(hint.contains("trust-builder dark` here"), "{hint}");
+    }
 
     fn find(id: &str) -> Option<Problem> {
         diagnostics::snapshot().into_iter().find(|p| p.id == id)

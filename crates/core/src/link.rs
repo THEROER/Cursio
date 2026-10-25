@@ -160,6 +160,7 @@ where
     // different neighbour, and a single machine-wide setting can only ever
     // state one of those answers.
     let peer_edge = plan.position.edge_toward(peer.position);
+    crate::health::version_matched(peer.peer_id);
     tracing::info!(
         peer = %peer.display_name,
         id = %peer.peer_id,
@@ -229,6 +230,14 @@ where
         Err(e) => return anyhow::anyhow!("{mismatch}; its stored key is unreadable: {e}"),
     };
     tracing::info!(peer = %trusted.display_name, %mismatch, "carrying only updates on this link");
+    crate::health::version_skew(
+        preamble.peer_id,
+        &trusted.display_name,
+        &plan.identity.display_name,
+        cursio_protocol::PROTOCOL_VERSION,
+        preamble.protocol_version,
+        &preamble.build,
+    );
     let secure = match EncryptedTransport::establish(transport, &key, plan.role).await {
         Ok(secure) => secure,
         Err(e) => return anyhow::anyhow!("{mismatch}; the encrypted channel failed: {e}"),
