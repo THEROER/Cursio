@@ -41,7 +41,6 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 use crate::video::nv12;
 use crate::WindowError;
-use cursio_protocol::Rect;
 
 /// The one input / one output stream an H.264 encoder MFT exposes.
 const STREAM_ID: u32 = 0;
@@ -103,16 +102,7 @@ impl VideoEncoder {
     /// keyframe). Same contract as the Linux encoder, which the capture backend
     /// relies on when it compares [`size`](Self::size).
     pub fn open(width: u32, height: u32, bitrate: u32) -> Result<Self, WindowError> {
-        // 4:2:0 chroma is subsampled by two on both axes, so odd dimensions
-        // have no valid chroma plane. Reject rather than silently skew.
-        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return Err(WindowError::Backend(format!(
-                "video encoder needs even dimensions, got {width}x{height}"
-            )));
-        }
-        if width == 0 || height == 0 {
-            return Err(WindowError::Backend("zero-sized window".into()));
-        }
+        crate::frame_pipeline::check_encoder_size(width, height)?;
 
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -180,32 +170,12 @@ impl VideoEncoder {
         (self.width, self.height)
     }
 
-    /// The whole-window rect a video frame covers.
-    ///
-    /// Video packets always describe the full window, never a dirty sub-rect:
-    /// the codec's own inter-frame prediction is what makes an unchanged region
-    /// cost nothing, so cropping would only break its references.
-    pub fn full_rect(&self) -> Rect {
-        Rect {
-            x: 0,
-            y: 0,
-            width: self.width,
-            height: self.height,
-        }
-    }
-
     /// Encode one full-window BGRA frame; return whatever packets it produced.
     ///
     /// Zero packets is ordinary — the encoder may hold a frame back. Several is
     /// also ordinary.
     pub fn encode(&mut self, bgra: &[u8]) -> Result<Vec<Vec<u8>>, WindowError> {
-        let expected = (self.width as usize) * (self.height as usize) * 4;
-        if bgra.len() != expected {
-            return Err(WindowError::Backend(format!(
-                "frame is {} bytes, encoder expects {expected}",
-                bgra.len()
-            )));
-        }
+        crate::frame_pipeline::check_frame_len(bgra, self.width, self.height)?;
 
         nv12::from_bgra(bgra, self.width, self.height, &mut self.nv12);
 

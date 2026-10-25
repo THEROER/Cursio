@@ -11,11 +11,13 @@
 //! video stream.
 
 mod differ;
+mod geometry;
 mod keyframe;
 mod pipeline;
 mod quality;
 
 pub use differ::FrameDiffer;
+pub use geometry::{check_encoder_size, check_frame_len, whole_frame};
 pub use keyframe::{KeyframeClock, KEYFRAME_INTERVAL};
 pub use pipeline::{
     try_queue_frames, CapturePipeline, EncoderSource, FrameQueueError, StreamEncoder, SETTLE,

@@ -59,7 +59,6 @@
 //! decodes it ([`Fidelity`]), and every other viewer gets a lossy High-profile
 //! stream at a bitrate.
 
-use cursio_protocol::Rect;
 
 use crate::WindowError;
 
@@ -245,16 +244,7 @@ impl VideoEncoder {
     /// change frame size mid-stream, so a window resize means a new encoder
     /// (and a fresh keyframe).
     pub fn open(width: u32, height: u32, fidelity: Fidelity) -> Result<Self, WindowError> {
-        // 4:2:0 chroma is subsampled by two on both axes, so odd dimensions
-        // have no valid chroma plane. Reject rather than silently skew.
-        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return Err(WindowError::Backend(format!(
-                "video encoder needs even dimensions, got {width}x{height}"
-            )));
-        }
-        if width == 0 || height == 0 {
-            return Err(WindowError::Backend("zero-sized window".into()));
-        }
+        crate::frame_pipeline::check_encoder_size(width, height)?;
 
         let mut attempts = Vec::new();
         for kind in EncoderKind::candidates() {
@@ -429,17 +419,6 @@ impl VideoEncoder {
         (self.width, self.height)
     }
 
-    /// The `dirty` rect a stream frame must carry: the whole window, since an
-    /// inter-frame packet is not independently croppable.
-    pub fn full_rect(&self) -> Rect {
-        Rect {
-            x: 0,
-            y: 0,
-            width: self.width,
-            height: self.height,
-        }
-    }
-
     /// Encode one full-window BGRA frame, returning the packets it produced.
     ///
     /// `bgra` must be tightly packed (`width * height * 4`, no row padding) —
@@ -449,15 +428,7 @@ impl VideoEncoder {
     /// may hold a frame briefly or emit several, and callers must not assume
     /// one-in-one-out. An empty result is normal, not an error.
     pub fn encode(&mut self, bgra: &[u8]) -> Result<Vec<Vec<u8>>, WindowError> {
-        let expected = (self.width as usize) * (self.height as usize) * 4;
-        if bgra.len() != expected {
-            return Err(WindowError::Backend(format!(
-                "frame is {} bytes, expected {expected} for {}x{}",
-                bgra.len(),
-                self.width,
-                self.height
-            )));
-        }
+        crate::frame_pipeline::check_frame_len(bgra, self.width, self.height)?;
 
         // FFmpeg aligns each row to `stride()`, which for BGRA is usually but
         // *not always* `width * 4`, so copy row by row rather than in one
@@ -893,14 +864,5 @@ mod tests {
         ffmpeg_next::init().expect("ffmpeg init");
         let enc = VideoEncoder::open(640, 480, Fidelity::Lossless).expect("some encoder must open");
         assert_eq!(enc.size(), (640, 480));
-        assert_eq!(
-            enc.full_rect(),
-            Rect {
-                x: 0,
-                y: 0,
-                width: 640,
-                height: 480
-            }
-        );
     }
 }
