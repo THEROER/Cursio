@@ -7,8 +7,10 @@ use crate::node::lock;
 use crate::node::Node;
 use crate::node::NodeCtx;
 use crate::node::Shared;
+use cursio_core::audio_gate::MicGate;
 use cursio_core::audio_session::AudioFactory;
 use cursio_core::control::ModuleSwitch;
+use cursio_core::control::NodeState;
 use cursio_core::live::Shared as LiveShared;
 use cursio_core::mesh::SharedRegistry;
 use cursio_core::module::ModuleRegistry;
@@ -51,74 +53,15 @@ pub(super) async fn serve(node: Node) -> anyhow::Result<()> {
         tracing::info!(peer = %peer.display_name, id = %peer.peer_id, "known peer");
     }
 
-    let modules = ModuleRegistry::new()
-        .with(Box::new(AudioFactory {
-            enabled: true,
-            render_device: LiveShared::new(None),
-            mic_gate,
-            mixer: control.mixer(),
-        }))
-        .with(Box::new(cursio_core::share_session::ShareFactory {
-            sink: crate::share::AndroidSink::shared(),
-        }))
-        .with(Box::new(cursio_core::notify_session::NotifyFactory {
-            display: None,
-            actor: Some(crate::notify::AndroidActor::shared()),
-            rings: false,
-        }))
-        .with(Box::new(cursio_core::calls_session::CallsFactory {
-            actor: Some(crate::calls::AndroidCallActor::shared()),
-            computer: false,
-        }))
-        .with(Box::new(cursio_core::messages_session::MessagesFactory {
-            store: Some(crate::messages::AndroidStore::shared()),
-            view: false,
-        }))
-        .with(Box::new(cursio_core::media_session::MediaFactory {
-            plays: true,
-            shows: true,
-            shows_only_computers: true,
-        }))
-        // The phone's shared storage, for a computer to mount. Offered always:
-        // what it holds is empty until the user grants storage access, and the
-        // module's rescan offers the volumes the moment that happens.
-        .with(Box::new(cursio_core::files_session::FilesFactory {
-            enabled: true,
-            share: cursio_core::live::Shared::new(cursio_files::SharePolicy::everything()),
-            role: cursio_protocol::ModuleRole::Source,
-        }))
-        .with(Box::new(cursio_core::gallery_session::GalleryFactory {
-            store: Some(crate::gallery::AndroidGallery::shared()),
-            view: true,
-        }))
-        // The phone's screen, shown on a computer and driven from it.
-        .with(Box::new(
-            cursio_core::window_session::WindowFactory::default(),
-        ));
-    cursio_core::media_hub::hub().set_backend(crate::media::AndroidBackend::shared());
-    cursio_core::media_hub::hub().set_display(crate::media::AndroidDisplay::shared());
-    cursio_core::phone_screen::set_backend(crate::screen::AndroidScreen::shared());
+    let modules = phone_modules(&control, mic_gate);
     for advert in modules.advertise() {
         tracing::info!(module = %advert.id, version = advert.version, "module available");
     }
     // Input too: the touchpad drives a peer's cursor through the links.
     control.set_available(ModuleSwitch::available(&modules.available(), true));
 
-    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
     let self_id = identity.peer_id;
-    let browse_config = cursio_core::link::discovery_config();
-    // Discovery blocks its thread, so it gets one of its own rather than the
-    // only thread this runtime has.
-    std::thread::Builder::new()
-        .name("cursio-browse".into())
-        .spawn(move || {
-            if let Err(e) = discovery::browse_with(self_id, &browse_config, |peer| {
-                let _ = seen_tx.send(peer);
-            }) {
-                tracing::warn!(error = %e, "discovery ended");
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("cannot spawn the discovery thread: {e}"))?;
+    let mut seen_rx = spawn_browse(self_id)?;
 
     let ctx = Rc::new(NodeCtx {
         identity,
@@ -177,50 +120,140 @@ pub(super) async fn serve(node: Node) -> anyhow::Result<()> {
             }
 
             _ = sweep.tick() => {
-                publish(&ctx);
-                strangers.retain(|id, _| !ctx.registry.borrow().is_known(id));
-                if ctx.pairing.is_open() {
-                    let now = std::time::Instant::now();
-                    for stranger in strangers.values_mut() {
-                        if stranger.called.is_some_and(|at| now.duration_since(at) < STRANGER_RECALL) {
-                            continue;
-                        }
-                        stranger.called = Some(now);
-                        match TcpTransport::connect(stranger.addr).await {
-                            Ok(t) => {
-                                tracing::info!(peer = %stranger.name, addr = %stranger.addr, "dialled an unpaired machine to pair with it");
-                                let addr = Some(stranger.addr);
-                                spawn_session(t, Rc::clone(&ctx), Role::Initiator, None, addr);
-                            }
-                            Err(e) => tracing::warn!(peer = %stranger.name, error = %e, "could not reach the machine to pair with"),
-                        }
-                    }
-                } else {
-                    for stranger in strangers.values_mut() {
-                        stranger.called = None;
-                    }
-                }
-                let targets = cursio_core::mesh::next_dial_targets(self_id, &ctx.registry);
-                for (target, dialled) in cursio_core::mesh::dial(targets).await {
-                    match dialled {
-                        Ok(t) => {
-                            tracing::info!(peer = %target.display_name, addr = %target.addr, "dialled peer");
-                            if let Ok(mut store) = TrustStore::load() {
-                                let _ = store.remember_addr(&target.peer_id, target.addr);
-                            }
-                            let addr = Some(target.addr);
-                            spawn_session(t, Rc::clone(&ctx), Role::Initiator, Some(target.peer_id), addr);
-                        }
-                        Err(e) => {
-                            tracing::debug!(peer = %target.display_name, error = %e, "dial failed; will retry");
-                            ctx.registry.borrow_mut().mark_offline(target.peer_id);
-                        }
-                    }
-                }
-                dial_bluetooth(&ctx).await;
+                sweep_once(&ctx, self_id, &mut strangers).await;
             }
         }
     }
+}
+
+/// What a phone runs on a link, and the platform halves the hubs reach the
+/// phone through.
+fn phone_modules(control: &NodeState, mic_gate: LiveShared<MicGate>) -> ModuleRegistry {
+    let modules = ModuleRegistry::new()
+        .with(Box::new(AudioFactory {
+            enabled: true,
+            render_device: LiveShared::new(None),
+            mic_gate,
+            mixer: control.mixer(),
+        }))
+        .with(Box::new(cursio_core::share_session::ShareFactory {
+            sink: crate::share::AndroidSink::shared(),
+        }))
+        .with(Box::new(cursio_core::notify_session::NotifyFactory {
+            display: None,
+            actor: Some(crate::notify::AndroidActor::shared()),
+            rings: false,
+        }))
+        .with(Box::new(cursio_core::calls_session::CallsFactory {
+            actor: Some(crate::calls::AndroidCallActor::shared()),
+            computer: false,
+        }))
+        .with(Box::new(cursio_core::messages_session::MessagesFactory {
+            store: Some(crate::messages::AndroidStore::shared()),
+            view: false,
+        }))
+        .with(Box::new(cursio_core::media_session::MediaFactory {
+            plays: true,
+            shows: true,
+            shows_only_computers: true,
+        }))
+        // The phone's shared storage, for a computer to mount. Offered always:
+        // what it holds is empty until the user grants storage access, and the
+        // module's rescan offers the volumes the moment that happens.
+        .with(Box::new(cursio_core::files_session::FilesFactory {
+            enabled: true,
+            share: cursio_core::live::Shared::new(cursio_files::SharePolicy::everything()),
+            role: cursio_protocol::ModuleRole::Source,
+        }))
+        .with(Box::new(cursio_core::gallery_session::GalleryFactory {
+            store: Some(crate::gallery::AndroidGallery::shared()),
+            view: true,
+        }))
+        // The phone's screen, shown on a computer and driven from it.
+        .with(Box::new(
+            cursio_core::window_session::WindowFactory::default(),
+        ));
+    cursio_core::media_hub::hub().set_backend(crate::media::AndroidBackend::shared());
+    cursio_core::media_hub::hub().set_display(crate::media::AndroidDisplay::shared());
+    cursio_core::phone_screen::set_backend(crate::screen::AndroidScreen::shared());
+    modules
+}
+
+/// Discovery blocks its thread, so it gets one of its own rather than the
+/// only thread this runtime has. What it sees arrives on the channel.
+fn spawn_browse(
+    self_id: PeerId,
+) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<discovery::DiscoveredPeer>> {
+    let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let browse_config = cursio_core::link::discovery_config();
+    std::thread::Builder::new()
+        .name("cursio-browse".into())
+        .spawn(move || {
+            if let Err(e) = discovery::browse_with(self_id, &browse_config, |peer| {
+                let _ = seen_tx.send(peer);
+            }) {
+                tracing::warn!(error = %e, "discovery ended");
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("cannot spawn the discovery thread: {e}"))?;
+    Ok(seen_rx)
+}
+
+/// One sweep: publish what the mesh knows, call the strangers an open
+/// pairing window lets in, and dial every known machine that is down.
+async fn sweep_once(ctx: &Rc<NodeCtx>, self_id: PeerId, strangers: &mut HashMap<PeerId, Stranger>) {
+    publish(ctx);
+    strangers.retain(|id, _| !ctx.registry.borrow().is_known(id));
+    if ctx.pairing.is_open() {
+        let now = std::time::Instant::now();
+        for stranger in strangers.values_mut() {
+            if stranger
+                .called
+                .is_some_and(|at| now.duration_since(at) < STRANGER_RECALL)
+            {
+                continue;
+            }
+            stranger.called = Some(now);
+            match TcpTransport::connect(stranger.addr).await {
+                Ok(t) => {
+                    tracing::info!(peer = %stranger.name, addr = %stranger.addr, "dialled an unpaired machine to pair with it");
+                    let addr = Some(stranger.addr);
+                    spawn_session(t, Rc::clone(ctx), Role::Initiator, None, addr);
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %stranger.name, error = %e, "could not reach the machine to pair with")
+                }
+            }
+        }
+    } else {
+        for stranger in strangers.values_mut() {
+            stranger.called = None;
+        }
+    }
+    let targets = cursio_core::mesh::next_dial_targets(self_id, &ctx.registry);
+    for (target, dialled) in cursio_core::mesh::dial(targets).await {
+        match dialled {
+            Ok(t) => {
+                tracing::info!(peer = %target.display_name, addr = %target.addr, "dialled peer");
+                if let Ok(mut store) = TrustStore::load() {
+                    let _ = store.remember_addr(&target.peer_id, target.addr);
+                }
+                let addr = Some(target.addr);
+                spawn_session(
+                    t,
+                    Rc::clone(ctx),
+                    Role::Initiator,
+                    Some(target.peer_id),
+                    addr,
+                );
+            }
+            Err(e) => {
+                tracing::debug!(peer = %target.display_name, error = %e, "dial failed; will retry");
+                ctx.registry.borrow_mut().mark_offline(target.peer_id);
+            }
+        }
+    }
+    dial_bluetooth(ctx).await;
 }
 
 /// A machine on the LAN this phone has not paired with.
