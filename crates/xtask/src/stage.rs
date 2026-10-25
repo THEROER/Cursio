@@ -17,6 +17,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 
+use crate::cross::WINDOWS_TARGET;
 use crate::deploy::{current_commit, sha256_file};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -117,8 +118,8 @@ pub fn stage_build(
                 crate::windows(true)?;
             }
             (
-                Some(crate::WINDOWS_TARGET),
-                crate::out_dir(true, Some(crate::WINDOWS_TARGET)),
+                Some(WINDOWS_TARGET),
+                crate::out_dir(true, Some(WINDOWS_TARGET)),
             )
         }
         StageTarget::Ubuntu24 => {

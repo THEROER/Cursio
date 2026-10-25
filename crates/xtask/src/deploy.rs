@@ -23,6 +23,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 
+use crate::cross::WINDOWS_TARGET;
 use crate::remote::{command_line_args, ps_quote, sh_quote, wsl_to_windows, Peer};
 
 #[derive(Args, Debug)]
@@ -387,7 +388,7 @@ fn deploy_windows(args: &DeployArgs, commit: &Commit) -> Result<String> {
     let peer = &args.peer;
     windows_target_dir()?;
     let dir = if args.no_build {
-        crate::out_dir(true, Some(crate::WINDOWS_TARGET))
+        crate::out_dir(true, Some(WINDOWS_TARGET))
     } else {
         crate::windows(true)?
     };
