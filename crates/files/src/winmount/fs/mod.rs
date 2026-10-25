@@ -9,22 +9,21 @@ use std::sync::Mutex;
 use cursio_protocol::{FileError, FileKind, FileMeta, OpenMode, Volume};
 use widestring::U16CStr;
 use winfsp::filesystem::{
-    DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo,
-    WideNameInfo,
+    DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo,
 };
 
 use super::convert::{attributes_of, to_ntstatus};
 use crate::bridge::PeerLink;
 use crate::winmount::fs::info::fill_info;
 use crate::winmount::fs::info::fill_info_at;
-use crate::winmount::fs::info::set_entry_name;
 use crate::winmount::fs::info::set_normalized_name;
 use crate::winmount::fs::info::synthetic_dir;
-use crate::winmount::fs::pattern::matches_pattern;
 
 mod handle;
 mod info;
+mod listing;
 mod pattern;
+mod write;
 
 pub use handle::{mount, MountHandle};
 
@@ -478,127 +477,14 @@ impl FileSystemContext for RemoteFs {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
-        let _call = crate::inflight::shared().enter("write");
-        let lease = self.remote(context).map_err(|e| to_ntstatus(&e))?;
-        let remote = lease.handle;
-        // Pipelined: this write is sent now and its answer collected later,
-        // while the answer being waited on here belongs to a write already a
-        // window behind. Nothing is acknowledged before the peer has stored it
-        // — what changes is only which write the caller waits out, so the
-        // link carries several at once instead of one per round trip. See
-        // `crate::writeback`.
-        let mut pipeline = context.writes.lock().expect("handle writes");
-        if let Some(e) = pipeline.take_failure() {
-            // An earlier write in this pipeline failed. Report it here rather
-            // than letting the application believe its file is complete.
-            pipeline.drain(
-                |rx, limit| self.peer.await_write(rx, limit),
-                crate::bridge::BULK_OP_TIMEOUT,
-            );
-            tracing::warn!(
-                path = %context.path,
-                offset,
-                error = ?e,
-                "a write earlier in this file failed"
-            );
-            return Err(to_ntstatus(&e));
-        }
-
-        // Placed while the pipeline is held, so two appends on one handle
-        // cannot both be told the same end of file.
-        let (offset, len) = crate::filesize::place_write(
-            context.size.get(),
+        self.write_pipelined(
+            context,
+            buffer,
             offset,
-            buffer.len(),
             write_to_eof,
             constrained_io,
-        );
-        if len == 0 {
-            drop(pipeline);
-            let meta = self.described_after_write(context, context.size.get());
-            fill_info(file_info, &meta);
-            return Ok(0);
-        }
-        let buffer = &buffer[..len];
-
-        // A slot on the link, or an answer collected to free one. Collecting is
-        // the work this thread would be waiting to do in any case, and it keeps
-        // the queue on the link bounded by what the link carries rather than by
-        // how many files the application has open.
-        if !pipeline.reserve() {
-            match pipeline.collect_one(
-                |rx, limit| self.peer.await_write(rx, limit),
-                crate::bridge::BULK_OP_TIMEOUT,
-            ) {
-                Some(Err(e)) => {
-                    tracing::warn!(
-                        path = %context.path,
-                        offset,
-                        error = ?e,
-                        "a write to the peer failed"
-                    );
-                    return Err(to_ntstatus(&e));
-                }
-                // The slot that answer held is free now. If another handle
-                // took it first this write still goes out — one over the
-                // budget is a rounding error next to stalling the thread.
-                _ => drop(pipeline.reserve()),
-            }
-        }
-
-        let rx = self
-            .peer
-            .write_later(remote, offset, buffer.to_vec())
-            .map_err(|e| {
-                // Named with the path and offset Steam quotes back — its
-                // "writing chunk, offset N" names the same write, so the two
-                // logs can be lined up against each other.
-                tracing::warn!(
-                    path = %context.path,
-                    offset,
-                    len = buffer.len(),
-                    error = ?e,
-                    "a write to the peer failed"
-                );
-                to_ntstatus(&e)
-            })?;
-        pipeline.push(rx, buffer.len() as u64);
-
-        // Report this write's own length as accepted. It is not an
-        // acknowledgement: the bytes are still outstanding, and any failure
-        // reaches the application at a later write or at `flush`/`cleanup`,
-        // before the file can be closed as complete — which is the guarantee
-        // `rclone`'s pipeline does not give on Windows, where WinFsp drops an
-        // error returned from `flush`.
-        let written = buffer.len() as u64;
-        let size = context.size.wrote(offset, written);
-        drop(pipeline);
-        // Windows expects the file's state after the write, and takes what it
-        // is given: a `FileInfo` left untouched is whatever the caller's memory
-        // held — a size and timestamps invented from nothing.
-        //
-        // Computed rather than fetched. The peer was just told to put `written`
-        // bytes at `offset`, so the file is at least that long and its contents
-        // changed now; asking for that back is a round trip spent learning what
-        // this call already decided. It is not a small saving: Windows follows
-        // almost every write with a `get_file_info`, and Steam's unpacking
-        // measured 3.3 stats per write — the metadata traffic outnumbered the
-        // data more than three to one, and a link doing 41 MB/s on a plain
-        // sequential write served Steam at 5.6.
-        //
-        // The size is the handle's own figure, raised by this write and never
-        // lowered by it. It was once invented from the write itself —
-        // `offset + len` whenever the cache had expired — which told Windows a
-        // preallocated file had shrunk to the end of whatever chunk was being
-        // written. See `crate::filesize`.
-        //
-        // The cached entry is updated to match instead of being dropped, so the
-        // `get_file_info` that follows is answered from memory rather than
-        // starting the round trip again.
-        let meta = self.described_after_write(context, size);
-        context.ahead.invalidate();
-        fill_info(file_info, &meta);
-        Ok(written as u32)
+            file_info,
+        )
     }
 
     /// Report the volume's size and label.
@@ -801,110 +687,7 @@ impl FileSystemContext for RemoteFs {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        let _call = crate::inflight::shared().enter("read_directory");
-        if !context.is_dir {
-            return Err(to_ntstatus(&FileError::WrongKind));
-        }
-        // Once per enumeration: a continuation carries a marker and lists the
-        // same directory again.
-        if marker.inner_as_cstr().is_none() {
-            crate::walk::observe(
-                &self.peer_name,
-                &self.bound,
-                context.opener,
-                crate::walk::dir_key(&context.volume, &context.path),
-            );
-        }
-
-        // Fill the caller's buffer directly, the way WinFsp's own MEMFS sample
-        // does, rather than going through a `DirBuffer`.
-        //
-        // The buffered route ended enumeration by *not* finding the marker: its
-        // continuation is a binary search over records WinFsp sorted itself, and
-        // once the marker reached the last name the search kept resolving to
-        // that same record. Asked for what follows `var`, it answered `var`,
-        // forever — 2.5 million entries in a directory of 24.
-        //
-        // Writing straight into `buffer` removes the search entirely: we skip
-        // past the marker ourselves and append until the buffer is full, which
-        // is exactly what the sample implementation does.
-        let mut cursor = 0u32;
-
-        // `.` and `..` come first, and only at the start of an enumeration —
-        // the sample emits `.` when there is no marker and `..` when the marker
-        // is `.`, then clears the marker so the real entries follow.
-        let pattern = pattern.map(|p| p.to_string_lossy());
-
-        let mut skip_until = marker.inner_as_cstr().map(|m| m.to_string_lossy());
-        if skip_until.is_none() || skip_until.as_deref() == Some(".") {
-            let starting = skip_until.is_none();
-            for dot in [".", ".."] {
-                if starting || dot == ".." {
-                    let mut info: DirInfo = DirInfo::default();
-                    let dot_path = if dot == "." {
-                        context.path.clone()
-                    } else {
-                        // The parent of the volume root is the mount root.
-                        context
-                            .path
-                            .rsplit_once('/')
-                            .map(|(p, _)| p.to_string())
-                            .unwrap_or_default()
-                    };
-                    fill_info_at(
-                        info.file_info_mut(),
-                        &synthetic_dir(dot),
-                        &context.volume,
-                        &dot_path,
-                    );
-                    set_entry_name(&mut info, dot)?;
-                    if !info.append_to_buffer(buffer, &mut cursor) {
-                        return Ok(cursor);
-                    }
-                }
-            }
-            // Past the dot entries: everything after this is a real name.
-            skip_until = None;
-        }
-
-        // Windows may ask for a subset. Answering with the whole directory
-        // regardless is not merely wasteful — the caller takes the mismatch as a
-        // malformed reply, which is how `cargo` clearing a `.temp-archive`
-        // directory got `ERROR_INVALID_NAME` on a name that was perfectly valid.
-        let entries = self.entries_of(context).map_err(|e| to_ntstatus(&e))?;
-        let mut past_marker = skip_until.is_none();
-        for meta in entries {
-            if let Some(pat) = pattern.as_deref() {
-                if !matches_pattern(pat, &meta.name) {
-                    continue;
-                }
-            }
-            // Resume *after* the marker, never at it — returning the marker
-            // again is what made the listing repeat.
-            if !past_marker {
-                if Some(meta.name.as_str()) == skip_until.as_deref() {
-                    past_marker = true;
-                }
-                continue;
-            }
-            let mut info: DirInfo = DirInfo::default();
-            let child = if context.path.is_empty() {
-                meta.name.clone()
-            } else {
-                format!("{}/{}", context.path, meta.name)
-            };
-            fill_info_at(info.file_info_mut(), &meta, &context.volume, &child);
-            set_entry_name(&mut info, &meta.name)?;
-            if !info.append_to_buffer(buffer, &mut cursor) {
-                // Buffer full: what is left comes on the next call.
-                return Ok(cursor);
-            }
-        }
-
-        // Everything fit, so this is the end of the directory. The terminating
-        // call is what tells the caller to stop asking.
-        DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
-        Ok(cursor)
+        self.list_into(context, pattern, marker, buffer)
     }
 
     /// Set a file's length, or reserve the space it will need.
