@@ -38,7 +38,8 @@ use pipewire::{
     stream::{StreamFlags, StreamRc},
 };
 
-use crate::AudioError;
+use crate::worker::{OnDrop, Worker};
+use crate::{AudioError, DeviceChange, DeviceCommand};
 
 /// Fixed capture/playback format for the first cut: 48 kHz stereo f32.
 ///
@@ -109,11 +110,11 @@ fn format_param_pod() -> Vec<u8> {
 /// into [`AudioChunk`]s and forwarded on the tokio channel the
 /// [`AudioSource`](crate::AudioSource) trait exposes.
 pub struct PwSource {
+    // First, so the thread is signalled before its channels close.
+    _worker: Worker,
     id: AudioStreamId,
     adverts_rx: tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta>,
     chunks_rx: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
-    stop: Option<std_mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PwSource {
@@ -161,10 +162,6 @@ impl PwSource {
     fn with_mode(id: AudioStreamId, mode: CaptureMode) -> Result<Self, AudioError> {
         let (adverts_tx, adverts_rx) = tokio::sync::mpsc::unbounded_channel();
         let (chunks_tx, chunks_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
-        // Handshake so `start` fails synchronously if the PW loop can't build,
-        // instead of leaving a silently dead thread.
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
 
         // Advertise this stream before any chunk. An app tap carries the app
         // name so the peer creates a per-app node for it; the other modes are
@@ -189,24 +186,18 @@ impl PwSource {
             codec: AudioCodec::RawPcm,
         });
 
-        let thread = std::thread::Builder::new()
-            .name(format!("cursio-pw-capture-{id}"))
-            .spawn(move || run_capture_loop(id, mode, chunks_tx, stop_rx, ready_tx))
-            .map_err(|e| AudioError::Backend(format!("spawn capture thread: {e}")))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(PwSource {
-                id,
-                adverts_rx,
-                chunks_rx,
-                stop: Some(stop_tx),
-                thread: Some(thread),
-            }),
-            Ok(Err(e)) => Err(AudioError::Backend(e)),
-            Err(_) => Err(AudioError::Backend(
-                "capture thread exited before signalling readiness".into(),
-            )),
-        }
+        let worker = Worker::start(
+            format!("cursio-pw-capture-{id}"),
+            "capture thread",
+            OnDrop::Detach,
+            move |stop_rx, ready_tx| run_capture_loop(id, mode, chunks_tx, stop_rx, ready_tx),
+        )?;
+        Ok(PwSource {
+            id,
+            adverts_rx,
+            chunks_rx,
+            _worker: worker,
+        })
     }
 
     pub fn advertisements(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta> {
@@ -219,23 +210,6 @@ impl PwSource {
 
     pub fn id(&self) -> AudioStreamId {
         self.id
-    }
-}
-
-/// Signals the stream's thread and detaches it rather than joining.
-///
-/// Every stream is dropped from the session loop — a tap when its app's node
-/// goes away, a playback when the peer closes it — and tearing a PipeWire
-/// stream down takes the loop hundreds of milliseconds ("module pump blocked
-/// the session loop module=audio took_ms=380"), felt as a frozen cursor since
-/// input rides the same loop. Nothing needs the thread gone before `drop`
-/// returns: it owns its stream outright and exits on the signal by itself.
-impl Drop for PwSource {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        drop(self.thread.take());
     }
 }
 
@@ -267,10 +241,10 @@ pub enum IntentSinkEvent {
 /// A device Intent Sink: a real local sink that carries no audio, only observes
 /// which playback streams are funnelled into it (reported on [`Self::events`]).
 pub struct PwIntentSink {
+    // First, so the thread is signalled before its channel closes.
+    _worker: Worker,
     id: AudioStreamId,
     events_rx: tokio::sync::mpsc::UnboundedReceiver<IntentSinkEvent>,
-    stop: Option<std_mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PwIntentSink {
@@ -283,26 +257,19 @@ impl PwIntentSink {
         description: String,
     ) -> Result<Self, AudioError> {
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
-
-        let thread = std::thread::Builder::new()
-            .name(format!("cursio-pw-intent-{id}"))
-            .spawn(move || run_intent_sink_loop(name, description, events_tx, stop_rx, ready_tx))
-            .map_err(|e| AudioError::Backend(format!("spawn intent-sink thread: {e}")))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(PwIntentSink {
-                id,
-                events_rx,
-                stop: Some(stop_tx),
-                thread: Some(thread),
-            }),
-            Ok(Err(e)) => Err(AudioError::Backend(e)),
-            Err(_) => Err(AudioError::Backend(
-                "intent-sink thread exited before signalling readiness".into(),
-            )),
-        }
+        let worker = Worker::start(
+            format!("cursio-pw-intent-{id}"),
+            "intent-sink thread",
+            OnDrop::Detach,
+            move |stop_rx, ready_tx| {
+                run_intent_sink_loop(name, description, events_tx, stop_rx, ready_tx)
+            },
+        )?;
+        Ok(PwIntentSink {
+            id,
+            events_rx,
+            _worker: worker,
+        })
     }
 
     /// Membership changes: apps joining/leaving this Intent Sink.
@@ -312,16 +279,6 @@ impl PwIntentSink {
 
     pub fn id(&self) -> AudioStreamId {
         self.id
-    }
-}
-
-/// Detaches rather than joins, for the reason given on `PwSource`'s `Drop`.
-impl Drop for PwIntentSink {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        drop(self.thread.take());
     }
 }
 
@@ -539,29 +496,6 @@ fn run_intent_sink_loop(
     }
 }
 
-/// A change to a real device's volume/mute, observed by [`PwDeviceMonitor`].
-///
-/// The owner side of the "one system" model emits one of these whenever a
-/// device it owns changes (the user turned the knob, or a remote request was
-/// applied), so the session can broadcast the new [`DeviceState`] to every node.
-#[derive(Debug, Clone)]
-pub struct DeviceChange {
-    /// The device's node name (its owner-side handle, matched to the peer's
-    /// Intent Sink).
-    pub node_name: String,
-    /// Master volume, linear `0.0`..=`1.0` (already de-cubed from PipeWire's
-    /// internal cubic `channelVolumes`).
-    pub volume: f32,
-    /// Whether the device is muted.
-    pub mute: bool,
-}
-
-/// A command to set a real device's volume/mute, sent to a [`PwDeviceMonitor`].
-enum DeviceCommand {
-    SetVolume { node_name: String, volume: f32 },
-    SetMute { node_name: String, mute: bool },
-}
-
 /// Watches every local audio **device** (sinks and sources), reports volume/mute
 /// changes, and applies volume/mute sets — the backend half of device-state
 /// replication (see docs/audio-design.md, "Device state is REPLICATED").
@@ -572,10 +506,10 @@ enum DeviceCommand {
 /// `0..1` the protocol carries. The owner uses [`changes`](Self::changes) to
 /// learn when to broadcast, and [`set_volume`]/[`set_mute`] to apply a request.
 pub struct PwDeviceMonitor {
+    // First, so it is stopped and joined while `commands` is still open.
+    _worker: Worker,
     changes_rx: tokio::sync::mpsc::UnboundedReceiver<DeviceChange>,
     commands: std_mpsc::Sender<DeviceCommand>,
-    stop: Option<std_mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PwDeviceMonitor {
@@ -583,26 +517,17 @@ impl PwDeviceMonitor {
     pub fn start() -> Result<Self, AudioError> {
         let (changes_tx, changes_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<DeviceCommand>();
-        let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
-
-        let thread = std::thread::Builder::new()
-            .name("cursio-pw-device-monitor".to_string())
-            .spawn(move || run_device_monitor_loop(changes_tx, cmd_rx, stop_rx, ready_tx))
-            .map_err(|e| AudioError::Backend(format!("spawn device-monitor thread: {e}")))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(PwDeviceMonitor {
-                changes_rx,
-                commands: cmd_tx,
-                stop: Some(stop_tx),
-                thread: Some(thread),
-            }),
-            Ok(Err(e)) => Err(AudioError::Backend(e)),
-            Err(_) => Err(AudioError::Backend(
-                "device-monitor thread exited before signalling readiness".into(),
-            )),
-        }
+        let worker = Worker::start(
+            "cursio-pw-device-monitor".to_string(),
+            "device-monitor thread",
+            OnDrop::Join,
+            move |stop_rx, ready_tx| run_device_monitor_loop(changes_tx, cmd_rx, stop_rx, ready_tx),
+        )?;
+        Ok(PwDeviceMonitor {
+            _worker: worker,
+            changes_rx,
+            commands: cmd_tx,
+        })
     }
 
     /// Observed device volume/mute changes.
@@ -622,17 +547,6 @@ impl PwDeviceMonitor {
         let _ = self
             .commands
             .send(DeviceCommand::SetMute { node_name, mute });
-    }
-}
-
-impl Drop for PwDeviceMonitor {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
     }
 }
 
@@ -1758,6 +1672,8 @@ fn frames_to_write(requested: u64, capacity: usize) -> usize {
 /// prefills a little before output begins, then feeds each buffer PipeWire asks
 /// for, emitting silence on underrun rather than blocking.
 pub struct PwSink {
+    // First, so the thread is signalled before the feed and gain go.
+    _worker: Worker,
     id: AudioStreamId,
     /// Samples to play, pushed from the async side, drained on the PW thread.
     feed: crate::playback_feed::Sender,
@@ -1780,8 +1696,6 @@ pub struct PwSink {
     /// audio (the sender's backlog trim discarding chunks it could not keep up
     /// with) and what filled the undrained queues behind [`Self::queued`].
     listening: Arc<AtomicBool>,
-    stop: Option<std_mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PwSink {
@@ -1823,8 +1737,6 @@ impl PwSink {
         target: Option<String>,
     ) -> Result<Self, AudioError> {
         let (feed_tx, feed_rx) = crate::playback_feed::channel(JITTER_MAX_BYTES);
-        let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
 
         // Unity gain to start; the atomic is shared with the PW thread so
         // `set_gain` takes effect on the next output buffer without a lock.
@@ -1833,9 +1745,11 @@ impl PwSink {
         let listening = Arc::new(AtomicBool::new(false));
         let listening_thread = Arc::clone(&listening);
 
-        let thread = std::thread::Builder::new()
-            .name(format!("cursio-pw-playback-{id}"))
-            .spawn(move || {
+        let worker = Worker::start(
+            format!("cursio-pw-playback-{id}"),
+            "playback thread",
+            OnDrop::Detach,
+            move |stop_rx, ready_tx| {
                 run_playback_loop(
                     node_name,
                     as_source,
@@ -1846,23 +1760,15 @@ impl PwSink {
                     gain_thread,
                     listening_thread,
                 )
-            })
-            .map_err(|e| AudioError::Backend(format!("spawn playback thread: {e}")))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(PwSink {
-                id,
-                feed: feed_tx,
-                gain,
-                listening,
-                stop: Some(stop_tx),
-                thread: Some(thread),
-            }),
-            Ok(Err(e)) => Err(AudioError::Backend(e)),
-            Err(_) => Err(AudioError::Backend(
-                "playback thread exited before signalling readiness".into(),
-            )),
-        }
+            },
+        )?;
+        Ok(PwSink {
+            _worker: worker,
+            id,
+            feed: feed_tx,
+            gain,
+            listening,
+        })
     }
 
     /// Enqueue audio without blocking the async or PipeWire threads.
@@ -1892,16 +1798,6 @@ impl PwSink {
     /// [`listening`](Self::listening).
     pub fn is_listening(&self) -> bool {
         self.listening.load(Ordering::Relaxed)
-    }
-}
-
-/// Detaches rather than joins, for the reason given on `PwSource`'s `Drop`.
-impl Drop for PwSink {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        drop(self.thread.take());
     }
 }
 

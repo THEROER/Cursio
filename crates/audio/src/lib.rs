@@ -50,6 +50,8 @@ mod sample_clock;
 pub mod vad_client;
 #[cfg(target_os = "windows")]
 pub mod wasapi_backend;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod worker;
 
 use cursio_protocol::{
     AudioChunk, AudioFrameAck, AudioStreamCloseReason, AudioStreamId, AudioStreamMeta,
@@ -705,23 +707,27 @@ impl IntentSink {
     }
 }
 
-/// An observed change to a real device's volume/mute. See [`DeviceMonitor`].
-#[cfg(target_os = "linux")]
-pub use pipewire_backend::DeviceChange;
-#[cfg(target_os = "windows")]
-pub use wasapi_backend::DeviceChange;
-
-/// The device-change type on platforms without a monitor backend. Present so
-/// callers compile everywhere.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// A real device's volume or mute changed (the user turned the knob, or a
+/// remote request was applied), observed by a [`DeviceMonitor`] so the
+/// session can broadcast the new [`DeviceState`] to every node.
 #[derive(Debug, Clone)]
 pub struct DeviceChange {
-    /// The device's owner-side node handle.
+    /// The device's owner-side handle, matched to the peer's Intent Sink: its
+    /// node name on PipeWire, its friendly name on Windows (what
+    /// `list_output_devices` advertises as `id`).
     pub node_name: String,
-    /// Master volume, linear `0.0`..=`1.0`.
+    /// Master volume, linear `0.0`..=`1.0`. PipeWire's own cubic channel
+    /// volumes are converted before this; WASAPI's scalar already is linear.
     pub volume: f32,
     /// Whether the device is muted.
     pub mute: bool,
+}
+
+/// What the owner asks a backend's device monitor to apply.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) enum DeviceCommand {
+    SetVolume { node_name: String, volume: f32 },
+    SetMute { node_name: String, mute: bool },
 }
 
 /// Watches this machine's real audio **devices** and replicates their state.

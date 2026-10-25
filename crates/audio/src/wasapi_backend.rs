@@ -34,7 +34,8 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
 };
 
-use crate::AudioError;
+use crate::worker::{OnDrop, Worker};
+use crate::{AudioError, DeviceChange, DeviceCommand};
 
 /// `PKEY_Device_FriendlyName` — the human name shown in Sound settings (e.g.
 /// "VB-Audio Virtual Cable"). Used to find a device by name. Defined here
@@ -576,11 +577,11 @@ impl Drop for ComGuard {
 
 /// Handle to a running WASAPI loopback capture (the **source** side).
 pub struct WasapiSource {
+    // First, so the thread is signalled before its channels close.
+    _worker: Worker,
     id: AudioStreamId,
     adverts_rx: tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta>,
     chunks_rx: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
-    stop: Option<std_mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WasapiSource {
@@ -620,8 +621,6 @@ impl WasapiSource {
     ) -> Result<Self, AudioError> {
         let (adverts_tx, adverts_rx) = tokio::sync::mpsc::unbounded_channel();
         let (chunks_tx, chunks_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
 
         // A microphone is offered as a source the peer can pull from; anything
         // else is something we are playing.
@@ -639,24 +638,18 @@ impl WasapiSource {
             codec: AudioCodec::RawPcm,
         });
 
-        let thread = std::thread::Builder::new()
-            .name(format!("cursio-wasapi-capture-{id}"))
-            .spawn(move || run_capture_loop(id, pid, mic, chunks_tx, stop_rx, ready_tx))
-            .map_err(|e| AudioError::Backend(format!("spawn capture thread: {e}")))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(WasapiSource {
-                id,
-                adverts_rx,
-                chunks_rx,
-                stop: Some(stop_tx),
-                thread: Some(thread),
-            }),
-            Ok(Err(e)) => Err(AudioError::Backend(e)),
-            Err(_) => Err(AudioError::Backend(
-                "capture thread exited before signalling readiness".into(),
-            )),
-        }
+        let worker = Worker::start(
+            format!("cursio-wasapi-capture-{id}"),
+            "capture thread",
+            OnDrop::Detach,
+            move |stop_rx, ready_tx| run_capture_loop(id, pid, mic, chunks_tx, stop_rx, ready_tx),
+        )?;
+        Ok(WasapiSource {
+            _worker: worker,
+            id,
+            adverts_rx,
+            chunks_rx,
+        })
     }
 
     pub fn advertisements(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<AudioStreamMeta> {
@@ -669,19 +662,6 @@ impl WasapiSource {
 
     pub fn id(&self) -> AudioStreamId {
         self.id
-    }
-}
-
-/// Signals the stream's thread and detaches it rather than joining: streams are
-/// dropped from the session loop, and waiting out a WASAPI teardown there
-/// stalls input, which rides the same loop. The thread owns its client and
-/// exits on the signal by itself.
-impl Drop for WasapiSource {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        drop(self.thread.take());
     }
 }
 
@@ -994,6 +974,8 @@ const RENDER_AHEAD_MS: u32 = 40;
 /// render thread, which fills the device buffer's free space each pass and
 /// writes silence on underrun. Symmetric to the PipeWire `PwSink`.
 pub struct WasapiSink {
+    // First, so the thread is signalled before the feed and gain go.
+    _worker: Worker,
     id: AudioStreamId,
     feed: crate::playback_feed::Sender,
     /// Logical gain (linear, 1.0 = unity) applied to inbound audio, published to
@@ -1003,8 +985,6 @@ pub struct WasapiSink {
     /// f32 samples before the device-format conversion, so it is independent of
     /// the endpoint's mix format.
     gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    stop: Option<std_mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WasapiSink {
@@ -1032,15 +1012,15 @@ impl WasapiSink {
         display_name: String,
     ) -> Result<Self, AudioError> {
         let (feed_tx, feed_rx) = crate::playback_feed::channel(RENDER_MAX_BYTES);
-        let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
 
         let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
         let gain_thread = std::sync::Arc::clone(&gain);
 
-        let thread = std::thread::Builder::new()
-            .name(format!("cursio-wasapi-render-{id}"))
-            .spawn(move || {
+        let worker = Worker::start(
+            format!("cursio-wasapi-render-{id}"),
+            "render thread",
+            OnDrop::Detach,
+            move |stop_rx, ready_tx| {
                 run_render_loop(
                     device_name,
                     display_name,
@@ -1049,22 +1029,14 @@ impl WasapiSink {
                     ready_tx,
                     gain_thread,
                 )
-            })
-            .map_err(|e| AudioError::Backend(format!("spawn render thread: {e}")))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(WasapiSink {
-                id,
-                feed: feed_tx,
-                gain,
-                stop: Some(stop_tx),
-                thread: Some(thread),
-            }),
-            Ok(Err(e)) => Err(AudioError::Backend(e)),
-            Err(_) => Err(AudioError::Backend(
-                "render thread exited before signalling readiness".into(),
-            )),
-        }
+            },
+        )?;
+        Ok(WasapiSink {
+            _worker: worker,
+            id,
+            feed: feed_tx,
+            gain,
+        })
     }
 
     /// Enqueue one inbound chunk for playback.
@@ -1086,38 +1058,9 @@ impl WasapiSink {
     }
 }
 
-/// Detaches rather than joins, for the reason given on `WasapiSource`'s `Drop`.
-impl Drop for WasapiSink {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        drop(self.thread.take());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Device-state monitor (volume/mute replication — docs/audio-design.md phase 5)
 // ---------------------------------------------------------------------------
-
-/// An observed change to a real device's volume/mute. The Windows twin of the
-/// PipeWire `DeviceChange`; the `lib.rs` façade unifies the two.
-#[derive(Debug, Clone)]
-pub struct DeviceChange {
-    /// The device's friendly name — its Windows-side handle, matched to the
-    /// peer's Intent Sink (this is what `list_output_devices` advertises as `id`).
-    pub node_name: String,
-    /// Master volume, linear `0.0`..=`1.0` (WASAPI's scalar is already linear).
-    pub volume: f32,
-    /// Whether the device is muted.
-    pub mute: bool,
-}
-
-/// A command to set a real device's volume/mute, sent to a [`WasapiDeviceMonitor`].
-enum DeviceCommand {
-    SetVolume { node_name: String, volume: f32 },
-    SetMute { node_name: String, mute: bool },
-}
 
 /// Watches this machine's render endpoints' volume/mute and applies sets — the
 /// Windows half of device-state replication (see docs/audio-design.md, "Device
@@ -1129,10 +1072,10 @@ enum DeviceCommand {
 /// apartment/lifetime pitfalls of `RegisterControlChangeNotify` callbacks, and a
 /// volume knob changes far slower than the poll, so nothing perceptible is lost.
 pub struct WasapiDeviceMonitor {
+    // First, so it is stopped and joined while `commands` is still open.
+    _worker: Worker,
     changes_rx: tokio::sync::mpsc::UnboundedReceiver<DeviceChange>,
     commands: std_mpsc::Sender<DeviceCommand>,
-    stop: Option<std_mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WasapiDeviceMonitor {
@@ -1141,18 +1084,16 @@ impl WasapiDeviceMonitor {
     pub fn start() -> Result<Self, AudioError> {
         let (changes_tx, changes_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<DeviceCommand>();
-        let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
-
-        let thread = std::thread::Builder::new()
-            .name("cursio-wasapi-device-monitor".to_string())
-            .spawn(move || run_device_monitor_loop(changes_tx, cmd_rx, stop_rx))
-            .map_err(|e| AudioError::Backend(format!("spawn device-monitor thread: {e}")))?;
-
+        let worker = Worker::spawn(
+            "cursio-wasapi-device-monitor".to_string(),
+            "device-monitor thread",
+            OnDrop::Join,
+            move |stop_rx| run_device_monitor_loop(changes_tx, cmd_rx, stop_rx),
+        )?;
         Ok(WasapiDeviceMonitor {
+            _worker: worker,
             changes_rx,
             commands: cmd_tx,
-            stop: Some(stop_tx),
-            thread: Some(thread),
         })
     }
 
@@ -1170,17 +1111,6 @@ impl WasapiDeviceMonitor {
         let _ = self
             .commands
             .send(DeviceCommand::SetMute { node_name, mute });
-    }
-}
-
-impl Drop for WasapiDeviceMonitor {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
     }
 }
 
