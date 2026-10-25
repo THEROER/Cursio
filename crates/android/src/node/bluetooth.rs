@@ -88,7 +88,11 @@ pub(super) fn spawn_bluetooth_session<T: Transport + 'static>(
         // computer calls back there; the Bluetooth path is then let go of,
         // not the session.
         let ended = tokio::select! {
-            result = run_link(transport, &ctx, Role::Initiator, None, &who, &hold) => result,
+            result = async {
+                run_link(transport, &ctx, Role::Initiator, None, &who, &hold).await?;
+                bluetooth_path_gone(&hold).await;
+                anyhow::Ok(())
+            } => result,
             () = leave_bluetooth_once_the_network_carries(&hold, &address, &ctx) => Ok(()),
             () = hold.superseded.notified() => {
                 tracing::info!("the network link to this computer is up; leaving bluetooth");
@@ -102,6 +106,28 @@ pub(super) fn spawn_bluetooth_session<T: Transport + 'static>(
         end_link(&ctx, who.get(), &hold);
         publish(&ctx);
     });
+}
+
+/// Resolves once the session this connection carried has no Bluetooth path.
+///
+/// A connection that joins a session already running over the network
+/// returns from `run_link` as soon as it is attached, while its path lives on
+/// in that session. Counting the device unlinked then made the next sweep dial
+/// it again a second later, and Android, refusing a second RFCOMM connection
+/// to the same channel, closed the first one with it: the standby rose and
+/// fell every half minute, all day.
+async fn bluetooth_path_gone(hold: &LinkHold) {
+    loop {
+        let carried = hold
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| !session.is_ended() && session.paths().bluetooth);
+        if !carried {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// Let the Bluetooth path go once a network path carries the session, which

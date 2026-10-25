@@ -52,7 +52,8 @@ pub(super) struct LinkHold {
     pub(super) superseded: Rc<tokio::sync::Notify>,
     /// This connection joined a running session, which now owns it.
     joined: std::cell::Cell<bool>,
-    /// The session this connection started, ended with it.
+    /// The session this connection carries: one it started, ended with it,
+    /// or one it joined, which outlives it.
     pub(super) session: RefCell<Option<cursio_transport::resume::ResumeHandle>>,
 }
 
@@ -113,7 +114,9 @@ pub(super) async fn run_link<T: Transport + 'static>(
             .borrow_mut()
             .set_state(peer_id, PeerState::Online);
         tracing::info!(peer = %peer_name, "the computer called back; resuming the session");
-        return cursio_core::link::join(identified, &plan, &session).await;
+        cursio_core::link::join(identified, &plan, &session).await?;
+        *hold.session.borrow_mut() = Some(session);
+        return Ok(());
     }
     let shape = cursio_core::registry::LinkShape {
         dialled: matches!(role, Role::Initiator),
