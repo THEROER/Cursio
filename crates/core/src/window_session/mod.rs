@@ -626,6 +626,17 @@ mod tests {
         mpsc::channel(64)
     }
 
+    /// The advert carries this module's own wire version. Peers run a module
+    /// only on an exact match, so a number borrowed from another module turns
+    /// the window module off against every build that has the right one.
+    #[test]
+    fn the_factory_advertises_the_window_modules_own_version() {
+        use crate::module::ModuleFactory;
+        let advert = WindowFactory::default().advert().expect("supported here");
+        assert_eq!(advert.id, ModuleId::WINDOW);
+        assert_eq!(advert.version, VERSION);
+    }
+
     #[tokio::test]
     async fn a_drag_request_starts_the_transfer_on_the_next_pump() {
         let (_frames_tx, frames_rx) = frame_channel();

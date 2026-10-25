@@ -2,7 +2,7 @@
 //! platform has, the remote-screen sources it offers, and the drag and AirPlay
 //! triggers that start a transfer.
 
-use crate::audio_session::VERSION;
+use crate::window_session::VERSION;
 use crate::module::SessionModule;
 use crate::remote_screen::ScreenHost;
 use crate::screen_hub::ScreenHub;
