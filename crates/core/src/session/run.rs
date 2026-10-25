@@ -263,7 +263,6 @@ where
                     );
                 }
             }
-            let woke = tokio::time::Instant::now();
 
             let turn = tokio::select! {
                 // Ordered, not random. The branches are already written most-
@@ -279,11 +278,11 @@ where
                     Err(SessionError::Transport(result.err().unwrap_or(TransportError::Closed)))
                 }
                 _ = self.ticker.tick() => {
-                    working_since = Some(woke);
+                    working_since = Some(tokio::time::Instant::now());
                     self.heartbeat().await
                 }
                 _ = self.status_ticker.tick() => {
-                    working_since = Some(woke);
+                    working_since = Some(tokio::time::Instant::now());
                     self.status().await
                 }
                 Some(failure) = self.failures.recv() => {
@@ -291,7 +290,7 @@ where
                     Err(SessionError::from(failure.error))
                 }
                 latest = settings_changed(&mut self.settings) => {
-                    working_since = Some(woke);
+                    working_since = Some(tokio::time::Instant::now());
                     self.apply_settings(latest).await
                 }
                 Some(ids) = stopped_maybe(&mut self.stopped) => {
@@ -301,19 +300,19 @@ where
                     GO_ON
                 }
                 cmd = recv_maybe(&mut self.commands) => {
-                    working_since = Some(woke);
+                    working_since = Some(tokio::time::Instant::now());
                     self.command(cmd).await
                 }
                 local = recv_captured(&mut self.captured),
                     if prefer_local || (self.inbound_rx.is_empty() && self.held_back.is_none()) => {
                     prefer_local = false;
-                    working_since = Some(woke);
+                    working_since = Some(tokio::time::Instant::now());
                     self.captured_input(local).await
                 }
                 incoming = next_inbound(&mut self.held_back, &mut self.inbound_rx),
                     if !prefer_local || self.captured.as_ref().is_none_or(|rx| rx.is_empty()) => {
                     prefer_local = true;
-                    working_since = Some(woke);
+                    working_since = Some(tokio::time::Instant::now());
                     self.inbound(incoming).await
                 }
             };
