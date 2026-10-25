@@ -24,7 +24,6 @@
 
 use std::ffi::OsStr;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use cursio_protocol::{FileError, FileKind, OpenMode};
 use fuser::{
@@ -76,6 +75,7 @@ pub struct RemoteFs {
     /// The Windows half has had this since it was written; this side went
     /// without, which is most of why the same copy costs so much more here.
     meta: crate::metacache::MetaCache,
+    volumes: crate::metacache::VolumeList,
     uid: u32,
     gid: u32,
     /// The peer volume this mount *is*.
@@ -98,11 +98,6 @@ pub struct RemoteFs {
 
 struct State {
     inodes: InodeTable,
-    /// Volume list, fetched once at mount and refreshed when it goes stale.
-    /// Cached because it is the mount root's entire contents: without this,
-    /// every `ls` of the mount point is a round trip.
-    volumes: Vec<cursio_protocol::Volume>,
-    volumes_fetched: Option<std::time::Instant>,
     /// Our inode-scoped file handles mapped to the peer's.
     handles: std::collections::HashMap<u64, cursio_protocol::FileHandle>,
     next_handle: u64,
@@ -119,23 +114,16 @@ struct Plus {
     counts: bool,
 }
 
-/// How long the volume list is trusted before being refetched.
-///
-/// Far longer than [`CACHE_TTL`]: drives do not come and go the way file
-/// contents change, and this list is consulted on every path resolution.
-const VOLUMES_TTL: Duration = Duration::from_secs(30);
-
 impl RemoteFs {
     pub fn new(peer: PeerLink, bound: impl Into<String>) -> Self {
         Self {
             peer,
             meta: crate::metacache::MetaCache::new(),
+            volumes: crate::metacache::VolumeList::default(),
             bound: bound.into(),
             peer_name: String::new(),
             state: Mutex::new(State {
                 inodes: InodeTable::new(),
-                volumes: Vec::new(),
-                volumes_fetched: None,
                 handles: std::collections::HashMap::new(),
                 next_handle: 1,
             }),
@@ -153,22 +141,7 @@ impl RemoteFs {
 
     /// The peer's volumes, refetched when the cached list has expired.
     fn volumes(&self) -> Result<Vec<cursio_protocol::Volume>, FileError> {
-        {
-            let state = self.state.lock().expect("inode state");
-            if let Some(at) = state.volumes_fetched {
-                if at.elapsed() < VOLUMES_TTL && !state.volumes.is_empty() {
-                    return Ok(state.volumes.clone());
-                }
-            }
-        }
-        // Fetched without the lock held: this is a network round trip, and
-        // holding the mutex across it would serialise every other callback
-        // behind it.
-        let fetched = self.peer.volumes()?;
-        let mut state = self.state.lock().expect("inode state");
-        state.volumes = fetched.clone();
-        state.volumes_fetched = Some(std::time::Instant::now());
-        Ok(fetched)
+        self.volumes.get(|| self.peer.volumes())
     }
 
     /// Ask the peer about a path, or answer from what it said a moment ago.
@@ -178,12 +151,8 @@ impl RemoteFs {
     /// and asking the peer again each time costs the same round trip as a real
     /// one.
     fn stat_path(&self, volume: &str, path: &str) -> Result<cursio_protocol::FileMeta, FileError> {
-        if let Some(hit) = self.meta.get(volume, path) {
-            return hit;
-        }
-        let fresh = self.peer.stat(volume, path);
-        self.meta.put(volume, path, fresh.clone());
-        fresh
+        self.meta
+            .get_or_ask(volume, path, || self.peer.stat(volume, path))
     }
 
     /// The peer's handle behind one of ours.
@@ -1058,7 +1027,7 @@ impl Filesystem for RemoteFs {
             name: path.rsplit('/').next().unwrap_or(&path).to_string(),
             kind: FileKind::File,
             size,
-            modified_unix: now_unix(),
+            modified_unix: crate::now_unix(),
             writable: true,
             allocated: None,
         };
@@ -1210,15 +1179,6 @@ impl Filesystem for RemoteFs {
         }
         reply.ok();
     }
-}
-
-/// Now, as seconds since the epoch — for a file we just created and whose
-/// timestamp the peer has not yet told us.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Translate the kernel's open flags into what the peer understands.

@@ -134,6 +134,16 @@ pub fn volume_display_name(id: &str, label: &str) -> String {
     }
 }
 
+/// Now, as seconds since the epoch — for a file just created here, whose
+/// timestamp the peer has not yet told us.
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+pub(crate) fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{volume_dir_name, volume_display_name};

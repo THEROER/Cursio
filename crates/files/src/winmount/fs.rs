@@ -17,11 +17,6 @@ use winfsp::host::{FileSystemHost, VolumeParams};
 use super::convert::{attributes_of, dir_name_of, to_filetime, to_ntstatus};
 use crate::bridge::PeerLink;
 
-/// How long the volume list is trusted before being fetched again. Drives do
-/// not come and go the way file contents do, and this is consulted on every
-/// path resolution.
-const VOLUMES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Sector and cluster geometry reported to Windows.
 ///
 /// Windows insists on a geometry even for a filesystem that has none. 4 KiB is
@@ -90,7 +85,7 @@ pub struct RemoteFs {
     /// Writes in flight across every handle on this drive — see
     /// [`crate::writeback::InFlightBudget`] for why it is not per handle.
     write_budget: crate::writeback::InFlightBudget,
-    volumes: Mutex<(Vec<Volume>, Option<std::time::Instant>)>,
+    volumes: crate::metacache::VolumeList,
     /// What the drive calls itself in Explorer; also answered to anything
     /// asking the volume for its label.
     label: String,
@@ -121,7 +116,7 @@ impl RemoteFs {
     pub fn new(peer: PeerLink, label: impl Into<String>, bound: impl Into<String>) -> Self {
         Self {
             peer,
-            volumes: Mutex::new((Vec::new(), None)),
+            volumes: crate::metacache::VolumeList::default(),
             label: label.into(),
             bound: bound.into(),
             meta: crate::metacache::MetaCache::new(),
@@ -151,20 +146,7 @@ impl RemoteFs {
 
     /// The peer's volumes, refetched when the cached list has expired.
     fn volumes(&self) -> Result<Vec<Volume>, FileError> {
-        {
-            let guard = self.volumes.lock().expect("volume cache");
-            if let (list, Some(at)) = &*guard {
-                if at.elapsed() < VOLUMES_TTL && !list.is_empty() {
-                    return Ok(list.clone());
-                }
-            }
-        }
-        // Fetched without the lock: this is a network round trip, and holding
-        // the lock across it would serialise every other call behind it.
-        let fetched = self.peer.volumes()?;
-        *self.volumes.lock().expect("volume cache") =
-            (fetched.clone(), Some(std::time::Instant::now()));
-        Ok(fetched)
+        self.volumes.get(|| self.peer.volumes())
     }
 
     /// Resolve a Windows path against the volume this drive is bound to.
@@ -190,12 +172,8 @@ impl RemoteFs {
         if path.is_empty() {
             return Ok(synthetic_dir(volume));
         }
-        if let Some(hit) = self.meta.get(volume, path) {
-            return hit;
-        }
-        let fresh = self.peer.stat(volume, path);
-        self.meta.put(volume, path, fresh.clone());
-        fresh
+        self.meta
+            .get_or_ask(volume, path, || self.peer.stat(volume, path))
     }
 
     /// What a file looks like once a write to it has been sent, remembered so
@@ -210,7 +188,7 @@ impl RemoteFs {
                 .to_string(),
             kind: FileKind::File,
             size,
-            modified_unix: now_unix(),
+            modified_unix: crate::now_unix(),
             writable: true,
             allocated: None,
         };
@@ -1197,7 +1175,7 @@ impl FileSystemContext for RemoteFs {
             name: path.rsplit('/').next().unwrap_or(&path).to_string(),
             kind: FileKind::File,
             size,
-            modified_unix: now_unix(),
+            modified_unix: crate::now_unix(),
             writable: true,
             allocated: None,
         };
@@ -1337,13 +1315,6 @@ fn access_to_mode(access: u32) -> OpenMode {
         truncate: false,
         exclusive: false,
     }
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// A drive letter nothing is using, counting down from `Z:`.

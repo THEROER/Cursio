@@ -221,6 +221,58 @@ impl MetaCache {
         self.entries.lock().expect("meta cache").clear();
         self.listings.lock().expect("listing cache").clear();
     }
+
+    /// The answer remembered for a path, or `ask`'s, which is then
+    /// remembered — failures included, as [`Self::get`] explains.
+    pub fn get_or_ask(
+        &self,
+        volume: &str,
+        path: &str,
+        ask: impl FnOnce() -> Result<FileMeta, cursio_protocol::FileError>,
+    ) -> Result<FileMeta, cursio_protocol::FileError> {
+        if let Some(hit) = self.get(volume, path) {
+            return hit;
+        }
+        let fresh = ask();
+        self.put(volume, path, fresh.clone());
+        fresh
+    }
+}
+
+/// How long the volume list is trusted before being refetched.
+///
+/// Far longer than [`META_TTL`]: drives do not come and go the way file
+/// contents change, and this list is consulted on every path resolution.
+const VOLUMES_TTL: Duration = Duration::from_secs(30);
+
+/// The peer's volume list, fetched once and refetched when it goes stale.
+///
+/// Cached because a mount consults it to resolve every path, and the root of
+/// a mount is nothing but this list: without it every listing of the mount
+/// point is a round trip.
+#[derive(Default)]
+pub struct VolumeList {
+    fetched: Mutex<(Vec<cursio_protocol::Volume>, Option<Instant>)>,
+}
+
+impl VolumeList {
+    /// The list, from `fetch` when the one held has expired or is empty.
+    pub fn get(
+        &self,
+        fetch: impl FnOnce() -> Result<Vec<cursio_protocol::Volume>, cursio_protocol::FileError>,
+    ) -> Result<Vec<cursio_protocol::Volume>, cursio_protocol::FileError> {
+        if let (list, Some(at)) = &*self.fetched.lock().expect("volume list") {
+            if at.elapsed() < VOLUMES_TTL && !list.is_empty() {
+                return Ok(list.clone());
+            }
+        }
+        // Fetched without the lock held: this is a network round trip, and
+        // holding the lock across it would serialise every other callback
+        // behind it.
+        let fetched = fetch()?;
+        *self.fetched.lock().expect("volume list") = (fetched.clone(), Some(Instant::now()));
+        Ok(fetched)
+    }
 }
 
 #[cfg(test)]
@@ -314,5 +366,28 @@ mod tests {
             held <= MAX_ENTRIES,
             "cache grew to {held}, past its {MAX_ENTRIES} cap"
         );
+    }
+
+    /// A volume list still fresh is answered without asking the peer, and a
+    /// failed fetch is not remembered: the next question asks again.
+    #[test]
+    fn the_volume_list_is_fetched_once_while_fresh() {
+        let volumes = VolumeList::default();
+        let asked = std::cell::Cell::new(0);
+        let fetch = || {
+            asked.set(asked.get() + 1);
+            Ok(vec![cursio_protocol::Volume {
+                id: "C:".into(),
+                label: "Windows (C:)".into(),
+                writable: true,
+                total_bytes: 1,
+                free_bytes: 1,
+                removable: false,
+            }])
+        };
+        assert!(volumes.get(|| Err(FileError::NotFound)).is_err());
+        assert_eq!(volumes.get(fetch).unwrap().len(), 1);
+        assert_eq!(volumes.get(fetch).unwrap()[0].id, "C:");
+        assert_eq!(asked.get(), 1);
     }
 }
