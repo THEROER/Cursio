@@ -127,11 +127,10 @@ fn apply(_stream: &TcpStream) -> io::Result<&'static str> {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::*;
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn a_connection_drops_unacknowledged_data_after_the_user_timeout() {
         use std::os::fd::AsRawFd;

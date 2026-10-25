@@ -471,8 +471,10 @@ mod tests {
         assert_eq!(&block[..4], &20u32.to_le_bytes());
         assert_eq!(&block[16..20], &1u32.to_le_bytes());
         let units: Vec<u16> = block[20..]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         let mut expected: Vec<u16> = "C:\\a.jpg".encode_utf16().collect();
         expected.extend([0, 0]);
