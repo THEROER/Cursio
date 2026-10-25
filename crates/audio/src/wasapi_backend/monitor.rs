@@ -13,56 +13,27 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
-/// Watches this machine's render endpoints' volume/mute and applies sets — the
-/// Windows half of device-state replication (see docs/audio-design.md, "Device
-/// state is REPLICATED"). Mirrors the PipeWire `PwDeviceMonitor` API.
+/// Start watching this machine's render endpoints' volume/mute, reporting
+/// changes on `changes` and applying what arrives on `commands` — the Windows
+/// half of device-state replication (see docs/audio-design.md, "Device state
+/// is REPLICATED"). Fails only if the monitor thread can't be spawned;
+/// per-device COM errors are logged and skipped, not fatal.
 ///
 /// Unlike the PipeWire backend (event-driven on the graph), this **polls** each
 /// endpoint's [`IAudioEndpointVolume`] on a short interval and emits a change
 /// when the scalar volume or mute flag moves. Polling avoids the COM
 /// apartment/lifetime pitfalls of `RegisterControlChangeNotify` callbacks, and a
 /// volume knob changes far slower than the poll, so nothing perceptible is lost.
-pub struct WasapiDeviceMonitor {
-    // First, so it is stopped and joined while `commands` is still open.
-    _worker: Worker,
-    changes_rx: tokio::sync::mpsc::UnboundedReceiver<DeviceChange>,
-    commands: std_mpsc::Sender<DeviceCommand>,
-}
-
-impl WasapiDeviceMonitor {
-    /// Start the monitor. Fails only if the monitor thread can't be spawned;
-    /// per-device COM errors are logged and skipped, not fatal.
-    pub fn start() -> Result<Self, AudioError> {
-        let (changes_tx, changes_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = std_mpsc::channel::<DeviceCommand>();
-        let worker = Worker::spawn(
-            "cursio-wasapi-device-monitor".to_string(),
-            "device-monitor thread",
-            OnDrop::Join,
-            move |stop_rx| run_device_monitor_loop(changes_tx, cmd_rx, stop_rx),
-        )?;
-        Ok(WasapiDeviceMonitor {
-            _worker: worker,
-            changes_rx,
-            commands: cmd_tx,
-        })
-    }
-
-    pub fn changes(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<DeviceChange> {
-        &mut self.changes_rx
-    }
-
-    pub fn set_volume(&self, node_name: String, volume: f32) {
-        let _ = self
-            .commands
-            .send(DeviceCommand::SetVolume { node_name, volume });
-    }
-
-    pub fn set_mute(&self, node_name: String, mute: bool) {
-        let _ = self
-            .commands
-            .send(DeviceCommand::SetMute { node_name, mute });
-    }
+pub(crate) fn spawn_device_monitor(
+    changes: tokio::sync::mpsc::UnboundedSender<DeviceChange>,
+    commands: std_mpsc::Receiver<DeviceCommand>,
+) -> Result<Worker, AudioError> {
+    Worker::spawn(
+        "cursio-wasapi-device-monitor".to_string(),
+        "device-monitor thread",
+        OnDrop::Join,
+        move |stop_rx| run_device_monitor_loop(changes, commands, stop_rx),
+    )
 }
 
 /// How often the monitor polls each endpoint's volume/mute. A knob turn changes

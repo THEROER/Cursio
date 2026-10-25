@@ -14,58 +14,25 @@ use pipewire::{
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
-/// Watches every local audio **device** (sinks and sources), reports volume/mute
-/// changes, and applies volume/mute sets — the backend half of device-state
-/// replication (see docs/audio-design.md, "Device state is REPLICATED").
+/// Start watching every local audio **device** (sinks and sources): report
+/// volume/mute changes on `changes` and apply what arrives on `commands` — the
+/// backend half of device-state replication (see docs/audio-design.md, "Device
+/// state is REPLICATED"). Fails only if the PipeWire connection can't be made.
 ///
 /// It runs one persistent PipeWire loop (its own thread, like the other
 /// backends): it binds each device node as a proxy, subscribes to its `Props`
 /// param, and translates PipeWire's cubic `channelVolumes` to/from the linear
-/// `0..1` the protocol carries. The owner uses [`changes`](Self::changes) to
-/// learn when to broadcast, and [`set_volume`]/[`set_mute`] to apply a request.
-pub struct PwDeviceMonitor {
-    // First, so it is stopped and joined while `commands` is still open.
-    _worker: Worker,
-    changes_rx: tokio::sync::mpsc::UnboundedReceiver<DeviceChange>,
-    commands: std_mpsc::Sender<DeviceCommand>,
-}
-
-impl PwDeviceMonitor {
-    /// Start the monitor. Fails only if the PipeWire connection can't be made.
-    pub fn start() -> Result<Self, AudioError> {
-        let (changes_tx, changes_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = std_mpsc::channel::<DeviceCommand>();
-        let worker = Worker::start(
-            "cursio-pw-device-monitor".to_string(),
-            "device-monitor thread",
-            OnDrop::Join,
-            move |stop_rx, ready_tx| run_device_monitor_loop(changes_tx, cmd_rx, stop_rx, ready_tx),
-        )?;
-        Ok(PwDeviceMonitor {
-            _worker: worker,
-            changes_rx,
-            commands: cmd_tx,
-        })
-    }
-
-    /// Observed device volume/mute changes.
-    pub fn changes(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<DeviceChange> {
-        &mut self.changes_rx
-    }
-
-    /// Apply a master volume (linear `0.0`..=`1.0`) to the named device.
-    pub fn set_volume(&self, node_name: String, volume: f32) {
-        let _ = self
-            .commands
-            .send(DeviceCommand::SetVolume { node_name, volume });
-    }
-
-    /// Apply a mute flag to the named device.
-    pub fn set_mute(&self, node_name: String, mute: bool) {
-        let _ = self
-            .commands
-            .send(DeviceCommand::SetMute { node_name, mute });
-    }
+/// `0..1` the protocol carries.
+pub(crate) fn spawn_device_monitor(
+    changes: tokio::sync::mpsc::UnboundedSender<DeviceChange>,
+    commands: std_mpsc::Receiver<DeviceCommand>,
+) -> Result<Worker, AudioError> {
+    Worker::start(
+        "cursio-pw-device-monitor".to_string(),
+        "device-monitor thread",
+        OnDrop::Join,
+        move |stop_rx, ready_tx| run_device_monitor_loop(changes, commands, stop_rx, ready_tx),
+    )
 }
 
 /// PipeWire stores per-channel volume on a **cubic** curve: the value a UI shows

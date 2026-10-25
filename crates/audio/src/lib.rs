@@ -739,29 +739,29 @@ pub(crate) enum DeviceCommand {
 /// [`IAudioEndpointVolume`] on Windows; other platforms report
 /// [`AudioError::Unsupported`].
 pub struct DeviceMonitor {
-    #[cfg(target_os = "linux")]
-    inner: pipewire_backend::PwDeviceMonitor,
-    #[cfg(target_os = "windows")]
-    inner: wasapi_backend::WasapiDeviceMonitor,
-    // Never constructed on other platforms (`start` errors); the empty receiver
-    // only exists so `changes()` compiles uniformly.
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    _changes_rx: tokio::sync::mpsc::UnboundedReceiver<DeviceChange>,
+    // First, so it is stopped and joined while `commands` is still open.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    _worker: worker::Worker,
+    changes_rx: tokio::sync::mpsc::UnboundedReceiver<DeviceChange>,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    commands: std::sync::mpsc::Sender<DeviceCommand>,
 }
 
 impl DeviceMonitor {
     /// Start monitoring local devices.
     pub fn start() -> Result<Self, AudioError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
+            let (changes_tx, changes_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (commands, commands_rx) = std::sync::mpsc::channel();
+            #[cfg(target_os = "linux")]
+            let worker = pipewire_backend::spawn_device_monitor(changes_tx, commands_rx)?;
+            #[cfg(target_os = "windows")]
+            let worker = wasapi_backend::spawn_device_monitor(changes_tx, commands_rx)?;
             Ok(DeviceMonitor {
-                inner: pipewire_backend::PwDeviceMonitor::start()?,
-            })
-        }
-        #[cfg(target_os = "windows")]
-        {
-            Ok(DeviceMonitor {
-                inner: wasapi_backend::WasapiDeviceMonitor::start()?,
+                _worker: worker,
+                changes_rx,
+                commands,
             })
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -772,27 +772,24 @@ impl DeviceMonitor {
 
     /// Observed device volume/mute changes.
     pub fn changes(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<DeviceChange> {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        {
-            self.inner.changes()
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        {
-            &mut self._changes_rx
-        }
+        &mut self.changes_rx
     }
 
     /// Apply a master volume (linear `0.0`..=`1.0`) to the named device.
     #[allow(unused_variables)]
     pub fn set_volume(&self, node_name: String, volume: f32) {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
-        self.inner.set_volume(node_name, volume);
+        let _ = self
+            .commands
+            .send(DeviceCommand::SetVolume { node_name, volume });
     }
 
     /// Apply a mute flag to the named device.
     #[allow(unused_variables)]
     pub fn set_mute(&self, node_name: String, mute: bool) {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
-        self.inner.set_mute(node_name, mute);
+        let _ = self
+            .commands
+            .send(DeviceCommand::SetMute { node_name, mute });
     }
 }

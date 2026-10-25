@@ -31,7 +31,7 @@ mod listing;
 mod playback;
 
 pub use capture::{CaptureMode, PwSource};
-pub use devices::PwDeviceMonitor;
+pub(crate) use devices::spawn_device_monitor;
 pub use intent_sink::{IntentSinkEvent, PwIntentSink};
 pub use listing::{list_app_streams, list_input_devices, list_output_devices};
 pub use playback::PwSink;

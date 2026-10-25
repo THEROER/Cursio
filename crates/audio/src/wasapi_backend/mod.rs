@@ -29,7 +29,7 @@ mod sessions;
 pub use capture::WasapiSource;
 pub use devices::{list_input_devices, list_output_devices};
 pub(crate) use format::wire_format;
-pub use monitor::WasapiDeviceMonitor;
+pub(crate) use monitor::spawn_device_monitor;
 pub use render::WasapiSink;
 pub use sessions::{app_volume, list_app_streams, set_app_volume};
 
