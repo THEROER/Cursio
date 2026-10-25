@@ -26,7 +26,8 @@ use windows::Win32::Media::Audio::{
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
     IAudioRenderClient, IAudioSessionControl, IAudioSessionControl2, IAudioSessionManager2,
     IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    DEVICE_STATE_ACTIVE, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, StructuredStorage::PropVariantToStringAlloc,
@@ -427,7 +428,17 @@ const CHANNELS: u16 = 2;
 /// The mirror image of [`to_wire_format`]: extra channels are filled by
 /// repeating the stereo pair (so a multi-channel endpoint isn't left with
 /// garbage in the other channels), and the rate is nearest-neighbour resampled.
+#[cfg(test)]
 fn from_wire_format(src: &[u8], dst_channels: u16, dst_rate: u32) -> Vec<u8> {
+    from_wire_format_stream(src, dst_channels, dst_rate, &mut 0)
+}
+
+fn from_wire_format_stream(
+    src: &[u8],
+    dst_channels: u16,
+    dst_rate: u32,
+    phase: &mut u64,
+) -> Vec<u8> {
     if dst_channels == CHANNELS && dst_rate == SAMPLE_RATE {
         return src.to_vec();
     }
@@ -446,19 +457,10 @@ fn from_wire_format(src: &[u8], dst_channels: u16, dst_rate: u32) -> Vec<u8> {
         return Vec::new();
     }
 
-    let dst_frames = if dst_rate == SAMPLE_RATE {
-        src_frames
-    } else {
-        ((src_frames as u64 * dst_rate as u64) / SAMPLE_RATE as u64) as usize
-    };
-
+    let (dst_frames, first) = crate::sample_clock::layout(src_frames, SAMPLE_RATE, dst_rate, phase);
     let mut out = Vec::with_capacity(dst_frames * dst_channels as usize * 4);
     for i in 0..dst_frames {
-        let src_i = if dst_rate == SAMPLE_RATE {
-            i
-        } else {
-            (i as u64 * SAMPLE_RATE as u64 / dst_rate.max(1) as u64) as usize
-        };
+        let src_i = ((first + i as u64 * SAMPLE_RATE as u64) / dst_rate.max(1) as u64) as usize;
         let base = src_i.min(src_frames - 1) * CHANNELS as usize;
         let (left, right) = (samples[base], samples[base + 1]);
 
@@ -495,7 +497,12 @@ fn from_wire_format(src: &[u8], dst_channels: u16, dst_rate: u32) -> Vec<u8> {
 /// Sample *kind* is not converted: WASAPI shared mode mixes to float, so the
 /// mix format is f32 in practice. A non-float device is left alone rather than
 /// silently mangled — better a wrong-sounding stream than a wrong-looking one.
+#[cfg(test)]
 fn to_wire_format(src: &[u8], src_channels: u16, src_rate: u32) -> Vec<u8> {
+    to_wire_format_stream(src, src_channels, src_rate, &mut 0)
+}
+
+fn to_wire_format_stream(src: &[u8], src_channels: u16, src_rate: u32, phase: &mut u64) -> Vec<u8> {
     // Already what we want: hand the bytes straight through.
     if src_channels == CHANNELS && src_rate == SAMPLE_RATE {
         return src.to_vec();
@@ -516,19 +523,10 @@ fn to_wire_format(src: &[u8], src_channels: u16, src_rate: u32) -> Vec<u8> {
     }
 
     // Resample by frame index so the output lasts the right amount of time.
-    let dst_frames = if src_rate == SAMPLE_RATE {
-        src_frames
-    } else {
-        ((src_frames as u64 * SAMPLE_RATE as u64) / src_rate.max(1) as u64) as usize
-    };
-
+    let (dst_frames, first) = crate::sample_clock::layout(src_frames, src_rate, SAMPLE_RATE, phase);
     let mut out = Vec::with_capacity(dst_frames * CHANNELS as usize * 4);
     for i in 0..dst_frames {
-        let src_i = if src_rate == SAMPLE_RATE {
-            i
-        } else {
-            (i as u64 * src_rate as u64 / SAMPLE_RATE as u64) as usize
-        };
+        let src_i = ((first + i as u64 * src_rate.max(1) as u64) / SAMPLE_RATE as u64) as usize;
         let base = src_i.min(src_frames - 1) * src_channels as usize;
 
         // Take the first two channels; duplicate when the source is mono.
@@ -874,6 +872,7 @@ fn run_capture_loop(
 
         let mut seq = 0u32;
         let mut ts = 0u64;
+        let mut capture_phase = 0u64;
         // Set when the device fails; ends the outer loop too.
         let mut return_err: Option<String> = None;
 
@@ -919,16 +918,29 @@ fn run_capture_loop(
                     break;
                 }
 
-                if num_frames > 0 && !p_data.is_null() {
-                    let byte_len = num_frames as usize * frame_bytes;
-                    // SAFETY: WASAPI guarantees p_data points to num_frames *
-                    // frame_bytes valid bytes until ReleaseBuffer.
-                    let src = std::slice::from_raw_parts(p_data, byte_len);
-                    // Convert to the format we advertised. The device's mix
-                    // format is whatever Windows chose (16 channels on a
-                    // VB-CABLE endpoint, 44.1 kHz on plenty of hardware); the
-                    // peer decodes strictly as 48k stereo f32.
-                    let data = to_wire_format(src, mix.nChannels, mix.nSamplesPerSec);
+                let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+                if num_frames > 0 && (silent || !p_data.is_null()) {
+                    let data = if silent {
+                        let (frames, _) = crate::sample_clock::layout(
+                            num_frames as usize,
+                            mix.nSamplesPerSec,
+                            SAMPLE_RATE,
+                            &mut capture_phase,
+                        );
+                        vec![0; frames * CHANNELS as usize * 4]
+                    } else {
+                        let byte_len = num_frames as usize * frame_bytes;
+                        // SAFETY: a non-silent packet holds num_frames complete frames
+                        // until ReleaseBuffer. Silent packets must not read p_data.
+                        let src = std::slice::from_raw_parts(p_data, byte_len);
+                        to_wire_format_stream(
+                            src,
+                            mix.nChannels,
+                            mix.nSamplesPerSec,
+                            &mut capture_phase,
+                        )
+                    };
+                    let wire_frames = data.len() / (CHANNELS as usize * 4);
                     let _ = chunks_tx.send(AudioChunk {
                         id,
                         seq,
@@ -936,7 +948,7 @@ fn run_capture_loop(
                         data,
                     });
                     seq = seq.wrapping_add(1);
-                    ts = ts.wrapping_add(num_frames as u64);
+                    ts = ts.wrapping_add(wire_frames as u64);
                 }
 
                 let _ = capture.ReleaseBuffer(num_frames);
@@ -955,11 +967,10 @@ fn run_capture_loop(
 // Playback (render / sink) side
 // ---------------------------------------------------------------------------
 
-/// Bytes to prefill the jitter buffer before render starts (~40ms at the common
-/// mix format). Small on purpose — see the PipeWire sink for the rationale.
-const RENDER_PREFILL_BYTES: usize = 4 * 480 * 8;
-
-/// Hard ceiling on the render jitter buffer: ~200 ms at the common mix format.
+/// Playback handoff ceiling: 200 ms at the wire format. The render queue's
+/// ceiling is calculated separately from the endpoint's rate and frame size.
+/// Keep jitter below this ceiling: resetting a 100 ms backlog to 40 ms after
+/// every burst repeatedly discards the reserve needed for the next late packet.
 ///
 /// Mirrors the PipeWire sink — an unbounded queue converts a rate mismatch into
 /// unbounded latency, because nothing ever removes the backlog. Beyond this the
@@ -984,7 +995,7 @@ const RENDER_AHEAD_MS: u32 = 40;
 /// writes silence on underrun. Symmetric to the PipeWire `PwSink`.
 pub struct WasapiSink {
     id: AudioStreamId,
-    feed: std_mpsc::Sender<Vec<u8>>,
+    feed: crate::playback_feed::Sender,
     /// Logical gain (linear, 1.0 = unity) applied to inbound audio, published to
     /// the render thread via an atomic (f32 bits) so `set_gain` never blocks it.
     /// The per-stream gain of the "one system" model — above the OS mixer,
@@ -1020,7 +1031,7 @@ impl WasapiSink {
         device_name: Option<String>,
         display_name: String,
     ) -> Result<Self, AudioError> {
-        let (feed_tx, feed_rx) = std_mpsc::channel::<Vec<u8>>();
+        let (feed_tx, feed_rx) = crate::playback_feed::channel(RENDER_MAX_BYTES);
         let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
 
@@ -1058,9 +1069,7 @@ impl WasapiSink {
 
     /// Enqueue one inbound chunk for playback.
     pub fn play(&self, chunk: &AudioChunk) -> Result<(), AudioError> {
-        self.feed
-            .send(chunk.data.clone())
-            .map_err(|_| AudioError::Backend("render thread gone".into()))
+        self.feed.send(chunk)
     }
 
     /// Set the logical gain (linear, 1.0 = unity) applied to this node's audio.
@@ -1425,12 +1434,14 @@ fn fill_inaudible(dst: &mut [u8], mix: &WAVEFORMATEX, phase: &mut bool) {
 fn run_render_loop(
     device_name: Option<String>,
     display_name: String,
-    feed_rx: std_mpsc::Receiver<Vec<u8>>,
+    feed_rx: crate::playback_feed::Receiver,
     stop_rx: std_mpsc::Receiver<()>,
     ready_tx: std_mpsc::Sender<Result<(), String>>,
     gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     use std::collections::VecDeque;
+
+    let _span = tracing::debug_span!("wasapi_render", stream = %display_name).entered();
 
     let _com = match ComGuard::new() {
         Ok(g) => g,
@@ -1491,6 +1502,18 @@ fn run_render_loop(
         }
 
         let frame_bytes = mix.nBlockAlign as usize;
+        let rate = mix.nSamplesPerSec;
+        let max_jitter_bytes = rate as usize / 5 * frame_bytes;
+        let mut render_phase = 0u64;
+        let channel_count = mix.nChannels;
+        tracing::info!(
+            rate,
+            channels = channel_count,
+            frame_bytes,
+            buffer_frames,
+            ahead_ms = RENDER_AHEAD_MS,
+            "WASAPI render initialized"
+        );
 
         if let Err(e) = client.Start() {
             let _ = ready_tx.send(Err(format!("client start: {e}")));
@@ -1500,6 +1523,10 @@ fn run_render_loop(
 
         let mut jitter: VecDeque<u8> = VecDeque::new();
         let mut started = false;
+        let mut delay =
+            crate::jitter::Delay::new(rate as usize, rate as usize * 40 / 1000, rate as usize / 5);
+        let mut recovery = crate::jitter::Recovery::default();
+        let mut accelerated_bytes = 0usize;
         // Sign of the next keep-alive frame; see `fill_inaudible`.
         let mut keepalive_phase = false;
         // The ramps assume f32 samples, as the rest of the render path does; on
@@ -1513,8 +1540,51 @@ fn run_render_loop(
         let mut declick = crate::declick::Declick::new(fade);
         let mut stopping = false;
         let mut stop_deadline = std::time::Instant::now();
+        let mut report_at = std::time::Instant::now();
+        let mut last_loop = report_at;
+        let mut last_feed = None;
+        let mut max_loop_gap = Duration::ZERO;
+        let mut max_feed_age = Duration::ZERO;
+        let mut max_feed_gap = Duration::ZERO;
+        let mut packets = 0u64;
+        let mut underruns = 0u64;
+        let mut dropped_bytes = 0usize;
+        let mut api_errors = 0u64;
+        let mut audio_frames = 0u64;
+        let mut keepalive_frames = 0u64;
 
         loop {
+            let now = std::time::Instant::now();
+            max_loop_gap = max_loop_gap.max(now.duration_since(last_loop));
+            last_loop = now;
+            if now.duration_since(report_at) >= Duration::from_secs(10) {
+                tracing::debug!(
+                    packets,
+                    underruns,
+                    dropped_bytes,
+                    api_errors,
+                    accelerated_bytes,
+                    target_ms = delay.frames() * 1000 / rate as usize,
+                    audio_frames,
+                    keepalive_frames,
+                    max_loop_gap_ms = max_loop_gap.as_secs_f64() * 1000.0,
+                    max_feed_age_ms = max_feed_age.as_secs_f64() * 1000.0,
+                    max_feed_gap_ms = max_feed_gap.as_secs_f64() * 1000.0,
+                    queued_ms = jitter.len() as f64 * 1000.0 / (frame_bytes as f64 * rate as f64),
+                    "WASAPI render health"
+                );
+                report_at = now;
+                max_loop_gap = Duration::ZERO;
+                max_feed_age = Duration::ZERO;
+                max_feed_gap = Duration::ZERO;
+                packets = 0;
+                underruns = 0;
+                dropped_bytes = 0;
+                api_errors = 0;
+                accelerated_bytes = 0;
+                audio_frames = 0;
+                keepalive_frames = 0;
+            }
             if !stopping && stop_rx.try_recv().is_ok() {
                 // `Stop` halts the device mid-buffer, so a stream closed while
                 // audio is still queued ends on a click. Write a fade-out, let
@@ -1532,12 +1602,25 @@ fn run_render_loop(
                 }
             }
 
+            feed_rx.report(&display_name);
             // Pull any newly arrived chunks into the jitter buffer, converting
             // from the wire format to whatever this device actually wants.
             // Inbound chunks are always 48k stereo f32; the endpoint may be
             // 16-channel or 44.1 kHz, and feeding wire bytes straight into it
             // misaligns every frame (heard as noise).
-            while let Ok(mut bytes) = feed_rx.try_recv() {
+            while let Ok(packet) = feed_rx.try_recv() {
+                let (mut bytes, arrived) = (packet.data, packet.arrived);
+                delay.arrival(
+                    arrived,
+                    bytes.len() / 8 * rate as usize / 48000,
+                    Some(packet.timestamp),
+                );
+                max_feed_age = max_feed_age.max(arrived.elapsed());
+                if let Some(previous) = last_feed {
+                    max_feed_gap = max_feed_gap.max(arrived.duration_since(previous));
+                }
+                last_feed = Some(arrived);
+                packets += 1;
                 // Apply the logical gain to the wire-format f32 samples before
                 // converting to the device format, so gain is independent of the
                 // endpoint's mix format. Read the atomic once per chunk (knob
@@ -1548,18 +1631,24 @@ fn run_render_loop(
                         *s = (f32::from_le_bytes(*s) * g).to_le_bytes();
                     }
                 }
-                jitter.extend(from_wire_format(&bytes, mix.nChannels, mix.nSamplesPerSec));
+                jitter.extend(from_wire_format_stream(
+                    &bytes,
+                    mix.nChannels,
+                    mix.nSamplesPerSec,
+                    &mut render_phase,
+                ));
             }
             // Bound the backlog by discarding the oldest audio — see
             // RENDER_MAX_BYTES. Trim whole frames so the stream stays aligned
             // and channels don't swap.
-            if jitter.len() > RENDER_MAX_BYTES {
+            if jitter.len() > max_jitter_bytes {
                 let frame = (mix.nChannels as usize) * (mix.wBitsPerSample as usize / 8);
-                let mut excess = jitter.len() - RENDER_MAX_BYTES;
+                let mut excess = jitter.len() - max_jitter_bytes;
                 if frame > 0 {
                     excess -= excess % frame;
                 }
                 if excess > 0 {
+                    dropped_bytes += excess;
                     crate::declick::skip_crossfaded(&mut jitter, excess, channels, fade);
                     tracing::debug!(
                         dropped_bytes = excess,
@@ -1567,22 +1656,22 @@ fn run_render_loop(
                     );
                 }
             }
-            if started {
-                crate::declick::settle_backlog(
-                    &mut jitter,
-                    frame_bytes,
-                    mix.nSamplesPerSec as usize,
-                    channels,
-                    fade,
-                    0,
-                );
-            }
-            if !started && jitter.len() >= RENDER_PREFILL_BYTES {
+            if !started && jitter.len() >= delay.frames() * frame_bytes {
                 started = true;
             }
 
             // Top the device up to RENDER_AHEAD_MS, not to its whole buffer.
-            let padding = client.GetCurrentPadding().unwrap_or(0);
+            let padding = match client.GetCurrentPadding() {
+                Ok(padding) => padding,
+                Err(error) => {
+                    api_errors += 1;
+                    if api_errors == 1 {
+                        tracing::warn!(%error, "WASAPI GetCurrentPadding failed");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+            };
             let ahead = (mix.nSamplesPerSec * RENDER_AHEAD_MS / 1000).min(buffer_frames);
             let mut free_frames = ahead.saturating_sub(padding);
             if stopping {
@@ -1595,10 +1684,33 @@ fn run_render_loop(
                 };
             }
             if free_frames > 0 {
-                if let Ok(p_data) = render.GetBuffer(free_frames) {
+                let buffer = render.GetBuffer(free_frames);
+                if let Err(error) = &buffer {
+                    api_errors += 1;
+                    if api_errors == 1 {
+                        tracing::warn!(%error, free_frames, padding, "WASAPI GetBuffer failed");
+                    }
+                }
+                if let Ok(p_data) = buffer {
                     if !p_data.is_null() {
+                        if started && !stopping {
+                            accelerated_bytes += recovery.process(
+                                &mut jitter,
+                                channels,
+                                &delay,
+                                free_frames as usize,
+                                free_frames as usize,
+                                now,
+                            );
+                        }
+
                         let want = free_frames as usize * frame_bytes;
                         let take = if started { want.min(jitter.len()) } else { 0 };
+                        audio_frames += (take / frame_bytes) as u64;
+                        keepalive_frames += ((want - take) / frame_bytes) as u64;
+                        if started && take < want && !stopping {
+                            underruns += 1;
+                        }
                         // SAFETY: WASAPI guarantees `p_data` addresses
                         // free_frames * frame_bytes writable bytes until
                         // ReleaseBuffer.
@@ -1632,7 +1744,12 @@ fn run_render_loop(
                         // content is silence, and it treats the session as idle no
                         // matter what the bytes hold. So it is never set here.
                         fill_inaudible(&mut dst[take..], &mix, &mut keepalive_phase);
-                        let _ = render.ReleaseBuffer(free_frames, 0);
+                        if let Err(error) = render.ReleaseBuffer(free_frames, 0) {
+                            api_errors += 1;
+                            if api_errors == 1 {
+                                tracing::warn!(%error, "WASAPI ReleaseBuffer failed");
+                            }
+                        }
                         if started && jitter.is_empty() {
                             started = false; // re-arm prefill after a drain
                         }

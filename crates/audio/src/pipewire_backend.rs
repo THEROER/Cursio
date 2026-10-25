@@ -13,7 +13,7 @@
 //! buffer. Per-app nodes (advertising each PipeWire stream by `application.name`)
 //! and Opus come in later milestones; the trait shape already accommodates them.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1737,15 +1737,6 @@ const JITTER_PREFILL_BYTES: usize = 4 * 256 * BYTES_PER_FRAME;
 /// trade the kernel-side ring makes (see CursioRing.h).
 const JITTER_MAX_BYTES: usize = 48_000 / 5 * BYTES_PER_FRAME;
 
-/// Whether `feed` already holds a full jitter buffer's worth of undrained audio,
-/// so the next chunk should be dropped rather than enqueued.
-///
-/// Split out of [`PwSink::play`] only so it is reachable from tests without a
-/// live PipeWire daemon — `play` calls exactly this.
-fn queue_is_full(queued: &AtomicUsize) -> bool {
-    queued.load(Ordering::Relaxed) > JITTER_MAX_BYTES
-}
-
 /// How many frames of a playback buffer holding `capacity` to fill: what the
 /// graph asked for this cycle, or the whole buffer when it named no amount.
 ///
@@ -1769,25 +1760,13 @@ fn frames_to_write(requested: u64, capacity: usize) -> usize {
 pub struct PwSink {
     id: AudioStreamId,
     /// Samples to play, pushed from the async side, drained on the PW thread.
-    feed: std_mpsc::Sender<Vec<u8>>,
+    feed: crate::playback_feed::Sender,
     /// Logical gain (linear, 1.0 = unity) applied to every sample as the PW
     /// thread fills the output buffer. Stored as the bit pattern of an `f32` in
     /// an atomic so the async side can update it (`set_gain`) without a lock —
     /// the process callback is real-time and must never block. See
     /// [`Message::AudioGain`](cursio_protocol::Message::AudioGain).
     gain: Arc<AtomicU32>,
-    /// Bytes currently sitting in `feed` and not yet moved into the jitter
-    /// buffer. Incremented by [`play`](PwSink::play), decremented on the PW
-    /// thread as chunks are drained.
-    ///
-    /// This exists because [`JITTER_MAX_BYTES`] can only be enforced *inside*
-    /// the process callback, and a node PipeWire never drives never runs that
-    /// callback. A virtual `Audio/Source` with no application recording from it
-    /// is exactly that case: the peer keeps sending microphone audio, `play`
-    /// keeps accepting it, and nothing ever trims — 48 kHz stereo f32 accrues
-    /// ~1.4 GB/hour per silent-but-fed stream and never comes back. Counting
-    /// here bounds the queue whether or not the graph is draining it.
-    queued: Arc<AtomicUsize>,
     /// Whether anything is actually consuming this node right now.
     ///
     /// PipeWire drives a stream only while something is linked to it, which it
@@ -1843,7 +1822,7 @@ impl PwSink {
         as_source: bool,
         target: Option<String>,
     ) -> Result<Self, AudioError> {
-        let (feed_tx, feed_rx) = std_mpsc::channel::<Vec<u8>>();
+        let (feed_tx, feed_rx) = crate::playback_feed::channel(JITTER_MAX_BYTES);
         let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), String>>();
 
@@ -1851,8 +1830,6 @@ impl PwSink {
         // `set_gain` takes effect on the next output buffer without a lock.
         let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let gain_thread = Arc::clone(&gain);
-        let queued = Arc::new(AtomicUsize::new(0));
-        let queued_thread = Arc::clone(&queued);
         let listening = Arc::new(AtomicBool::new(false));
         let listening_thread = Arc::clone(&listening);
 
@@ -1867,7 +1844,6 @@ impl PwSink {
                     stop_rx,
                     ready_tx,
                     gain_thread,
-                    queued_thread,
                     listening_thread,
                 )
             })
@@ -1878,7 +1854,6 @@ impl PwSink {
                 id,
                 feed: feed_tx,
                 gain,
-                queued,
                 listening,
                 stop: Some(stop_tx),
                 thread: Some(thread),
@@ -1890,25 +1865,9 @@ impl PwSink {
         }
     }
 
-    /// Enqueue one inbound chunk for playback (into the jitter buffer).
-    ///
-    /// Drops the chunk instead of enqueuing it once more than
-    /// [`JITTER_MAX_BYTES`] is already waiting. The process callback applies the
-    /// same ceiling to audio it has taken delivery of, but it only runs while
-    /// the graph drives this node; the check here is what holds when it does
-    /// not (see [`PwSink::queued`]). Dropping the newest chunk rather than the
-    /// oldest is deliberate: the backlog ahead of it is what plays next, and a
-    /// caller with nowhere to put audio should not be able to grow this queue.
+    /// Enqueue audio without blocking the async or PipeWire threads.
     pub fn play(&self, chunk: &AudioChunk) -> Result<(), AudioError> {
-        if queue_is_full(&self.queued) {
-            return Ok(());
-        }
-        let len = chunk.data.len();
-        self.feed
-            .send(chunk.data.clone())
-            .map_err(|_| AudioError::Backend("playback thread gone".into()))?;
-        self.queued.fetch_add(len, Ordering::Relaxed);
-        Ok(())
+        self.feed.send(chunk)
     }
 
     /// Set the logical gain (linear, 1.0 = unity) applied to this node's audio.
@@ -1956,15 +1915,11 @@ fn run_playback_loop(
     as_source: bool,
     // The output to be linked to, by node name; the default output when unset.
     target: Option<String>,
-    feed_rx: std_mpsc::Receiver<Vec<u8>>,
+    feed_rx: crate::playback_feed::Receiver,
     stop_rx: std_mpsc::Receiver<()>,
     ready_tx: std_mpsc::Sender<Result<(), String>>,
     // Logical gain (f32 bits), updated from the async side by `set_gain`.
     gain: Arc<AtomicU32>,
-    // Bytes queued in `feed_rx` but not yet pulled into the jitter buffer; see
-    // `PwSink::queued`. Decremented here as chunks are taken delivery of.
-    queued: Arc<AtomicUsize>,
-    // Set while something is linked to this node; see `PwSink::listening`.
     listening: Arc<AtomicBool>,
 ) {
     use std::cell::RefCell;
@@ -2057,11 +2012,6 @@ fn run_playback_loop(
         })
         .process(move |stream, ()| {
             let mut playout = playout.borrow_mut();
-            let mut trimmed = 0;
-            while let Ok(bytes) = feed_rx.try_recv() {
-                queued.fetch_sub(bytes.len(), Ordering::Relaxed);
-                trimmed += playout.push(&bytes);
-            }
 
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
@@ -2074,6 +2024,13 @@ fn run_playback_loop(
             let Some(slice) = data.data() else { return };
 
             let want_bytes = frames_to_write(requested, slice.len() / stride) * stride;
+            feed_rx.set_cycle(want_bytes);
+            let mut trimmed = 0;
+            feed_rx.report(&node_label);
+            while let Ok(packet) = feed_rx.try_recv() {
+                trimmed += playout.push_at(&packet.data, packet.arrived, Some(packet.timestamp));
+            }
+
             // Read once per buffer: the gain changes at knob speed, not audio
             // speed.
             let g = f32::from_bits(gain.load(Ordering::Relaxed));
@@ -2433,29 +2390,6 @@ mod tests {
     /// application recording from it is never driven, so before this check the
     /// peer's microphone audio accumulated in the feed channel for the life of
     /// the session — measured at 35 GB over ~24 h on one stream.
-    #[test]
-    fn undrained_queue_stops_accepting_audio() {
-        let queued = AtomicUsize::new(0);
-        assert!(!queue_is_full(&queued), "an empty queue accepts audio");
-
-        // Simulate `play` filling the channel while nothing drains it.
-        queued.store(JITTER_MAX_BYTES, Ordering::Relaxed);
-        assert!(
-            !queue_is_full(&queued),
-            "a queue exactly at the ceiling still accepts"
-        );
-
-        queued.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            queue_is_full(&queued),
-            "past the ceiling the sink must drop, not grow without bound"
-        );
-
-        // Once the callback drains, the sink takes audio again.
-        queued.store(0, Ordering::Relaxed);
-        assert!(!queue_is_full(&queued), "draining re-opens the queue");
-    }
-
     /// The ceiling must be a live-audio buffer, not an unbounded backlog.
     #[test]
     fn jitter_ceiling_is_bounded_and_small() {

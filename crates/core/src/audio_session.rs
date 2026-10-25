@@ -420,6 +420,11 @@ pub struct AudioEngine {
     /// sent an ack for it — so acks stay sparse (a few per second), not one per
     /// chunk. See [`AudioEngine::pump`].
     recv_seq: HashMap<u32, u32>,
+    recv_timing: HashMap<u32, (std::time::Instant, u64)>,
+    max_arrival_gap: std::time::Duration,
+    max_arrival_lateness: std::time::Duration,
+    max_decode_time: std::time::Duration,
+    capture_seq_skipped: u64,
     last_ack_sent: HashMap<u32, std::time::Instant>,
     /// The peer, for sound made here to reach it ([`crate::audio_relay`]).
     /// `None` only in tests that build an engine without a link.
@@ -583,6 +588,11 @@ impl AudioEngine {
             stream_bitrate: HashMap::new(),
             last_adapt: HashMap::new(),
             recv_seq: HashMap::new(),
+            recv_timing: HashMap::new(),
+            max_arrival_gap: std::time::Duration::ZERO,
+            max_arrival_lateness: std::time::Duration::ZERO,
+            max_decode_time: std::time::Duration::ZERO,
+            capture_seq_skipped: 0,
             last_ack_sent: HashMap::new(),
             peer: None,
             _relay_mark: None,
@@ -928,6 +938,9 @@ impl SessionModule for AudioEngine {
                         }
                     }
                 };
+                let first_timestamp = chunk
+                    .timestamp
+                    .saturating_sub(encoder.buffered_frames() as u64);
                 let packets = match encoder.encode(&chunk.data) {
                     Ok(p) => p,
                     Err(err) => {
@@ -940,11 +953,14 @@ impl SessionModule for AudioEngine {
                 // Larger chunks may yield several packets; enqueue every one
                 // before the next loop iteration spends the remaining budget.
                 let pending = self.pending_packets.entry(*id).or_default();
-                pending.extend(packets.into_iter().map(|data| cursio_protocol::AudioChunk {
-                    id: *id,
-                    seq: chunk.seq,
-                    timestamp: chunk.timestamp,
-                    data,
+                pending.extend(packets.into_iter().enumerate().map(|(index, data)| {
+                    cursio_protocol::AudioChunk {
+                        id: *id,
+                        seq: chunk.seq,
+                        timestamp: first_timestamp
+                            .saturating_add((index * cursio_audio::codec::FRAME_SAMPLES) as u64),
+                        data,
+                    }
                 }));
                 // (health logging happens once per pump, above — not per stream)
             }
@@ -1083,6 +1099,7 @@ impl SessionModule for AudioEngine {
                 self.gains.remove(&id);
                 self.mixer.remove(id);
                 self.recv_seq.remove(&id);
+                self.recv_timing.remove(&id);
                 self.demand_sent.remove(&id);
                 self.unwanted_streams.remove(&id);
                 self.last_ack_sent.remove(&id);
@@ -1290,8 +1307,18 @@ impl AudioEngine {
             over_budget = self.over_budget,
             stale_dropped = self.stale_dropped,
             streams = self.playbacks.len(),
+            peer = %self.peer_name,
+            max_arrival_gap_ms = self.max_arrival_gap.as_secs_f64() * 1000.0,
+            max_arrival_lateness_ms = self.max_arrival_lateness.as_secs_f64() * 1000.0,
+            max_decode_ms = self.max_decode_time.as_secs_f64() * 1000.0,
+            capture_seq_skipped = self.capture_seq_skipped,
             "audio health"
         );
+
+        self.max_arrival_gap = std::time::Duration::ZERO;
+        self.max_arrival_lateness = std::time::Duration::ZERO;
+        self.max_decode_time = std::time::Duration::ZERO;
+        self.capture_seq_skipped = 0;
 
         // The automatic threshold is invisible otherwise, and it is the first
         // thing to look at when a peer says this mic cuts out.
@@ -2509,7 +2536,10 @@ impl AudioEngine {
                 }
             }
         };
-        match decoder.decode(data) {
+        let started = std::time::Instant::now();
+        let result = decoder.decode(data);
+        self.max_decode_time = self.max_decode_time.max(started.elapsed());
+        match result {
             Ok(p) => Some(p),
             Err(err) => {
                 tracing::warn!(error = %err, id, "opus decode failed");
@@ -2547,23 +2577,21 @@ impl AudioEngine {
         }
         self.last_chunk_at = Some(now);
 
-        // Track the newest seq we've received for this stream; `pump` turns this
-        // into a sparse AudioFrameAck (a few per second) for the sender's rate
-        // control. Chunks can arrive slightly out of order, so keep the max.
-        // A gap here means chunks were lost or delayed on the WIRE, as opposed to
-        // the receiver draining its buffer faster than they arrive. The two sound
-        // identical (audio cutting in and out) but have opposite fixes, so log the
-        // gap: matched against the sink's underruns it says which end is at fault.
-        if let Some(&prev) = self.recv_seq.get(&id) {
-            if chunk.seq > prev + 1 {
-                tracing::debug!(
-                    id,
-                    missing = chunk.seq - prev - 1,
-                    prev_seq = prev,
-                    seq = chunk.seq,
-                    "gap in the inbound chunk sequence"
-                );
-            }
+        if let Some((previous, timestamp)) = self.recv_timing.insert(id, (now, chunk.timestamp)) {
+            let gap = now.saturating_duration_since(previous);
+            let media_gap = std::time::Duration::from_secs_f64(
+                chunk.timestamp.saturating_sub(timestamp) as f64 / 48000.0,
+            );
+            self.max_arrival_gap = self.max_arrival_gap.max(gap);
+            self.max_arrival_lateness =
+                self.max_arrival_lateness.max(gap.saturating_sub(media_gap));
+        }
+        // Capture sequence gaps also include silence gating and encoder framing.
+        // They are diagnostic discontinuities, not a count of lost network packets.
+        if let Some(&previous) = self.recv_seq.get(&id) {
+            self.capture_seq_skipped = self
+                .capture_seq_skipped
+                .saturating_add(chunk.seq.saturating_sub(previous).saturating_sub(1) as u64);
         }
         self.recv_seq
             .entry(id)

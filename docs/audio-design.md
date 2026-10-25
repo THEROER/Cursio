@@ -111,26 +111,42 @@ playback clock causes crackle or growing lag.
   same — **drop/degrade rather than buffer unboundedly** — but audio keeps a
   *small* jitter buffer on purpose, unlike video which favors freshness.
 
-  Small means small in steady state, not merely bounded. Every playback
-  backend starts after a 40 ms prefill, caps the backlog at 200 ms, and once a
-  playing stream's backlog passes 100 ms skips back to 40 ms, crossfaded
-  (`declick::settle_backlog`): after a Wi-Fi stall and burst, audio arrives as
-  fast as it plays, so a backlog left alone is a delay kept for the rest of the
-  stream. WASAPI also writes only 40 ms ahead of the device rather than filling
-  its 200 ms endpoint buffer, which, kept full with keep-alive, put every
-  arriving sample 200 ms behind.
+  Playback handoff queues are bounded by bytes (200 ms plus one pull-model
+  device cycle at the wire format) and packet count (128). Admission never
+  waits; full feeds discard incoming audio. Packets older than 250 ms, or one
+  large device cycle plus 50 ms, are discarded on receipt.
+  Local arrival times travel with the decoded PCM to separate handoff delays
+  from network timing. Queue drops, stale packets, and maximum age are logged.
 
-  On the pull-model backends (PipeWire, AAudio, `playout.rs`) each of those
-  numbers sits *on top of one device cycle*: the prefill is a cycle plus
-  ~21 ms, the settle point is a cycle plus 100 ms, the ceiling never falls
-  below a cycle plus the prefill. A PipeWire playback cycle is
-  `pw_buffer.requested` frames, not the mapped buffer — a virtual microphone's
-  buffer holds 12288 frames, and filling all of it made every cycle 256 ms
-  against a 200 ms ceiling, heard as a peer microphone cutting out four times
-  a second.
-- **Clock:** the receiver resamples to its own device clock to absorb drift
-  (details are a backend concern; the protocol carries timestamps/seq to make it
-  possible).
+  WASAPI starts with a 40 ms reserve and writes only 40 ms ahead of the
+  device. PipeWire and AAudio start with their existing ~21 ms margin on top
+  of one complete device cycle. The reserve grows with arrival lateness,
+  bounded at 200 ms, with a 10 ms guard above measured lateness and the
+  original margin as its minimum. Lateness compares the local arrival interval with the
+  source sample-clock interval, so silence gating does not look like jitter.
+  After 30 seconds without a new delay spike, the target decreases by 2 ms
+  per second toward its baseline.
+
+  Surplus audio is recovered with correlation-gated overlap removal, limited
+  to 0.5% of playback time. All channels share the same splice, and recovery
+  is disabled during the 30-second settling period. Only strongly correlated
+  waveforms (or very low energy) are eligible; unmatched material is retained
+  rather than forced through an audible discontinuity. This is conservative
+  catch-up, not a complete speech concealment or general music time-stretcher.
+  Hard overflow still drops the oldest whole frames with a crossfade.
+
+  Pull-model backends include one complete device cycle in the prefill and
+  ceiling, including unusually large cycles. A PipeWire playback cycle is
+  `pw_buffer.requested` frames, not the mapped buffer. WASAPI keeps its jitter
+  queue within 200 ms at the device format independently of its 40 ms device
+  lead. Health logs distinguish target reserve, buffered duration, graceful
+  acceleration, hard drops, and silence produced.
+
+- **Clock:** packet timestamps use the source sample clock. Drift that builds
+  surplus audio can be reduced by conservative overlap recovery. Continuous
+  asynchronous sample-rate conversion is not implemented. Windows fixed-rate
+  conversion carries fractional positions across packets so 44.1 kHz does not
+  lose half an output sample on every 5 ms packet.
 - **Silence gate:** the sender drops chunks nobody would hear
   (`core/src/audio_gate.rs`), because an idle mirror pumping full-rate silence
   is link capacity the cursor shares. Two questions, two answers:

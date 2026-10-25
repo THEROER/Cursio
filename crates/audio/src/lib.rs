@@ -34,10 +34,16 @@ pub mod codec;
 pub mod android_backend;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 mod declick;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+mod jitter;
 #[cfg(target_os = "linux")]
 pub mod pipewire_backend;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+mod playback_feed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod playout;
+#[cfg(any(target_os = "windows", test))]
+mod sample_clock;
 /// Drives the Cursio virtual audio driver, which is what gives Windows the
 /// same per-device parity Linux gets from PipeWire.
 #[cfg(target_os = "windows")]

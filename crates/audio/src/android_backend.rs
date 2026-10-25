@@ -24,7 +24,7 @@
 //! exist (latency that grows without bound, clicks at every underrun) are not
 //! platform-specific.
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -545,30 +545,23 @@ impl Drop for AndroidSource {
 
 /// A peer's stream playing on this phone.
 pub struct AndroidSink {
-    feed: std_mpsc::Sender<Vec<u8>>,
-    /// Bytes handed to the callback and not yet taken into its buffer, so
-    /// [`play`](Self::play) can refuse more once a full buffer is waiting even
-    /// while the callback is not running (a stream paused by a route change).
-    queued: Arc<AtomicUsize>,
+    feed: crate::playback_feed::Sender,
     gain: Arc<AtomicU32>,
     wake: std_mpsc::Sender<Wake>,
 }
 
 impl AndroidSink {
     pub fn open(id: AudioStreamId, name: String) -> Result<Self, AudioError> {
-        let (feed_tx, feed_rx) = std_mpsc::channel::<Vec<u8>>();
+        let (feed_tx, feed_rx) = crate::playback_feed::channel(JITTER_MAX_BYTES);
         let feed_rx = Arc::new(std::sync::Mutex::new(feed_rx));
-        let queued = Arc::new(AtomicUsize::new(0));
         let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
 
-        let thread_queued = Arc::clone(&queued);
         let thread_gain = Arc::clone(&gain);
         let wake = spawn_owner(format!("cursio-aaudio-play-{id}"), move |wake| {
             // Each opened stream takes the receiver for its callback's life;
             // the lock is held by one callback at a time, never contended,
             // because the previous stream is stopped before the next opens.
             let feed_rx = Arc::clone(&feed_rx);
-            let queued = Arc::clone(&thread_queued);
             let gain = Arc::clone(&thread_gain);
             let mut playout = crate::playout::Playout::new(
                 SAMPLE_RATE,
@@ -593,9 +586,10 @@ impl AndroidSink {
                     // stereo, and the pointer is valid for this call.
                     let out = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, want) };
                     if let Ok(rx) = feed_rx.try_lock() {
-                        while let Ok(bytes) = rx.try_recv() {
-                            queued.fetch_sub(bytes.len(), Ordering::Relaxed);
-                            playout.push(&bytes);
+                        rx.set_cycle(want);
+                        rx.report(id);
+                        while let Ok(packet) = rx.try_recv() {
+                            playout.push_at(&packet.data, packet.arrived, Some(packet.timestamp));
                         }
                     }
                     let g = f32::from_bits(gain.load(Ordering::Relaxed));
@@ -619,20 +613,13 @@ impl AndroidSink {
 
         Ok(Self {
             feed: feed_tx,
-            queued,
             gain,
             wake,
         })
     }
 
     pub fn play(&self, chunk: &AudioChunk) -> Result<(), AudioError> {
-        if self.queued.load(Ordering::Relaxed) > JITTER_MAX_BYTES {
-            return Ok(());
-        }
-        self.queued.fetch_add(chunk.data.len(), Ordering::Relaxed);
-        self.feed
-            .send(chunk.data.clone())
-            .map_err(|_| AudioError::Backend("playback thread gone".into()))
+        self.feed.send(chunk)
     }
 
     pub fn set_gain(&self, gain: f32) {

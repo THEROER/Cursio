@@ -15,11 +15,12 @@
 //! all. Both were heard on peer microphones as audio cutting in and out four
 //! times a second while every chunk arrived on time.
 //!
-//! So the prefill, the ceiling and the catch-up point are each "one cycle,
-//! plus" — the cycle is what plays next, and only what lies beyond it is
-//! jitter margin or backlog.
+//! Prefill and the ceiling include one complete device cycle. The remaining
+//! reserve adapts to local packet arrival gaps and decays after a stable period.
+//! Correlation-gated overlap removal reduces excess delay gradually.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crate::declick::{self, Declick};
 
@@ -34,6 +35,8 @@ pub(crate) struct Fill {
     pub ran_dry: bool,
     /// Bytes of the oldest audio dropped to stay under the ceiling.
     pub trimmed: usize,
+    pub accelerated: usize,
+    pub target_ms: usize,
 }
 
 /// One playback stream's queued audio, interleaved little-endian `f32`.
@@ -48,10 +51,16 @@ pub(crate) struct Playout {
     max_bytes: usize,
     /// Audio held beyond one cycle before playback starts: the jitter the
     /// stream can absorb without running dry.
-    margin_bytes: usize,
+    delay: crate::jitter::Delay,
+    recovery: crate::jitter::Recovery,
     /// The size of the device's last cycle, so a push between cycles trims
     /// against the same ceiling the next fill will.
     cycle_bytes: usize,
+    health: [u64; 6],
+    reported: Instant,
+    last_fill: Instant,
+    max_callback_gap: std::time::Duration,
+    max_feed_age: std::time::Duration,
 }
 
 impl Playout {
@@ -65,8 +74,18 @@ impl Playout {
             rate: rate as usize,
             fade,
             max_bytes,
-            margin_bytes,
+            delay: crate::jitter::Delay::new(
+                rate as usize,
+                margin_bytes / (channels * 4),
+                max_bytes / (channels * 4),
+            ),
+            recovery: crate::jitter::Recovery::default(),
             cycle_bytes: 0,
+            health: [0; 6],
+            reported: Instant::now(),
+            last_fill: Instant::now(),
+            max_callback_gap: std::time::Duration::ZERO,
+            max_feed_age: std::time::Duration::ZERO,
         }
     }
 
@@ -77,12 +96,25 @@ impl Playout {
     /// The ceiling: never below one cycle and its margin, or the buffer could
     /// not hold what a single cycle takes.
     fn ceiling(&self) -> usize {
-        self.max_bytes.max(self.cycle_bytes + self.margin_bytes)
+        self.max_bytes
+            .max(self.cycle_bytes + self.delay.frames() * self.frame_bytes())
     }
 
     /// Queue newly arrived audio. Returns the bytes of old audio dropped to
     /// make room.
+    #[cfg(test)]
     pub(crate) fn push(&mut self, bytes: &[u8]) -> usize {
+        self.push_at(bytes, Instant::now(), None)
+    }
+
+    pub(crate) fn push_at(
+        &mut self,
+        bytes: &[u8],
+        arrived: Instant,
+        timestamp: Option<u64>,
+    ) -> usize {
+        self.delay
+            .arrival(arrived, bytes.len() / self.frame_bytes(), timestamp);
         self.buf.extend(bytes);
         self.trim()
     }
@@ -103,6 +135,14 @@ impl Playout {
     /// Fill `out`, one device cycle, from the queue, ramping every edge and
     /// scaling by `gain`. `stopping` ramps to silence and stays there.
     pub(crate) fn fill(&mut self, out: &mut [u8], gain: f32, stopping: bool) -> Fill {
+        self.fill_at(out, gain, stopping, Instant::now())
+    }
+
+    fn fill_at(&mut self, out: &mut [u8], gain: f32, stopping: bool, now: Instant) -> Fill {
+        self.max_callback_gap = self
+            .max_callback_gap
+            .max(now.saturating_duration_since(self.last_fill));
+        self.last_fill = now;
         let frame_bytes = self.frame_bytes();
         let want = out.len() - out.len() % frame_bytes.max(1);
         self.cycle_bytes = want;
@@ -110,17 +150,18 @@ impl Playout {
             trimmed: self.trim(),
             ..Fill::default()
         };
-        if self.started {
-            declick::settle_backlog(
+        fill.target_ms = self.delay.frames() * 1000 / self.rate;
+        if !stopping && self.started {
+            fill.accelerated = self.recovery.process(
                 &mut self.buf,
-                frame_bytes,
-                self.rate,
                 self.channels,
-                self.fade,
-                want,
+                &self.delay,
+                want / frame_bytes,
+                want / frame_bytes,
+                now,
             );
         }
-        if !self.started && self.buf.len() >= want + self.margin_bytes {
+        if !self.started && self.buf.len() >= want + self.delay.frames() * frame_bytes {
             self.started = true;
             fill.started = true;
         }
@@ -149,6 +190,31 @@ impl Playout {
         if self.started && self.buf.is_empty() {
             self.started = false;
             fill.ran_dry = true;
+        }
+        self.health[1] += (take / frame_bytes) as u64;
+        self.health[2] += ((want - take) / frame_bytes) as u64;
+        self.health[3] += u64::from(fill.ran_dry);
+        self.health[4] += fill.trimmed as u64;
+        self.health[5] += fill.accelerated as u64;
+        if now.saturating_duration_since(self.reported) >= std::time::Duration::from_secs(10) {
+            tracing::debug!(
+                packets = self.health[0],
+                audio_frames = self.health[1],
+                silence_frames = self.health[2],
+                drains = self.health[3],
+                dropped_bytes = self.health[4],
+                accelerated_bytes = self.health[5],
+                target_ms = fill.target_ms,
+                cycle_frames = want / frame_bytes,
+                queued_ms = self.buf.len() * 1000 / frame_bytes / self.rate,
+                max_callback_gap_ms = self.max_callback_gap.as_secs_f64() * 1000.0,
+                max_feed_age_ms = self.max_feed_age.as_secs_f64() * 1000.0,
+                "adaptive playout health"
+            );
+            self.reported = now;
+            self.health = [0; 6];
+            self.max_callback_gap = std::time::Duration::ZERO;
+            self.max_feed_age = std::time::Duration::ZERO;
         }
         fill
     }
@@ -223,6 +289,49 @@ mod tests {
     }
 
     #[test]
+    fn repeated_network_stalls_recover_without_recurring_cuts_and_delay_returns_to_baseline() {
+        use std::time::Duration;
+        let start = Instant::now();
+        let mut playout = Playout::new(RATE, 2, MAX, MARGIN);
+        let mut output = vec![0; 240 * FRAME];
+        let input: Vec<u8> = (0..240)
+            .flat_map(|n| {
+                let sample = (n as f32 * std::f32::consts::TAU / 120.0).sin();
+                [sample, -sample].into_iter().flat_map(f32::to_le_bytes)
+            })
+            .collect();
+        let mut next = 0;
+        let mut accelerated = 0;
+        let mut peak_target = 0;
+        for ms in (0..120000u64).step_by(5) {
+            let now = start + Duration::from_millis(ms);
+            let blocked = (1000..6000).contains(&ms) && ms % 250 < 150;
+            if !blocked {
+                while next <= ms {
+                    playout.push_at(&input, now, Some(next * 48));
+                    next += 5;
+                }
+            }
+            let fill = playout.fill_at(&mut output, 1.0, false, now);
+            peak_target = peak_target.max(fill.target_ms);
+            accelerated += fill.accelerated;
+            if ms > 7000 {
+                assert_eq!(fill.played, output.len(), "playback restarted at {ms} ms");
+                assert_eq!(fill.trimmed, 0);
+            }
+            assert!(playout.buf.len() <= playout.ceiling());
+        }
+        assert!(peak_target >= 150);
+        assert!(accelerated > 0);
+        assert!(playout.delay.frames() <= MARGIN / FRAME + 1);
+        assert!(
+            playout.buf.len() <= 50 * MS,
+            "delay did not recover: {}",
+            playout.buf.len()
+        );
+    }
+
+    #[test]
     fn playback_waits_for_a_whole_cycle_and_its_margin() {
         let mut playout = Playout::new(RATE, 2, MAX, MARGIN);
         let mut out = vec![0u8; 1024 * FRAME];
@@ -241,20 +350,20 @@ mod tests {
     }
 
     #[test]
-    fn a_backlog_is_cut_back_to_one_cycle_and_the_settle_point() {
+    fn a_network_burst_keeps_its_reserve_instead_of_repeatedly_cutting_to_40ms() {
         let mut playout = Playout::new(RATE, 2, MAX, MARGIN);
         let mut out = vec![0u8; 2048 * FRAME];
         playout.push(&tone(2048 + 1024));
         assert!(playout.fill(&mut out, 1.0, false).started);
         playout.push(&tone(48 * 150));
 
+        let before = playout.buf.len();
         let fill = playout.fill(&mut out, 1.0, false);
         assert_eq!(fill.played, 2048 * FRAME);
-        assert_eq!(
-            playout.buf.len(),
-            40 * MS,
-            "what remains is the settle point"
-        );
+        assert_eq!(fill.trimmed, 0);
+        assert_eq!(fill.accelerated, 0);
+        assert_eq!(playout.buf.len(), before - out.len());
+        assert!(playout.buf.len() > 100 * MS);
     }
 
     #[test]

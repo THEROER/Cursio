@@ -240,6 +240,11 @@ impl OpusEncoder {
         Ok(value as u32)
     }
 
+    /// Samples per channel retained before the next complete Opus frame.
+    pub fn buffered_frames(&self) -> usize {
+        self.pending.len() / 2
+    }
+
     /// Encode raw wire bytes, returning zero or more Opus packets.
     ///
     /// Returns several packets when the input spans multiple frames, and none
@@ -383,6 +388,19 @@ mod tests {
 
     /// A tone must survive the round trip recognisably. Opus is lossy, so this
     /// checks energy is preserved rather than exact samples.
+    #[test]
+    fn partial_frames_keep_a_precise_sample_clock_across_capture_boundaries() {
+        let mut encoder = OpusEncoder::new().unwrap();
+        assert!(encoder.encode(&vec![0; 128 * 8]).unwrap().is_empty());
+        assert_eq!(encoder.buffered_frames(), 128);
+        let second_capture_timestamp = 128u64;
+        let first_packet_timestamp = second_capture_timestamp - encoder.buffered_frames() as u64;
+        let packets = encoder.encode(&vec![0; 512 * 8]).unwrap();
+        assert_eq!(first_packet_timestamp, 0);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(encoder.buffered_frames(), 160);
+    }
+
     #[test]
     fn tone_survives_the_round_trip() {
         let mut enc = OpusEncoder::new().unwrap();
