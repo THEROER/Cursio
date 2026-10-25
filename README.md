@@ -40,7 +40,7 @@ launched on.**
 - Not a replacement for your mixer — Cursio replaces the network hop, not
   VoiceMeeter or Carla
 
-## Supported platforms (v0.1)
+## Supported platforms (v0.9)
 
 | | Input | Clipboard | Window host | Window view | Remote screen | Audio | Files | USB | AirPlay |
 |---|---|---|---|---|---|---|---|---|---|

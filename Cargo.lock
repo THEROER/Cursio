@@ -837,7 +837,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clipboard-core"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "arboard",
  "cc",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "clipd"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-airplay"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "aes",
  "cbc",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-android"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "cursio-audio",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-app"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clipboard-core",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-audio"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "audiopus_sys",
  "cursio-protocol",
@@ -1168,7 +1168,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-bluetooth"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "cursio-protocol",
  "libc",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-core"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-files"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-input"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "ashpd",
  "cursio-protocol",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-log"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "directories",
  "tracing",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-protocol"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bincode",
  "clipboard-core",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-queue"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "thiserror 1.0.69",
  "tokio",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-transport"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "cursio-protocol",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-usb"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "cursio-protocol",
  "serde_json",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-window"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "ashpd",
  "cc",
@@ -6539,7 +6539,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "wgc-probe"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "windows",
 ]
@@ -7217,7 +7217,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
