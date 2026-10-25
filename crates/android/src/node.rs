@@ -620,27 +620,8 @@ async fn run_link<T: Transport + 'static>(
         tracing::warn!(peer = %peer_name, "untrusted machine; not admitted");
     }
 
-    let stranger =
-        !password.is_empty() && TrustStore::load().is_ok_and(|store| store.get(&peer_id).is_none());
-    let link = match cursio_core::link::secure(identified, &plan).await {
-        Ok(link) => link,
-        Err(error) => {
-            if stranger
-                && matches!(
-                    error.downcast_ref::<cursio_transport::pairing::PairingError>(),
-                    Some(
-                        cursio_transport::pairing::PairingError::ConfirmationFailed
-                            | cursio_transport::pairing::PairingError::Rejected(_)
-                    )
-                )
-            {
-                ctx.pairing.note_failure();
-            }
-            return Err(error);
-        }
-    };
-    if stranger {
-        ctx.pairing.note_paired(&peer_name);
+    let (link, paired_now) = ctx.pairing.secure(identified, &plan).await?;
+    if paired_now {
         // The desktop waits for the next restart or for the peer to call; a
         // phone the user just paired should show and dial the machine at once.
         ctx.registry

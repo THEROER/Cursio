@@ -321,33 +321,10 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
             }
         }
     }
-    let stranger = !password.is_empty()
-        && TrustStore::load().is_ok_and(|store| store.get(&identified.peer.peer_id).is_none());
-    let peer_name = identified.peer.display_name.clone();
     let peer_id = identified.peer.peer_id;
     let negotiated = identified.negotiated().clone();
-    let link = match cursio_core::link::secure(identified, &plan).await {
-        Ok(link) => link,
-        Err(error) => {
-            // Only a wrong secret counts against the window. A dropped socket
-            // mid-handshake is the network, and closing the window for it
-            // would punish the user for Wi-Fi.
-            if stranger
-                && matches!(
-                    error.downcast_ref::<cursio_transport::pairing::PairingError>(),
-                    Some(
-                        cursio_transport::pairing::PairingError::ConfirmationFailed
-                            | cursio_transport::pairing::PairingError::Rejected(_)
-                    )
-                )
-            {
-                pairing.note_failure();
-            }
-            return Err(error);
-        }
-    };
-    if stranger {
-        pairing.note_paired(&peer_name);
+    let (link, paired_now) = pairing.secure(identified, &plan).await?;
+    if paired_now {
         // Paired again after being removed: its links may stay up now.
         live.unforget(peer_id);
     }

@@ -310,6 +310,48 @@ impl PairingWindow {
             peer: peer.to_owned(),
         });
     }
+
+    /// [`link::secure`](crate::link::secure) with this window told how a first
+    /// meeting went. Answers the link and whether the peer was a stranger
+    /// paired just now.
+    ///
+    /// Only a wrong secret counts against the window. A dropped socket
+    /// mid-handshake is the network, and closing the window for it would
+    /// punish the user for Wi-Fi.
+    pub async fn secure<T>(
+        &self,
+        identified: crate::link::Identified<T>,
+        plan: &crate::link::Handshake<'_>,
+    ) -> anyhow::Result<(crate::link::Link, bool)>
+    where
+        T: cursio_transport::Transport + 'static,
+    {
+        use cursio_transport::pairing::{PairingError, TrustStore};
+
+        let peer_id = identified.peer.peer_id;
+        let peer_name = identified.peer.display_name.clone();
+        let stranger = !plan.password.is_empty()
+            && TrustStore::load().is_ok_and(|store| store.get(&peer_id).is_none());
+        match crate::link::secure(identified, plan).await {
+            Ok(link) => {
+                if stranger {
+                    self.note_paired(&peer_name);
+                }
+                Ok((link, stranger))
+            }
+            Err(error) => {
+                if stranger
+                    && matches!(
+                        error.downcast_ref::<PairingError>(),
+                        Some(PairingError::ConfirmationFailed | PairingError::Rejected(_))
+                    )
+                {
+                    self.note_failure();
+                }
+                Err(error)
+            }
+        }
+    }
 }
 
 fn describe(open: &Open) -> PairingState {
