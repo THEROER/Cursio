@@ -27,6 +27,7 @@ pub struct DragWatcher {
 impl DragWatcher {
     /// Run `detect` on the runtime until the watcher is dropped, receiving
     /// what it reports.
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     pub(crate) fn run<F, Fut>(detect: F) -> Self
     where
         F: FnOnce(mpsc::UnboundedSender<DragEvent>) -> Fut,
