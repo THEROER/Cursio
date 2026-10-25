@@ -87,7 +87,6 @@ impl MprisBackend {
     }
 }
 
-
 fn str_of(v: Option<&OwnedValue>) -> Option<String> {
     match &**v? {
         Value::Str(s) => Some(s.to_string()),
@@ -484,7 +483,10 @@ impl PlayerIface {
                 m.insert(k.to_string(), v);
             }
         };
-        let track = format!("/dev/cursio/track/{:016x}", crate::media_hub::art_hash(&p.title));
+        let track = format!(
+            "/dev/cursio/track/{:016x}",
+            crate::media_hub::art_hash(&p.title)
+        );
         if let Ok(path) = ObjectPath::try_from(track.as_str()) {
             put("mpris:trackid", Value::from(path));
         }
@@ -610,7 +612,6 @@ fn serve(
         }
     }
 }
-
 
 /// A player's name as a person reads it. A snap's Firefox reports itself as
 /// "Mozilla firefox_firefox": the snap's name glued on after an underscore,

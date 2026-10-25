@@ -78,9 +78,10 @@ impl SmtcBackend {
     }
 
     fn session(&self, player: &str) -> Option<Session> {
-        self.sessions()
-            .into_iter()
-            .find(|s| s.SourceAppUserModelId().is_ok_and(|id| id.to_string() == player))
+        self.sessions().into_iter().find(|s| {
+            s.SourceAppUserModelId()
+                .is_ok_and(|id| id.to_string() == player)
+        })
     }
 
     fn poll(&self) {
@@ -97,7 +98,10 @@ impl SmtcBackend {
 
 fn read_player(session: &Session) -> Option<Player> {
     let id = session.SourceAppUserModelId().ok()?.to_string();
-    let props = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()).ok()?;
+    let props = session
+        .TryGetMediaPropertiesAsync()
+        .and_then(|op| op.get())
+        .ok()?;
     let info = session.GetPlaybackInfo().ok()?;
     let controls = info.Controls().ok()?;
     let timeline = session.GetTimelineProperties().ok();
@@ -108,7 +112,10 @@ fn read_player(session: &Session) -> Option<Player> {
     };
     let title = props.Title().map(|t| t.to_string()).unwrap_or_default();
     let artist = props.Artist().map(|t| t.to_string()).unwrap_or_default();
-    let album = props.AlbumTitle().map(|t| t.to_string()).unwrap_or_default();
+    let album = props
+        .AlbumTitle()
+        .map(|t| t.to_string())
+        .unwrap_or_default();
     // A TimeSpan counts 100 ns ticks.
     let ms = |ticks: i64| u64::try_from(ticks / 10_000).ok();
     let (duration_ms, position_ms) = match &timeline {
@@ -176,7 +183,10 @@ fn set_app_volume(_app: &str, _volume: f32) -> Result<(), String> {
 /// app's `Publisher.Name_hash!App` is its last part.
 fn app_name(id: &str) -> String {
     let name = id.rsplit('!').next().unwrap_or(id);
-    let name = name.strip_suffix(".exe").or_else(|| name.strip_suffix(".EXE")).unwrap_or(name);
+    let name = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name);
     let name = name.rsplit('\\').next().unwrap_or(name);
     if name.eq_ignore_ascii_case("app") {
         // `SpotifyAB.SpotifyMusic_zpdnekdrzrea0!App`: the package says it.
@@ -189,7 +199,10 @@ fn app_name(id: &str) -> String {
 
 impl MediaBackend for SmtcBackend {
     fn players(&self) -> Vec<Player> {
-        self.players.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.players
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn command(&self, player: &str, command: MediaCommand) -> Result<(), String> {
@@ -223,8 +236,16 @@ impl MediaBackend for SmtcBackend {
 
     fn art(&self, player: &str, _art: u64) -> Option<(String, Vec<u8>)> {
         let session = self.session(player)?;
-        let props = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()).ok()?;
-        let stream = props.Thumbnail().ok()?.OpenReadAsync().and_then(|op| op.get()).ok()?;
+        let props = session
+            .TryGetMediaPropertiesAsync()
+            .and_then(|op| op.get())
+            .ok()?;
+        let stream = props
+            .Thumbnail()
+            .ok()?
+            .OpenReadAsync()
+            .and_then(|op| op.get())
+            .ok()?;
         let size = stream.Size().ok()?;
         if size as usize > MAX_ART_BYTES {
             tracing::debug!(player, size, "cover too large to send");
@@ -251,8 +272,14 @@ mod tests {
     #[test]
     fn players_are_named_after_their_app_not_its_id() {
         assert_eq!(app_name("Spotify.exe"), "Spotify");
-        assert_eq!(app_name("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"), "Spotify");
-        assert_eq!(app_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"), "Microsoft.ZuneMusic");
+        assert_eq!(
+            app_name("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"),
+            "Spotify"
+        );
+        assert_eq!(
+            app_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"),
+            "Microsoft.ZuneMusic"
+        );
         assert_eq!(app_name("Some.Package_abc!App"), "Package");
     }
 }

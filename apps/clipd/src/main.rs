@@ -346,7 +346,7 @@ fn list(dir: &Path, limit: usize, search: Option<&str>) -> Result<()> {
 /// makes the hotkey feel instant (see [`ipc`]). With `--with`, or when no
 /// daemon is running, it falls back to driving an external picker in this
 /// process, so `clipd pick` still works in a bare session.
-fn pick(dir: &Path,with: Option<&str>, limit: usize) -> Result<()> {
+fn pick(dir: &Path, with: Option<&str>, limit: usize) -> Result<()> {
     if with.is_none() {
         match ipc::send(ipc::Request::Toggle) {
             Ok(_) => return Ok(()),
