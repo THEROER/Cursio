@@ -1,218 +1,29 @@
-//! Linux surrogate window: show a transferred window, send its input back.
-//!
-//! The **viewer** side. A [`WindowMeta`] from the host opens a local GTK4 window
-//! sized to match; inbound [`WindowFrame`] tiles are blitted into a full-window
-//! BGRA framebuffer that a `gtk::Picture` draws from; the user's clicks, motion,
-//! scrolls, and keys come back out as [`WindowInput`] in that window's own
-//! coordinates for the host to replay.
-//!
-//! A **remote-screen view** is not one of these on Linux: nobody is meant to
-//! look at it here, so it is a PipeWire node instead
-//! ([`PipeWireScreenSource`](crate::PipeWireScreenSource)); [`LinuxSurrogate`]
-//! is the renderer's answer for either.
-//!
-//! ## Why GTK4
-//!
-//! It is already in the tree (clipd's popup), which means no new toolkit to
-//! carry, and it hands us the two things a hand-rolled Wayland client would cost
-//! hundreds of lines to get right: a real xdg-shell window that behaves like a
-//! native one on GNOME, and cooked input — including an xkb-resolved keyboard —
-//! through event controllers. Pixels stay cheap because
-//! [`gdk::MemoryTexture`] takes **B8g8r8a8** directly, which is exactly the wire
-//! format, so a frame goes to the screen with no colour conversion.
-//!
-//! ## Threading
-//!
-//! GTK owns its thread and its main loop, and none of its objects are `Send` —
-//! but [`Surrogate`] is driven from the session task. So GTK runs on a
-//! **dedicated thread** and only channels cross the boundary, the same shape as
-//! the capture side: frames in, input and acks out.
-//!
-//! **One** thread for the whole process, started with the first window and
-//! never ended. It was one per window, and GTK refuses that twice over: it may
-//! be initialised on one thread only, so every window after the first in a
-//! process panicked in `gtk::init` ("surrogate thread ended before signalling
-//! readiness"); and the first window, closed by ending its thread's loop, never
-//! left the screen — destroying it only queues the request to the compositor,
-//! and with no loop left to flush it the dead window stayed up until the node
-//! was killed. A window now ends by stopping its own tick; the loop goes on.
+//! The GTK window itself: built on the one GTK thread, sized to the picture
+//! within the largest monitor, and fed by a video thread of its own.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use cursio_protocol::{
-    Rect, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
-};
-use gtk::prelude::*;
-use gtk::{gdk, glib};
-use tokio::sync::mpsc;
-
+use crate::linux_surrogate::input::attach_input_controllers;
+use crate::linux_surrogate::to_texture;
+use crate::linux_surrogate::SurrogateCommand;
+use crate::GtkSurrogate;
 use crate::{
-    framebuffer::{contained_to_host, fit_into, refit, Framebuffer},
+    framebuffer::{fit_into, refit, Framebuffer},
     surrogate_front::SurrogateFront,
     video_decoder::VideoDecoder,
-    Surrogate, WindowError, WindowRenderer,
+    WindowError,
 };
-/// Snapshot a framebuffer as a texture GTK can paint.
-///
-/// `B8g8r8a8` is the wire format verbatim, so this is a copy, not a conversion.
-fn to_texture(fb: &Framebuffer) -> gdk::MemoryTexture {
-    gdk::MemoryTexture::new(
-        fb.width as i32,
-        fb.height as i32,
-        gdk::MemoryFormat::B8g8r8a8,
-        &glib::Bytes::from(&fb.pixels[..]),
-        (fb.width as usize) * 4,
-    )
-}
-
-/// What the session hands the GTK thread; a GTK window has nothing of its own
-/// to be told.
-type SurrogateCommand = crate::surrogate_front::SurrogateCommand<std::convert::Infallible>;
-
-/// A surrogate window driven from the session, rendered by GTK on its own thread.
-pub struct GtkSurrogate {
-    front: SurrogateFront<std::convert::Infallible>,
-    input: mpsc::UnboundedReceiver<WindowInput>,
-    /// Sizes the user dragged this window to, newest wins. See
-    /// [`Surrogate::take_resize_request`].
-    resized: mpsc::UnboundedReceiver<(u32, u32)>,
-    /// The last size actually asked of the host, so a drag that returns to a
-    /// size already requested does not ask again.
-    requested_size: Option<(u32, u32)>,
-}
-
-impl Surrogate for GtkSurrogate {
-    fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
-        self.front.apply_frame(frame)
-    }
-
-    fn input(&mut self) -> &mut mpsc::UnboundedReceiver<WindowInput> {
-        &mut self.input
-    }
-
-    /// The window's tick owns the command receiver and ends with the window.
-    fn is_gone(&self) -> bool {
-        self.front.is_gone()
-    }
-
-    fn take_ack(&mut self) -> Option<WindowFrameAck> {
-        self.front.take_ack()
-    }
-
-    fn take_keyframe_request(&mut self) -> bool {
-        self.front.take_keyframe_request()
-    }
-
-    fn take_resize_request(&mut self) -> Option<(u32, u32)> {
-        // Drain to the newest: a drag emits a size per frame, and only where the
-        // user let go matters.
-        let mut latest = None;
-        while let Ok(size) = self.resized.try_recv() {
-            latest = Some(size);
-        }
-        let size = latest?;
-        // The host answers a resize with a full frame, which sets `self.width`
-        // — so a size we already asked for, or one that matches what is being
-        // shown, would be an echo of our own request.
-        if Some(size) == self.requested_size || size == self.front.size() {
-            return None;
-        }
-        self.requested_size = Some(size);
-        Some(size)
-    }
-
-    fn close(&mut self, reason: WindowCloseReason) {
-        self.front.close(reason);
-    }
-}
-
-/// The Linux [`WindowRenderer`] backend: one GTK window per transferred window,
-/// and a PipeWire node — no window — per remote-screen view.
-pub struct GtkWindowRenderer;
-
-impl WindowRenderer for GtkWindowRenderer {
-    type Surrogate = LinuxSurrogate;
-
-    fn open(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
-        spawn_surrogate(meta).map(LinuxSurrogate::Window)
-    }
-
-    /// A node the ScreenCast portal hands to the capture app; see
-    /// [`PipeWireScreenSource`](crate::PipeWireScreenSource).
-    fn open_screen_view(&mut self, meta: &WindowMeta) -> Result<Self::Surrogate, WindowError> {
-        crate::PipeWireScreenSource::open(meta).map(LinuxSurrogate::Node)
-    }
-}
-
-/// What the Linux renderer opens: a transfer's window, or a view's node.
-pub enum LinuxSurrogate {
-    Window(GtkSurrogate),
-    Node(crate::PipeWireScreenSource),
-}
-
-impl LinuxSurrogate {
-    fn inner(&mut self) -> &mut dyn Surrogate {
-        match self {
-            Self::Window(w) => w,
-            Self::Node(n) => n,
-        }
-    }
-}
-
-impl Surrogate for LinuxSurrogate {
-    fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
-        self.inner().apply_frame(frame)
-    }
-
-    fn input(&mut self) -> &mut mpsc::UnboundedReceiver<WindowInput> {
-        match self {
-            Self::Window(w) => w.input(),
-            Self::Node(n) => n.input(),
-        }
-    }
-
-    fn is_gone(&self) -> bool {
-        match self {
-            Self::Window(w) => w.is_gone(),
-            Self::Node(n) => n.is_gone(),
-        }
-    }
-
-    fn take_ack(&mut self) -> Option<WindowFrameAck> {
-        self.inner().take_ack()
-    }
-
-    fn take_resize_request(&mut self) -> Option<(u32, u32)> {
-        self.inner().take_resize_request()
-    }
-
-    fn take_keyframe_request(&mut self) -> bool {
-        self.inner().take_keyframe_request()
-    }
-
-    fn restart_stream(&mut self, title: &str) {
-        self.inner().restart_stream(title)
-    }
-
-    fn node_id(&self) -> Option<u32> {
-        match self {
-            Self::Window(_) => None,
-            Self::Node(n) => Some(n.node_id()),
-        }
-    }
-
-    fn close(&mut self, reason: WindowCloseReason) {
-        self.inner().close(reason)
-    }
-}
+use cursio_protocol::{Rect, WindowId, WindowInput, WindowMeta};
+use gtk::glib;
+use gtk::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
+use tokio::sync::mpsc;
 
 /// Start the GTK thread for one surrogate and wait until its window is up.
 ///
 /// Blocks on readiness so a failure to reach the display server surfaces from
 /// `open()` rather than as a window that never appears — the same contract as
 /// the capture side's `begin()`.
-fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
+pub(super) fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (presented_tx, presented_rx) = mpsc::unbounded_channel();
@@ -260,7 +71,7 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
 /// A failed start (no display yet, at login) is not remembered: GTK counts as
 /// initialised only once `gtk::init` succeeds, so the next window may try
 /// again on a new thread.
-fn gtk_context() -> Result<glib::MainContext, WindowError> {
+pub(super) fn gtk_context() -> Result<glib::MainContext, WindowError> {
     static CONTEXT: std::sync::Mutex<Option<glib::MainContext>> = std::sync::Mutex::new(None);
     let mut context = CONTEXT.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(context) = context.as_ref() {
@@ -292,14 +103,14 @@ fn gtk_context() -> Result<glib::MainContext, WindowError> {
 /// A GTK 4 window's default size includes its title bar, so a window sized to
 /// the picture alone gives the picture that many rows less than it needs, and
 /// `Contain` fills the difference with bars down both sides of a phone.
-fn fitted(width: u32, height: u32, titlebar: i32) -> (i32, i32) {
+pub(super) fn fitted(width: u32, height: u32, titlebar: i32) -> (i32, i32) {
     let (w, h) = fit_into(width, height, largest_monitor());
     (w, h + titlebar)
 }
 
 /// The largest monitor's size. Wayland tells a client nothing about panels or
 /// where its window is, so this is the best `room` there is.
-fn largest_monitor() -> Option<(i32, i32)> {
+pub(super) fn largest_monitor() -> Option<(i32, i32)> {
     gtk::gdk::Display::default().and_then(|display| {
         let monitors = display.monitors();
         (0..monitors.n_items())
@@ -311,7 +122,7 @@ fn largest_monitor() -> Option<(i32, i32)> {
 }
 
 /// One window's H.264 decoder, on a thread of its own.
-struct VideoThread {
+pub(super) struct VideoThread {
     packets: std::sync::mpsc::Sender<(u32, Vec<u8>)>,
     /// Converted pictures, at most one waiting: a window that falls behind
     /// holds the decoder back, which then decodes what queued up meanwhile
@@ -321,7 +132,7 @@ struct VideoThread {
 
 /// Start the decoder thread for window `id`. It ends when the window drops
 /// its [`VideoThread`].
-fn spawn_video(
+pub(super) fn spawn_video(
     id: WindowId,
     wants_keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> VideoThread {
@@ -387,7 +198,7 @@ fn spawn_video(
 /// The window lives as long as its tick: the tick owns the command receiver,
 /// the decoder and the senders back to the session, so ending it is what tells
 /// the session the window is gone.
-fn build_window(
+pub(super) fn build_window(
     meta: WindowMeta,
     mut commands: mpsc::UnboundedReceiver<SurrogateCommand>,
     input_tx: mpsc::UnboundedSender<WindowInput>,
@@ -581,242 +392,4 @@ fn build_window(
     });
     window.present();
     let _ = ready_tx.send(Ok(()));
-}
-
-/// Wire pointer, scroll, and keyboard on the surrogate into [`WindowInput`].
-///
-/// Coordinates are reported **in the host window's pixel space**: GTK gives us
-/// widget-local coordinates, which match 1:1 only while the surrogate is shown
-/// unscaled, so we rescale by the ratio between the widget's current size and
-/// the framebuffer's. Without that, dragging a resized surrogate would land
-/// clicks in the wrong place on the host.
-fn attach_input_controllers(
-    window: &gtk::Window,
-    picture: &gtk::Picture,
-    id: WindowId,
-    input_tx: mpsc::UnboundedSender<WindowInput>,
-    fb: Rc<RefCell<Framebuffer>>,
-) {
-    // The handlers hold the picture weakly: a controller owned by the picture
-    // holding it strongly is a cycle, which kept a closed window — its
-    // framebuffer and the senders of its input — alive for the process's life.
-
-    /// Map a widget-local point onto host pixels.
-    fn to_host(
-        picture: &gtk::Picture,
-        fb: &Rc<RefCell<Framebuffer>>,
-        x: f64,
-        y: f64,
-    ) -> (u32, u32) {
-        let fb = fb.borrow();
-        contained_to_host(
-            (picture.width() as f64, picture.height() as f64),
-            (fb.width, fb.height),
-            x,
-            y,
-        )
-    }
-
-    // Pointer motion.
-    let motion = gtk::EventControllerMotion::new();
-    {
-        let (tx, pic, fb) = (input_tx.clone(), picture.downgrade(), fb.clone());
-        motion.connect_motion(move |_, x, y| {
-            let Some(pic) = pic.upgrade() else { return };
-            let (x, y) = to_host(&pic, &fb, x, y);
-            let _ = tx.send(WindowInput::PointerMove { id, x, y });
-        });
-    }
-    picture.add_controller(motion);
-
-    // Buttons. `set_button(0)` makes the gesture report every button, not just
-    // the primary one, so middle/right/thumb clicks reach the host too.
-    let click = gtk::GestureClick::new();
-    click.set_button(0);
-    {
-        let (tx, pic, fb) = (input_tx.clone(), picture.downgrade(), fb.clone());
-        click.connect_pressed(move |g, _, x, y| {
-            let Some(pic) = pic.upgrade() else { return };
-            let (x, y) = to_host(&pic, &fb, x, y);
-            // Traced at both ends (see windows_input.rs) so a button that does
-            // nothing on the host can be told apart from one never sent.
-            let raw = g.current_button();
-            match map_button(raw) {
-                Some(button) => {
-                    tracing::debug!(?button, raw, "surrogate button pressed");
-                    let _ = tx.send(WindowInput::PointerButton {
-                        id,
-                        x,
-                        y,
-                        button,
-                        pressed: true,
-                    });
-                }
-                None => tracing::debug!(raw, "unmapped surrogate button; dropping"),
-            }
-        });
-    }
-    {
-        let (tx, pic, fb) = (input_tx.clone(), picture.downgrade(), fb.clone());
-        click.connect_released(move |g, _, x, y| {
-            let Some(pic) = pic.upgrade() else { return };
-            let (x, y) = to_host(&pic, &fb, x, y);
-            if let Some(button) = map_button(g.current_button()) {
-                let _ = tx.send(WindowInput::PointerButton {
-                    id,
-                    x,
-                    y,
-                    button,
-                    pressed: false,
-                });
-            }
-        });
-    }
-    picture.add_controller(click);
-
-    // Scroll, in notches. GTK's y grows downward while the protocol's positive
-    // y means "up" (matching `InputEvent::PointerScroll`), hence the negation.
-    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-    {
-        let tx = input_tx.clone();
-        scroll.connect_scroll(move |_, dx, dy| {
-            tracing::debug!(dx, dy, "surrogate scroll");
-            let _ = tx.send(WindowInput::PointerScroll {
-                id,
-                dx: dx.round() as i32,
-                dy: -(dy.round() as i32),
-            });
-            glib::Propagation::Stop
-        });
-    }
-    picture.add_controller(scroll);
-
-    // Keyboard on the window (the toplevel holds focus, not the Picture).
-    let keys = gtk::EventControllerKey::new();
-    {
-        let tx = input_tx.clone();
-        keys.connect_key_pressed(move |_, _, keycode, _| {
-            if let Some(key) = evdev_from_gdk_keycode(keycode) {
-                let _ = tx.send(WindowInput::Key {
-                    id,
-                    key,
-                    pressed: true,
-                });
-            }
-            glib::Propagation::Proceed
-        });
-    }
-    {
-        let tx = input_tx.clone();
-        keys.connect_key_released(move |_, _, keycode, _| {
-            if let Some(key) = evdev_from_gdk_keycode(keycode) {
-                let _ = tx.send(WindowInput::Key {
-                    id,
-                    key,
-                    pressed: false,
-                });
-            }
-        });
-    }
-    window.add_controller(keys);
-}
-
-/// GDK button number → the protocol's neutral [`MouseButton`].
-fn map_button(gdk_button: u32) -> Option<cursio_protocol::MouseButton> {
-    use cursio_protocol::MouseButton;
-    Some(match gdk_button {
-        1 => MouseButton::Left,
-        2 => MouseButton::Middle,
-        3 => MouseButton::Right,
-        8 => MouseButton::Back,
-        9 => MouseButton::Forward,
-        _ => return None,
-    })
-}
-
-/// GDK hardware keycode → evdev keycode, the namespace the protocol uses.
-///
-/// On Linux GDK's "hardware keycode" is the X11-style code, which is the evdev
-/// code plus the historic 8-key offset. Undoing that offset is the whole
-/// mapping — no keymap lookup needed, which is exactly why the wire format is
-/// evdev-based (see `input-design.md`).
-fn evdev_from_gdk_keycode(gdk_keycode: u32) -> Option<u16> {
-    const X11_EVDEV_OFFSET: u32 = 8;
-    gdk_keycode
-        .checked_sub(X11_EVDEV_OFFSET)
-        .and_then(|k| u16::try_from(k).ok())
-}
-
-#[cfg(test)]
-mod input_tests {
-    use super::*;
-    use cursio_protocol::MouseButton;
-
-    #[test]
-    fn gdk_keycodes_lose_the_x11_offset() {
-        // GDK 38 is X11's code for `a`, whose evdev code is 30 (KEY_A).
-        assert_eq!(evdev_from_gdk_keycode(38), Some(30));
-        // Below the offset there is no evdev key to map to.
-        assert_eq!(evdev_from_gdk_keycode(4), None);
-    }
-
-    #[test]
-    fn buttons_map_to_neutral_names() {
-        assert_eq!(map_button(1), Some(MouseButton::Left));
-        assert_eq!(map_button(2), Some(MouseButton::Middle));
-        assert_eq!(map_button(3), Some(MouseButton::Right));
-        assert_eq!(map_button(8), Some(MouseButton::Back));
-        assert_eq!(map_button(9), Some(MouseButton::Forward));
-        assert_eq!(map_button(42), None);
-    }
-}
-
-#[cfg(test)]
-mod framebuffer_tests {
-    use super::*;
-
-    #[test]
-    fn blit_places_a_tile_at_its_offset() {
-        let mut fb = Framebuffer::new(4, 2);
-        // A 1x1 white tile at (2,1).
-        let tile = [0xFF, 0xFF, 0xFF, 0xFF];
-        fb.blit(
-            Rect {
-                x: 2,
-                y: 1,
-                width: 1,
-                height: 1,
-            },
-            &tile,
-        )
-        .unwrap();
-        let (row, col, width) = (1usize, 2usize, 4usize);
-        let i = (row * width + col) * 4;
-        assert_eq!(&fb.pixels[i..i + 4], &tile);
-        // Everything else stays untouched.
-        assert!(fb.pixels[..i].iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn out_of_bounds_tile_is_rejected_not_clipped() {
-        let mut fb = Framebuffer::new(4, 2);
-        let err = fb.blit(
-            Rect {
-                x: 3,
-                y: 0,
-                width: 2,
-                height: 1,
-            },
-            &[0; 8],
-        );
-        assert!(matches!(err, Err(WindowError::Backend(_))));
-    }
-
-    #[test]
-    fn resize_reallocates_to_the_new_geometry() {
-        let mut fb = Framebuffer::new(4, 2);
-        fb.resize(8, 4);
-        assert_eq!(fb.width, 8);
-        assert_eq!(fb.pixels.len(), 8 * 4 * 4);
-    }
 }
