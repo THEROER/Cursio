@@ -133,6 +133,39 @@ impl EdgeGate {
     }
 }
 
+/// Where a pointer coming in across `edge` belongs: `pos_norm` of the way along
+/// it — the fraction the peer measured where the pointer left *its* desktop,
+/// in the same terms [`frac`] measures one leaving this one — and `inset`
+/// pixels inside, so the jump zone does not send it straight back.
+///
+/// The fraction is of the whole virtual desktop's edge. With monitors of
+/// different heights side by side that is not the monitor the pointer left,
+/// but it is the one mapping that needs to know nothing about the peer's
+/// layout, and going over and back lands where it started.
+pub(crate) fn entry_point(
+    edge: Edge,
+    pos_norm: f32,
+    bounds: Bounds,
+    inset: i32,
+) -> Option<(i32, i32)> {
+    let (vx, vy, vw, vh) = bounds;
+    if vw <= 0 || vh <= 0 {
+        return None;
+    }
+    let along = |origin: i32, span: i32| {
+        let offset = (pos_norm.clamp(0.0, 1.0) * span as f32) as i32;
+        origin + offset.min(span - 1)
+    };
+    let inset_x = inset.min(vw - 1);
+    let inset_y = inset.min(vh - 1);
+    Some(match edge {
+        Edge::Left => (vx + inset_x, along(vy, vh)),
+        Edge::Right => (vx + vw - 1 - inset_x, along(vy, vh)),
+        Edge::Top => (along(vx, vw), vy + inset_y),
+        Edge::Bottom => (along(vx, vw), vy + vh - 1 - inset_y),
+    })
+}
+
 /// Normalize `v` into `0.0..=1.0` over `span` pixels (guards span > 0).
 fn frac(v: i32, span: i32) -> f32 {
     if span <= 0 {
@@ -212,6 +245,36 @@ mod tests {
         gate.on_move((1900, 540), DESK, left());
         assert_eq!(gate.on_move((1919, 540), DESK, left()), None);
         assert_eq!(gate.on_move((0, 540), DESK, EdgeSet::EMPTY), None);
+    }
+
+    #[test]
+    fn a_pointer_entering_lands_at_the_height_it_left_the_peer_at() {
+        assert_eq!(entry_point(Edge::Left, 0.5, DESK, 12), Some((12, 540)));
+        assert_eq!(entry_point(Edge::Right, 0.0, DESK, 12), Some((1907, 0)));
+        assert_eq!(entry_point(Edge::Bottom, 0.25, DESK, 12), Some((480, 1067)));
+    }
+
+    #[test]
+    fn the_bottom_of_the_peer_is_the_bottom_here_not_one_past_it() {
+        assert_eq!(entry_point(Edge::Left, 1.0, DESK, 12), Some((12, 1079)));
+        assert_eq!(entry_point(Edge::Left, 7.0, DESK, 12), Some((12, 1079)));
+        assert_eq!(entry_point(Edge::Left, -1.0, DESK, 12), Some((12, 0)));
+    }
+
+    #[test]
+    fn leaving_and_coming_back_lands_where_the_pointer_left() {
+        let mut gate = EdgeGate::default();
+        gate.on_move((5, 811), DESK, left());
+        let out = gate.on_move((0, 811), DESK, left()).unwrap();
+        let (_, y) = entry_point(out.edge, out.pos_norm, DESK, 12).unwrap();
+        assert!((y - 811).abs() <= 1, "came back at {y}");
+    }
+
+    #[test]
+    fn an_entry_on_a_desktop_left_of_the_primary_starts_at_its_origin() {
+        let desk = (-1920, 0, 3840, 1080);
+        assert_eq!(entry_point(Edge::Left, 0.5, desk, 12), Some((-1908, 540)));
+        assert_eq!(entry_point(Edge::Left, 0.5, (0, 0, 0, 0), 12), None);
     }
 
     #[test]

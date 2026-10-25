@@ -26,11 +26,14 @@ use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 use cursio_protocol::{Edge, InputEvent, MouseButton};
 use tokio::sync::mpsc;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
 };
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
@@ -47,8 +50,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_MOUSEMOVE, WM_QUIT, WM_SYSKEYDOWN, WNDCLASSW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetClipCursor, GetCursorInfo, GetCursorPos, GetSystemMetrics, SetCursorPos, CURSORINFO,
+    CURSOR_SHOWING, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use crate::edge_gate::EdgeGate;
@@ -532,7 +535,7 @@ fn apply_mode(code: usize) {
     // after a handoff, which ends with BOTH sides dormant and input frozen
     // until Ctrl+Alt+G.
     if (code == MODE_ACTIVE) != (was == MODE_ACTIVE) {
-        if code == MODE_ACTIVE {
+        if code == MODE_ACTIVE && !place_at_entry() {
             nudge_off_edge();
         }
         GATE.with(|gate| gate.borrow_mut().ownership_changed());
@@ -664,6 +667,87 @@ fn check_jump_zone(pt: POINT) {
 /// takes control, so the jump zone doesn't immediately re-trigger. Mirrors
 /// Deskflow's jump-zone inset.
 const EDGE_NUDGE_PX: i32 = 12;
+
+/// Put the cursor where the peer's left it: on the edge it came in across, at
+/// the same fraction of the way along, [`EDGE_NUDGE_PX`] inside. Returns
+/// whether it did, so the caller falls back to the plain nudge otherwise.
+///
+/// `SetCursorPos` is the one way to do it a game does not see: it produces no
+/// `WM_INPUT` and passes no low-level hook, so nothing reading raw input — and
+/// not our own jump-zone watch — takes it for motion. A `SendInput` move of
+/// the same distance is exactly what a game reads as a flick.
+///
+/// Left alone while something owns the pointer. A game that hid the cursor or
+/// confined it with `ClipCursor` is steering by it, and has no free pointer
+/// for a height to apply to; a held button is a drag that a jump would tear.
+fn place_at_entry() -> bool {
+    let Some(entry) = crate::take_entry() else {
+        return false;
+    };
+    // Physical pixels, like the hook's, since this thread is per-monitor DPI
+    // aware. SAFETY: GetSystemMetrics has no preconditions.
+    let bounds = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if let Some(reason) = pointer_owned(bounds) {
+        tracing::debug!(reason, "pointer left where it was on entry");
+        return false;
+    }
+    let Some((x, y)) =
+        crate::edge_gate::entry_point(entry.edge, entry.pos_norm, bounds, EDGE_NUDGE_PX)
+    else {
+        return false;
+    };
+    // SAFETY: SetCursorPos takes plain screen coordinates; the OS clamps them to
+    // the virtual desktop.
+    if unsafe { SetCursorPos(x, y) } == 0 {
+        tracing::debug!(err = last_error(), "could not place the pointer on entry");
+        return false;
+    }
+    tracing::debug!(
+        edge = ?entry.edge,
+        pos_norm = entry.pos_norm,
+        x,
+        y,
+        "pointer placed where it left the peer"
+    );
+    true
+}
+
+/// Why the pointer belongs to someone else right now, if it does.
+fn pointer_owned(bounds: crate::edge_gate::Bounds) -> Option<&'static str> {
+    let mut info = CURSORINFO {
+        cbSize: size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is ours, with cbSize set as the call requires.
+    if unsafe { GetCursorInfo(&mut info) } != 0 && info.flags & CURSOR_SHOWING == 0 {
+        return Some("cursor hidden");
+    }
+    let mut clip = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let (vx, vy, vw, vh) = bounds;
+    // SAFETY: `clip` is ours; the call only writes it.
+    if unsafe { GetClipCursor(&mut clip) } != 0
+        && (clip.left > vx || clip.top > vy || clip.right < vx + vw || clip.bottom < vy + vh)
+    {
+        return Some("cursor confined");
+    }
+    // SAFETY: GetAsyncKeyState has no preconditions. The high bit is "down now".
+    let held = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+        .iter()
+        .any(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } as u16 & 0x8000 != 0);
+    held.then_some("button held")
+}
 
 /// Move the cursor inward, away from the edge it last left by, by
 /// [`EDGE_NUDGE_PX`]. No-op when no edge is known or the position can't be

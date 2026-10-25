@@ -682,6 +682,28 @@ async fn capture_loop(
                     // off the edge, the way Deskflow's `avoidJumpZone()` does.
                     // Crossing again then requires actually travelling back to the
                     // edge, which is exactly the intent we want to detect.
+                    //
+                    // When the cursor came back across an edge, it belongs at the
+                    // height it left the peer at, not where it left here. `Release`
+                    // takes that position and the compositor puts the pointer there
+                    // itself: no device motion, so nothing a game reads through
+                    // relative-pointer or raw input, and the barriers stay armed.
+                    let entry = crate::take_entry();
+                    if state.captured {
+                        if let Some(at) = entry.and_then(|e| entry_position(&rects, e.edge, e.pos_norm)) {
+                            let options = ashpd::desktop::input_capture::ReleaseOptions::default()
+                                .set_activation_id(state.activation_id)
+                                .set_cursor_position(Some(at));
+                            match ic.release(&session, options).await {
+                                Ok(()) => {
+                                    state.released();
+                                    tracing::info!(?at, "grab released with the pointer where it left the peer");
+                                    continue;
+                                }
+                                Err(e) => tracing::warn!(error = %e, "release at the entry point failed; nudging off the edge instead"),
+                            }
+                        }
+                    }
                     if state.captured || state.enabled {
                         let _ = ic.disable(&session, Default::default()).await;
                         state.released();
@@ -915,6 +937,54 @@ fn inside_edge(at: (f32, f32), peer_edge: Option<Edge>) -> (f64, f64) {
     }
 }
 
+/// Where a pointer coming in across `edge` at `pos_norm` belongs, in the
+/// portal's absolute coordinates: that far along the desktop's outer edge on
+/// that side, [`EDGE_NUDGE_PX`] inside it so the armed barrier does not catch
+/// it at once.
+///
+/// "Along the edge" is along every outer edge on that side taken together —
+/// the span [`crossing_from`] measures a pointer leaving by — so a desktop of
+/// two monitors stacked against the peer maps the peer's top half to the upper
+/// one. A fraction falling in a gap between them goes to the nearest.
+fn entry_position(rects: &[Rect], edge: Edge, pos_norm: f32) -> Option<(f64, f64)> {
+    let outer: Vec<Rect> = rects
+        .iter()
+        .copied()
+        .filter(|&r| is_outer_edge(r, edge, rects))
+        .collect();
+    let along = |&(x, y, w, h): &Rect| if edge.is_horizontal() { (x, w) } else { (y, h) };
+    let (origin, end) = edge_span(outer.iter().map(along))?;
+    let t = origin as f32 + pos_norm.clamp(0.0, 1.0) * (end - origin) as f32;
+    let t = t.min((end - 1) as f32);
+    let rect = *outer.iter().min_by_key(|r| {
+        let (start, len) = along(r);
+        let t = t as i32;
+        if t < start {
+            start - t
+        } else {
+            (t - (start + len - 1)).max(0)
+        }
+    })?;
+    let (start, len) = along(&rect);
+    let t = f64::from(t.clamp(start as f32, (start + len - 1) as f32));
+    let (x, y, w, h) = rect;
+    let inset = EDGE_NUDGE_PX;
+    Some(match edge {
+        Edge::Left => (f64::from(x + inset.min(w - 1)), t),
+        Edge::Right => (f64::from(x + w - 1 - inset.min(w - 1)), t),
+        Edge::Top => (t, f64::from(y + inset.min(h - 1))),
+        Edge::Bottom => (t, f64::from(y + h - 1 - inset.min(h - 1))),
+    })
+}
+
+/// The extent `(start, end)` covered by spans given as `(start, length)`.
+fn edge_span(spans: impl Iterator<Item = (i32, i32)>) -> Option<(i32, i32)> {
+    spans
+        .filter(|&(_, len)| len > 0)
+        .map(|(start, len)| (start, start + len))
+        .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+}
+
 /// Turn a portal [`Activated`] into an [`EdgeCrossing`], or `None` if we can't
 /// attribute it to a known barrier (unknown/absent id, or no cursor position).
 ///
@@ -934,15 +1004,25 @@ fn crossing_from(a: &Activated, info: &HashMap<u32, BarrierInfo>) -> Option<crat
     let (x, y) = a.cursor_position()?;
     // Position varies along x for a horizontal edge, along y for a vertical one.
     let coord = if bi.edge.is_horizontal() { x } else { y };
-    let pos_norm = if bi.length > 0 {
-        ((coord - bi.origin as f32) / bi.length as f32).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
     Some(crate::EdgeCrossing {
         edge: bi.edge,
-        pos_norm,
+        pos_norm: fraction_along(bi.edge, coord, info),
     })
+}
+
+/// How far along `edge` the pixel `coord` is, over every barrier on that side
+/// together — the span [`entry_position`] places a pointer coming back over.
+/// Measured per barrier, a desktop of two stacked monitors reported the middle
+/// of the lower one as halfway, and the pointer came home on the upper one.
+fn fraction_along(edge: Edge, coord: f32, info: &HashMap<u32, BarrierInfo>) -> f32 {
+    let spans = info
+        .values()
+        .filter(|b| b.edge == edge)
+        .map(|b| (b.origin, b.length));
+    match edge_span(spans) {
+        Some((start, end)) => ((coord - start as f32) / (end - start) as f32).clamp(0.0, 1.0),
+        None => 0.0,
+    }
 }
 
 /// Carries the sub-pixel remainder of pointer motion between libei events.
@@ -1268,6 +1348,34 @@ mod tests {
         let (_, info) = outer_edge_barriers(&[(1920, 200, 2560, 1440)], only(Edge::Right));
         let bi = *info.values().next().unwrap();
         assert_eq!((bi.origin, bi.length), (200, 1440));
+    }
+
+    #[test]
+    fn a_pointer_coming_home_lands_at_the_height_it_left_the_peer_at() {
+        let desk = [(0, 0, 1920, 1080)];
+        assert_eq!(
+            entry_position(&desk, Edge::Right, 0.5),
+            Some((1907.0, 540.0))
+        );
+        assert_eq!(entry_position(&desk, Edge::Left, 1.0), Some((12.0, 1079.0)));
+        assert_eq!(entry_position(&desk, Edge::Top, 0.25), Some((480.0, 12.0)));
+    }
+
+    #[test]
+    fn stacked_monitors_share_one_edge_both_leaving_and_coming_back() {
+        let desk = [(0, 0, 1920, 1080), (0, 1080, 1920, 1080)];
+        let (_, info) = outer_edge_barriers(&desk, only(Edge::Right));
+        let out = fraction_along(Edge::Right, 1620.0, &info);
+        assert!((out - 0.75).abs() < 1e-6, "left at {out}");
+        assert_eq!(
+            entry_position(&desk, Edge::Right, out),
+            Some((1907.0, 1620.0))
+        );
+    }
+
+    #[test]
+    fn an_edge_with_no_outer_monitor_has_nowhere_to_place_the_pointer() {
+        assert_eq!(entry_position(&[], Edge::Left, 0.5), None);
     }
 
     #[test]

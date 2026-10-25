@@ -150,6 +150,50 @@ and the cursor could reach it but never come back. The root window's bounds are
 the desktop's outer edges, as the Windows virtual screen is. With no display
 server at all the session says so at startup and hands over by hotkey.
 
+## Where the pointer comes in
+
+A pointer that leaves near the top of one screen should come in near the top
+of the next. `CrossEdge` has always carried where along the edge it left
+(`pos_norm`, a fraction of the whole desktop's edge on that side), but the
+receiver ignored it: the pointer appeared wherever it had last been, and on
+Wayland the portal handed it back at the spot it had left by, so going over at
+the top and back at the bottom brought it home at the top.
+
+The session now hands that fraction to capture with the ownership change
+(`Ownership::entry` → `cursio_input::enter_at`), and the backend places the
+pointer once, as it takes control, at the same fraction of its own edge and
+12 px inside it so the jump zone or barrier does not send it straight back. A
+hotkey handoff carries no entry and leaves the pointer alone. Motion after it
+stays relative.
+
+The rule that keeps this from jerking a game: **place it only by a means a
+game does not read as motion, and not at all while something owns the
+pointer.** A game reads relative device motion (raw input, Wayland's
+relative-pointer); a jump made of injected motion is exactly a flick to it.
+
+| backend | how it places | when it does not |
+| --- | --- | --- |
+| Windows | `SetCursorPos` — no `WM_INPUT`, no low-level hook event, so neither games nor our own jump-zone watch see it | cursor hidden (`GetCursorInfo` without `CURSOR_SHOWING`), confined by `ClipCursor` to less than the desktop, or a mouse button held (a drag the jump would tear) |
+| Wayland | `Release` with `cursor_position` while the portal holds the pointer: the compositor moves it itself, no device motion, barriers stay armed | the portal is not capturing (the cursor left by hotkey), or the release fails — then the old nudge off the edge |
+| macOS, X11 | not yet: the pointer comes back where it left | — |
+
+A game that hides the cursor is steering with it, and has no free pointer for a
+height to apply to. That is not a lost feature but the correct answer: the
+crossing itself should not happen while a game holds the mouse, and the flick
+filter in `edge_gate.rs` exists for the same reason.
+
+On Wayland a pointer this machine's portal never captured cannot be placed:
+uinput only moves relatively, which is the motion a game reads. In practice
+that is rare: a cursor coming here from a peer almost always left here across
+a barrier first, so the portal still holds this machine's pointer and releases
+it at the entry point. That covers a peer's own mouse driving this machine too:
+the cursor reached the peer by this barrier before the user picked that mouse
+up.
+
+Monitors of different heights on one side are measured as one span, leaving and
+coming in alike (`fraction_along`, `entry_position`): two monitors stacked
+against the peer map its top half to the upper one.
+
 ## Several peers: one mouse, one hub
 
 A machine with a neighbour to the right and another below has one mouse and

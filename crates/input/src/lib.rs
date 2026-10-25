@@ -202,6 +202,31 @@ pub fn last_crossed_edge() -> Option<cursio_protocol::Edge> {
     }
 }
 
+/// Where the pointer is to come in when this machine next takes the cursor:
+/// which of *its* edges and how far along, as the peer measured the pointer
+/// leaving its own desktop. `None` for a handoff that crossed no edge (the
+/// hotkey), which leaves the pointer where it was.
+static ENTRY: std::sync::Mutex<Option<EdgeCrossing>> = std::sync::Mutex::new(None);
+
+/// Say where the pointer enters on the coming handoff, replacing whatever an
+/// earlier one left unclaimed. Called before the grab mode changes, so the
+/// backend finds it when it takes control.
+///
+/// The backend places the pointer once, by a means a game does not read as
+/// motion — `SetCursorPos` on Windows, the portal's own release position on
+/// Wayland — and not at all while something has hidden or confined it
+/// (`docs/input-design.md`, "Where the pointer comes in"). Motion after it stays
+/// relative.
+pub fn enter_at(entry: Option<EdgeCrossing>) {
+    *ENTRY.lock().unwrap_or_else(|p| p.into_inner()) = entry;
+}
+
+/// Claim the entry [`enter_at`] left, so one handoff places the pointer once.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+pub(crate) fn take_entry() -> Option<EdgeCrossing> {
+    ENTRY.lock().unwrap_or_else(|p| p.into_inner()).take()
+}
+
 /// A screen-edge crossing detected by the capture backend: the shared cursor
 /// was shoved past `edge` at `pos_norm` along it (`0.0`..=`1.0`). The session
 /// turns this into an edge-crossing ownership handoff (if that edge borders the
@@ -209,7 +234,7 @@ pub fn last_crossed_edge() -> Option<cursio_protocol::Edge> {
 ///
 /// Emitted by the Wayland portal barriers, the Windows mouse hook and the macOS
 /// event tap. The evdev backend never emits one and cannot: see [`capture`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EdgeCrossing {
     /// Which of this machine's edges the cursor left across.
     pub edge: cursio_protocol::Edge,

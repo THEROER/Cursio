@@ -485,6 +485,11 @@ pub struct Ownership {
     /// Never set by something the peer said: taking the cursor back tells us to
     /// stop driving, never to start.
     pub driving: bool,
+    /// Where the pointer comes in, when the peer sent it across an edge: which
+    /// of this machine's edges, and how far along it (`0.0..=1.0`) it left the
+    /// peer's. `None` for every other handoff, which leaves the pointer where
+    /// it was.
+    pub entry: Option<(cursio_protocol::Edge, f32)>,
 }
 
 /// One locally captured input event, stamped when it was handed to sessions.
@@ -865,6 +870,7 @@ where
         active: am_active,
         panic: false,
         driving: role.driving(),
+        entry: None,
     });
     tracing::info!(am_active, "initial ownership");
 
@@ -987,7 +993,7 @@ where
                     if role.driving() {
                         role.seize();
                         am_active = role.active();
-                        on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
+                        on_ownership(Ownership { active: am_active, panic: false, driving: role.driving(), entry: None });
                     }
                     let _ = outbox.send(&Message::Bye).await;
                     break Ok(());
@@ -1016,7 +1022,7 @@ where
                     role.seize();
                     am_active = role.active();
                     tracing::info!("input sharing turned off; the cursor is back on this machine");
-                    on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
+                    on_ownership(Ownership { active: am_active, panic: false, driving: role.driving(), entry: None });
                     if let Err(e) = outbox.send(&Message::Grab { active: false }).await {
                         break Err(SessionError::from(e));
                     }
@@ -1065,7 +1071,7 @@ where
                         role.toggle();
                         am_active = role.active();
                         tracing::info!(am_active, driving = role.driving(), "hotkey toggled ownership");
-                        on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
+                        on_ownership(Ownership { active: am_active, panic: false, driving: role.driving(), entry: None });
                         // Peer takes the opposite of our new state.
                         if let Err(e) = outbox.send(&Message::Grab { active: !am_active }).await {
                             break Err(SessionError::from(e));
@@ -1095,7 +1101,7 @@ where
                             role.hand_over();
                             am_active = role.active();
                             tracing::info!(?edge, pos_norm, "cursor crossed peer edge; handing off");
-                            on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
+                            on_ownership(Ownership { active: am_active, panic: false, driving: role.driving(), entry: None });
                             // Peer becomes active, entering on its opposite edge.
                             let msg = Message::CrossEdge { edge: edge.opposite(), pos_norm };
                             if let Err(e) = outbox.send(&msg).await {
@@ -1119,7 +1125,7 @@ where
                         tracing::warn!("PANIC: forcing control back to this machine");
                         role.panic();
                         am_active = role.active();
-                        on_ownership(Ownership { active: am_active, panic: true, driving: role.driving() });
+                        on_ownership(Ownership { active: am_active, panic: true, driving: role.driving(), entry: None });
                         let _ = outbox.send(&Message::Grab { active: false }).await;
                     }
                     None => commands = None,
@@ -1231,7 +1237,7 @@ where
                             // hunting through the motion path while diagnosing a
                             // frozen cursor.
                             tracing::info!(am_active, "peer handed ownership over (Grab)");
-                            on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
+                            on_ownership(Ownership { active: am_active, panic: false, driving: role.driving(), entry: None });
                         }
                     }
                     Some(Message::CrossEdge { edge, pos_norm }) => {
@@ -1247,7 +1253,12 @@ where
                         am_active = role.active();
                         if !was_active {
                             tracing::info!(?edge, pos_norm, "cursor crossed in from peer");
-                            on_ownership(Ownership { active: am_active, panic: false, driving: role.driving() });
+                            on_ownership(Ownership {
+                                active: am_active,
+                                panic: false,
+                                driving: role.driving(),
+                                entry: Some((edge, pos_norm)),
+                            });
                         } else {
                             tracing::info!(?edge, pos_norm, "peer began driving the cursor held here");
                         }
@@ -1302,6 +1313,7 @@ where
         active: true,
         panic: false,
         driving: false,
+        entry: None,
     });
     tracing::info!("session ending; shutting down modules");
     module_host::shut_down(hosts, module_host::MODULE_SHUTDOWN_GRACE).await;
