@@ -49,6 +49,8 @@ pub mod window_test_support;
 
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 mod presentation_ack;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod surrogate_front;
 
 /// The platform-independent half of the H.264 path (what a decoder returns,
 /// and where a stream may be entered), shared by the Linux and Windows

@@ -41,17 +41,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cursio_protocol::{
-    Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
-    WindowMeta,
+    Rect, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput, WindowMeta,
 };
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use tokio::sync::mpsc;
 
 use crate::{
-    codec::decode_tile,
-    framebuffer::{contained_to_host, fit_into, geometry_of, refit, Framebuffer, Geometry},
-    presentation_ack::PresentationAcks,
+    framebuffer::{contained_to_host, fit_into, refit, Framebuffer},
+    surrogate_front::SurrogateFront,
     video_decoder::VideoDecoder,
     Surrogate, WindowError, WindowRenderer,
 };
@@ -68,106 +66,25 @@ fn to_texture(fb: &Framebuffer) -> gdk::MemoryTexture {
     )
 }
 
-/// What the session hands the GTK thread.
-enum SurrogateCommand {
-    /// A decoded tile to blit and present.
-    Frame { seq: u32, dirty: Rect, raw: Vec<u8> },
-    /// A raw H.264 packet, for this window's own decoder thread
-    /// ([`spawn_video`]).
-    ///
-    /// Every other codec is decoded on the session's thread. Video cannot be:
-    /// `ffmpeg`'s scaling context is not `Send` (the crate deliberately
-    /// declines to claim it is, though it does claim it for codec contexts),
-    /// and [`SessionModule`] requires `Send`. Nor on the GTK thread, where it
-    /// used to be: a phone's 848×1920 stream took ticks past 100 ms there, and
-    /// the window stopped answering its own close button.
-    VideoPacket { seq: u32, packet: Vec<u8> },
-    /// Window geometry changed; reallocate before the next blit.
-    Resize { width: u32, height: u32 },
-    /// The window grew, learnt from a tile rather than a full frame. Keeps the
-    /// pixels already drawn — see [`Framebuffer::grow_to`].
-    Grow { width: u32, height: u32 },
-    /// Tear the window down.
-    Close(WindowCloseReason),
-}
+/// What the session hands the GTK thread; a GTK window has nothing of its own
+/// to be told.
+type SurrogateCommand = crate::surrogate_front::SurrogateCommand<std::convert::Infallible>;
 
 /// A surrogate window driven from the session, rendered by GTK on its own thread.
 pub struct GtkSurrogate {
-    id: WindowId,
-    /// Geometry as the viewer currently believes it — used to spot a resize and
-    /// to size-check tiles before they reach the GTK thread.
-    width: u32,
-    height: u32,
-    commands: mpsc::UnboundedSender<SurrogateCommand>,
+    front: SurrogateFront<std::convert::Infallible>,
     input: mpsc::UnboundedReceiver<WindowInput>,
-    presented: mpsc::UnboundedReceiver<u32>,
     /// Sizes the user dragged this window to, newest wins. See
     /// [`Surrogate::take_resize_request`].
     resized: mpsc::UnboundedReceiver<(u32, u32)>,
     /// The last size actually asked of the host, so a drag that returns to a
     /// size already requested does not ask again.
     requested_size: Option<(u32, u32)>,
-    acks: PresentationAcks,
-    /// Whether a `LossyVideo` packet has been seen, so the log says once that
-    /// the stream switched to video. The decoder itself lives on the GTK
-    /// thread — see [`SurrogateCommand::VideoPacket`].
-    video_started: bool,
-    /// Raised by the GTK thread while its decoder waits for a keyframe.
-    wants_keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Surrogate for GtkSurrogate {
     fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
-        // A frame the picture cannot hold means the host resized the window;
-        // adopt the new geometry before blitting into it.
-        match geometry_of(frame.dirty, frame.codec, self.width, self.height) {
-            Geometry::Unchanged => {}
-            Geometry::Resize { width, height } => {
-                (self.width, self.height) = (width, height);
-                let _ = self
-                    .commands
-                    .send(SurrogateCommand::Resize { width, height });
-            }
-            Geometry::Grow { width, height } => {
-                (self.width, self.height) = (width, height);
-                let _ = self.commands.send(SurrogateCommand::Grow { width, height });
-            }
-        }
-
-        // `LossyVideo` is the one codec whose packets are *not* self-contained:
-        // each references earlier ones, so it needs a decoder that persists
-        // across frames, and one packet may yield zero pictures (the decoder is
-        // still accumulating) or several. Every other codec is a pure
-        // bytes-in/pixels-out transform.
-        if frame.codec == TileCodec::LossyVideo {
-            if !self.video_started {
-                self.video_started = true;
-                tracing::info!(id = self.id, "host switched this window to a video stream");
-            }
-            // The packet, not the pixels, crosses to the GTK thread — the
-            // decoder cannot live here (see `SurrogateCommand::VideoPacket`).
-            self.commands
-                .send(SurrogateCommand::VideoPacket {
-                    seq: frame.seq,
-                    packet: frame.data.clone(),
-                })
-                .map_err(|_| WindowError::Backend("surrogate window is gone".into()))?;
-            return Ok(());
-        }
-
-        let expected = (frame.dirty.width as usize) * (frame.dirty.height as usize) * 4;
-        // Decoding happens here, off the GTK thread: zstd on a large tile is
-        // real work and the UI thread must stay free to actually paint.
-        let raw = decode_tile(frame.codec, &frame.data, expected)?;
-        self.commands
-            .send(SurrogateCommand::Frame {
-                seq: frame.seq,
-                dirty: frame.dirty,
-                raw,
-            })
-            .map_err(|_| WindowError::Backend("surrogate window is gone".into()))?;
-
-        Ok(())
+        self.front.apply_frame(frame)
     }
 
     fn input(&mut self) -> &mut mpsc::UnboundedReceiver<WindowInput> {
@@ -176,19 +93,15 @@ impl Surrogate for GtkSurrogate {
 
     /// The window's tick owns the command receiver and ends with the window.
     fn is_gone(&self) -> bool {
-        self.commands.is_closed()
+        self.front.is_gone()
     }
 
     fn take_ack(&mut self) -> Option<WindowFrameAck> {
-        while let Ok(seq) = self.presented.try_recv() {
-            self.acks.note_presented(seq);
-        }
-        self.acks.take()
+        self.front.take_ack()
     }
 
     fn take_keyframe_request(&mut self) -> bool {
-        self.wants_keyframe
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        self.front.take_keyframe_request()
     }
 
     fn take_resize_request(&mut self) -> Option<(u32, u32)> {
@@ -202,7 +115,7 @@ impl Surrogate for GtkSurrogate {
         // The host answers a resize with a full frame, which sets `self.width`
         // — so a size we already asked for, or one that matches what is being
         // shown, would be an echo of our own request.
-        if Some(size) == self.requested_size || size == (self.width, self.height) {
+        if Some(size) == self.requested_size || size == self.front.size() {
             return None;
         }
         self.requested_size = Some(size);
@@ -210,16 +123,7 @@ impl Surrogate for GtkSurrogate {
     }
 
     fn close(&mut self, reason: WindowCloseReason) {
-        tracing::info!(?reason, id = self.id, "closing surrogate window");
-        let _ = self.commands.send(SurrogateCommand::Close(reason));
-    }
-}
-
-impl Drop for GtkSurrogate {
-    fn drop(&mut self) {
-        let _ = self
-            .commands
-            .send(SurrogateCommand::Close(WindowCloseReason::ViewerClosed));
+        self.front.close(reason);
     }
 }
 
@@ -333,17 +237,16 @@ fn spawn_surrogate(meta: &WindowMeta) -> Result<GtkSurrogate, WindowError> {
 
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(GtkSurrogate {
-            id: meta.id,
-            width: meta.width,
-            height: meta.height,
-            commands: cmd_tx,
+            front: SurrogateFront::new(
+                meta.id,
+                (meta.width, meta.height),
+                cmd_tx,
+                presented_rx,
+                wants_keyframe,
+            ),
             input: input_rx,
-            presented: presented_rx,
             resized: resized_rx,
             requested_size: None,
-            acks: PresentationAcks::new(meta.id),
-            video_started: false,
-            wants_keyframe,
         }),
         Ok(Err(e)) => Err(WindowError::Backend(e)),
         Err(_) => Err(WindowError::Backend(
@@ -596,6 +499,7 @@ fn build_window(
                         main_loop_window.set_default_size(w, h);
                         painted = true;
                     }
+                    Ok(SurrogateCommand::Platform(never)) => match never {},
                     Ok(SurrogateCommand::Close(reason)) => {
                         tracing::info!(?reason, id, "surrogate window closing");
                         // `destroy`, not `close`: a close is a request the window

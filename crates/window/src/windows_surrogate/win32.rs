@@ -43,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::framebuffer::{contained_to_host, refit, Framebuffer};
 use crate::video_decoder_win::VideoDecoder;
 
-use super::{unseen, SurrogateCommand};
+use super::{unseen, SurrogateCommand, Win32Command};
 
 /// State the window procedure needs, reached through `GWLP_USERDATA`.
 ///
@@ -864,7 +864,7 @@ pub(crate) fn run(
                         size_for(hwnd, is_view, old, (width, height));
                         painted = true;
                     }
-                    Ok(SurrogateCommand::Restart { title }) => {
+                    Ok(SurrogateCommand::Platform(Win32Command::Restart { title })) => {
                         // A new source is a new H.264 stream, possibly at
                         // another size; the old decoder's reference frames
                         // mean nothing to it.
@@ -882,7 +882,7 @@ pub(crate) fn run(
                         }
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
-                    Ok(SurrogateCommand::Sources(list)) => {
+                    Ok(SurrogateCommand::Platform(Win32Command::Sources(list))) => {
                         let state = &*state_ptr;
                         if let Some(view) = state.view.as_ref() {
                             *view.sources.borrow_mut() = list;

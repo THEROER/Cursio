@@ -36,61 +36,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use cursio_protocol::{
-    Rect, ScreenSource, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId,
-    WindowInput, WindowMeta,
+    ScreenSource, WindowCloseReason, WindowFrame, WindowFrameAck, WindowInput, WindowMeta,
 };
 use tokio::sync::mpsc;
 
-use crate::codec::decode_tile;
-use crate::framebuffer::{geometry_of, Geometry};
-use crate::{
-    presentation_ack::PresentationAcks, SourcePick, Surrogate, WindowError, WindowRenderer,
-};
+use crate::surrogate_front::SurrogateFront;
+use crate::{SourcePick, Surrogate, WindowError, WindowRenderer};
 
 mod unseen;
 mod win32;
 
 pub use unseen::set_icons_shown;
 
-/// What the session hands the window thread.
-pub(crate) enum SurrogateCommand {
-    /// A decoded tile to blit and present.
-    Frame { seq: u32, dirty: Rect, raw: Vec<u8> },
-    /// A raw H.264 packet, decoded **on the window thread**.
-    ///
-    /// Same reasoning as the GTK side: a video decoder is stateful and its
-    /// pieces are not `Send`, while [`SessionModule`] requires `Send`. Sending
-    /// the packet rather than the pixels also saves a copy, since the decoded
-    /// frame is wanted exactly where the framebuffer lives.
-    VideoPacket { seq: u32, packet: Vec<u8> },
-    /// Window geometry changed; reallocate before the next blit.
-    Resize { width: u32, height: u32 },
-    /// The window grew, learnt from a tile rather than a full frame. Keeps the
-    /// pixels already drawn — see [`Framebuffer::grow_to`].
-    Grow { width: u32, height: u32 },
-    /// A remote-screen view's stream starts over with another source: drop the
-    /// decoder and the picture, keep the window.
+/// What only a Win32 surrogate is told: a remote-screen view switching what it
+/// shows.
+pub(crate) enum Win32Command {
+    /// The view's stream starts over with another source: drop the decoder and
+    /// the picture, keep the window.
     Restart { title: String },
-    /// A remote-screen view's selector list changed.
+    /// The view's selector list changed.
     Sources(Vec<ScreenSource>),
-    /// Tear the window down.
-    Close(WindowCloseReason),
 }
+
+/// What the session hands the window thread.
+pub(crate) type SurrogateCommand = crate::surrogate_front::SurrogateCommand<Win32Command>;
 
 /// A surrogate window on Windows, driven from the session.
 pub struct Win32Surrogate {
-    id: WindowId,
-    width: u32,
-    height: u32,
-    commands: mpsc::UnboundedSender<SurrogateCommand>,
+    front: SurrogateFront<Win32Command>,
     input: mpsc::UnboundedReceiver<WindowInput>,
-    presented: mpsc::UnboundedReceiver<u32>,
-    acks: PresentationAcks,
-    video_started: bool,
     /// Set by the window thread when the user closes the window, so the session
     /// learns about it even before the channels drop.
-    /// Raised by the window thread while its decoder waits for a keyframe.
-    wants_keyframe: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     /// Set for a remote-screen view: what the user picked in its selector.
     picks: Option<mpsc::UnboundedReceiver<SourcePick>>,
@@ -101,48 +77,7 @@ impl Surrogate for Win32Surrogate {
         if self.closed.load(Ordering::Relaxed) {
             return Err(WindowError::Backend("surrogate window was closed".into()));
         }
-
-        match geometry_of(frame.dirty, frame.codec, self.width, self.height) {
-            Geometry::Unchanged => {}
-            Geometry::Resize { width, height } => {
-                (self.width, self.height) = (width, height);
-                let _ = self
-                    .commands
-                    .send(SurrogateCommand::Resize { width, height });
-            }
-            Geometry::Grow { width, height } => {
-                (self.width, self.height) = (width, height);
-                let _ = self.commands.send(SurrogateCommand::Grow { width, height });
-            }
-        }
-
-        if frame.codec == TileCodec::LossyVideo {
-            if !self.video_started {
-                self.video_started = true;
-                tracing::info!(id = self.id, "host switched this window to a video stream");
-            }
-            self.commands
-                .send(SurrogateCommand::VideoPacket {
-                    seq: frame.seq,
-                    packet: frame.data.clone(),
-                })
-                .map_err(|_| WindowError::Backend("surrogate window is gone".into()))?;
-            return Ok(());
-        }
-
-        let expected = (frame.dirty.width as usize) * (frame.dirty.height as usize) * 4;
-        // Decoded here, off the window thread, so the message loop stays
-        // responsive — the same discipline as the GTK surrogate.
-        let raw = decode_tile(frame.codec, &frame.data, expected)?;
-        self.commands
-            .send(SurrogateCommand::Frame {
-                seq: frame.seq,
-                dirty: frame.dirty,
-                raw,
-            })
-            .map_err(|_| WindowError::Backend("surrogate window is gone".into()))?;
-
-        Ok(())
+        self.front.apply_frame(frame)
     }
 
     fn input(&mut self) -> &mut mpsc::UnboundedReceiver<WindowInput> {
@@ -150,28 +85,22 @@ impl Surrogate for Win32Surrogate {
     }
 
     fn take_ack(&mut self) -> Option<WindowFrameAck> {
-        while let Ok(seq) = self.presented.try_recv() {
-            self.acks.note_presented(seq);
-        }
-        self.acks.take()
+        self.front.take_ack()
     }
 
     fn take_keyframe_request(&mut self) -> bool {
-        self.wants_keyframe.swap(false, Ordering::Relaxed)
+        self.front.take_keyframe_request()
     }
 
     fn restart_stream(&mut self, title: &str) {
-        self.video_started = false;
-        self.acks = PresentationAcks::new(self.id);
-        let _ = self.commands.send(SurrogateCommand::Restart {
+        self.front.restart();
+        self.front.platform(Win32Command::Restart {
             title: title.to_string(),
         });
     }
 
     fn set_sources(&mut self, sources: &[ScreenSource]) {
-        let _ = self
-            .commands
-            .send(SurrogateCommand::Sources(sources.to_vec()));
+        self.front.platform(Win32Command::Sources(sources.to_vec()));
     }
 
     fn take_source_pick(&mut self) -> Option<SourcePick> {
@@ -179,16 +108,7 @@ impl Surrogate for Win32Surrogate {
     }
 
     fn close(&mut self, reason: WindowCloseReason) {
-        tracing::info!(?reason, id = self.id, "closing surrogate window");
-        let _ = self.commands.send(SurrogateCommand::Close(reason));
-    }
-}
-
-impl Drop for Win32Surrogate {
-    fn drop(&mut self) {
-        let _ = self
-            .commands
-            .send(SurrogateCommand::Close(WindowCloseReason::ViewerClosed));
+        self.front.close(reason);
     }
 }
 
@@ -243,16 +163,15 @@ fn open_surrogate(meta: &WindowMeta, view: bool) -> Result<Win32Surrogate, Windo
     // rather than as a window that never appears.
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(Win32Surrogate {
-            id: meta.id,
-            width: meta.width,
-            height: meta.height,
-            commands: cmd_tx,
+            front: SurrogateFront::new(
+                meta.id,
+                (meta.width, meta.height),
+                cmd_tx,
+                presented_rx,
+                wants_keyframe,
+            ),
             input: input_rx,
-            presented: presented_rx,
-            acks: PresentationAcks::new(meta.id),
-            video_started: false,
             closed,
-            wants_keyframe,
             picks: view.then_some(picks_rx),
         }),
         Ok(Err(e)) => Err(WindowError::Backend(e)),
