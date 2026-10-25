@@ -107,6 +107,15 @@ enum Command {
         /// The machine's name or id, as `cursio status` shows it.
         machine: String,
     },
+    /// Wake a paired machine that is asleep, with a Wake-on-LAN packet.
+    ///
+    /// Needs no running node: the machine's hardware address was learned the
+    /// last time it connected over the network, and its own firmware must
+    /// have wake-on-LAN on.
+    Wake {
+        /// The machine's name or id, as `cursio status` shows it.
+        machine: String,
+    },
     /// Send a link, text or a file to a connected machine.
     ///
     /// A link opens in that machine's browser and a file in its default
@@ -1184,6 +1193,11 @@ async fn run() -> anyhow::Result<()> {
             restart_process("asked to").await
         }
         Command::Forget { machine } => forget_machine(&machine, &config_path).await,
+        Command::Wake { machine } => {
+            let name = cursio_core::wake::wake(&machine)?;
+            println!("sent a wake-up to {name}; it joins the mesh once it is up");
+            Ok(())
+        }
         Command::Send {
             target,
             to,
@@ -2018,6 +2032,7 @@ async fn run_mesh(
                             modules.clone(),
                             offer,
                             Some(device),
+                            None,
                         );
                     },
                 )
@@ -2056,6 +2071,7 @@ async fn run_mesh(
                             }
                         };
                         tracing::info!(peer = %transport.peer_addr(), "peer dialled in");
+                        let network = Some(transport.peer_addr().ip());
                         spawn_peer_session(
                             transport,
                             identity.clone(),
@@ -2070,6 +2086,7 @@ async fn run_mesh(
                             modules.clone(),
                             offer,
                             None,
+                            network,
                         );
                     }
 
@@ -2160,6 +2177,7 @@ async fn run_mesh(
                                     modules.clone(),
                                     offer,
                                     None,
+                                    Some(addr.ip()),
                                 );
                             }
                         }
@@ -2220,6 +2238,7 @@ async fn run_mesh(
                                 modules.clone(),
                                 offer,
                                 None,
+                                Some(target.addr.ip()),
                             );
                         }
                         });
@@ -2472,6 +2491,9 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
     // The device's address for a Bluetooth connection, so the peer that
     // greets on it is remembered as that radio's.
     bluetooth: Option<String>,
+    // The peer's address for a network connection, whose neighbour-table
+    // entry gives the hardware address a wake-up is sent to.
+    network: Option<std::net::IpAddr>,
 ) {
     let shape = cursio_core::registry::LinkShape {
         dialled: matches!(role, Role::Initiator),
@@ -2507,6 +2529,9 @@ fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
                   name: &str,
                   peer_tags: &[cursio_protocol::SessionTag]| {
                 *seen.borrow_mut() = Some(id);
+                if let Some(ip) = network {
+                    tokio::task::spawn_blocking(move || cursio_core::wake::learn(id, ip));
+                }
                 let mut reg = reg_for_cb.borrow_mut();
                 if let Some(address) = &bluetooth {
                     // Kept past a restart, like the network address after a

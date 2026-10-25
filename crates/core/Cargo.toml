@@ -138,6 +138,8 @@ windows = { version = "0.61", features = [
     # GlobalMemoryStatusEx — commit charge against its limit, for the pressure
     # monitor; see pressure.rs.
     "Win32_System_SystemInformation",
+    # SendARP — a peer's hardware address, for Wake-on-LAN; see wake.rs.
+    "Win32_NetworkManagement_IpHelper",
     # GetNamedPipeServerProcessId — the drive helper's pipe is checked to be
     # served by the helper this node started; see mount_helper.rs.
     "Win32_System_Pipes",

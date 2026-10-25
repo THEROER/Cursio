@@ -154,6 +154,7 @@ cursio mesh            # run as a mesh node — this is how everything runs
 cursio status          # what the running node is doing: peers, modules, latency, problems
 cursio pair [CODE]     # pair through the running node with a one-time code
 cursio forget <NAME>   # remove a paired machine and its key
+cursio wake <NAME>     # wake a paired machine that is asleep (Wake-on-LAN)
 cursio peers           # list peers discovered on the LAN, then exit
 cursio config          # print the config `mesh` would run with, and where it lives
 cursio update ...      # install, switch and roll back versions

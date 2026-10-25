@@ -935,6 +935,18 @@ pub mod commands {
         link.request(Command::Ring { peer: phone }).await
     }
 
+    /// Wake a paired machine that is asleep. Not through the node: the
+    /// packet needs only the address the trust store keeps, and a machine
+    /// worth waking is often woken while this one's node is still starting.
+    #[cfg(desktop)]
+    #[tauri::command]
+    pub async fn node_wake(machine: String) -> Result<String, NodeError> {
+        tauri::async_runtime::spawn_blocking(move || cursio_core::wake::wake(&machine))
+            .await
+            .map_err(NodeError::failed)?
+            .map_err(NodeError::failed)
+    }
+
     /// Off the window's thread: `systemctl` or a process spawn can take a
     /// noticeable moment, and a synchronous command would freeze the window
     /// for it.

@@ -95,6 +95,23 @@ export function usePeerMenu() {
     // A machine that never comes online may be one the other side removed;
     // pairing again is then the way back, not waiting.
     if (peer.presence === "offline") {
+      // A computer asleep wakes by its hardware address, learned the last
+      // time it connected; the phone's app cannot read that table, so it
+      // offers nothing it could not do.
+      if (!isMobile.value) {
+        list.push({
+          label: t("peerMenu.wake"),
+          icon: "lucide:power",
+          onSelect: async () => {
+            try {
+              await invoke("node_wake", { machine: peer.id })
+              toast.success(t("peerMenu.wakeSent", { name: peer.name }))
+            } catch (e) {
+              toast.failure(e, { title: t("peerMenu.wakeFailed", { name: peer.name }) })
+            }
+          },
+        })
+      }
       list.push({
         label: t("peerMenu.pairAgain"),
         icon: "lucide:link",

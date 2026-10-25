@@ -174,6 +174,24 @@ handshake fails here the way any stranger's does; the node says so once
 (`forget::note_refused_call`) and not every sweep. Pairing the two again, from
 either side, takes the machine off `forgotten` so its new link stays up.
 
+## Waking a machine that is asleep
+
+An offline machine may only be asleep. `cursio wake <NAME>`, and *Wake up* in
+an offline machine's menu in the app, send it a Wake-on-LAN packet
+(`core/src/wake.rs`). The one thing that takes is the hardware address of its
+network card, and a sleeping machine cannot say it. So it is learned while the
+machine is awake: whenever a link over the network identifies a peer, this
+machine reads the address from its own neighbour table and keeps it in the
+trust store beside the peer's last address (`TrustedPeer::mac`). Nobody types
+it, and it follows a card that was replaced.
+
+Neither needs a running node, since the address is in the file. The packet goes
+to the LAN's broadcast address, so it wakes machines on this network only,
+which is all the mesh is. Whether a card listens while asleep is that machine's
+firmware and driver setting. Nothing comes back to say the machine woke; its
+link coming up is the answer. A phone learns nothing: since Android 10 an app
+may not read the neighbour table.
+
 ## Where a machine stands
 
 Placement is a **grid cell**, `--at X,Y`, carried in `Hello` — cells, not pixels,

@@ -165,6 +165,8 @@ pub mod usb_node;
 pub mod usb_session;
 #[cfg(feature = "window")]
 mod video_budget;
+/// Waking a paired machine that is asleep, by the address learned while awake.
+pub mod wake;
 #[cfg(feature = "window")]
 pub mod window_session;
 
