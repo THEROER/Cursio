@@ -12,18 +12,15 @@
 //! thousand texts or read a whole history in one page. [`check`] bounds it
 //! before the store sees it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use cursio_protocol::messages::{
     MessagesMsg, MessagesRequest, MessagesResponse, MAX_BODY_BYTES, MAX_PAGE,
 };
-use cursio_protocol::{Message, ModuleAdvert, ModuleId, ModuleRole, PeerId};
-use cursio_transport::{TransportError, TransportTx};
-use tokio::sync::{mpsc, oneshot};
+use cursio_protocol::{ModuleAdvert, ModuleId, ModuleRole, Priority};
 
-use crate::messages_hub::{hub, MessageStore, Outgoing};
+use crate::exchange_session::{Exchange, ExchangeEngine};
+use crate::messages_hub::{hub, MessageStore, MessagesHub};
 use crate::module::SessionModule;
 
 /// Version of [`MessagesMsg`]; peers run the module only on an exact match.
@@ -32,96 +29,6 @@ pub const VERSION: u16 = 1;
 /// Most recipients one message may go to. A group text to more is a mailing
 /// list, and a request for one is more likely a mistake than a message.
 const MAX_RECIPIENTS: usize = 20;
-
-type Answer = Result<MessagesResponse, String>;
-
-/// The phone's half.
-struct Answering {
-    store: Arc<dyn MessageStore>,
-    /// The store's change count last told to the desktop.
-    told: u64,
-    incoming: Vec<(u32, MessagesRequest)>,
-    in_flight: usize,
-    done_tx: mpsc::UnboundedSender<(u32, Answer)>,
-    done_rx: mpsc::UnboundedReceiver<(u32, Answer)>,
-}
-
-/// The desktop's half.
-struct Asking {
-    outbox: mpsc::UnboundedReceiver<Outgoing>,
-    token: u64,
-    next_id: u32,
-    waiting: HashMap<u32, oneshot::Sender<Answer>>,
-}
-
-pub struct MessagesEngine {
-    peer: PeerId,
-    peer_name: String,
-    answering: Option<Answering>,
-    asking: Option<Asking>,
-}
-
-impl MessagesEngine {
-    pub fn new(
-        peer: PeerId,
-        peer_name: String,
-        store: Option<Arc<dyn MessageStore>>,
-        asks: bool,
-    ) -> Self {
-        let answering = store.map(|store| {
-            let (done_tx, done_rx) = mpsc::unbounded_channel();
-            Answering {
-                store,
-                told: hub().generation(),
-                incoming: Vec::new(),
-                in_flight: 0,
-                done_tx,
-                done_rx,
-            }
-        });
-        let asking = asks.then(|| {
-            let (outbox, token) = hub().register(peer, peer_name.clone());
-            Asking {
-                outbox,
-                token,
-                next_id: 1,
-                waiting: HashMap::new(),
-            }
-        });
-        MessagesEngine {
-            peer,
-            peer_name,
-            answering,
-            asking,
-        }
-    }
-
-    fn on_message(&mut self, msg: MessagesMsg) {
-        match msg {
-            MessagesMsg::Request { id, request } => match &mut self.answering {
-                Some(answering) => answering.incoming.push((id, request)),
-                None => {
-                    tracing::debug!(peer = %self.peer_name, "a peer asked for messages this machine does not have")
-                }
-            },
-            MessagesMsg::Response { id, response } => {
-                let waiting = self.asking.as_mut().and_then(|a| a.waiting.remove(&id));
-                match waiting {
-                    // The asker may have given up waiting; that is not an error.
-                    Some(reply) => drop(reply.send(response)),
-                    None => {
-                        tracing::debug!(peer = %self.peer_name, id, "an answer nobody is waiting for")
-                    }
-                }
-            }
-            MessagesMsg::Changed => {
-                if self.asking.is_some() {
-                    hub().bump(&self.peer);
-                }
-            }
-        }
-    }
-}
 
 /// Bound a request from the peer before the store sees it.
 pub fn check(request: MessagesRequest) -> Result<MessagesRequest, String> {
@@ -181,99 +88,47 @@ pub fn check(request: MessagesRequest) -> Result<MessagesRequest, String> {
     }
 }
 
-async fn send(tx: &mut dyn TransportTx, msg: &MessagesMsg) -> Result<(), TransportError> {
-    let message = Message::module(ModuleId::MESSAGES, MessagesMsg::PRIORITY, msg)?;
-    tx.send(&message).await
-}
+/// Messages as a request-and-answer module.
+pub struct Messages;
 
-#[async_trait]
-impl SessionModule for MessagesEngine {
-    fn name(&self) -> &'static str {
-        "messages"
+impl Exchange for Messages {
+    type Request = MessagesRequest;
+    type Response = MessagesResponse;
+    type Store = dyn MessageStore;
+
+    const MODULE: ModuleId = ModuleId::MESSAGES;
+    const NAME: &'static str = "messages";
+    const NOT_HERE: &'static str = "a peer asked for messages this machine does not have";
+    // A provider query or a radio call each: every one is handed to the pool
+    // as it comes, so a slow one does not hold the others behind it.
+    const MAX_IN_FLIGHT: Option<usize> = None;
+
+    fn hub() -> &'static MessagesHub {
+        hub()
     }
 
-    fn id(&self) -> ModuleId {
-        ModuleId::MESSAGES
+    fn answer(
+        store: &dyn MessageStore,
+        request: &MessagesRequest,
+    ) -> Result<MessagesResponse, String> {
+        store.handle(request)
     }
 
-    async fn start(&mut self, _tx: &mut dyn TransportTx) -> Result<(), TransportError> {
-        if self.asking.is_some() {
-            tracing::info!(peer = %self.peer_name, "this phone's messages can be read here");
-        }
-        Ok(())
+    fn check(request: MessagesRequest) -> Result<MessagesRequest, String> {
+        check(request)
     }
 
-    async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
-        if let Some(answering) = &mut self.answering {
-            for (id, request) in answering.incoming.drain(..) {
-                let request = match check(request) {
-                    Ok(request) => request,
-                    Err(reason) => {
-                        let _ = answering.done_tx.send((id, Err(reason)));
-                        continue;
-                    }
-                };
-                // A provider query or a radio call: off this thread, so a slow
-                // one does not hold the link's other answers behind it.
-                let store = answering.store.clone();
-                let done = answering.done_tx.clone();
-                answering.in_flight += 1;
-                tokio::task::spawn_blocking(move || {
-                    let _ = done.send((id, store.handle(&request)));
-                });
-            }
-            while let Ok((id, response)) = answering.done_rx.try_recv() {
-                answering.in_flight = answering.in_flight.saturating_sub(1);
-                if let Err(reason) = &response {
-                    tracing::debug!(id, %reason, "a messages request was refused");
-                }
-                send(tx, &MessagesMsg::Response { id, response }).await?;
-            }
-            let generation = hub().generation();
-            if generation != answering.told {
-                answering.told = generation;
-                send(tx, &MessagesMsg::Changed).await?;
-            }
-        }
-        if let Some(asking) = &mut self.asking {
-            asking.waiting.retain(|_, reply| !reply.is_closed());
-            while let Ok(Outgoing { request, reply }) = asking.outbox.try_recv() {
-                let id = asking.next_id;
-                asking.next_id = asking.next_id.wrapping_add(1).max(1);
-                asking.waiting.insert(id, reply);
-                send(tx, &MessagesMsg::Request { id, request }).await?;
-            }
-        }
-        Ok(())
+    fn priority(_msg: &MessagesMsg) -> Priority {
+        MessagesMsg::PRIORITY
     }
 
-    fn has_pending_work(&self) -> bool {
-        self.answering.as_ref().is_some_and(|a| a.in_flight > 0)
-            || self.asking.as_ref().is_some_and(|a| !a.waiting.is_empty())
-    }
-
-    fn handle_message(&mut self, msg: &Message) -> bool {
-        match msg.decode_module::<MessagesMsg>(ModuleId::MESSAGES) {
-            Ok(Some(msg)) => {
-                self.on_message(msg);
-                true
-            }
-            Ok(None) => false,
-            Err(e) => {
-                tracing::error!(error = %e, "undecodable messages message from peer");
-                true
-            }
-        }
+    fn asking_started(peer_name: &str) {
+        tracing::info!(peer = %peer_name, "this phone's messages can be read here");
     }
 }
 
-impl Drop for MessagesEngine {
-    fn drop(&mut self) {
-        if let Some(asking) = &self.asking {
-            hub().unregister(&self.peer, asking.token);
-        }
-    }
-}
+/// The messages module on one link.
+pub type MessagesEngine = ExchangeEngine<Messages>;
 
 /// Builds [`MessagesEngine`]: a phone hands it its store, a desktop asks.
 pub struct MessagesFactory {
@@ -314,6 +169,13 @@ impl crate::module::ModuleFactory for MessagesFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use cursio_protocol::Message;
+    use cursio_protocol::PeerId;
+    use cursio_transport::TransportError;
+    use cursio_transport::TransportTx;
+
+    type Answer = Result<MessagesResponse, String>;
     use crate::messages_hub::MemoryStore;
     use cursio_protocol::messages::Conversation;
     use std::sync::Mutex;

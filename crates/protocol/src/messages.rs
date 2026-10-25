@@ -128,20 +128,10 @@ pub enum MessagesResponse {
     Done,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MessagesMsg {
-    /// Desktop -> phone.
-    Request { id: u32, request: MessagesRequest },
-    /// Phone -> desktop: the answer to request `id`, or why there is none.
-    Response {
-        id: u32,
-        response: Result<MessagesResponse, String>,
-    },
-    /// Phone -> desktop: something in the provider changed — a message
-    /// arrived, one was sent or failed. Whatever is shown should be asked for
-    /// again.
-    Changed,
-}
+/// The messages module's messages: requests go desktop -> phone, answers come
+/// back, and the phone sends `Changed` when something in the provider changed
+/// — a message arrived, one was sent or failed.
+pub type MessagesMsg = crate::exchange::ExchangeMsg<MessagesRequest, MessagesResponse>;
 
 impl MessagesMsg {
     /// Below audio and input, which a page of history must never stutter;

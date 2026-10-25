@@ -10,18 +10,15 @@
 //! made up, and the store resolves it only within its own gallery. Sizes are
 //! bounded here by [`check`] before the store sees them.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use cursio_protocol::gallery::{
     GalleryMsg, GalleryRequest, GalleryResponse, MAX_PAGE, MAX_SLICE, MAX_THUMBNAIL_PX,
 };
-use cursio_protocol::{Message, ModuleAdvert, ModuleId, ModuleRole, PeerId};
-use cursio_transport::{TransportError, TransportTx};
-use tokio::sync::{mpsc, oneshot};
+use cursio_protocol::{ModuleAdvert, ModuleId, ModuleRole, Priority};
 
-use crate::gallery_hub::{hub, MediaStore, Outgoing};
+use crate::exchange_session::{Exchange, ExchangeEngine};
+use crate::gallery_hub::{hub, GalleryHub, MediaStore};
 use crate::module::SessionModule;
 
 /// Version of [`GalleryMsg`]; peers run the module only on an exact match.
@@ -35,89 +32,6 @@ const MAX_ID_BYTES: usize = 1024;
 /// thumbnail together, and each is a photo decode; this keeps a phone from
 /// decoding fifty at once while the link can carry a few at a time anyway.
 const MAX_IN_FLIGHT: usize = 4;
-
-type Answer = Result<GalleryResponse, String>;
-
-struct Answering {
-    store: Arc<dyn MediaStore>,
-    told: u64,
-    incoming: std::collections::VecDeque<(u32, GalleryRequest)>,
-    in_flight: usize,
-    done_tx: mpsc::UnboundedSender<(u32, Answer)>,
-    done_rx: mpsc::UnboundedReceiver<(u32, Answer)>,
-}
-
-struct Asking {
-    outbox: mpsc::UnboundedReceiver<Outgoing>,
-    token: u64,
-    next_id: u32,
-    waiting: HashMap<u32, oneshot::Sender<Answer>>,
-}
-
-pub struct GalleryEngine {
-    peer: PeerId,
-    peer_name: String,
-    answering: Option<Answering>,
-    asking: Option<Asking>,
-}
-
-impl GalleryEngine {
-    pub fn new(
-        peer: PeerId,
-        peer_name: String,
-        store: Option<Arc<dyn MediaStore>>,
-        asks: bool,
-    ) -> Self {
-        let answering = store.map(|store| {
-            let (done_tx, done_rx) = mpsc::unbounded_channel();
-            Answering {
-                store,
-                told: hub().generation(),
-                incoming: Default::default(),
-                in_flight: 0,
-                done_tx,
-                done_rx,
-            }
-        });
-        let asking = asks.then(|| {
-            let (outbox, token) = hub().register(peer, peer_name.clone());
-            Asking {
-                outbox,
-                token,
-                next_id: 1,
-                waiting: HashMap::new(),
-            }
-        });
-        GalleryEngine {
-            peer,
-            peer_name,
-            answering,
-            asking,
-        }
-    }
-
-    fn on_message(&mut self, msg: GalleryMsg) {
-        match msg {
-            GalleryMsg::Request { id, request } => match &mut self.answering {
-                Some(answering) => answering.incoming.push_back((id, request)),
-                None => {
-                    tracing::debug!(peer = %self.peer_name, "a peer asked for a gallery this machine does not share")
-                }
-            },
-            GalleryMsg::Response { id, response } => {
-                if let Some(reply) = self.asking.as_mut().and_then(|a| a.waiting.remove(&id)) {
-                    // The window may have scrolled past; not an error.
-                    let _ = reply.send(response);
-                }
-            }
-            GalleryMsg::Changed => {
-                if self.asking.is_some() {
-                    hub().bump(&self.peer);
-                }
-            }
-        }
-    }
-}
 
 /// Bound a request from the peer before the store sees it.
 pub fn check(request: GalleryRequest) -> Result<GalleryRequest, String> {
@@ -150,99 +64,38 @@ pub fn check(request: GalleryRequest) -> Result<GalleryRequest, String> {
     }
 }
 
-async fn send(tx: &mut dyn TransportTx, msg: &GalleryMsg) -> Result<(), TransportError> {
-    let message = Message::module(ModuleId::GALLERY, msg.priority(), msg)?;
-    tx.send(&message).await
-}
+/// The gallery as a request-and-answer module.
+pub struct Gallery;
 
-#[async_trait]
-impl SessionModule for GalleryEngine {
-    fn name(&self) -> &'static str {
-        "gallery"
+impl Exchange for Gallery {
+    type Request = GalleryRequest;
+    type Response = GalleryResponse;
+    type Store = dyn MediaStore;
+
+    const MODULE: ModuleId = ModuleId::GALLERY;
+    const NAME: &'static str = "gallery";
+    const NOT_HERE: &'static str = "a peer asked for a gallery this machine does not share";
+    const MAX_IN_FLIGHT: Option<usize> = Some(MAX_IN_FLIGHT);
+
+    fn hub() -> &'static GalleryHub {
+        hub()
     }
 
-    fn id(&self) -> ModuleId {
-        ModuleId::GALLERY
+    fn answer(store: &dyn MediaStore, request: &GalleryRequest) -> Result<GalleryResponse, String> {
+        store.handle(request)
     }
 
-    async fn start(&mut self, _tx: &mut dyn TransportTx) -> Result<(), TransportError> {
-        Ok(())
+    fn check(request: GalleryRequest) -> Result<GalleryRequest, String> {
+        check(request)
     }
 
-    async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
-        if let Some(answering) = &mut self.answering {
-            while answering.in_flight < MAX_IN_FLIGHT {
-                let Some((id, request)) = answering.incoming.pop_front() else {
-                    break;
-                };
-                let request = match check(request) {
-                    Ok(request) => request,
-                    Err(reason) => {
-                        let _ = answering.done_tx.send((id, Err(reason)));
-                        continue;
-                    }
-                };
-                let store = answering.store.clone();
-                let done = answering.done_tx.clone();
-                answering.in_flight += 1;
-                tokio::task::spawn_blocking(move || {
-                    let _ = done.send((id, store.handle(&request)));
-                });
-            }
-            while let Ok((id, response)) = answering.done_rx.try_recv() {
-                answering.in_flight = answering.in_flight.saturating_sub(1);
-                if let Err(reason) = &response {
-                    tracing::debug!(id, %reason, "a gallery request was refused");
-                }
-                send(tx, &GalleryMsg::Response { id, response }).await?;
-            }
-            let generation = hub().generation();
-            if generation != answering.told {
-                answering.told = generation;
-                send(tx, &GalleryMsg::Changed).await?;
-            }
-        }
-        if let Some(asking) = &mut self.asking {
-            asking.waiting.retain(|_, reply| !reply.is_closed());
-            while let Ok(Outgoing { request, reply }) = asking.outbox.try_recv() {
-                let id = asking.next_id;
-                asking.next_id = asking.next_id.wrapping_add(1).max(1);
-                asking.waiting.insert(id, reply);
-                send(tx, &GalleryMsg::Request { id, request }).await?;
-            }
-        }
-        Ok(())
-    }
-
-    fn has_pending_work(&self) -> bool {
-        self.answering
-            .as_ref()
-            .is_some_and(|a| a.in_flight > 0 || !a.incoming.is_empty())
-            || self.asking.as_ref().is_some_and(|a| !a.waiting.is_empty())
-    }
-
-    fn handle_message(&mut self, msg: &Message) -> bool {
-        match msg.decode_module::<GalleryMsg>(ModuleId::GALLERY) {
-            Ok(Some(msg)) => {
-                self.on_message(msg);
-                true
-            }
-            Ok(None) => false,
-            Err(e) => {
-                tracing::error!(error = %e, "undecodable gallery message from peer");
-                true
-            }
-        }
+    fn priority(msg: &GalleryMsg) -> Priority {
+        msg.priority()
     }
 }
 
-impl Drop for GalleryEngine {
-    fn drop(&mut self) {
-        if let Some(asking) = &self.asking {
-            hub().unregister(&self.peer, asking.token);
-        }
-    }
-}
+/// The gallery module on one link.
+pub type GalleryEngine = ExchangeEngine<Gallery>;
 
 /// Builds [`GalleryEngine`]: `store` answers for this machine's photos, `view`
 /// lets a window here browse the peer's.
@@ -283,6 +136,13 @@ impl crate::module::ModuleFactory for GalleryFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use cursio_protocol::Message;
+    use cursio_protocol::PeerId;
+    use cursio_transport::TransportError;
+    use cursio_transport::TransportTx;
+
+    type Answer = Result<GalleryResponse, String>;
     use cursio_protocol::gallery::{MediaFilter, MediaItem, MediaKind};
 
     #[derive(Default)]

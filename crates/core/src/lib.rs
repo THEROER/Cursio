@@ -53,6 +53,8 @@ pub mod control;
 pub mod diagnostics;
 /// Windows self-elevation, so injected input isn't blocked by UIPI.
 pub mod elevate;
+/// The engine a request-and-answer module (messages, the gallery) runs on a link.
+pub mod exchange_session;
 /// File sharing. Serving this machine's volumes is portable and always built;
 /// *mounting* the peer's needs FUSE on Linux or WinFsp on Windows (and the
 /// latter only under MSVC, because `winfsp-sys` rejects every other target

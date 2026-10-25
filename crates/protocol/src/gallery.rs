@@ -119,20 +119,10 @@ pub enum GalleryResponse {
     Slice(Vec<u8>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GalleryMsg {
-    Request {
-        id: u32,
-        request: GalleryRequest,
-    },
-    Response {
-        id: u32,
-        response: Result<GalleryResponse, String>,
-    },
-    /// Something was added or removed; whatever is shown should be asked for
-    /// again.
-    Changed,
-}
+/// The gallery's messages: requests either way (every machine both shows its
+/// photos and browses its peer's), and `Changed` when something was added or
+/// removed.
+pub type GalleryMsg = crate::exchange::ExchangeMsg<GalleryRequest, GalleryResponse>;
 
 impl GalleryMsg {
     /// The class this message rides in; see the module docs.
