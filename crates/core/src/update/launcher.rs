@@ -1,6 +1,7 @@
 //! The app's entry in the desktop's application list, written by the install.
 //!
-//! `cargo xtask install` writes one for a checkout, but a machine that only
+//! `cargo xtask install` has one written for a checkout (through
+//! [`register_app`]), but a machine that only
 //! ever received builds over the mesh has no checkout and never runs it: the
 //! app was installed and kept up to date there, and searching for Cursio found
 //! nothing. So the node writes it whenever it runs from the install — at its
@@ -57,13 +58,20 @@ pub fn register_from_install() -> Result<Option<PathBuf>, UpdateError> {
     let Some(app) = super::layout::stable_executable(APP) else {
         return Ok(None);
     };
+    register_app(&app).map(Some)
+}
+
+/// Register `app` as Cursio's entry, wherever it lives. `cargo xtask install`
+/// runs this through `cursio update launcher`, so a checkout's install and the
+/// node's write one entry the same way rather than two that drift apart.
+pub fn register_app(app: &Path) -> Result<PathBuf, UpdateError> {
     let Some(data) = data_home() else {
         return Err(UpdateError::Refused(
             "neither XDG_DATA_HOME nor HOME is set; cannot add Cursio to the application list"
                 .into(),
         ));
     };
-    register(&data, &app).map(Some)
+    register(&data, app)
 }
 
 fn data_home() -> Option<PathBuf> {

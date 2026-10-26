@@ -42,7 +42,11 @@ pub(crate) fn install(only: Option<BinArg>, no_build: bool) -> Result<()> {
         println!("✓ installed {} → {}", b.bin, dst.display());
 
         if b.gui && cfg!(target_os = "linux") {
-            install_desktop_file(b.bin, &dst)?;
+            if b.bin == "cursio-app" {
+                register_app_through_node(&src_dir, &dst)?;
+            } else {
+                install_desktop_file(b.bin, &dst)?;
+            }
         }
     }
 
@@ -84,7 +88,31 @@ pub(crate) fn local_bin_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local").join("bin"))
 }
 
-/// Write a `.desktop` launcher into ~/.local/share/applications for a GUI app.
+/// Have the built node write the app's launcher and icon. The node writes the
+/// same entry for an install it runs from, so doing it here too would be a
+/// second writer of one file, with its own idea of the format.
+fn register_app_through_node(src_dir: &Path, app: &Path) -> Result<()> {
+    let node = src_dir.join(exe_name("cursio", None));
+    if !node.is_file() {
+        bail!(
+            "{} is missing, and it writes the app's launcher; build it too \
+             (`cargo xtask build`) or install without --only",
+            node.display()
+        );
+    }
+    let status = Command::new(&node)
+        .args(["update", "launcher", "--app"])
+        .arg(app)
+        .status()
+        .with_context(|| format!("running {}", node.display()))?;
+    if !status.success() {
+        bail!("{} update launcher failed ({status})", node.display());
+    }
+    Ok(())
+}
+
+/// Write a `.desktop` launcher into ~/.local/share/applications for a GUI app
+/// other than `cursio-app`, whose launcher the node writes.
 pub(crate) fn install_desktop_file(bin: &str, exec: &Path) -> Result<()> {
     let apps_dir = {
         let base = std::env::var_os("XDG_DATA_HOME")
@@ -97,25 +125,17 @@ pub(crate) fn install_desktop_file(bin: &str, exec: &Path) -> Result<()> {
 
     let (name, comment) = match bin {
         "clipd" => ("Cursio Clipboard", "Clipboard history (Win+V for Wayland)"),
-        "cursio-app" => ("Cursio", "LAN-first cross-machine workspace"),
         _ => (bin, "Cursio"),
     };
     // The window's Wayland app id is the binary's name, not the file name of
     // this launcher, so without `StartupWMClass` GNOME cannot tie the two
-    // together and the dock shows "cursio-app" with a generic icon.
-    let icon = if bin == "cursio-app" {
-        install_app_icons(&base_data_dir()?)?;
-        "Icon=cursio\n".to_string()
-    } else {
-        String::new()
-    };
+    // together and the dock shows the binary's name with a generic icon.
     let desktop = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name={name}\n\
          Comment={comment}\n\
          Exec={exec}\n\
-         {icon}\
          StartupWMClass={bin}\n\
          Terminal=false\n\
          Categories=Utility;\n",
@@ -128,41 +148,6 @@ pub(crate) fn install_desktop_file(bin: &str, exec: &Path) -> Result<()> {
     // its own, and neither is installed everywhere.
     let _ = Command::new("update-desktop-database")
         .arg(&apps_dir)
-        .status();
-    Ok(())
-}
-
-/// `$XDG_DATA_HOME`, or `~/.local/share`.
-pub(crate) fn base_data_dir() -> Result<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .context("HOME not set")
-}
-
-/// Put the logo into the user's hicolor theme as `cursio`, which is the name
-/// the launcher asks for.
-pub(crate) fn install_app_icons(data_dir: &Path) -> Result<()> {
-    let src = checkout_dir().join("app/icons");
-    let theme = data_dir.join("icons/hicolor");
-    for (file, size) in [
-        ("32x32.png", "32x32"),
-        ("128x128.png", "128x128"),
-        ("128x128@2x.png", "256x256"),
-        ("icon.png", "512x512"),
-    ] {
-        let dir = theme.join(size).join("apps");
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        std::fs::copy(src.join(file), dir.join("cursio.png"))
-            .with_context(|| format!("installing the {size} icon"))?;
-    }
-    let scalable = theme.join("scalable/apps");
-    std::fs::create_dir_all(&scalable)?;
-    std::fs::copy(src.join("logo.svg"), scalable.join("cursio.svg"))
-        .context("installing the scalable icon")?;
-    let _ = Command::new("gtk-update-icon-cache")
-        .args(["-f", "-t"])
-        .arg(&theme)
         .status();
     Ok(())
 }

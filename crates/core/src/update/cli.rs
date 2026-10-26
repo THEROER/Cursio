@@ -71,6 +71,15 @@ pub enum UpdateAction {
     },
     /// Stop accepting builds from this machine.
     UntrustBuilder { machine: String },
+    /// Put this app in the desktop's application list, with its icon. The
+    /// node does this itself for the install; `cargo xtask install` runs it
+    /// for a checkout.
+    #[cfg(target_os = "linux")]
+    Launcher {
+        /// The `cursio-app` executable the entry starts.
+        #[arg(long)]
+        app: PathBuf,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -201,6 +210,12 @@ pub async fn run(action: UpdateAction, config_path: &std::path::Path) -> anyhow:
             }
             config.save(config_path)?;
             println!("builds from {machine} are no longer accepted here");
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        UpdateAction::Launcher { app } => {
+            let entry = super::launcher::register_app(&app)?;
+            println!("  ↳ launcher {}", entry.display());
             Ok(())
         }
         UpdateAction::Status => {
