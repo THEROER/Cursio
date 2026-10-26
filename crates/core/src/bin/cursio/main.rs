@@ -45,6 +45,7 @@ use crate::client::send_share;
 use crate::client::sms;
 use crate::input::apply_crossing;
 use crate::input::apply_modifier_map;
+use crate::input::watch_screens;
 use crate::mesh::run_mesh;
 use crate::mesh::start_control;
 use crate::modules::module_registry;
@@ -250,6 +251,13 @@ async fn run() -> anyhow::Result<()> {
                 let live = live.clone();
                 control.set_on_forget(std::sync::Arc::new(move |peer| live.forget(peer)));
             }
+            {
+                let live = live.clone();
+                control.set_on_arrange(std::sync::Arc::new(move |peer, request| {
+                    live.request_arrange(peer, request)
+                }));
+            }
+            watch_screens(live.clone());
             start_control(control.clone());
             let cursio_core::config::Config {
                 port,

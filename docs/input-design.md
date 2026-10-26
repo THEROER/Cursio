@@ -218,6 +218,54 @@ for this. On Wayland the portal grabs the pointer the moment it meets the
 barrier, so the desktop never sees the press, however long crossing then waits.
 A narrowed edge leaves that part to the desktop entirely.
 
+## Screens on one desk
+
+The grid says a laptop is below a desktop; it cannot say the laptop stands
+under the right-hand of the desktop's two monitors. With the desktop's whole
+bottom edge as the unit, pushing down on either monitor reached the laptop,
+and a laptop under the seam between two monitors could not be described at
+all. So each machine also says what its screens are, and where they stand on
+one desk every machine shares (`protocol/src/layout.rs`, `core/src/desk.rs`).
+
+**What each machine says.** Its screens, read from the desktop every 5 s
+(`cursio_input::screens`): each one's rectangle in the pixels capture measures
+a crossing in, its panel's size in millimetres from EDID, and an id from the
+EDID's maker and serial — the operating systems do not even agree on a port's
+name (GNOME's `HDMI-1` is the kernel's `HDMI-A-1`), so the panel is recognised
+by itself. Sources: GNOME's `DisplayConfig` with the kernel's EDID on Linux
+(Wayland and X11 alike), `EnumDisplayMonitors` with the registry's EDID on
+Windows, CoreGraphics on a Mac. Plus `[layout] place`, its corner on the desk
+in millimetres, and the seams it closed. All of it rides `Hello` and
+`Reconfigure` (protocol v24).
+
+**Millimetres, not pixels.** The desk is the desk: a 27-inch 4K panel and a
+14-inch 1080p laptop are told apart by size, and a pointer leaving one comes
+in beside where it left, physically. One machine's screens are joined where
+their pixels join, each sized by its panel; a panel that reports no size is
+taken at 96 dpi. Each machine writes only its own place, so there is nothing
+to reconcile; arranging another machine from the app asks that machine
+(`Message::Arrange`), and every peer hears the result from it.
+
+**Seams.** Where one machine's screen edge lies against another's — within
+3 mm, overlapping by at least 5 mm — is a seam. The hub arms only those
+pixels of each edge (`set_crossing_windows`), sends a crossing to the peer
+whose screen meets that very pixel, and fills `CrossEdge::entry` with the
+point on that screen beside it, in the peer's pixels; the peer places the
+pointer there (Wayland's release position, Windows' `SetCursorPos`). A seam
+closed on either side (`[layout] barriers`) is not crossed either way.
+
+**The grid stays.** A pair where either machine has no place yet, or no
+screens (a phone, a desktop without a layout interface), crosses by the grid
+as before. A machine placed on the desk but touching nothing is reached by no
+edge at all. `[input.crossing]` still narrows whatever a seam allows.
+
+**Edges of monitors, not of the box.** A crossing happens on the side of a
+monitor that no other monitor continues: Wayland places barriers that way,
+and Windows' gate now checks the hook's position against each monitor
+(`input/src/desk.rs`) rather than the virtual screen's bounds, whose bottom a
+shorter monitor never reaches. macOS and X11 still watch the box around their
+monitors, which is the same edge unless the monitors differ in height.
+
 ## Several peers: one mouse, one hub
 
 A machine with a neighbour to the right and another below has one mouse and

@@ -19,6 +19,41 @@ pub(crate) fn apply_crossing(crossing: &cursio_core::config::CrossingConfig) {
     }
 }
 
+/// How often the desktop's screens are read again. Nothing on GNOME or
+/// Windows announces a monitor plugged in to a process with no window, and a
+/// read is one D-Bus call or one enumeration.
+const SCREENS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Keep this machine's screens on the desk current, on a thread of its own:
+/// the read blocks, and on Linux it is a D-Bus call that must not run on the
+/// runtime's threads.
+pub(crate) fn watch_screens(live: cursio_core::live::LiveConfig) {
+    let spawned = std::thread::Builder::new()
+        .name("cursio-screens".into())
+        .spawn(move || {
+            let mut said = None;
+            loop {
+                match cursio_input::screens::screens() {
+                    Ok(screens) => {
+                        said = None;
+                        live.set_screens(screens);
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if said.as_ref() != Some(&message) {
+                            tracing::warn!(error = %message, "cannot read this desktop's screens; it stays on the grid");
+                            said = Some(message);
+                        }
+                    }
+                }
+                std::thread::sleep(SCREENS_EVERY);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "cannot start watching the screens; this machine stays on the grid");
+    }
+}
+
 /// Read `--mac-modifiers` and hand it to the keymap, or refuse to start.
 ///
 /// Refusing is deliberate. A mistyped map would otherwise be silently ignored
@@ -200,6 +235,8 @@ pub(crate) fn spawn_edge_handoff(
             hub.route_command(session::OwnershipCmd::HandoffToPeer {
                 edge: crossing.edge,
                 pos_norm: crossing.pos_norm,
+                at: crossing.at,
+                entry: None,
             });
         }
     });
@@ -401,7 +438,7 @@ impl PersistentCapture {
     /// grab mode again is not free — on Wayland re-entering Active releases
     /// the portal grab and nudges the pointer.
     pub(crate) fn apply(&self, machine: MachineInput) {
-        cursio_input::set_watched_edges(machine.edges);
+        arm(&machine);
         let mode = if machine.driving {
             cursio_input::InputMode::Dormant
         } else if machine.linked {
@@ -417,6 +454,18 @@ impl PersistentCapture {
             set_cursor_hidden(self.cursor.borrow_mut().as_mut(), machine.driving);
         }
     }
+}
+
+/// Arm the edges the hub says lead somewhere, and only the pixels of each
+/// where a peer's screen meets it. Callable from any thread: capture keeps
+/// both behind its own atomics and locks.
+pub(crate) fn arm(machine: &MachineInput) {
+    use cursio_core::input_hub::edge_slot;
+    use cursio_protocol::Edge;
+    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+        cursio_input::set_crossing_windows(edge, machine.windows[edge_slot(edge)].clone());
+    }
+    cursio_input::set_watched_edges(machine.edges);
 }
 
 /// Capture shared between concurrent mesh sessions.

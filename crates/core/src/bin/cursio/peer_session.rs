@@ -308,6 +308,7 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
         role,
         registry: modules,
         position: greeted.position,
+        layout: greeted.layout.clone(),
         service: offer,
         status: status.borrow().current(),
         sends_input,
@@ -349,6 +350,12 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
             edge: link.peer_edge,
             distance: greeted.position.distance_to(peer.position),
             takes_cursor: peer.device_kind.takes_cursor(),
+            seams: cursio_core::desk::seams(
+                identity.peer_id,
+                &greeted.layout,
+                peer.peer_id,
+                &peer.layout,
+            ),
         };
         let (ports, machine) = capture.hub.attach(peer.peer_id, placement);
         capture.apply(machine);
@@ -385,6 +392,7 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
         peer: peer.clone(),
         advertised: cursio_core::link::advertise(modules, sends_input),
         position: greeted.position,
+        layout: greeted.layout.clone(),
         settings,
         can_send_input,
         on_change: {
@@ -410,8 +418,9 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
                         edge: state.peer_edge,
                         distance: state.position.distance_to(state.peer_position),
                         takes_cursor,
+                        seams: state.seams.clone(),
                     };
-                    cursio_input::set_watched_edges(hub.place(token, placement).edges);
+                    crate::input::arm(&hub.place(token, placement));
                 }
                 control.link_reconfigured(
                     &id,
@@ -424,6 +433,17 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
                         .collect(),
                     cursio_core::control::link_skips(&state.negotiated, peer_kind),
                 );
+            })
+        },
+        on_arrange: {
+            let control = control.clone();
+            let peer = peer.peer_id;
+            Box::new(move |request| {
+                if let cursio_core::control::Reply::Error { message } =
+                    control.arranged_by(peer, request)
+                {
+                    tracing::warn!(%message, "could not take the place the peer arranged");
+                }
             })
         },
     };
@@ -564,12 +584,10 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
                 // Before `apply`: the mode change it makes is what the backend
                 // places the pointer on, and every handoff overwrites this, so
                 // a hotkey takeback never inherits an older crossing's spot.
-                cursio_input::enter_at(ownership.entry.map(|(edge, pos_norm)| {
-                    cursio_input::EdgeCrossing {
-                        edge,
-                        pos_norm,
-                        at: None,
-                    }
+                cursio_input::enter_at(ownership.entry.map(|entry| cursio_input::EdgeCrossing {
+                    edge: entry.edge,
+                    pos_norm: entry.pos_norm,
+                    at: entry.at,
                 }));
                 c.apply(c.hub.note_driving(token, ownership.driving));
                 // The cursor just left across the peer-facing edge, so this

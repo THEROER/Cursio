@@ -128,7 +128,7 @@ pub enum Command {
     Config,
     /// Replace the file with this config.
     SetConfig {
-        config: Config,
+        config: Box<Config>,
     },
     SetModule {
         module: ModuleSwitch,
@@ -478,7 +478,6 @@ pub enum Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use cursio_protocol::PeerId;
     use cursio_protocol::Position;
 
@@ -498,7 +497,7 @@ mod tests {
                 code: "ABCD-EFGH".into(),
             },
             Command::SetConfig {
-                config: Config::default(),
+                config: Box::default(),
             },
             Command::UpdateApply,
             Command::Forget {

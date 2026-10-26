@@ -357,7 +357,7 @@ where
     }
 
     /// Report the role as it now stands.
-    fn tell(&mut self, panic: bool, entry: Option<(cursio_protocol::Edge, f32)>) {
+    fn tell(&mut self, panic: bool, entry: Option<crate::session::Entry>) {
         let driving = self.role.driving();
         self.driving_mark.set(driving);
         self.driven_mark.set(driving);
@@ -467,12 +467,17 @@ where
             return Ok(ControlFlow::Break(()));
         }
         let was_on = r.input_on();
+        let arranged = r.outgoing(&latest);
         if let Some((msg, restart)) = r.local(&latest) {
             tracing::info!("settings changed; telling the peer");
             self.outbox.send(&msg).await?;
             if let Some((r, hosts)) = self.reconfigurable() {
                 r.reconcile(&restart, false, hosts);
             }
+        }
+        for msg in arranged {
+            tracing::info!("asking the peer to take its new place on the desk");
+            self.outbox.send(&msg).await?;
         }
         if was_on && !self.sharing_input() && self.role.driving() {
             // Input switched off while it was driving the peer: bring the
@@ -562,7 +567,12 @@ where
             Some(OwnershipCmd::HandoffToPeer { edge, .. }) if !self.cursor.peer_takes_cursor => {
                 tracing::trace!(?edge, "edge crossing ignored: peer cannot hold the cursor");
             }
-            Some(OwnershipCmd::HandoffToPeer { edge, pos_norm }) => {
+            Some(OwnershipCmd::HandoffToPeer {
+                edge,
+                pos_norm,
+                entry,
+                ..
+            }) => {
                 // Only the machine holding the cursor can send it away.
                 //
                 // This used to accept an idle machine too, reasoning that one
@@ -581,6 +591,7 @@ where
                     let msg = Message::CrossEdge {
                         edge: edge.opposite(),
                         pos_norm,
+                        entry,
                     };
                     self.outbox.send(&msg).await?;
                 } else {
@@ -709,7 +720,11 @@ where
                     self.tell(false, None);
                 }
             }
-            Message::CrossEdge { edge, pos_norm } => {
+            Message::CrossEdge {
+                edge,
+                pos_norm,
+                entry,
+            } => {
                 // The peer's cursor crossed the edge toward us. Record that
                 // peer even when we are already active: an idle second machine
                 // can begin driving the screen that already holds the shared
@@ -719,8 +734,15 @@ where
                 let was_active = self.role.active();
                 self.role.take_over();
                 if !was_active {
-                    tracing::info!(?edge, pos_norm, "cursor crossed in from peer");
-                    self.tell(false, Some((edge, pos_norm)));
+                    tracing::info!(?edge, pos_norm, ?entry, "cursor crossed in from peer");
+                    self.tell(
+                        false,
+                        Some(crate::session::Entry {
+                            edge,
+                            pos_norm,
+                            at: entry,
+                        }),
+                    );
                 } else {
                     tracing::info!(?edge, pos_norm, "peer began driving the cursor held here");
                 }
@@ -746,6 +768,13 @@ where
                     }
                 }
             }
+            Message::Arrange(request) => match self.reconf.as_mut() {
+                Some(r) => {
+                    tracing::info!(?request, "the peer arranged this machine on the desk");
+                    r.arrange(request);
+                }
+                None => tracing::debug!("this link follows no settings; arrangement ignored"),
+            },
             // Module traffic never gets here — the reader routes it — so this
             // is something neither side's session speaks.
             other => {

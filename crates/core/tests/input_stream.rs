@@ -98,6 +98,8 @@ async fn streamed_input_all_arrives_over_encrypted_tcp() {
         .send(session::OwnershipCmd::HandoffToPeer {
             edge: cursio_protocol::Edge::Right,
             pos_norm: 0.5,
+            at: None,
+            entry: None,
         })
         .expect("the session has not started yet, so the channel is open");
     drop(cmd_tx);

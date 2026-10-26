@@ -16,6 +16,60 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::PeerId;
+
+/// What a machine says about its own part of the desk: its screens, where
+/// it stands, and the seams it has closed. In the greeting, and again in
+/// [`crate::Reconfigure`] whenever any of it changes — a monitor plugged in,
+/// the person moving it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Layout {
+    /// Empty when the desktop cannot say (a compositor without a layout
+    /// interface, a phone): then the grid decides its edges, as before.
+    pub screens: Vec<Screen>,
+    /// `None` until someone arranges this machine on the desk; the grid
+    /// decides until then, so a mesh that never opened the arrangement
+    /// behaves exactly as it did.
+    pub place: Option<Place>,
+    pub barriers: Vec<Barrier>,
+}
+
+/// Where a machine's desktop stands: the top-left corner of its screens laid
+/// out in millimetres, from the desk's origin. Each machine holds its own and
+/// is the only one that writes it, so there is nothing to reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct Place {
+    pub x_mm: i32,
+    pub y_mm: i32,
+}
+
+/// A seam the person closed: the cursor does not cross between this
+/// machine's `screen` and `peer`'s `peer_screen`, though they touch on the
+/// desk. Either side's barrier closes it both ways, so a machine that was
+/// offline when it was closed still honours it once it hears the other's.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Barrier {
+    pub screen: String,
+    pub peer: PeerId,
+    pub peer_screen: String,
+}
+
+/// A peer asking this machine to change its own part of the desk: the person
+/// arranged it from the peer's app. The machine writes it into its own
+/// settings and announces the result like any other change, so every peer
+/// hears it from the machine it concerns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Arrange {
+    Place(Place),
+    /// Close (or open) the seam between this machine's `screen` and the
+    /// sender's `peer_screen`.
+    Barrier {
+        screen: String,
+        peer_screen: String,
+        closed: bool,
+    },
+}
+
 /// One monitor of a machine, as that machine's own desktop places it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Screen {

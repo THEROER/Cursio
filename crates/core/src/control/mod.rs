@@ -37,12 +37,14 @@
 //! that way, and a setting only a restart applies is named in the reply
 //! (`restart_needed`), rather than either pretending or restarting unasked.
 
+mod arrange;
 mod handle;
 #[cfg(test)]
 mod test_support;
 mod view;
 mod wire;
 
+pub use arrange::Arranger;
 pub use handle::{ask_gallery, handle_waiting};
 pub use view::{
     link_skips, KnownPeerView, LinkPath, LinkView, NearbyMachine, NodeView, PeerView, Presence,
@@ -121,6 +123,8 @@ pub struct NodeState {
     /// Tells the running mesh a machine was removed; set by the binary, which
     /// owns the links. Without one, removal is the on-disk half alone.
     on_forget: Arc<Mutex<Option<Forgetter>>>,
+    /// Carries an arrangement of a peer to its link; set by the binary.
+    on_arrange: Arc<Mutex<Option<arrange::Arranger>>>,
     /// The listener's per-stream volumes; the same one the audio factory
     /// hands every engine. See [`NodeState::mixer`].
     mixer: crate::mixer::LocalMixer,
@@ -170,6 +174,7 @@ impl NodeState {
             restart: Arc::new(tokio::sync::Notify::new()),
             revision: Arc::new(tokio::sync::watch::channel(0).0),
             on_forget: Arc::new(Mutex::new(None)),
+            on_arrange: Arc::new(Mutex::new(None)),
             mixer: crate::mixer::LocalMixer::default(),
         }
     }
@@ -212,6 +217,10 @@ impl NodeState {
 
     fn changed(&self) {
         self.revision.send_modify(|r| *r = r.wrapping_add(1));
+    }
+
+    fn node_id(&self) -> PeerId {
+        self.inner().node.id
     }
 
     /// Which module switches this build can act on. Set once by whoever built

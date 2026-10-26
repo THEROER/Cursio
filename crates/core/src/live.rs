@@ -15,7 +15,9 @@
 //!   whose answer changed.
 //! - **Position** travels in the same message, and each side re-derives the
 //!   edge between them. The window module reads that edge when it is built, so
-//!   an edge that moved restarts it on both sides.
+//!   an edge that moved restarts it on both sides. **The desk layout** — the
+//!   screens, read from the desktop every few seconds, and where the config
+//!   stands them — travels the same way, and so does a seam closed.
 //! - **A setting a module reads when it is built** (files' share policy,
 //!   audio's render device, whether peers may view this screen) restarts that
 //!   module on every link, both ends at once, through [`Restarts`].
@@ -40,7 +42,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
-use cursio_protocol::{ModuleId, PeerId, Position};
+use cursio_protocol::{Arrange, Layout, ModuleId, PeerId, Position};
 
 use crate::config::Config;
 pub use crate::module::ModuleSwitches;
@@ -101,6 +103,13 @@ impl Restarts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSettings {
     pub position: Position,
+    /// This machine's part of the shared desk: its screens as the desktop
+    /// last reported them, and where the config stands it.
+    pub layout: Layout,
+    /// Arrangements the person made of other machines from here, for the
+    /// link to each to carry; each link sends those numbered past the last it
+    /// sent. Bounded to the latest [`ARRANGE_KEPT`].
+    pub arrange_out: Vec<Outgoing>,
     /// Whether the user wants this machine's input shared. Only meaningful on
     /// a link that has capture.
     pub input: bool,
@@ -109,6 +118,18 @@ pub struct LiveSettings {
     /// one of them ends itself.
     pub forgotten: BTreeSet<PeerId>,
 }
+
+/// An arrangement of `peer` made here, waiting for that peer's link to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outgoing {
+    pub seq: u64,
+    pub peer: PeerId,
+    pub request: Arrange,
+}
+
+/// How many outgoing arrangements are kept. A drag sends one at its end, so
+/// this is many more than a link that was down for a moment can miss.
+pub const ARRANGE_KEPT: usize = 32;
 
 /// The node's live settings: switches for the registry, and a watch for the
 /// links.
@@ -127,6 +148,12 @@ impl LiveConfig {
         }
         let (settings, _) = tokio::sync::watch::channel(LiveSettings {
             position: config.position,
+            layout: Layout {
+                screens: Vec::new(),
+                place: config.layout.place,
+                barriers: config.layout.barriers.clone(),
+            },
+            arrange_out: Vec::new(),
             input: config.modules.input,
             restarts: Restarts::default(),
             forgotten: BTreeSet::new(),
@@ -167,6 +194,29 @@ impl LiveConfig {
         self.settings.borrow().forgotten.contains(peer)
     }
 
+    /// The desktop's screens as just read. Every link hears of a change —
+    /// a monitor plugged in, a resolution changed — and nothing otherwise.
+    pub fn set_screens(&self, screens: Vec<cursio_protocol::Screen>) {
+        self.settings.send_if_modified(|s| {
+            let changed = s.layout.screens != screens;
+            if changed {
+                tracing::info!(screens = screens.len(), "this machine's screens changed");
+                s.layout.screens = screens;
+            }
+            changed
+        });
+    }
+
+    /// Ask `peer`, through its link, to change its own part of the desk.
+    pub fn request_arrange(&self, peer: PeerId, request: Arrange) {
+        self.settings.send_modify(|s| {
+            let seq = s.arrange_out.last().map_or(1, |o| o.seq + 1);
+            s.arrange_out.push(Outgoing { seq, peer, request });
+            let excess = s.arrange_out.len().saturating_sub(ARRANGE_KEPT);
+            s.arrange_out.drain(..excess);
+        });
+    }
+
     /// Carry out the part of `plan` every node shares. Switches are written
     /// before the links are woken, so a link that renegotiates reads the new
     /// answer; the wake itself is unconditional, because a switch alone
@@ -178,6 +228,10 @@ impl LiveConfig {
         self.settings.send_modify(|s| {
             if let Some(position) = plan.position {
                 s.position = position;
+            }
+            if let Some(layout) = &plan.layout {
+                s.layout.place = layout.place;
+                s.layout.barriers = layout.barriers.clone();
             }
             if let Some(input) = plan.input {
                 s.input = input;
@@ -206,6 +260,8 @@ pub struct Plan {
     /// Module switches that changed.
     pub switches: Vec<(ModuleId, bool)>,
     pub position: Option<Position>,
+    /// Where this machine stands on the desk, and its closed seams.
+    pub layout: Option<crate::config::LayoutConfig>,
     pub input: Option<bool>,
     /// Modules to restart on every link because a setting they read at build
     /// time changed.
@@ -234,6 +290,9 @@ pub fn plan(running: &Config, next: &Config) -> Plan {
     }
     if running.position != next.position {
         plan.position = Some(next.position);
+    }
+    if running.layout != next.layout {
+        plan.layout = Some(next.layout.clone());
     }
     if running.modules.input != next.modules.input {
         plan.input = Some(next.modules.input);

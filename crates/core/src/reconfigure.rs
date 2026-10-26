@@ -25,8 +25,12 @@
 
 use std::collections::HashSet;
 
-use cursio_protocol::{Edge, Message, ModuleAdvert, ModuleId, Negotiated, Position, Reconfigure};
+use cursio_protocol::{
+    Arrange, Edge, Layout, Message, ModuleAdvert, ModuleId, Negotiated, Position, Reconfigure,
+};
 use tokio::sync::{mpsc, watch};
+
+use crate::desk::Seam;
 
 use crate::live::{LiveSettings, Restarts};
 use crate::module::{ModuleRegistry, SessionCtx};
@@ -43,6 +47,8 @@ pub struct LinkLive<'a> {
     pub advertised: Vec<ModuleAdvert>,
     /// Where this side said it stood in its greeting.
     pub position: Position,
+    /// The desk layout this side greeted with.
+    pub layout: Layout,
     pub settings: watch::Receiver<LiveSettings>,
     /// Whether this machine has capture. Input can be offered only with it,
     /// whatever the settings say.
@@ -51,6 +57,8 @@ pub struct LinkLive<'a> {
     /// now stands. `Send` so a session with no settings to follow can still
     /// be spawned onto the multi-threaded runtime.
     pub on_change: Box<dyn FnMut(&LinkState) + Send + 'a>,
+    /// The peer asked this machine to change its own part of the desk.
+    pub on_arrange: Box<dyn FnMut(Arrange) + Send + 'a>,
 }
 
 /// A link's arrangement after a renegotiation.
@@ -60,6 +68,11 @@ pub struct LinkState {
     /// Where this machine stands, which a settings change can move too.
     pub position: Position,
     pub peer_position: Position,
+    /// The peer's part of the desk, as it last said.
+    pub peer_layout: Layout,
+    /// Where this machine's screens meet the peer's, or `None` while either
+    /// is not on the desk; see [`crate::desk::seams`].
+    pub seams: Option<Vec<Seam>>,
     /// Which of this machine's edges borders the peer now.
     pub peer_edge: Option<Edge>,
     /// Whether that edge is different from the last one reported.
@@ -72,10 +85,14 @@ pub(crate) struct Reconf<'a> {
     local: &'a crate::NodeIdentity,
     peer: PeerHello,
     on_change: Box<dyn FnMut(&LinkState) + Send + 'a>,
+    on_arrange: Box<dyn FnMut(Arrange) + Send + 'a>,
     can_send_input: bool,
     /// What the peer last heard this side offer.
     adverts: Vec<ModuleAdvert>,
     position: Position,
+    layout: Layout,
+    /// The last outgoing arrangement this link sent, or was too young for.
+    arrange_seen: u64,
     input_on: bool,
     seen: Restarts,
     /// What should be running: agreed, less input, which is not a module.
@@ -110,26 +127,41 @@ impl<'a> Reconf<'a> {
             peer,
             advertised,
             position,
+            layout,
             mut settings,
             can_send_input,
             on_change,
+            on_arrange,
         } = live;
         // Whatever moved between the greeting and now is compared against
         // what the greeting said, below; only restarts are taken as seen,
-        // because every module on this link was just built.
-        let seen = settings.borrow_and_update().restarts.clone();
+        // because every module on this link was just built. An arrangement
+        // made before this link came up is not sent: the peer may have been
+        // moved since, from its own app, and replaying an old drag would
+        // undo that.
+        let (seen, arrange_seen) = {
+            let now = settings.borrow_and_update();
+            (
+                now.restarts.clone(),
+                now.arrange_out.last().map_or(0, |o| o.seq),
+            )
+        };
         settings.mark_changed();
         let desired = agreed_modules(&cursio_protocol::negotiate(&advertised, &peer.modules));
         let (stopped_tx, stopped_rx) = mpsc::unbounded_channel();
+        let peer_edge = edge_between(local, position, &layout, &peer);
         let reconf = Self {
             registry,
             local,
             input_on: advertised.iter().any(|a| a.id == ModuleId::INPUT),
             adverts: advertised,
-            peer_edge: position.edge_toward(peer.position),
+            peer_edge,
             position,
+            layout,
+            arrange_seen,
             peer,
             on_change,
+            on_arrange,
             can_send_input,
             seen,
             desired,
@@ -156,7 +188,7 @@ impl<'a> Reconf<'a> {
         let input_on = self.can_send_input && settings.input;
         let adverts = crate::link::advertise(self.registry, input_on);
         let mut restart = settings.restarts.since(&mut self.seen);
-        let edge = settings.position.edge_toward(self.peer.position);
+        let edge = edge_between(self.local, settings.position, &settings.layout, &self.peer);
         if edge != self.peer_edge && self.desired.contains(&ModuleId::WINDOW) {
             // The drag trigger compares the pointer against the edge it was
             // built with.
@@ -164,25 +196,54 @@ impl<'a> Reconf<'a> {
         }
         restart.retain(|id| self.desired.contains(id));
         restart.dedup();
-        if adverts == self.adverts && settings.position == self.position && restart.is_empty() {
+        if adverts == self.adverts
+            && settings.position == self.position
+            && settings.layout == self.layout
+            && restart.is_empty()
+        {
             self.input_on = input_on;
             return None;
         }
         self.adverts = adverts;
         self.position = settings.position;
+        self.layout = settings.layout.clone();
         self.input_on = input_on;
         let msg = Message::Reconfigure(Reconfigure {
             modules: self.adverts.clone(),
             position: self.position,
+            layout: self.layout.clone(),
             restart: restart.clone(),
         });
         Some((msg, restart))
+    }
+
+    /// Arrangements of this link's peer made here since the last call, as
+    /// the messages that carry them.
+    pub(crate) fn outgoing(&mut self, settings: &LiveSettings) -> Vec<Message> {
+        let peer = self.peer.peer_id;
+        let seen = self.arrange_seen;
+        self.arrange_seen = settings
+            .arrange_out
+            .last()
+            .map_or(seen, |o| o.seq.max(seen));
+        settings
+            .arrange_out
+            .iter()
+            .filter(|o| o.seq > seen && o.peer == peer)
+            .map(|o| Message::Arrange(o.request.clone()))
+            .collect()
+    }
+
+    /// The peer asked this machine to change its own part of the desk.
+    pub(crate) fn arrange(&mut self, request: Arrange) {
+        (self.on_arrange)(request);
     }
 
     /// The peer's settings moved. Answers the modules it asked to restart.
     pub(crate) fn peer(&mut self, change: Reconfigure) -> Vec<ModuleId> {
         self.peer.modules = change.modules;
         self.peer.position = change.position;
+        self.peer.layout = change.layout;
         change.restart
     }
 
@@ -194,13 +255,21 @@ impl<'a> Reconf<'a> {
     pub(crate) fn reconcile(&mut self, restart: &[ModuleId], peer_started: bool, to: Hosts<'_>) {
         let negotiated = cursio_protocol::negotiate(&self.adverts, &self.peer.modules);
         self.desired = agreed_modules(&negotiated);
-        let edge = self.position.edge_toward(self.peer.position);
+        let seams = crate::desk::seams(
+            self.local.peer_id,
+            &self.layout,
+            self.peer.peer_id,
+            &self.peer.layout,
+        );
+        let edge = edge_between(self.local, self.position, &self.layout, &self.peer);
         let edge_changed = edge != self.peer_edge;
         self.peer_edge = edge;
         (self.on_change)(&LinkState {
             negotiated,
             position: self.position,
             peer_position: self.peer.position,
+            peer_layout: self.peer.layout.clone(),
+            seams,
             peer_edge: edge,
             edge_changed,
         });
@@ -277,6 +346,28 @@ impl<'a> Reconf<'a> {
             }
         }
     }
+}
+
+/// Which of this machine's edges faces the peer, standing at `position` with
+/// `layout`.
+fn edge_between(
+    local: &crate::NodeIdentity,
+    position: Position,
+    layout: &Layout,
+    peer: &PeerHello,
+) -> Option<Edge> {
+    crate::desk::edge_toward(
+        &crate::desk::Standing {
+            id: local.peer_id,
+            position,
+            layout,
+        },
+        &crate::desk::Standing {
+            id: peer.peer_id,
+            position: peer.position,
+            layout: &peer.layout,
+        },
+    )
 }
 
 /// The agreed modules that run on a host of their own: all but input, which

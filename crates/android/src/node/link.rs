@@ -91,6 +91,8 @@ pub(super) async fn run_link<T: Transport + 'static>(
         role,
         registry: &ctx.modules,
         position: PHONE_POSITION,
+        // A phone's screen is not one the cursor enters.
+        layout: cursio_protocol::Layout::default(),
         service: ServiceOffer::none(),
         status: ctx.status.borrow().current(),
         // The touchpad: a phone has no capture, but its touch surface is input

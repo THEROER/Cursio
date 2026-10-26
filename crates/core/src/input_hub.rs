@@ -41,6 +41,7 @@ use std::sync::{Arc, Mutex};
 use cursio_protocol::{Edge, EdgeSet, PeerId};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::desk::Seam;
 use crate::session::{CapturedInput, OwnershipCmd};
 
 /// The two channels a session reads its local input and ownership requests
@@ -65,7 +66,7 @@ pub struct LinkToken {
 }
 
 /// Where one link sits relative to this machine, as far as the cursor cares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
     /// Which of this machine's edges borders the peer, if any.
     pub edge: Option<Edge>,
@@ -74,10 +75,19 @@ pub struct Placement {
     /// Whether the peer has a screen the cursor can enter at all. A phone used
     /// as a touchpad borders nothing, whatever cell it was placed in.
     pub takes_cursor: bool,
+    /// Where the two machines' screens meet on the shared desk, once both
+    /// are on it ([`crate::desk::seams`]). Then these, not the grid's whole
+    /// edge, are what the cursor crosses, and `edge`/`distance` only answer
+    /// for a peer still on the grid.
+    pub seams: Option<Vec<Seam>>,
 }
 
+/// The pixels along each edge (by [`edge_slot`]) that lead somewhere:
+/// `None` for the whole edge, as a grid neighbour has it.
+pub type EdgeWindows = [Option<Vec<(i32, i32)>>; 4];
+
 /// What this machine's own input should be doing, across all its links.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineInput {
     /// Some session is streaming this machine's input to its peer, so local
     /// input is grabbed and the pointer hidden.
@@ -87,6 +97,18 @@ pub struct MachineInput {
     pub linked: bool,
     /// The edges to arm.
     pub edges: EdgeSet,
+    /// Which part of each armed edge.
+    pub windows: EdgeWindows,
+}
+
+/// An edge's slot in [`EdgeWindows`].
+pub fn edge_slot(edge: Edge) -> usize {
+    match edge {
+        Edge::Left => 0,
+        Edge::Right => 1,
+        Edge::Top => 2,
+        Edge::Bottom => 3,
+    }
 }
 
 struct Link {
@@ -232,8 +254,27 @@ impl InputHub {
     /// Pass an ownership request to the one session it concerns.
     pub fn route_command(&self, cmd: OwnershipCmd) {
         let routes = self.routes();
+        let (target, cmd) = match cmd {
+            OwnershipCmd::HandoffToPeer {
+                edge, pos_norm, at, ..
+            } => match routes.across(edge, at) {
+                // On the desk: the peer whose screen is beyond that very
+                // pixel, entering beside it.
+                Some((link, entry)) => (
+                    Some(link),
+                    OwnershipCmd::HandoffToPeer {
+                        edge,
+                        pos_norm,
+                        at,
+                        entry: Some(entry),
+                    },
+                ),
+                None => (routes.beyond(edge), cmd),
+            },
+            _ => (None, cmd),
+        };
         let target = match cmd {
-            OwnershipCmd::HandoffToPeer { edge, .. } => routes.beyond(edge),
+            OwnershipCmd::HandoffToPeer { .. } => target,
             OwnershipCmd::Toggle => routes
                 .driven()
                 .or_else(|| routes.last.and_then(|p| routes.link(p)))
@@ -264,28 +305,74 @@ impl Routes {
         self.links.iter().find(|l| l.token == *token)
     }
 
-    /// The nearest peer beyond `edge` that can take the cursor.
+    /// The nearest peer beyond `edge` that can take the cursor, of those
+    /// still placed on the grid.
     fn beyond(&self, edge: Edge) -> Option<&Link> {
         self.links
             .iter()
-            .filter(|l| l.placement.takes_cursor && l.placement.edge == Some(edge))
+            .filter(|l| l.placement.takes_cursor && l.placement.seams.is_none())
+            .filter(|l| l.placement.edge == Some(edge))
             .min_by_key(|l| l.placement.distance)
     }
 
+    /// The peer on the desk whose screen meets `edge` at the pixel `at` left
+    /// by, and where the pointer comes in on it.
+    fn across(&self, edge: Edge, at: Option<(i32, i32)>) -> Option<(&Link, (i32, i32))> {
+        let (x, y) = at?;
+        let along = if edge.is_horizontal() { x } else { y };
+        self.links
+            .iter()
+            .filter(|l| l.placement.takes_cursor)
+            .find_map(|l| {
+                let seam = l
+                    .placement
+                    .seams
+                    .as_ref()?
+                    .iter()
+                    .find(|s| s.edge == edge && s.contains(along))?;
+                Some((l, seam.entry(along)))
+            })
+    }
+
     fn machine(&self) -> MachineInput {
-        let edges = if self.disarmed {
-            EdgeSet::EMPTY
-        } else {
-            self.links
+        let mut edges = EdgeSet::EMPTY;
+        let mut windows: EdgeWindows = [
+            Some(Vec::new()),
+            Some(Vec::new()),
+            Some(Vec::new()),
+            Some(Vec::new()),
+        ];
+        if !self.disarmed {
+            for placement in self
+                .links
                 .iter()
-                .filter(|l| l.placement.takes_cursor)
-                .filter_map(|l| l.placement.edge)
-                .collect()
-        };
+                .map(|l| &l.placement)
+                .filter(|p| p.takes_cursor)
+            {
+                match &placement.seams {
+                    // A grid neighbour has the whole edge.
+                    None => {
+                        if let Some(edge) = placement.edge {
+                            edges = edges.with(edge);
+                            windows[edge_slot(edge)] = None;
+                        }
+                    }
+                    Some(seams) => {
+                        for seam in seams {
+                            edges = edges.with(seam.edge);
+                            if let Some(list) = &mut windows[edge_slot(seam.edge)] {
+                                list.push((seam.from, seam.to));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         MachineInput {
             driving: self.driven().is_some(),
             linked: !self.links.is_empty(),
             edges,
+            windows,
         }
     }
 }
@@ -303,6 +390,7 @@ mod tests {
             edge: Some(edge),
             distance,
             takes_cursor: true,
+            seams: None,
         }
     }
 
@@ -314,7 +402,68 @@ mod tests {
         OwnershipCmd::HandoffToPeer {
             edge,
             pos_norm: 0.5,
+            at: None,
+            entry: None,
         }
+    }
+
+    /// A peer on the desk meeting the bottom edge at pixels `from..to`.
+    fn below(from: i32, to: i32) -> Placement {
+        Placement {
+            edge: Some(Edge::Bottom),
+            distance: 1,
+            takes_cursor: true,
+            seams: Some(vec![Seam {
+                edge: Edge::Bottom,
+                from,
+                to,
+                peer_from: 0.0,
+                peer_to: 1919.0,
+                peer_line: 0,
+                screen: "mine".into(),
+                peer_screen: "theirs".into(),
+            }]),
+        }
+    }
+
+    fn crossing_at(edge: Edge, x: i32, y: i32) -> OwnershipCmd {
+        OwnershipCmd::HandoffToPeer {
+            edge,
+            pos_norm: 0.5,
+            at: Some((x, y)),
+            entry: None,
+        }
+    }
+
+    /// Two machines under one desktop's two monitors: the pixel the pointer
+    /// left by decides which, and it comes in beside that pixel.
+    #[test]
+    fn a_crossing_on_the_desk_reaches_the_peer_under_that_very_pixel() {
+        let hub = InputHub::new();
+        let (mut left, _) = hub.attach(peer(1), below(0, 1920));
+        let (mut right, machine) = hub.attach(peer(2), below(1920, 3840));
+        assert_eq!(
+            machine.windows[edge_slot(Edge::Bottom)],
+            Some(vec![(0, 1920), (1920, 3840)])
+        );
+        hub.route_command(crossing_at(Edge::Bottom, 2880, 1079));
+        assert!(left.commands.try_recv().is_err());
+        match right.commands.try_recv().unwrap() {
+            OwnershipCmd::HandoffToPeer { entry, .. } => assert_eq!(entry, Some((960, 0))),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Arranged apart, a peer is reached by no edge at all — not the grid's.
+    #[test]
+    fn a_peer_on_the_desk_touching_nothing_arms_no_edge() {
+        let hub = InputHub::new();
+        let mut apart = below(0, 1920);
+        apart.seams = Some(Vec::new());
+        let (mut link, machine) = hub.attach(peer(1), apart);
+        assert!(machine.edges.is_empty());
+        hub.route_command(crossing_at(Edge::Bottom, 100, 1079));
+        assert!(link.commands.try_recv().is_err());
     }
 
     /// The layout that exposed the one-edge design: a machine to the right,
@@ -463,6 +612,7 @@ mod tests {
                 edge: Some(Edge::Left),
                 distance: 1,
                 takes_cursor: false,
+                seams: None,
             },
         );
         assert!(machine.edges.is_empty());

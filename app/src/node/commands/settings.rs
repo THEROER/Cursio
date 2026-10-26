@@ -68,7 +68,10 @@ pub async fn node_set_mic_gate(
         }
     };
     config.audio.mic_gate = Some(value);
-    link.request(Command::SetConfig { config }).await
+    link.request(Command::SetConfig {
+        config: Box::new(config),
+    })
+    .await
 }
 
 /// Replace the `[calls]` section of the config file, like
@@ -87,7 +90,10 @@ pub async fn node_set_calls(
         }
     };
     config.calls = calls;
-    link.request(Command::SetConfig { config }).await
+    link.request(Command::SetConfig {
+        config: Box::new(config),
+    })
+    .await
 }
 
 /// Keep a Bluetooth path open beside the network, or not: the config
@@ -106,7 +112,10 @@ pub async fn node_set_bluetooth_standby(
         }
     };
     config.bluetooth.standby = on;
-    link.request(Command::SetConfig { config }).await
+    link.request(Command::SetConfig {
+        config: Box::new(config),
+    })
+    .await
 }
 
 /// Make one change a problem offers, or a settings control names: the
@@ -125,7 +134,10 @@ pub async fn node_apply_config_edit(
         }
     };
     edit.apply(&mut config);
-    link.request(Command::SetConfig { config }).await
+    link.request(Command::SetConfig {
+        config: Box::new(config),
+    })
+    .await
 }
 
 #[tauri::command]

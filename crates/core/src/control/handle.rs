@@ -156,7 +156,7 @@ impl NodeState {
                 }
                 Reply::Saved {
                     pinned: self.pinned(),
-                    restart_needed: self.apply(config.with_overrides(&self.overrides)),
+                    restart_needed: self.apply((*config).with_overrides(&self.overrides)),
                 }
             }
             Command::SetModule { module, enabled } => {

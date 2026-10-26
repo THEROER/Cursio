@@ -21,6 +21,8 @@ pub struct PeerHello {
     /// Where the peer stands in the layout, which is what decides the edge the
     /// cursor crosses to reach it.
     pub position: cursio_protocol::Position,
+    /// The peer's screens on the shared desk; see [`crate::desk`].
+    pub layout: cursio_protocol::Layout,
     /// What the peer can carry for the mesh, and what quality it wants from a
     /// duty the mesh places. See [`cursio_protocol::ServiceOffer`].
     pub service: cursio_protocol::ServiceOffer,
@@ -51,6 +53,7 @@ pub async fn handshake<T: Transport + ?Sized>(
     device_kind: DeviceKind,
     modules: &[ModuleAdvert],
     position: cursio_protocol::Position,
+    layout: &cursio_protocol::Layout,
     service: cursio_protocol::ServiceOffer,
     status: cursio_protocol::NodeStatus,
     resumable: &[cursio_protocol::SessionTag],
@@ -62,6 +65,7 @@ pub async fn handshake<T: Transport + ?Sized>(
         device_kind,
         modules,
         position,
+        layout,
         service,
         status,
         resumable,
@@ -80,6 +84,7 @@ pub async fn handshake_as<T: Transport + ?Sized>(
     device_kind: DeviceKind,
     modules: &[ModuleAdvert],
     position: cursio_protocol::Position,
+    layout: &cursio_protocol::Layout,
     service: cursio_protocol::ServiceOffer,
     status: cursio_protocol::NodeStatus,
     resumable: &[cursio_protocol::SessionTag],
@@ -127,6 +132,7 @@ pub async fn handshake_as<T: Transport + ?Sized>(
             device_kind,
             modules: modules.to_vec(),
             position,
+            layout: layout.clone(),
             service,
             status,
             resumable: resumable.to_vec(),
@@ -151,6 +157,7 @@ pub async fn handshake_as<T: Transport + ?Sized>(
         device_kind: hello.device_kind,
         modules: hello.modules,
         position: hello.position,
+        layout: hello.layout,
         service: hello.service,
         status: hello.status,
         resumable: hello.resumable,

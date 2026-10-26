@@ -26,7 +26,7 @@ mod test_support;
 
 pub use forward::{input_channel, CapturedInput, InputReceiver, InputSender};
 pub use handshake::{handshake, handshake_as, local_device_kind, PeerHello};
-pub use role::{CursorRole, CursorSetup, Ownership, OwnershipCmd};
+pub use role::{CursorRole, CursorSetup, Entry, Ownership, OwnershipCmd};
 pub use run::run_session_live;
 
 /// Errors during the session handshake or run loop.

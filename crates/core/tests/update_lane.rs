@@ -73,6 +73,7 @@ async fn greet(
         DeviceKind::Desktop,
         &[],
         Position::new(0, 0),
+        &Default::default(),
         ServiceOffer::none(),
         NodeStatus::unknown(),
         &[],

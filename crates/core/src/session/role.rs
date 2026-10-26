@@ -25,6 +25,12 @@ pub enum OwnershipCmd {
     HandoffToPeer {
         edge: cursio_protocol::Edge,
         pos_norm: f32,
+        /// The point it left by, in capture's pixels, which decides whose
+        /// screen it went to when the desk has several along one edge.
+        at: Option<(i32, i32)>,
+        /// Where it comes in on the peer, in the peer's pixels; filled by
+        /// the input hub from the desk ([`crate::desk::Seam::entry`]).
+        entry: Option<(i32, i32)>,
     },
     /// Emergency release: unconditionally take control back to THIS machine —
     /// become active, tell the peer to go dormant, and let the caller drop any
@@ -209,11 +215,21 @@ pub struct Ownership {
     /// Never set by something the peer said: taking the cursor back tells us to
     /// stop driving, never to start.
     pub driving: bool,
-    /// Where the pointer comes in, when the peer sent it across an edge: which
-    /// of this machine's edges, and how far along it (`0.0..=1.0`) it left the
-    /// peer's. `None` for every other handoff, which leaves the pointer where
-    /// it was.
-    pub entry: Option<(cursio_protocol::Edge, f32)>,
+    /// Where the pointer comes in, when the peer sent it across an edge.
+    /// `None` for every other handoff, which leaves the pointer where it was.
+    pub entry: Option<Entry>,
+}
+
+/// Where a pointer the peer sent across an edge comes in here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Entry {
+    /// Which of this machine's edges.
+    pub edge: cursio_protocol::Edge,
+    /// How far along it (`0.0..=1.0`) the pointer left the peer's.
+    pub pos_norm: f32,
+    /// The exact point, in this machine's pixels, when the peer worked it
+    /// out from the shared desk.
+    pub at: Option<(i32, i32)>,
 }
 
 #[cfg(test)]

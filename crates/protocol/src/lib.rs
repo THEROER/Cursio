@@ -53,7 +53,7 @@ pub use input::{
     neighbour_across, Edge, EdgeSet, GesturePhase, InputEvent, MouseButton, Position,
     GESTURE_SCALE_ONE, SCROLL_NOTCH,
 };
-pub use layout::Screen;
+pub use layout::{Arrange, Barrier, Layout, Place, Screen};
 pub use node::{NetworkKind, NodeStatus, PowerSource};
 pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{
@@ -89,7 +89,9 @@ pub use window::{
 /// so a session survives its connection dropping and continues on a new one.
 /// v23 split that session over four independent lanes, each with its own
 /// connection, sequence numbers and acknowledgements (`docs/transport-design.md`).
-pub const PROTOCOL_VERSION: u16 = 23;
+/// v24 added the shared desk: [`Hello::layout`] and [`Reconfigure::layout`],
+/// the entry point in [`Message::CrossEdge`], and [`Message::Arrange`].
+pub const PROTOCOL_VERSION: u16 = 24;
 
 /// Names one live session between two nodes, the same on both ends: derived
 /// from the Noise handshake that opened it. Not a secret — a connection that
@@ -228,8 +230,17 @@ pub enum Message {
     /// right spot, and later for an absolute warp-on-enter if we add one. Motion
     /// itself stays relative (see [`InputEvent`]).
     ///
+    /// `entry` is the exact point to come in at, in the receiver's own pixels,
+    /// when the sender worked it out from the shared layout ([`layout`]):
+    /// the spot on the receiver's screen beside where the pointer left.
+    /// `None` when either machine is still placed only on the grid.
+    ///
     /// [`opposite`]: input::Edge::opposite
-    CrossEdge { edge: input::Edge, pos_norm: f32 },
+    CrossEdge {
+        edge: input::Edge,
+        pos_norm: f32,
+        entry: Option<(i32, i32)>,
+    },
 
     /// Host -> viewer: one pixel update (dirty region) for a transferred window.
     /// Streamed continuously while the window is live on the viewer.
@@ -280,6 +291,10 @@ pub enum Message {
     /// plain byte vector it carries — must mean the same thing to every
     /// version. Variants are only ever appended after it. See [`update`].
     Update(Vec<u8>),
+
+    /// The person arranged this machine from the peer's app; see
+    /// [`layout::Arrange`].
+    Arrange(layout::Arrange),
 }
 
 /// Payload of [`Message::Hello`].
@@ -309,6 +324,10 @@ pub struct Hello {
     /// Where this machine stands on the layout grid, so each side can work out
     /// which of its own edges faces the other. See [`Position`].
     pub position: Position,
+    /// This machine's screens on the shared desk, which narrow the grid's
+    /// whole edge to where a peer's screen actually meets one of them. See
+    /// [`layout`].
+    pub layout: layout::Layout,
     /// What this node can carry for the mesh, and what it wants from it.
     ///
     /// In the greeting rather than asked for, because placing a duty has to be
@@ -343,6 +362,7 @@ pub struct Reconfigure {
     /// that crossed another in flight still leaves both sides agreeing.
     pub modules: Vec<ModuleAdvert>,
     pub position: Position,
+    pub layout: layout::Layout,
     /// Modules to stop and start again on both sides even though they stay
     /// agreed, because a setting they read when built changed. Restarting only
     /// one side would leave the other mid-conversation with a module that
@@ -364,6 +384,7 @@ impl Hello {
             device_kind: DeviceKind::Desktop,
             modules: Vec::new(),
             position: Position::default(),
+            layout: layout::Layout::default(),
             service: ServiceOffer::none(),
             status: NodeStatus::unknown(),
             resumable: Vec::new(),
@@ -437,7 +458,9 @@ impl Message {
             // Must reach the peer before the first message of a module it
             // starts, or that message arrives for a module not yet running
             // there and is dropped.
-            | Message::Reconfigure(_) => Priority::Control,
+            | Message::Reconfigure(_)
+            // A person dragging a machine is watching for it to move.
+            | Message::Arrange(_) => Priority::Control,
 
             // The pointer/keyboard. The one thing that must never feel laggy.
             Message::Input(_) | Message::WindowInput(_) => Priority::Input,
@@ -497,7 +520,8 @@ impl Message {
             | Message::Opaque(_)
             | Message::Input(_)
             | Message::Grab { .. }
-            | Message::CrossEdge { .. } => None,
+            | Message::CrossEdge { .. }
+            | Message::Arrange(_) => None,
         }
     }
 
@@ -621,6 +645,26 @@ mod tests {
                 ModuleAdvert::new(ModuleId::INPUT, 1, ModuleRole::Source),
             ],
             position: Position::new(1, 0),
+            layout: Layout {
+                screens: vec![Screen {
+                    id: "GSM:502NDWE0C929".into(),
+                    name: "LG Electronics 22\"".into(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    size_mm: Some((480, 270)),
+                }],
+                place: Some(Place {
+                    x_mm: -480,
+                    y_mm: 0,
+                }),
+                barriers: vec![Barrier {
+                    screen: "GSM:502NDWE0C929".into(),
+                    peer: PeerId::nil(),
+                    peer_screen: "BOE:103".into(),
+                }],
+            },
             service: ServiceOffer {
                 fitness: Fitness::Full,
                 wanted: Some(Quality::new(2560, 1440, 30)),
@@ -729,11 +773,34 @@ mod tests {
         let msg = Message::Reconfigure(Reconfigure {
             modules: vec![ModuleAdvert::symmetric(ModuleId::FILES, 4)],
             position: Position::new(-1, 0),
+            layout: Layout::default(),
             restart: vec![ModuleId::WINDOW],
         });
         assert_eq!(msg.module_id(), None);
         assert_eq!(msg.priority(), Priority::Control);
         assert_eq!(Message::from_bytes(&msg.to_bytes().unwrap()).unwrap(), msg);
+    }
+
+    /// Arranging a machine from a peer's app is the session's, and travels as
+    /// control: the person dragging it is watching for it to land.
+    #[test]
+    fn an_arrangement_request_roundtrips_as_session_control() {
+        for arrange in [
+            Arrange::Place(Place {
+                x_mm: 120,
+                y_mm: -40,
+            }),
+            Arrange::Barrier {
+                screen: "BOE:103".into(),
+                peer_screen: "PHL:UK01944014362".into(),
+                closed: true,
+            },
+        ] {
+            let msg = Message::Arrange(arrange);
+            assert_eq!(msg.module_id(), None);
+            assert_eq!(msg.priority(), Priority::Control);
+            assert_eq!(Message::from_bytes(&msg.to_bytes().unwrap()).unwrap(), msg);
+        }
     }
 
     /// A stand-in for a module's own enum — the point being that `Message` has

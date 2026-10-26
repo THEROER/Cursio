@@ -57,6 +57,8 @@ pub struct Handshake<'a> {
     pub registry: &'a ModuleRegistry,
     /// Where this machine stands in the user's layout.
     pub position: cursio_protocol::Position,
+    /// This machine's screens on the shared desk.
+    pub layout: cursio_protocol::Layout,
     /// What this machine can carry for the mesh, and what it wants from it.
     pub service: cursio_protocol::ServiceOffer,
     /// This machine's power and network state as the link comes up. Read once
@@ -144,6 +146,7 @@ where
         session::local_device_kind(),
         &advertised,
         plan.position,
+        &plan.layout,
         plan.service,
         plan.status,
         &plan.resumable,
@@ -159,7 +162,18 @@ where
     // Derived per link, not per process: four machines in a row each border a
     // different neighbour, and a single machine-wide setting can only ever
     // state one of those answers.
-    let peer_edge = plan.position.edge_toward(peer.position);
+    let peer_edge = crate::desk::edge_toward(
+        &crate::desk::Standing {
+            id: plan.identity.peer_id,
+            position: plan.position,
+            layout: &plan.layout,
+        },
+        &crate::desk::Standing {
+            id: peer.peer_id,
+            position: peer.position,
+            layout: &peer.layout,
+        },
+    );
     crate::health::version_matched(peer.peer_id);
     tracing::info!(
         peer = %peer.display_name,

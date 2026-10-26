@@ -92,6 +92,24 @@ pub struct Config {
     pub update: UpdateConfig,
     pub calls: CallsConfig,
     pub bluetooth: BluetoothConfig,
+    pub layout: LayoutConfig,
+}
+
+/// This machine's part of the shared desk (`docs/input-design.md`, "Screens
+/// on one desk"). Its screens are read from the desktop as it runs, never
+/// stored: a monitor unplugged is gone from the desk at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayoutConfig {
+    /// Where its screens' top-left corner stands, in millimetres from the
+    /// desk's origin. Absent until someone arranges this machine; the grid
+    /// (`position`) decides its edges until then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place: Option<cursio_protocol::Place>,
+    /// Seams the person closed between one of this machine's screens and a
+    /// peer's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub barriers: Vec<cursio_protocol::Barrier>,
 }
 
 /// The mesh's Bluetooth path: a phone's to its computers, and a computer's to
@@ -394,6 +412,7 @@ impl Default for Config {
             update: UpdateConfig::default(),
             calls: CallsConfig::default(),
             bluetooth: BluetoothConfig::default(),
+            layout: LayoutConfig::default(),
         }
     }
 }

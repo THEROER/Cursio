@@ -50,6 +50,7 @@ pub mod config;
 /// The local socket the app, the tray and `cursio status` talk to.
 pub mod control;
 /// This machine's current problems, each with the fix where there is one.
+pub mod desk;
 pub mod diagnostics;
 /// Windows self-elevation, so injected input isn't blocked by UIPI.
 pub mod elevate;

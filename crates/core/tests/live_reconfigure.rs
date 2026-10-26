@@ -143,6 +143,7 @@ fn greeting(id: &NodeIdentity, position: Position) -> PeerHello {
         device_kind: DeviceKind::Desktop,
         modules: vec![ModuleAdvert::symmetric(ModuleId::FILES, 1)],
         position,
+        layout: Default::default(),
         service: ServiceOffer::none(),
         status: NodeStatus::unknown(),
         resumable: Vec::new(),
@@ -191,9 +192,11 @@ fn run_side(
             peer: peer.clone(),
             advertised,
             position,
+            layout: Default::default(),
             settings: live.subscribe(),
             can_send_input: input,
             on_change: Box::new(move |state| states.lock().unwrap().push(state.clone())),
+            on_arrange: Box::new(|_| {}),
         };
         session::run_session_live(
             Box::new(transport),
