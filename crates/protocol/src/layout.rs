@@ -32,6 +32,20 @@ pub struct Layout {
     /// behaves exactly as it did.
     pub place: Option<Place>,
     pub barriers: Vec<Barrier>,
+    /// Screens the person moved on the desk away from where the operating
+    /// system's pixels put them: two monitors aligned at the top in the
+    /// display settings may stand bottom-aligned on the desk.
+    pub offsets: Vec<ScreenOffset>,
+}
+
+/// How far one screen stands from where its machine's pixels place it, in
+/// millimetres. Only the desk moves: the pointer between a machine's own
+/// screens still goes where its operating system sends it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScreenOffset {
+    pub screen: String,
+    pub dx_mm: i32,
+    pub dy_mm: i32,
 }
 
 /// Where a machine's desktop stands: the top-left corner of its screens laid
@@ -68,6 +82,9 @@ pub enum Arrange {
         peer_screen: String,
         closed: bool,
     },
+    /// Stand one of this machine's screens this far from where its pixels
+    /// put it.
+    Screen(ScreenOffset),
 }
 
 /// One monitor of a machine, as that machine's own desktop places it.

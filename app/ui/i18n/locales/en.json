@@ -411,7 +411,11 @@
   "placement": {
     "title": "Arrange machines",
     "description": "Drag each machine's screens to where they stand on your desk, at their real size. The cursor crosses only where two machines' screens meet; click a seam to put a barrier there.",
-    "noScreens": "No machine has reported its screens yet. They appear here once the node is running and a desktop says where its monitors are.",
+    "moveMachines": "Machines",
+    "moveScreens": "Monitors",
+    "moveMachinesHint": "Drag a machine to move all its screens together.",
+    "moveScreensHint": "Drag one monitor to where it stands on the desk; the cursor between a machine's own monitors still follows its display settings.",
+    "noScreens":"No machine has reported its screens yet. They appear here once the node is running and a desktop says where its monitors are.",
     "unplaced": "Not arranged yet",
     "hint": "Drag to move · edges snap together · click a seam to block it",
     "legendOpen": "Cursor crosses ({n})",

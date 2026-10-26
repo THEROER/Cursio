@@ -53,6 +53,25 @@ pub async fn node_arrange(
     .await
 }
 
+/// Stand one screen of a machine apart from where its pixels put it.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn node_arrange_screen(
+    link: State<'_, NodeLink>,
+    machine: Option<cursio_protocol::PeerId>,
+    screen: String,
+    dx_mm: i32,
+    dy_mm: i32,
+) -> Result<Reply, NodeError> {
+    link.request(Command::ArrangeScreen {
+        machine,
+        screen,
+        dx_mm,
+        dy_mm,
+    })
+    .await
+}
+
 /// Close or open the seam between one of this machine's screens and a
 /// peer's.
 #[cfg(desktop)]

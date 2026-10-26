@@ -110,6 +110,9 @@ pub struct LayoutConfig {
     /// peer's.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub barriers: Vec<cursio_protocol::Barrier>,
+    /// Screens moved on the desk from where the desktop's pixels put them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub offsets: Vec<cursio_protocol::ScreenOffset>,
 }
 
 /// The mesh's Bluetooth path: a phone's to its computers, and a computer's to

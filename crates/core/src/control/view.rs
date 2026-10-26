@@ -291,6 +291,7 @@ impl NodeState {
             screens,
             place: running.layout.place,
             barriers: running.layout.barriers.clone(),
+            offsets: running.layout.offsets.clone(),
         };
         let desk = crate::desk::view(
             &std::iter::once(crate::desk::Machine {

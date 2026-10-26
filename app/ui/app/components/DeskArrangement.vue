@@ -27,11 +27,18 @@ const props = defineProps<{
   selected: string | null
   /** This node's id: only seams it is part of can be closed from here. */
   self: string
+  /**
+   * What a drag moves: a whole machine, or one monitor of it — for monitors
+   * that stand on the desk otherwise than the display settings line them up.
+   */
+  mode: "machine" | "screen"
   labels: { unplaced: string; open: string; closed: string; elsewhere: string }
 }>()
 
 const emit = defineEmits<{
   move: [id: string, x: number, y: number]
+  /** One monitor of a machine moved by `dx`, `dy` millimetres. */
+  moveScreen: [id: string, screen: string, dx: number, dy: number]
   select: [id: string]
   toggleSeam: [seam: DeskSeam]
   menu: [id: string]
@@ -46,12 +53,28 @@ function rectsAt(m: DeskMachine, x: number, y: number): MmRect[] {
   return m.screens.map((s) => ({ x: x + s.x_mm, y: y + s.y_mm, w: s.w_mm, h: s.h_mm }))
 }
 
-const drag = ref<{ id: string; from: DOMPoint; origin: { x: number; y: number }; at: { x: number; y: number } } | null>(null)
+/**
+ * A drag in progress. `screen` is the monitor's index when one monitor is
+ * moved; then `origin` and `at` are that monitor's corner, not the machine's.
+ */
+const drag = ref<{
+  id: string
+  screen: number | null
+  from: DOMPoint
+  origin: { x: number; y: number }
+  at: { x: number; y: number }
+} | null>(null)
 
 /** Where each machine is drawn now: where it is, or where it is being dragged. */
 const drawn = computed(() =>
   props.machines.map((p) => {
-    const at = drag.value?.id === p.machine.id ? drag.value.at : { x: p.x, y: p.y }
+    const d = drag.value?.id === p.machine.id ? drag.value : null
+    if (d && d.screen !== null) {
+      const rects = rectsAt(p.machine, p.x, p.y)
+      rects[d.screen] = { ...rects[d.screen]!, x: d.at.x, y: d.at.y }
+      return { ...p, rects }
+    }
+    const at = d ? d.at : { x: p.x, y: p.y }
     return { ...p, ...at, rects: rectsAt(p.machine, at.x, at.y) }
   }),
 )
@@ -73,6 +96,18 @@ function toDesk(e: PointerEvent): DOMPoint | null {
   return new DOMPoint(e.clientX, e.clientY).matrixTransform(ctm.inverse())
 }
 
+/** Which of `p`'s monitors holds the desk point `at`, else the nearest. */
+function screenAt(p: Positioned, at: DOMPoint): number {
+  const rects = rectsAt(p.machine, p.x, p.y)
+  const distance = (r: MmRect) =>
+    Math.hypot(Math.max(r.x - at.x, 0, at.x - r.x - r.w), Math.max(r.y - at.y, 0, at.y - r.y - r.h))
+  let best = 0
+  rects.forEach((r, i) => {
+    if (distance(r) < distance(rects[best]!)) best = i
+  })
+  return best
+}
+
 function onDown(e: PointerEvent, p: Positioned) {
   if (e.button !== 0) return
   const from = toDesk(e)
@@ -80,7 +115,13 @@ function onDown(e: PointerEvent, p: Positioned) {
   emit("select", p.machine.id)
   frozen.value = fitted.value
   ;(e.currentTarget as Element).setPointerCapture(e.pointerId)
-  drag.value = { id: p.machine.id, from, origin: { x: p.x, y: p.y }, at: { x: p.x, y: p.y } }
+  if (props.mode === "screen" && !p.unplaced) {
+    const screen = screenAt(p, from)
+    const r = rectsAt(p.machine, p.x, p.y)[screen]!
+    drag.value = { id: p.machine.id, screen, from, origin: { x: r.x, y: r.y }, at: { x: r.x, y: r.y } }
+  } else {
+    drag.value = { id: p.machine.id, screen: null, from, origin: { x: p.x, y: p.y }, at: { x: p.x, y: p.y } }
+  }
 }
 
 function onMove(e: PointerEvent) {
@@ -92,10 +133,23 @@ function onMove(e: PointerEvent) {
   if (!moving) return
   const x = d.origin.x + (p.x - d.from.x)
   const y = d.origin.y + (p.y - d.from.y)
+  const mmPerPx = view.value.w / Math.max(el.clientWidth, 1)
+  if (d.screen !== null) {
+    // One monitor: pulled flush against anything, its own machine's
+    // monitors included — the display settings join those edge to edge.
+    const own = rectsAt(moving.machine, moving.x, moving.y)
+    const r = own[d.screen]!
+    const others = [
+      ...own.filter((_, i) => i !== d.screen),
+      ...props.machines.filter((m) => m.machine.id !== d.id).flatMap((m) => rectsAt(m.machine, m.x, m.y)),
+    ]
+    const pull = snap([{ ...r, x, y }], others, SNAP_PX * mmPerPx)
+    d.at = { x: x + pull.dx, y: y + pull.dy }
+    return
+  }
   const others = props.machines
     .filter((m) => m.machine.id !== d.id)
     .flatMap((m) => rectsAt(m.machine, m.x, m.y))
-  const mmPerPx = view.value.w / Math.max(el.clientWidth, 1)
   const pull = snap(rectsAt(moving.machine, x, y), others, SNAP_PX * mmPerPx)
   d.at = { x: x + pull.dx, y: y + pull.dy }
 }
@@ -105,8 +159,15 @@ function onUp() {
   drag.value = null
   frozen.value = null
   if (!d) return
-  const moved = Math.abs(d.at.x - d.origin.x) > 0.5 || Math.abs(d.at.y - d.origin.y) > 0.5
+  const dx = d.at.x - d.origin.x
+  const dy = d.at.y - d.origin.y
+  const moved = Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5
   const was = props.machines.find((m) => m.machine.id === d.id)
+  if (d.screen !== null) {
+    const screen = was?.machine.screens[d.screen]
+    if (moved && screen) emit("moveScreen", d.id, screen.id, dx, dy)
+    return
+  }
   if (moved || was?.unplaced) emit("move", d.id, d.at.x, d.at.y)
 }
 

@@ -166,6 +166,19 @@ impl NodeState {
                 self.edit_file(&["position"], |c| c.position = position)
             }
             Command::Arrange { machine, place } => self.arrange(machine, place),
+            Command::ArrangeScreen {
+                machine,
+                screen,
+                dx_mm,
+                dy_mm,
+            } => self.arrange_screen(
+                machine,
+                cursio_protocol::ScreenOffset {
+                    screen,
+                    dx_mm,
+                    dy_mm,
+                },
+            ),
             Command::Barrier {
                 screen,
                 peer,

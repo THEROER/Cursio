@@ -53,7 +53,7 @@ pub use input::{
     neighbour_across, Edge, EdgeSet, GesturePhase, InputEvent, MouseButton, Position,
     GESTURE_SCALE_ONE, SCROLL_NOTCH,
 };
-pub use layout::{Arrange, Barrier, Layout, Place, Screen};
+pub use layout::{Arrange, Barrier, Layout, Place, Screen, ScreenOffset};
 pub use node::{NetworkKind, NodeStatus, PowerSource};
 pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{
@@ -91,7 +91,9 @@ pub use window::{
 /// connection, sequence numbers and acknowledgements (`docs/transport-design.md`).
 /// v24 added the shared desk: [`Hello::layout`] and [`Reconfigure::layout`],
 /// the entry point in [`Message::CrossEdge`], and [`Message::Arrange`].
-pub const PROTOCOL_VERSION: u16 = 24;
+/// v25 let a screen stand on the desk apart from where its pixels put it
+/// ([`layout::ScreenOffset`]).
+pub const PROTOCOL_VERSION: u16 = 25;
 
 /// Names one live session between two nodes, the same on both ends: derived
 /// from the Noise handshake that opened it. Not a secret — a connection that
@@ -664,6 +666,11 @@ mod tests {
                     peer: PeerId::nil(),
                     peer_screen: "BOE:103".into(),
                 }],
+                offsets: vec![ScreenOffset {
+                    screen: "GSM:502NDWE0C929".into(),
+                    dx_mm: 0,
+                    dy_mm: 26,
+                }],
             },
             service: ServiceOffer {
                 fitness: Fitness::Full,
@@ -795,6 +802,11 @@ mod tests {
                 peer_screen: "PHL:UK01944014362".into(),
                 closed: true,
             },
+            Arrange::Screen(ScreenOffset {
+                screen: "GSM:502NDWE0C929".into(),
+                dx_mm: -3,
+                dy_mm: 26,
+            }),
         ] {
             let msg = Message::Arrange(arrange);
             assert_eq!(msg.module_id(), None);

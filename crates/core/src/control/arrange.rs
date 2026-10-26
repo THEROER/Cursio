@@ -6,7 +6,7 @@
 //! every peer learns the result from that machine's own announcement rather
 //! than from whoever asked.
 
-use cursio_protocol::{Arrange, Barrier, PeerId, Place};
+use cursio_protocol::{Arrange, Barrier, PeerId, Place, ScreenOffset};
 
 use crate::control::handle::error;
 use crate::control::{NodeState, Reply};
@@ -30,6 +30,15 @@ impl NodeState {
         match machine {
             Some(peer) if peer != self.node_id() => self.ask(peer, Arrange::Place(place)),
             _ => self.edit_file(&["layout"], |c| c.layout.place = Some(place)),
+        }
+    }
+
+    /// Stand one screen of `machine` (this one when `None`) `offset` from
+    /// where its pixels put it.
+    pub fn arrange_screen(&self, machine: Option<PeerId>, offset: ScreenOffset) -> Reply {
+        match machine {
+            Some(peer) if peer != self.node_id() => self.ask(peer, Arrange::Screen(offset)),
+            _ => self.edit_file(&["layout"], |c| set_offset(&mut c.layout.offsets, offset)),
         }
     }
 
@@ -89,6 +98,9 @@ impl NodeState {
                     closed,
                 )
             }),
+            Arrange::Screen(offset) => {
+                self.edit_file(&["layout"], |c| set_offset(&mut c.layout.offsets, offset))
+            }
         }
     }
 
@@ -109,6 +121,15 @@ impl NodeState {
     }
 }
 
+/// Replace `offset.screen`'s offset; a zero one is dropped, so a screen put
+/// back where its pixels say leaves nothing in the file.
+fn set_offset(offsets: &mut Vec<ScreenOffset>, offset: ScreenOffset) {
+    offsets.retain(|o| o.screen != offset.screen);
+    if offset.dx_mm != 0 || offset.dy_mm != 0 {
+        offsets.push(offset);
+    }
+}
+
 fn toggle(barriers: &mut Vec<Barrier>, barrier: Barrier, closed: bool) {
     barriers.retain(|b| *b != barrier);
     if closed {
@@ -126,6 +147,21 @@ mod tests {
             peer: PeerId::from_u128(2),
             peer_screen: "BOE".into(),
         }
+    }
+
+    #[test]
+    fn a_screen_moved_back_where_its_pixels_put_it_leaves_no_offset() {
+        let offset = |dy_mm| ScreenOffset {
+            screen: "LG".into(),
+            dx_mm: 0,
+            dy_mm,
+        };
+        let mut offsets = Vec::new();
+        set_offset(&mut offsets, offset(26));
+        set_offset(&mut offsets, offset(30));
+        assert_eq!(offsets, vec![offset(30)]);
+        set_offset(&mut offsets, offset(0));
+        assert!(offsets.is_empty());
     }
 
     #[test]

@@ -16,7 +16,7 @@ import { bounds } from "~/utils/deskSnap"
  * reports it from that machine itself.
  */
 const { t } = useI18n()
-const { status, arrange, setBarrier } = useNode()
+const { status, arrange, arrangeScreen, setBarrier } = useNode()
 const toast = useCursioToast()
 const peerMenu = usePeerMenu()
 
@@ -87,6 +87,24 @@ async function onMove(id: string, x: number, y: number) {
   }
 }
 
+/** Whether a drag moves whole machines or single monitors. */
+const mode = ref<"machine" | "screen">("machine")
+const modeOptions = computed(() => [
+  { value: "machine", label: t("placement.moveMachines"), icon: "lucide:computer" },
+  { value: "screen", label: t("placement.moveScreens"), icon: "lucide:monitor" },
+])
+
+async function onMoveScreen(id: string, screenId: string, dx: number, dy: number) {
+  const machine = desk.value?.machines.find((m) => m.id === id)
+  const screen = machine?.screens.find((s) => s.id === screenId)
+  if (!machine || !screen) return
+  try {
+    await arrangeScreen(machine.this ? null : id, screenId, screen.dx_mm + dx, screen.dy_mm + dy)
+  } catch (e) {
+    toast.failure(e, { title: t("placement.failed") })
+  }
+}
+
 async function onToggleSeam(s: DeskSeam) {
   // Always told from this machine's side: its screen, the peer's screen.
   const mine = s.machine === self.value
@@ -147,6 +165,12 @@ const labels = computed(() => ({
       </LpAlert>
       <div v-else class="grid gap-4 lg:grid-cols-[1fr_18rem]">
         <LpCard class="overflow-hidden">
+          <div class="flex items-center gap-3 border-b border-line px-4 py-2">
+            <LpSegmented v-model="mode" :options="modeOptions" size="sm" />
+            <span class="text-xs text-muted">
+              {{ mode === "machine" ? t("placement.moveMachinesHint") : t("placement.moveScreensHint") }}
+            </span>
+          </div>
           <LpContextMenu always :items="canvasMenu">
             <div class="h-[28rem] bg-surface-soft" @contextmenu.capture="menuPeer = null">
               <DeskArrangement
@@ -154,8 +178,10 @@ const labels = computed(() => ({
                 :seams="desk.seams"
                 :selected="selectedMachine?.machine.id ?? null"
                 :self="self"
+                :mode="mode"
                 :labels="labels"
                 @move="onMove"
+                @move-screen="onMoveScreen"
                 @select="(id) => (selected = id)"
                 @toggle-seam="onToggleSeam"
                 @menu="onMenu"

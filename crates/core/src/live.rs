@@ -152,6 +152,7 @@ impl LiveConfig {
                 screens: Vec::new(),
                 place: config.layout.place,
                 barriers: config.layout.barriers.clone(),
+                offsets: config.layout.offsets.clone(),
             },
             arrange_out: Vec::new(),
             input: config.modules.input,
@@ -232,6 +233,7 @@ impl LiveConfig {
             if let Some(layout) = &plan.layout {
                 s.layout.place = layout.place;
                 s.layout.barriers = layout.barriers.clone();
+                s.layout.offsets = layout.offsets.clone();
             }
             if let Some(input) = plan.input {
                 s.input = input;

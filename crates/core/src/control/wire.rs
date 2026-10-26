@@ -35,7 +35,8 @@ use std::path::PathBuf;
 /// `[calls]` in the config. v18: `kind` on each stream playing here.
 /// v19: `dir` on `gallery_save`, a folder to save into other than
 /// Pictures/Cursio. v20: `desk` in the status, `arrange` and `barrier`.
-pub const CONTROL_VERSION: u32 = 20;
+/// v21: `arrange_screen`, and each desk screen's `dx_mm`/`dy_mm`.
+pub const CONTROL_VERSION: u32 = 21;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -143,6 +144,15 @@ pub enum Command {
         #[serde(default)]
         machine: Option<PeerId>,
         place: cursio_protocol::Place,
+    },
+    /// Stand one screen of a machine (this one when `machine` is absent)
+    /// `dx_mm`, `dy_mm` from where its pixels put it on the desk.
+    ArrangeScreen {
+        #[serde(default)]
+        machine: Option<PeerId>,
+        screen: String,
+        dx_mm: i32,
+        dy_mm: i32,
     },
     /// Close or open the seam between this machine's `screen` and `peer`'s
     /// `peer_screen`, on both machines.
@@ -514,6 +524,12 @@ mod tests {
                     x_mm: 560,
                     y_mm: 296,
                 },
+            },
+            Command::ArrangeScreen {
+                machine: None,
+                screen: "GSM:502NDWE0C929".into(),
+                dx_mm: 0,
+                dy_mm: 26,
             },
             Command::Barrier {
                 screen: "PHL:UK01944014362".into(),

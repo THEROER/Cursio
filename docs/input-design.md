@@ -242,7 +242,11 @@ in millimetres, and the seams it closed. All of it rides `Hello` and
 14-inch 1080p laptop are told apart by size, and a pointer leaving one comes
 in beside where it left, physically. One machine's screens are joined where
 their pixels join, each sized by its panel; a panel that reports no size is
-taken at 96 dpi. Each machine writes only its own place, so there is nothing
+taken at 96 dpi. Where the display settings and the desk disagree — a 22-inch
+and a 24-inch monitor aligned at the top in pixels but standing on the desk by
+their feet — a monitor can be moved on its own (`[layout] offsets`, protocol
+v25): only the desk moves, and the pointer between a machine's own monitors
+still goes where its operating system sends it. Each machine writes only its own place, so there is nothing
 to reconcile; arranging another machine from the app asks that machine
 (`Message::Arrange`), and every peer hears the result from it.
 

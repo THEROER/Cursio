@@ -194,6 +194,9 @@ export interface DeskScreen {
   y_mm: number
   w_mm: number
   h_mm: number
+  /** How far it was moved from where its pixels put it; counted in `x_mm`/`y_mm`. */
+  dx_mm: number
+  dy_mm: number
   /** The panel reported its size; otherwise a 96 dpi guess. */
   measured: boolean
 }
@@ -434,6 +437,9 @@ export function useNode() {
     /** Stand a machine on the desk; `machine` null is this one. */
     arrange: (machine: string | null, xMm: number, yMm: number) =>
       call<Reply>("node_arrange", { machine, xMm: Math.round(xMm), yMm: Math.round(yMm) }),
+    /** Move one screen of a machine on the desk, as an offset from where its pixels put it. */
+    arrangeScreen: (machine: string | null, screen: string, dxMm: number, dyMm: number) =>
+      call<Reply>("node_arrange_screen", { machine, screen, dxMm: Math.round(dxMm), dyMm: Math.round(dyMm) }),
     /** Close or open the seam between this machine's `screen` and `peer`'s `peerScreen`. */
     setBarrier: (screen: string, peer: string, peerScreen: string, closed: boolean) =>
       call<Reply>("node_set_barrier", { screen, peer, peerScreen, closed }),

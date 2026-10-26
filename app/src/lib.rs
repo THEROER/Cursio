@@ -251,6 +251,7 @@ pub fn run() {
             node::commands::node_set_module,
             node::commands::node_set_position,
             node::commands::node_arrange,
+            node::commands::node_arrange_screen,
             node::commands::node_set_barrier,
             node::commands::node_set_name,
             node::commands::node_set_mic_gate,

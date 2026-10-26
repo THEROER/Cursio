@@ -172,6 +172,26 @@ fn offset_from(a: &Screen, rect: MmRect, b: &Screen) -> MmRect {
     }
 }
 
+/// A machine's screens relative to its corner as the person stood them: as
+/// their pixels join, then each moved by its own offset. The corner is not
+/// moved again after, so moving one monitor never shifts the others.
+pub fn screens_mm(layout: &Layout) -> Vec<MmRect> {
+    arrange(&layout.screens)
+        .into_iter()
+        .zip(&layout.screens)
+        .map(
+            |(r, s)| match layout.offsets.iter().find(|o| o.screen == s.id) {
+                Some(o) => MmRect {
+                    x: r.x + f64::from(o.dx_mm),
+                    y: r.y + f64::from(o.dy_mm),
+                    ..r
+                },
+                None => r,
+            },
+        )
+        .collect()
+}
+
 /// A machine's screens where they stand on the desk, or `None` while it has
 /// no screens or has not been arranged.
 pub fn on_desk(layout: &Layout) -> Option<Vec<MmRect>> {
@@ -180,7 +200,7 @@ pub fn on_desk(layout: &Layout) -> Option<Vec<MmRect>> {
         return None;
     }
     Some(
-        arrange(&layout.screens)
+        screens_mm(layout)
             .into_iter()
             .map(|r| MmRect {
                 x: r.x + f64::from(place.x_mm),
@@ -371,6 +391,10 @@ pub struct DeskScreen {
     pub y_mm: f64,
     pub w_mm: f64,
     pub h_mm: f64,
+    /// How far the person moved it from where its pixels put it; already
+    /// counted in `x_mm`/`y_mm`.
+    pub dx_mm: i32,
+    pub dy_mm: i32,
     /// The panel reported its size; otherwise it is a 96 dpi guess.
     pub measured: bool,
 }
@@ -450,17 +474,22 @@ pub fn view(machines: &[Machine<'_>]) -> DeskView {
                     .layout
                     .screens
                     .iter()
-                    .zip(arrange(&m.layout.screens))
-                    .map(|(s, r)| DeskScreen {
-                        id: s.id.clone(),
-                        name: s.name.clone(),
-                        width: s.width,
-                        height: s.height,
-                        x_mm: r.x,
-                        y_mm: r.y,
-                        w_mm: r.w,
-                        h_mm: r.h,
-                        measured: s.size_mm.is_some_and(|(w, h)| w > 0 && h > 0),
+                    .zip(screens_mm(m.layout))
+                    .map(|(s, r)| {
+                        let offset = m.layout.offsets.iter().find(|o| o.screen == s.id);
+                        DeskScreen {
+                            id: s.id.clone(),
+                            name: s.name.clone(),
+                            width: s.width,
+                            height: s.height,
+                            x_mm: r.x,
+                            y_mm: r.y,
+                            w_mm: r.w,
+                            h_mm: r.h,
+                            dx_mm: offset.map_or(0, |o| o.dx_mm),
+                            dy_mm: offset.map_or(0, |o| o.dy_mm),
+                            measured: s.size_mm.is_some_and(|(w, h)| w > 0 && h > 0),
+                        }
                     })
                     .collect(),
             })
@@ -511,6 +540,7 @@ mod tests {
             ],
             place: Some(Place { x_mm: 0, y_mm: 0 }),
             barriers: Vec::new(),
+            offsets: Vec::new(),
         }
     }
 
@@ -520,6 +550,7 @@ mod tests {
             screens: vec![screen("BOE", 0, 0, 1920, 1080, Some((344, 194)))],
             place: Some(Place { x_mm, y_mm }),
             barriers: Vec::new(),
+            offsets: Vec::new(),
         }
     }
 
@@ -622,6 +653,24 @@ mod tests {
         // And the far end of the seam is the far end of the laptop.
         let (x, _) = s.entry(s.to - 1);
         assert!((1900..1920).contains(&x), "came in at x = {x}");
+    }
+
+    /// The LG lowered 26 mm, so its bottom lines up with the Philips': a
+    /// laptop under the seam between them now meets both.
+    #[test]
+    fn a_monitor_moved_on_the_desk_meets_what_stands_by_it_there() {
+        let mut desk = nocturne();
+        desk.offsets.push(cursio_protocol::ScreenOffset {
+            screen: "LG".into(),
+            dx_mm: 0,
+            dy_mm: 26,
+        });
+        let seams = seams(me(), &desk, them(), &laptop(300, 296)).unwrap();
+        let mut met: Vec<&str> = seams.iter().map(|s| s.screen.as_str()).collect();
+        met.sort();
+        assert_eq!(met, vec!["LG", "PHL"]);
+        // The other monitor did not move.
+        assert_eq!(screens_mm(&desk)[1].y, 0.0);
     }
 
     #[test]
