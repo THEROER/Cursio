@@ -47,6 +47,90 @@ pub(crate) fn limit_malloc_arenas() {
     }
 }
 
+/// The desktop session's variables this process took from the user's
+/// session manager, for the log once it is open; see
+/// [`adopt_session_environment`].
+#[cfg(target_os = "linux")]
+static ADOPTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The variables that place a process in the desktop session.
+#[cfg(target_os = "linux")]
+const SESSION_VARIABLES: [&str; 6] = [
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+/// Join the user's desktop session when started outside it, before any
+/// thread exists.
+///
+/// A node started from SSH or a console — by hand, or by an update applied
+/// from there, whose new node inherits that shell — had no `DISPLAY`: on X11
+/// capture then cannot ask where the pointer is, so no edge ever crossed and
+/// the cursor stayed stuck on the laptop with only the hotkey to bring it
+/// back. GNOME exports its session's variables to the user's systemd manager,
+/// so they are read from there; each one already set is kept.
+#[cfg(target_os = "linux")]
+pub(crate) fn adopt_session_environment() {
+    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return;
+    }
+    let Ok(output) = std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let found = session_variables(&text);
+    if !found
+        .iter()
+        .any(|(name, _)| *name == "DISPLAY" || *name == "WAYLAND_DISPLAY")
+    {
+        return;
+    }
+    let mut adopted = Vec::new();
+    for (name, value) in found {
+        // A console login says `tty` here; the session it joins says what it is.
+        let replace = name == "XDG_SESSION_TYPE";
+        if replace || std::env::var_os(name).is_none() {
+            adopted.push(format!("{name}={value}"));
+            std::env::set_var(name, value);
+        }
+    }
+    let _ = ADOPTED.set(adopted);
+}
+
+/// Log what [`adopt_session_environment`] took, now that there is a log.
+#[cfg(target_os = "linux")]
+pub(crate) fn report_adopted_session() {
+    if let Some(adopted) = ADOPTED.get() {
+        tracing::info!(
+            ?adopted,
+            "started outside the desktop session; joined it through the user's session manager"
+        );
+    }
+}
+
+/// The session variables in `systemctl --user show-environment` output.
+#[cfg(target_os = "linux")]
+fn session_variables(text: &str) -> Vec<(&'static str, String)> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .filter_map(|(name, value)| {
+            let name = SESSION_VARIABLES.iter().find(|v| **v == name)?;
+            (!value.is_empty()).then(|| (*name, value.to_string()))
+        })
+        .collect()
+}
+
 /// Let SIGINT stop this process however it was started.
 ///
 /// A program started in the background by a non-interactive shell inherits
@@ -185,5 +269,29 @@ pub(crate) async fn bind_mesh_port(port: u16) -> anyhow::Result<TcpListenerHandl
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// What a laptop's GNOME on X11 exported, from a console login.
+    #[test]
+    fn reads_the_desktop_sessions_variables_from_the_session_manager() {
+        let text = "HOME=/home/theroer\nDISPLAY=:0\nXAUTHORITY=/run/user/1000/gdm/Xauthority\n\
+                    XDG_SESSION_TYPE=x11\nWAYLAND_DISPLAY=\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\n";
+        assert_eq!(
+            session_variables(text),
+            vec![
+                ("DISPLAY", ":0".to_string()),
+                ("XAUTHORITY", "/run/user/1000/gdm/Xauthority".to_string()),
+                ("XDG_SESSION_TYPE", "x11".to_string()),
+                (
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "unix:path=/run/user/1000/bus".to_string()
+                ),
+            ]
+        );
     }
 }

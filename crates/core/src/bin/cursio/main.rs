@@ -79,6 +79,8 @@ fn main() -> anyhow::Result<()> {
     process::raise_descriptor_limit();
     #[cfg(unix)]
     process::accept_interrupt();
+    #[cfg(target_os = "linux")]
+    process::adopt_session_environment();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -132,6 +134,8 @@ async fn run() -> anyhow::Result<()> {
         name = %identity.display_name,
         "this node"
     );
+    #[cfg(target_os = "linux")]
+    process::report_adopted_session();
 
     let config_path = match cli.config {
         Some(path) => path,
