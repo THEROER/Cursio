@@ -84,11 +84,26 @@ async function cancel() {
   confirmCancel.value = false
 }
 
-const remaining = computed(() => {
-  if (!state.value) return ""
-  const left = Math.max(0, Math.round((toMillis(state.value.expires_at) - now.value) / 1000))
-  return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`
-})
+// Seconds, not a ready "2:54": the badge then rolls only the digits that
+// changed, where a whole new string made all of it flicker every second.
+const left = computed(() =>
+  state.value ? Math.max(0, Math.round((toMillis(state.value.expires_at) - now.value) / 1000)) : 0,
+)
+const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
+
+// The dash only groups the code for reading; entering accepts it either way,
+// so what is copied is the eight characters alone.
+const bareCode = computed(() => state.value?.code?.replace(/-/g, "") ?? "")
+async function copyCode() {
+  await navigator.clipboard.writeText(bareCode.value)
+  toast.success(t("pair.codeCopied"))
+}
+function copySelection(event: ClipboardEvent) {
+  const picked = window.getSelection()?.toString() ?? ""
+  if (!event.clipboardData || !picked) return
+  event.clipboardData.setData("text/plain", picked.replace(/-/g, ""))
+  event.preventDefault()
+}
 </script>
 
 <template>
@@ -100,11 +115,22 @@ const remaining = computed(() => {
         <template v-if="state.code">
           <p class="text-sm text-muted">{{ t("pair.showThis") }}</p>
           <LpTooltip :content="t('pair.copyHint')">
-            <p class="font-mono text-4xl font-semibold tracking-[0.2em] select-all">{{ state.code }}</p>
+            <button
+              type="button"
+              class="cursor-pointer rounded-control px-2 font-mono text-4xl font-semibold tracking-[0.2em] select-text transition-colors hover:bg-surface-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              @click="copyCode"
+              @copy="copySelection"
+            >
+              {{ state.code }}
+            </button>
           </LpTooltip>
         </template>
         <p v-else class="text-sm">{{ t("pair.waiting") }}</p>
-        <LpBadge tone="brand">{{ t("pair.expiresIn", { time: remaining }) }}</LpBadge>
+        <LpBadge tone="brand">
+          <i18n-t keypath="pair.expiresIn" scope="global">
+            <template #time><LpNumberFlow :value="left" :format="clock" /></template>
+          </i18n-t>
+        </LpBadge>
         <LpBadge v-if="state.failed_attempts" tone="danger">
           {{ t("pair.failedAttempts", { n: state.failed_attempts }) }}
         </LpBadge>
