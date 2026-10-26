@@ -83,19 +83,32 @@ fn register(data: &Path, app: &Path) -> Result<PathBuf, UpdateError> {
     let apps = data.join("applications");
     let path = apps.join(ENTRY);
     if write_if_changed(&path, entry(app).as_bytes())? {
-        let _ = std::process::Command::new("update-desktop-database")
-            .arg(&apps)
-            .status();
+        // Only a cache: a desktop without the tool reads the directory itself.
+        refresh_cache("update-desktop-database", &[], &apps, false);
     }
-    // A stale cache in the theme hides icons added beside it; with no cache
-    // the desktop scans the directory, so a missing tool costs nothing.
+    // A stale cache in the theme hides icons added beside it, so here a
+    // failure is worth saying; with no cache the desktop scans the directory.
     if icons_changed && theme.join("icon-theme.cache").exists() {
-        let _ = std::process::Command::new("gtk-update-icon-cache")
-            .args(["-f", "-t"])
-            .arg(&theme)
-            .status();
+        refresh_cache("gtk-update-icon-cache", &["-f", "-t"], &theme, true);
     }
     Ok(path)
+}
+
+fn refresh_cache(tool: &str, args: &[&str], dir: &Path, needed: bool) {
+    let result = std::process::Command::new(tool)
+        .args(args)
+        .arg(dir)
+        .status();
+    match result {
+        Ok(status) if status.success() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !needed => {}
+        Ok(status) => {
+            tracing::warn!(tool, dir = %dir.display(), %status, "cache refresh failed; the desktop may show the app without its icon until it rebuilds the cache")
+        }
+        Err(e) => {
+            tracing::warn!(tool, dir = %dir.display(), error = %e, "cannot run the cache refresh; the desktop may show the app without its icon until it rebuilds the cache")
+        }
+    }
 }
 
 fn entry(app: &Path) -> String {
@@ -106,13 +119,34 @@ fn entry(app: &Path) -> String {
          Type=Application\n\
          Name=Cursio\n\
          Comment=LAN-first cross-machine workspace\n\
-         Exec=\"{}\"\n\
+         Exec={}\n\
          Icon={ICON}\n\
          StartupWMClass={APP}\n\
          Terminal=false\n\
          Categories=Utility;\n",
-        app.display()
+        exec_quoted(&app.display().to_string())
     )
+}
+
+/// `path` as one quoted Exec argument, escaped as the Desktop Entry spec
+/// asks: `"`, `` ` ``, `$` and `\` inside quotes, and `%`, which names a field
+/// code anywhere, doubled. The string escapes of the file format then double
+/// every backslash again.
+fn exec_quoted(path: &str) -> String {
+    let mut out = String::from("\"");
+    for c in path.chars() {
+        match c {
+            '"' | '`' | '$' => {
+                out.push_str("\\\\");
+                out.push(c);
+            }
+            '\\' => out.push_str("\\\\\\\\"),
+            '%' => out.push_str("%%"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool, UpdateError> {
@@ -149,6 +183,14 @@ mod tests {
             .join("icons/hicolor/scalable/apps/cursio.svg")
             .is_file());
         let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn exec_escapes_what_the_desktop_entry_spec_reserves() {
+        assert_eq!(exec_quoted("/home/u/bin/app"), "\"/home/u/bin/app\"");
+        assert_eq!(exec_quoted("/a$b/100%"), "\"/a\\\\$b/100%%\"");
+        assert_eq!(exec_quoted("/a\"b"), "\"/a\\\\\"b\"");
+        assert_eq!(exec_quoted("/a\\b"), "\"/a\\\\\\\\b\"");
     }
 
     #[test]
