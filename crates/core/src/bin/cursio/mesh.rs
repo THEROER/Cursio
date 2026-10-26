@@ -83,10 +83,11 @@ pub(crate) async fn run_mesh(
         })?;
 
     // Machines seen announcing themselves that this node does not trust yet.
-    // Only ever filled while `--pair` holds a window open; emptied by the sweep
-    // that dials them, so a machine that refuses is retried on the next
-    // sighting rather than hammered every two seconds.
-    let mut strangers: std::collections::HashMap<PeerId, (String, SocketAddr)> =
+    // Only ever filled while a pairing window is open. One this node calls
+    // leaves the map when called, so a machine that refuses is retried on the
+    // next sighting rather than hammered every two seconds; one it leaves to
+    // call stays, with when it started waiting, so the wait can run out.
+    let mut strangers: std::collections::HashMap<PeerId, Stranger> =
         std::collections::HashMap::new();
     if let Some(addr) = pairing.addr() {
         // An address given on the command line stands in for a sighting, for
@@ -94,7 +95,14 @@ pub(crate) async fn run_mesh(
         // handshake, so a nil one is used purely to key the map — `should_dial`
         // would otherwise decide the call, and a machine the user named
         // explicitly is one they want called.
-        strangers.insert(PeerId::nil(), ("the machine you named".into(), addr));
+        strangers.insert(
+            PeerId::nil(),
+            Stranger {
+                name: "the machine you named".into(),
+                addr,
+                yielding_since: None,
+            },
+        );
     }
 
     let local = tokio::task::LocalSet::new();
@@ -220,12 +228,24 @@ pub(crate) async fn run_mesh(
                             // Outside it an unknown machine announcing itself is
                             // ignored, which is what keeps joining the mesh an
                             // explicit, password-gated act.
-                            if strangers.insert(peer.peer_id, (peer.display_name.clone(), peer.addr)).is_none() {
-                                tracing::info!(
-                                    peer = %peer.display_name,
-                                    addr = %peer.addr,
-                                    "unpaired machine found; will offer it the pairing password"
-                                );
+                            match strangers.entry(peer.peer_id) {
+                                std::collections::hash_map::Entry::Occupied(mut seen) => {
+                                    let seen = seen.get_mut();
+                                    seen.name.clone_from(&peer.display_name);
+                                    seen.addr = peer.addr;
+                                }
+                                std::collections::hash_map::Entry::Vacant(slot) => {
+                                    tracing::info!(
+                                        peer = %peer.display_name,
+                                        addr = %peer.addr,
+                                        "unpaired machine found; will offer it the pairing password"
+                                    );
+                                    slot.insert(Stranger {
+                                        name: peer.display_name.clone(),
+                                        addr: peer.addr,
+                                        yielding_since: None,
+                                    });
+                                }
                             }
                         } else {
                             tracing::trace!(peer = %peer.display_name, "ignoring untrusted peer");
@@ -259,17 +279,41 @@ pub(crate) async fn run_mesh(
                         // command and `should_dial` settles which one calls —
                         // the same rule that stops two trusted nodes dialling
                         // each other at once.
-                        if pairing.is_open() {
-                            for (peer_id, (name, addr)) in std::mem::take(&mut strangers) {
-                                // A nil id is the `--addr` placeholder: the user
-                                // named this machine, so this side calls it
-                                // rather than waiting to be called.
-                                if peer_id != PeerId::nil()
-                                    && !cursio_core::registry::should_dial(self_id, peer_id)
-                                {
-                                    tracing::debug!(peer = %name, "letting the other machine call us");
+                        if !pairing.is_open() {
+                            strangers.clear();
+                        } else {
+                            let now = std::time::Instant::now();
+                            let due: Vec<PeerId> = strangers
+                                .iter_mut()
+                                .filter_map(|(&peer_id, stranger)| {
+                                    // A nil id is the `--addr` placeholder: the
+                                    // user named this machine, so this side
+                                    // calls it rather than waiting to be called.
+                                    if peer_id == PeerId::nil()
+                                        || cursio_core::registry::should_dial(self_id, peer_id)
+                                    {
+                                        return Some(peer_id);
+                                    }
+                                    let Some(since) = stranger.yielding_since else {
+                                        tracing::debug!(peer = %stranger.name, "letting the other machine call us");
+                                        stranger.yielding_since = Some(now);
+                                        return None;
+                                    };
+                                    if now.duration_since(since) < cursio_core::mesh::YIELD_GRACE {
+                                        return None;
+                                    }
+                                    tracing::info!(
+                                        peer = %stranger.name,
+                                        addr = %stranger.addr,
+                                        "the unpaired machine has not called; calling it instead"
+                                    );
+                                    Some(peer_id)
+                                })
+                                .collect();
+                            for peer_id in due {
+                                let Some(Stranger { name, addr, .. }) = strangers.remove(&peer_id) else {
                                     continue;
-                                }
+                                };
                                 let transport = match TcpTransport::connect(addr).await {
                                     Ok(t) => t,
                                     Err(e) => {
@@ -483,6 +527,16 @@ pub(crate) async fn dial_over_bluetooth(
             }
         }
     }
+}
+
+/// A machine heard while a pairing window is open, not trusted yet.
+struct Stranger {
+    name: String,
+    addr: SocketAddr,
+    /// When this node first left the call to it. `should_dial` assumes the
+    /// two hear each other, and a stranger that never hears this node never
+    /// calls; past [`cursio_core::mesh::YIELD_GRACE`] this side calls instead.
+    yielding_since: Option<std::time::Instant>,
 }
 
 /// Everything a node needs before it can talk to anyone: a bound listener, an

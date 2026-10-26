@@ -120,7 +120,11 @@ keeps its outbound attempt, the higher one drops it in favour of the inbound.
 That rule only says who *should* call; it cannot stop two links forming. The
 side told to wait calls anyway after `YIELD_GRACE`, so a slow side and an
 impatient one meet halfway, and a phone moving from Bluetooth to the network
-briefly has both. Two links ran two whole sessions — the phone's screen opened
+briefly has both. A machine not paired yet is called under the same rule
+while a pairing window is open, and gets the same grace: hearing is often one
+way (a laptop on a weak Wi-Fi card hears the desktop, the desktop never hears
+it), and without it the waiting side waited out the whole window for a call
+that could not come. Two links ran two whole sessions — the phone's screen opened
 twice, its microphone was offered twice, and either link ending marked the
 peer offline while the other was still up, which had the mesh dial it again.
 So each session, the moment it learns who it talks to, claims the peer's one

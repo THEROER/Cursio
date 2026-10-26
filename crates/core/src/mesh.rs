@@ -80,8 +80,13 @@ pub fn next_dial_targets(local_id: PeerId, registry: &SharedRegistry) -> Vec<Dia
 /// still sees it down after this long dials anyway. Several sweeps long, so a
 /// peer that can dial has done so first and the pair does not open two links.
 ///
+///
+/// The same holds for a machine not paired yet, which the pairing window
+/// calls under the same rule; two laptops on one LAN can hear each other one
+/// way only as well.
+///
 /// [`should_dial`]: crate::registry::should_dial
-const YIELD_GRACE: Duration = Duration::from_secs(10);
+pub const YIELD_GRACE: Duration = Duration::from_secs(10);
 
 /// The same, for a peer this node has not heard in this run and knows only by
 /// the address it remembered.
