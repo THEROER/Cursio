@@ -101,6 +101,26 @@ export interface PhoneAudioState {
 }
 
 export const phoneAudioState = () => invoke<PhoneAudioState>("phone_audio_state")
+
+/** Whether this window already asked to bring the phone's sound back. */
+let resumeAsked = false
+
+/**
+ * Send the phone's sound back to the device it went to before Cursio
+ * restarted, once that device's machine is connected. Android's consent
+ * cannot outlive the process and only a visible window can ask for it, so
+ * whichever page is open first asks — the settings card used to be the only
+ * one, and the sound stayed off until that page was opened. Once per window,
+ * so declining is not answered with another prompt. Answers whether it asked.
+ */
+export async function resumePhoneAudio(): Promise<boolean> {
+  if (resumeAsked) return false
+  const state = await phoneAudioState()
+  if (state.resume == null) return false
+  resumeAsked = true
+  await phoneAudioRoute(state.resume)
+  return true
+}
 export const phoneAudioVolume = (volume: number) => invoke<void>("phone_audio_volume", { volume })
 
 /**

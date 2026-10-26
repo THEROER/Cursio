@@ -42,6 +42,23 @@ const activeTab = computed({
   get: () => items.value.find((i) => isActive(i.path))?.path ?? "/",
   set: (path: string) => void navigateTo(path),
 })
+
+// The phone's sound comes back to its computer from whatever page opens
+// first, as soon as that computer is linked: the node can start capture only
+// with the consent a visible window asks for.
+const toast = useCursioToast()
+async function resumeSound() {
+  try {
+    if (await resumePhoneAudio()) toast.success(t("phoneAudio.routed"))
+  } catch (e) {
+    toast.failure(e, { title: t("phoneAudio.routeFailed") })
+  }
+}
+watch(
+  () => status.value?.peers.map((p) => `${p.id}:${p.presence}`).join(),
+  () => void resumeSound(),
+)
+onMounted(() => void resumeSound())
 </script>
 
 <template>

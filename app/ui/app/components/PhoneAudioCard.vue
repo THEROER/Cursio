@@ -18,13 +18,6 @@ const state = ref<PhoneAudioState | null>(null)
 const busy = ref(false)
 
 /**
- * Whether this window already asked to resume the device chosen before a
- * restart. Android's consent cannot outlive the process, so the choice comes
- * back as one prompt — once, so declining it is not answered with another.
- */
-let resumeAsked = false
-
-/**
  * The computer as this phone's Bluetooth speaker needs no consent prompt, but
  * only Android's own Bluetooth screen can pair it and pick it.
  */
@@ -42,11 +35,6 @@ async function refresh() {
   } catch (e) {
     toast.failure(e, { title: t("phoneAudio.listFailed") })
     return
-  }
-  const resume = state.value?.resume
-  if (resume != null && !resumeAsked && !busy.value) {
-    resumeAsked = true
-    await pick(String(resume))
   }
 }
 
