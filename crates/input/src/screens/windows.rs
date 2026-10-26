@@ -92,6 +92,16 @@ pub(super) fn screens() -> Result<Vec<Screen>, InputError> {
         .collect())
 }
 
+/// Every monitor as a `(x, y, width, height)`, for capture's own thread, which
+/// is per-monitor DPI aware already and so reads physical pixels.
+pub(crate) fn rects() -> Vec<crate::desk::Rect> {
+    monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, r)| (r.left, r.top, r.right - r.left, r.bottom - r.top))
+        .collect()
+}
+
 /// Every monitor's GDI name and rectangle in the virtual screen.
 fn monitors() -> Result<Vec<(String, RECT)>, InputError> {
     unsafe extern "system" fn each(

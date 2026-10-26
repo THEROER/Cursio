@@ -77,10 +77,16 @@ pub(super) fn is_outer_edge(rect: Rect, edge: Edge, rects: &[Rect]) -> bool {
 /// only that part, and the rest of the edge is the desktop's own. Each
 /// barrier's [`BarrierInfo`] still records its monitor's whole segment, so a
 /// crossing is measured along the whole edge, the way the peer places it.
+///
+/// `windows` (by `Edge as usize`, `None` for all of it) are the pixels along
+/// each edge where a peer's screen meets it in the shared layout; a barrier
+/// covers only those, so a peer under the right monitor is not reached from
+/// the left one.
 pub(super) fn outer_edge_barriers(
     rects: &[Rect],
     edges: EdgeSet,
     spans: &[(f32, f32); 4],
+    windows: &[Option<Vec<(i32, i32)>>; 4],
 ) -> (Vec<Barrier>, HashMap<u32, BarrierInfo>) {
     let mut barriers = Vec::new();
     let mut info = HashMap::new();
@@ -114,27 +120,29 @@ pub(super) fn outer_edge_barriers(
             continue;
         };
         let (a, b) = (origin.max(lo), (origin + length).min(hi));
-        if b <= a {
-            continue;
-        }
-        let pos = match peer_edge {
-            Edge::Left => BarrierPosition::new(x, a, x, b - 1),
-            Edge::Right => BarrierPosition::new(x + w, a, x + w, b - 1),
-            Edge::Top => BarrierPosition::new(a, y, b - 1, y),
-            Edge::Bottom => BarrierPosition::new(a, y + h, b - 1, y + h),
+        let pieces: Vec<(i32, i32)> = match &windows[crate::edge_index(peer_edge)] {
+            None => vec![(a, b)],
+            Some(list) => list.iter().map(|&(s, e)| (a.max(s), b.min(e))).collect(),
         };
-
-        if let Some(id) = BarrierID::new(next_id) {
-            barriers.push(Barrier::new(id, pos));
-            info.insert(
-                next_id,
-                BarrierInfo {
-                    edge: peer_edge,
-                    origin,
-                    length,
-                },
-            );
-            next_id += 1;
+        for (a, b) in pieces.into_iter().filter(|&(a, b)| b > a) {
+            let pos = match peer_edge {
+                Edge::Left => BarrierPosition::new(x, a, x, b - 1),
+                Edge::Right => BarrierPosition::new(x + w, a, x + w, b - 1),
+                Edge::Top => BarrierPosition::new(a, y, b - 1, y),
+                Edge::Bottom => BarrierPosition::new(a, y + h, b - 1, y + h),
+            };
+            if let Some(id) = BarrierID::new(next_id) {
+                barriers.push(Barrier::new(id, pos));
+                info.insert(
+                    next_id,
+                    BarrierInfo {
+                        edge: peer_edge,
+                        origin,
+                        length,
+                    },
+                );
+                next_id += 1;
+            }
         }
     }
     (barriers, info)
@@ -251,6 +259,7 @@ pub(super) fn crossing_from(
     Some(crate::EdgeCrossing {
         edge: bi.edge,
         pos_norm: fraction_along(bi.edge, coord, info),
+        at: Some((x.round() as i32, y.round() as i32)),
     })
 }
 
@@ -277,11 +286,29 @@ mod tests {
         EdgeSet::EMPTY.with(edge)
     }
 
+    const WHOLE: [Option<Vec<(i32, i32)>>; 4] = [None, None, None, None];
+
     fn whole_edge_barriers(
         rects: &[Rect],
         edges: EdgeSet,
     ) -> (Vec<Barrier>, HashMap<u32, BarrierInfo>) {
-        outer_edge_barriers(rects, edges, &[(0.0, 1.0); 4])
+        outer_edge_barriers(rects, edges, &[(0.0, 1.0); 4], &WHOLE)
+    }
+
+    /// A laptop under the right one of two monitors: only that monitor's
+    /// bottom, and only where the laptop's screen meets it, gets a barrier.
+    #[test]
+    fn a_peer_under_one_monitor_gets_a_barrier_only_where_its_screen_meets_it() {
+        let desk = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
+        let mut windows = WHOLE;
+        windows[crate::edge_index(Edge::Bottom)] = Some(vec![(1500, 2700)]);
+        let (barriers, _) =
+            outer_edge_barriers(&desk, only(Edge::Bottom), &[(0.0, 1.0); 4], &windows);
+        let lines: Vec<_> = barriers.iter().map(|b| b.position().as_tuple()).collect();
+        assert_eq!(
+            lines,
+            vec![(1500, 1080, 1919, 1080), (1920, 1080, 2699, 1080)]
+        );
     }
 
     fn bottom_only(from: f32, to: f32) -> [(f32, f32); 4] {
@@ -296,6 +323,7 @@ mod tests {
             &[(0, 0, 1920, 1080)],
             only(Edge::Bottom),
             &bottom_only(0.66, 1.0),
+            &WHOLE,
         );
         assert_eq!(barriers.len(), 1);
         assert_eq!(barriers[0].position().as_tuple(), (1267, 1080, 1919, 1080));
@@ -307,7 +335,8 @@ mod tests {
     #[test]
     fn a_span_that_misses_a_monitor_leaves_that_monitor_without_a_barrier() {
         let desk = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
-        let (barriers, _) = outer_edge_barriers(&desk, only(Edge::Bottom), &bottom_only(0.75, 1.0));
+        let (barriers, _) =
+            outer_edge_barriers(&desk, only(Edge::Bottom), &bottom_only(0.75, 1.0), &WHOLE);
         assert_eq!(barriers.len(), 1);
         assert_eq!(barriers[0].position().as_tuple().0, 2880);
     }

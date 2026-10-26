@@ -237,12 +237,22 @@ impl TapState {
         } else {
             fraction(at.y, self.bounds.min_y, self.bounds.max_y)
         };
-        if self.crossed || !crate::crosses_at(edge, pos_norm) {
+        let point = (at.x.round() as i32, at.y.round() as i32);
+        let along = if edge.is_horizontal() {
+            point.0
+        } else {
+            point.1
+        };
+        if self.crossed || !crate::crosses_at(edge, pos_norm, along) {
             return;
         }
         self.crossed = true;
         crate::note_crossed(edge);
-        let _ = self.edges.send(EdgeCrossing { edge, pos_norm });
+        let _ = self.edges.send(EdgeCrossing {
+            edge,
+            pos_norm,
+            at: Some(point),
+        });
     }
 
     fn emit(&self, event: InputEvent) {

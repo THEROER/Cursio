@@ -163,12 +163,18 @@ fn watch(
             Touch::Away => crossed = false,
             Touch::Resting => {}
             Touch::Pushed { edge, pos_norm } => {
-                if crossed || !crate::crosses_at(edge, pos_norm) {
+                let along = if edge.is_horizontal() { at.0 } else { at.1 };
+                if crossed || !crate::crosses_at(edge, pos_norm, along) {
                     continue;
                 }
                 crossed = true;
                 crate::note_crossed(edge);
-                if edges.send(EdgeCrossing { edge, pos_norm }).is_err() {
+                let crossing = EdgeCrossing {
+                    edge,
+                    pos_norm,
+                    at: Some(at),
+                };
+                if edges.send(crossing).is_err() {
                     return;
                 }
                 let (nx, ny) = inward(edge);

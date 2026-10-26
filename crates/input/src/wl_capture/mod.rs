@@ -45,6 +45,7 @@ use tokio::sync::mpsc;
 
 use crate::wl_capture::barriers::crossing_from;
 use crate::wl_capture::barriers::entry_position;
+use crate::wl_capture::barriers::EDGE_NUDGE_PX;
 use crate::wl_capture::barriers::inside_edge;
 use crate::wl_capture::barriers::nudge_off_edge;
 use crate::wl_capture::events::handle_ei_event;
@@ -340,6 +341,7 @@ async fn capture_loop(
     // reaching the peer even though barriers still fire. Cost an afternoon.
     let mut state = CaptureState::default();
     let mut spans = crate::crossing_spans();
+    let mut windows = crate::crossing_windows();
     // Sub-pixel motion carried between libei events, so small moves aren't lost
     // to rounding (see [`MotionRemainder`]).
     let mut remainder = MotionRemainder::default();
@@ -402,7 +404,12 @@ async fn capture_loop(
                     // relative-pointer or raw input, and the barriers stay armed.
                     let entry = crate::take_entry();
                     if state.captured {
-                        if let Some(at) = entry.and_then(|e| entry_position(&rects, e.edge, e.pos_norm)) {
+                        if let Some(at) = entry.and_then(|e| match e.at {
+                            // The peer placed it through the shared layout.
+                            Some(at) => crate::desk::entry_at(&rects, e.edge, at, EDGE_NUDGE_PX)
+                                .map(|(x, y)| (f64::from(x), f64::from(y))),
+                            None => entry_position(&rects, e.edge, e.pos_norm),
+                        }) {
                             let options = ashpd::desktop::input_capture::ReleaseOptions::default()
                                 .set_activation_id(state.activation_id)
                                 .set_cursor_position(Some(at));
@@ -458,9 +465,13 @@ async fn capture_loop(
                     let wanted = *edge_rx.borrow_and_update();
                     // A narrowed span is poked through this same channel with
                     // the edges unchanged; the barriers move all the same.
-                    if wanted != edges || crate::crossing_spans() != spans {
+                    if wanted != edges
+                        || crate::crossing_spans() != spans
+                        || crate::crossing_windows() != windows
+                    {
                         edges = wanted;
                         spans = crate::crossing_spans();
+                        windows = crate::crossing_windows();
                         barrier_info = replace_barriers(
                             &ic, &session, &rects, zone_set, edges, &mut state,
                         )

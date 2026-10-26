@@ -25,6 +25,8 @@
 
 use cursio_protocol::{Edge, EdgeSet};
 
+use crate::desk::Rect;
+
 /// Largest single-step movement (px, along the edge's normal) that crosses on
 /// arrival. Pushing into an edge moves the pointer a few pixels per event; a
 /// flick jumps far more.
@@ -53,8 +55,10 @@ enum Zone {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Crossing {
     pub edge: Edge,
-    /// Where along the edge, `0.0..=1.0`.
+    /// Where along the whole desktop's edge, `0.0..=1.0`.
     pub pos_norm: f32,
+    /// The pointer's position as it crossed.
+    pub at: (i32, i32),
 }
 
 /// The jump-zone state across move events.
@@ -65,6 +69,8 @@ pub(crate) struct EdgeGate {
     /// The part of each edge (by `edge_index`) that crosses; outside it the
     /// edge is an ordinary wall.
     pub(crate) spans: [(f32, f32); 4],
+    /// The pixels along each edge a peer's screen meets (`None`: all).
+    pub(crate) windows: [Option<Vec<(i32, i32)>>; 4],
 }
 
 impl Default for EdgeGate {
@@ -73,6 +79,7 @@ impl Default for EdgeGate {
             zone: Zone::Outside,
             last: None,
             spans: [(0.0, 1.0); 4],
+            windows: [None, None, None, None],
         }
     }
 }
@@ -85,33 +92,53 @@ impl EdgeGate {
         self.last = None;
     }
 
-    /// One pointer move to `pt`. Returns the crossing it makes, if any.
+    /// One pointer move to `pt` on a desktop of `monitors`. Returns the
+    /// crossing it makes, if any.
+    ///
+    /// The zone is at the edge of the monitor the pointer is on, where that
+    /// edge faces off the desktop ([`crate::desk::outer_at`]) — not at the
+    /// box around them all, whose bottom a shorter monitor never reaches.
     pub(crate) fn on_move(
         &mut self,
         pt: (i32, i32),
-        bounds: Bounds,
+        monitors: &[Rect],
         watched: EdgeSet,
     ) -> Option<Crossing> {
         // Sampled even with nothing armed, so the first move after an edge is
         // armed measures its step from where the pointer really was.
         let prev = self.last.replace(pt);
-        let (vx, vy, vw, vh) = bounds;
-        if watched.is_empty() || vw <= 0 || vh <= 0 {
+        let (Some(desk), Some(monitor)) = (
+            crate::desk::bounds(monitors),
+            crate::desk::monitor_at(monitors, pt),
+        ) else {
+            return None;
+        };
+        if watched.is_empty() {
             return None;
         }
+        let (vx, vy, vw, vh) = desk;
+        let (mx, my, mw, mh) = monitor;
 
         // In a corner two watched edges can both be hit; the first in
         // `EdgeSet` order wins, which is arbitrary but stable, and moving
         // along the edge a pixel settles it.
         let hit = watched.iter().find_map(|edge| {
-            let (in_zone, pos_norm) = match edge {
-                Edge::Left => (pt.0 <= vx + ZONE, frac(pt.1 - vy, vh)),
-                Edge::Right => (pt.0 >= vx + vw - 1 - ZONE, frac(pt.1 - vy, vh)),
-                Edge::Top => (pt.1 <= vy + ZONE, frac(pt.0 - vx, vw)),
-                Edge::Bottom => (pt.1 >= vy + vh - 1 - ZONE, frac(pt.0 - vx, vw)),
+            let (in_zone, along, pos_norm) = match edge {
+                Edge::Left => (pt.0 <= mx + ZONE, pt.1, frac(pt.1 - vy, vh)),
+                Edge::Right => (pt.0 >= mx + mw - 1 - ZONE, pt.1, frac(pt.1 - vy, vh)),
+                Edge::Top => (pt.1 <= my + ZONE, pt.0, frac(pt.0 - vx, vw)),
+                Edge::Bottom => (pt.1 >= my + mh - 1 - ZONE, pt.0, frac(pt.0 - vx, vw)),
             };
             let (from, to) = self.spans[crate::edge_index(edge)];
-            (in_zone && (from..=to).contains(&pos_norm)).then_some(Crossing { edge, pos_norm })
+            (in_zone
+                && crate::desk::outer_at(monitors, monitor, edge, along)
+                && (from..=to).contains(&pos_norm)
+                && crate::within(&self.windows[crate::edge_index(edge)], along))
+            .then_some(Crossing {
+                edge,
+                pos_norm,
+                at: pt,
+            })
         });
 
         let Some(crossing) = hit else {
@@ -185,6 +212,7 @@ mod tests {
     use super::*;
 
     const DESK: Bounds = (0, 0, 1920, 1080);
+    const MON: [Rect; 1] = [DESK];
 
     fn left() -> EdgeSet {
         EdgeSet::EMPTY.with(Edge::Left)
@@ -193,8 +221,8 @@ mod tests {
     #[test]
     fn a_slow_push_into_a_watched_edge_crosses_at_once() {
         let mut gate = EdgeGate::default();
-        assert_eq!(gate.on_move((10, 540), DESK, left()), None);
-        let crossed = gate.on_move((0, 540), DESK, left()).unwrap();
+        assert_eq!(gate.on_move((10, 540), &MON, left()), None);
+        let crossed = gate.on_move((0, 540), &MON, left()).unwrap();
         assert_eq!(crossed.edge, Edge::Left);
         assert!((crossed.pos_norm - 0.5).abs() < 0.01);
     }
@@ -202,68 +230,68 @@ mod tests {
     #[test]
     fn a_fast_arrival_crosses_on_the_next_push_without_leaving_the_edge() {
         let mut gate = EdgeGate::default();
-        gate.on_move((900, 540), DESK, left());
-        assert_eq!(gate.on_move((0, 540), DESK, left()), None);
+        gate.on_move((900, 540), &MON, left());
+        assert_eq!(gate.on_move((0, 540), &MON, left()), None);
         // Held against the edge, the pointer cannot move further: step 0.
-        assert!(gate.on_move((0, 541), DESK, left()).is_some());
+        assert!(gate.on_move((0, 541), &MON, left()).is_some());
     }
 
     #[test]
     fn a_pointer_resting_on_the_edge_crosses_only_once() {
         let mut gate = EdgeGate::default();
-        gate.on_move((5, 540), DESK, left());
-        assert!(gate.on_move((0, 540), DESK, left()).is_some());
-        assert_eq!(gate.on_move((0, 540), DESK, left()), None);
-        assert_eq!(gate.on_move((0, 545), DESK, left()), None);
+        gate.on_move((5, 540), &MON, left());
+        assert!(gate.on_move((0, 540), &MON, left()).is_some());
+        assert_eq!(gate.on_move((0, 540), &MON, left()), None);
+        assert_eq!(gate.on_move((0, 545), &MON, left()), None);
     }
 
     #[test]
     fn leaving_the_edge_lets_the_next_approach_cross_again() {
         let mut gate = EdgeGate::default();
-        gate.on_move((5, 540), DESK, left());
-        assert!(gate.on_move((0, 540), DESK, left()).is_some());
-        gate.on_move((30, 540), DESK, left());
-        assert!(gate.on_move((0, 540), DESK, left()).is_some());
+        gate.on_move((5, 540), &MON, left());
+        assert!(gate.on_move((0, 540), &MON, left()).is_some());
+        gate.on_move((30, 540), &MON, left());
+        assert!(gate.on_move((0, 540), &MON, left()).is_some());
     }
 
     #[test]
     fn a_flick_that_carries_on_away_from_the_edge_never_crosses() {
         let mut gate = EdgeGate::default();
-        gate.on_move((900, 540), DESK, left());
-        assert_eq!(gate.on_move((0, 540), DESK, left()), None);
-        assert_eq!(gate.on_move((400, 540), DESK, left()), None);
+        gate.on_move((900, 540), &MON, left());
+        assert_eq!(gate.on_move((0, 540), &MON, left()), None);
+        assert_eq!(gate.on_move((400, 540), &MON, left()), None);
     }
 
     #[test]
     fn the_edge_it_arrived_on_does_not_send_control_straight_back() {
         let mut gate = EdgeGate::default();
         gate.ownership_changed();
-        assert_eq!(gate.on_move((0, 540), DESK, left()), None);
-        assert_eq!(gate.on_move((0, 541), DESK, left()), None);
-        gate.on_move((12, 541), DESK, left());
-        assert!(gate.on_move((0, 541), DESK, left()).is_some());
+        assert_eq!(gate.on_move((0, 540), &MON, left()), None);
+        assert_eq!(gate.on_move((0, 541), &MON, left()), None);
+        gate.on_move((12, 541), &MON, left());
+        assert!(gate.on_move((0, 541), &MON, left()).is_some());
     }
 
     #[test]
     fn an_unwatched_edge_never_crosses() {
         let mut gate = EdgeGate::default();
-        gate.on_move((1900, 540), DESK, left());
-        assert_eq!(gate.on_move((1919, 540), DESK, left()), None);
-        assert_eq!(gate.on_move((0, 540), DESK, EdgeSet::EMPTY), None);
+        gate.on_move((1900, 540), &MON, left());
+        assert_eq!(gate.on_move((1919, 540), &MON, left()), None);
+        assert_eq!(gate.on_move((0, 540), &MON, EdgeSet::EMPTY), None);
     }
 
     #[test]
     fn a_narrowed_edge_crosses_only_inside_its_span() {
         let mut gate = EdgeGate::default();
         gate.spans[crate::edge_index(Edge::Left)] = (0.5, 1.0);
-        gate.on_move((5, 100), DESK, left());
+        gate.on_move((5, 100), &MON, left());
         assert_eq!(
-            gate.on_move((0, 100), DESK, left()),
+            gate.on_move((0, 100), &MON, left()),
             None,
             "above the span is a wall"
         );
-        gate.on_move((5, 900), DESK, left());
-        assert!(gate.on_move((0, 900), DESK, left()).is_some());
+        gate.on_move((5, 900), &MON, left());
+        assert!(gate.on_move((0, 900), &MON, left()).is_some());
     }
 
     #[test]
@@ -283,8 +311,8 @@ mod tests {
     #[test]
     fn leaving_and_coming_back_lands_where_the_pointer_left() {
         let mut gate = EdgeGate::default();
-        gate.on_move((5, 811), DESK, left());
-        let out = gate.on_move((0, 811), DESK, left()).unwrap();
+        gate.on_move((5, 811), &MON, left());
+        let out = gate.on_move((0, 811), &MON, left()).unwrap();
         let (_, y) = entry_point(out.edge, out.pos_norm, DESK, 12).unwrap();
         assert!((y - 811).abs() <= 1, "came back at {y}");
     }
@@ -299,9 +327,36 @@ mod tests {
     #[test]
     fn a_desktop_left_of_the_primary_monitor_has_its_edge_at_its_own_origin() {
         let mut gate = EdgeGate::default();
-        let desk = (-1920, 0, 3840, 1080);
-        assert_eq!(gate.on_move((0, 540), desk, left()), None);
-        gate.on_move((-1910, 540), desk, left());
-        assert!(gate.on_move((-1920, 540), desk, left()).is_some());
+        let desk = [(-1920, 0, 1920, 1080), (0, 0, 1920, 1080)];
+        assert_eq!(gate.on_move((0, 540), &desk, left()), None);
+        gate.on_move((-1910, 540), &desk, left());
+        assert!(gate.on_move((-1920, 540), &desk, left()).is_some());
+    }
+
+    fn bottom() -> EdgeSet {
+        EdgeSet::EMPTY.with(Edge::Bottom)
+    }
+
+    /// The case the box around the monitors got wrong: the short monitor's
+    /// bottom is an edge of the desktop although the box goes lower.
+    #[test]
+    fn the_bottom_of_a_short_monitor_beside_a_tall_one_crosses() {
+        let desk = [(0, 0, 2560, 1440), (2560, 0, 1920, 1080)];
+        let mut gate = EdgeGate::default();
+        gate.on_move((3000, 1070), &desk, bottom());
+        let crossed = gate.on_move((3000, 1079), &desk, bottom()).unwrap();
+        assert_eq!(crossed.at, (3000, 1079));
+    }
+
+    /// A peer under the right monitor only: the left one's bottom is a wall.
+    #[test]
+    fn only_the_pixels_a_peers_screen_meets_cross() {
+        let desk = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
+        let mut gate = EdgeGate::default();
+        gate.windows[crate::edge_index(Edge::Bottom)] = Some(vec![(1920, 3840)]);
+        gate.on_move((500, 1070), &desk, bottom());
+        assert_eq!(gate.on_move((500, 1079), &desk, bottom()), None);
+        gate.on_move((2500, 1070), &desk, bottom());
+        assert!(gate.on_move((2500, 1079), &desk, bottom()).is_some());
     }
 }

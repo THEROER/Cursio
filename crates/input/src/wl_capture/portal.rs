@@ -128,7 +128,12 @@ pub(super) async fn place_barriers(
     zone_set: u32,
     edges: EdgeSet,
 ) -> HashMap<u32, BarrierInfo> {
-    let (barriers, barrier_info) = outer_edge_barriers(rects, edges, &crate::crossing_spans());
+    let (barriers, barrier_info) = outer_edge_barriers(
+        rects,
+        edges,
+        &crate::crossing_spans(),
+        &crate::crossing_windows(),
+    );
     tracing::info!(count = barriers.len(), edges = ?edges.iter().collect::<Vec<_>>(), "placing edge barriers");
     match ic
         .set_pointer_barriers(session, &barriers, zone_set, Default::default())

@@ -13,6 +13,8 @@ use cursio_protocol::{EdgeSet, InputEvent};
 
 #[cfg(target_os = "linux")]
 pub mod capture;
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+mod desk;
 #[cfg(any(target_os = "windows", test))]
 mod edge_gate;
 #[cfg(any(target_os = "windows", test))]
@@ -249,12 +251,60 @@ pub(crate) fn crossing_spans() -> [(f32, f32); 4] {
     *CROSSING_SPANS.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Whether a pointer pressing `edge` at `pos_norm` along it crosses. Windows
-/// asks its `EdgeGate` instead, which holds a copy per hook thread.
+/// Which pixels along each edge (by [`edge_index`]) lead to a peer: `None`
+/// for the whole edge, else `start..end` ranges in capture's own pixels, x for
+/// a top or bottom edge and y for a side. Set from the shared layout, where a
+/// peer stands under one monitor and not the other; the user's
+/// [`set_crossing_span`] still narrows whatever this allows.
+type Windows = [Option<Vec<(i32, i32)>>; 4];
+static CROSSING_WINDOWS: std::sync::Mutex<Windows> =
+    std::sync::Mutex::new([None, None, None, None]);
+
+/// Let only these pixel ranges along `edge` hand the cursor on (`None`: all of
+/// it). Applied at once, like [`set_crossing_span`].
+pub fn set_crossing_windows(edge: cursio_protocol::Edge, windows: Option<Vec<(i32, i32)>>) {
+    let mut all = CROSSING_WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+    let slot = &mut all[edge_index(edge)];
+    if *slot == windows {
+        return;
+    }
+    tracing::info!(
+        ?edge,
+        ?windows,
+        "crossing limited to where a peer's screen meets this edge"
+    );
+    *slot = windows;
+    drop(all);
+    #[cfg(target_os = "linux")]
+    wl_capture::set_watched_edges(watched_edges());
+}
+
+/// Every edge's crossing pixels, by [`edge_index`].
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
+pub(crate) fn crossing_windows() -> Windows {
+    CROSSING_WINDOWS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Whether `along` (a pixel along an edge) falls in one of `windows`.
+pub(crate) fn within(windows: &Option<Vec<(i32, i32)>>, along: i32) -> bool {
+    windows
+        .as_ref()
+        .is_none_or(|w| w.iter().any(|&(start, end)| (start..end).contains(&along)))
+}
+
+/// Whether a pointer pressing `edge` at `pos_norm` along it, pixel `along`,
+/// crosses. Windows asks its `EdgeGate` instead, which holds a copy per hook
+/// thread.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-pub(crate) fn crosses_at(edge: cursio_protocol::Edge, pos_norm: f32) -> bool {
+pub(crate) fn crosses_at(edge: cursio_protocol::Edge, pos_norm: f32, along: i32) -> bool {
     let (from, to) = crossing_spans()[edge_index(edge)];
-    (from..=to).contains(&pos_norm)
+    (from..=to).contains(&pos_norm) && within(&crossing_windows()[edge_index(edge)], along)
 }
 
 /// Where the pointer is to come in when this machine next takes the cursor:
@@ -296,6 +346,11 @@ pub struct EdgeCrossing {
     /// Where along the edge, normalized: y-fraction for a vertical edge
     /// (left/right), x-fraction for a horizontal one (top/bottom).
     pub pos_norm: f32,
+    /// The exact point, in capture's own pixels: where the pointer left, or
+    /// where it is to come in. A crossing always has one. An entry has one
+    /// when the peer placed it through the shared layout; without, the
+    /// backend places it by `pos_norm` along the whole edge.
+    pub at: Option<(i32, i32)>,
 }
 
 /// Handle to a running input capture: a channel of neutral events, the names of

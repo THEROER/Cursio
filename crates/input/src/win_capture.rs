@@ -99,6 +99,28 @@ thread_local! {
     /// Thread-local because the hook and [`apply_mode`] both run on the
     /// capture thread and nowhere else.
     static GATE: RefCell<EdgeGate> = RefCell::new(EdgeGate::default());
+    /// The monitors as last enumerated, and when. A hook runs per move and
+    /// must stay quick; monitors change rarely, so they are re-read at most
+    /// every [`MONITORS_FRESH_FOR`].
+    static MONITORS: RefCell<(Vec<crate::desk::Rect>, Option<std::time::Instant>)> =
+        const { RefCell::new((Vec::new(), None)) };
+}
+
+const MONITORS_FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// This desktop's monitors in physical pixels, re-read when the copy is old.
+fn monitors() -> Vec<crate::desk::Rect> {
+    MONITORS.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let stale = cell.1.is_none_or(|at| at.elapsed() > MONITORS_FRESH_FOR);
+        if stale {
+            *cell = (
+                crate::screens::windows::rects(),
+                Some(std::time::Instant::now()),
+            );
+        }
+        cell.0.clone()
+    })
 }
 
 /// Signalled once by the capture thread when it's up: `Ok(thread_id)` when the
@@ -636,23 +658,17 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 /// Pass the cursor at `pt` (physical virtual-desktop coords) to the
 /// [`EdgeGate`], and emit the [`EdgeCrossing`] it decides on, if any.
 fn check_jump_zone(pt: POINT) {
-    // Virtual-desktop bounds (spans all monitors), physical like `pt` because
-    // the capture thread is per-monitor DPI aware. SAFETY: GetSystemMetrics
-    // has no preconditions.
-    let bounds = unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        )
-    };
+    // Monitors in physical pixels like `pt`, because the capture thread is
+    // per-monitor DPI aware.
+    let monitors = monitors();
     let watched = crate::watched_edges();
     let spans = crate::crossing_spans();
+    let windows = crate::crossing_windows();
     let Some(crossing) = GATE.with(|gate| {
         let mut gate = gate.borrow_mut();
         gate.spans = spans;
-        gate.on_move((pt.x, pt.y), bounds, watched)
+        gate.windows = windows;
+        gate.on_move((pt.x, pt.y), &monitors, watched)
     }) else {
         return;
     };
@@ -662,6 +678,7 @@ fn check_jump_zone(pt: POINT) {
             let _ = tx.send(crate::EdgeCrossing {
                 edge: crossing.edge,
                 pos_norm: crossing.pos_norm,
+                at: Some(crossing.at),
             });
         }
     });
@@ -702,9 +719,13 @@ fn place_at_entry() -> bool {
         tracing::debug!(reason, "pointer left where it was on entry");
         return false;
     }
-    let Some((x, y)) =
-        crate::edge_gate::entry_point(entry.edge, entry.pos_norm, bounds, EDGE_NUDGE_PX)
-    else {
+    // The peer placed it through the shared layout when it could; otherwise
+    // the same fraction of this desktop's whole edge.
+    let placed = match entry.at {
+        Some(at) => crate::desk::entry_at(&monitors(), entry.edge, at, EDGE_NUDGE_PX),
+        None => crate::edge_gate::entry_point(entry.edge, entry.pos_norm, bounds, EDGE_NUDGE_PX),
+    };
+    let Some((x, y)) = placed else {
         return false;
     };
     // SAFETY: SetCursorPos takes plain screen coordinates; the OS clamps them to

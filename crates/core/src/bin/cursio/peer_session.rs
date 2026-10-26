@@ -564,11 +564,13 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
                 // Before `apply`: the mode change it makes is what the backend
                 // places the pointer on, and every handoff overwrites this, so
                 // a hotkey takeback never inherits an older crossing's spot.
-                cursio_input::enter_at(
-                    ownership
-                        .entry
-                        .map(|(edge, pos_norm)| cursio_input::EdgeCrossing { edge, pos_norm }),
-                );
+                cursio_input::enter_at(ownership.entry.map(|(edge, pos_norm)| {
+                    cursio_input::EdgeCrossing {
+                        edge,
+                        pos_norm,
+                        at: None,
+                    }
+                }));
                 c.apply(c.hub.note_driving(token, ownership.driving));
                 // The cursor just left across the peer-facing edge, so this
                 // machine's own pointer is pinned against it — a `pos_norm` of
