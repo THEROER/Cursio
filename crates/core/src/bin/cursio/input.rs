@@ -27,7 +27,10 @@ const SCREENS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 /// Keep this machine's screens on the desk current, on a thread of its own:
 /// the read blocks, and on Linux it is a D-Bus call that must not run on the
 /// runtime's threads.
-pub(crate) fn watch_screens(live: cursio_core::live::LiveConfig) {
+pub(crate) fn watch_screens(
+    live: cursio_core::live::LiveConfig,
+    control: cursio_core::control::NodeState,
+) {
     let spawned = std::thread::Builder::new()
         .name("cursio-screens".into())
         .spawn(move || {
@@ -36,6 +39,7 @@ pub(crate) fn watch_screens(live: cursio_core::live::LiveConfig) {
                 match cursio_input::screens::screens() {
                     Ok(screens) => {
                         said = None;
+                        control.set_local_screens(screens.clone());
                         live.set_screens(screens);
                     }
                     Err(e) => {

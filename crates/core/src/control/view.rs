@@ -66,6 +66,10 @@ pub struct Status {
     /// where the build carries no Bluetooth calls, and from a v16 node.
     #[serde(default)]
     pub call_setup: Option<crate::calls_hub::CallSetup>,
+    /// This machine and every connected one on the shared desk. Defaulted
+    /// from a v19 node.
+    #[serde(default)]
+    pub desk: crate::desk::DeskView,
 }
 
 /// A machine this node has heard announce itself on the LAN.
@@ -148,6 +152,10 @@ pub struct LinkView {
     /// on, and from an older node.
     #[serde(default)]
     pub path_since: Option<SystemTime>,
+    /// The peer's part of the shared desk, as it last said. Empty from a v19
+    /// node.
+    #[serde(default)]
+    pub layout: cursio_protocol::Layout,
 }
 
 /// What carries a link: the same mesh either way, at very different speeds.
@@ -271,8 +279,38 @@ impl NodeState {
             .is_some_and(|greeted| *greeted != node.name);
         let available = inner.available.clone();
         let nearby = inner.nearby();
+        let screens = inner.screens.clone();
+        let linked: Vec<(PeerId, String, cursio_protocol::Layout)> = inner
+            .links
+            .iter()
+            .map(|(id, (name, link))| (*id, name.clone(), link.layout.clone()))
+            .collect();
         drop(inner);
         let running = self.running();
+        let own = cursio_protocol::Layout {
+            screens,
+            place: running.layout.place,
+            barriers: running.layout.barriers.clone(),
+        };
+        let desk = crate::desk::view(
+            &std::iter::once(crate::desk::Machine {
+                id: node.id,
+                name: &node.name,
+                this: true,
+                layout: &own,
+            })
+            .chain(
+                linked
+                    .iter()
+                    .map(|(id, name, layout)| crate::desk::Machine {
+                        id: *id,
+                        name,
+                        this: false,
+                        layout,
+                    }),
+            )
+            .collect::<Vec<_>>(),
+        );
         let mut restart_needed = crate::live::restart_needed(&self.started, &running);
         if renamed {
             restart_needed.push("name".to_owned());
@@ -297,6 +335,7 @@ impl NodeState {
             screens: crate::screen_views::list(),
             gallery: crate::gallery_hub::hub().peers(),
             call_setup: crate::calls_hub::hub().setup(),
+            desk,
         }
     }
 }
@@ -411,6 +450,7 @@ mod tests {
                 since: SystemTime::now(),
                 path: LinkPath::Network,
                 path_since: None,
+                layout: Default::default(),
             },
         );
         let peers = node.status().peers;
@@ -449,6 +489,7 @@ mod tests {
                 since: SystemTime::now(),
                 path: LinkPath::Network,
                 path_since: None,
+                layout: Default::default(),
             },
         );
         assert_eq!(node.status().peers[0].name, "POCO X7 Pro");
@@ -475,6 +516,7 @@ mod tests {
                 since: SystemTime::now(),
                 path: LinkPath::Network,
                 path_since: None,
+                layout: Default::default(),
             },
         );
         let shown = |node: &NodeState| node.status().peers[0].link.as_ref().unwrap().path;

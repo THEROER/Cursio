@@ -165,6 +165,13 @@ impl NodeState {
             Command::SetPosition { position } => {
                 self.edit_file(&["position"], |c| c.position = position)
             }
+            Command::Arrange { machine, place } => self.arrange(machine, place),
+            Command::Barrier {
+                screen,
+                peer,
+                peer_screen,
+                closed,
+            } => self.set_barrier(screen, peer, peer_screen, closed),
             Command::PairShow => {
                 self.pairing.open_shown_code();
                 self.changed();

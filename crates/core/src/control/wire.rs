@@ -34,8 +34,8 @@ use std::path::PathBuf;
 /// v17: `call_setup` in the status, `voice_on` on a phone's calls, and
 /// `[calls]` in the config. v18: `kind` on each stream playing here.
 /// v19: `dir` on `gallery_save`, a folder to save into other than
-/// Pictures/Cursio.
-pub const CONTROL_VERSION: u32 = 19;
+/// Pictures/Cursio. v20: `desk` in the status, `arrange` and `barrier`.
+pub const CONTROL_VERSION: u32 = 20;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -136,6 +136,21 @@ pub enum Command {
     },
     SetPosition {
         position: Position,
+    },
+    /// Stand a machine (this one when `machine` is absent) at `place` on
+    /// the shared desk. Another machine is asked over its link.
+    Arrange {
+        #[serde(default)]
+        machine: Option<PeerId>,
+        place: cursio_protocol::Place,
+    },
+    /// Close or open the seam between this machine's `screen` and `peer`'s
+    /// `peer_screen`, on both machines.
+    Barrier {
+        screen: String,
+        peer: PeerId,
+        peer_screen: String,
+        closed: bool,
     },
     /// Open a window with a fresh code for this machine to show.
     PairShow,
@@ -492,6 +507,19 @@ mod tests {
             },
             Command::SetPosition {
                 position: Position::new(-1, 2),
+            },
+            Command::Arrange {
+                machine: Some(PeerId::from_u128(5)),
+                place: cursio_protocol::Place {
+                    x_mm: 560,
+                    y_mm: 296,
+                },
+            },
+            Command::Barrier {
+                screen: "PHL:UK01944014362".into(),
+                peer: PeerId::from_u128(5),
+                peer_screen: "BOE:103".into(),
+                closed: true,
             },
             Command::PairEnter {
                 code: "ABCD-EFGH".into(),

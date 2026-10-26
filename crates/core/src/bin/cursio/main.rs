@@ -257,7 +257,7 @@ async fn run() -> anyhow::Result<()> {
                     live.request_arrange(peer, request)
                 }));
             }
-            watch_screens(live.clone());
+            watch_screens(live.clone(), control.clone());
             start_control(control.clone());
             let cursio_core::config::Config {
                 port,

@@ -382,6 +382,7 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
             since: std::time::SystemTime::now(),
             path,
             path_since: None,
+            layout: peer.layout.clone(),
         },
     );
     let mut secure = link.transport;
@@ -425,6 +426,7 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
                 control.link_reconfigured(
                     &id,
                     state.peer_position,
+                    state.peer_layout.clone(),
                     state
                         .negotiated
                         .agreed

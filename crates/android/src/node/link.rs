@@ -177,6 +177,7 @@ pub(super) async fn run_link<T: Transport + 'static>(
             since: std::time::SystemTime::now(),
             path,
             path_since: None,
+            layout: peer.layout.clone(),
         },
     );
     publish(ctx);

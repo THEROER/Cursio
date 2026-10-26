@@ -76,6 +76,8 @@ struct Inner {
     available: Vec<ModuleSwitch>,
     /// Every machine discovery reported, by id: name, address, when.
     nearby: BTreeMap<PeerId, (String, std::net::SocketAddr, SystemTime)>,
+    /// This machine's screens as last read.
+    screens: Vec<cursio_protocol::Screen>,
 }
 
 impl Inner {
@@ -164,6 +166,7 @@ impl NodeState {
                 greeted_as: None,
                 available: Vec::new(),
                 nearby: BTreeMap::new(),
+                screens: Vec::new(),
             })),
             config_path,
             overrides,
@@ -345,6 +348,14 @@ impl NodeState {
         );
     }
 
+    /// This machine's screens as just read; a change wakes subscribers.
+    pub fn set_local_screens(&self, screens: Vec<cursio_protocol::Screen>) {
+        let moved = std::mem::replace(&mut self.inner().screens, screens.clone()) != screens;
+        if moved {
+            self.changed();
+        }
+    }
+
     pub fn link_up(&self, peer: PeerId, name: &str, link: LinkView) {
         crate::metrics::note_peer_status(peer, link.status);
         self.inner().links.insert(peer, (name.to_owned(), link));
@@ -384,11 +395,13 @@ impl NodeState {
         &self,
         peer: &PeerId,
         position: Position,
+        layout: cursio_protocol::Layout,
         modules: Vec<String>,
         (skipped, inapplicable): (Vec<(String, String)>, Vec<String>),
     ) {
         if let Some((_, link)) = self.inner().links.get_mut(peer) {
             link.position = position;
+            link.layout = layout;
             link.modules = modules;
             link.skipped = skipped;
             link.inapplicable = inapplicable;

@@ -24,7 +24,8 @@
 //! rounding, and a seam shorter than [`MIN_SEAM_MM`] is a corner brushing a
 //! corner, which no hand aims at.
 
-use cursio_protocol::{Edge, Layout, PeerId, Screen};
+use cursio_protocol::{Edge, Layout, PeerId, Place, Screen};
+use serde::{Deserialize, Serialize};
 
 /// How far apart two edges may lie and still meet.
 pub const TOUCH_MM: f64 = 3.0;
@@ -268,9 +269,9 @@ fn closed(
             .any(|b| b.peer == me && b.screen == n.id && b.peer_screen == m.id)
 }
 
-/// Where `m`'s `edge` meets `n`, if it does.
-fn seam(edge: Edge, m: &Screen, mr: MmRect, n: &Screen, nr: MmRect) -> Option<Seam> {
-    // The line each edge lies on, and the stretch it covers, on the desk.
+/// Where the rectangle `mr`'s `edge` lies against `nr` on the desk: the line
+/// (x for a side, y for a top or bottom) and the stretch `lo..hi` along it.
+fn meeting(edge: Edge, mr: MmRect, nr: MmRect) -> Option<(f64, f64, f64)> {
     let (mine_line, theirs_line) = match edge {
         Edge::Left => (mr.x, nr.x + nr.w),
         Edge::Right => (mr.x + mr.w, nr.x),
@@ -286,9 +287,17 @@ fn seam(edge: Edge, m: &Screen, mr: MmRect, n: &Screen, nr: MmRect) -> Option<Se
         (mr.y, mr.y + mr.h, nr.y, nr.y + nr.h)
     };
     let (lo, hi) = (m0.max(n0), m1.min(n1));
-    if hi - lo < MIN_SEAM_MM {
-        return None;
-    }
+    (hi - lo >= MIN_SEAM_MM).then_some((mine_line, lo, hi))
+}
+
+/// Where `m`'s `edge` meets `n`, if it does.
+fn seam(edge: Edge, m: &Screen, mr: MmRect, n: &Screen, nr: MmRect) -> Option<Seam> {
+    let (_, lo, hi) = meeting(edge, mr, nr)?;
+    let (m0, m1, n0, n1) = if edge.is_horizontal() {
+        (mr.x, mr.x + mr.w, nr.x, nr.x + nr.w)
+    } else {
+        (mr.y, mr.y + mr.h, nr.y, nr.y + nr.h)
+    };
     // Millimetres along each screen's edge, to its pixels.
     let (m_px0, m_len) = if edge.is_horizontal() {
         (m.x, m.width)
@@ -328,6 +337,136 @@ fn seam(edge: Edge, m: &Screen, mr: MmRect, n: &Screen, nr: MmRect) -> Option<Se
 /// have said for a pair not yet on the desk.
 pub fn main_edge(seams: &[Seam]) -> Option<Edge> {
     seams.iter().max_by_key(|s| s.to - s.from).map(|s| s.edge)
+}
+
+/// The whole desk as the arrangement page draws it: every machine with its
+/// screens in millimetres, and every seam, closed or not. Worked out here so
+/// the page draws what the cursor will do rather than its own guess at it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeskView {
+    pub machines: Vec<DeskMachine>,
+    pub seams: Vec<DeskSeam>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeskMachine {
+    pub id: PeerId,
+    pub name: String,
+    /// The machine this node runs on.
+    pub this: bool,
+    /// `None` until someone arranges it; the page stands it beside the others
+    /// for the person to drag into place.
+    pub place: Option<Place>,
+    pub screens: Vec<DeskScreen>,
+}
+
+/// A screen, relative to its machine's corner.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeskScreen {
+    pub id: String,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub x_mm: f64,
+    pub y_mm: f64,
+    pub w_mm: f64,
+    pub h_mm: f64,
+    /// The panel reported its size; otherwise it is a 96 dpi guess.
+    pub measured: bool,
+}
+
+/// Where two machines' screens meet, as a line on the desk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeskSeam {
+    pub machine: PeerId,
+    pub screen: String,
+    pub peer: PeerId,
+    pub peer_screen: String,
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+    /// A barrier on either side keeps the cursor from crossing here.
+    pub closed: bool,
+}
+
+/// One machine for [`view`].
+pub struct Machine<'a> {
+    pub id: PeerId,
+    pub name: &'a str,
+    pub this: bool,
+    pub layout: &'a Layout,
+}
+
+/// The desk as `machines` stand on it. A machine with no screens (a phone)
+/// has no place on it and is left out.
+pub fn view(machines: &[Machine<'_>]) -> DeskView {
+    let machines: Vec<&Machine<'_>> = machines
+        .iter()
+        .filter(|m| !m.layout.screens.is_empty())
+        .collect();
+    let mut seams = Vec::new();
+    for (i, a) in machines.iter().enumerate() {
+        for b in &machines[i + 1..] {
+            let (Some(ar), Some(br)) = (on_desk(a.layout), on_desk(b.layout)) else {
+                continue;
+            };
+            for (m, mr) in a.layout.screens.iter().zip(&ar) {
+                for (n, nr) in b.layout.screens.iter().zip(&br) {
+                    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+                        let Some((line, lo, hi)) = meeting(edge, *mr, *nr) else {
+                            continue;
+                        };
+                        let (x1, y1, x2, y2) = if edge.is_horizontal() {
+                            (lo, line, hi, line)
+                        } else {
+                            (line, lo, line, hi)
+                        };
+                        seams.push(DeskSeam {
+                            machine: a.id,
+                            screen: m.id.clone(),
+                            peer: b.id,
+                            peer_screen: n.id.clone(),
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            closed: closed(a.id, a.layout, m, b.id, b.layout, n),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    DeskView {
+        machines: machines
+            .iter()
+            .map(|m| DeskMachine {
+                id: m.id,
+                name: m.name.to_string(),
+                this: m.this,
+                place: m.layout.place,
+                screens: m
+                    .layout
+                    .screens
+                    .iter()
+                    .zip(arrange(&m.layout.screens))
+                    .map(|(s, r)| DeskScreen {
+                        id: s.id.clone(),
+                        name: s.name.clone(),
+                        width: s.width,
+                        height: s.height,
+                        x_mm: r.x,
+                        y_mm: r.y,
+                        w_mm: r.w,
+                        h_mm: r.h,
+                        measured: s.size_mm.is_some_and(|(w, h)| w > 0 && h > 0),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        seams,
+    }
 }
 
 /// One side of a link, as far as where it stands goes.
@@ -521,6 +660,38 @@ mod tests {
             seams(them(), &laptop(560, 296), me(), &mine),
             Some(Vec::new())
         );
+    }
+
+    #[test]
+    fn the_page_sees_each_seam_once_with_whether_it_is_closed() {
+        let mut mine = nocturne();
+        mine.barriers.push(Barrier {
+            screen: "PHL".into(),
+            peer: them(),
+            peer_screen: "BOE".into(),
+        });
+        let laptop = laptop(560, 296);
+        let desk = view(&[
+            Machine {
+                id: me(),
+                name: "Nocturne",
+                this: true,
+                layout: &mine,
+            },
+            Machine {
+                id: them(),
+                name: "dark",
+                this: false,
+                layout: &laptop,
+            },
+        ]);
+        assert_eq!(desk.machines.len(), 2);
+        assert_eq!(desk.machines[0].screens[1].x_mm, 480.0);
+        assert_eq!(desk.seams.len(), 1);
+        let seam = &desk.seams[0];
+        assert_eq!((seam.y1, seam.y2), (296.0, 296.0));
+        assert_eq!((seam.x1, seam.x2), (560.0, 904.0));
+        assert!(seam.closed);
     }
 
     #[test]
