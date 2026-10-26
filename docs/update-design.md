@@ -70,6 +70,14 @@ the child so it can never loop. A registry entry naming
 `versions/<v>/cursio.exe` would outlive that version by one prune. Development
 builds under `target/` are never under the root and never hand over.
 
+On Linux the node also puts the app in the desktop's application list
+whenever it runs from the root (`update::launcher`): an entry naming
+`<root>/cursio-app` plus the icon, which is compiled in. A machine fed only by
+the mesh has no checkout to run `cargo xtask install` from, so without this
+the app was installed and up to date there and search found nothing. The node
+writes it at its own start, not in the apply helper, because the helper is the
+previous version's code.
+
 **Installing** (`cursio update install <dir>`) reads the build's
 `manifest.json`, verifies every component's sha256 in the source, copies into
 `versions/.<v>.partial`, verifies again, and renames into place — a half-copied

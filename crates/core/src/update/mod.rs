@@ -17,6 +17,8 @@ pub mod agent;
 pub mod apply;
 pub mod cli;
 pub mod lane;
+#[cfg(target_os = "linux")]
+pub mod launcher;
 pub mod layout;
 pub mod manifest;
 pub mod quiet;

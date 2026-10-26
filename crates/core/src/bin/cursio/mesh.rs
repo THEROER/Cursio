@@ -42,6 +42,17 @@ pub(crate) async fn run_mesh(
         status,
     } = start_node(&identity, port, send_input).await?;
 
+    #[cfg(target_os = "linux")]
+    match cursio_core::update::launcher::register_from_install() {
+        Ok(Some(entry)) => {
+            tracing::debug!(entry = %entry.display(), "the app is in the application list")
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot add Cursio to the application list; search will not find the app")
+        }
+    }
+
     // One registry for the whole process, shared by every session. Sessions are
     // single-threaded by design, so `Rc` is the right sharing primitive here.
     let modules = std::rc::Rc::new(modules);
