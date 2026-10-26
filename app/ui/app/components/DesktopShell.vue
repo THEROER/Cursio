@@ -26,7 +26,7 @@ const { isMobile } = usePlatform()
 const items = computed<SidebarItem[]>(() => [
   { id: "/", label: t("nav.status"), icon: "lucide:activity", badge: status.value?.problems.length || undefined },
   { id: "/placement", label: t("nav.placement"), icon: "lucide:layout-grid" },
-  { id: "/pair", label: t("nav.pair"), icon: "lucide:link", badge: status.value?.pairing ? "•" : undefined },
+  { id: "/pair", label: t("nav.pair"), icon: "lucide:link", dot: !!status.value?.pairing },
   // Only while a phone shares its messages, or the page is already open
   // (`cursio-app --page messages` from the Shell menu).
   ...(status.value?.messages?.length || route.path === "/messages"
@@ -37,6 +37,14 @@ const items = computed<SidebarItem[]>(() => [
     : []),
   { id: "/settings", label: t("nav.settings"), icon: "lucide:settings" },
 ])
+
+const nodeState = computed(() =>
+  status.value
+    ? { tone: "success" as const, dot: "bg-action", label: t("node.running") }
+    : notRunning.value
+      ? { tone: "danger" as const, dot: "bg-danger", label: t("node.stopped") }
+      : { tone: "neutral" as const, dot: "bg-muted", label: t("node.connecting") },
+)
 
 const title = computed(() => {
   const match = [...items.value].sort((a, b) => b.id.length - a.id.length).find((i) =>
@@ -56,23 +64,29 @@ const title = computed(() => {
     :path="route.path"
     :full-bleed="fullBleed"
     content-class="mx-auto w-full max-w-5xl"
+    resizable
+    pinnable
+    persist="cursio"
     @select="(item: SidebarItem) => navigateTo(item.id)"
   >
-    <template #logo>
-      <div class="flex items-center gap-2 px-1" data-tauri-drag-region>
-        <CursioLogo :size="20" class="text-brand" />
-        <div class="min-w-0" data-tauri-drag-region>
+    <template #logo="{ compact }">
+      <div class="flex items-center gap-2" :class="compact ? '' : 'px-1'" data-tauri-drag-region>
+        <CursioLogo :size="20" class="shrink-0 text-brand" />
+        <div v-if="!compact" class="min-w-0" data-tauri-drag-region>
           <p class="truncate text-sm font-semibold" data-tauri-drag-region>{{ t("app.title") }}</p>
           <p class="truncate text-xs text-muted" data-tauri-drag-region>{{ status?.node.name ?? t("app.desktopSubtitle") }}</p>
         </div>
       </div>
     </template>
 
-    <template #sidebar-footer>
-      <div class="flex flex-col gap-2 px-1">
-        <LpBadge v-if="status" tone="success" dot>{{ t("node.running") }}</LpBadge>
-        <LpBadge v-else-if="notRunning" tone="danger" dot>{{ t("node.stopped") }}</LpBadge>
-        <LpBadge v-else tone="neutral" dot>{{ t("node.connecting") }}</LpBadge>
+    <template #sidebar-footer="{ compact }">
+      <LpTooltip v-if="compact" :content="nodeState.label" side="right">
+        <span class="grid size-10 place-items-center" role="status" :aria-label="nodeState.label">
+          <span class="size-2.5 rounded-full" :class="nodeState.dot" />
+        </span>
+      </LpTooltip>
+      <div v-else class="flex flex-col gap-2 px-1">
+        <LpBadge :tone="nodeState.tone" dot>{{ nodeState.label }}</LpBadge>
       </div>
     </template>
 

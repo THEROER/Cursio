@@ -124,8 +124,9 @@ watch(open, (o) => {
         compact
         icon="lucide:package-open"
         :title="t('update.noInstall')"
-        :description="t('update.noInstallHint')"
-      />
+      >
+        <template #description><CodeText :text="t('update.noInstallHint')" /></template>
+      </LpEmptyState>
       <ul v-else class="flex flex-col gap-1">
         <li
           v-for="version in [...install.installed].reverse()"

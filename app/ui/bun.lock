@@ -8,7 +8,7 @@
         "@iconify-json/lucide": "^1.2.120",
         "@iconify/vue": "^5.0.1",
         "@internationalized/date": "^3.12.2",
-        "@leavepulse/ui": "^0.70.1",
+        "@leavepulse/ui": "^0.72.1",
         "@nuxtjs/i18n": "^10.5.0",
         "@tailwindcss/vite": "^4.3.3",
         "@tauri-apps/api": "^2.11.1",
@@ -238,7 +238,7 @@
 
     "@kwsites/promise-deferred": ["@kwsites/promise-deferred@1.1.1", "", {}, "sha512-GaHYm+c0O9MjZRu0ongGBRbinu8gVAMd2UZjji6jVmqKtZluZnptXGWhz1E8j8D2HJ3f/yMxKAUC0b+57wncIw=="],
 
-    "@leavepulse/ui": ["@leavepulse/ui@0.70.1", "", { "dependencies": { "@vue-flow/background": "^1.3.2", "@vue-flow/controls": "^1.1.3", "@vue-flow/core": "^1.48.2", "@vue-flow/minimap": "^1.5.4", "libphonenumber-js": "^1.12.0", "tailwind-merge": "^3.6.0", "vaul-vue": "^0.4.1" }, "peerDependencies": { "@iconify-json/lucide": "^1.2.0", "@iconify/vue": "^5.0.0", "@internationalized/date": "^3.5.0", "@nuxt/kit": "^3.0.0 || ^4.0.0", "motion-v": "^2.2.0", "reka-ui": "^2.9.0", "tailwind-variants": "^3.0.0", "tailwindcss": "^4.0.0", "vue": "^3.5.0" }, "optionalPeers": ["@nuxt/kit"] }, "sha512-3KwxylIfGHCkQyp/4PBmbA7F9AYIiPVJyRACCPzTyJb6/ncURL+i8yOjVjv62Z/XIUN+1sY/ezClk55u+f/lag=="],
+    "@leavepulse/ui": ["@leavepulse/ui@0.72.1", "", { "dependencies": { "@vue-flow/background": "^1.3.2", "@vue-flow/controls": "^1.1.3", "@vue-flow/core": "^1.48.2", "@vue-flow/minimap": "^1.5.4", "libphonenumber-js": "^1.12.0", "tailwind-merge": "^3.6.0", "vaul-vue": "^0.4.1" }, "peerDependencies": { "@iconify-json/lucide": "^1.2.0", "@iconify/vue": "^5.0.0", "@internationalized/date": "^3.5.0", "@nuxt/kit": "^3.0.0 || ^4.0.0", "motion-v": "^2.2.0", "reka-ui": "^2.9.0", "tailwind-variants": "^3.0.0", "tailwindcss": "^4.0.0", "vue": "^3.5.0" }, "optionalPeers": ["@nuxt/kit"] }, "sha512-AkbxNfBrowdiyZJJmYTiKXz4ljpU1LIGVw7bkt7uZT7DoNyE0NFC8LHBDavJ0451k0cj2rwG0F+pofKJ5O8dEQ=="],
 
     "@mapbox/node-pre-gyp": ["@mapbox/node-pre-gyp@2.0.3", "", { "dependencies": { "consola": "^3.2.3", "detect-libc": "^2.0.0", "https-proxy-agent": "^7.0.5", "node-fetch": "^2.6.7", "nopt": "^8.0.0", "semver": "^7.5.3", "tar": "^7.4.0" }, "bin": { "node-pre-gyp": "bin/node-pre-gyp" } }, "sha512-uwPAhccfFJlsfCxMYTwOdVfOz3xqyj8xYL3zJj8f0pb30tLohnnFPhLuqp4/qoEz8sNxe4SESZedcBojRefIzg=="],
 

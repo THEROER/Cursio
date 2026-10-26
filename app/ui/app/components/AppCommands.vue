@@ -824,7 +824,7 @@ const labels = computed(() => ({
         </LpPalettePreview>
 
         <LpPalettePreview v-else-if="p?.kind === 'start'">
-          <LpPaletteHeader :eyebrow="t('palette.node')" icon="lucide:play" :title="highlight(command.label)" :lead="t('node.notRunningBody')" />
+          <LpPaletteHeader :eyebrow="t('palette.node')" icon="lucide:play" :title="highlight(command.label)" :lead="t('node.notRunningBody').replaceAll('`', '')" />
         </LpPalettePreview>
 
         <LpPalettePreview v-else-if="p?.kind === 'update' && status?.update.ready">

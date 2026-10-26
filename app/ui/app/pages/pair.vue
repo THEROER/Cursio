@@ -142,7 +142,7 @@ function copySelection(event: ClipboardEvent) {
           <h3 class="flex items-center gap-2 text-sm font-semibold">
             <LpIcon name="lucide:qr-code" :size="16" class="text-brand" />{{ t("pair.showTitle") }}
           </h3>
-          <p class="text-xs text-muted">{{ t("pair.showHint") }}</p>
+          <p class="text-xs text-muted"><CodeText :text="t('pair.showHint')" /></p>
           <LpButton variant="solid" class="mt-auto" @click="run(pairShow)">{{ t("pair.show") }}</LpButton>
         </LpCard>
         <LpCard padded class="flex flex-col gap-3">

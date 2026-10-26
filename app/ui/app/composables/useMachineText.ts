@@ -1,4 +1,4 @@
-import type { LatencyReading, LinkView, ModuleSwitch, NodeStatus } from "~/composables/useNode"
+import type { LatencyReading, LinkView, ModuleSwitch, NodeStatus, Position } from "~/composables/useNode"
 
 export interface ModuleMeta {
   key: ModuleSwitch
@@ -56,7 +56,9 @@ export function useMachineText() {
   const { t } = useI18n()
 
   function battery(s: NodeStatus): string | null {
-    if (s.battery_percent === null) return null
+    // A desktop has no battery to report, and "cannot say" next to a machine
+    // on mains read as something being wrong with it.
+    if (s.battery_percent === null) return s.power === "Mains" ? t("peer.mains") : null
     const power = s.power === "Charging" ? t("peer.charging") : s.power === "Mains" ? t("peer.plugged") : ""
     return `${s.battery_percent}%${power ? ` · ${power}` : ""}`
   }
@@ -76,5 +78,13 @@ export function useMachineText() {
     }
   }
 
-  return { battery, network }
+  /** Where a peer's cell sits from this machine's, in words rather than grid numbers. */
+  function place(p: Position): string {
+    const across = p.x > 0 ? t("peer.toRight") : p.x < 0 ? t("peer.toLeft") : ""
+    const up = p.y > 0 ? t("peer.below") : p.y < 0 ? t("peer.above") : ""
+    if (across && up) return `${across}, ${up.toLowerCase()}`
+    return across || up || t("peer.samePlace")
+  }
+
+  return { battery, network, place }
 }

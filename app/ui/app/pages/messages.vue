@@ -356,8 +356,6 @@ const segments = computed(() => {
   return { length, count: length <= single ? 1 : Math.ceil(length / part) }
 })
 
-const composerRows = computed(() => Math.min(6, Math.max(1, body.value.split("\n").length)))
-
 const showList = computed(() => !(open.value || composingNew.value))
 </script>
 
@@ -501,7 +499,7 @@ const showList = computed(() => !(open.value || composingNew.value))
 
           <form class="flex items-end gap-2 border-t border-line p-3" @submit.prevent="send()">
             <div class="flex min-w-0 flex-1 flex-col gap-1">
-              <LpTextarea ref="composer" v-model="body" :rows="composerRows" :placeholder="t('messages.write')" :aria-label="t('messages.write')" @keydown="onKey" />
+              <LpTextarea ref="composer" v-model="body" :rows="1" autosize :max-rows="6" :placeholder="t('messages.write')" :aria-label="t('messages.write')" @keydown="onKey" />
               <span class="flex justify-between px-1 text-[11px] text-muted">
                 <span>{{ t("messages.enterHint") }}</span>
                 <span v-if="segments">{{ t("messages.segments", { length: segments.length, count: segments.count }, segments.count) }}</span>

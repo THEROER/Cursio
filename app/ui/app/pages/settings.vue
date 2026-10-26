@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { TocLink } from "@leavepulse/ui"
 import { invoke } from "@tauri-apps/api/core"
 import type { BluetoothMesh, CallsConfig, Reply, ServiceState } from "~/composables/useNode"
 
@@ -317,6 +318,26 @@ function autostartFailed(which: keyof Autostart) {
 
 const confirmRestart = ref(false)
 const restarting = ref(false)
+// The sections shown depend on the platform and on what the node reports, so
+// the contents are read off the page rather than kept as a second list of the
+// same conditions.
+const sectionsBox = ref<HTMLElement | null>(null)
+const toc = ref<TocLink[]>([])
+function collectToc() {
+  toc.value = [...(sectionsBox.value?.querySelectorAll<HTMLElement>(":scope > section[id]") ?? [])].map((s) => ({
+    id: s.id,
+    text: s.querySelector("h1, h2, h3, h4")?.textContent?.trim() || s.id,
+  }))
+}
+let watcher: MutationObserver | undefined
+onMounted(() => {
+  collectToc()
+  if (!sectionsBox.value) return
+  watcher = new MutationObserver(collectToc)
+  watcher.observe(sectionsBox.value, { childList: true })
+})
+onBeforeUnmount(() => watcher?.disconnect())
+
 async function restartNode() {
   restarting.value = true
   try {
@@ -333,292 +354,297 @@ async function restartNode() {
 
 <template>
   <DesktopShell>
-    <div class="flex flex-col gap-6">
-      <section v-if="status" id="name" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('settings.nameTitle')" :description="t('settings.nameDescription')" icon="lucide:tag" />
-        <LpCard padded class="flex flex-col gap-3">
-          <form class="flex flex-wrap items-end gap-3" @submit.prevent="saveName">
-            <LpInput
-              v-model="nameDraft"
-              :label="t('settings.nameLabel')"
-              :error="nameChanged ? nameError : undefined"
-              :disabled="nameBusy"
-              class="min-w-0 flex-1 basis-56"
-            />
-            <LpButton type="submit" variant="solid" :disabled="!nameChanged || !!nameError || nameBusy">
-              {{ nameBusy ? t("common.working") : t("settings.rename") }}
-            </LpButton>
-          </form>
-          <p v-if="isMobile" class="text-xs text-muted">{{ t("settings.namePhoneHint") }}</p>
-          <LpAlert v-else-if="nameWaitsForRestart" variant="warning" :title="t('settings.nameWaits')">
-            <LpButton variant="soft" size="sm" @click="confirmRestart = true">{{ t("settings.restart") }}</LpButton>
-          </LpAlert>
-        </LpCard>
-      </section>
+    <div class="xl:grid xl:grid-cols-[minmax(0,1fr)_11rem] xl:items-start xl:gap-8">
+      <div ref="sectionsBox" class="flex flex-col gap-6">
+        <section v-if="status" id="name" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('settings.nameTitle')" :description="t('settings.nameDescription')" icon="lucide:tag" />
+          <LpCard padded class="flex flex-col gap-3">
+            <form class="flex flex-wrap items-end gap-3" @submit.prevent="saveName">
+              <LpInput
+                v-model="nameDraft"
+                :label="t('settings.nameLabel')"
+                :error="nameChanged ? nameError : undefined"
+                :disabled="nameBusy"
+                class="min-w-0 flex-1 basis-56"
+              />
+              <LpButton type="submit" variant="solid" :disabled="!nameChanged || !!nameError || nameBusy">
+                {{ nameBusy ? t("common.working") : t("settings.rename") }}
+              </LpButton>
+            </form>
+            <p v-if="isMobile" class="text-xs text-muted">{{ t("settings.namePhoneHint") }}</p>
+            <LpAlert v-else-if="nameWaitsForRestart" variant="warning" :title="t('settings.nameWaits')">
+              <LpButton variant="soft" size="sm" @click="confirmRestart = true">{{ t("settings.restart") }}</LpButton>
+            </LpAlert>
+          </LpCard>
+        </section>
 
-      <section id="theme" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('settings.themeTitle')" :description="t('settings.themeDescription')" icon="lucide:palette" />
-        <LpCard padded>
-          <LpThemeSwitcher variant="swatch" show-label :aria-label="t('settings.themeTitle')" />
-        </LpCard>
-      </section>
+        <section id="theme" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('settings.themeTitle')" :description="t('settings.themeDescription')" icon="lucide:palette" />
+          <LpCard padded>
+            <LpThemeStudio :storage-key="THEME_STUDIO_KEY" :hide="['export']" :labels="{ title: '' }" />
+          </LpCard>
+        </section>
 
-      <section v-if="status" id="audio" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('settings.audioTitle')" icon="lucide:mic" />
-        <LpSkeleton v-if="!gateMode" rounded="card" class="h-24" />
-        <LpCard v-else padded class="flex flex-col gap-3">
-          <div class="flex flex-wrap items-center gap-4">
+        <section v-if="status" id="audio" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('settings.audioTitle')" icon="lucide:mic" />
+          <LpSkeleton v-if="!gateMode" rounded="card" class="h-24" />
+          <LpCard v-else padded class="flex flex-col gap-3">
+            <div class="flex flex-wrap items-center gap-4">
+              <div class="min-w-0 flex-1">
+                <p class="text-sm font-medium">{{ t("settings.micGate") }}</p>
+                <p class="text-xs text-muted">{{ t("settings.micGateHint") }}</p>
+              </div>
+              <LpSegmented
+                :model-value="gateMode"
+                :options="gateModes"
+                :disabled="gateBusy"
+                size="sm"
+                @update:model-value="setGateMode"
+              />
+            </div>
+            <div v-if="gateMode === 'fixed'" class="flex items-center gap-4">
+              <LpSlider
+                v-model="gateLevel"
+                :min="GATE_MIN"
+                :max="GATE_MAX"
+                :step="1"
+                :disabled="gateBusy"
+                :aria-label="t('settings.micGateLevel')"
+                class="flex-1"
+                @change="saveMicGate"
+              />
+              <span class="w-20 text-right font-mono text-xs tabular-nums">
+                {{ t("settings.micGateDb", { db: gateLevel }) }}
+              </span>
+            </div>
+            <p v-if="gatePinned" class="text-xs text-muted">{{ t("settings.micGatePinned") }}</p>
+          </LpCard>
+        </section>
+
+        <section v-if="status && !isMobile" id="calls" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('settings.callsTitle')" :description="t('settings.callsDescription')" icon="lucide:phone" />
+          <LpCard v-if="!callSetup" padded>
+            <p class="text-sm text-muted">{{ t("settings.callsUnsupported") }}</p>
+          </LpCard>
+          <LpSkeleton v-else-if="!calls" rounded="card" class="h-48" />
+          <LpCard v-else padded class="flex flex-col gap-4">
+            <p v-if="callSetup.headset === false" class="text-sm text-muted">{{ t("settings.callsUnsupported") }}</p>
+            <ul v-else class="flex flex-col divide-y divide-line">
+              <li class="flex flex-col gap-2 pb-3">
+                <div class="flex items-center gap-4">
+                  <p class="min-w-0 flex-1 text-sm font-medium">{{ t("settings.callsRoles") }}</p>
+                  <LpBadge :tone="callSetup.roles_taken ? 'success' : 'warning'" dot size="sm">
+                    {{ callSetup.roles_taken ? t("settings.callsRolesTaken") : t("settings.callsFailed") }}
+                  </LpBadge>
+                </div>
+                <template v-if="!callSetup.roles_taken">
+                  <p class="text-xs text-muted">{{ t("settings.callsRolesKept") }}</p>
+                  <LpCodeBlock model-value="cursio bluetooth install" />
+                </template>
+              </li>
+              <li
+                v-for="row in [
+                  { label: t('settings.callsHandsFree'), state: callSetup.hands_free },
+                  { label: t('settings.callsSpeaker'), state: callSetup.speaker },
+                ]"
+                :key="row.label"
+                class="flex flex-col gap-1 py-3"
+              >
+                <div class="flex items-center gap-4">
+                  <p class="min-w-0 flex-1 text-sm font-medium">{{ row.label }}</p>
+                  <LpBadge :tone="serviceTone(row.state)" dot size="sm">{{ serviceLabel(row.state) }}</LpBadge>
+                </div>
+                <p v-if="row.state.state === 'failed'" class="text-xs text-muted">{{ row.state.reason }}</p>
+              </li>
+              <li class="flex flex-col gap-2 pt-3">
+                <p class="text-sm font-medium">{{ t("settings.callsPhones") }}</p>
+                <p v-if="!callSetup.phones.length" class="text-xs text-muted">{{ t("settings.callsNoPhones") }}</p>
+                <div v-for="phone in callSetup.phones" :key="phone.address" class="flex items-center gap-3">
+                  <LpIcon name="lucide:smartphone" :size="16" class="shrink-0 text-muted" />
+                  <span class="min-w-0 flex-1 truncate text-sm">{{ phone.name }}</span>
+                  <span class="font-mono text-xs text-muted">{{ phone.address }}</span>
+                  <LpBadge v-if="phone.connected" tone="success" dot size="sm">{{ t("settings.callsConnected") }}</LpBadge>
+                </div>
+                <p v-if="unpairedPhones.length" class="text-xs text-muted">
+                  {{ t("settings.callsUnpaired", { phones: unpairedPhones.join(", ") }) }}
+                </p>
+              </li>
+            </ul>
+
+            <div class="flex items-center gap-4">
+              <div class="min-w-0 flex-1">
+                <p class="text-sm font-medium">{{ t("settings.callsAnswerMoves") }}</p>
+                <p class="text-xs text-muted">{{ t("settings.callsAnswerMovesHint") }}</p>
+              </div>
+              <LpSwitch
+                :model-value="calls.answer_moves_voice"
+                :disabled="callsBusy"
+                :aria-label="t('settings.callsAnswerMoves')"
+                @update:model-value="(v: boolean) => saveCalls({ answer_moves_voice: v })"
+              />
+            </div>
+            <div class="flex flex-wrap items-center gap-4">
+              <div class="min-w-0 flex-1">
+                <p class="text-sm font-medium">{{ t("settings.callsVoice") }}</p>
+                <p class="text-xs text-muted">{{ t("settings.callsVoiceHint") }}</p>
+              </div>
+              <LpSegmented
+                :model-value="calls.voice"
+                :options="voiceModes"
+                :disabled="callsBusy"
+                size="sm"
+                @update:model-value="(v: string) => saveCalls({ voice: v as CallsConfig['voice'] })"
+              />
+            </div>
+            <div class="grid gap-3 sm:grid-cols-2">
+              <LpFormField :label="t('settings.callsOutput')">
+                <LpSelect
+                  :model-value="calls.output ?? DEFAULT_DEVICE"
+                  :options="outputOptions"
+                  :disabled="callsBusy"
+                  @update:model-value="(v: string) => saveCalls({ output: v === DEFAULT_DEVICE ? null : v })"
+                />
+              </LpFormField>
+              <LpFormField :label="t('settings.callsInput')">
+                <LpSelect
+                  :model-value="calls.input ?? DEFAULT_DEVICE"
+                  :options="inputOptions"
+                  :disabled="callsBusy"
+                  @update:model-value="(v: string) => saveCalls({ input: v === DEFAULT_DEVICE ? null : v })"
+                />
+              </LpFormField>
+            </div>
+          </LpCard>
+        </section>
+
+        <section v-if="status && isMobile" id="phone-audio" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('phoneAudio.title')" :description="t('phoneAudio.description')" icon="lucide:speaker" />
+          <PhoneAudioCard />
+        </section>
+
+        <section v-if="status && isMobile" id="phone-screen" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('phoneScreen.title')" :description="t('phoneScreen.description')" icon="lucide:cast" />
+          <PhoneScreenCard />
+        </section>
+
+        <section v-if="status && !isMobile" id="crossing" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('crossing.title')" :description="t('crossing.description')" icon="lucide:panel-bottom" />
+          <EdgeCrossingCard />
+        </section>
+
+        <section v-if="status" id="standby" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('settings.standbyTitle')" :description="t('settings.standbyDescription')" icon="lucide:bluetooth" />
+          <LpSkeleton v-if="standby === null" rounded="card" class="h-16" />
+          <LpCard v-if="standby !== null" padded class="flex items-center gap-4">
             <div class="min-w-0 flex-1">
-              <p class="text-sm font-medium">{{ t("settings.micGate") }}</p>
-              <p class="text-xs text-muted">{{ t("settings.micGateHint") }}</p>
+              <p class="text-sm font-medium">{{ t("settings.bluetoothMode") }}</p>
+              <p class="text-xs text-muted">{{ t("settings.bluetoothModeHint") }}</p>
             </div>
             <LpSegmented
-              :model-value="gateMode"
-              :options="gateModes"
-              :disabled="gateBusy"
+              :model-value="bluetoothMesh"
+              :options="meshModes"
+              :disabled="standbyBusy"
               size="sm"
-              @update:model-value="setGateMode"
+              @update:model-value="(v: string) => saveMesh(v as BluetoothMesh)"
             />
-          </div>
-          <div v-if="gateMode === 'fixed'" class="flex items-center gap-4">
-            <LpSlider
-              v-model="gateLevel"
-              :min="GATE_MIN"
-              :max="GATE_MAX"
-              :step="1"
-              :disabled="gateBusy"
-              :aria-label="t('settings.micGateLevel')"
-              class="flex-1"
-              @change="saveMicGate"
-            />
-            <span class="w-20 text-right font-mono text-xs tabular-nums">
-              {{ t("settings.micGateDb", { db: gateLevel }) }}
-            </span>
-          </div>
-          <p v-if="gatePinned" class="text-xs text-muted">{{ t("settings.micGatePinned") }}</p>
-        </LpCard>
-      </section>
-
-      <section v-if="status && !isMobile" id="calls" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('settings.callsTitle')" :description="t('settings.callsDescription')" icon="lucide:phone" />
-        <LpCard v-if="!callSetup" padded>
-          <p class="text-sm text-muted">{{ t("settings.callsUnsupported") }}</p>
-        </LpCard>
-        <LpSkeleton v-else-if="!calls" rounded="card" class="h-48" />
-        <LpCard v-else padded class="flex flex-col gap-4">
-          <p v-if="callSetup.headset === false" class="text-sm text-muted">{{ t("settings.callsUnsupported") }}</p>
-          <ul v-else class="flex flex-col divide-y divide-line">
-            <li class="flex flex-col gap-2 pb-3">
-              <div class="flex items-center gap-4">
-                <p class="min-w-0 flex-1 text-sm font-medium">{{ t("settings.callsRoles") }}</p>
-                <LpBadge :tone="callSetup.roles_taken ? 'success' : 'warning'" dot size="sm">
-                  {{ callSetup.roles_taken ? t("settings.callsRolesTaken") : t("settings.callsFailed") }}
-                </LpBadge>
-              </div>
-              <template v-if="!callSetup.roles_taken">
-                <p class="text-xs text-muted">{{ t("settings.callsRolesKept") }}</p>
-                <LpCodeBlock model-value="cursio bluetooth install" />
-              </template>
-            </li>
-            <li
-              v-for="row in [
-                { label: t('settings.callsHandsFree'), state: callSetup.hands_free },
-                { label: t('settings.callsSpeaker'), state: callSetup.speaker },
-              ]"
-              :key="row.label"
-              class="flex flex-col gap-1 py-3"
-            >
-              <div class="flex items-center gap-4">
-                <p class="min-w-0 flex-1 text-sm font-medium">{{ row.label }}</p>
-                <LpBadge :tone="serviceTone(row.state)" dot size="sm">{{ serviceLabel(row.state) }}</LpBadge>
-              </div>
-              <p v-if="row.state.state === 'failed'" class="text-xs text-muted">{{ row.state.reason }}</p>
-            </li>
-            <li class="flex flex-col gap-2 pt-3">
-              <p class="text-sm font-medium">{{ t("settings.callsPhones") }}</p>
-              <p v-if="!callSetup.phones.length" class="text-xs text-muted">{{ t("settings.callsNoPhones") }}</p>
-              <div v-for="phone in callSetup.phones" :key="phone.address" class="flex items-center gap-3">
-                <LpIcon name="lucide:smartphone" :size="16" class="shrink-0 text-muted" />
-                <span class="min-w-0 flex-1 truncate text-sm">{{ phone.name }}</span>
-                <span class="font-mono text-xs text-muted">{{ phone.address }}</span>
-                <LpBadge v-if="phone.connected" tone="success" dot size="sm">{{ t("settings.callsConnected") }}</LpBadge>
-              </div>
-              <p v-if="unpairedPhones.length" class="text-xs text-muted">
-                {{ t("settings.callsUnpaired", { phones: unpairedPhones.join(", ") }) }}
-              </p>
-            </li>
-          </ul>
-
-          <div class="flex items-center gap-4">
+          </LpCard>
+          <LpCard v-if="standby !== null && bluetoothMesh !== 'off'" padded class="flex items-center gap-4">
             <div class="min-w-0 flex-1">
-              <p class="text-sm font-medium">{{ t("settings.callsAnswerMoves") }}</p>
-              <p class="text-xs text-muted">{{ t("settings.callsAnswerMovesHint") }}</p>
+              <p class="text-sm font-medium">{{ t("settings.standbyToggle") }}</p>
+              <p class="text-xs text-muted">{{ t("settings.standbyHint") }}</p>
             </div>
             <LpSwitch
-              :model-value="calls.answer_moves_voice"
-              :disabled="callsBusy"
-              :aria-label="t('settings.callsAnswerMoves')"
-              @update:model-value="(v: boolean) => saveCalls({ answer_moves_voice: v })"
+              v-model="standby"
+              :action="saveStandby"
+              :disabled="standbyBusy"
+              :aria-label="t('settings.standbyToggle')"
+              @error="standbyFailed"
             />
-          </div>
-          <div class="flex flex-wrap items-center gap-4">
-            <div class="min-w-0 flex-1">
-              <p class="text-sm font-medium">{{ t("settings.callsVoice") }}</p>
-              <p class="text-xs text-muted">{{ t("settings.callsVoiceHint") }}</p>
+          </LpCard>
+        </section>
+
+        <section v-if="status" id="playing" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('streams.title')" :description="t('streams.description')" icon="lucide:volume-2" />
+          <LpCard padded>
+            <PlayingStreams show="sound" />
+          </LpCard>
+        </section>
+
+        <section v-if="status?.streams?.some((s) => s.kind === 'microphone')" id="microphones" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('streams.microphones')" :description="t('streams.microphonesDescription')" icon="lucide:mic" />
+          <LpCard padded>
+            <PlayingStreams show="microphones" />
+          </LpCard>
+        </section>
+
+        <section v-if="!isMobile" id="autostart" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection
+            :title="t('settings.autostartTitle')"
+            :description="t('settings.autostartDescription')"
+            icon="lucide:power"
+          />
+          <LpSkeleton v-if="!autostart" rounded="card" class="h-32" />
+          <LpCard v-else padded>
+            <ul class="flex flex-col divide-y divide-line">
+              <li class="flex items-center gap-4 pb-3">
+                <div class="min-w-0 flex-1">
+                  <p class="text-sm font-medium">{{ t("settings.autostartNode") }}</p>
+                  <p class="text-xs text-muted">{{ t("settings.autostartNodeHint") }}</p>
+                </div>
+                <LpSwitch
+                  v-model="autostart.node"
+                  :action="(on: boolean) => setAutostart('node', on)"
+                  :aria-label="t('settings.autostartNode')"
+                  @error="autostartFailed('node')"
+                />
+              </li>
+              <li class="flex items-center gap-4 pt-3">
+                <div class="min-w-0 flex-1">
+                  <p class="text-sm font-medium">{{ t("settings.autostartTray") }}</p>
+                  <p class="text-xs text-muted">{{ t("settings.autostartTrayHint") }}</p>
+                </div>
+                <LpSwitch
+                  v-model="autostart.tray"
+                  :action="(on: boolean) => setAutostart('tray', on)"
+                  :aria-label="t('settings.autostartTray')"
+                  @error="autostartFailed('tray')"
+                />
+              </li>
+            </ul>
+          </LpCard>
+        </section>
+
+        <section id="node" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('settings.nodeTitle')" icon="lucide:server" />
+          <LpCard padded class="flex flex-col gap-3">
+            <template v-if="status">
+              <LpCodeBlock :model-value="status.config_path" :title="t('settings.configFile')" />
+              <p v-if="status.pinned.length" class="text-xs text-muted">
+                {{ t("settings.pinned", { fields: status.pinned.join(", ") }) }}
+              </p>
+              <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                <dt class="text-muted">{{ t("settings.build") }}</dt>
+                <dd class="font-mono">{{ status.node.build || "—" }}</dd>
+                <template v-if="!isMobile">
+                  <dt class="text-muted">{{ t("settings.installedVersion") }}</dt>
+                  <dd class="font-mono">{{ status.node.installed_version ?? t("settings.notInstalled") }}</dd>
+                  <dt class="text-muted">{{ t("settings.pid") }}</dt>
+                  <dd class="font-mono">{{ status.node.pid || "—" }}</dd>
+                </template>
+              </dl>
+            </template>
+            <div v-if="!isMobile">
+              <LpButton variant="soft" size="sm" :disabled="!status" @click="confirmRestart = true">
+                <LpIcon name="lucide:rotate-cw" :size="14" />
+                {{ t("settings.restart") }}
+              </LpButton>
             </div>
-            <LpSegmented
-              :model-value="calls.voice"
-              :options="voiceModes"
-              :disabled="callsBusy"
-              size="sm"
-              @update:model-value="(v: string) => saveCalls({ voice: v as CallsConfig['voice'] })"
-            />
-          </div>
-          <div class="grid gap-3 sm:grid-cols-2">
-            <LpFormField :label="t('settings.callsOutput')">
-              <LpSelect
-                :model-value="calls.output ?? DEFAULT_DEVICE"
-                :options="outputOptions"
-                :disabled="callsBusy"
-                @update:model-value="(v: string) => saveCalls({ output: v === DEFAULT_DEVICE ? null : v })"
-              />
-            </LpFormField>
-            <LpFormField :label="t('settings.callsInput')">
-              <LpSelect
-                :model-value="calls.input ?? DEFAULT_DEVICE"
-                :options="inputOptions"
-                :disabled="callsBusy"
-                @update:model-value="(v: string) => saveCalls({ input: v === DEFAULT_DEVICE ? null : v })"
-              />
-            </LpFormField>
-          </div>
-        </LpCard>
-      </section>
-
-      <section v-if="status && isMobile" id="phone-audio" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('phoneAudio.title')" :description="t('phoneAudio.description')" icon="lucide:speaker" />
-        <PhoneAudioCard />
-      </section>
-
-      <section v-if="status && isMobile" id="phone-screen" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('phoneScreen.title')" :description="t('phoneScreen.description')" icon="lucide:cast" />
-        <PhoneScreenCard />
-      </section>
-
-      <section v-if="status && !isMobile" id="crossing" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('crossing.title')" :description="t('crossing.description')" icon="lucide:panel-bottom" />
-        <EdgeCrossingCard />
-      </section>
-
-      <section v-if="status" id="standby" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('settings.standbyTitle')" :description="t('settings.standbyDescription')" icon="lucide:bluetooth" />
-        <LpSkeleton v-if="standby === null" rounded="card" class="h-16" />
-        <LpCard v-if="standby !== null" padded class="flex items-center gap-4">
-          <div class="min-w-0 flex-1">
-            <p class="text-sm font-medium">{{ t("settings.bluetoothMode") }}</p>
-            <p class="text-xs text-muted">{{ t("settings.bluetoothModeHint") }}</p>
-          </div>
-          <LpSegmented
-            :model-value="bluetoothMesh"
-            :options="meshModes"
-            :disabled="standbyBusy"
-            size="sm"
-            @update:model-value="(v: string) => saveMesh(v as BluetoothMesh)"
-          />
-        </LpCard>
-        <LpCard v-if="standby !== null && bluetoothMesh !== 'off'" padded class="flex items-center gap-4">
-          <div class="min-w-0 flex-1">
-            <p class="text-sm font-medium">{{ t("settings.standbyToggle") }}</p>
-            <p class="text-xs text-muted">{{ t("settings.standbyHint") }}</p>
-          </div>
-          <LpSwitch
-            v-model="standby"
-            :action="saveStandby"
-            :disabled="standbyBusy"
-            :aria-label="t('settings.standbyToggle')"
-            @error="standbyFailed"
-          />
-        </LpCard>
-      </section>
-
-      <section v-if="status" id="playing" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('streams.title')" :description="t('streams.description')" icon="lucide:volume-2" />
-        <LpCard padded>
-          <PlayingStreams show="sound" />
-        </LpCard>
-      </section>
-
-      <section v-if="status?.streams?.some((s) => s.kind === 'microphone')" id="microphones" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('streams.microphones')" :description="t('streams.microphonesDescription')" icon="lucide:mic" />
-        <LpCard padded>
-          <PlayingStreams show="microphones" />
-        </LpCard>
-      </section>
-
-      <section v-if="!isMobile" id="autostart" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection
-          :title="t('settings.autostartTitle')"
-          :description="t('settings.autostartDescription')"
-          icon="lucide:power"
-        />
-        <LpSkeleton v-if="!autostart" rounded="card" class="h-32" />
-        <LpCard v-else padded>
-          <ul class="flex flex-col divide-y divide-line">
-            <li class="flex items-center gap-4 pb-3">
-              <div class="min-w-0 flex-1">
-                <p class="text-sm font-medium">{{ t("settings.autostartNode") }}</p>
-                <p class="text-xs text-muted">{{ t("settings.autostartNodeHint") }}</p>
-              </div>
-              <LpSwitch
-                v-model="autostart.node"
-                :action="(on: boolean) => setAutostart('node', on)"
-                :aria-label="t('settings.autostartNode')"
-                @error="autostartFailed('node')"
-              />
-            </li>
-            <li class="flex items-center gap-4 pt-3">
-              <div class="min-w-0 flex-1">
-                <p class="text-sm font-medium">{{ t("settings.autostartTray") }}</p>
-                <p class="text-xs text-muted">{{ t("settings.autostartTrayHint") }}</p>
-              </div>
-              <LpSwitch
-                v-model="autostart.tray"
-                :action="(on: boolean) => setAutostart('tray', on)"
-                :aria-label="t('settings.autostartTray')"
-                @error="autostartFailed('tray')"
-              />
-            </li>
-          </ul>
-        </LpCard>
-      </section>
-
-      <section id="node" class="flex scroll-mt-4 flex-col gap-3">
-        <LpSection :title="t('settings.nodeTitle')" icon="lucide:server" />
-        <LpCard padded class="flex flex-col gap-3">
-          <template v-if="status">
-            <LpCodeBlock :model-value="status.config_path" :title="t('settings.configFile')" />
-            <p v-if="status.pinned.length" class="text-xs text-muted">
-              {{ t("settings.pinned", { fields: status.pinned.join(", ") }) }}
-            </p>
-            <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-              <dt class="text-muted">{{ t("settings.build") }}</dt>
-              <dd class="font-mono">{{ status.node.build || "—" }}</dd>
-              <template v-if="!isMobile">
-                <dt class="text-muted">{{ t("settings.installedVersion") }}</dt>
-                <dd class="font-mono">{{ status.node.installed_version ?? t("settings.notInstalled") }}</dd>
-                <dt class="text-muted">{{ t("settings.pid") }}</dt>
-                <dd class="font-mono">{{ status.node.pid || "—" }}</dd>
-              </template>
-            </dl>
-          </template>
-          <div v-if="!isMobile">
-            <LpButton variant="soft" size="sm" :disabled="!status" @click="confirmRestart = true">
-              <LpIcon name="lucide:rotate-cw" :size="14" />
-              {{ t("settings.restart") }}
-            </LpButton>
-          </div>
-        </LpCard>
-      </section>
+          </LpCard>
+        </section>
+      </div>
+      <aside v-if="!isMobile" class="sticky top-0 hidden xl:block">
+        <LpTableOfContents :links="toc" :hover-follow="false" :title="t('settings.onThisPage')" />
+      </aside>
     </div>
 
     <LpConfirmDialog

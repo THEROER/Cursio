@@ -151,7 +151,12 @@
     "latencyTrend": "Input latency p99 since this window opened",
     "noLatency": "No input measured yet",
     "problems": "Problems",
-    "problemsHint": "What the node found wrong on this machine, each with its fix"
+    "problemsHint": "What the node found wrong on this machine, each with its fix",
+    "nobodyOnline": "None of them is connected",
+    "allClear": "All clear",
+    "errors": "{n} error | {n} errors",
+    "warnings": "{n} warning | {n} warnings",
+    "notes": "{n} note | {n} notes"
   },
   "problems": {
     "title": "Problems",
@@ -369,6 +374,12 @@
     "network": "Network",
     "charging": "charging",
     "plugged": "plugged in",
+    "mains": "Plugged in",
+    "toRight": "To the right",
+    "toLeft": "To the left",
+    "above": "Above",
+    "below": "Below",
+    "samePlace": "Not placed yet",
     "wired": "Wired",
     "wifi": "Wi-Fi",
     "cellular": "Cellular",
@@ -468,6 +479,7 @@
     "nobodyCli": "Where the network blocks discovery, pair from a terminal by address: cursio mesh --pair --pair-addr ADDRESS:46073"
   },
   "settings": {
+    "onThisPage": "On this page",
     "autostartTitle": "Start at login",
     "autostartDescription": "Off unless you turn it on.",
     "autostartNode": "Start the node",
@@ -477,7 +489,7 @@
     "autostartFailed": "Start at login was not changed",
     "saved": "Saved",
     "themeTitle": "Theme",
-    "themeDescription": "Kept on this machine for this app.",
+    "themeDescription": "The colours, accent, corners, control size and animation speed of this app, kept on this machine.",
     "audioTitle": "Audio",
     "micGate": "Microphone gate",
     "micGateHint": "Who records from this machine's microphone on another device hears it only while you speak. Auto follows the mic's background noise.",

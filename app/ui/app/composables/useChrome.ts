@@ -15,6 +15,9 @@ function showInLogs(text: string) {
   logsOpen.value = true
 }
 
+/** Where the theme studio remembers its tuning; the startup plugin and the settings page share it. */
+export const THEME_STUDIO_KEY = "cursio-theme-studio"
+
 export function useChrome() {
   return { logsOpen, logsSource, logsFilter, paletteOpen, showInLogs }
 }

@@ -22,8 +22,8 @@
  * same crash and bypasses the transition; hiding the API here makes every kit
  * component fall back to an instant switch without each needing to know.
  */
-import { dark, isBrokenBackdropEngine, presets, themeToCssVars, useTheme, type TokenSet } from "@leavepulse/ui"
-import { defineNuxtPlugin } from "#imports"
+import { dark, isBrokenBackdropEngine, presets, themeToCssVars, useTheme, useThemeStudio, type TokenSet } from "@leavepulse/ui"
+import { defineNuxtPlugin, THEME_STUDIO_KEY } from "#imports"
 
 function preset(saved: TokenSet): TokenSet {
   return Object.values(presets).find((p) => p.name === saved.name) ?? dark
@@ -38,7 +38,13 @@ export default defineNuxtPlugin(() => {
   }
   const theme = useTheme()
   const saved = theme.init(dark)
-  if (theme.system.value) return
-  const wanted = preset(saved)
-  if (saved.name !== wanted.name || themeToCssVars(saved) !== themeToCssVars(wanted)) theme.apply(wanted)
+  if (!theme.system.value) {
+    const wanted = preset(saved)
+    if (saved.name !== wanted.name || themeToCssVars(saved) !== themeToCssVars(wanted)) theme.apply(wanted)
+  }
+  // The studio's tuning (brand, corners, size, motion, following the system)
+  // sits on top of the preset just restored. It is made here, not by the
+  // settings page that shows it: made there, a picked brand would only come
+  // back once that page was opened.
+  useThemeStudio({ themes: Object.values(presets), storageKey: THEME_STUDIO_KEY, system: { light: "Light", dark: "Dark" } })
 })

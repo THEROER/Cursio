@@ -33,7 +33,23 @@ function skipHint(peer: string, why: string): string {
   return why
 }
 
-const online = computed(() => status.value?.peers.filter((p) => p.presence === "online").length ?? 0)
+const onlinePeers = computed(() => status.value?.peers.filter((p) => p.presence === "online") ?? [])
+const online = computed(() => onlinePeers.value.length)
+const onlineNames = computed(() => onlinePeers.value.map((p) => p.name).join(", ") || t("stats.nobodyOnline"))
+
+const problemsNote = computed(() => {
+  const all = status.value?.problems ?? []
+  if (!all.length) return t("stats.allClear")
+  const count = (severity: string) => all.filter((p) => p.severity === severity).length
+  return [
+    ["stats.errors", count("Error")],
+    ["stats.warnings", count("Warning")],
+    ["stats.notes", count("Info")],
+  ]
+    .filter(([, n]) => n)
+    .map(([key, n]) => t(key as string, { n }, n as number))
+    .join(" · ")
+})
 
 const latency = computed(() => worstLatency(status.value?.latency ?? []))
 
@@ -65,7 +81,9 @@ function isPinned(key: ModuleSwitch) {
   return status.value?.pinned.includes(`modules.${key}`) ?? false
 }
 
-const { battery, network } = useMachineText()
+const { battery, network, place } = useMachineText()
+
+const MODULE_META = Object.fromEntries(MODULES.map((m) => [m.key, m]))
 
 const peerRef = peerRefOf
 
@@ -105,15 +123,16 @@ function presenceTone(p: PeerView) {
 
       <div v-else class="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <LpTooltip :content="t('stats.peersHint')">
-          <LpStat
+          <LpCard padded><LpStat
             :label="t('stats.peers')"
             :value="`${online} / ${status.peers.length}`"
             icon="lucide:monitor-smartphone"
             :online="online > 0"
-          />
+            :hint="onlineNames"
+          /></LpCard>
         </LpTooltip>
         <LpTooltip :content="latency ? t('stats.latencyHint') : t('stats.noLatency')">
-          <LpStat
+          <LpCard padded><LpStat
             :label="t('stats.latency')"
             :value="latency ? latency.p99 : '—'"
             :decimals="1"
@@ -132,10 +151,10 @@ function presenceTone(p: PeerView) {
                 :aria-label="t('stats.latencyTrend')"
               />
             </template>
-          </LpStat>
+          </LpStat></LpCard>
         </LpTooltip>
         <LpTooltip :content="t('stats.problemsHint')">
-          <LpStat :label="t('stats.problems')" :value="status.problems.length" icon="lucide:triangle-alert" />
+          <LpCard padded><LpStat :label="t('stats.problems')" :value="status.problems.length" :hint="problemsNote" icon="lucide:triangle-alert" /></LpCard>
         </LpTooltip>
       </div>
 
@@ -218,7 +237,7 @@ function presenceTone(p: PeerView) {
                 <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
                   <template v-if="takesCursor(peer.link.device_kind)">
                     <dt class="text-muted">{{ t("peer.position") }}</dt>
-                    <dd>{{ peer.link.position.x }}, {{ peer.link.position.y }}</dd>
+                    <dd>{{ place(peer.link.position) }}</dd>
                   </template>
                   <dt class="text-muted">{{ t("peer.kind") }}</dt>
                   <dd>{{ t(`kind.${peer.link.device_kind}`) }}</dd>
@@ -228,9 +247,15 @@ function presenceTone(p: PeerView) {
                   <dd>{{ network(peer.link.status) ?? t("peer.cannotSay") }}</dd>
                 </dl>
                 <div class="flex flex-wrap gap-1">
-                  <LpBadge v-for="m in peer.link.modules" :key="m" size="sm" tone="brand">{{ m }}</LpBadge>
+                  <LpBadge v-for="m in peer.link.modules" :key="m" size="sm" tone="brand">
+                    <LpIcon v-if="MODULE_META[m]" :name="MODULE_META[m]!.icon" :size="12" />
+                    {{ MODULE_META[m] ? t(MODULE_META[m]!.label) : m }}
+                  </LpBadge>
                   <LpTooltip v-for="[m, why] in peer.link.skipped" :key="m" :content="skipHint(peer.name, why)">
-                    <LpBadge size="sm" tone="outline" class="line-through">{{ m }}</LpBadge>
+                    <LpBadge size="sm" tone="outline" class="text-muted">
+                      <LpIcon v-if="MODULE_META[m]" :name="MODULE_META[m]!.icon" :size="12" />
+                      {{ MODULE_META[m] ? t(MODULE_META[m]!.label) : m }}
+                    </LpBadge>
                   </LpTooltip>
                 </div>
               </template>

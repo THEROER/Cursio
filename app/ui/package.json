@@ -12,7 +12,7 @@
     "@iconify-json/lucide": "^1.2.120",
     "@iconify/vue": "^5.0.1",
     "@internationalized/date": "^3.12.2",
-    "@leavepulse/ui": "^0.70.1",
+    "@leavepulse/ui": "^0.72.1",
     "@nuxtjs/i18n": "^10.5.0",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/api": "^2.11.1",
