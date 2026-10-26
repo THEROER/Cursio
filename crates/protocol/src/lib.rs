@@ -17,6 +17,7 @@ pub mod frame;
 pub mod gallery;
 pub mod input;
 pub mod keys;
+pub mod layout;
 pub mod media;
 pub mod messages;
 pub mod node;
@@ -52,6 +53,7 @@ pub use input::{
     neighbour_across, Edge, EdgeSet, GesturePhase, InputEvent, MouseButton, Position,
     GESTURE_SCALE_ONE, SCROLL_NOTCH,
 };
+pub use layout::Screen;
 pub use node::{NetworkKind, NodeStatus, PowerSource};
 pub use service::{Fitness, Quality, ServiceId, ServiceMsg, ServiceOffer};
 pub use window::{

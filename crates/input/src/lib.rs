@@ -27,6 +27,7 @@ pub mod mac_capture;
 pub mod mac_cursor;
 #[cfg(target_os = "macos")]
 pub mod mac_keymap;
+pub mod screens;
 #[cfg(target_os = "linux")]
 pub mod uinput;
 #[cfg(target_os = "linux")]

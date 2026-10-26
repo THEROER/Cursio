@@ -27,6 +27,9 @@ reis = { version = "0.7", features = ["tokio"] }
 futures-util = "0.3"
 # Where the pointer is on an X11 desktop — the one thing evdev cannot say.
 x11rb.workspace = true
+# Where GNOME placed each monitor (org.gnome.Mutter.DisplayConfig), on
+# Wayland and X11 alike.
+zbus.workspace = true
 
 # Windows input injection/capture via SendInput + RawInput.
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -45,6 +48,10 @@ windows-sys = { version = "0.61", features = [
     # Per-monitor DPI awareness for the capture thread, so edge bounds and
     # hook positions are both physical pixels.
     "Win32_UI_HiDpi",
+    # Each monitor's panel and its EDID: the display configuration names the
+    # device, SetupAPI opens its registry key.
+    "Win32_Devices_Display",
+    "Win32_Devices_DeviceAndDriverInstallation",
 ] }
 
 [dev-dependencies]
