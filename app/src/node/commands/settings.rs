@@ -37,6 +37,42 @@ pub async fn node_set_position(
     .await
 }
 
+/// Stand a machine on the shared desk; `machine` absent is this one.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn node_arrange(
+    link: State<'_, NodeLink>,
+    machine: Option<cursio_protocol::PeerId>,
+    x_mm: i32,
+    y_mm: i32,
+) -> Result<Reply, NodeError> {
+    link.request(Command::Arrange {
+        machine,
+        place: cursio_protocol::Place { x_mm, y_mm },
+    })
+    .await
+}
+
+/// Close or open the seam between one of this machine's screens and a
+/// peer's.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn node_set_barrier(
+    link: State<'_, NodeLink>,
+    screen: String,
+    peer: cursio_protocol::PeerId,
+    peer_screen: String,
+    closed: bool,
+) -> Result<Reply, NodeError> {
+    link.request(Command::Barrier {
+        screen,
+        peer,
+        peer_screen,
+        closed,
+    })
+    .await
+}
+
 /// The node has no command for one audio field, so this edits the file as
 /// written (not the effective config, which would bake flags into it) and
 /// hands the whole of it back. `value` is what the file takes: `auto`,

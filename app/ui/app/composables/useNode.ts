@@ -164,6 +164,51 @@ export interface NodeStatusReply {
   gallery?: import("~/composables/useGallery").GalleryPeer[]
   /** This computer as a phone's Bluetooth headset; absent where it cannot be one, and from a node older than control v16. */
   call_setup?: CallSetup | null
+  /** Every connected machine on the shared desk; absent from a node older than control v20. */
+  desk?: DeskView
+}
+
+/** Mirrors `cursio_core::desk::DeskView`: millimetres on the desk. */
+export interface DeskView {
+  machines: DeskMachine[]
+  seams: DeskSeam[]
+}
+
+export interface DeskMachine {
+  id: string
+  name: string
+  /** The machine this app's node runs on. */
+  this: boolean
+  /** Its screens' top-left on the desk; `null` until someone arranges it. */
+  place: { x_mm: number; y_mm: number } | null
+  screens: DeskScreen[]
+}
+
+/** A screen relative to its machine's corner. */
+export interface DeskScreen {
+  id: string
+  name: string
+  width: number
+  height: number
+  x_mm: number
+  y_mm: number
+  w_mm: number
+  h_mm: number
+  /** The panel reported its size; otherwise a 96 dpi guess. */
+  measured: boolean
+}
+
+/** Where two machines' screens meet, as a line on the desk. */
+export interface DeskSeam {
+  machine: string
+  screen: string
+  peer: string
+  peer_screen: string
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+  closed: boolean
 }
 
 /** Mirrors `cursio_core::calls_hub::ServiceState`. */
@@ -386,6 +431,12 @@ export function useNode() {
     pendingSwitches,
     setModule,
     setPosition: (p: Position) => call<Reply>("node_set_position", { x: p.x, y: p.y }),
+    /** Stand a machine on the desk; `machine` null is this one. */
+    arrange: (machine: string | null, xMm: number, yMm: number) =>
+      call<Reply>("node_arrange", { machine, xMm: Math.round(xMm), yMm: Math.round(yMm) }),
+    /** Close or open the seam between this machine's `screen` and `peer`'s `peerScreen`. */
+    setBarrier: (screen: string, peer: string, peerScreen: string, closed: boolean) =>
+      call<Reply>("node_set_barrier", { screen, peer, peerScreen, closed }),
     setName: (name: string) => call<Reply>("node_set_name", { name }),
     config: () => call<Reply>("node_config"),
     setMicGate: (value: string) => call<Reply>("node_set_mic_gate", { value }),

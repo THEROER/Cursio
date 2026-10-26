@@ -1,240 +1,209 @@
 <script setup lang="ts">
-import type { ContextMenuItemDef, TopologyEdge, TopologyLane, TopologyNode } from "@leavepulse/ui"
-import type { PeerView, Position } from "~/composables/useNode"
+import type { ContextMenuItemDef } from "@leavepulse/ui"
+import type { DeskMachine, DeskSeam, PeerView } from "~/composables/useNode"
 import type { PeerRef } from "~/composables/usePeerMenu"
+import type { Positioned } from "~/components/DeskArrangement.vue"
+import { bounds } from "~/utils/deskSnap"
 
+/**
+ * The shared desk: every connected machine's screens at their real size,
+ * dragged into the places they stand in. The cursor crosses only where two
+ * machines' screens meet here, so a laptop under the right-hand monitor is
+ * reached from that monitor and not the left one; clicking a seam closes it.
+ *
+ * Each machine writes its own place. Dropping another machine asks it over
+ * its link, and the move shows once it has taken it — the status then
+ * reports it from that machine itself.
+ */
 const { t } = useI18n()
-const { status, setPosition } = useNode()
+const { status, arrange, setBarrier } = useNode()
 const toast = useCursioToast()
 const peerMenu = usePeerMenu()
 
-function peerRef(p: PeerView): PeerRef {
-  return { id: p.id, name: p.name, presence: p.presence }
+const desk = computed(() => status.value?.desk ?? null)
+const self = computed(() => status.value?.node.id ?? "")
+
+/** Where a machine was dropped, until the status reports it standing there. */
+const pending = ref<Record<string, { x: number; y: number }>>({})
+
+watch(desk, (d) => {
+  if (!d) return
+  const left = { ...pending.value }
+  for (const m of d.machines) {
+    const want = left[m.id]
+    if (want && m.place && Math.abs(m.place.x_mm - want.x) < 1 && Math.abs(m.place.y_mm - want.y) < 1) {
+      delete left[m.id]
+    }
+  }
+  pending.value = left
+})
+
+function rects(m: DeskMachine, x: number, y: number) {
+  return m.screens.map((s) => ({ x: x + s.x_mm, y: y + s.y_mm, w: s.w_mm, h: s.h_mm }))
 }
 
 /**
- * The machine the canvas was right-clicked on. The canvas names the node
- * before the menu opens, so the menu is resolved per click; this machine's own
- * card and the empty grid have no actions and open nothing.
+ * Every machine where it is drawn. One not yet arranged waits to the right
+ * of those that are, so it can be seen and dragged in; with none arranged,
+ * this machine stands at the origin.
  */
+const positioned = computed<Positioned[]>(() => {
+  const machines = desk.value?.machines ?? []
+  const out: Positioned[] = []
+  for (const m of machines) {
+    const at = pending.value[m.id] ?? (m.place ? { x: m.place.x_mm, y: m.place.y_mm } : null)
+    if (at) out.push({ machine: m, x: at.x, y: at.y, unplaced: false })
+  }
+  for (const m of machines) {
+    if (out.some((p) => p.machine.id === m.id)) continue
+    const box = bounds(out.flatMap((p) => rects(p.machine, p.x, p.y)))
+    out.push({ machine: m, x: box ? box.x + box.w + 120 : 0, y: box ? box.y : 0, unplaced: true })
+  }
+  return out
+})
+
+const selected = ref<string | null>(null)
+const selectedMachine = computed(
+  () => positioned.value.find((p) => p.machine.id === selected.value) ?? positioned.value.find((p) => p.machine.this),
+)
+
+async function onMove(id: string, x: number, y: number) {
+  pending.value = { ...pending.value, [id]: { x, y } }
+  const machine = desk.value?.machines.find((m) => m.id === id)
+  try {
+    await arrange(machine?.this ? null : id, x, y)
+    // The cursor crosses only between machines both on the desk, so the
+    // first machine dragged in brings this one with it where it is drawn.
+    const me = positioned.value.find((p) => p.machine.this)
+    if (me?.unplaced && !machine?.this) {
+      pending.value = { ...pending.value, [me.machine.id]: { x: me.x, y: me.y } }
+      await arrange(null, me.x, me.y)
+    }
+  } catch (e) {
+    const left = { ...pending.value }
+    delete left[id]
+    pending.value = left
+    toast.failure(e, { title: t("placement.failed") })
+  }
+}
+
+async function onToggleSeam(s: DeskSeam) {
+  // Always told from this machine's side: its screen, the peer's screen.
+  const mine = s.machine === self.value
+  const screen = mine ? s.screen : s.peer_screen
+  const peer = mine ? s.peer : s.machine
+  const peerScreen = mine ? s.peer_screen : s.screen
+  try {
+    await setBarrier(screen, peer, peerScreen, !s.closed)
+    toast.success(s.closed ? t("placement.seamOpened") : t("placement.seamClosed"))
+  } catch (e) {
+    toast.failure(e, { title: t("placement.seamFailed") })
+  }
+}
+
+function peerRef(p: PeerView): PeerRef {
+  return peerRefOf(p)
+}
+
+/** The machine the desk was right-clicked on; this machine has no menu. */
 const menuPeer = ref<PeerRef | null>(null)
-function onNodeContextMenu({ id }: { id: string }) {
+function onMenu(id: string) {
   const peer = status.value?.peers.find((p) => p.id === id)
   menuPeer.value = peer ? peerRef(peer) : null
 }
-const canvasMenu = computed<ContextMenuItemDef[]>(() =>
-  menuPeer.value ? peerMenu.items(menuPeer.value) : [],
+const canvasMenu = computed<ContextMenuItemDef[]>(() => (menuPeer.value ? peerMenu.items(menuPeer.value) : []))
+
+/** Peers with no screen on the desk: offline ones, and phones. */
+const offDesk = computed(() =>
+  (status.value?.peers ?? []).filter((p) => !desk.value?.machines.some((m) => m.id === p.id)),
 )
 
-/**
- * Where this machine is being moved to, before it is applied. Only this
- * machine's card moves: each node writes its own `position`, and a peer's
- * cell is that peer's to change, from its own app.
- */
-const draft = ref<Position | null>(null)
-const here = computed<Position | null>(() => draft.value ?? status.value?.node.position ?? null)
+const seamCounts = computed(() => {
+  const seams = desk.value?.seams ?? []
+  return { open: seams.filter((s) => !s.closed).length, closed: seams.filter((s) => s.closed).length }
+})
 
-/** One grid cell on the canvas, and where a card sits inside it. */
-const CELL_W = 260
-const CELL_H = 170
-const PAD_X = 20
-const PAD_Y = 40
-
-interface Placed {
-  id: string
-  name: string
-  at: Position
-  self: boolean
-  online: boolean
-  kind?: string
+/** A panel's diagonal in inches, as monitors are sold. */
+function inches(w: number, h: number): string {
+  return (Math.hypot(w, h) / 25.4).toFixed(1)
 }
 
-const placed = computed<Placed[]>(() => {
-  const s = status.value
-  if (!s || !here.value) return []
-  const out: Placed[] = [{ id: s.node.id, name: s.node.name, at: here.value, self: true, online: true }]
-  for (const p of s.peers) {
-    if (p.link && takesCursor(p.link.device_kind)) {
-      out.push({
-        id: p.id,
-        name: p.name,
-        at: p.link.position,
-        self: false,
-        online: p.presence === "online",
-        kind: t(`kind.${p.link.device_kind}`),
-      })
-    }
-  }
-  return out
-})
-
-/** Peers whose cell is not known: it rides the greeting, so only while linked. */
-const unplaced = computed(() => status.value?.peers.filter((p) => !p.link) ?? [])
-
-/** Every placed machine plus a ring of empty cells to move into. */
-const bounds = computed(() => {
-  const xs = placed.value.map((m) => m.at.x)
-  const ys = placed.value.map((m) => m.at.y)
-  if (xs.length === 0) return { x0: -1, x1: 1, y0: -1, y1: 1 }
-  return { x0: Math.min(...xs) - 1, x1: Math.max(...xs) + 1, y0: Math.min(...ys) - 1, y1: Math.max(...ys) + 1 }
-})
-
-const lanes = computed<TopologyLane[]>(() => {
-  const out: TopologyLane[] = []
-  for (let y = bounds.value.y0; y <= bounds.value.y1; y++) {
-    for (let x = bounds.value.x0; x <= bounds.value.x1; x++) {
-      out.push({ id: `${x},${y}`, label: `${x}, ${y}`, x: x * CELL_W, y: y * CELL_H, width: CELL_W - 12, height: CELL_H - 12 })
-    }
-  }
-  return out
-})
-
-/**
- * Bumped when a drag must be undone — a peer's card, which is not this
- * machine's to move. The canvas keeps a dragged node where it was dropped
- * until it is handed positions it has not seen, so the nodes are rebuilt.
- */
-const revision = ref(0)
-
-const nodes = computed<TopologyNode[]>(() => {
-  void revision.value
-  return placed.value.map((m) => ({
-    id: m.id,
-    position: { x: m.at.x * CELL_W + PAD_X, y: m.at.y * CELL_H + PAD_Y },
-    data: {
-      name: m.name,
-      // The kit's own role keys, so this machine and its peers take different
-      // colours and glyphs; the printed label is `roleLabel`.
-      role: m.self ? "host" : "edge",
-      roleLabel: m.self ? t("placement.thisMachine") : (m.kind ?? t("placement.peer")),
-      online: m.online,
-    },
-  }))
-})
-
-const edges = computed<TopologyEdge[]>(() => {
-  const self = placed.value.find((m) => m.self)
-  if (!self) return []
-  return placed.value
-    .filter((m) => !m.self)
-    .map((m) => ({
-      id: `${self.id}-${m.id}`,
-      source: self.id,
-      target: m.id,
-      kind: t("placement.link"),
-      observed: m.online ? ("applied" as const) : ("pending" as const),
-    }))
-})
-
-function onDragStop({ id, position }: { id: string; position: { x: number; y: number } }) {
-  const self = placed.value.find((m) => m.self)
-  if (!self || id !== self.id) {
-    revision.value += 1
-    toast.info(t("placement.peerNotMine"))
-    return
-  }
-  draft.value = {
-    x: Math.round((position.x - PAD_X) / CELL_W),
-    y: Math.round((position.y - PAD_Y) / CELL_H),
-  }
-  revision.value += 1
-}
-
-const sharing = computed(() => {
-  const me = here.value
-  if (!me) return []
-  return placed.value.filter((m) => !m.self && m.at.x === me.x && m.at.y === me.y)
-})
-
-const changed = computed(() => {
-  const s = status.value
-  return !!draft.value && !!s && (draft.value.x !== s.node.position.x || draft.value.y !== s.node.position.y)
-})
-
-function nudge(dx: number, dy: number) {
-  if (here.value) draft.value = { x: here.value.x + dx, y: here.value.y + dy }
-}
-
-const applying = ref(false)
-async function apply() {
-  if (!draft.value) return
-  applying.value = true
-  try {
-    const reply = await setPosition(draft.value)
-    if (reply.reply === "saved" && (reply.pinned as string[]).includes("position")) toast.warning(t("placement.pinned"))
-    else toast.success(t("placement.applied"))
-    draft.value = null
-  } catch (e) {
-    toast.failure(e, { title: t("placement.failed"), retry: apply })
-  } finally {
-    applying.value = false
-  }
-}
-
-const legendLabels = computed(() => ({
-  network: t("placement.legendLinked"),
-  pending: t("placement.legendPending"),
+const labels = computed(() => ({
+  unplaced: t("placement.unplaced"),
+  open: t("placement.seamOpen"),
+  closed: t("placement.seamClosedHint"),
+  elsewhere: t("placement.seamElsewhere"),
 }))
 </script>
 
 <template>
   <DesktopShell>
     <section class="flex flex-col gap-4">
-      <LpSection :title="t('placement.title')" :description="t('placement.description')" icon="lucide:layout-grid" />
+      <LpSection :title="t('placement.title')" :description="t('placement.description')" icon="lucide:monitor" />
 
-      <LpSkeleton v-if="!status" rounded="card" class="h-[26rem]" />
-      <LpCard v-else class="overflow-hidden">
-        <LpContextMenu always :items="canvasMenu">
-          <div class="h-[26rem]" @contextmenu.capture="menuPeer = null">
-            <LpTopologyCanvas
-              :nodes="nodes"
-              :edges="edges"
-              :lanes="lanes"
-              :minimap="false"
-              :legend-labels="legendLabels"
-              @node-drag-stop="onDragStop"
-              @node-contextmenu="onNodeContextMenu"
-            />
-          </div>
-        </LpContextMenu>
-        <div class="flex flex-wrap items-center gap-2 border-t border-line p-3">
-          <LpTooltip :content="t('placement.left')">
-            <LpButton variant="soft" size="sm" square :aria-label="t('placement.left')" @click="nudge(-1, 0)">
-              <LpIcon name="lucide:arrow-left" :size="16" />
-            </LpButton>
-          </LpTooltip>
-          <LpTooltip :content="t('placement.up')">
-            <LpButton variant="soft" size="sm" square :aria-label="t('placement.up')" @click="nudge(0, -1)">
-              <LpIcon name="lucide:arrow-up" :size="16" />
-            </LpButton>
-          </LpTooltip>
-          <LpTooltip :content="t('placement.down')">
-            <LpButton variant="soft" size="sm" square :aria-label="t('placement.down')" @click="nudge(0, 1)">
-              <LpIcon name="lucide:arrow-down" :size="16" />
-            </LpButton>
-          </LpTooltip>
-          <LpTooltip :content="t('placement.right')">
-            <LpButton variant="soft" size="sm" square :aria-label="t('placement.right')" @click="nudge(1, 0)">
-              <LpIcon name="lucide:arrow-right" :size="16" />
-            </LpButton>
-          </LpTooltip>
-          <span class="text-xs text-muted">{{ t("placement.here", { x: here?.x, y: here?.y }) }}</span>
-          <div class="ml-auto flex gap-2">
-            <LpButton v-if="changed" variant="ghost" size="sm" @click="draft = null">{{ t("placement.reset") }}</LpButton>
-            <LpButton variant="solid" size="sm" :disabled="!changed || applying" @click="apply">
-              {{ t("placement.apply") }}
-            </LpButton>
-          </div>
-        </div>
-      </LpCard>
-
-      <LpAlert v-if="sharing.length" variant="warning">
-        {{ t("placement.sameCell", { names: sharing.map((s) => s.name).join(", ") }) }}
+      <LpSkeleton v-if="!status" rounded="card" class="h-[28rem]" />
+      <LpAlert v-else-if="!desk || !desk.machines.length" variant="info">
+        {{ t("placement.noScreens") }}
       </LpAlert>
-      <div v-if="unplaced.length" class="flex flex-col gap-2">
-        <p class="text-xs text-muted">{{ t("placement.unplacedTitle") }}</p>
+      <div v-else class="grid gap-4 lg:grid-cols-[1fr_18rem]">
+        <LpCard class="overflow-hidden">
+          <LpContextMenu always :items="canvasMenu">
+            <div class="h-[28rem] bg-surface-soft" @contextmenu.capture="menuPeer = null">
+              <DeskArrangement
+                :machines="positioned"
+                :seams="desk.seams"
+                :selected="selectedMachine?.machine.id ?? null"
+                :self="self"
+                :labels="labels"
+                @move="onMove"
+                @select="(id) => (selected = id)"
+                @toggle-seam="onToggleSeam"
+                @menu="onMenu"
+              />
+            </div>
+          </LpContextMenu>
+          <div class="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-line px-4 py-2 text-xs text-muted">
+            <span class="flex items-center gap-1.5">
+              <span class="inline-block h-0.5 w-5 rounded bg-accent" />
+              {{ t("placement.legendOpen", { n: seamCounts.open }) }}
+            </span>
+            <span class="flex items-center gap-1.5">
+              <span class="inline-block h-0.5 w-5 rounded border-t-2 border-dashed border-danger" />
+              {{ t("placement.legendClosed", { n: seamCounts.closed }) }}
+            </span>
+            <span class="ml-auto">{{ t("placement.hint") }}</span>
+          </div>
+        </LpCard>
+
+        <LpCard v-if="selectedMachine" class="flex flex-col gap-3 p-4">
+          <div class="flex items-center gap-2">
+            <LpIcon :name="selectedMachine.machine.this ? 'lucide:monitor-check' : 'lucide:monitor'" :size="18" />
+            <span class="font-semibold">{{ selectedMachine.machine.name }}</span>
+            <LpBadge v-if="selectedMachine.machine.this" tone="brand">{{ t("placement.thisMachine") }}</LpBadge>
+            <LpBadge v-else-if="selectedMachine.unplaced" tone="warning">{{ t("placement.unplaced") }}</LpBadge>
+          </div>
+          <ul class="flex flex-col gap-2">
+            <li
+              v-for="s in selectedMachine.machine.screens"
+              :key="s.id"
+              class="rounded-control border border-line px-3 py-2 text-sm"
+            >
+              <div class="truncate font-medium">{{ s.name }}</div>
+              <div class="text-xs text-muted">
+                {{ t("placement.screenSize", { inches: inches(s.w_mm, s.h_mm), w: Math.round(s.w_mm), h: Math.round(s.h_mm) }) }}
+                · {{ s.width }}×{{ s.height }}
+              </div>
+              <div v-if="!s.measured" class="mt-1 text-xs text-muted">{{ t("placement.estimated") }}</div>
+            </li>
+          </ul>
+          <p v-if="!selectedMachine.machine.this" class="text-xs text-muted">{{ t("placement.peerMoves") }}</p>
+        </LpCard>
+      </div>
+
+      <div v-if="offDesk.length" class="flex flex-col gap-2">
+        <p class="text-xs text-muted">{{ t("placement.offDeskTitle") }}</p>
         <div class="flex flex-wrap gap-2">
-          <PeerMenu v-for="p in unplaced" :key="p.id" :peer="peerRef(p)">
+          <PeerMenu v-for="p in offDesk" :key="p.id" :peer="peerRef(p)">
             <div class="flex items-center gap-1 rounded-control border border-line py-0.5 pl-3 pr-1 text-sm">
               <span>{{ p.name }}</span>
               <PeerMenuButton :peer="peerRef(p)" />
