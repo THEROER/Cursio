@@ -1,6 +1,5 @@
 //! What the gallery does with a file once it is on this computer: open it in
-//! its own application, show it in the file manager, put it on the clipboard
-//! as a file.
+//! its own application, show it in the file manager, put it on the clipboard.
 //!
 //! None of it goes through a shell. A gallery item's name comes from another
 //! machine, so it reaches a program only as one argument of its own, never as
@@ -87,15 +86,41 @@ pub fn reveal(path: &Path) -> Result<(), String> {
     open(folder)
 }
 
-/// Put files on the clipboard as a file manager copies them. The backend
-/// keeps serving them after this returns, as X11 requires of a clipboard's
-/// owner.
+/// Put files on the clipboard: one picture as the picture itself, anything
+/// else as a file manager copies files. The backend keeps serving them after
+/// this returns, as X11 requires of a clipboard's owner.
+///
+/// A picture goes as pixels because that is what a chat window, an editor or
+/// a terminal's image paste asks for, as after a browser's "Copy image". The
+/// Linux backend offers one representation per copy, and offered as a file it
+/// reached those as its `file://` path, pasted as text.
 pub fn copy(paths: &[PathBuf]) -> Result<(), String> {
-    let content = clipboard_core::ClipboardContent::files(paths);
+    let content = match paths {
+        [one] => match picture_format(one) {
+            Some(format) => {
+                let bytes = std::fs::read(one)
+                    .map_err(|e| format!("cannot read {}: {e}", one.display()))?;
+                clipboard_core::ClipboardContent::single(format, bytes)
+            }
+            None => clipboard_core::ClipboardContent::files(paths),
+        },
+        _ => clipboard_core::ClipboardContent::files(paths),
+    };
     let mut clipboard = clipboard_core::open().map_err(|e| e.to_string())?;
     clipboard
         .write(clipboard_core::Selection::Clipboard, &content)
         .map_err(|e| e.to_string())
+}
+
+/// The clipboard format a picture is copied in, by its name: only the ones
+/// every backend decodes. Anything else (a video, a HEIC) is copied as a file.
+fn picture_format(path: &Path) -> Option<clipboard_core::ClipboardFormat> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "jpg" | "jpeg" => Some(clipboard_core::ClipboardFormat::ImageJpeg),
+        "png" => Some(clipboard_core::ClipboardFormat::ImagePng),
+        _ => None,
+    }
 }
 
 #[cfg(not(windows))]
@@ -116,6 +141,20 @@ mod tests {
         let path = Path::new("/home/me/Pictures/Cursio/POCO/$(rm -rf ~) a;b.jpg");
         let (_, args) = open_invocation(path);
         assert_eq!(args, vec![path.as_os_str().to_owned()]);
+    }
+
+    #[test]
+    fn a_photo_is_copied_as_a_picture_and_a_video_as_a_file() {
+        assert_eq!(
+            picture_format(Path::new("/tmp/IMG_1.JPG")),
+            Some(clipboard_core::ClipboardFormat::ImageJpeg)
+        );
+        assert_eq!(
+            picture_format(Path::new("/tmp/shot.png")),
+            Some(clipboard_core::ClipboardFormat::ImagePng)
+        );
+        assert_eq!(picture_format(Path::new("/tmp/VID_1.mp4")), None);
+        assert_eq!(picture_format(Path::new("/tmp/no-extension")), None);
     }
 
     #[cfg(not(windows))]
