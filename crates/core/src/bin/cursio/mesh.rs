@@ -42,16 +42,22 @@ pub(crate) async fn run_mesh(
         status,
     } = start_node(&identity, port, send_input).await?;
 
+    // Its own thread: it writes files and waits on the desktop's cache tools,
+    // which must not hold up the first peers.
     #[cfg(target_os = "linux")]
-    match cursio_core::update::launcher::register_from_install() {
-        Ok(Some(entry)) => {
-            tracing::debug!(entry = %entry.display(), "the app is in the application list")
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot add Cursio to the application list; search will not find the app")
-        }
-    }
+    std::thread::Builder::new()
+        .name("cursio-launcher".into())
+        .spawn(
+            || match cursio_core::update::launcher::register_from_install() {
+                Ok(Some(entry)) => {
+                    tracing::debug!(entry = %entry.display(), "the app is in the application list")
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot add Cursio to the application list; search will not find the app")
+                }
+            },
+        )?;
 
     // One registry for the whole process, shared by every session. Sessions are
     // single-threaded by design, so `Rc` is the right sharing primitive here.
@@ -222,6 +228,7 @@ pub(crate) async fn run_mesh(
                             peer.addr,
                         );
                         if known {
+                            strangers.remove(&peer.peer_id);
                             tracing::debug!(peer = %peer.display_name, addr = %peer.addr, "trusted peer seen");
                         } else if pairing.is_open() {
                             // The one window in which a stranger is interesting.
@@ -282,6 +289,9 @@ pub(crate) async fn run_mesh(
                         if !pairing.is_open() {
                             strangers.clear();
                         } else {
+                            // One that called in and paired meanwhile is no
+                            // stranger: calling it now would open a second link.
+                            strangers.retain(|peer_id, _| !registry.borrow().is_known(peer_id));
                             let now = std::time::Instant::now();
                             let due: Vec<PeerId> = strangers
                                 .iter_mut()
@@ -314,30 +324,43 @@ pub(crate) async fn run_mesh(
                                 let Some(Stranger { name, addr, .. }) = strangers.remove(&peer_id) else {
                                     continue;
                                 };
-                                let transport = match TcpTransport::connect(addr).await {
-                                    Ok(t) => t,
-                                    Err(e) => {
-                                        tracing::warn!(peer = %name, %addr, error = %e, "could not reach the machine to pair with");
-                                        continue;
-                                    }
-                                };
-                                tracing::info!(peer = %name, %addr, "dialled an unpaired machine to pair with it");
-                                spawn_peer_session(
-                                    transport,
-                                    identity.clone(),
-                                    Role::Initiator,
-                                    None,
-                                    registry.clone(),
-                                    pairing.clone(),
-                                    control.clone(),
-                                    capture.clone(),
-                                    status.clone(),
-                                    live.clone(),
-                                    modules.clone(),
-                                    offer,
-                                    None,
-                                    Some(addr.ip()),
-                                );
+                                // Off the loop, as the trusted dials below: a
+                                // stranger that announced itself and left holds
+                                // the connect for its whole timeout.
+                                let identity = identity.clone();
+                                let registry = registry.clone();
+                                let pairing = pairing.clone();
+                                let control = control.clone();
+                                let capture = capture.clone();
+                                let status = status.clone();
+                                let live = live.clone();
+                                let modules = modules.clone();
+                                tokio::task::spawn_local(async move {
+                                    let transport = match TcpTransport::connect(addr).await {
+                                        Ok(t) => t,
+                                        Err(e) => {
+                                            tracing::warn!(peer = %name, %addr, error = %e, "could not reach the machine to pair with");
+                                            return;
+                                        }
+                                    };
+                                    tracing::info!(peer = %name, %addr, "dialled an unpaired machine to pair with it");
+                                    spawn_peer_session(
+                                        transport,
+                                        identity,
+                                        Role::Initiator,
+                                        None,
+                                        registry,
+                                        pairing,
+                                        control,
+                                        capture,
+                                        status,
+                                        live,
+                                        modules,
+                                        offer,
+                                        None,
+                                        Some(addr.ip()),
+                                    );
+                                });
                             }
                         }
                         let targets = cursio_core::mesh::next_dial_targets(self_id, &registry);
