@@ -27,8 +27,8 @@
 //!
 //! The clipboard's lock does not keep two threads of one process apart when
 //! both open it with no owner window. Every peer session runs its own
-//! clipboard worker, so with three peers three threads were inside
-//! `GetClipboardData` at once, and user32's per-process copy of the data —
+//! clipboard worker, and a crash dump caught two of them inside
+//! `GetClipboardData` at once, where user32's per-process copy of the data —
 //! freed and replaced on each call — was freed twice: `0xc0000374` heap
 //! corruption in `GlobalSize`, or a `memcpy` off the end of a block another
 //! thread had just released. The node died with it, several times a day.
