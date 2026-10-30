@@ -360,8 +360,11 @@ pub fn transport(socket: std::os::windows::io::OwnedSocket) -> std::io::Result<L
     // stream socket; nothing here asks it TCP's questions.
     let socket = Arc::new(std::net::TcpStream::from(socket));
     // The pipe is the queue below the session here, so it is the one bounded;
-    // what Winsock buffers behind a blocking send is not ours to set.
-    let (node, pump) = tokio::io::duplex(UNSENT);
+    // what Winsock buffers behind a blocking send is not ours to set. It
+    // counts bare bytes where Linux charges each small packet about a
+    // kilobyte, so it is smaller: 8 KiB here would hold a hundred pointer
+    // moves the session could otherwise have merged into one.
+    let (node, pump) = tokio::io::duplex(UNSENT / 4);
     let (mut from_node, mut to_node) = tokio::io::split(pump);
 
     let radio = Arc::clone(&socket);

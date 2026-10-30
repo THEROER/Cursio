@@ -163,7 +163,14 @@ socket's send buffer on Linux, the pump's pipe on Windows), because an
 RFCOMM socket's default buffer held over a second of other traffic in front
 of every pointer move. A frame already being written still finishes first, so
 a file chunk on the radio can delay input by its own length. Pixels are not
-sent over it. A fully idle Bluetooth standby keeps its sparse 15-second
+sent over it.
+
+Classic Bluetooth carries well under the thousand packets a second a 1000 Hz
+mouse produces, so on any link that cannot keep up a pointer move that finds
+the previous move still waiting in the input queue is added into it (relative
+deltas sum exactly; a button or key between them stops the merge). This is
+what a Bluetooth mouse itself does per connection interval. A link that keeps
+up never has a move waiting, so nothing changes there. A fully idle Bluetooth standby keeps its sparse 15-second
 keepalive. Loss of the interactive path holds the session even if a data socket
 is still alive; a usable control path must return within 60 seconds. Modules,
 mounts and capture objects remain intact while individual paths reconnect.

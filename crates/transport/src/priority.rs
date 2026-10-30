@@ -58,7 +58,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use cursio_protocol::{Message, Priority};
+use cursio_protocol::{InputEvent, Message, Priority};
 use tokio::sync::Notify;
 use tracing::Instrument;
 
@@ -207,6 +207,9 @@ struct Queued {
     queued_at: Instant,
     /// From a message that only matters fresh ([`Message::is_lossy`]).
     lossy: bool,
+    /// The deltas of a pointer move still waiting here, which a later move
+    /// may fold into rather than queue behind; see [`PrioritizedTx::send`].
+    motion: Option<(i32, i32)>,
 }
 
 /// A frame the drainer chose, on its way out.
@@ -298,7 +301,32 @@ impl Queues {
             frame,
             queued_at: Instant::now(),
             lossy,
+            motion: None,
         });
+    }
+
+    /// Fold a pointer move into the move waiting last in `class`, if that is
+    /// what is waiting there. Summing relative deltas is exact, and the merged
+    /// move keeps the older one's place and age.
+    fn fold_motion(&mut self, class: usize, dx: i32, dy: i32) -> Result<bool, TransportError> {
+        let Some(last) = self.classes[class].back_mut() else {
+            return Ok(false);
+        };
+        let Some((x, y)) = last.motion else {
+            return Ok(false);
+        };
+        let (Some(x), Some(y)) = (x.checked_add(dx), y.checked_add(dy)) else {
+            return Ok(false);
+        };
+        let mut frames =
+            chunk_plaintext(&Message::Input(InputEvent::PointerMotion { dx: x, dy: y }))?;
+        let Some(frame) = frames.pop().filter(|_| frames.is_empty()) else {
+            return Ok(false);
+        };
+        self.queued_bytes[class] = self.queued_bytes[class] - last.frame.len() + frame.len();
+        last.frame = frame;
+        last.motion = Some((x, y));
+        Ok(true)
     }
 
     /// Record that a frame of `class` queued at `queued_at` reached the socket
@@ -623,6 +651,23 @@ impl TransportTx for PrioritizedTx {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
         let idx = class_index(msg.priority());
         let lossy = msg.is_lossy();
+        // A move that finds the previous one still unsent joins it. A link
+        // that keeps up never sees this; one that cannot send a frame per
+        // move — Bluetooth carries well under a thousand packets a second,
+        // which a 1000 Hz mouse alone asks for — would otherwise deliver the
+        // backlog as a burst of tiny steps after a pause, felt as the pointer
+        // jerking. A Bluetooth mouse does the same: it adds up its motion and
+        // reports once per connection interval.
+        let motion = match msg {
+            Message::Input(InputEvent::PointerMotion { dx, dy }) => Some((*dx, *dy)),
+            _ => None,
+        };
+        if let Some((dx, dy)) = motion {
+            let mut q = self.shared.queues.lock().unwrap();
+            if q.terminal_error.is_none() && !q.closed && q.fold_motion(idx, dx, dy)? {
+                return Ok(());
+            }
+        }
         let frames = chunk_plaintext(msg)?;
         let size: usize = frames.iter().map(Vec::len).sum();
         loop {
@@ -638,8 +683,14 @@ impl TransportTx for PrioritizedTx {
                     return Err(TransportError::Closed);
                 }
                 if q.queued_bytes[idx] + size <= QUEUE_BYTES[idx].max(size) {
+                    let single = frames.len() == 1;
                     for frame in frames {
                         q.push_frame(idx, frame, lossy);
+                    }
+                    if single {
+                        if let Some(last) = q.classes[idx].back_mut() {
+                            last.motion = motion;
+                        }
                     }
                     // Plain encrypted transports have only the interactive
                     // worker; resumable transports also wake the lane's worker.
@@ -1060,6 +1111,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tx.queue_depth(Priority::Bulk).queued_bytes, 0);
+    }
+
+    struct RecordingSink {
+        gate: Arc<tokio::sync::Semaphore>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl FrameSink for RecordingSink {
+        async fn send_frame(&mut self, frame: OutFrame) -> Result<(), TransportError> {
+            self.gate.acquire().await.unwrap().forget();
+            self.sent.lock().unwrap().push(frame.tagged);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn moves_waiting_behind_a_slow_link_merge_without_crossing_a_click() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut tx = PrioritizedTx::spawn_sink(Box::new(RecordingSink {
+            gate: gate.clone(),
+            sent: sent.clone(),
+        }));
+        let motion = |dx, dy| Message::Input(InputEvent::PointerMotion { dx, dy });
+        let click = Message::Input(InputEvent::PointerButton {
+            button: cursio_protocol::MouseButton::Left,
+            pressed: true,
+        });
+        let key = Message::Input(InputEvent::Key {
+            key: 1,
+            pressed: true,
+        });
+        tx.send(&key).await.unwrap();
+        tokio::task::yield_now().await; // the key is now blocked in the sink
+        for message in [
+            motion(1, 2),
+            motion(3, 4),
+            click.clone(),
+            motion(5, 0),
+            motion(1, 1),
+        ] {
+            tx.send(&message).await.unwrap();
+        }
+        gate.add_permits(100);
+        tokio::time::timeout(Duration::from_secs(1), tx.flush())
+            .await
+            .unwrap();
+
+        let expected: Vec<Vec<u8>> = [key, motion(4, 6), click, motion(6, 1)]
+            .iter()
+            .flat_map(|m| chunk_plaintext(m).unwrap())
+            .collect();
+        assert_eq!(*sent.lock().unwrap(), expected);
+        assert_eq!(tx.queue_depth(Priority::Input).queued_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn a_move_on_an_idle_link_goes_out_alone() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(100));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut tx = PrioritizedTx::spawn_sink(Box::new(RecordingSink {
+            gate,
+            sent: sent.clone(),
+        }));
+        for dx in [1, 2] {
+            tx.send(&Message::Input(InputEvent::PointerMotion { dx, dy: 0 }))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), tx.flush())
+                .await
+                .unwrap();
+        }
+        assert_eq!(sent.lock().unwrap().len(), 2);
     }
 
     /// Priority-scheduled sends must still decode correctly on the far side: a
