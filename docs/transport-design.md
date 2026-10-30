@@ -156,8 +156,14 @@ space being freed. ACK snapshots are cumulative and can be retried if a writer
 inbox is full.
 
 Bluetooth remains one shared standby, carrying the lane identifiers and the
-same encrypted protocol; it does not provide TCP-like lane isolation. Pixels
-are not sent over it. A fully idle Bluetooth standby keeps its sparse 15-second
+same encrypted protocol; it does not provide TCP-like lane isolation. Its
+writer keeps one inbox per lane and always takes the interactive one first,
+then audio, then bulk, and the queue below it is kept small (8 KiB: the
+socket's send buffer on Linux, the pump's pipe on Windows), because an
+RFCOMM socket's default buffer held over a second of other traffic in front
+of every pointer move. A frame already being written still finishes first, so
+a file chunk on the radio can delay input by its own length. Pixels are not
+sent over it. A fully idle Bluetooth standby keeps its sparse 15-second
 keepalive. Loss of the interactive path holds the session even if a data socket
 is still alive; a usable control path must return within 60 seconds. Modules,
 mounts and capture objects remain intact while individual paths reconnect.

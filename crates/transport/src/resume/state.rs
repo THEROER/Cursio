@@ -22,13 +22,30 @@ pub(super) struct Kept {
 pub(super) struct PathSlot {
     pub(super) id: u64,
     pub(super) kind: PathKind,
-    pub(super) writer: mpsc::Sender<Vec<u8>>,
+    /// One inbox per lane, drained in lane order by the path's writer. A
+    /// network path only ever carries its own lane; a Bluetooth path carries
+    /// all of them, and without this they reached its socket in arrival order,
+    /// so a file chunk or a run of sound written first held the pointer
+    /// motion behind it for as long as the radio took to send it.
+    pub(super) writers: [mpsc::Sender<Vec<u8>>; Lane::COUNT],
     pub(super) last_heard: Instant,
     pub(super) degraded_until: Option<Instant>,
     pub(super) attached_at: Instant,
     pub(super) probe: Option<(u64, Instant)>,
     pub(super) last_probe: Instant,
     pub(super) tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl PathSlot {
+    pub(super) fn writer(&self, lane: Lane) -> &mpsc::Sender<Vec<u8>> {
+        &self.writers[lane as usize]
+    }
+
+    /// Where `ACK`, `PING` and `PONG` go: a network path's own lane, and the
+    /// interactive one on Bluetooth, so they keep pace with input.
+    pub(super) fn control(&self) -> &mpsc::Sender<Vec<u8>> {
+        self.writer(self.kind.lane().unwrap_or(Lane::Interactive))
+    }
 }
 
 impl Drop for PathSlot {

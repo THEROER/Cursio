@@ -103,7 +103,7 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
                 {
                     let mut ping = vec![link_tag::PING];
                     ping.extend_from_slice(&nonce.to_be_bytes());
-                    if path.writer.try_send(ping).is_ok() {
+                    if path.control().try_send(ping).is_ok() {
                         path.probe = Some((nonce, now));
                         path.last_probe = now;
                     }

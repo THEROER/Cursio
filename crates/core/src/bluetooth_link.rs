@@ -287,6 +287,17 @@ pub fn report(decision: &Decision) {
     });
 }
 
+/// The most a Bluetooth link holds unsent below the session's own queues.
+///
+/// Whatever sits there goes out first in the order written, out of reach of
+/// the lane order the path's writer keeps. Over TCP that queue is bounded by
+/// `transport::send_backlog`; an RFCOMM socket keeps the kernel's default of
+/// about 200 KiB, which at the radio's 100–200 KB/s is a second or more of
+/// sound and file data queued in front of every pointer move written after
+/// it — the mouse on a Bluetooth-only peer jumped in bursts. Linux doubles
+/// the figure asked for.
+const UNSENT: usize = 8 * 1024;
+
 /// A Bluetooth connection as a mesh transport.
 #[cfg(unix)]
 pub type Link = StreamTransport<tokio::net::UnixStream>;
@@ -302,6 +313,25 @@ pub type Link = StreamTransport<tokio::io::DuplexStream>;
 /// readiness.
 #[cfg(unix)]
 pub fn transport(fd: std::os::fd::OwnedFd) -> std::io::Result<Link> {
+    use std::os::fd::AsRawFd;
+
+    let size = UNSENT as libc::c_int;
+    // SAFETY: fd is a live socket we own; size is a c_int for the length passed.
+    let r = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &size as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "could not bound a bluetooth link's send buffer; input may queue behind other traffic on it"
+        );
+    }
     let socket = std::os::unix::net::UnixStream::from(fd);
     socket.set_nonblocking(true)?;
     Ok(StreamTransport::new(
@@ -329,7 +359,9 @@ pub fn transport(socket: std::os::windows::io::OwnedSocket) -> std::io::Result<L
     // Only read, write and shutdown are used, which Winsock serves for any
     // stream socket; nothing here asks it TCP's questions.
     let socket = Arc::new(std::net::TcpStream::from(socket));
-    let (node, pump) = tokio::io::duplex(64 * 1024);
+    // The pipe is the queue below the session here, so it is the one bounded;
+    // what Winsock buffers behind a blocking send is not ours to set.
+    let (node, pump) = tokio::io::duplex(UNSENT);
     let (mut from_node, mut to_node) = tokio::io::split(pump);
 
     let radio = Arc::clone(&socket);

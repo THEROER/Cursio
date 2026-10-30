@@ -129,7 +129,7 @@ impl Inner {
         if tagged[0] == link_tag::PING {
             let mut pong = vec![link_tag::PONG];
             pong.extend_from_slice(&nonce.to_be_bytes());
-            let _ = path.writer.try_send(pong);
+            let _ = path.control().try_send(pong);
         } else if let Some((expected, at)) = path.probe {
             if expected == nonce {
                 path.probe = None;
@@ -161,7 +161,11 @@ impl Inner {
             noise,
             kind,
         } = path;
-        let (writer, mut frames) = mpsc::channel::<Vec<u8>>(2);
+        let (writers, mut frames): (Vec<_>, Vec<_>) = (0..Lane::COUNT)
+            .map(|_| mpsc::channel::<Vec<u8>>(2))
+            .unzip();
+        let writers: [mpsc::Sender<Vec<u8>>; Lane::COUNT] =
+            writers.try_into().expect("one inbox per lane");
         let id = {
             let mut state = self.lock();
             state.next_path_id += 1;
@@ -171,7 +175,7 @@ impl Inner {
         let weak = Arc::downgrade(self);
         let write_noise = noise.clone();
         let write = tokio::spawn(async move {
-            while let Some(frame) = frames.recv().await {
+            while let Some(frame) = next_by_lane(&mut frames).await {
                 let sent = match seal_frame(&write_noise, &frame) {
                     Ok(sealed) => tx.send(&sealed).await,
                     Err(e) => Err(e),
@@ -243,7 +247,7 @@ impl Inner {
             state.paths.push(PathSlot {
                 id,
                 kind,
-                writer,
+                writers,
                 last_heard: now,
                 degraded_until: None,
                 attached_at: now,
@@ -271,5 +275,74 @@ impl Inner {
         self.changed.notify_waiters();
         self.kick(0);
         self.report();
+    }
+}
+
+/// The next frame for a path's socket: the most urgent lane's first, so a
+/// path shared by every lane sends in lane order. `None` once every inbox has
+/// closed.
+async fn next_by_lane(frames: &mut [mpsc::Receiver<Vec<u8>>]) -> Option<Vec<u8>> {
+    std::future::poll_fn(|cx| {
+        let mut open = false;
+        for inbox in frames.iter_mut() {
+            match inbox.poll_recv(cx) {
+                std::task::Poll::Ready(Some(frame)) => return std::task::Poll::Ready(Some(frame)),
+                std::task::Poll::Ready(None) => {}
+                std::task::Poll::Pending => open = true,
+            }
+        }
+        if open {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(None)
+        }
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_shared_path_sends_input_ahead_of_frames_queued_before_it() {
+        let (senders, mut inboxes): (Vec<_>, Vec<_>) = (0..Lane::COUNT)
+            .map(|_| mpsc::channel::<Vec<u8>>(2))
+            .unzip();
+        senders[Lane::Bulk as usize]
+            .send(b"bulk".to_vec())
+            .await
+            .unwrap();
+        senders[Lane::Audio as usize]
+            .send(b"audio".to_vec())
+            .await
+            .unwrap();
+        senders[Lane::Interactive as usize]
+            .send(b"input".to_vec())
+            .await
+            .unwrap();
+
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            order.push(next_by_lane(&mut inboxes).await.unwrap());
+        }
+        assert_eq!(
+            order,
+            [b"input".to_vec(), b"audio".to_vec(), b"bulk".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_writer_ends_only_when_every_lane_has_closed() {
+        let (senders, mut inboxes): (Vec<_>, Vec<_>) = (0..Lane::COUNT)
+            .map(|_| mpsc::channel::<Vec<u8>>(2))
+            .unzip();
+        let mut senders = senders.into_iter();
+        let interactive = senders.next().unwrap();
+        drop(senders);
+        interactive.send(b"last".to_vec()).await.unwrap();
+        drop(interactive);
+        assert_eq!(next_by_lane(&mut inboxes).await, Some(b"last".to_vec()));
+        assert_eq!(next_by_lane(&mut inboxes).await, None);
     }
 }

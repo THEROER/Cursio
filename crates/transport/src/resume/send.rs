@@ -62,7 +62,7 @@ impl FrameSink for ResumableSink {
             }
             let carrying = state
                 .carrying(self.lane, now)
-                .map(|p| (p.id, p.kind, p.writer.clone()));
+                .map(|p| (p.id, p.kind, p.writer(self.lane).clone()));
             if let Some((id, _, writer)) = &carrying {
                 if self.last_path != Some(*id) {
                     self.last_path = Some(*id);
@@ -92,7 +92,7 @@ impl FrameSink for ResumableSink {
                             || bluetooth_active
                             || flags & ACK_ALL_PATHS != 0
                         {
-                            let _ = path.writer.try_send(frame.clone());
+                            let _ = path.control().try_send(frame.clone());
                         }
                     }
                 }
