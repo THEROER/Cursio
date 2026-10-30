@@ -22,8 +22,20 @@
 //! a live process: once `SetClipboardData` copies the data in, the writing
 //! process can exit and the content survives. So there is no serving thread here
 //! (contrast `linux.rs`).
+//!
+//! ## One thread at a time
+//!
+//! The clipboard's lock does not keep two threads of one process apart when
+//! both open it with no owner window. Every peer session runs its own
+//! clipboard worker, so with three peers three threads were inside
+//! `GetClipboardData` at once, and user32's per-process copy of the data —
+//! freed and replaced on each call — was freed twice: `0xc0000374` heap
+//! corruption in `GlobalSize`, or a `memcpy` off the end of a block another
+//! thread had just released. The node died with it, several times a day.
+//! [`ClipboardGuard`] therefore also holds a process-wide mutex.
 
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Mutex, MutexGuard};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
@@ -66,18 +78,31 @@ impl WinClipboard {
     }
 }
 
+/// Serializes this process's clipboard access across threads; see the module
+/// docs for why the system's own lock does not.
+static PROCESS_CLIPBOARD: Mutex<()> = Mutex::new(());
+
 /// RAII guard: opens the clipboard on construction, closes it on drop, so no
 /// path can leave the clipboard locked (which would hang every other app).
-struct ClipboardGuard;
+struct ClipboardGuard {
+    // `Drop::drop` runs before fields are dropped, so the clipboard is closed
+    // before the next thread may open it.
+    _process: MutexGuard<'static, ()>,
+}
 
 impl ClipboardGuard {
     fn open() -> Result<Self, ClipboardError> {
+        // Nothing the mutex guards can be left half-done by a panic: the
+        // clipboard is closed by `Drop` either way.
+        let process = PROCESS_CLIPBOARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // A null owner window is fine for a background tool. Retry briefly: the
         // clipboard is a single global lock and another app may hold it for a
         // moment right as we try.
         for _ in 0..10 {
             if unsafe { OpenClipboard(None) }.is_ok() {
-                return Ok(ClipboardGuard);
+                return Ok(ClipboardGuard { _process: process });
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

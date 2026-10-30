@@ -8,6 +8,7 @@
 //! cargo run -p clipboard-core --example probe          # read what's on the clipboard
 //! cargo run -p clipboard-core --example probe -- write # write, then read back
 //! cargo run -p clipboard-core --example probe -- watch # print changes as they happen
+//! cargo run -p clipboard-core --example probe -- race  # several threads at once, as one per peer
 //! ```
 
 use clipboard_core::{ClipboardContent, ClipboardEntry, ClipboardFormat, Selection};
@@ -22,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("write") => write_and_read_back(),
         Some("watch") => watch(),
+        Some("race") => race(),
         _ => read(),
     }
 }
@@ -121,5 +123,45 @@ async fn watch() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => println!("changed, but read failed: {e}"),
         }
     }
+    Ok(())
+}
+
+/// Read and write from several threads at once, the way one clipboard worker
+/// per peer session does.
+///
+/// On Windows this used to corrupt the heap within seconds: the process died
+/// with `0xc0000374` rather than returning an error, so surviving is the check.
+fn race() -> Result<(), Box<dyn std::error::Error>> {
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 500;
+    let text = "x".repeat(64 * 1024);
+    let workers: Vec<_> = (0..THREADS)
+        .map(|n| {
+            let text = text.clone();
+            std::thread::spawn(move || -> Result<(), clipboard_core::ClipboardError> {
+                let mut clipboard = clipboard_core::open()?;
+                for round in 0..ROUNDS {
+                    if (round + n) % 5 == 0 {
+                        let content = ClipboardContent {
+                            entries: vec![ClipboardEntry::loaded(
+                                ClipboardFormat::Text,
+                                text.clone().into_bytes(),
+                            )],
+                        };
+                        clipboard.write(Selection::Clipboard, &content)?;
+                    } else {
+                        // Another app holding the clipboard for a moment is not
+                        // what is being tested.
+                        let _ = clipboard.load(Selection::Clipboard, &ClipboardFormat::Text);
+                    }
+                }
+                Ok(())
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("a probe thread panicked")?;
+    }
+    println!("OK: {THREADS} threads x {ROUNDS} rounds without corrupting the heap");
     Ok(())
 }
