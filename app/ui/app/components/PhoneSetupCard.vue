@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { PhoneGrant } from "~/composables/usePhone"
+import type { PhoneGrant, PhoneSetup } from "~/composables/usePhone"
 
 /**
  * What the phone still has to allow for the node to stay up and carry sound.
@@ -15,7 +15,9 @@ const { setup, missing, autostartDone, request, markAutostartDone } = usePhone()
 const toast = useCursioToast()
 
 interface Row {
-  what: Exclude<PhoneGrant, "autostart">
+  // A grant the setup reports as given or not; "autostart" and "bluetooth"
+  // only open a settings screen and have nothing to read back.
+  what: PhoneGrant & keyof PhoneSetup
   icon: string
 }
 

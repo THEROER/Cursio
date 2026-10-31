@@ -33,6 +33,6 @@ export default defineNuxtModule({
         filePath: `@leavepulse/ui/dist/components/${name}.vue.js`,
       })
     }
-    addPlugin({ src: createResolver(import.meta.url).resolve("./theme.client"), mode: "client" })
+    addPlugin({ src: createResolver(import.meta.url).resolve("./runtime/theme.client"), mode: "client" })
   },
 })

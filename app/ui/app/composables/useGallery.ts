@@ -33,7 +33,7 @@ export const THUMB_PX = 320
 /** Bytes asked for per read; `cursio_protocol::gallery::MAX_SLICE`. */
 const SLICE = 512 * 1024
 
-function bytesOf(base64: string): Uint8Array {
+function bytesOf(base64: string): Uint8Array<ArrayBuffer> {
   const raw = atob(base64)
   const out = new Uint8Array(raw.length)
   for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i)
@@ -76,7 +76,7 @@ export function useGallery() {
 
   /** The whole item, read slice by slice, as a Blob of its own type. */
   async function whole(peer: string, item: MediaItem, progress?: (done: number) => void): Promise<Blob> {
-    const parts: Uint8Array[] = []
+    const parts: Uint8Array<ArrayBuffer>[] = []
     let offset = 0
     for (;;) {
       const reply = await invoke<Reply>("gallery_read", { peer, item: item.id, offset, len: SLICE })
