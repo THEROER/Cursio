@@ -5,9 +5,11 @@ use crate::crypto::link_tag;
 use crate::lane::Lane;
 use crate::resume::frame::ACK_ALL_PATHS;
 use crate::resume::inner::Inner;
+use crate::resume::PathKind;
 use crate::resume::ACK_EVERY;
 use crate::resume::ACK_SOON;
 use crate::resume::ACTIVE_SILENCE;
+use crate::resume::BLUETOOTH_SILENCE;
 use crate::resume::DEGRADED_FOR;
 use crate::resume::HOLD;
 use crate::resume::STALL;
@@ -42,10 +44,12 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
                 .filter_map(|lane| state.carrying(lane, now).map(|p| p.id))
                 .collect();
             for path in &state.paths {
-                let limit = if carrying.contains(&path.id) {
-                    ACTIVE_SILENCE
-                } else {
+                let limit = if !carrying.contains(&path.id) {
                     STANDBY_SILENCE
+                } else if path.kind == PathKind::Bluetooth {
+                    BLUETOOTH_SILENCE
+                } else {
+                    ACTIVE_SILENCE
                 };
                 let quiet = now.duration_since(path.last_heard);
                 if quiet > limit {

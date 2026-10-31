@@ -95,6 +95,19 @@ const STANDBY_KEEPALIVE: Duration = Duration::from_secs(15);
 
 /// Silence after which the path carrying the session is let go of.
 const ACTIVE_SILENCE: Duration = Duration::from_secs(3);
+/// As [`ACTIVE_SILENCE`], for a Bluetooth path. The radio pauses for seconds
+/// while it pages another device or opens a profile, and a Bluetooth path is
+/// usually the only one left: letting it go at three seconds ended it in the
+/// middle of every session's opening burst, and each new path then resent
+/// everything unacknowledged into the next pause. A dead link still ends at
+/// the radio's own supervision timeout, as a read error.
+const BLUETOOTH_SILENCE: Duration = Duration::from_secs(10);
+
+/// The largest frame while Bluetooth carries the interactive lane. A frame
+/// cannot be interrupted once on the wire, and at the radio's speed a full
+/// 64 KiB one held every pointer move behind it for most of a second; 4 KiB
+/// is tens of milliseconds there, for about 1% more framing.
+const BLUETOOTH_FRAME: usize = 4 * 1024;
 /// Silence after which a standby path is let go of: three keepalives.
 const STANDBY_SILENCE: Duration = Duration::from_secs(45);
 
@@ -394,7 +407,23 @@ impl ResumableLink {
                 state.ended.is_none() && state.carrying(Lane::Interactive, Instant::now()).is_none()
             })
         });
-        let tx = PrioritizedTx::spawn_lanes(sinks).with_holding(holding);
+        let weak = Arc::downgrade(&self.inner);
+        let frame_limit = Arc::new(move || {
+            let on_bluetooth = weak.upgrade().is_some_and(|inner| {
+                inner
+                    .lock()
+                    .carrying(Lane::Interactive, Instant::now())
+                    .is_some_and(|path| path.kind == PathKind::Bluetooth)
+            });
+            if on_bluetooth {
+                BLUETOOTH_FRAME
+            } else {
+                usize::MAX
+            }
+        });
+        let tx = PrioritizedTx::spawn_lanes(sinks)
+            .with_holding(holding)
+            .with_frame_limit(frame_limit);
         self.inner.lock().kick = Some(tx.kick_handle());
         Box::new(tx)
     }
@@ -793,6 +822,24 @@ mod tests {
         a.tx.send(&key(3)).await.unwrap();
         assert_eq!(next(&mut b).await, key(3), "the standby did not take over");
         assert!(!a.tx.holding());
+    }
+
+    #[tokio::test]
+    async fn a_large_message_crosses_bluetooth_in_small_frames_and_arrives_whole() {
+        let (mut a, mut b) = session().await;
+        let (pa, pb, _) = path_pair(PathKind::Bluetooth).await;
+        let (ra, rb) = tokio::join!(a.handle.attach(pa), b.handle.attach(pb));
+        ra.unwrap();
+        rb.unwrap();
+        a.handle.network_lost();
+        b.handle.network_lost();
+
+        let image = Message::Opaque((0..300_000u32).map(|i| (i % 251) as u8).collect());
+        a.tx.send(&image).await.unwrap();
+        a.tx.send(&key(4)).await.unwrap();
+        let received = [next(&mut b).await, next(&mut b).await];
+        assert!(received.contains(&image), "the image did not arrive whole");
+        assert!(received.contains(&key(4)));
     }
 
     #[tokio::test(start_paused = true)]

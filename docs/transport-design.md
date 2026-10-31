@@ -162,7 +162,12 @@ then audio, then bulk, and the queue below it is kept small (8 KiB: the
 socket's send buffer on Linux, the pump's pipe on Windows), because an
 RFCOMM socket's default buffer held over a second of other traffic in front
 of every pointer move. A frame already being written still finishes first, so
-a file chunk on the radio can delay input by its own length. Pixels are not
+while Bluetooth carries the interactive lane a message is cut into 4 KiB
+frames rather than 64 KiB ones: a full frame held input for most of a second
+on the radio, a small one for tens of milliseconds. Receivers accept any piece
+size, so this needs nothing of the peer. A carrying Bluetooth path is let go
+of after 10 s of silence rather than 3 s, since it is usually the only path and
+the radio pauses for seconds while it pages another device. Pixels are not
 sent over it.
 
 Classic Bluetooth carries well under the thousand packets a second a 1000 Hz

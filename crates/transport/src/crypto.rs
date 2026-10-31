@@ -193,28 +193,53 @@ pub(crate) fn seal_frame(
 /// Noise nonces must advance in exactly the order frames hit the wire, so we
 /// must not seal until the drainer has decided what goes next.
 pub(crate) fn chunk_plaintext(msg: &Message) -> Result<Vec<Vec<u8>>, TransportError> {
+    chunk_plaintext_within(msg, || MAX_TAGGED_PLAINTEXT)
+}
+
+/// The smallest frame [`chunk_plaintext_within`] cuts to.
+pub(crate) const MIN_FRAME: usize = 1024;
+
+/// As [`chunk_plaintext`], with each tagged frame at most `frame` bytes,
+/// which is asked only of a message too large for [`MIN_FRAME`].
+///
+/// A frame on the wire cannot be interrupted, so its length is how long
+/// whatever is queued behind it waits: on a slow path that bounds how long a
+/// pointer move waits behind a file or an image. Receivers accept any piece
+/// up to the full budget, and the piece grows past `frame` only where a
+/// message would otherwise need more pieces than a receiver accepts.
+pub(crate) fn chunk_plaintext_within(
+    msg: &Message,
+    frame: impl FnOnce() -> usize,
+) -> Result<Vec<Vec<u8>>, TransportError> {
     let body = msg.to_bytes()?;
     if body.len() > MAX_LOGICAL_MESSAGE_BYTES {
         return Err(CryptoError::MessageTooLarge(body.len()).into());
     }
+    let frame = if body.len() < MIN_FRAME {
+        MAX_TAGGED_PLAINTEXT
+    } else {
+        frame().clamp(MIN_FRAME, MAX_TAGGED_PLAINTEXT)
+    };
 
     // Fast path: fits whole. Tag byte + body in one frame.
-    if body.len() < MAX_TAGGED_PLAINTEXT {
+    if body.len() < frame {
         let mut tagged = Vec::with_capacity(body.len() + 1);
         tagged.push(frame_tag::WHOLE);
         tagged.extend_from_slice(&body);
         return Ok(vec![tagged]);
     }
 
-    // Chunked path: split the body into MAX_CHUNK_PAYLOAD-sized pieces.
-    let part_count = body.len().div_ceil(MAX_CHUNK_PAYLOAD);
+    let payload = (frame - 1 - PART_HEADER_LEN)
+        .max(body.len().div_ceil(MAX_PARTS))
+        .min(MAX_CHUNK_PAYLOAD);
+    let part_count = body.len().div_ceil(payload);
     if part_count > MAX_PARTS {
         return Err(CryptoError::MessageTooLarge(body.len()).into());
     }
     let msg_id = NEXT_MSG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let mut frames = Vec::with_capacity(part_count);
-    for (idx, chunk) in body.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
+    for (idx, chunk) in body.chunks(payload).enumerate() {
         let mut tagged = Vec::with_capacity(1 + PART_HEADER_LEN + chunk.len());
         tagged.push(frame_tag::PART);
         tagged.extend_from_slice(&msg_id.to_be_bytes());
@@ -946,5 +971,43 @@ mod tests {
 
         let whole = chunk_plaintext(&Message::Opaque(vec![0u8; 16])).unwrap();
         assert!(!has_more_parts(&whole[0]));
+    }
+
+    #[test]
+    fn small_frames_reassemble_into_the_same_message() {
+        let msg = Message::Opaque((0..100_000u32).map(|i| i as u8).collect());
+        let frames = chunk_plaintext_within(&msg, || 4096).unwrap();
+        assert!(frames.len() > 20);
+        assert!(frames.iter().all(|f| f.len() <= 4096));
+
+        let mut reassembler = Reassembler::default();
+        let mut done = None;
+        for frame in &frames {
+            done = reassembler.accept(frame).unwrap().or(done);
+        }
+        assert_eq!(done, Some(msg));
+    }
+
+    #[test]
+    fn small_frames_grow_rather_than_exceed_what_a_receiver_accepts() {
+        let msg = Message::Opaque(vec![7u8; 16 * 1024 * 1024]);
+        let frames = chunk_plaintext_within(&msg, || 4096).unwrap();
+        assert!(frames.len() <= MAX_PARTS);
+
+        let mut reassembler = Reassembler::default();
+        let mut done = None;
+        for frame in &frames {
+            done = reassembler.accept(frame).unwrap().or(done);
+        }
+        assert_eq!(done, Some(msg));
+    }
+
+    #[test]
+    fn a_message_below_the_smallest_frame_is_never_asked_about() {
+        let frames = chunk_plaintext_within(&Message::Heartbeat { nonce: 1 }, || {
+            panic!("a small message needs no frame limit")
+        })
+        .unwrap();
+        assert_eq!(frames.len(), 1);
     }
 }

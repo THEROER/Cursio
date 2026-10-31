@@ -62,7 +62,9 @@ use cursio_protocol::{InputEvent, Message, Priority};
 use tokio::sync::Notify;
 use tracing::Instrument;
 
-use crate::crypto::{chunk_plaintext, has_more_parts, seal_frame, SharedNoise};
+use crate::crypto::{
+    chunk_plaintext, chunk_plaintext_within, has_more_parts, seal_frame, SharedNoise,
+};
 use crate::lane::Lane;
 use crate::{QueueDelay, TransportError, TransportTx};
 
@@ -456,6 +458,9 @@ pub struct PrioritizedTx {
     /// Answers [`TransportTx::holding`] for a sink that can lose its
     /// connection and wait for another.
     holding: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// The largest frame to cut a message into, for a sink whose connection
+    /// may be slow; the full Noise budget without it.
+    frame_limit: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
 }
 
 /// Closes the queues when dropped, which happens once, with the last clone.
@@ -599,12 +604,21 @@ impl PrioritizedTx {
             _open: Arc::new(OpenHandle(shared.clone())),
             shared,
             holding: None,
+            frame_limit: None,
         }
     }
 
     /// Answer [`TransportTx::holding`] with `holding`.
     pub(crate) fn with_holding(mut self, holding: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.holding = Some(holding);
+        self
+    }
+
+    /// Cut each message larger than [`crate::crypto::MIN_FRAME`] into frames
+    /// of at most what `limit` answers when it is queued; see
+    /// [`crate::crypto::chunk_plaintext_within`].
+    pub(crate) fn with_frame_limit(mut self, limit: Arc<dyn Fn() -> usize + Send + Sync>) -> Self {
+        self.frame_limit = Some(limit);
         self
     }
 }
@@ -668,7 +682,10 @@ impl TransportTx for PrioritizedTx {
                 return Ok(());
             }
         }
-        let frames = chunk_plaintext(msg)?;
+        let frames = match &self.frame_limit {
+            Some(limit) => chunk_plaintext_within(msg, || limit())?,
+            None => chunk_plaintext(msg)?,
+        };
         let size: usize = frames.iter().map(Vec::len).sum();
         loop {
             let available = self.shared.drained.notified();
