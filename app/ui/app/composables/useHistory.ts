@@ -33,9 +33,10 @@ function samplePresence(status: NodeStatusReply | null) {
   const next: Record<string, UptimeSegment[]> = {}
   for (const peer of status.peers) {
     const past = presence.value[peer.id] ?? []
+    // "connecting" is this node trying to reach the peer, which it has not:
+    // shown as up in part, a machine that was off all along read as flaky.
     const now: UptimeSegment = {
-      status:
-        peer.presence === "online" ? "operational" : peer.presence === "connecting" ? "degraded" : "down",
+      status: peer.presence === "online" ? "operational" : "down",
     }
     next[peer.id] = [...past, now].slice(-PRESENCE_POINTS)
   }
