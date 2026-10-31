@@ -292,7 +292,16 @@ async fn drive(
         if pump_due {
             pump_due = false;
             let started = tokio::time::Instant::now();
-            let result = module.pump(&mut tx).await;
+            // Stop is heard mid-pump too. A pump waiting for queue space —
+            // a session holding with no path drains nothing — otherwise
+            // heard it only after the grace ran out, and the module's thread
+            // was left behind: the notify module on every phone session that
+            // ended that way, eight times in five days.
+            let result = tokio::select! {
+                biased;
+                _ = &mut stop => break,
+                result = module.pump(&mut tx) => result,
+            };
             let took = started.elapsed();
             if took >= SLOW_PUMP_WARN {
                 tracing::warn!(
@@ -372,6 +381,54 @@ mod tests {
     use crate::module_host::router::PARKED_PER_MODULE;
 
     use cursio_protocol::Priority;
+    use cursio_transport::TransportTx;
+
+    /// A transport whose queue never has room, as one holding with no path.
+    struct FullQueue;
+    #[async_trait::async_trait]
+    impl TransportTx for FullQueue {
+        async fn send(&mut self, _: &Message) -> Result<(), TransportError> {
+            std::future::pending().await
+        }
+    }
+
+    /// A module whose every pump has something to send.
+    struct Talker;
+    #[async_trait::async_trait]
+    impl SessionModule for Talker {
+        fn name(&self) -> &'static str {
+            "talker"
+        }
+        fn id(&self) -> ModuleId {
+            ModuleId::NOTIFY
+        }
+        async fn start(&mut self, _: &mut dyn TransportTx) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
+            tx.send(&Message::Heartbeat { nonce: 1 }).await
+        }
+        fn handle_message(&mut self, _: &Message) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_module_waiting_to_send_stops_when_asked_instead_of_being_left_behind() {
+        let (failures, _) = mpsc::unbounded_channel();
+        let host = ModuleHost::spawn(Box::new(Talker), LinkTx::new(Box::new(FullQueue)), failures)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = tokio::time::Instant::now();
+        let mut hosts = vec![host];
+        hosts[0].request_stop();
+        let done = std::mem::replace(&mut hosts[0].done, oneshot::channel().1);
+        tokio::time::timeout(Duration::from_secs(1), done)
+            .await
+            .expect("the module's thread ended within a second")
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     fn inbox(name: &'static str) -> (Inbox, crate::queue::Receiver<Message>) {
         let (tx, rx) = module_inbox(name);
