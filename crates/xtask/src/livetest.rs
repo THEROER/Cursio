@@ -44,8 +44,97 @@ pub struct LiveTestArgs {
     /// `(C)` volume under ~/Cursio/<peer>).
     #[arg(long)]
     pub mount: Option<PathBuf>,
+    /// Carry the session over this path on both ends while measuring
+    /// (`cursio path`), and check it carried throughout; `auto` again after.
+    #[arg(long, value_enum)]
+    pub path: Option<PathArg>,
     #[command(flatten)]
     pub peer: Peer,
+}
+
+/// A path to measure the session over.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathArg {
+    Network,
+    Bluetooth,
+}
+
+impl PathArg {
+    fn name(self) -> &'static str {
+        match self {
+            PathArg::Network => "network",
+            PathArg::Bluetooth => "bluetooth",
+        }
+    }
+}
+
+/// The installed node's CLI, which asks the running node.
+fn cursio_cli() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".local/lib/cursio/cursio"))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("cursio"))
+}
+
+/// Run `cursio path <peer> [choice]`, answering what each end said carries
+/// input: `(this end, the peer)`.
+fn path_report(peer: &str, choice: Option<&str>) -> Result<(Option<String>, Option<String>)> {
+    let mut command = Command::new(cursio_cli());
+    command.args(["path", peer]).args(choice);
+    let output = command
+        .stderr(Stdio::null())
+        .output()
+        .context("running `cursio path`")?;
+    if !output.status.success() {
+        bail!("`cursio path {peer}` failed; is the node running and the peer connected?");
+    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(carriers(&text, peer))
+}
+
+/// What each end's line of `cursio path` says carries input.
+fn carriers(text: &str, peer: &str) -> (Option<String>, Option<String>) {
+    let over = |line: &str| {
+        line.split("input over ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .map(str::to_string)
+    };
+    let here = text
+        .lines()
+        .find(|l| l.starts_with("this end:"))
+        .and_then(over);
+    let there = text
+        .lines()
+        .find(|l| l.starts_with(&format!("{peer}:")))
+        .and_then(over);
+    (here, there)
+}
+
+/// Puts the session back on `auto` however the test ends.
+struct PathChosen<'a>(&'a str);
+
+impl Drop for PathChosen<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = path_report(self.0, Some("auto")) {
+            println!("! could not put the session back on auto: {error:#}");
+        }
+    }
+}
+
+/// Whether both ends carry input over `want`, as one check's verdict.
+fn carried(peer: &str, want: PathArg, when: &str) -> Result<String, String> {
+    match path_report(peer, None) {
+        Ok((Some(here), Some(there))) if here == want.name() && there == want.name() => {
+            Ok(format!("{} on both ends {when}", want.name()))
+        }
+        Ok((here, there)) => Err(format!(
+            "{when}: this end over {}, {peer} over {}",
+            here.as_deref().unwrap_or("?"),
+            there.as_deref().unwrap_or("?")
+        )),
+        Err(error) => Err(format!("{when}: {error:#}")),
+    }
 }
 
 /// Size of the roundtrip file: several bulk chunks, small enough to finish in
@@ -399,6 +488,21 @@ pub fn live_test(args: LiveTestArgs) -> Result<()> {
         }
     };
 
+    // Chosen before the window opens: the move itself resends what was
+    // unacknowledged and is not what is being measured.
+    let _chosen = match args.path {
+        Some(want) => {
+            path_report(peer_name, Some(want.name()))?;
+            println!("→ the session is carried over {} for the test", want.name());
+            std::thread::sleep(Duration::from_secs(2));
+            Some(PathChosen(peer_name))
+        }
+        None => None,
+    };
+    let path_at_start = args
+        .path
+        .map(|want| carried(peer_name, want, "at the start"));
+
     let local_start = local_mark()?;
     let remote_start = remote_mark(peer).context("reading the peer's log position")?;
     let pressure_start = pressure_totals();
@@ -458,6 +562,12 @@ pub fn live_test(args: LiveTestArgs) -> Result<()> {
         &Probes {
             file_roundtrip,
             pressure,
+            path: args.path.map(|want| {
+                path_at_start
+                    .clone()
+                    .unwrap_or_else(|| Err("not checked".into()))
+                    .and_then(|_| carried(peer_name, want, "throughout"))
+            }),
         },
     );
     print!("\n{}", logscan::render(&rows));
@@ -471,6 +581,17 @@ pub fn live_test(args: LiveTestArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_carries_input_is_read_from_each_ends_line() {
+        let text = "this end:  has network + bluetooth, input over bluetooth, choice bluetooth (by hand)\n\
+                    Lightmoon: has network + bluetooth, input over network, choice auto\n";
+        assert_eq!(
+            carriers(text, "Lightmoon"),
+            (Some("bluetooth".into()), Some("network".into()))
+        );
+        assert_eq!(carriers("nothing", "Lightmoon"), (None, None));
+    }
 
     #[test]
     fn probe_bytes_are_reproducible_and_not_constant() {

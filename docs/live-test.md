@@ -54,7 +54,15 @@ The last lines printed say which build runs where.
 cargo xtask live-test                       # passive, 65 s
 cargo xtask live-test --yes --seconds 95    # with synthetic pointer motion
 cargo xtask live-test --no-files
+cargo xtask live-test --yes --path bluetooth  # the same over the Bluetooth path
 ```
+
+`--path bluetooth` (or `network`) carries the session over that path on both
+ends for the test (`cursio path`), fails the run unless both ends report it
+carrying input at the start and at the end, and puts the session back on
+`auto` however the run ends. The Bluetooth path must already be up
+(`[bluetooth] standby = true`). The round-trip row is what a jerking pointer
+over the radio shows as.
 
 It records where both logs end, drives load for `--seconds`, reads back exactly
 the lines written in that window from both machines, and prints a table. It
@@ -68,6 +76,8 @@ played, no video) is `SKIP`, never `PASS`.
 | process input queue max age | raw capture, captured input, session inbound/outbound queue reports | < 50 ms |
 | process queue overloads | explicit queue overload errors | 0 |
 | send queue input p99 | `send queue delay` / `input waited long enough` | < 5 ms |
+| interactive round trip p99 | `interactive round trip` | < 250 ms |
+| session on the chosen path | `cursio path`, with `--path` only | both ends |
 | send queue video p99 (screen) | same lines, `video_p99` | < 200 ms |
 | session loop stalls | `session loop turn was slow`, `... blocked the session loop` | none > 50 ms |
 | module thread stalls | `module pump was slow`, `module was slow handling a message` | none > 500 ms |

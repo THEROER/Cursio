@@ -23,6 +23,11 @@ pub const LOOP_STALL_MAX_MS: f64 = 50.0;
 pub const MODULE_STALL_MAX_MS: f64 = 500.0;
 /// Slowest file answer tolerated within one health interval.
 pub const FILES_RTT_MAX_MS: f64 = 500.0;
+/// The link's own answer time, worst report in the window. A LAN answers in
+/// milliseconds and Bluetooth in tens; a quarter of a second is a pointer
+/// that visibly stops and jumps, which is what this exists to catch on the
+/// radio (`--path bluetooth`).
+pub const ROUND_TRIP_P99_MAX_US: f64 = 250_000.0;
 /// Share of the window this machine may spend with every task stalled on
 /// memory, or on I/O, per `/proc/pressure`.
 pub const PSI_MEMORY_FULL_MAX_PCT: f64 = 5.0;
@@ -72,6 +77,9 @@ pub struct Probes {
     pub file_roundtrip: Option<Result<String, String>>,
     /// `(memory full %, io full %)` over the window on the local machine.
     pub pressure: Option<(f64, f64)>,
+    /// Whether the chosen path carried input on both ends at the start and
+    /// the end; `None` when no path was chosen.
+    pub path: Option<Result<String, String>>,
 }
 
 pub(super) fn row(
@@ -189,6 +197,11 @@ pub(super) fn latency_rows(rows: &mut Vec<Row>, m: &Machine) {
             &s.queue_input_p99_us,
             QUEUE_INPUT_P99_MAX_US,
             "send queue input p99",
+        ),
+        (
+            &s.round_trip_p99_us,
+            ROUND_TRIP_P99_MAX_US,
+            "interactive round trip p99",
         ),
         (
             &s.queue_video_p99_us,
@@ -328,6 +341,24 @@ pub(super) fn link_rows(rows: &mut Vec<Row>, m: &Machine) {
 }
 
 pub(super) fn probe_rows(rows: &mut Vec<Row>, local: &str, probes: &Probes) {
+    if let Some(path) = &probes.path {
+        rows.push(match path {
+            Ok(detail) => row(
+                "session on the chosen path",
+                local,
+                detail.clone(),
+                "both ends".into(),
+                Status::Pass,
+            ),
+            Err(why) => row(
+                "session on the chosen path",
+                local,
+                why.clone(),
+                "both ends".into(),
+                Status::Fail,
+            ),
+        });
+    }
     rows.push(match &probes.file_roundtrip {
         None => row(
             "file roundtrip on peer mount",
@@ -521,6 +552,9 @@ mod tests {
         let probes = Probes {
             file_roundtrip: Some(Err("timed out".into())),
             pressure: Some((0.5, PSI_IO_FULL_MAX_PCT + 1.0)),
+            path: Some(Err(
+                "throughout: this end over network, m over bluetooth".into()
+            )),
         };
         let rows = evaluate(
             &[Machine {
@@ -532,6 +566,10 @@ mod tests {
         );
         assert_eq!(status_of(&rows, "file roundtrip", "m"), Status::Fail);
         assert_eq!(status_of(&rows, "memory/io pressure", "m"), Status::Fail);
+        assert_eq!(
+            status_of(&rows, "session on the chosen path", "m"),
+            Status::Fail
+        );
         assert!(render(&rows).contains("FAIL"));
     }
 

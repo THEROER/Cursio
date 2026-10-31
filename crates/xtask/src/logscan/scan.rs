@@ -26,6 +26,9 @@ pub struct Summary {
     pub latency: Vec<Latency>,
     /// `input_p99` of each send-queue report, in µs.
     pub queue_input_p99_us: Vec<f64>,
+    /// `p99_ms` of each `interactive round trip` report, in µs: the link's
+    /// own answer time, which is what a jerking pointer over Bluetooth is.
+    pub round_trip_p99_us: Vec<f64>,
     pub process_input_age_us: Vec<f64>,
     pub process_queue_failures: usize,
     /// `video_p99` of each send-queue report that carried video, in µs.
@@ -111,6 +114,10 @@ pub(super) fn scan_line(s: &mut Summary, line: &str) {
                 p50_us: num(line, "p50_us").unwrap_or(0.0),
                 p99_us: p99,
             });
+        }
+    } else if has("interactive round trip") {
+        if let Some(p99) = num(line, "p99_ms") {
+            s.round_trip_p99_us.push(p99 * 1000.0);
         }
     } else if has("send queue delay") || has("input waited long enough") {
         if let Some(p99) = field(line, "input_p99").and_then(duration_us) {
@@ -246,6 +253,13 @@ mod tests {
         assert_eq!(field(line, "path"), Some("a->b"));
         assert_eq!(num(line, "p99_us"), Some(271.0));
         assert_eq!(field(line, "missing"), None);
+    }
+
+    #[test]
+    fn reads_the_links_round_trip_inside_a_peers_span() {
+        let line = "2026-10-31T21:04:46.268738Z  INFO peer{name=\"Lightmoon\"}: cursio_core::session::latency: interactive round trip peer=Some(29cd3b2b) samples=7 p50_ms=30.9 p99_ms=608.3 max_ms=608.3 outstanding=0";
+        let s = summarize([line]);
+        assert_eq!(s.round_trip_p99_us, vec![608_300.0]);
     }
 
     #[test]
