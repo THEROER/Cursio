@@ -86,6 +86,7 @@ pub mod input_hub;
 pub mod link;
 /// Applying a changed config to running links instead of restarting.
 pub mod live;
+pub mod log_report;
 pub mod log_tail;
 pub mod logging;
 /// Where this machine's players meet the mesh and peers' are shown.
@@ -142,6 +143,7 @@ pub mod portal_setup;
 /// Whether the user is at this machine: where a phone's notification goes.
 pub mod presence;
 pub mod pressure;
+pub mod proc_memory;
 pub mod queue;
 /// Renegotiating a running link when either side's settings change.
 pub mod reconfigure;

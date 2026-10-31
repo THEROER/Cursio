@@ -291,8 +291,15 @@ pub fn watch() {
             .name("cursio-pressure".into())
             .spawn(|| {
                 let mut active: Vec<&'static str> = Vec::new();
+                // The node's own figure beside the machine's, so a leak of
+                // Cursio's shows in its log as a line that keeps climbing.
+                let mut logged_own: Option<std::time::Instant> = None;
                 loop {
                     active = apply(&judge(&read(), &active), &active);
+                    if logged_own.is_none_or(|at| at.elapsed() >= crate::proc_memory::LOG_EVERY) {
+                        crate::proc_memory::log_own();
+                        logged_own = Some(std::time::Instant::now());
+                    }
                     std::thread::sleep(POLL);
                 }
             });

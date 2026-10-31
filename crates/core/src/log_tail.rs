@@ -138,6 +138,82 @@ enum Scan {
     OutOfBudget,
 }
 
+/// How much of the log a [`scan_since`] read.
+#[derive(Debug, Default)]
+pub struct Coverage {
+    /// The oldest timestamped line read.
+    pub oldest: Option<String>,
+    /// Lines in the window were left unread: the scan ran out of budget.
+    pub truncated: bool,
+}
+
+/// Hand `visit` every line of `dir`'s log named `file_name` from `since` (a
+/// timestamp prefix, as [`timestamp`] writes) on, newest first.
+pub fn scan_since(
+    dir: &Path,
+    file_name: &str,
+    since: &str,
+    mut visit: impl FnMut(&str),
+) -> Result<Coverage, String> {
+    let mut coverage = Coverage::default();
+    let mut scanned = 0u64;
+    let paths = files(dir, file_name).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+    for path in paths {
+        let mut done = false;
+        let result = backwards(&path, &mut scanned, |line| {
+            if let Some(stamp) = leading_timestamp(line) {
+                if stamp < since {
+                    done = true;
+                    return false;
+                }
+                coverage.oldest = Some(stamp.to_string());
+            }
+            visit(line);
+            true
+        });
+        match result {
+            Ok(Scan::Finished) => {}
+            Ok(Scan::OutOfBudget) => {
+                coverage.truncated = true;
+                break;
+            }
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        }
+        if done {
+            break;
+        }
+    }
+    Ok(coverage)
+}
+
+/// A line's timestamp as seconds since the epoch, for measuring between two
+/// lines: `2026-10-31T16:11:12.191382Z`.
+pub fn stamp_secs(stamp: &str) -> Option<f64> {
+    let b = stamp.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let num =
+        |from: usize, len: usize| -> Option<i64> { stamp.get(from..from + len)?.parse().ok() };
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hour, minute, second) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    let fraction: f64 = stamp
+        .get(19..)
+        .map(|rest| rest.trim_end_matches('Z'))
+        .filter(|rest| rest.starts_with('.'))
+        .and_then(|rest| format!("0{rest}").parse().ok())
+        .unwrap_or(0.0);
+    // Howard Hinnant's days_from_civil.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + hour * 3600 + minute * 60 + second) as f64 + fraction)
+}
+
 /// Hand `line` each line of `path`, last first, until it answers `false`.
 fn backwards(
     path: &Path,
@@ -229,6 +305,16 @@ mod tests {
         let at = UNIX_EPOCH + Duration::from_secs(1_793_463_072);
         assert_eq!(timestamp(at), "2026-10-31T16:11:12");
         assert_eq!(timestamp(UNIX_EPOCH), "1970-01-01T00:00:00");
+    }
+
+    #[test]
+    fn a_line_timestamp_reads_back_as_the_seconds_it_was_written_at() {
+        assert_eq!(stamp_secs("2026-10-31T16:11:12Z"), Some(1_793_463_072.0));
+        let fine = stamp_secs("2026-10-31T16:11:12.250000Z").unwrap();
+        assert!((fine - 1_793_463_072.25).abs() < 1e-6);
+        assert_eq!(stamp_secs("1970-01-01T00:00:00"), Some(0.0));
+        assert_eq!(stamp_secs("2024-02-29T00:00:00Z"), Some(1_709_164_800.0));
+        assert_eq!(stamp_secs("not a time"), None);
     }
 
     #[test]

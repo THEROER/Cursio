@@ -95,6 +95,40 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                 logs(hub.ask(machine, request).await)
             }
         },
+        Command::Report {
+            machine,
+            since_secs,
+        } => {
+            let report = match machine {
+                None => {
+                    crate::diag_session::own_report(std::time::Duration::from_secs(*since_secs))
+                }
+                Some(machine) => match hub
+                    .ask(
+                        machine,
+                        DiagRequest::Report {
+                            since_secs: *since_secs,
+                        },
+                    )
+                    .await
+                {
+                    Ok(DiagResponse::Report(report)) => Ok(*report),
+                    Ok(other) => Err(format!("a report request was answered with {other:?}")),
+                    Err(e) => Err(e),
+                },
+            };
+            match report {
+                Ok(report) => Reply::Report(Box::new(report)),
+                Err(message) => Reply::Error { message },
+            }
+        }
+        Command::Maintain { machine, what } => {
+            match hub.ask(machine, DiagRequest::Maintain(*what)).await {
+                Ok(DiagResponse::Maintaining(_)) => Reply::Done,
+                Ok(other) => error(format!("a maintenance request was answered with {other:?}")),
+                Err(message) => Reply::Error { message },
+            }
+        }
         Command::Paths { peer, choice } => {
             let Some(id) = hub
                 .peers()
@@ -363,7 +397,10 @@ impl NodeState {
             }
             // They wait on a peer; the socket answers them through
             // `handle_waiting`.
-            Command::Logs { .. } | Command::Paths { .. } => {
+            Command::Logs { .. }
+            | Command::Paths { .. }
+            | Command::Report { .. }
+            | Command::Maintain { .. } => {
                 error("logs and paths are asked through a desktop's control socket")
             }
         }

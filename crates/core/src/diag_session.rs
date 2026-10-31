@@ -10,12 +10,19 @@
 //! records each session's [`ResumeHandle`] here as it holds it
 //! ([`hold`]/[`release`]), and both the control socket and the answering
 //! half find it by peer.
+//!
+//! A node also reports on itself ([`own_report`], `cursio report`) and takes
+//! a restart or an update from a peer ([`maintain`], `cursio restart`): a
+//! machine on a hotspot, with no shell anyone can reach, was otherwise left
+//! running an old build until a quiet moment came or a person walked over.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use cursio_protocol::diag::{DiagMsg, DiagRequest, DiagResponse, PathChoice, PathReport};
+use cursio_protocol::diag::{
+    DiagMsg, DiagRequest, DiagResponse, Maintenance, NodeReport, PathChoice, PathReport,
+};
 use cursio_protocol::{ModuleAdvert, ModuleId, ModuleRole, PeerId, Priority};
 use cursio_transport::resume::ResumeHandle;
 
@@ -25,7 +32,70 @@ use crate::module::SessionModule;
 use crate::request_hub::{HubKind, RequestHub};
 
 /// Version of [`DiagMsg`]; peers run the module only on an exact match.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
+
+/// How many of the machine's largest processes a report lists.
+const TOP_PROCESSES: usize = 8;
+
+/// Longest a report reaches back.
+const MAX_REPORT_SPAN: Duration = Duration::from_secs(14 * 24 * 3600);
+
+/// How long a node waits before acting on a maintenance request, so its
+/// answer leaves on the link the request is about to end.
+const MAINTAIN_AFTER: Duration = Duration::from_millis(500);
+
+/// What performs a [`Maintenance`] on this node: set by the node's control
+/// state, which owns the restart signal and the update agent.
+pub type Maintainer = Arc<dyn Fn(Maintenance) -> Result<(), String> + Send + Sync>;
+
+fn maintainer() -> std::sync::MutexGuard<'static, Option<Maintainer>> {
+    static MAINTAINER: OnceLock<Mutex<Option<Maintainer>>> = OnceLock::new();
+    MAINTAINER
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Let peers restart or update this node through `act`.
+pub fn set_maintainer(act: Maintainer) {
+    *maintainer() = Some(act);
+}
+
+/// Do `what` to this node, shortly: the answer goes out first.
+pub fn maintain(what: Maintenance) -> Result<(), String> {
+    let act = maintainer()
+        .clone()
+        .ok_or("this node takes no maintenance from its peers")?;
+    std::thread::Builder::new()
+        .name("cursio-maintain".into())
+        .spawn(move || {
+            std::thread::sleep(MAINTAIN_AFTER);
+            if let Err(error) = act(what) {
+                tracing::warn!(?what, %error, "a peer's maintenance request could not be done");
+            }
+        })
+        .map_err(|e| format!("cannot start the maintenance: {e}"))?;
+    Ok(())
+}
+
+/// How this node has fared over the last `since`: counted from its log, with
+/// its memory, the machine's largest processes and its problems now.
+pub fn own_report(since: Duration) -> Result<NodeReport, String> {
+    let name = cursio_log::log_file_name().ok_or("this node keeps no log file")?;
+    let mut report = crate::log_report::build(
+        &cursio_log::log_dir(),
+        name,
+        since.min(MAX_REPORT_SPAN),
+        std::time::SystemTime::now(),
+    )?;
+    report.memory = crate::proc_memory::own();
+    report.top = crate::proc_memory::top(TOP_PROCESSES);
+    report.problems = crate::diagnostics::snapshot()
+        .into_iter()
+        .map(|p| p.summary)
+        .collect();
+    Ok(report)
+}
 
 /// Longest a caller waits for a peer's answer. A log answer is up to half a
 /// megabyte, which over Bluetooth is seconds.
@@ -139,6 +209,12 @@ impl Exchange for Diag {
                 }
                 paths(&store.peer, *choice).map(DiagResponse::Paths)
             }
+            DiagRequest::Report { since_secs } => own_report(Duration::from_secs(*since_secs))
+                .map(|r| DiagResponse::Report(Box::new(r))),
+            DiagRequest::Maintain(what) => {
+                tracing::info!(?what, "a peer asked this node for maintenance");
+                maintain(*what).map(|()| DiagResponse::Maintaining(*what))
+            }
         }
     }
 
@@ -167,7 +243,10 @@ impl Exchange for Diag {
                     log: tail.log,
                 })
             }
-            paths @ DiagRequest::Paths { .. } => Ok(paths),
+            DiagRequest::Report { since_secs } => Ok(DiagRequest::Report {
+                since_secs: since_secs.min(MAX_REPORT_SPAN.as_secs()),
+            }),
+            other @ (DiagRequest::Paths { .. } | DiagRequest::Maintain(_)) => Ok(other),
         }
     }
 

@@ -55,6 +55,8 @@ cargo run -p cursio-core -- peers
 RUST_LOG=cursio_airplay=debug,info cargo run -p cursio-core -- mesh
 cursio logs all --since 10m --grep path     # every connected machine's log, merged by time
 cursio path Lightmoon [auto|network|bluetooth]   # see or choose the path, on both ends
+cursio report all --since 1d                # every machine's day: drops, warnings, memory
+cursio restart Lightmoon | apply-update Lightmoon   # maintain a machine through the mesh
 ```
 
 `RUST_LOG` raises console + file; `CURSIO_LOG_FILE` raises only the file. Logs rotate daily under the platform data dir.

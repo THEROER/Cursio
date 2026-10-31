@@ -488,6 +488,9 @@ async fn run() -> anyhow::Result<()> {
             .await
         }
         Command::Path { machine, choice } => diag::path(&machine, choice).await,
+        Command::Report { machines, since } => diag::report(&machines, &since).await,
+        Command::Restart { machine } => diag::restart(machine.as_deref()).await,
+        Command::ApplyUpdate { machine } => diag::apply_update(&machine).await,
         Command::Portal { action } => portal(action).await,
         Command::MountHelper { .. } => unreachable!("handled before the node starts"),
     }

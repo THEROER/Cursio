@@ -85,6 +85,21 @@ pub enum DiagRequest {
     /// Report the session's paths, first choosing `choice` for this end of
     /// it when given.
     Paths { choice: Option<PathChoice> },
+    /// How the node has fared over the last `since_secs` by its own clock,
+    /// counted from its log by the node itself; see [`NodeReport`].
+    Report { since_secs: u64 },
+    /// Restart the node, or switch it to the build from the mesh that is
+    /// installed and waiting; see [`Maintenance`].
+    Maintain(Maintenance),
+}
+
+/// Something a person at another machine asks a node to do to itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Maintenance {
+    /// Stop and come back from the top, re-reading everything.
+    Restart,
+    /// Switch to the waiting build now rather than at a quiet moment.
+    ApplyUpdate,
 }
 
 /// The answer to one [`DiagRequest`].
@@ -96,6 +111,84 @@ pub enum DiagResponse {
         truncated: bool,
     },
     Paths(PathReport),
+    Report(Box<NodeReport>),
+    /// The node took the request and is about to do it; the link drops as
+    /// it does.
+    Maintaining(Maintenance),
+}
+
+/// A node's own memory. `None` is "cannot say".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeMemory {
+    /// What the node holds by the system's own limit: resident bytes on
+    /// Linux, private bytes (its share of the commit charge) on Windows.
+    pub held: Option<u64>,
+    /// The most it has been resident at once.
+    pub peak: Option<u64>,
+    pub threads: Option<u32>,
+}
+
+/// One process on the answering machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessUse {
+    pub name: String,
+    pub pid: u32,
+    /// Measured as [`NodeMemory::held`] is.
+    pub bytes: u64,
+}
+
+/// Something counted, with how often.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Counted {
+    pub what: String,
+    pub count: u32,
+}
+
+/// A module that kept its own traffic waiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlowModule {
+    pub module: String,
+    pub count: u32,
+    pub max_ms: u64,
+}
+
+/// One peer's sessions as this node saw them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerReport {
+    pub name: String,
+    /// Sessions started: each is a full module set brought up.
+    pub sessions: u32,
+    /// Why sessions ended, most common first.
+    pub sessions_ended: Vec<Counted>,
+    /// Why paths ended, as "kind: reason", most common first.
+    pub paths_ended: Vec<Counted>,
+    /// Time with no path at all, summed and the longest stretch.
+    pub pathless_secs: u64,
+    pub longest_pathless_secs: u64,
+}
+
+/// How a node has fared, counted from its own log by the node. Asked of every
+/// machine at once, it is the mesh's day in a screenful; see `cursio report`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeReport {
+    pub since_secs: u64,
+    /// The oldest line read, which is where the counts begin: a node started
+    /// later, or a log longer than one answer reads, begins later than asked.
+    pub from: Option<String>,
+    /// Older lines were left unread.
+    pub truncated: bool,
+    /// Times the node started.
+    pub starts: u32,
+    pub memory: NodeMemory,
+    /// The machine's largest processes now, largest first.
+    pub top: Vec<ProcessUse>,
+    /// Problems the node is raising now.
+    pub problems: Vec<String>,
+    pub peers: Vec<PeerReport>,
+    /// Warnings and errors by kind, the variable parts taken out, most common
+    /// first.
+    pub warnings: Vec<Counted>,
+    pub slow_modules: Vec<SlowModule>,
 }
 
 /// One end's view of the session between two machines.
@@ -118,7 +211,7 @@ impl DiagMsg {
     pub fn priority(&self) -> Priority {
         match self {
             DiagMsg::Response {
-                response: Ok(DiagResponse::Logs { .. }),
+                response: Ok(DiagResponse::Logs { .. } | DiagResponse::Report(_)),
                 ..
             } => Priority::Bulk,
             _ => Priority::Metadata,

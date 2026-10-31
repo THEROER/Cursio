@@ -308,6 +308,18 @@ pub enum Command {
         #[serde(default)]
         log: Option<String>,
     },
+    /// How a machine (this one when `machine` is absent) has fared over the
+    /// last `since_secs`; see [`cursio_protocol::diag::NodeReport`].
+    Report {
+        #[serde(default)]
+        machine: Option<String>,
+        since_secs: u64,
+    },
+    /// Restart a connected machine's node, or switch it to its waiting build.
+    Maintain {
+        machine: String,
+        what: cursio_protocol::diag::Maintenance,
+    },
     /// Report the paths of the session with `peer` from both ends, first
     /// choosing `choice` on both when given; see
     /// [`cursio_protocol::diag::PathChoice`].
@@ -458,7 +470,11 @@ impl Command {
             || self.gallery_ask().is_some()
             || matches!(
                 self,
-                Command::Ring { .. } | Command::Logs { .. } | Command::Paths { .. }
+                Command::Ring { .. }
+                    | Command::Logs { .. }
+                    | Command::Paths { .. }
+                    | Command::Report { .. }
+                    | Command::Maintain { .. }
             )
     }
 }
@@ -532,6 +548,8 @@ pub enum Reply {
         lines: Vec<String>,
         truncated: bool,
     },
+    /// How a machine has fared; see [`Command::Report`].
+    Report(Box<cursio_protocol::diag::NodeReport>),
     /// The session with a peer as each end sees it. `there` is absent when
     /// the peer could not be asked, and `there_error` says why.
     Paths {

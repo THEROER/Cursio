@@ -146,6 +146,24 @@ pub(crate) enum Command {
         #[arg(long)]
         log: Option<String>,
     },
+    /// How machines have fared, each counted from its own log by itself:
+    /// sessions and paths lost per peer and why, time with no path, repeated
+    /// warnings, slow modules, its memory and the machine's largest processes.
+    /// Goes through the running node.
+    Report {
+        /// Machines, by name or id, `this` for this one; `all` is this one
+        /// and every connected machine. This one when none is named.
+        machines: Vec<String>,
+        /// How far back: `30m`, `6h`, `1d`.
+        #[arg(long, default_value = "1d")]
+        since: String,
+    },
+    /// Restart a node: this one when no machine is named, else a connected
+    /// machine's, through the mesh.
+    Restart { machine: Option<String> },
+    /// Switch a connected machine to the build from the mesh it has installed
+    /// and waiting, now rather than at its next quiet moment.
+    ApplyUpdate { machine: String },
     /// Show which path carries the session with a machine, from both ends, or
     /// choose one on both ends for the rest of that session. Goes through the
     /// running node.

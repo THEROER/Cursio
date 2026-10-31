@@ -149,6 +149,19 @@ impl NodeState {
         pairing: PairingWindow,
         applier: Applier,
     ) -> Self {
+        let restart = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&restart);
+        crate::diag_session::set_maintainer(Arc::new(move |what| match what {
+            cursio_protocol::diag::Maintenance::Restart => {
+                signal.notify_one();
+                Ok(())
+            }
+            cursio_protocol::diag::Maintenance::ApplyUpdate => crate::update::agent::global()
+                .ok_or("updates are not running on this node".to_string())?
+                .apply_ready()
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        }));
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 node: NodeView {
@@ -174,7 +187,7 @@ impl NodeState {
             running: Arc::new(Mutex::new(running)),
             applier,
             pairing,
-            restart: Arc::new(tokio::sync::Notify::new()),
+            restart,
             revision: Arc::new(tokio::sync::watch::channel(0).0),
             on_forget: Arc::new(Mutex::new(None)),
             on_arrange: Arc::new(Mutex::new(None)),

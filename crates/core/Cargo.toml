@@ -138,6 +138,10 @@ windows = { version = "0.61", features = [
     # GlobalMemoryStatusEx — commit charge against its limit, for the pressure
     # monitor; see pressure.rs.
     "Win32_System_SystemInformation",
+    # The node's own private bytes and the machine's largest processes, for
+    # `cursio report`; see proc_memory.rs.
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
     # SendARP — a peer's hardware address, for Wake-on-LAN; see wake.rs.
     "Win32_NetworkManagement_IpHelper",
     # GetNamedPipeServerProcessId — the drive helper's pipe is checked to be

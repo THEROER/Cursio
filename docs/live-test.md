@@ -118,7 +118,22 @@ cursio path Lightmoon                       # which path carries input, seen fro
 cursio path Lightmoon bluetooth             # carry the session over Bluetooth on both ends
 cursio path Lightmoon network               # keep it on the network even while that fails
 cursio path Lightmoon auto
+cursio report all --since 1d                # each machine's day, counted by itself
+cursio restart Lightmoon                    # restart a connected machine's node
+cursio apply-update Lightmoon               # switch it to its waiting build now
 ```
+
+`cursio report` is counted by each node from its own log
+(`core/src/log_report.rs`): per peer, the sessions it started and why they
+ended, why paths ended (by kind), and the time spent with no path at all;
+the warnings that repeat, by kind; the modules that kept their own traffic
+waiting; and, read at the moment of asking, the node's own memory and the
+machine's largest processes (`core/src/proc_memory.rs` — resident on Linux,
+private bytes on Windows). Paths are tied to peers by the `session=` label the
+transport writes and the registry's `holding the session with this peer` line,
+so lines from a build older than those count under no peer. The node also
+writes its own memory to its log every ten minutes, so a leak shows as a line
+that keeps climbing.
 
 A log answer is the newest lines at most 5000 lines or 512 KiB, and the
 answering node reads at most 64 MiB of its files for one; `--since` counts by

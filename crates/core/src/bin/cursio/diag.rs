@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use cursio_core::control::{Command, Presence, Reply};
 use cursio_core::log_tail::leading_timestamp;
-use cursio_protocol::diag::{PathChoice, PathReport};
+use cursio_protocol::diag::{Maintenance, NodeReport, PathChoice, PathReport};
 
 use crate::cli::PathArg;
 use crate::client::control_client;
@@ -183,6 +183,146 @@ fn parse_since(text: &str) -> anyhow::Result<u64> {
         _ => anyhow::bail!("--since takes s, m, h or d; got {text:?}"),
     };
     Ok(n * scale)
+}
+
+pub(crate) async fn report(machines: &[String], since: &str) -> anyhow::Result<()> {
+    let client = control_client()
+        .await
+        .map_err(|e| anyhow::anyhow!("no running node to ask ({e}); start `cursio mesh` first"))?;
+    let since_secs = parse_since(since)?;
+    for source in sources(&client, machines).await? {
+        let reply = client
+            .request(Command::Report {
+                machine: source.machine.clone(),
+                since_secs,
+            })
+            .await?;
+        match reply {
+            Reply::Report(report) => print_report(&source.label, since, &report),
+            Reply::Error { message } => println!("== {}: {message}\n", source.label),
+            other => anyhow::bail!(
+                "the running node does not know how to report ({other:?}); restart it with this version of Cursio"
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn print_report(label: &str, since: &str, report: &NodeReport) {
+    let from = report
+        .from
+        .as_deref()
+        .map(|f| f.get(..16).unwrap_or(f))
+        .unwrap_or("-");
+    let cut = if report.truncated {
+        ", older lines unread"
+    } else {
+        ""
+    };
+    println!(
+        "== {label} — last {since}, counted from {from}{cut}; {} start(s)",
+        report.starts
+    );
+    let m = &report.memory;
+    println!(
+        "memory: node holds {}, peak {}, {} threads",
+        size(m.held),
+        size(m.peak),
+        m.threads.map_or("?".to_string(), |t| t.to_string())
+    );
+    if !report.top.is_empty() {
+        let top: Vec<String> = report
+            .top
+            .iter()
+            .map(|p| format!("{} {}", p.name, size(Some(p.bytes))))
+            .collect();
+        println!("largest: {}", top.join(", "));
+    }
+    for problem in &report.problems {
+        println!("problem: {problem}");
+    }
+    for peer in &report.peers {
+        println!(
+            "peer {}: {} session(s), {} with no path (longest {})",
+            peer.name,
+            peer.sessions,
+            span(peer.pathless_secs),
+            span(peer.longest_pathless_secs)
+        );
+        for c in &peer.sessions_ended {
+            println!("    session ended {:>5}× {}", c.count, c.what);
+        }
+        for c in peer.paths_ended.iter().take(6) {
+            println!("    path ended    {:>5}× {}", c.count, c.what);
+        }
+    }
+    for s in &report.slow_modules {
+        println!(
+            "slow module {}: {}× (worst {} ms)",
+            s.module, s.count, s.max_ms
+        );
+    }
+    for w in &report.warnings {
+        println!("{:>6}× {}", w.count, w.what);
+    }
+    println!();
+}
+
+fn size(bytes: Option<u64>) -> String {
+    match bytes {
+        None => "?".into(),
+        Some(b) if b >= 1 << 30 => format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64),
+        Some(b) => format!("{} MiB", b / (1 << 20)),
+    }
+}
+
+fn span(secs: u64) -> String {
+    match secs {
+        s if s >= 3600 => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+        s if s >= 60 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{s}s"),
+    }
+}
+
+pub(crate) async fn restart(machine: Option<&str>) -> anyhow::Result<()> {
+    let client = control_client()
+        .await
+        .map_err(|e| anyhow::anyhow!("no running node to ask ({e}); start `cursio mesh` first"))?;
+    let command = match machine {
+        None => Command::Restart,
+        Some(machine) => Command::Maintain {
+            machine: machine.to_string(),
+            what: Maintenance::Restart,
+        },
+    };
+    match client.request(command).await? {
+        Reply::Done => {
+            println!("{} is restarting", machine.unwrap_or("this node"));
+            Ok(())
+        }
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("the running node answered {other:?}"),
+    }
+}
+
+pub(crate) async fn apply_update(machine: &str) -> anyhow::Result<()> {
+    let client = control_client()
+        .await
+        .map_err(|e| anyhow::anyhow!("no running node to ask ({e}); start `cursio mesh` first"))?;
+    match client
+        .request(Command::Maintain {
+            machine: machine.to_string(),
+            what: Maintenance::ApplyUpdate,
+        })
+        .await?
+    {
+        Reply::Done => {
+            println!("{machine} is switching to its waiting build");
+            Ok(())
+        }
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("the running node answered {other:?}"),
+    }
 }
 
 pub(crate) async fn path(machine: &str, choice: Option<PathArg>) -> anyhow::Result<()> {
