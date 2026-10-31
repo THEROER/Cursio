@@ -208,8 +208,28 @@ impl Inner {
                 let Some(inner) = weak.upgrade() else { return };
                 match result {
                     Ok(tagged) => {
-                        if let Some(slot) = inner.lock().paths.iter_mut().find(|p| p.id == id) {
-                            slot.last_heard = Instant::now();
+                        let recovered = {
+                            let mut state = inner.lock();
+                            match state.paths.iter_mut().find(|p| p.id == id) {
+                                Some(slot) => {
+                                    slot.last_heard = Instant::now();
+                                    let was_suspect = slot.suspect_since.take().is_some();
+                                    if was_suspect {
+                                        slot.degraded_until = None;
+                                    }
+                                    was_suspect
+                                }
+                                None => false,
+                            }
+                        };
+                        if recovered {
+                            tracing::info!(
+                                session = %inner.label(),
+                                path = id,
+                                "a quiet path came back by itself"
+                            );
+                            inner.changed.notify_waiters();
+                            inner.kick(0);
                         }
                         if matches!(
                             tagged.first(),
@@ -258,6 +278,7 @@ impl Inner {
                 writers,
                 last_heard: now,
                 degraded_until: None,
+                suspect_since: None,
                 attached_at: now,
                 probe: None,
                 last_probe: now,

@@ -32,6 +32,9 @@ pub(super) struct PathSlot {
     pub(super) writers: [mpsc::Sender<Vec<u8>>; Lane::COUNT],
     pub(super) last_heard: Instant,
     pub(super) degraded_until: Option<Instant>,
+    /// A network path that went quiet while carrying, kept while another is
+    /// placed; see `supervise`.
+    pub(super) suspect_since: Option<Instant>,
     pub(super) attached_at: Instant,
     pub(super) probe: Option<(u64, Instant)>,
     pub(super) last_probe: Instant,
@@ -186,6 +189,7 @@ mod tests {
             writers: std::array::from_fn(|_| mpsc::channel(1).0),
             last_heard: now,
             degraded_until: None,
+            suspect_since: None,
             attached_at: now,
             probe: None,
             last_probe: now,

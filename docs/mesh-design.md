@@ -589,9 +589,14 @@ connections are *paths* under it:
   so a fresh one starts. Session tags come from the Noise handshake hash, the
   same on both ends; they are not secret, since a joining connection must still
   complete Noise with the pair's key.
-- **Path health.** A path silent for 3 s (10 s for a carrying Bluetooth path,
-  whose radio pauses for seconds while it pages or opens a profile; 45 s for a
-  standby, whose keepalive is every 15 s) is let go of; so is any connection whose sent data stays
+- **Path health.** A carrying network path silent for 3 s is passed over and
+  counted missing, so a standby takes the session and the mesh places a
+  replacement at once, but it is kept: a blip shorter than 15 s resumes on
+  the old connection, and only then is it let go of (closing it at 3 s made
+  every Wi-Fi blip four new connections and a resend). A carrying Bluetooth
+  path silent for 10 s, whose radio pauses for seconds while it pages or opens
+  a profile, and a standby silent for 45 s, whose keepalive is every 15 s,
+  are let go of; so is any connection whose sent data stays
   unacknowledged for 10 s (`TCP_USER_TIMEOUT`, `transport/src/dead_peer.rs` —
   keepalive alone never fires while data is queued). A carrying path whose
   frames stay unacknowledged for 3 s while another path exists is *degraded*

@@ -40,9 +40,12 @@
 //! make progress without waiting for another lane. A newer path replaces the
 //! older one for that lane. Bluetooth does not carry pixels.
 //!
-//! A path is let go of when it falls silent: three seconds for the one
-//! carrying the session, which hears an `ACK` every second, and longer for a
-//! standby that hears one rarely. A path that is alive but not delivering —
+//! A path carrying the session is passed over when it falls silent for three
+//! seconds, since it hears an `ACK` every second. A network path is then kept,
+//! suspect, while the mesh places a replacement, and let go of only after
+//! fifteen: a blip shorter than that resumes on the old connection, and a
+//! replacement that joins first replaces it. Bluetooth and standby paths are
+//! let go of at their own silences. A path that is alive but not delivering —
 //! frames sent on it stay unacknowledged for seconds while another path
 //! exists — is *degraded*: the session moves to the other path and comes back
 //! only after a while, so a marginal link does not make it flap. That is what
@@ -94,8 +97,16 @@ const ACK_SOON: Duration = Duration::from_millis(50);
 /// How often every path, standby included, hears a keepalive.
 const STANDBY_KEEPALIVE: Duration = Duration::from_secs(15);
 
-/// Silence after which the path carrying the session is let go of.
+/// Silence after which the path carrying the session is passed over: a
+/// network path is then kept, suspect, until [`NETWORK_GIVE_UP`]; any other
+/// is let go of.
 const ACTIVE_SILENCE: Duration = Duration::from_secs(3);
+/// Silence after which a suspect network path is let go of. Closing it at
+/// [`ACTIVE_SILENCE`], as before, turned every Wi-Fi blip into four new
+/// connections and a resend of everything unacknowledged — 150 to 240 times
+/// a day on a laptop with a weak card — even when the old connections would
+/// have carried on a second later.
+const NETWORK_GIVE_UP: Duration = Duration::from_secs(15);
 /// As [`ACTIVE_SILENCE`], for a Bluetooth path. The radio pauses for seconds
 /// while it pages another device or opens a profile, and a Bluetooth path is
 /// usually the only one left: letting it go at three seconds ended it in the
@@ -866,6 +877,97 @@ mod tests {
         a.tx.send(&key(3)).await.unwrap();
         assert_eq!(next(&mut b).await, key(3), "the standby did not take over");
         assert!(!a.tx.holding());
+    }
+
+    /// Holds back what is sent while muted and lets it through afterwards,
+    /// as a TCP connection does across a radio blip.
+    struct BlipTx {
+        inner: Box<dyn TransportTx>,
+        muted: Arc<std::sync::atomic::AtomicBool>,
+        held: Vec<Message>,
+    }
+
+    #[async_trait]
+    impl TransportTx for BlipTx {
+        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
+            if self.muted.load(std::sync::atomic::Ordering::Relaxed) {
+                self.held.push(msg.clone());
+                return Ok(());
+            }
+            for held in std::mem::take(&mut self.held) {
+                self.inner.send(&held).await?;
+            }
+            self.inner.send(msg).await
+        }
+    }
+
+    /// A session whose `b` end can be muted on every network path.
+    async fn blip_session() -> (End, End, Arc<std::sync::atomic::AtomicBool>) {
+        let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = |mut path: Path| {
+            path.tx = Box::new(BlipTx {
+                inner: path.tx,
+                muted: muted.clone(),
+                held: Vec::new(),
+            });
+            path
+        };
+        let (a, b, tag) = path_pair(PathKind::Network).await;
+        let (link_a, handle_a) = ResumableLink::new(a, tag);
+        let (link_b, handle_b) = ResumableLink::new(gate(b), tag);
+        for lane in [Lane::Audio, Lane::Video, Lane::Bulk] {
+            let (pa, pb, _) = path_pair(PathKind::for_lane(lane)).await;
+            let (ra, rb) = tokio::join!(handle_a.attach(pa), handle_b.attach(gate(pb)));
+            ra.unwrap();
+            rb.unwrap();
+        }
+        let (tx_a, rx_a) = Box::new(link_a).split_prioritized();
+        let (tx_b, rx_b) = Box::new(link_b).split_prioritized();
+        (
+            End {
+                tx: tx_a,
+                rx: rx_a,
+                handle: handle_a,
+            },
+            End {
+                tx: tx_b,
+                rx: rx_b,
+                handle: handle_b,
+            },
+            muted,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_short_blip_resumes_on_the_same_connection_instead_of_closing_it() {
+        let (mut a, b, muted) = blip_session().await;
+        muted.store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(ACTIVE_SILENCE + Duration::from_secs(3)).await;
+        assert!(
+            a.handle.paths().network,
+            "a quiet network path is kept while a replacement is placed"
+        );
+        assert!(
+            !a.handle.network_complete(),
+            "and counts as missing, so the mesh places one"
+        );
+        muted.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut b = b;
+        b.tx.send(&key(6)).await.unwrap();
+        assert_eq!(next(&mut a).await, key(6));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            a.handle.network_complete(),
+            "the old connection carries again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_network_path_silent_past_the_give_up_is_let_go_of() {
+        let (a, _b, muted) = blip_session().await;
+        muted.store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(ACTIVE_SILENCE + NETWORK_GIVE_UP + Duration::from_secs(1)).await;
+        assert!(!a.handle.paths().network);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ use crate::resume::ACTIVE_SILENCE;
 use crate::resume::BLUETOOTH_SILENCE;
 use crate::resume::DEGRADED_FOR;
 use crate::resume::HOLD;
+use crate::resume::NETWORK_GIVE_UP;
 use crate::resume::STALL;
 use crate::resume::STANDBY_KEEPALIVE;
 use crate::resume::STANDBY_SILENCE;
@@ -43,17 +44,50 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
                 .into_iter()
                 .filter_map(|lane| state.carrying(lane, now).map(|p| p.id))
                 .collect();
+            let mut quiet_network: Vec<u64> = Vec::new();
             for path in &state.paths {
+                let quiet = now.duration_since(path.last_heard);
+                let network = path.kind != PathKind::Bluetooth;
+                if network && path.suspect_since.is_some() {
+                    if quiet > NETWORK_GIVE_UP {
+                        silent.push((path.id, quiet));
+                    }
+                    continue;
+                }
                 let limit = if !carrying.contains(&path.id) {
                     STANDBY_SILENCE
-                } else if path.kind == PathKind::Bluetooth {
-                    BLUETOOTH_SILENCE
-                } else {
+                } else if network {
                     ACTIVE_SILENCE
+                } else {
+                    BLUETOOTH_SILENCE
                 };
-                let quiet = now.duration_since(path.last_heard);
                 if quiet > limit {
-                    silent.push((path.id, quiet));
+                    if network && limit == ACTIVE_SILENCE {
+                        quiet_network.push(path.id);
+                    } else {
+                        silent.push((path.id, quiet));
+                    }
+                }
+            }
+            // A carrying network path gone quiet is kept while its
+            // replacement is dialled, rather than closed: passed over for
+            // carrying, and missing as far as the mesh's dialling is
+            // concerned, so a standby takes the session and a new
+            // connection is placed at once. A blip shorter than that leaves
+            // the old connection to carry on as if nothing happened; a
+            // replacement that joins first replaces it.
+            for id in quiet_network {
+                if let Some(path) = state.paths.iter_mut().find(|p| p.id == id) {
+                    path.suspect_since = Some(now);
+                    path.degraded_until = Some(now + NETWORK_GIVE_UP);
+                    path.probe = None;
+                    tracing::info!(
+                        session = %inner.label(),
+                        path = id,
+                        kind = ?path.kind,
+                        "a path went quiet; keeping it while another is placed"
+                    );
+                    degraded = Some(id);
                 }
             }
             let interactive = state.carrying(Lane::Interactive, now).map(|p| p.id);
