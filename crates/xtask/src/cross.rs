@@ -271,6 +271,13 @@ pub(crate) fn android(release: bool, build_version: Option<&str>) -> Result<Path
     // (`cursio_core::update::running_build`) so it knows not to take it again.
     if let Some(version) = build_version {
         cmd.env("CURSIO_BUILD", version);
+        // And when: whatever was published before it is older, which the
+        // phone cannot tell from a store a hand install left empty.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        cmd.env("CURSIO_BUILD_AT", now.to_string());
     }
     cmd.env("CMAKE_GENERATOR", "Ninja");
     run(cmd)?;

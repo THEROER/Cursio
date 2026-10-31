@@ -88,6 +88,9 @@ pub struct Agent {
     state: Mutex<State>,
     /// Switches in place of the update helper, at once when installed.
     switcher: Option<Switcher>,
+    /// When the running build was made, where its store cannot say: a
+    /// phone's app installed by hand holds no statement of itself.
+    built_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -127,7 +130,17 @@ impl Agent {
                 ..State::default()
             }),
             switcher: None,
+            built_at: None,
         }
+    }
+
+    /// The running build was made at `at` (Unix seconds): take nothing
+    /// published before. A phone's app put on by hand had an empty store, so
+    /// every build its computer still held looked new — it took an older one
+    /// than it ran and offered to install it.
+    pub fn with_built_at(mut self, at: Option<u64>) -> Self {
+        self.built_at = at;
+        self
     }
 
     /// Switch through `switcher`, as soon as a build is installed, rather
@@ -294,6 +307,7 @@ impl Agent {
             .map(|h| h.statement.published_at)
             .max()
             .unwrap_or(0)
+            .max(self.built_at.unwrap_or(0))
     }
 
     pub fn progressed(&self, received: u64) {
@@ -630,6 +644,22 @@ mod tests {
         .apply(&mut config);
         assert_eq!(config.update.channel, UpdateChannel::Dev);
         assert!(crate::update::sign::verify(&o, &config.update).is_ok());
+    }
+
+    #[test]
+    fn a_build_published_before_the_running_one_was_made_is_not_taken() {
+        let root = scratch("built-at");
+        let key = BuilderKey::from_seed([5; 32]);
+        let agent = agent_at(&root, &key, UpdatePolicy::Ask).with_built_at(Some(100));
+        assert!(matches!(
+            agent.consider(&offer(&key, "0.9.0+older", 90), "a"),
+            Decision::Skip
+        ));
+        assert!(matches!(
+            agent.consider(&offer(&key, "0.9.0+newer", 110), "a"),
+            Decision::Fetch(_)
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

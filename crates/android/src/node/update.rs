@@ -39,7 +39,8 @@ pub fn start(config_path: PathBuf) {
             }
         },
     )
-    .with_switcher(Box::new(offer_to_installer));
+    .with_switcher(Box::new(offer_to_installer))
+    .with_built_at(cursio_core::update::running_built_at());
     let agent: Arc<Agent> = cursio_core::update::agent::install(agent);
     tracing::info!(platform = agent.platform(), "taking builds from the mesh");
 }

@@ -67,6 +67,12 @@ pub fn platform() -> String {
 
 /// Which build this process is: the installed version it was started from,
 /// or the crate version for a development build under `target/`.
+/// When this build was staged, Unix seconds, where `cargo xtask` wrote it in:
+/// a phone's. Any build published before it is older than what runs.
+pub fn running_built_at() -> Option<u64> {
+    option_env!("CURSIO_BUILD_AT").and_then(|s| s.parse().ok())
+}
+
 pub fn running_build() -> String {
     std::env::current_exe()
         .ok()
