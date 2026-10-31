@@ -25,7 +25,7 @@ use crate::module::SessionModule;
 use crate::request_hub::{HubKind, RequestHub};
 
 /// Version of [`DiagMsg`]; peers run the module only on an exact match.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Longest a caller waits for a peer's answer. A log answer is up to half a
 /// megabyte, which over Bluetooth is seconds.
@@ -82,10 +82,15 @@ pub fn paths(peer: &PeerId, choice: Option<PathChoice>) -> Result<PathReport, St
 /// This node's own log, as a peer or the control socket asks for it.
 pub fn own_log(tail: Tail) -> Result<DiagResponse, String> {
     let tail = tail.bounded()?;
-    let name = cursio_log::log_file_name().ok_or("this node keeps no log file")?;
+    let name = match &tail.log {
+        Some(log) => format!("{log}.log"),
+        None => cursio_log::log_file_name()
+            .ok_or("this node keeps no log file")?
+            .to_string(),
+    };
     crate::log_tail::read(
         &cursio_log::log_dir(),
-        name,
+        &name,
         &tail,
         std::time::SystemTime::now(),
     )
@@ -120,11 +125,13 @@ impl Exchange for Diag {
                 within_secs,
                 contains,
                 max_lines,
+                log,
             } => own_log(Tail {
                 after: after.clone(),
                 within: within_secs.map(Duration::from_secs),
                 contains: contains.clone(),
                 max_lines: *max_lines,
+                log: log.clone(),
             }),
             DiagRequest::Paths { choice } => {
                 if let Some(choice) = choice {
@@ -142,12 +149,14 @@ impl Exchange for Diag {
                 within_secs,
                 contains,
                 max_lines,
+                log,
             } => {
                 let tail = Tail {
                     after,
                     within: within_secs.map(Duration::from_secs),
                     contains,
                     max_lines,
+                    log,
                 }
                 .bounded()?;
                 Ok(DiagRequest::Logs {
@@ -155,6 +164,7 @@ impl Exchange for Diag {
                     within_secs: tail.within.map(|w| w.as_secs()),
                     contains: tail.contains,
                     max_lines: tail.max_lines,
+                    log: tail.log,
                 })
             }
             paths @ DiagRequest::Paths { .. } => Ok(paths),
@@ -208,6 +218,7 @@ mod tests {
             within_secs: None,
             contains: None,
             max_lines: u32::MAX,
+            log: None,
         })
         .unwrap();
         assert!(matches!(
@@ -222,6 +233,15 @@ mod tests {
             within_secs: None,
             contains: Some("x".repeat(10_000)),
             max_lines: 10,
+            log: None,
+        })
+        .is_err());
+        assert!(Diag::check(DiagRequest::Logs {
+            after: None,
+            within_secs: None,
+            contains: None,
+            max_lines: 10,
+            log: Some("../../.ssh/id_ed25519".into()),
         })
         .is_err());
     }

@@ -113,6 +113,7 @@ session's paths, so neither needs a shell on the other machine:
 ```sh
 cursio logs all -n 300 --since 10m          # this machine and every connected one, merged by time
 cursio logs Lightmoon --grep "path of the session" -f
+cursio logs Lightmoon --log mount-helper    # a helper process's own log (Windows' drive helper, the app)
 cursio path Lightmoon                       # which path carries input, seen from both ends
 cursio path Lightmoon bluetooth             # carry the session over Bluetooth on both ends
 cursio path Lightmoon network               # keep it on the network even while that fails

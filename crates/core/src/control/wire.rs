@@ -303,6 +303,10 @@ pub enum Command {
         #[serde(default)]
         contains: Option<String>,
         max_lines: u32,
+        /// Another of Cursio's logs by its base name, such as
+        /// `cursio-mount-helper`; the node's own when absent.
+        #[serde(default)]
+        log: Option<String>,
     },
     /// Report the paths of the session with `peer` from both ends, first
     /// choosing `choice` on both when given; see

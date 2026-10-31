@@ -475,6 +475,7 @@ async fn run() -> anyhow::Result<()> {
             since,
             grep,
             follow,
+            log,
         } => {
             diag::logs(diag::LogsArgs {
                 machines,
@@ -482,6 +483,7 @@ async fn run() -> anyhow::Result<()> {
                 since,
                 grep,
                 follow,
+                log,
             })
             .await
         }

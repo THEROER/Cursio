@@ -42,6 +42,17 @@ pub const MAX_LOG_BYTES: usize = 512 * 1024;
 /// Longest piece of text a request may filter by.
 pub const MAX_FILTER_BYTES: usize = 256;
 
+/// Whether `name` may name a log a peer reads: one of Cursio's own, a bare
+/// name with no path in it. A name off the wire is untrusted, and this is
+/// what keeps it from reaching any file but a log beside the node's.
+pub fn valid_log_name(name: &str) -> bool {
+    name.starts_with("cursio")
+        && name.len() <= 40
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Which of a session's paths should carry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PathChoice {
@@ -61,12 +72,15 @@ pub enum DiagRequest {
     /// The newest `max_lines` lines of the node's log that are newer than
     /// `after` (a line's leading timestamp, compared as text), no older than
     /// `within_secs` by the answering machine's clock, and contain
-    /// `contains`.
+    /// `contains`. `log` names another of Cursio's logs in the same
+    /// directory instead — `cursio-mount-helper`, `cursio-app` — since a
+    /// helper process writes its own; see [`valid_log_name`].
     Logs {
         after: Option<String>,
         within_secs: Option<u64>,
         contains: Option<String>,
         max_lines: u32,
+        log: Option<String>,
     },
     /// Report the session's paths, first choosing `choice` for this end of
     /// it when given.
@@ -128,6 +142,16 @@ mod tests {
         let bytes = bincode::serialize(&msg).unwrap();
         assert_eq!(bincode::deserialize::<DiagMsg>(&bytes).unwrap(), msg);
         assert_eq!(msg.priority(), Priority::Bulk);
+    }
+
+    #[test]
+    fn a_log_name_cannot_reach_outside_the_log_directory() {
+        assert!(valid_log_name("cursio-mount-helper"));
+        assert!(valid_log_name("cursio-app"));
+        assert!(!valid_log_name("../cursio"));
+        assert!(!valid_log_name("cursio/../../etc/passwd"));
+        assert!(!valid_log_name("cursio.log"));
+        assert!(!valid_log_name("trusted_peers"));
     }
 
     #[test]

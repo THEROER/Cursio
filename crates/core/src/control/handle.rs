@@ -75,12 +75,14 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
             within_secs,
             contains,
             max_lines,
+            log,
         } => match machine {
             None => logs(crate::diag_session::own_log(crate::log_tail::Tail {
                 after: after.clone(),
                 within: within_secs.map(std::time::Duration::from_secs),
                 contains: contains.clone(),
                 max_lines: *max_lines,
+                log: log.clone(),
             })),
             Some(machine) => {
                 let request = DiagRequest::Logs {
@@ -88,6 +90,7 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                     within_secs: *within_secs,
                     contains: contains.clone(),
                     max_lines: *max_lines,
+                    log: log.clone(),
                 };
                 logs(hub.ask(machine, request).await)
             }

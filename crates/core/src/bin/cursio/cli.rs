@@ -141,6 +141,10 @@ pub(crate) enum Command {
         /// Keep printing lines as they are written.
         #[arg(short = 'f', long)]
         follow: bool,
+        /// Another of Cursio's logs instead of the node's: `mount-helper`
+        /// (Windows' drive helper) or `app`.
+        #[arg(long)]
+        log: Option<String>,
     },
     /// Show which path carries the session with a machine, from both ends, or
     /// choose one on both ends for the rest of that session. Goes through the

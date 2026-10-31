@@ -28,6 +28,9 @@ pub struct Tail {
     pub within: Option<Duration>,
     pub contains: Option<String>,
     pub max_lines: u32,
+    /// Another of Cursio's logs in the same directory, by its base name;
+    /// the node's own when absent.
+    pub log: Option<String>,
 }
 
 impl Tail {
@@ -42,6 +45,13 @@ impl Tail {
         }
         if self.after.as_ref().is_some_and(|a| a.len() > 64) {
             return Err("not a log timestamp".into());
+        }
+        if let Some(log) = &self.log {
+            if !cursio_protocol::diag::valid_log_name(log) {
+                return Err(format!(
+                    "{log:?} is not one of Cursio's logs; try cursio-mount-helper or cursio-app"
+                ));
+            }
         }
         self.max_lines = self.max_lines.clamp(1, MAX_LINES);
         Ok(self)

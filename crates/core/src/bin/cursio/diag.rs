@@ -27,6 +27,7 @@ pub(crate) struct LogsArgs {
     pub(crate) since: Option<String>,
     pub(crate) grep: Option<String>,
     pub(crate) follow: bool,
+    pub(crate) log: Option<String>,
 }
 
 /// One machine to read: `None` is this one, otherwise a peer's name or id.
@@ -63,6 +64,15 @@ pub(crate) async fn logs(args: LogsArgs) -> anyhow::Result<()> {
                     },
                     contains: args.grep.clone(),
                     max_lines: args.lines,
+                    // `mount-helper` is read as `cursio-mount-helper`, the
+                    // name the helper's log file carries.
+                    log: args.log.as_ref().map(|log| {
+                        if log.starts_with("cursio") {
+                            log.clone()
+                        } else {
+                            format!("cursio-{log}")
+                        }
+                    }),
                 })
                 .await?;
             match reply {
