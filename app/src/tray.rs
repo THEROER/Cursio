@@ -250,6 +250,19 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Longest a problem's text runs in the menu, in characters.
+const PROBLEM_CHARS: usize = 60;
+
+/// `text` cut to fit a menu line. A menu item is as wide as its text: a
+/// crash report with a file path in it made the menu wider than two screens,
+/// with every other item off the edge. The whole text is in the status.
+fn clipped(text: &str) -> String {
+    match text.char_indices().nth(PROBLEM_CHARS) {
+        Some((at, _)) => format!("{}…", text[..at].trim_end()),
+        None => text.to_owned(),
+    }
+}
+
 /// The one-line summary: who is here and how the cursor feels.
 pub fn summary(status: &Status) -> String {
     let online = status
@@ -279,7 +292,7 @@ fn refresh(items: &Items, status: Option<Status>) {
     let _ = items.summary.set_text(summary(&status));
     let _ = items.problems.set_text(match status.problems.len() {
         0 => "No problems".to_owned(),
-        1 => format!("1 problem: {}", status.problems[0].summary),
+        1 => format!("1 problem: {}", clipped(&status.problems[0].summary)),
         n => format!("{n} problems — open status for details"),
     });
     let _ = items.start.set_enabled(false);
@@ -382,6 +395,16 @@ fn screens_menu(app: &AppHandle, views: &[ScreenView]) -> tauri::Result<Submenu<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_problem_is_cut_to_fit_the_menu() {
+        let long = format!("the node crashed before this start: {}", "x".repeat(300));
+        let cut = clipped(&long);
+        assert_eq!(cut.chars().count(), PROBLEM_CHARS + 1);
+        assert!(cut.ends_with('…'));
+        assert_eq!(clipped("short"), "short");
+        assert_eq!(clipped(&"ж".repeat(70)).chars().count(), PROBLEM_CHARS + 1);
+    }
 
     #[test]
     fn a_screen_menu_id_carries_its_peer_and_source_back() {
