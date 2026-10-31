@@ -187,7 +187,15 @@ impl Agent {
                 let version = cursio_protocol::update::Statement::from_bytes(&offer.statement)
                     .map(|s| s.version)
                     .unwrap_or_default();
-                if matches!(refusal, super::sign::Refusal::Untrusted { .. }) {
+                // Both mean "not chosen yet" rather than "wrong": a machine
+                // that has never taken a dev build follows stable, and says so
+                // before it ever checks who signed.
+                let a_choice = matches!(
+                    refusal,
+                    super::sign::Refusal::Untrusted { .. }
+                        | super::sign::Refusal::WrongChannel { .. }
+                );
+                if a_choice {
                     self.store.note_signer(from, &offer.signer);
                 }
                 // Reported once, but asked again every time: trusting the
@@ -195,10 +203,11 @@ impl Agent {
                 let mut state = self.state();
                 if state.reported.insert(version.clone()) {
                     tracing::warn!(%from, %version, %refusal, "refused a build offered over the mesh");
-                    // Not trusted yet is a choice for the person, so it is
-                    // offered as one; any other refusal is a fault.
-                    let actions = match refusal {
-                        super::sign::Refusal::Untrusted { .. } => vec![ProblemAction {
+                    // A choice not made yet is offered as one — accepting
+                    // trusts the key and follows dev, which answers both;
+                    // any other refusal is a fault.
+                    let actions = match a_choice {
+                        true => vec![ProblemAction {
                             label: format!("Accept builds from {from}"),
                             edit: ConfigEdit::TrustBuilder(TrustedBuilder {
                                 peer: state.peers.get(from).copied().unwrap_or(PeerId::nil()),
@@ -206,7 +215,7 @@ impl Agent {
                                 key: super::sign::hex(&offer.signer),
                             }),
                         }],
-                        _ => Vec::new(),
+                        false => Vec::new(),
                     };
                     diagnostics::raise(Problem {
                         id: REFUSED.into(),
