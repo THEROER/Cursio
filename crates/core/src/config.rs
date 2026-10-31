@@ -147,10 +147,14 @@ pub enum BluetoothMesh {
 
 /// One change to the config a problem offers to make, so a person can act on
 /// the problem where they read it rather than in the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigEdit {
     BluetoothMesh(BluetoothMesh),
+    /// Accept `dev` builds signed by this machine's key, and follow `dev`:
+    /// what `cursio update trust-builder` does, as a button on the refusal
+    /// of its build — the one way a phone, with no shell to type it in, can.
+    TrustBuilder(TrustedBuilder),
     /// Narrow one edge to the part that crosses; `None` gives it back whole.
     Crossing {
         edge: Edge,
@@ -162,6 +166,12 @@ impl ConfigEdit {
     pub fn apply(self, config: &mut Config) {
         match self {
             ConfigEdit::BluetoothMesh(mode) => config.bluetooth.mesh = mode,
+            ConfigEdit::TrustBuilder(builder) => {
+                let builders = &mut config.update.trusted_builders;
+                builders.retain(|b| b.key != builder.key && b.peer != builder.peer);
+                builders.push(builder);
+                config.update.channel = UpdateChannel::Dev;
+            }
             ConfigEdit::Crossing { edge, span } => {
                 let span = span.filter(|s| *s != EdgeSpan::WHOLE);
                 let crossing = &mut config.input.crossing;

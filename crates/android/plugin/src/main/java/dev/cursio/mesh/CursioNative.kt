@@ -181,6 +181,10 @@ object CursioNative {
     @JvmStatic
     fun onRing(on: Boolean) = Ringer.ring(on)
 
+    /** A build of this app arrived over the mesh; see [UpdateOffer]. */
+    @JvmStatic
+    fun offerUpdate(path: String, version: String) = UpdateOffer.offer(path, version)
+
     /** Paired computers, as `address\tname` lines; see [BtLink]. */
     @JvmStatic
     fun btComputers(): String = BtLink.computers()

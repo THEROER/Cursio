@@ -26,6 +26,8 @@ pub enum StageTarget {
     Windows,
     /// Linux for machines on Ubuntu 24.04, built in a container.
     Ubuntu24,
+    /// The phone app, as one APK the phone hands to its system installer.
+    Android,
 }
 
 #[derive(Args)]
@@ -68,6 +70,8 @@ pub fn platform_name(target: StageTarget) -> Result<String> {
         }
         StageTarget::Windows => "windows-x86_64".into(),
         StageTarget::Ubuntu24 => format!("linux-x86_64-{}", crate::container::abi()?),
+        // `std::env::consts` as the phone's node reads them.
+        StageTarget::Android => "android-aarch64".into(),
     })
 }
 
@@ -105,6 +109,12 @@ pub fn stage_build(
     no_build: bool,
     version: Option<&str>,
 ) -> Result<(String, PathBuf)> {
+    if matches!(target_kind, StageTarget::Android) {
+        let version = version
+            .map(str::to_owned)
+            .context("the phone's build is staged only beside a computer's, under its version")?;
+        return stage_android(no_build, &version);
+    }
     let (target, out) = match target_kind {
         StageTarget::Host => {
             if !no_build {
@@ -128,6 +138,7 @@ pub fn stage_build(
             }
             (None, crate::container::out_dir())
         }
+        StageTarget::Android => unreachable!("staged by stage_android above"),
     };
 
     let files: Vec<String> = ["cursio", "cursio-app"]
@@ -175,6 +186,45 @@ pub fn stage_build(
     Ok((version, dir))
 }
 
+/// The component a phone build carries: the APK, named as the phone's node
+/// looks it up (`crates/android/src/node/update.rs`).
+const APK_COMPONENT: &str = "apk";
+const APK_FILE: &str = "cursio.apk";
+
+/// Build (unless `no_build`) and stage the phone's APK under `version`.
+fn stage_android(no_build: bool, version: &str) -> Result<(String, PathBuf)> {
+    let apk = if no_build {
+        crate::checkout_dir().join(
+            "app/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk",
+        )
+    } else {
+        crate::cross::android(true)?
+    };
+    if !apk.is_file() {
+        bail!("{} is missing; build it or drop --no-build", apk.display());
+    }
+    let dir = crate::target_root()
+        .join("stage")
+        .join(version)
+        .join(platform_name(StageTarget::Android)?);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::copy(&apk, dir.join(APK_FILE))
+        .with_context(|| format!("copying {}", apk.display()))?;
+    let components = [(
+        APK_COMPONENT.to_owned(),
+        APK_FILE.to_owned(),
+        sha256_file(&apk)?,
+    )];
+    std::fs::write(
+        dir.join("manifest.json"),
+        manifest_json(version, &components),
+    )
+    .context("writing manifest.json")?;
+    println!("✓ staged the phone's {version} in {}", dir.display());
+    Ok((version.to_owned(), dir))
+}
+
 #[derive(Args)]
 pub struct PublishArgs {
     /// Publish only this machine's build, not the Windows and Ubuntu 24.04
@@ -184,6 +234,9 @@ pub struct PublishArgs {
     /// Publish what is already built instead of building first.
     #[arg(long)]
     no_build: bool,
+    /// Leave the phone's APK out, even where this machine can build it.
+    #[arg(long)]
+    no_android: bool,
 }
 
 /// Stage this machine's build, the Windows one and — from a Linux host whose
@@ -213,6 +266,16 @@ pub fn publish(args: PublishArgs) -> Result<()> {
         } else {
             let (_, dir) = stage_build(StageTarget::Ubuntu24, args.no_build, Some(&version))?;
             builds.push((platform_name(StageTarget::Ubuntu24)?, dir));
+        }
+    }
+    if !args.host_only && !args.no_android {
+        if crate::cross::android_available() {
+            let (_, dir) = stage_build(StageTarget::Android, args.no_build, Some(&version))?;
+            builds.push((platform_name(StageTarget::Android)?, dir));
+        } else {
+            println!(
+                "note: no Android SDK with an NDK, or no bun, here; phones keep what they run"
+            );
         }
     }
     let node = host_dir.join(crate::exe_name("cursio", None));

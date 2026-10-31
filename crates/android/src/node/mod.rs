@@ -46,6 +46,7 @@ use cursio_protocol::{PeerId, Position};
 mod bluetooth;
 mod link;
 mod serve;
+mod update;
 
 /// Where the phone stands in the layout. It never takes the cursor
 /// (`DeviceKind::Phone`), so no edge of it is ever crossed; the position only
@@ -100,6 +101,7 @@ impl NodeHandle {
         let config_path = cursio_core::config::default_path()?;
         let config = Config::load(&config_path)?;
         let mic_gate = LiveShared::new(MicGate::from_config(config.audio.mic_gate.as_deref())?);
+        update::start(config_path.clone());
 
         let applier: cursio_core::control::Applier = {
             let mic_gate = mic_gate.clone();

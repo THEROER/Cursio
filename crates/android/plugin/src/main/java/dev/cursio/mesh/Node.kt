@@ -49,6 +49,7 @@ object Node {
         return try {
             ShareReceiver.context = context.applicationContext
             Ringer.context = context.applicationContext
+            UpdateOffer.context = context.applicationContext
             SmsStore.context = context.applicationContext
             GalleryStore.context = context.applicationContext
             BtLink.context = context.applicationContext

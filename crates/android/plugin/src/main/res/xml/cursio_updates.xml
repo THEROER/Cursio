@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Builds from the mesh: cursio_protocol::paths::data_dir()/updates. -->
+<paths>
+    <files-path name="updates" path="data/updates/" />
+</paths>

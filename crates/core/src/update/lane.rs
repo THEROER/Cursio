@@ -376,6 +376,7 @@ impl crate::module::ModuleFactory for UpdateFactory {
     ) -> anyhow::Result<Box<dyn crate::module::SessionModule>> {
         let agent = super::agent::global()
             .ok_or_else(|| anyhow::anyhow!("updates are not running on this node"))?;
+        agent.know_peer(ctx.peer_name(), ctx.peer.peer_id);
         Ok(Box::new(UpdateModule {
             lane: Lane::new(agent, ctx.peer_name()),
             outbox: Vec::new(),

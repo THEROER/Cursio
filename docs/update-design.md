@@ -238,13 +238,31 @@ on Windows (Authenticode, same Azure signing profile), `.deb` and AppImage on
 Linux. The installer only lays out `<root>` and the stable copies; everything
 after is the updater.
 
-## Phase 4: Android and macOS (not built)
+## Phase 4: Android (built) and macOS (not built)
 
-**Android** cannot replace its own APK silently. An update is handed to the
-system `PackageInstaller`, which asks the user; or it comes from a store. The
-mesh can still deliver the APK — it is a file — but the last step is the
-user's. The node lives in the app process, so there is no helper and no
-pointer: the installer replaces the app and Android restarts it.
+**Android** cannot replace its own APK silently, so the mesh delivers it and
+the person installs it. `cargo xtask publish` builds the APK too wherever an
+SDK with an NDK and bun are present (`--no-android` leaves it out) and stages
+it as the platform `android-aarch64`, whose one component is `apk`. The
+phone's node runs the same agent and lane as a computer, with its store under
+the app's data directory (`crates/android/src/node/update.rs`), and fetches,
+verifies and installs the APK into `versions/` the same way. What differs is
+the switch: the agent is given a `Switcher` that hands the APK to Kotlin
+(`UpdateOffer`), which posts a notification; its tap opens the system
+installer on the file, served by the plugin's own `UpdateFileProvider`. The
+first time, Android also asks to let Cursio install apps. The installer
+replaces the app and Android restarts it; there is no helper and no pointer.
+
+Every APK is signed with the building machine's debug key, so builds from one
+machine install over each other; a build from another machine would be refused
+by the installer as a different signer.
+
+A phone has no shell for `cursio update trust-builder`. So a refusal because
+the builder is not trusted carries a button, "Accept builds from <machine>",
+which is `ConfigEdit::TrustBuilder`: the same pinned key and the switch to
+`dev` the command makes, on every machine, not only phones. The phone that
+first runs this needs one install by hand (adb), since a build without the
+update module cannot take one.
 
 **macOS** needs a signed and notarized `.app`. Replacing a bundle in
 `~/Applications` is allowed; replacing one that lost its signature trips

@@ -176,7 +176,7 @@ pub(crate) const ANDROID_TAURI_TARGET: &str = "aarch64";
 /// What crosses is the mesh core plus the modules with an Android backend
 /// (audio). Turning another on does not fail at the feature — it fails deep
 /// inside PipeWire or FUSE, which is a much worse error to read.
-pub(crate) fn android(release: bool) -> Result<()> {
+pub(crate) fn android(release: bool) -> Result<PathBuf> {
     ensure_rust_target(ANDROID_TARGET)?;
 
     let Some(bun) = which("bun") else {
@@ -204,6 +204,9 @@ pub(crate) fn android(release: bool) -> Result<()> {
     let ndk = ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"]
         .iter()
         .find_map(|k| std::env::var_os(k).map(PathBuf::from))
+        // Android Studio puts NDKs under the SDK, one directory per version;
+        // the newest is what a build there would use.
+        .or_else(|| newest_ndk(&sdk))
         .with_context(|| {
             "ANDROID_NDK_HOME is not set.\n\
              Install the NDK through Android Studio (SDK Manager → SDK Tools → \
@@ -279,7 +282,40 @@ pub(crate) fn android(release: bool) -> Result<()> {
     }
     println!("✓ {}", apk.display());
     println!("  install it with: adb install -r {}", apk.display());
-    Ok(())
+    Ok(apk)
+}
+
+/// The newest NDK installed under `sdk`, by version directory name.
+fn newest_ndk(sdk: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(sdk.join("ndk"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("toolchains/llvm/prebuilt").is_dir())
+        .collect();
+    found.sort_by_key(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| {
+                n.split('.')
+                    .map(|part| part.parse::<u64>().unwrap_or(0))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    found.pop()
+}
+
+/// Whether this machine can build the phone's APK: an SDK with an NDK in it,
+/// or one named outright.
+pub(crate) fn android_available() -> bool {
+    let sdk = ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
+        .iter()
+        .find_map(|k| std::env::var_os(k).map(PathBuf::from));
+    let ndk_named = ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some());
+    which("bun").is_some() && sdk.is_some_and(|sdk| ndk_named || newest_ndk(&sdk).is_some())
 }
 
 /// Ensure the *active* toolchain can compile for `target`, installing it with

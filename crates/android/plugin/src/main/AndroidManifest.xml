@@ -88,6 +88,9 @@
     <!-- Lets the app ask for the exemption in one system dialog instead of
          sending the user through the battery settings list to find it. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Builds of this app arrive over the mesh and are handed to the system
+         installer (UpdateOffer); the installer asks the person every time. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- What a companion association with a paired computer grants (see
          ComputerCompanion): all `normal`, held only while an association exists. -->
     <uses-feature android:name="android.software.companion_device_setup" android:required="false" />
@@ -202,5 +205,14 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/cursio_touch" />
         </service>
+        <provider
+            android:name="dev.cursio.mesh.UpdateFileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/cursio_updates" />
+        </provider>
     </application>
 </manifest>

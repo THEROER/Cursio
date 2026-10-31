@@ -11,16 +11,27 @@
 //! that runs. Switching restarts the node, so it follows the machine's policy:
 //! `auto` waits for a [quiet moment](super::quiet), `ask` waits for the user,
 //! `never` fetches nothing at all.
+//!
+//! **A phone switches differently.** Its node lives in the app's process, and
+//! Android replaces an app only through its own installer, which asks the
+//! person. So the phone's agent is given a [`Switcher`] that hands the APK to
+//! that installer, and offers it as soon as it is in: the "switch" is a
+//! notification the person taps, which is already the asking `ask` means.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use cursio_protocol::update::{Offer, Statement};
+use cursio_protocol::PeerId;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{UpdateConfig, UpdatePolicy};
-use crate::diagnostics::{self, Problem, Severity};
+use crate::config::{ConfigEdit, TrustedBuilder, UpdateConfig, UpdatePolicy};
+use crate::diagnostics::{self, Problem, ProblemAction, Severity};
+
+/// What switches this machine to an installed build, in place of the update
+/// helper; see the module docs.
+pub type Switcher = Box<dyn Fn(&InstallLayout, &str) -> Result<(), UpdateError> + Send + Sync>;
 
 use super::layout::InstallLayout;
 use super::store::Store;
@@ -75,10 +86,15 @@ pub struct Agent {
     platform: String,
     config: Box<dyn Fn() -> UpdateConfig + Send + Sync>,
     state: Mutex<State>,
+    /// Switches in place of the update helper, at once when installed.
+    switcher: Option<Switcher>,
 }
 
 #[derive(Default)]
 struct State {
+    /// Which peer each linked machine's name is, so trusting its builds
+    /// from a refusal can name it.
+    peers: HashMap<String, PeerId>,
     fetching: Option<String>,
     /// Versions that failed here; not tried again this run.
     given_up: HashSet<String>,
@@ -110,7 +126,20 @@ impl Agent {
                 },
                 ..State::default()
             }),
+            switcher: None,
         }
+    }
+
+    /// Switch through `switcher`, as soon as a build is installed, rather
+    /// than through the update helper at a quiet moment; see the module docs.
+    pub fn with_switcher(mut self, switcher: Switcher) -> Self {
+        self.switcher = Some(switcher);
+        self
+    }
+
+    /// The machine called `name` is `peer`.
+    pub fn know_peer(&self, name: &str, peer: PeerId) {
+        self.state().peers.insert(name.to_owned(), peer);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -166,6 +195,19 @@ impl Agent {
                 let mut state = self.state();
                 if state.reported.insert(version.clone()) {
                     tracing::warn!(%from, %version, %refusal, "refused a build offered over the mesh");
+                    // Not trusted yet is a choice for the person, so it is
+                    // offered as one; any other refusal is a fault.
+                    let actions = match refusal {
+                        super::sign::Refusal::Untrusted { .. } => vec![ProblemAction {
+                            label: format!("Accept builds from {from}"),
+                            edit: ConfigEdit::TrustBuilder(TrustedBuilder {
+                                peer: state.peers.get(from).copied().unwrap_or(PeerId::nil()),
+                                name: from.to_owned(),
+                                key: super::sign::hex(&offer.signer),
+                            }),
+                        }],
+                        _ => Vec::new(),
+                    };
                     diagnostics::raise(Problem {
                         id: REFUSED.into(),
                         severity: Severity::Warning,
@@ -173,7 +215,7 @@ impl Agent {
                             "{from} offered build {version}, and it was refused: {refusal}"
                         ),
                         hint: None,
-                        actions: Vec::new(),
+                        actions,
                         since: SystemTime::now(),
                     });
                     state.status.last = Some(format!("refused {version} from {from}: {refusal}"));
@@ -181,6 +223,9 @@ impl Agent {
                 return Decision::Skip;
             }
         };
+        // Accepted now: an earlier refusal (an untrusted builder since
+        // trusted) is over.
+        diagnostics::clear(REFUSED);
         let version = statement.version.clone();
         let newest = self.newest_known();
         let installed_here = self.layout.installed().contains(&version);
@@ -291,6 +336,12 @@ impl Agent {
             });
             state.status.last = Some(format!("installed {version} from {from}"));
         }
+        if self.switcher.is_some() {
+            if let Err(error) = self.switch(version) {
+                tracing::warn!(%version, %error, "could not offer the installed build");
+            }
+            return;
+        }
         if self.config().policy == UpdatePolicy::Ask {
             diagnostics::raise(Problem {
                 id: READY.into(),
@@ -336,6 +387,12 @@ impl Agent {
     /// Hand over to the apply helper, which stops this node, flips `current`,
     /// starts the new one and rolls back if it does not answer.
     fn switch(&self, version: &str) -> Result<(), UpdateError> {
+        if let Some(switcher) = &self.switcher {
+            switcher(&self.layout, version)?;
+            self.state().status.last = Some(format!("offered {version} to the system installer"));
+            tracing::info!(%version, "handed the build to the system installer");
+            return Ok(());
+        }
         let exe = super::layout::stable_executable("cursio")
             .or_else(|| std::env::current_exe().ok())
             .ok_or(UpdateError::NoRoot)?;
@@ -546,6 +603,40 @@ mod tests {
         driving.set(true);
         assert_eq!(agent.tick(), None);
         assert!(agent.status().waiting_for.unwrap().contains("cursor"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn accepting_a_builder_from_its_refusal_lets_its_next_offer_through() {
+        let key = BuilderKey::from_seed([6; 32]);
+        let o = offer(&key, "0.9.0+phone", 9);
+        let mut config = crate::config::Config::default();
+        config.update.trusted_builders.clear();
+        assert!(crate::update::sign::verify(&o, &config.update).is_err());
+        ConfigEdit::TrustBuilder(TrustedBuilder {
+            peer: PeerId::nil(),
+            name: "Nocturne".into(),
+            key: hex(&o.signer),
+        })
+        .apply(&mut config);
+        assert_eq!(config.update.channel, UpdateChannel::Dev);
+        assert!(crate::update::sign::verify(&o, &config.update).is_ok());
+    }
+
+    #[test]
+    fn a_switcher_is_offered_the_build_the_moment_it_is_installed() {
+        let root = scratch("switcher");
+        let key = BuilderKey::from_seed([5; 32]);
+        let offered: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = offered.clone();
+        let agent =
+            agent_at(&root, &key, UpdatePolicy::Ask).with_switcher(Box::new(move |_, version| {
+                seen.lock().unwrap().push(version.to_owned());
+                Ok(())
+            }));
+        let statement = Statement::from_bytes(&offer(&key, "0.9.0+apk", 9).statement).unwrap();
+        agent.installed(&statement, "Nocturne");
+        assert_eq!(*offered.lock().unwrap(), vec!["0.9.0+apk".to_string()]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

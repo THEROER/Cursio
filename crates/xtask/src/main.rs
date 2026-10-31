@@ -225,7 +225,7 @@ fn main() -> Result<()> {
         } => run_task(!debug, bin, once, &args),
         Command_::Windows { debug } => windows(!debug).map(drop),
         Command_::Macos => macos(),
-        Command_::Android { debug } => android(!debug),
+        Command_::Android { debug } => android(!debug).map(|_| ()),
         Command_::Logs { follow } => logs(follow),
         Command_::Deploy(args) => deploy::deploy(args),
         Command_::LiveTest(args) => livetest::live_test(args),
