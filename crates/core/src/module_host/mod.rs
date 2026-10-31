@@ -416,14 +416,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_module_waiting_to_send_stops_when_asked_instead_of_being_left_behind() {
         let (failures, _) = mpsc::unbounded_channel();
-        let host = ModuleHost::spawn(Box::new(Talker), LinkTx::new(Box::new(FullQueue)), failures)
-            .unwrap();
+        let mut host =
+            ModuleHost::spawn(Box::new(Talker), LinkTx::new(Box::new(FullQueue)), failures)
+                .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let started = tokio::time::Instant::now();
-        let mut hosts = vec![host];
-        hosts[0].request_stop();
-        let done = std::mem::replace(&mut hosts[0].done, oneshot::channel().1);
-        tokio::time::timeout(Duration::from_secs(1), done)
+        host.request_stop();
+        tokio::time::timeout(Duration::from_secs(1), &mut host.done)
             .await
             .expect("the module's thread ended within a second")
             .unwrap();
