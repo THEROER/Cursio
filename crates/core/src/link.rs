@@ -194,7 +194,17 @@ where
         tracing::info!(module = %id, "module negotiated");
     }
     for (id, why) in &negotiated.skipped {
-        tracing::warn!(module = %id, reason = %why, "module not running on this link");
+        // Only a version mismatch says something is wrong — two builds that
+        // should agree do not. Two computers with no phone's messages to read,
+        // or a phone with no clipboard module, is what those machines are;
+        // as warnings they were most of a desktop's log, thousands a day
+        // repeated on every reconnect.
+        match why {
+            cursio_protocol::SkipReason::VersionMismatch { .. } => {
+                tracing::warn!(module = %id, reason = %why, "module not running on this link");
+            }
+            _ => tracing::debug!(module = %id, reason = %why, "module not running on this link"),
+        }
     }
 
     Ok(Identified {
