@@ -618,6 +618,8 @@ pub(crate) async fn start_node(
     // A machine short of memory looks, from inside Cursio, like a network
     // fault in every module at once; this says which it is.
     cursio_core::pressure::watch();
+    // A crash looks the same from the peers' side; this says it was one.
+    cursio_core::crash::arm();
 
     // Announce ourselves so other nodes can find us. Pin mDNS to the real LAN
     // interface so VPN/virtual interfaces don't break it.

@@ -49,9 +49,10 @@ pub mod clipboard_session;
 pub mod config;
 /// The local socket the app, the tray and `cursio status` talk to.
 pub mod control;
+/// The engine a request-and-answer module (messages, the gallery) runs on a link.
+pub mod crash;
 /// This machine's current problems, each with the fix where there is one.
 pub mod desk;
-/// The engine a request-and-answer module (messages, the gallery) runs on a link.
 pub mod diag_session;
 pub mod diagnostics;
 /// Windows self-elevation, so injected input isn't blocked by UIPI.

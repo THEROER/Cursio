@@ -85,6 +85,7 @@ impl NodeHandle {
     /// binding can fail (a port in use, no network yet) and a service that
     /// waited for it would block Android's `onStartCommand` past its deadline.
     pub fn start(display_name: String, port: u16) -> anyhow::Result<Self> {
+        cursio_core::crash::arm();
         let mut identity = NodeIdentity::load_or_create()?;
         // Android's hostname is a meaningless `localhost` on most devices, so a
         // phone that has never been named takes the one the app passes (the
