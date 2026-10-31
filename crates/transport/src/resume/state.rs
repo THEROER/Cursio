@@ -5,6 +5,7 @@ use crate::lane::Lane;
 use crate::priority::QueueKick;
 use crate::resume::PathKind;
 use crate::resume::Paths;
+use crate::resume::INPUT_STALL;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -94,6 +95,32 @@ impl State {
             })
     }
 
+    /// Whether input has stopped getting through on `id`, a network path
+    /// carrying the interactive lane, while a Bluetooth path could take it:
+    /// a key or click unacknowledged, or a probe unanswered, for
+    /// [`INPUT_STALL`]. Pointer motion is never kept for an acknowledgement,
+    /// so the probe is what notices a stall while only the pointer moves.
+    ///
+    /// Never true of a Bluetooth path, whose round trip itself spikes past a
+    /// second: moving input off it on that evidence would send it back to a
+    /// network path that may be the dead one.
+    pub(super) fn input_stalled_on(&self, id: u64, now: Instant) -> bool {
+        let Some(path) = self.paths.iter().find(|p| p.id == id) else {
+            return false;
+        };
+        if path.kind != PathKind::Network
+            || !self.paths.iter().any(|p| p.kind == PathKind::Bluetooth)
+        {
+            return false;
+        }
+        let late = |at: Instant| now.duration_since(at) > INPUT_STALL;
+        let unacked = self.lanes[Lane::Interactive as usize]
+            .unacked
+            .iter()
+            .any(|k| k.sent_on == Some(id) && k.sent_at.is_some_and(late));
+        unacked || path.probe.is_some_and(|(_, at)| late(at))
+    }
+
     pub(super) fn summary(&self) -> Paths {
         Paths {
             network: self.paths.iter().any(|p| p.kind == PathKind::Network),
@@ -133,5 +160,64 @@ impl State {
                         .is_none_or(|until| until <= Instant::now())
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(id: u64, kind: PathKind, now: Instant) -> PathSlot {
+        PathSlot {
+            id,
+            kind,
+            writers: std::array::from_fn(|_| mpsc::channel(1).0),
+            last_heard: now,
+            degraded_until: None,
+            attached_at: now,
+            probe: None,
+            last_probe: now,
+            tasks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_unanswered_probe_moves_input_to_a_bluetooth_standby_within_a_second() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.paths.push(path(1, PathKind::Network, now));
+        state.paths[0].probe = Some((7, now));
+        assert!(!state.input_stalled_on(1, now + INPUT_STALL * 2));
+
+        state.paths.push(path(2, PathKind::Bluetooth, now));
+        assert!(!state.input_stalled_on(1, now + INPUT_STALL / 2));
+        assert!(state.input_stalled_on(1, now + INPUT_STALL * 2));
+    }
+
+    #[test]
+    fn a_slow_bluetooth_path_is_never_called_stalled_for_input() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.paths.push(path(1, PathKind::Network, now));
+        state.paths.push(path(2, PathKind::Bluetooth, now));
+        state.paths[1].probe = Some((7, now));
+        assert!(!state.input_stalled_on(2, now + INPUT_STALL * 5));
+    }
+
+    #[test]
+    fn an_unacknowledged_key_counts_as_stalled_input() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.paths.push(path(1, PathKind::Network, now));
+        state.paths.push(path(2, PathKind::Bluetooth, now));
+        state.lanes[Lane::Interactive as usize]
+            .unacked
+            .push_back(Kept {
+                seq: 1,
+                frame: Vec::new(),
+                sent_at: Some(now),
+                sent_on: Some(1),
+            });
+        assert!(state.input_stalled_on(1, now + INPUT_STALL * 2));
     }
 }

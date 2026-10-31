@@ -114,6 +114,11 @@ const STANDBY_SILENCE: Duration = Duration::from_secs(45);
 /// A frame unacknowledged this long on the carrying path, with another path
 /// alive, marks the carrying path degraded.
 const STALL: Duration = Duration::from_secs(3);
+/// As [`STALL`], for input on a network path while a Bluetooth path stands
+/// by. Input is what the person is waiting on, and a LAN answers in
+/// milliseconds: three seconds of a pointer going nowhere before the standby
+/// took over was most of what a Wi-Fi drop felt like.
+const INPUT_STALL: Duration = Duration::from_secs(1);
 /// How long a degraded path is passed over.
 const DEGRADED_FOR: Duration = Duration::from_secs(10);
 

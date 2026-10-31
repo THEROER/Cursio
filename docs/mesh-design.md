@@ -595,7 +595,9 @@ connections are *paths* under it:
   unacknowledged for 10 s (`TCP_USER_TIMEOUT`, `transport/src/dead_peer.rs` —
   keepalive alone never fires while data is queued). A carrying path whose
   frames stay unacknowledged for 3 s while another path exists is *degraded*
-  for 10 s and the session moves — the stale-subflow idea from multipath TCP,
+  for 10 s and the session moves (1 s for input on a network path with a
+  Bluetooth path beside it, counting an unanswered probe, since pointer motion
+  is never kept for acknowledgement) — the stale-subflow idea from multipath TCP,
   with a hold so a marginal Wi-Fi does not make it flap. The system's own word
   ends network paths at once: NetworkManager's state on Linux
   (`core/src/network_watch.rs`), `NetworkCallback.onLost` on Android

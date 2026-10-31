@@ -56,15 +56,22 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
                     silent.push((path.id, quiet));
                 }
             }
+            let interactive = state.carrying(Lane::Interactive, now).map(|p| p.id);
             for id in carrying {
                 let stalled = state.paths.len() > 1
                     && state.lanes.iter().flat_map(|d| d.unacked.iter()).any(|k| {
                         k.sent_on == Some(id)
                             && k.sent_at.is_some_and(|at| now.duration_since(at) > STALL)
                     });
+                let stalled =
+                    stalled || (Some(id) == interactive && state.input_stalled_on(id, now));
                 if stalled {
                     if let Some(path) = state.paths.iter_mut().find(|p| p.id == id) {
                         path.degraded_until = Some(now + DEGRADED_FOR);
+                        // A ping lost in the stall would otherwise still be
+                        // outstanding when the hold ends, and degrade the path
+                        // again at once however well it carries by then.
+                        path.probe = None;
                         degraded = Some(id);
                     }
                 }
