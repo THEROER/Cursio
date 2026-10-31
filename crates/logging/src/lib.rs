@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 
-use tracing_appender::non_blocking::WorkerGuard;
+pub use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -86,6 +86,57 @@ impl<'writer> fmt::FormatFields<'writer> for FileFields {
     ) -> std::fmt::Result {
         self.0.format_fields(writer, fields)
     }
+}
+
+/// The rotating log file `app_name` writes in `dir`, kept for [`KEEP_DAYS`],
+/// remembered as this process's log ([`log_file_name`]).
+fn file_writer(
+    dir: &std::path::Path,
+    app_name: &str,
+) -> (tracing_appender::non_blocking::NonBlocking, WorkerGuard) {
+    let _ = LOG_FILE.set(format!("{app_name}.log"));
+    // Daily files with nothing removing them had grown to 5 GiB.
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(format!("{app_name}.log"))
+        .max_log_files(KEEP_DAYS)
+        .build(dir)
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "cannot keep a bounded log in {}: {error}; keeping every day",
+                dir.display()
+            );
+            tracing_appender::rolling::daily(dir, format!("{app_name}.log"))
+        });
+    tracing_appender::non_blocking(appender)
+}
+
+/// How a log file's lines are written, so every process's file reads alike.
+fn file_format<S>() -> fmt::Layer<S, FileFields>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .fmt_fields(FileFields::default())
+}
+
+/// The log file layer for a process that builds its own subscriber — a
+/// phone's, which also writes to logcat. Lines go to [`log_dir`] as `init`
+/// writes them, so a peer can read them with `cursio logs`; the guard must be
+/// kept for as long as the process logs. `None` when the directory cannot be
+/// made.
+pub fn file_layer<S>(
+    app_name: &str,
+) -> Option<(impl tracing_subscriber::Layer<S> + Send + Sync, WorkerGuard)>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    let dir = log_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let (writer, guard) = file_writer(&dir, app_name);
+    Some((file_format().with_writer(writer), guard))
 }
 
 /// How many days of each process's log are kept.
@@ -155,26 +206,8 @@ pub fn init_with_verbosity(app_name: &str, verbosity: u8) -> LogGuard {
     // than panicking a networking tool over a logging detail.
     let file_layer = match std::fs::create_dir_all(&dir) {
         Ok(()) => {
-            let _ = LOG_FILE.set(format!("{app_name}.log"));
-            // Kept for [`KEEP_DAYS`] and then removed, oldest first: daily
-            // files with nothing removing them had grown to 5 GiB.
-            let appender = tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix(format!("{app_name}.log"))
-                .max_log_files(KEEP_DAYS)
-                .build(&dir)
-                .unwrap_or_else(|error| {
-                    eprintln!(
-                        "cannot keep a bounded log in {}: {error}; keeping every day",
-                        dir.display()
-                    );
-                    tracing_appender::rolling::daily(&dir, format!("{app_name}.log"))
-                });
-            let (writer, worker) = tracing_appender::non_blocking(appender);
-            let layer = fmt::layer()
-                .with_ansi(false)
-                .with_target(true)
-                .fmt_fields(FileFields::default())
+            let (writer, worker) = file_writer(&dir, app_name);
+            let layer = file_format()
                 .with_writer(writer)
                 .with_filter(file_env_filter(verbosity));
             Some((layer, worker))

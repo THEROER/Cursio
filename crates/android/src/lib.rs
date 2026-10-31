@@ -192,8 +192,17 @@ fn init_logcat() {
         Ok(layer) => layer,
         Err(_) => return,
     };
+    // The file too: a release APK cannot be read with `run-as`, so the file
+    // is how a computer reads the phone's log (`cursio logs`, `cursio
+    // report`) — without it the phone answered "this node keeps no log file".
+    static FILE_GUARD: std::sync::OnceLock<cursio_log::WorkerGuard> = std::sync::OnceLock::new();
+    let file = cursio_log::file_layer("cursio").map(|(layer, guard)| {
+        let _ = FILE_GUARD.set(guard);
+        layer
+    });
     let _ = tracing_subscriber::registry()
         .with(layer)
+        .with(file)
         .with(tracing_subscriber::EnvFilter::new(log_filter()))
         .try_init();
 }
