@@ -176,7 +176,7 @@ pub(crate) const ANDROID_TAURI_TARGET: &str = "aarch64";
 /// What crosses is the mesh core plus the modules with an Android backend
 /// (audio). Turning another on does not fail at the feature — it fails deep
 /// inside PipeWire or FUSE, which is a much worse error to read.
-pub(crate) fn android(release: bool) -> Result<PathBuf> {
+pub(crate) fn android(release: bool, build_version: Option<&str>) -> Result<PathBuf> {
     ensure_rust_target(ANDROID_TARGET)?;
 
     let Some(bun) = which("bun") else {
@@ -267,6 +267,11 @@ pub(crate) fn android(release: bool) -> Result<PathBuf> {
     // found" otherwise), and whose default Makefile generator `cmake-rs` cannot
     // locate a make for under this toolchain.
     cmd.env("ANDROID_NDK_ROOT", &ndk);
+    // The version a staged APK goes out as, read back by the phone's node
+    // (`cursio_core::update::running_build`) so it knows not to take it again.
+    if let Some(version) = build_version {
+        cmd.env("CURSIO_BUILD", version);
+    }
     cmd.env("CMAKE_GENERATOR", "Ninja");
     run(cmd)?;
 

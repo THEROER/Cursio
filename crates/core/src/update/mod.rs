@@ -71,6 +71,10 @@ pub fn running_build() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|exe| layout::InstallLayout::for_user().ok()?.version_of(&exe))
+        // A phone's node runs inside its app, not from `versions/`; the
+        // version it was staged as is written in when it is built
+        // (`cargo xtask stage`), or it would take its own build again.
+        .or_else(|| option_env!("CURSIO_BUILD").map(str::to_owned))
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
 }
 

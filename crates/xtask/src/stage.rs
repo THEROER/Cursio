@@ -198,7 +198,7 @@ fn stage_android(no_build: bool, version: &str) -> Result<(String, PathBuf)> {
             "app/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk",
         )
     } else {
-        crate::cross::android(true)?
+        crate::cross::android(true, Some(version))?
     };
     if !apk.is_file() {
         bail!("{} is missing; build it or drop --no-build", apk.display());
