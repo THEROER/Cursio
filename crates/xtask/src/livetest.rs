@@ -251,6 +251,50 @@ fn local_window(mark: &LogMark) -> Result<String> {
     Ok(text)
 }
 
+/// Where the peer's log stood, read through the mesh: its newest line's
+/// timestamp. `None` when the peer cannot be asked that way.
+///
+/// The mesh reaches a peer ssh does not — a laptop on a phone's hotspot,
+/// whose Tailscale and ssh drop while its session goes on over Bluetooth.
+fn mesh_mark(peer_name: &str) -> Option<String> {
+    let output = Command::new(cursio_cli())
+        .args(["logs", peer_name, "-n", "1"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let stamp = text.lines().last()?.split_whitespace().next()?.to_string();
+    Some(stamp)
+}
+
+/// The peer's lines written after `mark`, through the mesh. The window is
+/// asked for by the peer's clock with room to spare and cut at the mark,
+/// which is also the peer's clock, so the two machines' clocks never meet.
+fn mesh_window(peer_name: &str, mark: &str, seconds: u64) -> Result<String> {
+    let output = Command::new(cursio_cli())
+        .args(["logs", peer_name, "-n", "5000", "--since"])
+        .arg(format!("{}s", seconds + 60))
+        .stderr(Stdio::null())
+        .output()
+        .context("running `cursio logs`")?;
+    if !output.status.success() {
+        bail!("`cursio logs {peer_name}` failed");
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .next()
+                .is_some_and(|stamp| stamp > mark)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect())
+}
+
 fn remote_mark(peer: &Peer) -> Result<LogMark> {
     let out = peer.bash(&format!(
         "d=$(date -u +%F); f={}/cursio.log.$d; echo $d; stat -c %s \"$f\" 2>/dev/null || echo 0\n",
@@ -504,7 +548,14 @@ pub fn live_test(args: LiveTestArgs) -> Result<()> {
         .map(|want| carried(peer_name, want, "at the start"));
 
     let local_start = local_mark()?;
-    let remote_start = remote_mark(peer).context("reading the peer's log position")?;
+    let mesh_start = mesh_mark(peer_name);
+    let remote_start = match &mesh_start {
+        Some(_) => None,
+        None => {
+            println!("→ {peer_name} does not answer `cursio logs`; reading its log over ssh");
+            Some(remote_mark(peer).context("reading the peer's log position")?)
+        }
+    };
     let pressure_start = pressure_totals();
     let started = Instant::now();
     let until = started + Duration::from_secs(args.seconds);
@@ -538,7 +589,12 @@ pub fn live_test(args: LiveTestArgs) -> Result<()> {
         });
 
     let local_log = local_window(&local_start)?;
-    let remote_log = remote_window(peer, &remote_start).context("reading the peer's log")?;
+    let remote_log = match (&mesh_start, &remote_start) {
+        (Some(mark), _) => mesh_window(peer_name, mark, args.seconds)
+            .context("reading the peer's log through the mesh")?,
+        (None, Some(mark)) => remote_window(peer, mark).context("reading the peer's log")?,
+        (None, None) => unreachable!("one of the two marks is always taken"),
+    };
     let local = logscan::summarize(local_log.lines());
     let remote = logscan::summarize(remote_log.lines());
     println!(
