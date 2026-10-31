@@ -90,13 +90,32 @@ fn chain_hook(dir: PathBuf) {
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "a panic with no message".into());
         let line = format!(
-            "{at} panic in thread {} at {place}: {message}",
-            thread.name().unwrap_or("unnamed")
+            "{at} panic in thread {} at {place}: {message}; from {}",
+            thread.name().unwrap_or("unnamed"),
+            our_frames(&std::backtrace::Backtrace::force_capture().to_string())
         );
         tracing::error!(%line, "panic");
         let _ = std::fs::write(dir.join(PANIC_FILE), &line);
         previous(info);
     }));
+}
+
+/// The frames of a backtrace that are Cursio's own, innermost first, as one
+/// line. A panic inside a library names only the library's line — tokio's
+/// "cannot start a runtime from within a runtime" said nothing of which call
+/// of ours did it — and the whole trace is too long to carry in a problem.
+fn our_frames(trace: &str) -> String {
+    let frames: Vec<&str> = trace
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.split_once(": ").map(|(_, name)| name))
+        .filter(|name| name.starts_with("cursio") && !name.starts_with("cursio_core::crash"))
+        .take(6)
+        .collect();
+    match frames.is_empty() {
+        true => "no frame of Cursio's in the trace".into(),
+        false => frames.join(" < "),
+    }
 }
 
 /// Crash dumps of this program newer than the last reported, oldest first,
@@ -166,6 +185,21 @@ fn new_dumps(_log_dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_cursios_own_frames_are_kept_innermost_first() {
+        let trace = "   0: std::backtrace::Backtrace::force_capture\n\
+                     \x20  1: cursio_core::crash::chain_hook::{{closure}}\n\
+                     \x20  2: tokio::runtime::scheduler::multi_thread::MultiThread::block_on\n\
+                     \x20            at /x/tokio/src/runtime/scheduler/multi_thread/mod.rs:91:9\n\
+                     \x20  3: cursio_core::media_hub::Hub::refresh\n\
+                     \x20  4: cursio::mesh::run_mesh::{{closure}}\n";
+        assert_eq!(
+            our_frames(trace),
+            "cursio_core::media_hub::Hub::refresh < cursio::mesh::run_mesh::{{closure}}"
+        );
+        assert_eq!(our_frames("0: std::x"), "no frame of Cursio's in the trace");
+    }
 
     #[test]
     fn a_panic_written_by_the_last_run_is_reported_once() {
