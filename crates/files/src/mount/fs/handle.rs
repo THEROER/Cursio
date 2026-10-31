@@ -120,6 +120,31 @@ pub fn release_stale_peer_mounts(root: &std::path::Path) {
         let target = target.replace("\\040", " ");
         release_stale_mount(std::path::Path::new(&target));
     }
+    remove_empty_leftovers(root);
+}
+
+/// Remove the empty folders a previous run's mounts left under `root`.
+///
+/// A mount point is removed when its mount ends in an orderly way
+/// ([`MountHandle`]'s `Drop`), but a node stopped for an update or killed
+/// never runs it, and a volume renamed since (a new naming rule, a relabelled
+/// disk) is never mounted at the old folder again to clean it then. They sat
+/// in `~/Cursio/<peer>` as folders that look like disks and hold nothing.
+///
+/// Only `remove_dir`, after the mounts above were released: it removes only
+/// an empty directory, so a folder holding anything — or still a mount
+/// point — stays. The volume folders are reached by listing `root`, never by
+/// stat'ing them, which on a wedged FUSE mount would block.
+fn remove_empty_leftovers(root: &std::path::Path) {
+    let Ok(volumes) = std::fs::read_dir(root) else {
+        return;
+    };
+    for volume in volumes.flatten() {
+        let volume = volume.path();
+        if !is_mounted(&volume) && std::fs::remove_dir(&volume).is_ok() {
+            tracing::info!(folder = %volume.display(), "removed an empty folder a previous mount left");
+        }
+    }
 }
 
 /// The session configuration the mount runs under.
@@ -221,6 +246,21 @@ pub fn mount(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_renamed_volumes_empty_folder_goes_and_a_folder_holding_files_stays() {
+        let root = std::env::temp_dir().join(format!("cursio-leftovers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Windows-SSD (C)")).unwrap();
+        std::fs::create_dir_all(root.join("kept")).unwrap();
+        std::fs::write(root.join("kept").join("note.txt"), b"x").unwrap();
+
+        release_stale_peer_mounts(&root);
+
+        assert!(!root.join("Windows-SSD (C)").exists());
+        assert!(root.join("kept").join("note.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The mount check must answer from `/proc/mounts` and never stat the path.
     ///
