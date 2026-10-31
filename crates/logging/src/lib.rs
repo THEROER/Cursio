@@ -68,6 +68,16 @@ pub fn log_dir() -> PathBuf {
 /// Where logs go when the platform cannot be asked.
 static LOG_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// The file name this process's log rotates under, set by [`init`].
+static LOG_FILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The name this process's rotating log files start with (`cursio.log`, so
+/// `cursio.log.2026-10-31`), once [`init`] has run. A phone's node logs inside
+/// its app's process, under the app's name, so a reader cannot assume one.
+pub fn log_file_name() -> Option<&'static str> {
+    LOG_FILE.get().map(String::as_str)
+}
+
 /// Write logs under `dir` instead of the platform's data directory.
 ///
 /// Android has no data directory this process can derive: the writable path is
@@ -122,6 +132,7 @@ pub fn init_with_verbosity(app_name: &str, verbosity: u8) -> LogGuard {
     // than panicking a networking tool over a logging detail.
     let file_layer = match std::fs::create_dir_all(&dir) {
         Ok(()) => {
+            let _ = LOG_FILE.set(format!("{app_name}.log"));
             let appender = tracing_appender::rolling::daily(&dir, format!("{app_name}.log"));
             let (writer, worker) = tracing_appender::non_blocking(appender);
             let layer = fmt::layer()

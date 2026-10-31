@@ -59,6 +59,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use async_trait::async_trait;
+use cursio_protocol::diag::{PathChoice, PathReport};
 use cursio_protocol::{Message, SessionTag};
 use tokio::sync::{mpsc, Notify};
 
@@ -244,6 +245,39 @@ impl ResumeHandle {
     /// End the session: its peer no longer has it, or the user removed it.
     pub fn end(&self, why: &str) {
         self.0.end(why.to_string());
+    }
+
+    /// Carry what this end sends as `choice` says, for the rest of the
+    /// session; see [`PathChoice`]. Frames already numbered are resent on the
+    /// newly chosen path, as after any change of path.
+    pub fn choose(&self, choice: PathChoice) {
+        {
+            let mut state = self.0.lock();
+            if state.choice == choice {
+                return;
+            }
+            state.choice = choice;
+        }
+        tracing::info!(?choice, "the session's path was chosen by hand");
+        self.0.changed.notify_waiters();
+        self.0.kick(0);
+    }
+
+    /// This end's view of its paths, for a person diagnosing them.
+    pub fn report(&self) -> PathReport {
+        let state = self.0.lock();
+        let paths = state.summary();
+        PathReport {
+            network: paths.network,
+            bluetooth: paths.bluetooth,
+            carrying: state
+                .carrying(Lane::Interactive, Instant::now())
+                .map(|path| match path.kind {
+                    PathKind::Bluetooth => "bluetooth".to_string(),
+                    _ => "network".to_string(),
+                }),
+            choice: state.choice,
+        }
     }
 
     /// Be told whenever the set of paths changes.
@@ -827,6 +861,27 @@ mod tests {
         a.tx.send(&key(3)).await.unwrap();
         assert_eq!(next(&mut b).await, key(3), "the standby did not take over");
         assert!(!a.tx.holding());
+    }
+
+    #[tokio::test]
+    async fn choosing_bluetooth_by_hand_carries_input_there_while_the_network_stands_by() {
+        let (mut a, mut b) = session().await;
+        let (pa, pb, _) = path_pair(PathKind::Bluetooth).await;
+        let (ra, rb) = tokio::join!(a.handle.attach(pa), b.handle.attach(pb));
+        ra.unwrap();
+        rb.unwrap();
+        assert_eq!(a.handle.report().carrying.as_deref(), Some("network"));
+
+        a.handle.choose(PathChoice::Bluetooth);
+        let report = a.handle.report();
+        assert_eq!(report.carrying.as_deref(), Some("bluetooth"));
+        assert_eq!(report.choice, PathChoice::Bluetooth);
+        assert!(report.network && report.bluetooth);
+        a.tx.send(&key(5)).await.unwrap();
+        assert_eq!(next(&mut b).await, key(5));
+
+        a.handle.choose(PathChoice::Auto);
+        assert_eq!(a.handle.report().carrying.as_deref(), Some("network"));
     }
 
     #[tokio::test]

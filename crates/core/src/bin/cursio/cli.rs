@@ -122,6 +122,37 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: BluetoothAction,
     },
+    /// Show the newest lines of this machine's log, of other machines' in the
+    /// mesh, or of all of them merged by time. Goes through the running node.
+    Logs {
+        /// Machines to read, by name or id, `this` for this one; `all` is
+        /// this one and every connected machine. This one when none is named.
+        machines: Vec<String>,
+        /// How many of the newest lines, per machine.
+        #[arg(short = 'n', long, default_value_t = 200)]
+        lines: u32,
+        /// Only lines from the last `30s`, `10m`, `2h` or `1d`, by each
+        /// machine's own clock.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only lines containing this text.
+        #[arg(short = 'g', long)]
+        grep: Option<String>,
+        /// Keep printing lines as they are written.
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+    /// Show which path carries the session with a machine, from both ends, or
+    /// choose one on both ends for the rest of that session. Goes through the
+    /// running node.
+    Path {
+        /// The machine, by name or id.
+        machine: String,
+        /// `bluetooth` carries the session over Bluetooth while it has a
+        /// Bluetooth path, `network` keeps it on the network even while that
+        /// fails, `auto` is the usual: the network, Bluetooth when it is gone.
+        choice: Option<PathArg>,
+    },
     /// Read and send a connected phone's text messages, through the running
     /// node.
     Sms {
@@ -433,6 +464,25 @@ pub(crate) enum SmsAction {
         number: String,
         text: String,
     },
+}
+
+/// Which path `cursio path` chooses; see
+/// [`cursio_protocol::diag::PathChoice`].
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum PathArg {
+    Auto,
+    Network,
+    Bluetooth,
+}
+
+impl From<PathArg> for cursio_protocol::diag::PathChoice {
+    fn from(arg: PathArg) -> Self {
+        match arg {
+            PathArg::Auto => Self::Auto,
+            PathArg::Network => Self::Network,
+            PathArg::Bluetooth => Self::Bluetooth,
+        }
+    }
 }
 
 /// What this machine offers over `--files`: the flag's roots when any were

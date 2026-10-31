@@ -11,6 +11,7 @@ pub mod audio;
 pub mod calls;
 pub mod capability;
 pub mod clipboard;
+pub mod diag;
 pub mod exchange;
 pub mod files;
 pub mod frame;

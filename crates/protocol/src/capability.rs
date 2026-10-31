@@ -83,6 +83,9 @@ impl ModuleId {
     /// Photos and videos of one machine, browsed from another; see
     /// [`gallery`](crate::gallery).
     pub const GALLERY: ModuleId = ModuleId(14);
+    /// Another machine's log and the session's paths, asked for; see
+    /// [`diag`](crate::diag).
+    pub const DIAG: ModuleId = ModuleId(15);
 
     /// Human-readable name, for logs and diagnostics. Unknown ids are rendered
     /// numerically rather than hidden — that is exactly the case worth seeing in
@@ -103,6 +106,7 @@ impl ModuleId {
             ModuleId::CALLS => "calls",
             ModuleId::MEDIA => "media",
             ModuleId::GALLERY => "gallery",
+            ModuleId::DIAG => "diag",
             _ => "unknown",
         }
     }

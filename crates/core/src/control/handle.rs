@@ -58,10 +58,78 @@ pub async fn ask_gallery(command: &Command) -> Option<Reply> {
     Some(reply)
 }
 
+/// Answer a diagnostics command: a log here or on a peer, or a session's
+/// paths seen, or chosen, from both ends.
+async fn ask_diag(command: &Command) -> Option<Reply> {
+    use cursio_protocol::diag::{DiagRequest, DiagResponse};
+    let hub = crate::diag_session::hub();
+    let logs = |result: Result<DiagResponse, String>| match result {
+        Ok(DiagResponse::Logs { lines, truncated }) => Reply::LogLines { lines, truncated },
+        Ok(other) => error(format!("a log request was answered with {other:?}")),
+        Err(message) => Reply::Error { message },
+    };
+    Some(match command {
+        Command::Logs {
+            machine,
+            after,
+            within_secs,
+            contains,
+            max_lines,
+        } => match machine {
+            None => logs(crate::diag_session::own_log(crate::log_tail::Tail {
+                after: after.clone(),
+                within: within_secs.map(std::time::Duration::from_secs),
+                contains: contains.clone(),
+                max_lines: *max_lines,
+            })),
+            Some(machine) => {
+                let request = DiagRequest::Logs {
+                    after: after.clone(),
+                    within_secs: *within_secs,
+                    contains: contains.clone(),
+                    max_lines: *max_lines,
+                };
+                logs(hub.ask(machine, request).await)
+            }
+        },
+        Command::Paths { peer, choice } => {
+            let Some(id) = hub
+                .peers()
+                .into_iter()
+                .find(|p| p.peer.to_string() == *peer || p.name.eq_ignore_ascii_case(peer))
+                .map(|p| p.peer)
+            else {
+                return Some(error(format!(
+                    "no connected machine called {peer} answers diagnostics"
+                )));
+            };
+            let here = match crate::diag_session::paths(&id, *choice) {
+                Ok(here) => here,
+                Err(message) => return Some(Reply::Error { message }),
+            };
+            let (there, there_error) =
+                match hub.ask(peer, DiagRequest::Paths { choice: *choice }).await {
+                    Ok(DiagResponse::Paths(report)) => (Some(report), None),
+                    Ok(other) => (None, Some(format!("answered with {other:?}"))),
+                    Err(e) => (None, Some(e)),
+                };
+            Reply::Paths {
+                here,
+                there,
+                there_error,
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// Answer a command that waits on a peer; anything else goes to `state`.
 pub async fn handle_waiting(state: &NodeState, command: Command) -> Reply {
     use cursio_protocol::messages::MessagesResponse;
     if let Some(reply) = ask_gallery(&command).await {
+        return reply;
+    }
+    if let Some(reply) = ask_diag(&command).await {
         return reply;
     }
     if let Command::Ring { peer } = &command {
@@ -289,6 +357,11 @@ impl NodeState {
             | Command::GalleryRead { .. }
             | Command::GallerySave { .. } => {
                 error("a machine's gallery is browsed from a desktop's control socket")
+            }
+            // They wait on a peer; the socket answers them through
+            // `handle_waiting`.
+            Command::Logs { .. } | Command::Paths { .. } => {
+                error("logs and paths are asked through a desktop's control socket")
             }
         }
     }

@@ -65,6 +65,7 @@ use cursio_protocol::{ModuleId, ServiceId, ServiceOffer};
 mod airplay;
 mod cli;
 mod client;
+mod diag;
 mod input;
 mod mesh;
 mod modules;
@@ -468,6 +469,23 @@ async fn run() -> anyhow::Result<()> {
         Command::Call { action } => call(action).await,
         Command::Bluetooth { action } => bluetooth(action),
         Command::Sms { action } => sms(action).await,
+        Command::Logs {
+            machines,
+            lines,
+            since,
+            grep,
+            follow,
+        } => {
+            diag::logs(diag::LogsArgs {
+                machines,
+                lines,
+                since,
+                grep,
+                follow,
+            })
+            .await
+        }
+        Command::Path { machine, choice } => diag::path(&machine, choice).await,
         Command::Portal { action } => portal(action).await,
         Command::MountHelper { .. } => unreachable!("handled before the node starts"),
     }

@@ -177,6 +177,7 @@ pub(crate) fn module_registry(
                 .map(|g| std::sync::Arc::new(g) as _),
             view: true,
         }))
+        .with(Box::new(cursio_core::diag_session::DiagFactory))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,
             reasons: services.reasons,

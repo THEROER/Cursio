@@ -51,10 +51,11 @@ pub mod config;
 pub mod control;
 /// This machine's current problems, each with the fix where there is one.
 pub mod desk;
+/// The engine a request-and-answer module (messages, the gallery) runs on a link.
+pub mod diag_session;
 pub mod diagnostics;
 /// Windows self-elevation, so injected input isn't blocked by UIPI.
 pub mod elevate;
-/// The engine a request-and-answer module (messages, the gallery) runs on a link.
 pub mod exchange_session;
 /// File sharing. Serving this machine's volumes is portable and always built;
 /// *mounting* the peer's needs FUSE on Linux or WinFsp on Windows (and the
@@ -85,6 +86,7 @@ pub mod input_hub;
 pub mod link;
 /// Applying a changed config to running links instead of restarting.
 pub mod live;
+pub mod log_tail;
 pub mod logging;
 /// Where this machine's players meet the mesh and peers' are shown.
 pub mod media_hub;

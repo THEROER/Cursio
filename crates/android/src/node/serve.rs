@@ -169,6 +169,7 @@ fn phone_modules(control: &NodeState, mic_gate: LiveShared<MicGate>) -> ModuleRe
             store: Some(crate::gallery::AndroidGallery::shared()),
             view: true,
         }))
+        .with(Box::new(cursio_core::diag_session::DiagFactory))
         // The phone's screen, shown on a computer and driven from it.
         .with(Box::new(
             cursio_core::window_session::WindowFactory::default(),

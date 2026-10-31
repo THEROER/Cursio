@@ -6,6 +6,7 @@ use crate::priority::QueueKick;
 use crate::resume::PathKind;
 use crate::resume::Paths;
 use crate::resume::INPUT_STALL;
+use cursio_protocol::diag::PathChoice;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -78,6 +79,7 @@ pub(super) struct State {
     pub(super) reported: Paths,
     pub(super) bulk_active: Option<Instant>,
     pub(super) next_probe: u64,
+    pub(super) choice: PathChoice,
 }
 
 impl State {
@@ -86,12 +88,22 @@ impl State {
             .iter()
             .filter(|p| p.kind.lane() == Some(lane) || p.kind == PathKind::Bluetooth)
             .min_by_key(|p| {
+                let bluetooth = p.kind == PathKind::Bluetooth;
                 let degraded = p.degraded_until.is_some_and(|until| until > now);
-                (
-                    degraded,
-                    p.kind == PathKind::Bluetooth,
-                    std::cmp::Reverse(p.attached_at),
-                )
+                match self.choice {
+                    PathChoice::Auto => {
+                        (false, degraded, bluetooth, std::cmp::Reverse(p.attached_at))
+                    }
+                    PathChoice::Network => {
+                        (bluetooth, degraded, false, std::cmp::Reverse(p.attached_at))
+                    }
+                    PathChoice::Bluetooth => (
+                        !bluetooth,
+                        degraded,
+                        false,
+                        std::cmp::Reverse(p.attached_at),
+                    ),
+                }
             })
     }
 

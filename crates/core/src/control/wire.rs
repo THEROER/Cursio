@@ -291,6 +291,27 @@ pub enum Command {
         offset: u64,
         len: u32,
     },
+    /// The newest lines of a machine's log (this one's when `machine` is
+    /// absent); see [`cursio_protocol::diag::DiagRequest::Logs`].
+    Logs {
+        #[serde(default)]
+        machine: Option<String>,
+        #[serde(default)]
+        after: Option<String>,
+        #[serde(default)]
+        within_secs: Option<u64>,
+        #[serde(default)]
+        contains: Option<String>,
+        max_lines: u32,
+    },
+    /// Report the paths of the session with `peer` from both ends, first
+    /// choosing `choice` on both when given; see
+    /// [`cursio_protocol::diag::PathChoice`].
+    Paths {
+        peer: String,
+        #[serde(default)]
+        choice: Option<cursio_protocol::diag::PathChoice>,
+    },
     /// Copy one item to this machine's `Pictures/Cursio/<peer>`, or into `dir`
     /// when given: a folder the user picked, or the app's cache for a file it
     /// is about to open, copy or send on.
@@ -431,7 +452,10 @@ impl Command {
     pub fn waits_on_peer(&self) -> bool {
         self.messages_request().is_some()
             || self.gallery_ask().is_some()
-            || matches!(self, Command::Ring { .. })
+            || matches!(
+                self,
+                Command::Ring { .. } | Command::Logs { .. } | Command::Paths { .. }
+            )
     }
 }
 
@@ -497,6 +521,21 @@ pub enum Reply {
     /// Where a gallery item was saved on this machine.
     SavedFile {
         path: PathBuf,
+    },
+    /// Lines of a machine's log, oldest first; `truncated` when older ones
+    /// matched but were left out.
+    LogLines {
+        lines: Vec<String>,
+        truncated: bool,
+    },
+    /// The session with a peer as each end sees it. `there` is absent when
+    /// the peer could not be asked, and `there_error` says why.
+    Paths {
+        here: cursio_protocol::diag::PathReport,
+        #[serde(default)]
+        there: Option<cursio_protocol::diag::PathReport>,
+        #[serde(default)]
+        there_error: Option<String>,
     },
 }
 

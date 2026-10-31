@@ -103,3 +103,26 @@ from traffic the user produces during the window.
 transmission. The outbox's age and transport queue delays are measured separately;
 their percentiles must not be added to claim an end-to-end percentile. Process
 queue peaks and ages describe each ten-second reporting window.
+
+## Every machine's log, and the path, from one machine
+
+The `diag` module (15, `core/src/diag_session.rs`) runs on every link, the
+phone's included. It answers for its node's own log and for its end of the
+session's paths, so neither needs a shell on the other machine:
+
+```sh
+cursio logs all -n 300 --since 10m          # this machine and every connected one, merged by time
+cursio logs Lightmoon --grep "path of the session" -f
+cursio path Lightmoon                       # which path carries input, seen from both ends
+cursio path Lightmoon bluetooth             # carry the session over Bluetooth on both ends
+cursio path Lightmoon network               # keep it on the network even while that fails
+cursio path Lightmoon auto
+```
+
+A log answer is the newest lines at most 5000 lines or 512 KiB, and the
+answering node reads at most 64 MiB of its files for one; `--since` counts by
+each machine's own clock. Merged lines are ordered by their UTC timestamps,
+so a machine with a skewed clock shows as one whose lines all sit early or
+late. A path choice lasts as long as that session and is not a setting:
+choosing a path the session does not have leaves it on the one it has, so
+`bluetooth` needs a Bluetooth path up first (`[bluetooth] standby = true`).

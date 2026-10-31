@@ -443,12 +443,14 @@ impl PeerRegistry {
 
     /// Hold `handle` as `peer`'s session.
     pub fn hold_session(&mut self, peer: PeerId, handle: ResumeHandle) {
+        crate::diag_session::hold(peer, handle.clone());
         self.sessions.insert(peer, HeldSession(handle));
     }
 
     /// `peer`'s session tagged `tag` ended; forget it unless a newer one
     /// replaced it already.
     pub fn session_ended(&mut self, peer: PeerId, tag: SessionTag) {
+        crate::diag_session::release(peer, tag);
         if self.sessions.get(&peer).is_some_and(|s| s.0.tag() == tag) {
             self.sessions.remove(&peer);
         }
