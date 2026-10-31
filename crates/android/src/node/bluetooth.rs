@@ -21,13 +21,22 @@ pub(super) async fn dial_bluetooth(ctx: &Rc<NodeCtx>) {
         return;
     }
     let now = std::time::Instant::now();
-    let offline: Vec<PeerId> = ctx
-        .registry
-        .borrow()
-        .all()
-        .filter(|peer| !matches!(peer.state, PeerState::Online | PeerState::Connecting))
-        .map(|peer| peer.peer_id)
-        .collect();
+    // Read from the session's paths, not the peer's state: a session whose
+    // Bluetooth path dropped stays Online for the minute it waits for a new
+    // one, so a phone that waited for Offline called back just after that
+    // minute ran out — every time, which built a whole new session over the
+    // radio once a minute instead of resuming the one that was waiting.
+    let offline: Vec<PeerId> = {
+        let registry = ctx.registry.borrow();
+        registry
+            .all()
+            .filter(|peer| {
+                !matches!(peer.state, PeerState::Connecting)
+                    && !registry.network_reaches(&peer.peer_id)
+            })
+            .map(|peer| peer.peer_id)
+            .collect()
+    };
     let gone_for = {
         let mut since = ctx.unreachable_since.borrow_mut();
         since.retain(|id, _| offline.contains(id));
