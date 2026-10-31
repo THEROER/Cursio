@@ -95,29 +95,51 @@ fn problems() -> std::sync::MutexGuard<'static, Vec<Problem>> {
 /// producer can sharpen its sentence (a PID it has just found) without the
 /// problem looking new.
 pub fn raise(problem: Problem) {
-    let changed = {
+    let change = {
         let mut list = problems();
         match list.iter_mut().find(|p| p.id == problem.id) {
             Some(existing) => {
-                let changed = existing.severity != problem.severity
-                    || existing.summary != problem.summary
-                    || existing.hint != problem.hint
-                    || existing.actions != problem.actions;
+                let change = if existing.severity != problem.severity
+                    || existing.actions != problem.actions
+                {
+                    Change::Turned
+                } else if existing.summary != problem.summary || existing.hint != problem.hint {
+                    Change::Reworded
+                } else {
+                    Change::None
+                };
                 existing.severity = problem.severity;
                 existing.summary = problem.summary.clone();
                 existing.hint = problem.hint.clone();
                 existing.actions = problem.actions.clone();
-                changed
+                change
             }
             None => {
                 list.push(problem.clone());
-                true
+                Change::Turned
             }
         }
     };
-    if changed {
-        log(&problem);
+    match change {
+        Change::Turned => log(&problem),
+        // A problem whose text carries a live reading — "95% of its limit
+        // (53.0 GiB …)" — reads differently at every check. The status shows
+        // the new figure; logged as a warning each time, one ongoing
+        // shortage of memory was two thousand lines a day.
+        Change::Reworded => {
+            tracing::debug!(problem = %problem.id, summary = %problem.summary, "still")
+        }
+        Change::None => {}
     }
+}
+
+/// How a raised problem differs from the one already recorded.
+enum Change {
+    /// New, or its severity or what can be done about it changed: logged.
+    Turned,
+    /// Only its words: a reading in the summary moved.
+    Reworded,
+    None,
 }
 
 /// End a problem. Clearing one that is not recorded is nothing.
