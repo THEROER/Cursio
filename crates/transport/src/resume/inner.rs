@@ -36,6 +36,13 @@ impl Inner {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// The session in logs: the first bytes of its tag, the same on both
+    /// ends. A node holds a session per peer and the transport knows no
+    /// peer, so without it two sessions' path numbers read as one's.
+    pub(super) fn label(&self) -> String {
+        self.tag[..4].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     pub(super) fn kick(&self, flags: u8) {
         let kick = self.lock().kick.clone();
         if let Some(kick) = kick {
@@ -57,6 +64,7 @@ impl Inner {
         };
         if let Some(paths) = changed {
             tracing::info!(
+                session = %self.label(),
                 network = paths.network,
                 bluetooth = paths.bluetooth,
                 "the session's paths changed"
@@ -88,7 +96,7 @@ impl Inner {
             removed
         };
         if removed {
-            tracing::info!(path = id, %why, "a path of the session ended");
+            tracing::info!(session = %self.label(), path = id, %why, "a path of the session ended");
             self.changed.notify_waiters();
             // The carrying path may have changed: resend on the new one now,
             // not when the session next has something to say.
@@ -103,7 +111,7 @@ impl Inner {
             if state.ended.is_some() {
                 return;
             }
-            tracing::info!(%why, "the session can no longer be resumed; ending it");
+            tracing::info!(session = %self.label(), %why, "the session can no longer be resumed; ending it");
             state.ended = Some(why);
             state.paths.clear();
         }
@@ -262,6 +270,7 @@ impl Inner {
         };
         for old in &replaced {
             tracing::info!(
+                session = %self.label(),
                 path = old.id,
                 ?kind,
                 "a newer path of the same kind replaced this one"
@@ -271,7 +280,7 @@ impl Inner {
         if matches!(kind, PathKind::Network | PathKind::Bluetooth) {
             *self.congestion.lock().unwrap() = crate::congestion::BackgroundRate::default();
         }
-        tracing::info!(path = id, ?kind, "a path joined the session");
+        tracing::info!(session = %self.label(), path = id, ?kind, "a path joined the session");
         self.changed.notify_waiters();
         self.kick(0);
         self.report();

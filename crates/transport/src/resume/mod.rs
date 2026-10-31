@@ -221,6 +221,11 @@ impl ResumeHandle {
         self.0.tag
     }
 
+    /// How the transport's log lines name this session.
+    pub fn label(&self) -> String {
+        self.0.label()
+    }
+
     /// The paths carrying the session now.
     pub fn paths(&self) -> Paths {
         self.0.lock().summary()
@@ -258,7 +263,7 @@ impl ResumeHandle {
             }
             state.choice = choice;
         }
-        tracing::info!(?choice, "the session's path was chosen by hand");
+        tracing::info!(session = %self.0.label(), ?choice, "the session's path was chosen by hand");
         self.0.changed.notify_waiters();
         self.0.kick(0);
     }

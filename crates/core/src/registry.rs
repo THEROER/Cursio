@@ -443,6 +443,11 @@ impl PeerRegistry {
 
     /// Hold `handle` as `peer`'s session.
     pub fn hold_session(&mut self, peer: PeerId, handle: ResumeHandle) {
+        tracing::info!(
+            peer = self.peers.get(&peer).map_or("unknown", |p| p.display_name.as_str()),
+            session = %handle.label(),
+            "holding the session with this peer"
+        );
         crate::diag_session::hold(peer, handle.clone());
         self.sessions.insert(peer, HeldSession(handle));
     }

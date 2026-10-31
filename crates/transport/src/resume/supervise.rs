@@ -128,6 +128,7 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
         }
         if let Some(id) = degraded {
             tracing::info!(
+                session = %inner.label(),
                 path = id,
                 "the carrying path stopped delivering; moving the session to another"
             );
