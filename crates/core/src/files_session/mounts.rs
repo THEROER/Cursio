@@ -81,7 +81,11 @@ pub(super) fn mount_root(peer_name: &str) -> std::path::PathBuf {
 /// name regardless of where it sits.
 #[cfg(target_os = "linux")]
 pub(super) fn volume_mount_point(peer_name: &str, volume: &Volume) -> std::path::PathBuf {
-    mount_root(peer_name).join(cursio_files::volume_display_name(&volume.id, &volume.label))
+    mount_root(peer_name).join(cursio_files::peer_volume_name(
+        peer_name,
+        &volume.id,
+        volume.removable,
+    ))
 }
 
 /// Paths this machine must not serve to the peer.
@@ -176,8 +180,9 @@ pub(super) fn mount_one_volume(
     peer_name: &str,
     volume: &Volume,
 ) -> anyhow::Result<Mount> {
+    let name = cursio_files::peer_volume_name(peer_name, &volume.id, volume.removable);
     if crate::elevate::is_elevated() {
-        match crate::mount_helper::mount(peer.clone(), peer_name, &volume.id, &volume.label) {
+        match crate::mount_helper::mount(peer.clone(), peer_name, &volume.id, &name) {
             Ok(relayed) => return Ok(Mount::Helper(relayed)),
             Err(e) => tracing::warn!(
                 peer = %peer_name,
@@ -188,7 +193,7 @@ pub(super) fn mount_one_volume(
             ),
         }
     }
-    cursio_files::winmount::mount(peer, peer_name, &volume.id, &volume.label)
+    cursio_files::winmount::mount(peer, peer_name, &volume.id, &name)
         .map(|drive| Mount::Here { _drive: drive })
 }
 

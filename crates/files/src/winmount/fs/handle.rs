@@ -256,12 +256,11 @@ pub fn mount(
         // disposition class, which is why it never hit this.
         .supports_posix_unlink_rename(true);
 
-    // Labelled with the peer and the disk, because several of these now sit
-    // side by side in Explorer and "cursio" alone would not say which is which.
-    let label = format!("{volume_label} ({peer_name})");
+    // The caller names the drive (`crate::peer_volume_name`): several of
+    // these sit side by side in Explorer, so the name says whose disk it is.
     let mut host: FileSystemHost<RemoteFs> = FileSystemHost::new(
         params,
-        RemoteFs::new(peer, label, volume).of_peer(peer_name),
+        RemoteFs::new(peer, volume_label, volume).of_peer(peer_name),
     )
     .map_err(|e| anyhow::anyhow!("cannot create the filesystem host: {e:?}"))?;
 

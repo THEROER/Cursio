@@ -107,30 +107,26 @@ pub fn volume_dir_name(id: &str) -> String {
     }
 }
 
-/// What a peer's volume is called where a person will read it.
+/// What a peer's volume is called where a person will read it: a file
+/// manager's sidebar, Explorer's drive list.
 ///
-/// [`volume_dir_name`] alone answers `C`, `V`, `Z` — which says nothing about
-/// what the disk *is*. A bare letter is the peer's own private naming: it means
-/// something on the machine that assigned it and nothing on the machine
-/// reading it, and with two Windows peers in the mesh both offer a `C` that are
-/// different disks. So the label leads and the letter follows in brackets, the
-/// way a file manager writes it: `Games (V)`, `Windows (C)`.
-///
-/// Falls back to the bare directory name when the label adds nothing — it is
-/// empty, or it already *is* the name, which is the case for a removable
-/// medium whose id is its mount path and for a Linux root called "Root".
-pub fn volume_display_name(id: &str, label: &str) -> String {
+/// The sidebar mixes the peers' disks with this machine's own, with nothing
+/// grouping them, so the name has to say whose disk it is — and the disk's own
+/// label cannot: a phone's is "Internal storage", which every phone offers
+/// alike, and a Windows system disk's is whatever the maker formatted it as
+/// ("Windows-SSD"). So a volume is named after its machine: the machine's main
+/// volume (a Linux root, a phone's internal storage) by the machine's name
+/// alone — `POCO X7 Pro`, `Nocturne` — and every other with which of its disks
+/// it is in brackets: `Lightmoon (C)`, `Nocturne (LocalDrive500)`,
+/// `POCO X7 Pro (SD card)`.
+pub fn peer_volume_name(peer: &str, id: &str, removable: bool) -> String {
     let dir = volume_dir_name(id);
-    let label = label.trim();
-    if label.is_empty() || label.eq_ignore_ascii_case(&dir) {
-        return dir;
-    }
-    // Only a drive letter gains the bracket: for anything else the directory
-    // name is already the medium's own name, and "MY_USB (MY_USB)" helps
-    // nobody.
-    match dir.chars().count() == 1 && dir.chars().all(|c| c.is_ascii_alphabetic()) {
-        true => format!("{label} ({dir})"),
-        false => dir,
+    let drive_letter = dir.chars().count() == 1 && dir.chars().all(|c| c.is_ascii_alphabetic());
+    let main = id == "/" || (!removable && !id.contains('/') && !drive_letter);
+    if main {
+        peer.to_string()
+    } else {
+        format!("{peer} ({dir})")
     }
 }
 
@@ -170,7 +166,7 @@ pub(crate) fn now_unix() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{volume_dir_name, volume_display_name, winfsp_filesystem_name};
+    use super::{peer_volume_name, volume_dir_name, winfsp_filesystem_name};
 
     #[test]
     fn a_long_peer_name_still_fits_the_file_system_name_winfsp_holds() {
@@ -184,28 +180,31 @@ mod tests {
         assert!(wide.chars().all(|c| c != char::REPLACEMENT_CHARACTER));
     }
 
-    /// A drive letter alone does not say what the disk is.
-    ///
-    /// `C`, `V`, `Z` are the peer's private naming: they mean something on the
-    /// machine that assigned them and nothing on the machine reading them —
-    /// and two Windows peers each offer a `C` that are different disks.
     #[test]
-    fn a_drive_letter_is_shown_with_the_name_of_its_disk() {
-        assert_eq!(volume_display_name("C:", "Windows"), "Windows (C)");
-        assert_eq!(volume_display_name("V:", "Games"), "Games (V)");
+    fn a_machines_main_volume_is_called_by_the_machines_name() {
+        assert_eq!(
+            peer_volume_name("POCO X7 Pro", "Internal storage", false),
+            "POCO X7 Pro"
+        );
+        assert_eq!(peer_volume_name("Nocturne", "/", false), "Nocturne");
     }
 
-    /// A medium already named by its own label gains nothing from repeating it.
     #[test]
-    fn a_name_is_not_doubled_when_it_says_the_same_thing() {
+    fn every_other_volume_says_which_of_the_machines_disks_it_is() {
+        assert_eq!(peer_volume_name("Lightmoon", "C:", false), "Lightmoon (C)");
+        assert_eq!(peer_volume_name("Lightmoon", "E:", true), "Lightmoon (E)");
         assert_eq!(
-            volume_display_name("/media/theroer/MY_USB", "MY_USB"),
-            "MY_USB"
+            peer_volume_name("Nocturne", "/mnt/LocalDrive500", false),
+            "Nocturne (LocalDrive500)"
         );
-        assert_eq!(volume_display_name("/", "Root"), "root");
-        // Nothing to add: the label is empty.
-        assert_eq!(volume_display_name("C:", ""), "C");
-        assert_eq!(volume_display_name("C:", "   "), "C");
+        assert_eq!(
+            peer_volume_name("Nocturne", "/media/theroer/MY_USB", true),
+            "Nocturne (MY_USB)"
+        );
+        assert_eq!(
+            peer_volume_name("POCO X7 Pro", "SD card", true),
+            "POCO X7 Pro (SD card)"
+        );
     }
 
     /// A removable medium is offered under its mount path, and only the last

@@ -345,7 +345,11 @@ mount: a phone has nowhere to present one.
 What it serves is the shared storage a person thinks of as the phone's files:
 `/storage/self/primary` as **Internal storage**, and each card under
 `/storage/<uuid>` as **SD card**, removable (`cursio_files::server`,
-`detect_volumes`'s Android arm). It reads them as plain files, which is why the
+`detect_volumes`'s Android arm). A computer shows them by the phone's name —
+`POCO X7 Pro`, `POCO X7 Pro (SD card)` — as it shows every peer's disks
+(`cursio_files::peer_volume_name`): a sidebar mixing every machine's disks
+would otherwise list each phone's storage as one more "Internal storage".
+It reads them as plain files, which is why the
 grant is "All files access" (`MANAGE_EXTERNAL_STORAGE`) from Android 11 and the
 legacy storage permissions with `requestLegacyExternalStorage` on Android 10,
 rather than the Storage Access Framework. SAF answers through a content
