@@ -93,7 +93,9 @@ arbitrary load. Low-rate ownership, edge and other internal command queues are
 not all bounded yet.
 
 `process queue health` reports count/byte peaks, merged events and observed
-event ages over ten-second windows while the queue is active. `captured->queued`
+event ages over ten-second windows while the queue is active, at debug level
+when something waited (a second item, a merge, or an age of 10 ms) and at
+trace level otherwise. `captured->queued`
 measures admission to the local session sender; it is not wire delivery.
 `received->injected` and `injector call` cover receiver-side work. Separate
 percentiles cannot be added to claim an end-to-end percentile; hardware-to-display

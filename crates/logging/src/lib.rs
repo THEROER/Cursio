@@ -68,6 +68,9 @@ pub fn log_dir() -> PathBuf {
 /// Where logs go when the platform cannot be asked.
 static LOG_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// How many days of each process's log are kept.
+const KEEP_DAYS: usize = 14;
+
 /// The file name this process's log rotates under, set by [`init`].
 static LOG_FILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -133,7 +136,20 @@ pub fn init_with_verbosity(app_name: &str, verbosity: u8) -> LogGuard {
     let file_layer = match std::fs::create_dir_all(&dir) {
         Ok(()) => {
             let _ = LOG_FILE.set(format!("{app_name}.log"));
-            let appender = tracing_appender::rolling::daily(&dir, format!("{app_name}.log"));
+            // Kept for [`KEEP_DAYS`] and then removed, oldest first: daily
+            // files with nothing removing them had grown to 5 GiB.
+            let appender = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix(format!("{app_name}.log"))
+                .max_log_files(KEEP_DAYS)
+                .build(&dir)
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "cannot keep a bounded log in {}: {error}; keeping every day",
+                        dir.display()
+                    );
+                    tracing_appender::rolling::daily(&dir, format!("{app_name}.log"))
+                });
             let (writer, worker) = tracing_appender::non_blocking(appender);
             let layer = fmt::layer()
                 .with_ansi(false)

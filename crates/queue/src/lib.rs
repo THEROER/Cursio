@@ -20,6 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc::error::TryRecvError, Notify};
 
+/// An item that waited this long makes its reporting window worth a line.
+const NOTABLE_AGE: Duration = Duration::from_millis(10);
+
 type Merge<T> = fn(&mut T, &T) -> bool;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -116,17 +119,30 @@ impl<T> Shared<T> {
             return;
         }
         let stats = Self::snapshot(state);
-        tracing::debug!(
-            queue = self.name,
-            items = stats.items,
-            bytes = stats.bytes,
-            peak_items = stats.peak_items,
-            peak_bytes = stats.peak_bytes,
-            merged = stats.merged,
-            oldest_us = stats.oldest.as_micros() as u64,
-            max_age_us = stats.max_age.as_micros() as u64,
-            "process queue health"
-        );
+        // A window in which nothing ever waited behind anything says only
+        // that the queue was used; written anyway, those were the largest
+        // share of a node's log — a line every ten seconds for every queue.
+        let notable = stats.peak_items > 1 || stats.merged > 0 || stats.max_age >= NOTABLE_AGE;
+        macro_rules! health {
+            ($level:ident) => {
+                tracing::$level!(
+                    queue = self.name,
+                    items = stats.items,
+                    bytes = stats.bytes,
+                    peak_items = stats.peak_items,
+                    peak_bytes = stats.peak_bytes,
+                    merged = stats.merged,
+                    oldest_us = stats.oldest.as_micros() as u64,
+                    max_age_us = stats.max_age.as_micros() as u64,
+                    "process queue health"
+                )
+            };
+        }
+        if notable {
+            health!(debug);
+        } else {
+            health!(trace);
+        }
         state.reported = Instant::now();
         state.stats.peak_items = state.stats.items;
         state.stats.peak_bytes = state.stats.bytes;
