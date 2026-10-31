@@ -68,6 +68,26 @@ pub fn log_dir() -> PathBuf {
 /// Where logs go when the platform cannot be asked.
 static LOG_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// The file's field formatter: the default one under a type of its own.
+///
+/// A span's fields are formatted once per formatter *type* and kept on the
+/// span, so with the console and the file both using the default type the
+/// file reused the console's copy — colour codes in a file asked to have
+/// none — and each recorded field was appended by both layers into that one
+/// copy, so `peer{name="Lightmoon" name="Lightmoon"}`.
+#[derive(Default)]
+struct FileFields(fmt::format::DefaultFields);
+
+impl<'writer> fmt::FormatFields<'writer> for FileFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(
+        &self,
+        writer: fmt::format::Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        self.0.format_fields(writer, fields)
+    }
+}
+
 /// How many days of each process's log are kept.
 const KEEP_DAYS: usize = 14;
 
@@ -154,6 +174,7 @@ pub fn init_with_verbosity(app_name: &str, verbosity: u8) -> LogGuard {
             let layer = fmt::layer()
                 .with_ansi(false)
                 .with_target(true)
+                .fmt_fields(FileFields::default())
                 .with_writer(writer)
                 .with_filter(file_env_filter(verbosity));
             Some((layer, worker))
