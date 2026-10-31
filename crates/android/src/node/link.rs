@@ -55,6 +55,20 @@ pub(super) struct LinkHold {
     /// The session this connection carries: one it started, ended with it,
     /// or one it joined, which outlives it.
     pub(super) session: RefCell<Option<cursio_transport::resume::ResumeHandle>>,
+    /// The Bluetooth address this connection was placed to, if it was: the
+    /// registry learns whose it is from the greeting, which is what lets a
+    /// session waiting for a path be called back at that address.
+    pub(super) bluetooth: Option<String>,
+}
+
+impl LinkHold {
+    /// The hold of a connection placed to the Bluetooth device at `address`.
+    pub(super) fn over_bluetooth(address: String) -> Self {
+        Self {
+            bluetooth: Some(address),
+            ..Self::default()
+        }
+    }
 }
 
 /// Take the computer offline after a session to it ended — unless another
@@ -106,6 +120,11 @@ pub(super) async fn run_link<T: Transport + 'static>(
     let peer_name = identified.peer.display_name.clone();
     let negotiated = identified.negotiated().clone();
     who.set(Some(peer_id));
+    if let Some(address) = &hold.bluetooth {
+        ctx.registry
+            .borrow_mut()
+            .note_bluetooth(address, peer_id, true);
+    }
     let greeted =
         ctx.registry
             .borrow_mut()

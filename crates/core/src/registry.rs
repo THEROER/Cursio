@@ -388,6 +388,21 @@ impl PeerRegistry {
             .is_some_and(|s| !s.0.is_ended() && s.0.paths().bluetooth)
     }
 
+    /// Whether `peer`'s session is alive with no path at all: waiting out
+    /// its hold for a connection to join it, which a new one only can before
+    /// the hold runs out.
+    pub fn waiting_for_path(&self, peer: &PeerId) -> bool {
+        self.sessions
+            .get(peer)
+            .is_some_and(|s| !s.0.is_ended() && s.0.paths() == Default::default())
+    }
+
+    /// Whether this node is the one of the pair to call `peer` first; see
+    /// [`should_dial`].
+    pub fn calls_first(&self, peer: PeerId) -> bool {
+        self.local.is_none_or(|local| should_dial(local, peer))
+    }
+
     /// `peer` greeted over the Bluetooth device at `address`; `dialled` when
     /// this node placed that call. Answers whether the address is new for
     /// that peer, so the caller knows to remember it past a restart.

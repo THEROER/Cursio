@@ -24,7 +24,9 @@
 //! seconds of Wi-Fi lost. So [`Dialer`] backs off: doubling up to
 //! [`MAX_RETRY`] for a device that does not answer, and [`REFUSED_RETRY`] for
 //! an unknown device with no mesh channel. Known peers retry after [`RETRY`],
-//! and a new OS connection clears the backoff once. A machine whose card is known to lose
+//! and a new OS connection clears the backoff once. None of that applies to
+//! a peer whose session is waiting with no path: it has a minute before it is
+//! lost, so it is called within seconds ([`WAITING_GRACE`]). A machine whose card is known to lose
 //! the network while Bluetooth is busy does not use Bluetooth at all unless
 //! the person says so ([`decide`]).
 //!
@@ -58,6 +60,23 @@ pub const MAX_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// How long a device that answered with no mesh channel is left alone.
 pub const REFUSED_RETRY: Duration = Duration::from_secs(30 * 60);
+
+/// How long the network must have been gone before Bluetooth is tried for a
+/// peer whose session is waiting with no path at all. Its input is stopped
+/// now, and the session is lost once the hold runs out — a minute — so the
+/// ordinary grace and backoff, sized for a peer that is simply away, would
+/// let it run out: two machines that called each other at the same moment
+/// both got "busy", both waited the minute, and met again just after their
+/// session had ended.
+pub const WAITING_GRACE: Duration = Duration::from_secs(5);
+
+/// The most time between attempts at a peer whose session is waiting, for
+/// the one of the pair that calls first ([`crate::registry::should_dial`]).
+/// The other waits [`WAITING_RETRY_SECOND`], so the two calls stop meeting
+/// on the radio: two pages crossing leave both sides "busy".
+pub const WAITING_RETRY_FIRST: Duration = Duration::from_secs(3);
+/// See [`WAITING_RETRY_FIRST`].
+pub const WAITING_RETRY_SECOND: Duration = Duration::from_secs(8);
 
 /// A device paired with this one over Bluetooth.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,17 +115,24 @@ impl Dialer {
     }
 
     /// The devices to try now. `unreachable_for` is how long the longest-gone
-    /// known peer has been off the network, `None` while all are on it.
-    /// `standby` asks for a Bluetooth path beside a working network one, so
-    /// it does not wait for the network to fail.
+    /// known peer has been off the network, `None` while all are on it, and
+    /// `waiting` whether one of them has a session waiting for a path
+    /// ([`WAITING_GRACE`]). `standby` asks for a Bluetooth path beside a
+    /// working network one, so it does not wait for the network to fail.
     pub fn due(
         &mut self,
         paired: &[Paired],
         unreachable_for: Option<Duration>,
+        waiting: bool,
         standby: bool,
         now: Instant,
     ) -> Vec<Paired> {
-        if !standby && !unreachable_for.is_some_and(|gone| gone >= NETWORK_GRACE) {
+        let grace = if waiting {
+            WAITING_GRACE
+        } else {
+            NETWORK_GRACE
+        };
+        if !standby && !unreachable_for.is_some_and(|gone| gone >= grace) {
             return Vec::new();
         }
         self.pace(paired, now)
@@ -154,6 +180,14 @@ impl Dialer {
         }
     }
 
+    /// Try `address` again within `wait` of the last attempt, whatever its
+    /// backoff had grown to; for a peer whose session is waiting for a path.
+    pub fn hurry(&mut self, address: &str, wait: Duration) {
+        if let Some(tried) = self.tried.get_mut(address) {
+            tried.wait = tried.wait.min(wait);
+        }
+    }
+
     /// A link to `address` is up, or has ended. Up also forgets its backoff:
     /// the next time it is missing is a new absence.
     pub fn set_linked(&mut self, address: &str, up: bool) {
@@ -174,6 +208,9 @@ pub struct Known {
     pub bluetooth_up: bool,
     /// How long that peer has been off the network, `None` while it is on.
     pub gone_for: Option<Duration>,
+    /// That peer's session is alive with no path at all; see
+    /// [`WAITING_GRACE`].
+    pub waiting: bool,
 }
 
 /// The paired computers to call: those whose peer has been off the network
@@ -192,7 +229,14 @@ pub fn select(
             let known = known(&device.address);
             match known.peer {
                 Some(_) if known.bluetooth_up => false,
-                Some(_) => standby || known.gone_for.is_some_and(|gone| gone >= NETWORK_GRACE),
+                Some(_) => {
+                    let grace = if known.waiting {
+                        WAITING_GRACE
+                    } else {
+                        NETWORK_GRACE
+                    };
+                    standby || known.gone_for.is_some_and(|gone| gone >= grace)
+                }
                 None => anyone_missing || standby,
             }
         })
@@ -601,7 +645,7 @@ mod tests {
     fn leaves_bluetooth_alone_while_the_network_reaches_everyone() {
         let mut dialer = Dialer::default();
         assert!(dialer
-            .due(&[pc("A")], None, false, Instant::now())
+            .due(&[pc("A")], None, false, false, Instant::now())
             .is_empty());
     }
 
@@ -609,7 +653,7 @@ mod tests {
     fn a_standby_is_dialled_while_the_network_still_works() {
         let mut dialer = Dialer::default();
         assert_eq!(
-            dialer.due(&[pc("A")], None, true, Instant::now()),
+            dialer.due(&[pc("A")], None, false, true, Instant::now()),
             vec![pc("A")]
         );
     }
@@ -619,10 +663,19 @@ mod tests {
         let mut dialer = Dialer::default();
         let now = Instant::now();
         assert!(dialer
-            .due(&[pc("A")], Some(Duration::from_secs(5)), false, now)
+            .due(&[pc("A")], Some(Duration::from_secs(5)), false, false, now)
             .is_empty());
         assert_eq!(
-            dialer.due(&[pc("A")], Some(NETWORK_GRACE), false, now),
+            dialer.due(&[pc("A")], Some(NETWORK_GRACE), false, false, now),
+            vec![pc("A")]
+        );
+    }
+
+    #[test]
+    fn a_waiting_session_does_not_wait_out_the_ordinary_grace() {
+        let mut dialer = Dialer::default();
+        assert_eq!(
+            dialer.due(&[pc("A")], Some(WAITING_GRACE), true, false, Instant::now()),
             vec![pc("A")]
         );
     }
@@ -632,11 +685,22 @@ mod tests {
         let mut dialer = Dialer::default();
         let now = Instant::now();
         let gone = Some(NETWORK_GRACE);
-        assert_eq!(dialer.due(&[pc("A")], gone, false, now).len(), 1);
+        assert_eq!(dialer.due(&[pc("A")], gone, false, false, now).len(), 1);
         assert!(dialer
-            .due(&[pc("A")], gone, false, now + Duration::from_secs(10))
+            .due(
+                &[pc("A")],
+                gone,
+                false,
+                false,
+                now + Duration::from_secs(10)
+            )
             .is_empty());
-        assert_eq!(dialer.due(&[pc("A")], gone, false, now + RETRY).len(), 1);
+        assert_eq!(
+            dialer
+                .due(&[pc("A")], gone, false, false, now + RETRY)
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -646,6 +710,7 @@ mod tests {
         let due = dialer.due(
             &[pc("A"), pc("B")],
             Some(NETWORK_GRACE),
+            false,
             false,
             Instant::now(),
         );
@@ -739,6 +804,7 @@ mod tests {
                 peer: Some(peer(if address == "LIGHT" { 1 } else { 2 })),
                 bluetooth_up: false,
                 gone_for: (address == "LIGHT").then_some(NETWORK_GRACE),
+                waiting: false,
             },
             true,
             false,
@@ -752,6 +818,7 @@ mod tests {
             peer: None,
             bluetooth_up: false,
             gone_for: None,
+            waiting: false,
         };
         assert!(select(&[pc("NEW")], unknown, false, false).is_empty());
         assert_eq!(select(&[pc("NEW")], unknown, true, false), vec![pc("NEW")]);
@@ -766,11 +833,40 @@ mod tests {
                 peer: Some(peer(1)),
                 bluetooth_up: address == "A",
                 gone_for: None,
+                waiting: false,
             },
             false,
             true,
         );
         assert_eq!(chosen, vec![pc("B")]);
+    }
+
+    #[test]
+    fn a_session_waiting_for_a_path_calls_well_before_the_ordinary_grace() {
+        let known = |waiting| {
+            move |_: &str| Known {
+                peer: Some(peer(1)),
+                bluetooth_up: false,
+                gone_for: Some(WAITING_GRACE),
+                waiting,
+            }
+        };
+        assert!(select(&[pc("A")], known(false), true, false).is_empty());
+        assert_eq!(select(&[pc("A")], known(true), true, false), vec![pc("A")]);
+    }
+
+    #[test]
+    fn hurrying_caps_a_grown_backoff_for_a_waiting_session() {
+        let mut dialer = Dialer::default();
+        let start = Instant::now();
+        dialer.pace(&[pc("A")], start);
+        for _ in 0..4 {
+            dialer.failed("A", false, true);
+        }
+        let later = start + WAITING_RETRY_SECOND;
+        assert!(dialer.pace(&[pc("A")], later).is_empty());
+        dialer.hurry("A", WAITING_RETRY_SECOND);
+        assert_eq!(dialer.pace(&[pc("A")], later), vec![pc("A")]);
     }
 
     #[test]

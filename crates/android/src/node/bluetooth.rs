@@ -52,10 +52,28 @@ pub(super) async fn dial_bluetooth(ctx: &Rc<NodeCtx>) {
     let paired = tokio::task::spawn_blocking(crate::bt::paired_computers)
         .await
         .unwrap_or_default();
+    // A phone is never called, so it is always the side that calls first.
+    let waiting = {
+        let registry = ctx.registry.borrow();
+        let mut dialer = ctx.bluetooth.borrow_mut();
+        let mut waiting = false;
+        for device in &paired {
+            if let Some(peer) = registry.bluetooth_peer(&device.address) {
+                if registry.waiting_for_path(&peer) {
+                    dialer.hurry(
+                        &device.address,
+                        cursio_core::bluetooth_link::WAITING_RETRY_FIRST,
+                    );
+                    waiting = true;
+                }
+            }
+        }
+        waiting
+    };
     let due = ctx
         .bluetooth
         .borrow_mut()
-        .due(&paired, gone_for, standby, now);
+        .due(&paired, gone_for, waiting, standby, now);
     for device in due {
         let address = device.address.clone();
         let opened = tokio::task::spawn_blocking(move || crate::bt::connect(&address)).await;
@@ -92,7 +110,7 @@ pub(super) fn spawn_bluetooth_session<T: Transport + 'static>(
 ) {
     tokio::task::spawn_local(async move {
         let who = std::cell::Cell::new(None);
-        let hold = LinkHold::default();
+        let hold = LinkHold::over_bluetooth(address.clone());
         // The session this connection starts moves to the network when the
         // computer calls back there; the Bluetooth path is then let go of,
         // not the session.

@@ -498,9 +498,14 @@ pub(crate) async fn dial_over_bluetooth(
                     missing_since.entry(id).or_insert(now);
                 }
             }
-            missing_since
-                .values()
-                .any(|since| now.duration_since(*since) >= bt::NETWORK_GRACE)
+            missing_since.iter().any(|(id, since)| {
+                let grace = if reg.waiting_for_path(id) {
+                    bt::WAITING_GRACE
+                } else {
+                    bt::NETWORK_GRACE
+                };
+                now.duration_since(*since) >= grace
+            })
         };
         if !anyone_missing && !standby {
             continue;
@@ -513,6 +518,14 @@ pub(crate) async fn dial_over_bluetooth(
             for device in &paired {
                 if let Some(peer) = reg.bluetooth_peer(&device.address) {
                     dialer.set_linked(&device.address, reg.bluetooth_reaches(&peer));
+                    if reg.waiting_for_path(&peer) {
+                        let wait = if reg.calls_first(peer) {
+                            bt::WAITING_RETRY_FIRST
+                        } else {
+                            bt::WAITING_RETRY_SECOND
+                        };
+                        dialer.hurry(&device.address, wait);
+                    }
                 }
             }
             bt::select(
@@ -525,6 +538,7 @@ pub(crate) async fn dial_over_bluetooth(
                         gone_for: peer
                             .and_then(|p| missing_since.get(&p))
                             .map(|since| now.duration_since(*since)),
+                        waiting: peer.is_some_and(|p| reg.waiting_for_path(&p)),
                     }
                 },
                 anyone_missing,
