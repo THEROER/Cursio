@@ -174,9 +174,13 @@ impl ModuleHost {
         let (done_tx, done_rx) = oneshot::channel();
         let closer = tx.closer();
         let runtime = tokio::runtime::Handle::current();
+        // The link's span, so the module's lines name the peer as the
+        // session's do; a new thread starts outside every span.
+        let span = tracing::Span::current();
         let thread = std::thread::Builder::new()
             .name(format!("cursio-{name}"))
             .spawn(move || {
+                let _span = span.enter();
                 runtime.block_on(drive(module, tx, inbox_rx, stop_rx, failures));
                 // After `drive` has dropped the module: a module's drop joins
                 // its own threads (PipeWire streams, a capture), and the next

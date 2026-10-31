@@ -1,6 +1,8 @@
 //! One connection to one peer, from the first byte to the session ending:
 //! identify, pair or recognise, secure, and run the session on it.
 
+use tracing::Instrument;
+
 use crate::input::inject;
 use crate::input::make_injector;
 use crate::input::set_cursor_hidden;
@@ -237,7 +239,8 @@ pub(crate) fn spawn_peer_session<T: cursio_transport::Transport + 'static>(
             registry.borrow_mut().mark_offline(id);
             control.link_down(&id);
         }
-    });
+    }
+    .instrument(cursio_core::link::link_span()));
 }
 
 /// Called once a session learns who the peer is (from the Hello handshake).
@@ -316,6 +319,7 @@ pub(crate) async fn run_pairing_and_session<T: cursio_transport::Transport + 'st
     };
     let path = cursio_core::control::LinkPath::of(transport.kind());
     let identified = cursio_core::link::identify(transport, &plan).await?;
+    cursio_core::link::name_link_span(&identified.peer.display_name);
     // Report who this turned out to be before the slower half runs: for an
     // inbound connection this is the first moment we know at all, and the mesh
     // wants such a peer marked online without waiting out pairing.

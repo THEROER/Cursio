@@ -13,6 +13,7 @@ use cursio_transport::Transport;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use tracing::Instrument;
 
 pub(super) fn spawn_session<T: Transport + 'static>(
     transport: T,
@@ -21,26 +22,29 @@ pub(super) fn spawn_session<T: Transport + 'static>(
     expected: Option<PeerId>,
     addr: Option<SocketAddr>,
 ) {
-    tokio::task::spawn_local(async move {
-        if let Some(id) = expected {
-            ctx.registry.borrow_mut().set_state(id, PeerState::Online);
-        }
-        let who = std::cell::Cell::new(expected);
-        let hold = LinkHold::default();
-        let result = tokio::select! {
-            result = run_link(transport, &ctx, role, addr, &who, &hold) => result,
-            () = hold.superseded.notified() => {
-                tracing::info!("a better link to this computer came up; closing this one");
-                Ok(())
+    tokio::task::spawn_local(
+        async move {
+            if let Some(id) = expected {
+                ctx.registry.borrow_mut().set_state(id, PeerState::Online);
             }
-        };
-        match &result {
-            Ok(()) => tracing::info!("peer session ended"),
-            Err(e) => tracing::warn!(error = %e, "peer session ended with error"),
+            let who = std::cell::Cell::new(expected);
+            let hold = LinkHold::default();
+            let result = tokio::select! {
+                result = run_link(transport, &ctx, role, addr, &who, &hold) => result,
+                () = hold.superseded.notified() => {
+                    tracing::info!("a better link to this computer came up; closing this one");
+                    Ok(())
+                }
+            };
+            match &result {
+                Ok(()) => tracing::info!("peer session ended"),
+                Err(e) => tracing::warn!(error = %e, "peer session ended with error"),
+            }
+            end_link(&ctx, who.get(), &hold);
+            publish(&ctx);
         }
-        end_link(&ctx, who.get(), &hold);
-        publish(&ctx);
-    });
+        .instrument(cursio_core::link::link_span()),
+    );
 }
 
 /// A session's hold on its peer's one link; see
@@ -116,6 +120,7 @@ pub(super) async fn run_link<T: Transport + 'static>(
     };
     let path = cursio_core::control::LinkPath::of(transport.kind());
     let identified = cursio_core::link::identify(transport, &plan).await?;
+    cursio_core::link::name_link_span(&identified.peer.display_name);
     let peer_id = identified.peer.peer_id;
     let peer_name = identified.peer.display_name.clone();
     let negotiated = identified.negotiated().clone();

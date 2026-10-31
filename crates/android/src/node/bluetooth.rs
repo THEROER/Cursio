@@ -11,6 +11,7 @@ use cursio_protocol::PeerId;
 use cursio_transport::pairing::Role;
 use cursio_transport::Transport;
 use std::rc::Rc;
+use tracing::Instrument;
 
 /// Open Bluetooth links to paired computers the network has not reached for
 /// a while; see [`crate::bt`].
@@ -108,31 +109,34 @@ pub(super) fn spawn_bluetooth_session<T: Transport + 'static>(
     ctx: Rc<NodeCtx>,
     address: String,
 ) {
-    tokio::task::spawn_local(async move {
-        let who = std::cell::Cell::new(None);
-        let hold = LinkHold::over_bluetooth(address.clone());
-        // The session this connection starts moves to the network when the
-        // computer calls back there; the Bluetooth path is then let go of,
-        // not the session.
-        let ended = tokio::select! {
-            result = async {
-                run_link(transport, &ctx, Role::Initiator, None, &who, &hold).await?;
-                bluetooth_path_gone(&hold).await;
-                anyhow::Ok(())
-            } => result,
-            () = leave_bluetooth_once_the_network_carries(&hold, &address, &ctx) => Ok(()),
-            () = hold.superseded.notified() => {
-                tracing::info!("the network link to this computer is up; leaving bluetooth");
-                Ok(())
+    tokio::task::spawn_local(
+        async move {
+            let who = std::cell::Cell::new(None);
+            let hold = LinkHold::over_bluetooth(address.clone());
+            // The session this connection starts moves to the network when the
+            // computer calls back there; the Bluetooth path is then let go of,
+            // not the session.
+            let ended = tokio::select! {
+                result = async {
+                    run_link(transport, &ctx, Role::Initiator, None, &who, &hold).await?;
+                    bluetooth_path_gone(&hold).await;
+                    anyhow::Ok(())
+                } => result,
+                () = leave_bluetooth_once_the_network_carries(&hold, &address, &ctx) => Ok(()),
+                () = hold.superseded.notified() => {
+                    tracing::info!("the network link to this computer is up; leaving bluetooth");
+                    Ok(())
+                }
+            };
+            if let Err(e) = &ended {
+                tracing::warn!(error = %e, "bluetooth session ended with error");
             }
-        };
-        if let Err(e) = &ended {
-            tracing::warn!(error = %e, "bluetooth session ended with error");
+            ctx.bluetooth.borrow_mut().set_linked(&address, false);
+            end_link(&ctx, who.get(), &hold);
+            publish(&ctx);
         }
-        ctx.bluetooth.borrow_mut().set_linked(&address, false);
-        end_link(&ctx, who.get(), &hold);
-        publish(&ctx);
-    });
+        .instrument(cursio_core::link::link_span()),
+    );
 }
 
 /// Resolves once the session this connection carried has no Bluetooth path.

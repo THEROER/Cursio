@@ -130,6 +130,20 @@ pub struct Link {
     pub resume: ResumeHandle,
 }
 
+/// The span a link's task runs in, so every line it and its modules write
+/// names the peer: `peer{name="Lightmoon"}: …`. Most of a link's lines did
+/// not, and a log with two peers' sessions in it could not be read one peer
+/// at a time. The name is filled in by [`name_link_span`] once the peer has
+/// said who it is.
+pub fn link_span() -> tracing::Span {
+    tracing::info_span!("peer", name = tracing::field::Empty)
+}
+
+/// Name the link this task runs in; see [`link_span`].
+pub fn name_link_span(name: &str) {
+    tracing::Span::current().record("name", name);
+}
+
 /// Say hello and work out which modules can run.
 ///
 /// Split from the rest so a caller can act on the peer's identity before the

@@ -227,6 +227,7 @@ fn template(line: &str) -> String {
     // A span's fields reach the file with their colour codes even though the
     // file writer asks for none.
     let rest = without_ansi(&words.collect::<Vec<_>>().join(" "));
+    let rest = without_link_span(rest.trim_start());
     let mut out = String::new();
     let mut chars = rest.trim_start().chars().peekable();
     let mut word = String::new();
@@ -263,6 +264,19 @@ fn template(line: &str) -> String {
     let mut out: String = numbers_out(&out).chars().take(160).collect();
     out.truncate(out.trim_end().len());
     out
+}
+
+/// `WARN peer{name="Lightmoon"}: target: …` as `WARN target: …`: one
+/// warning is one kind whichever peer's link wrote it (`crate::link::link_span`).
+fn without_link_span(text: &str) -> String {
+    let (level, rest) = text.split_once(' ').unwrap_or((text, ""));
+    let rest = rest.trim_start();
+    let rest = if let Some(after) = rest.strip_prefix("peer{") {
+        after.split_once("}: ").map_or(rest, |(_, tail)| tail)
+    } else {
+        rest.strip_prefix("peer: ").unwrap_or(rest)
+    };
+    format!("{level} {rest}")
 }
 
 /// `text` without terminal colour sequences (`ESC [ … m`).
@@ -384,6 +398,10 @@ mod tests {
         assert_eq!(a, b);
         let coloured = template("2026-10-31T16:00:00Z  WARN {}{\u{1b}[3mtask_name\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"x\"}: zbus::proxy: failed");
         assert!(!coloured.contains('\u{1b}'));
+        let lightmoon = template("2026-10-31T16:00:00Z  WARN peer{name=\"Lightmoon\"}: cursio_core::module_host: module pump was slow; only this module's traffic waited module=\"usb\" took_ms=79");
+        let poco = template("2026-10-31T16:00:00Z  WARN peer{name=\"POCO X7 Pro\"}: cursio_core::module_host: module pump was slow; only this module's traffic waited module=\"usb\" took_ms=79");
+        assert_eq!(lightmoon, poco);
+        assert!(lightmoon.starts_with("WARN cursio_core::module_host:"));
     }
 
     #[test]
