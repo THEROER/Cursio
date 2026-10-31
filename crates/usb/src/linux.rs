@@ -115,6 +115,25 @@ fn read_device(path: &Path, busid: &str) -> Result<Option<LocalDevice>, UsbBacke
     };
 
     let class = read_hex_u8(path, "bDeviceClass").unwrap_or(0);
+    // Root hubs are named `usbN` rather than `bus-port`, and are the only
+    // devices whose bus id carries no dash.
+    let is_root_hub = !busid.contains('-');
+    if is_root_hub {
+        // Never offered, so nothing below is wanted of it — and reading a
+        // suspended root hub's string descriptors wakes its controller: on a
+        // desktop with four idle ones, every third second's scan took over
+        // 100 ms one time in ten, and kept the controllers from sleeping.
+        return Ok(Some(LocalDevice {
+            busid: busid.to_string(),
+            vendor,
+            product,
+            manufacturer: None,
+            product_name: None,
+            class,
+            has_isochronous: false,
+            is_root_hub,
+        }));
+    }
     let interfaces = interfaces_of(path, busid);
 
     // Class 0 means "look at the interfaces" — most composite devices report
@@ -136,9 +155,7 @@ fn read_device(path: &Path, busid: &str) -> Result<Option<LocalDevice>, UsbBacke
         product_name: read_string(path, "product"),
         class,
         has_isochronous: interfaces.iter().any(|i| has_isochronous_endpoint(i)),
-        // Root hubs are named `usbN` rather than `bus-port`, and are the only
-        // devices whose bus id carries no dash.
-        is_root_hub: !busid.contains('-'),
+        is_root_hub,
     }))
 }
 
@@ -303,6 +320,7 @@ mod tests {
                 ("idVendor", "1d6b"),
                 ("idProduct", "0002"),
                 ("bDeviceClass", "09"),
+                ("manufacturer", "Linux 6.17.0 xhci-hcd"),
             ],
         );
 
@@ -313,6 +331,10 @@ mod tests {
         assert_eq!(devices.len(), 1, "it is still enumerated");
         assert!(devices[0].is_root_hub);
         assert!(!devices[0].is_shareable(), "but never offered");
+        assert_eq!(
+            devices[0].manufacturer, None,
+            "and its strings are not read, which would wake a suspended controller"
+        );
     }
 
     /// A bluetooth adapter carries isochronous endpoints for headset audio.
