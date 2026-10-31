@@ -134,6 +134,30 @@ pub fn volume_display_name(id: &str, label: &str) -> String {
     }
 }
 
+/// The file system name a peer's volume reports on Windows, `cursio-<peer>`
+/// cut to what WinFsp can hold.
+///
+/// `FSP_FSCTL_VOLUME_PARAMS::FileSystemName` is 16 UTF-16 units read as a
+/// terminated string, and the `winfsp` crate copies whatever it is given into
+/// it, bounded at 192 — so a name past 16 panicked the mount. A phone called
+/// "POCO X7 Pro" makes `cursio-POCO X7 Pro`, 18, and its storage never
+/// mounted, retried every second. The name only fills the "File system" line
+/// of a drive's properties; the label and the share carry the peer's full
+/// name.
+pub fn winfsp_filesystem_name(peer_name: &str) -> String {
+    const UNITS: usize = 15;
+    let mut name = String::new();
+    let mut units = 0;
+    for c in format!("cursio-{peer_name}").chars() {
+        units += c.len_utf16();
+        if units > UNITS {
+            break;
+        }
+        name.push(c);
+    }
+    name
+}
+
 /// Now, as seconds since the epoch — for a file just created here, whose
 /// timestamp the peer has not yet told us.
 #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
@@ -146,7 +170,19 @@ pub(crate) fn now_unix() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{volume_dir_name, volume_display_name};
+    use super::{volume_dir_name, volume_display_name, winfsp_filesystem_name};
+
+    #[test]
+    fn a_long_peer_name_still_fits_the_file_system_name_winfsp_holds() {
+        assert_eq!(winfsp_filesystem_name("Nocturne"), "cursio-Nocturne");
+        let long = winfsp_filesystem_name("POCO X7 Pro");
+        assert_eq!(long, "cursio-POCO X7 ");
+        assert!(long.encode_utf16().count() <= 15);
+        // A character outside the BMP is two units and is never split.
+        let wide = winfsp_filesystem_name("Ноут😀😀😀😀");
+        assert!(wide.encode_utf16().count() <= 15);
+        assert!(wide.chars().all(|c| c != char::REPLACEMENT_CHARACTER));
+    }
 
     /// A drive letter alone does not say what the disk is.
     ///

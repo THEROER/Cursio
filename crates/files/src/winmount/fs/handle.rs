@@ -198,7 +198,7 @@ pub fn mount(
     params
         .sector_size(SECTOR_SIZE)
         .sectors_per_allocation_unit(SECTORS_PER_CLUSTER)
-        .filesystem_name(format!("cursio-{peer_name}"))
+        .filesystem_name(crate::winfsp_filesystem_name(peer_name))
         // Declare this a NETWORK filesystem, by giving it a UNC prefix.
         //
         // The prefix is what makes WinFsp create the volume through
