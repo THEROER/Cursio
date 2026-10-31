@@ -188,6 +188,13 @@ pub struct FilesEngine {
     /// drives failed against a stale mount point and none came back.
     #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
     mount_retry_at: Option<Instant>,
+    /// Retries in a row that failed, which spaces the next one out; see
+    /// [`mounts::retry_after`].
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+    mount_failures: u32,
+    /// When a mount last failed or fell.
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+    mount_failed_at: Option<Instant>,
     /// Deferred until the first pump, because `new` is not async.
     announce_volumes: bool,
     /// The peer's volumes as last announced, answered from here instead of over
@@ -260,6 +267,10 @@ impl FilesEngine {
             mount_link: link,
             #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
             mount_retry_at: None,
+            #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+            mount_failures: 0,
+            #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+            mount_failed_at: None,
             announce_volumes: true,
             peer_volumes: Vec::new(),
             last_rescan: Instant::now(),

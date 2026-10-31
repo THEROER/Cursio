@@ -46,6 +46,10 @@ pub(super) fn engine() -> (FilesEngine, tokio::sync::mpsc::UnboundedSender<Op>) 
         mount_link: PeerLink::new(tokio::sync::mpsc::unbounded_channel().0),
         #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
         mount_retry_at: None,
+        #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+        mount_failures: 0,
+        #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+        mount_failed_at: None,
         announce_volumes: false,
         peer_volumes: Vec::new(),
         last_rescan: Instant::now(),

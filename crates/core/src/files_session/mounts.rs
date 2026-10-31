@@ -29,6 +29,28 @@ pub(super) const VOLUME_RESCAN: Duration = Duration::from_secs(1);
 #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
 pub(super) const MOUNT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long every mount must stand before the failures before it are
+/// forgotten. A relayed mount is handed back as made and falls a moment
+/// later, so "made" alone would forget them on every attempt.
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+const MOUNT_STABLE: Duration = Duration::from_secs(60);
+
+/// The longest a volume that keeps failing waits between attempts.
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+const MOUNT_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// How long to wait after `failures` failed attempts in a row: the interval,
+/// doubling to [`MOUNT_RETRY_MAX`]. A failure that clears on its own clears
+/// within the first few; one that does not — a helper that panics on this
+/// volume every time — was retried every second and wrote a warning each
+/// time, thousands an hour.
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+pub(super) fn retry_after(failures: u32) -> Duration {
+    MOUNT_RETRY_INTERVAL
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(MOUNT_RETRY_MAX)
+}
+
 /// Where a peer's volumes are mounted on Linux.
 ///
 /// Under the user's runtime directory rather than `/mnt`: no privileges needed,
@@ -274,13 +296,23 @@ impl FilesEngine {
         // mount point.
         let live: std::collections::HashSet<&str> =
             self.peer_volumes.iter().map(|v| v.id.as_str()).collect();
+        // A relayed mount is handed back at once and fails later, inside the
+        // helper; one that fell counts as a failed attempt, or it was dropped
+        // and tried again on the very next pump.
+        let mut fell = false;
         self.volume_mounts.retain(|id, mount| {
             let keep = live.contains(id.as_str());
             if !keep {
                 tracing::info!(peer = %self.peer_name, volume = %id, "peer volume went away; unmounting");
             }
-            keep && mount_is_alive(mount)
+            let alive = mount_is_alive(mount);
+            fell |= keep && !alive;
+            keep && alive
         });
+        if fell {
+            self.mount_failures += 1;
+            self.mount_retry_at = Some(Instant::now() + retry_after(self.mount_failures));
+        }
 
         // Arrived: one mount each. Anything still missing is retried, since a
         // failure here is often temporary — see [`FilesEngine::mount_retry_at`].
@@ -313,7 +345,21 @@ impl FilesEngine {
         // Spaced out rather than attempted every pump: a mount that cannot be
         // made usually cannot be made a millisecond later either, and each
         // attempt touches the filesystem.
-        self.mount_retry_at = failed.then(|| Instant::now() + MOUNT_RETRY_INTERVAL);
+        if failed {
+            self.mount_failures += 1;
+            self.mount_retry_at = Some(Instant::now() + retry_after(self.mount_failures));
+        } else {
+            self.mount_retry_at = None;
+        }
+        if failed || fell {
+            self.mount_failed_at = Some(Instant::now());
+        } else if self
+            .mount_failed_at
+            .is_some_and(|at| at.elapsed() >= MOUNT_STABLE)
+        {
+            self.mount_failures = 0;
+            self.mount_failed_at = None;
+        }
     }
 
     /// No-op where this platform has no mount backend at all.
@@ -331,6 +377,15 @@ impl FilesEngine {
 mod tests {
     use super::*;
     use crate::files_session::test_support::engine;
+
+    #[test]
+    fn a_volume_that_keeps_failing_is_tried_ever_less_often_up_to_five_minutes() {
+        assert_eq!(retry_after(1), MOUNT_RETRY_INTERVAL);
+        assert_eq!(retry_after(2), MOUNT_RETRY_INTERVAL * 2);
+        assert_eq!(retry_after(4), MOUNT_RETRY_INTERVAL * 8);
+        assert_eq!(retry_after(30), MOUNT_RETRY_MAX);
+        assert_eq!(retry_after(u32::MAX), MOUNT_RETRY_MAX);
+    }
 
     /// A scan that has not come back yet does not get a second one queued
     /// behind it.
