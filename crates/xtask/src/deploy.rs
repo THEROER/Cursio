@@ -78,7 +78,19 @@ pub fn current_commit() -> Result<Commit> {
     let sha = git(&["rev-parse", "--short=10", "HEAD"])?;
     // Untracked files are not built unless something references them, and
     // counting them would mark every build dirty over a stray scratch file.
-    let dirty = !git(&["status", "--porcelain", "--untracked-files=no"])?.is_empty();
+    // Tauri's generated schemas are rewritten by every build — the phone's
+    // and the desktop's write them differently — so a publish that builds the
+    // phone after the desktop found its own output dirty and named the
+    // version `.dirty`.
+    let dirty = !git(&[
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+        "--",
+        ".",
+        ":(exclude)app/gen/schemas",
+    ])?
+    .is_empty();
     Ok(Commit { sha, dirty })
 }
 
