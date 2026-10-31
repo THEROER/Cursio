@@ -252,7 +252,9 @@ async fn sweep_once(ctx: &Rc<NodeCtx>, self_id: PeerId, strangers: &mut HashMap<
             }
             Err(e) => {
                 tracing::debug!(peer = %target.display_name, error = %e, "dial failed; will retry");
-                ctx.registry.borrow_mut().mark_offline(target.peer_id);
+                ctx.registry
+                    .borrow_mut()
+                    .dial_failed(target.peer_id, std::time::Instant::now());
             }
         }
     }

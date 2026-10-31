@@ -121,11 +121,17 @@ fn next_dial_targets_at(
                 tracing::trace!(peer = %peer.display_name, "yielding dial to the peer");
                 continue;
             }
-            tracing::info!(
-                peer = %peer.display_name,
-                %addr,
-                "the peer has not called although it is up; calling it instead"
-            );
+            // Said once per absence: repeated at every retry it was most of
+            // a day's log for a phone that was simply off.
+            if reg.dial_failures(&peer.peer_id) == 0 {
+                tracing::info!(
+                    peer = %peer.display_name,
+                    %addr,
+                    "the peer has not called although it is up; calling it instead"
+                );
+            } else {
+                tracing::debug!(peer = %peer.display_name, %addr, "calling the peer again");
+            }
         }
         reg.set_state(peer.peer_id, PeerState::Connecting);
         targets.push(DialTarget {

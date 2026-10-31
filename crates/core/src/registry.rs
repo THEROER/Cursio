@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cursio_protocol::{PeerId, SessionTag};
 use cursio_transport::pairing::TrustStore;
@@ -130,7 +130,21 @@ pub struct PeerRegistry {
     /// the one that lets it go once the network carries the session again;
     /// a phone that keeps a standby open must not have it closed from here.
     bluetooth_dialled: HashSet<PeerId>,
+    /// Calls to each peer that failed in a row, and when the next may go.
+    ///
+    /// Without it a peer that is off — a phone in a drawer, a laptop at
+    /// home — was called at its remembered address every sweep, forever:
+    /// 17 000 calls a day to one phone, each two log lines, and a connect
+    /// timeout's worth of a socket every four seconds.
+    dial_backoff: HashMap<PeerId, (u32, Instant)>,
 }
+
+/// The wait after one failed call; it doubles with each in a row.
+pub const DIAL_RETRY: Duration = Duration::from_secs(4);
+/// The most a peer that keeps not answering waits between calls. Short
+/// enough that a machine woken up is found within it even when its own
+/// announcement never reaches this one.
+pub const DIAL_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// A running session, as the registry holds it.
 struct HeldSession(ResumeHandle);
@@ -218,6 +232,8 @@ impl PeerRegistry {
                 // on a different IP becomes reachable again.
                 peer.addr = Some(addr);
                 peer.seen_at = Some(Instant::now());
+                // Being heard is fresh evidence it may answer now.
+                self.dial_backoff.remove(&peer_id);
                 if peer.display_name != display_name {
                     peer.display_name = display_name.to_string();
                 }
@@ -252,9 +268,26 @@ impl PeerRegistry {
         if let Some(peer) = self.peers.get_mut(&peer_id) {
             if matches!(state, PeerState::Online) {
                 peer.yielding_since = None;
+                self.dial_backoff.remove(&peer_id);
             }
             peer.state = state;
         }
+    }
+
+    /// A call to `peer_id` failed: offline again, and not called again for a
+    /// while, the longer the more calls in a row have failed.
+    pub fn dial_failed(&mut self, peer_id: PeerId, now: Instant) {
+        self.mark_offline(peer_id);
+        let failures = self.dial_backoff.get(&peer_id).map_or(0, |(n, _)| *n) + 1;
+        let wait = DIAL_RETRY
+            .saturating_mul(1 << (failures - 1).min(8))
+            .min(DIAL_RETRY_MAX);
+        self.dial_backoff.insert(peer_id, (failures, now + wait));
+    }
+
+    /// Calls to `peer_id` that failed in a row.
+    pub fn dial_failures(&self, peer_id: &PeerId) -> u32 {
+        self.dial_backoff.get(peer_id).map_or(0, |(n, _)| *n)
     }
 
     /// Note that this node is leaving the dial to `peer_id`, and answer since
@@ -346,10 +379,17 @@ impl PeerRegistry {
     /// Peers we should try to reach: known, currently offline, and with a
     /// known address.
     pub fn dial_candidates(&self) -> Vec<KnownPeer> {
+        let now = Instant::now();
         self.peers
             .values()
             .filter(|p| {
-                p.dialable()
+                let resting = self
+                    .dial_backoff
+                    .get(&p.peer_id)
+                    .is_some_and(|(_, until)| now < *until);
+                (p.dialable() && !resting)
+                    // A session waiting for its network path is called at
+                    // every sweep: it is lost once its hold runs out.
                     || (p.addr.is_some()
                         && self.needs_network_path(&p.peer_id)
                         && !matches!(p.state, PeerState::Connecting))
@@ -546,6 +586,27 @@ mod tests {
 
     fn peer(n: u128) -> PeerId {
         PeerId::from_u128(n)
+    }
+
+    #[test]
+    fn a_peer_that_does_not_answer_is_called_ever_less_often_until_it_is_heard() {
+        let mut reg = PeerRegistry::default();
+        let addr: SocketAddr = "192.168.1.18:40061".parse().unwrap();
+        reg.admit(peer(9), "Redmi".into(), Some(addr));
+        assert_eq!(reg.dial_candidates().len(), 1);
+
+        let now = Instant::now();
+        reg.dial_failed(peer(9), now);
+        assert!(reg.dial_candidates().is_empty(), "not again at once");
+        for _ in 0..10 {
+            reg.dial_failed(peer(9), now);
+        }
+        let (_, until) = reg.dial_backoff[&peer(9)];
+        assert_eq!(until - now, DIAL_RETRY_MAX, "never longer than the cap");
+
+        reg.note_seen(peer(9), "Redmi", addr);
+        assert_eq!(reg.dial_failures(&peer(9)), 0);
+        assert_eq!(reg.dial_candidates().len(), 1, "heard again: called again");
     }
 
     /// Exactly one side of any pair dials — otherwise simultaneous startup

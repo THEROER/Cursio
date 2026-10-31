@@ -391,8 +391,10 @@ pub(crate) async fn run_mesh(
                                         error = %e,
                                         "dial failed; will retry"
                                     );
-                                    // Back to Offline so the next sweep retries.
-                                    registry.borrow_mut().mark_offline(target.peer_id);
+                                    // Back to Offline, retried after a backoff.
+                                    registry
+                                        .borrow_mut()
+                                        .dial_failed(target.peer_id, std::time::Instant::now());
                                     continue;
                                 }
                             };
