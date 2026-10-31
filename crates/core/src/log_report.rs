@@ -55,6 +55,8 @@ pub fn build(
             if let (Some(module), Some(ms)) = (field(line, "module"), field(line, "took_ms")) {
                 let entry = slow.entry(module.to_string()).or_default();
                 entry.0 += 1;
+                // `took_ms=24 Module(files)`: the figure is the first word.
+                let ms = ms.split_whitespace().next().unwrap_or_default();
                 entry.1 = entry.1.max(ms.parse().unwrap_or(0));
             }
         }
@@ -222,7 +224,9 @@ pub fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 fn template(line: &str) -> String {
     let mut words = line.splitn(3, char::is_whitespace);
     words.next();
-    let rest = words.collect::<Vec<_>>().join(" ");
+    // A span's fields reach the file with their colour codes even though the
+    // file writer asks for none.
+    let rest = without_ansi(&words.collect::<Vec<_>>().join(" "));
     let mut out = String::new();
     let mut chars = rest.trim_start().chars().peekable();
     let mut word = String::new();
@@ -254,8 +258,28 @@ fn template(line: &str) -> String {
         }
     }
     push_word(&mut out, &mut word);
-    let mut out: String = out.chars().take(160).collect();
+    // A reading in the message ("waited 24% of the last 10 s") would make each
+    // value its own kind.
+    let mut out: String = numbers_out(&out).chars().take(160).collect();
     out.truncate(out.trim_end().len());
+    out
+}
+
+/// `text` without terminal colour sequences (`ESC [ … m`).
+fn without_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
     out
 }
 
@@ -351,6 +375,15 @@ mod tests {
                 max_ms: 112
             }]
         );
+    }
+
+    #[test]
+    fn readings_and_colour_codes_do_not_split_one_warning_into_many() {
+        let a = template("2026-10-31T16:00:00Z  WARN cursio_core::diagnostics: this machine is stalling on disk i/o: everything waited 24% of the last 10 s problem=machine.io");
+        let b = template("2026-10-31T16:00:05Z  WARN cursio_core::diagnostics: this machine is stalling on disk i/o: everything waited 60% of the last 10 s problem=machine.io");
+        assert_eq!(a, b);
+        let coloured = template("2026-10-31T16:00:00Z  WARN {}{\u{1b}[3mtask_name\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"x\"}: zbus::proxy: failed");
+        assert!(!coloured.contains('\u{1b}'));
     }
 
     #[test]
