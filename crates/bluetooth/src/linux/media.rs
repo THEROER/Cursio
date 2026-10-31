@@ -64,14 +64,20 @@ impl Endpoint {
             .as_ref()
             .and_then(|d| super::address_from_path(d.as_str()))
             .unwrap_or_default();
-        let name = device
-            .as_ref()
-            .and_then(|d| super::property(&bus, d.as_str(), "org.bluez.Device1", "Alias"))
-            .unwrap_or_else(|| phone.clone());
-        tracing::info!(%phone, %name, config = ?config, "phone chose this computer as its speaker");
         let spawned = std::thread::Builder::new()
             .name(format!("a2dp-{phone}"))
-            .spawn(move || follow_transport(bus, transport, config, phone, name, audio));
+            .spawn(move || {
+                // Asked here, not in the method: BlueZ calls this method on
+                // zbus's own runtime, where a blocking call is a panic
+                // ("cannot start a runtime from within a runtime") — which
+                // ended every speaker setup before it began.
+                let name = device
+                    .as_ref()
+                    .and_then(|d| super::property(&bus, d.as_str(), "org.bluez.Device1", "Alias"))
+                    .unwrap_or_else(|| phone.clone());
+                tracing::info!(%phone, %name, config = ?config, "phone chose this computer as its speaker");
+                follow_transport(bus, transport, config, phone, name, audio)
+            });
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "cannot follow the phone's media transport");
         }
