@@ -490,6 +490,17 @@ class MeshService : Service() {
             // and the service stays in the foreground without it showing.
             .setShowWhen(false)
             .addAction(Notification.Action.Builder(null, "Stop", stop).build())
+        // Only while a machine is linked: the status line is rebuilt when that
+        // changes, and a button that can reach nobody is one more to ignore.
+        if (status.startsWith("connected")) {
+            val sendClip = PendingIntent.getActivity(
+                this,
+                3,
+                ClipboardSendActivity.intent(this),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            builder.addAction(Notification.Action.Builder(null, "Send clipboard", sendClip).build())
+        }
         if (screen != null) {
             val stopScreen = PendingIntent.getService(
                 this,

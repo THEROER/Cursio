@@ -144,6 +144,29 @@
             </intent-filter>
         </activity>
 
+        <!-- This phone's clipboard to a computer. Android reads the clipboard
+             only to a focused window, so this invisible one exists for the
+             moment that read takes; see ClipboardSendActivity. -->
+        <activity
+            android:name="dev.cursio.mesh.ClipboardSendActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- "Send clipboard" in Quick Settings, bound by the system alone. -->
+        <service
+            android:name="dev.cursio.mesh.ClipboardTile"
+            android:exported="true"
+            android:icon="@drawable/ic_notify"
+            android:label="Send clipboard"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
         <!-- This phone's notifications, for the desktop the user is at. Runs
              only once the user grants notification access in the system's
              settings; the system binds it, so it is exported to the system

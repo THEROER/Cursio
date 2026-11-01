@@ -115,6 +115,22 @@ object CursioNative {
         ShareReceiver.act(from, kind, text, path, name, mime, action)
 
     /**
+     * Where this phone's clipboard would go now, as JSON: `{"to":[id,name]}`,
+     * `{"pick":[[id,name],…]}` or `{"nowhere":why}`; see [ClipboardSendActivity].
+     */
+    external fun nativeClipboardDestination(): String
+
+    /** Offer [text] to [peer] as a copy; answers `sent:<name>`, otherwise why not. */
+    external fun nativeSendClipboard(peer: String, text: String): String
+
+    /**
+     * A computer's copy, for this phone's clipboard. Called by the node, on its
+     * own thread; answers `""` or why not, see [PhoneClipboard].
+     */
+    @JvmStatic
+    fun putClipboard(text: String): String = PhoneClipboard.put(text)
+
+    /**
      * A notification was posted on this phone; see [CursioNotificationListener].
      * [kind] is `dialer_call` (the phone's own), `call` (a messenger's),
      * `message` or `other`; [actionReplies] says which of [actionTitles] take

@@ -61,6 +61,10 @@ pub enum ReadReply {
     },
 }
 
+/// How the worker reaches the clipboard: `clipboard-core`'s backend, or one a
+/// platform without one hands in. Retried on every job until it works.
+pub type Opener = Box<dyn Fn() -> Result<Box<dyn Clipboard>, ClipboardError> + Send>;
+
 /// Handle to the clipboard worker thread. Dropping it stops the thread.
 pub struct ClipboardWorker {
     /// Jobs to the worker.
@@ -80,6 +84,11 @@ impl ClipboardWorker {
     /// use so a session on a headless/unsupported host still starts (the module
     /// simply never offers or serves anything).
     pub fn spawn() -> Self {
+        Self::spawn_with(Box::new(clipboard_core::open))
+    }
+
+    /// Spawn the worker over the clipboard `open` reaches.
+    pub fn spawn_with(open: Opener) -> Self {
         let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<Job>();
         let (reads_tx, reads_rx) = std::sync::mpsc::channel::<ReadReply>();
         let stop = Arc::new(AtomicBool::new(false));
@@ -87,7 +96,7 @@ impl ClipboardWorker {
 
         std::thread::Builder::new()
             .name("clipboard-worker".into())
-            .spawn(move || run_worker(jobs_rx, reads_tx, thread_stop))
+            .spawn(move || run_worker(open, jobs_rx, reads_tx, thread_stop))
             .expect("spawn clipboard worker thread");
 
         Self {
@@ -140,6 +149,11 @@ impl ClipboardWorker {
                 tracing::warn!(error = %e, "cannot watch clipboard; sharing local copies disabled");
             }
         }
+    }
+
+    /// Report a change no watcher saw: content handed in by the platform.
+    pub fn mark_changed(&self) {
+        self.changed.store(true, Ordering::Relaxed);
     }
 
     /// Whether the clipboard has changed since the last poll. Clears the flag.
@@ -202,6 +216,7 @@ impl Drop for ClipboardWorker {
 
 /// The worker thread body: open the clipboard on first use, then serve jobs.
 fn run_worker(
+    opener: Opener,
     jobs: std::sync::mpsc::Receiver<Job>,
     reads: std::sync::mpsc::Sender<ReadReply>,
     stop: Arc<AtomicBool>,
@@ -221,7 +236,7 @@ fn run_worker(
 
     let open = |cb: &mut Option<Box<dyn Clipboard>>| -> Result<(), ClipboardError> {
         if cb.is_none() {
-            *cb = Some(clipboard_core::open()?);
+            *cb = Some(opener()?);
         }
         Ok(())
     };

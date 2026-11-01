@@ -95,8 +95,18 @@ const CHUNK_BYTES: usize = 256 * 1024;
 /// and receive (never request past it).
 const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
+mod phone;
 mod worker;
+pub use phone::{Destination, PhoneClipboard, SystemClipboard};
 use worker::{ClipboardWorker, ReadReply};
+
+/// A phone's link: its registration for handed copies, what the worker's
+/// clipboard reads back, and when the link came up.
+struct PhoneState {
+    link: phone::PhoneLink,
+    current: std::sync::Arc<std::sync::Mutex<Option<ClipboardContent>>>,
+    since: std::time::Instant,
+}
 
 /// Clipboard-sharing state for one session.
 ///
@@ -145,6 +155,10 @@ pub struct ClipboardEngine {
     /// The peer's display name, for logs.
     peer_name: String,
 
+    /// Set on a phone, whose clipboard is written but never watched; see
+    /// [`phone`].
+    phone: Option<PhoneState>,
+
     offered: u64,
     pulled: u64,
     served: u64,
@@ -177,8 +191,32 @@ impl ClipboardEngine {
     /// Create the clipboard module. Nothing touches the clipboard or the wire
     /// until [`SessionModule::start`] spins up the worker.
     pub fn new(peer_name: String) -> Self {
+        Self::with_worker(peer_name, ClipboardWorker::spawn(), None)
+    }
+
+    /// The module on a phone: received copies go to the system through
+    /// `clipboard`, and only copies handed to `link` are offered.
+    fn on_phone(peer_name: String, clipboard: &PhoneClipboard, link: phone::PhoneLink) -> Self {
+        let current = std::sync::Arc::default();
+        let side_current = std::sync::Arc::clone(&current);
+        let clipboard = clipboard.clone();
+        let worker = ClipboardWorker::spawn_with(Box::new(move || {
+            Ok(Box::new(phone::PhoneSide {
+                phone: clipboard.clone(),
+                current: std::sync::Arc::clone(&side_current),
+            }) as Box<dyn clipboard_core::Clipboard>)
+        }));
+        let state = PhoneState {
+            link,
+            current,
+            since: std::time::Instant::now(),
+        };
+        Self::with_worker(peer_name, worker, Some(state))
+    }
+
+    fn with_worker(peer_name: String, worker: ClipboardWorker, phone: Option<PhoneState>) -> Self {
         Self {
-            worker: ClipboardWorker::spawn(),
+            worker,
             local_gen: 0,
             local_offer: None,
             peer_gen: None,
@@ -188,6 +226,7 @@ impl ClipboardEngine {
             pending_failures: Vec::new(),
             last_remote_copy: None,
             peer_name,
+            phone,
             offered: 0,
             pulled: 0,
             served: 0,
@@ -209,6 +248,13 @@ impl SessionModule for ClipboardEngine {
     /// goes out from `pump` when the watcher reports the current content (or the
     /// next copy). Starting the watch is all that's needed up front.
     async fn start(&mut self, _tx: &mut dyn TransportTx) -> Result<(), TransportError> {
+        if self.phone.is_some() {
+            tracing::info!(
+                peer = %self.peer_name,
+                "clipboard sharing up — the peer's copies land here, this phone's go by a tap"
+            );
+            return Ok(());
+        }
         self.worker.start_watch();
         tracing::info!(
             peer = %self.peer_name,
@@ -226,6 +272,7 @@ impl SessionModule for ClipboardEngine {
         for failed in self.pending_failures.drain(..) {
             send(tx, ClipboardMsg::Failed(failed)).await?;
         }
+        self.take_handed();
         self.pump_local_change(tx).await?;
         self.pump_read_replies(tx).await?;
         self.pump_outbound(tx).await?;
@@ -262,6 +309,22 @@ impl SessionModule for ClipboardEngine {
 }
 
 impl ClipboardEngine {
+    /// A copy the phone's user handed to this link becomes the local copy.
+    ///
+    /// Not checked against the copy last received from this peer: that check
+    /// tells a write's own notification from a real copy, and a tap is never
+    /// a notification — sending the computer back what it sent is what the
+    /// user asked for.
+    fn take_handed(&mut self) {
+        let Some(phone) = &self.phone else { return };
+        let Some(content) = phone.link.take_handed() else {
+            return;
+        };
+        *phone.current.lock().unwrap_or_else(|p| p.into_inner()) = Some(content);
+        self.last_remote_copy = None;
+        self.worker.mark_changed();
+    }
+
     /// If the local clipboard changed, read what it now offers and send a fresh
     /// [`ClipboardOffer`]. The offer is payload-free — sizes only — so this stays
     /// cheap even when a 4K image was just copied.
@@ -504,7 +567,24 @@ impl ClipboardEngine {
         // A new offer supersedes any inbound pull still in progress.
         self.inbound = None;
 
-        let want = match offer.best_for(PULLABLE) {
+        let pullable = match &self.phone {
+            None => PULLABLE,
+            Some(phone) => {
+                if !phone.link.phone().enabled() {
+                    tracing::debug!("clipboard sharing is off here; not pulling the peer's copy");
+                    return;
+                }
+                if phone.since.elapsed() < phone::STARTUP_GRACE {
+                    tracing::debug!(
+                        generation = offer.generation,
+                        "not putting what the peer held before the link came up on the phone"
+                    );
+                    return;
+                }
+                phone::PULLABLE
+            }
+        };
+        let want = match offer.best_for(pullable) {
             Some(f) => f.clone(),
             None => {
                 tracing::debug!(
@@ -671,9 +751,11 @@ impl ClipboardEngine {
 /// Builds [`ClipboardEngine`] when clipboard sharing is enabled.
 ///
 /// Available on every platform `clipboard-core` supports, so availability is
-/// purely "did the user ask for it".
+/// purely "did the user ask for it". A phone, which it does not support, hands
+/// its own clipboard in as `phone`.
 pub struct ClipboardFactory {
     pub enabled: bool,
+    pub phone: Option<PhoneClipboard>,
 }
 
 impl crate::module::ModuleFactory for ClipboardFactory {
@@ -687,7 +769,18 @@ impl crate::module::ModuleFactory for ClipboardFactory {
     }
 
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
-        Ok(Box::new(ClipboardEngine::new(ctx.peer_name().to_string())))
+        let name = ctx.peer_name().to_string();
+        Ok(Box::new(match &self.phone {
+            None => ClipboardEngine::new(name),
+            Some(phone) => {
+                let link = phone.attach(
+                    ctx.peer.peer_id,
+                    name.clone(),
+                    ctx.peer.device_kind.takes_cursor(),
+                );
+                ClipboardEngine::on_phone(name, phone, link)
+            }
+        }))
     }
 }
 
@@ -699,7 +792,7 @@ pub const VERSION: u16 = 1;
 mod tests {
     use super::*;
     use crate::test_support::RecordingTx;
-    use cursio_protocol::ClipboardFormatOffer;
+    use cursio_protocol::{ClipboardFormatOffer, PeerId};
 
     fn offer(
         generation: ClipboardGeneration,
@@ -965,5 +1058,133 @@ mod tests {
             tx.sent.is_empty(),
             "nothing should be sent for a superseded serve"
         );
+    }
+
+    #[derive(Default)]
+    struct PhoneSystem(std::sync::Mutex<Vec<String>>);
+
+    impl SystemClipboard for PhoneSystem {
+        fn put_text(&self, text: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(text.into());
+            Ok(())
+        }
+    }
+
+    fn phone_engine() -> (ClipboardEngine, PhoneClipboard, std::sync::Arc<PhoneSystem>) {
+        let system = std::sync::Arc::new(PhoneSystem::default());
+        let phone = PhoneClipboard::new(system.clone(), Default::default());
+        let link = phone.attach(PeerId::from_u128(1), "Nocturne".into(), true);
+        let engine = ClipboardEngine::on_phone("Nocturne".into(), &phone, link);
+        (engine, phone, system)
+    }
+
+    fn past_startup(eng: &mut ClipboardEngine) {
+        if let Some(phone) = &mut eng.phone {
+            phone.since -= phone::STARTUP_GRACE;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_phone_does_not_take_what_the_computer_held_when_the_link_came_up() {
+        let (mut eng, _, _) = phone_engine();
+        eng.on_offer(&offer(1, &[(ClipboardFormat::Text, 5)]));
+        assert!(eng.pending_request.is_none());
+        past_startup(&mut eng);
+        eng.on_offer(&offer(2, &[(ClipboardFormat::Text, 5)]));
+        assert!(eng.pending_request.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_phone_pulls_the_text_of_a_rich_copy() {
+        let (mut eng, _, _) = phone_engine();
+        past_startup(&mut eng);
+        eng.on_offer(&offer(
+            1,
+            &[
+                (ClipboardFormat::Text, 5),
+                (ClipboardFormat::Html, 20),
+                (ClipboardFormat::ImagePng, 90),
+            ],
+        ));
+        assert_eq!(eng.pending_request.unwrap().format, ClipboardFormat::Text);
+    }
+
+    #[tokio::test]
+    async fn a_phone_switched_off_pulls_nothing() {
+        let system = std::sync::Arc::new(PhoneSystem::default());
+        let switches = crate::module::ModuleSwitches::default();
+        let phone = PhoneClipboard::new(system, switches.clone());
+        let link = phone.attach(PeerId::from_u128(1), "Nocturne".into(), true);
+        let mut eng = ClipboardEngine::on_phone("Nocturne".into(), &phone, link);
+        past_startup(&mut eng);
+        switches.set(ModuleId::CLIPBOARD, false);
+        eng.on_offer(&offer(1, &[(ClipboardFormat::Text, 5)]));
+        assert!(eng.pending_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_received_copy_lands_on_the_phone_and_is_never_offered_back() {
+        let (mut eng, _, system) = phone_engine();
+        past_startup(&mut eng);
+        eng.on_offer(&offer(1, &[(ClipboardFormat::Text, 2)]));
+        eng.on_data(&ClipboardData {
+            generation: 1,
+            format: ClipboardFormat::Text,
+            seq: 0,
+            last: true,
+            data: b"hi".to_vec(),
+        });
+        let mut tx = RecordingTx::default();
+        eng.pump(&mut tx).await.unwrap();
+        // The write is asynchronous on the worker; `matches` queues behind it.
+        assert!(eng.worker.matches(&ClipboardContent::text("hi")).unwrap());
+        eng.pump(&mut tx).await.unwrap();
+        assert_eq!(*system.0.lock().unwrap(), vec!["hi"]);
+        let offers: Vec<ClipboardMsg> = tx.decoded(ModuleId::CLIPBOARD);
+        assert!(
+            !offers.iter().any(|m| matches!(m, ClipboardMsg::Offer(_))),
+            "a phone has no watcher, so its own write is no copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_handed_on_the_phone_is_offered_and_served_to_that_link() {
+        let (mut eng, phone, _) = phone_engine();
+        assert_eq!(
+            phone
+                .hand(&PeerId::from_u128(1).to_string(), "from the phone".into())
+                .unwrap(),
+            "Nocturne"
+        );
+        let mut tx = RecordingTx::default();
+        eng.pump(&mut tx).await.unwrap();
+        let offers: Vec<ClipboardMsg> = tx.decoded(ModuleId::CLIPBOARD);
+        let Some(ClipboardMsg::Offer(sent)) = offers.first() else {
+            panic!("a handed copy should be offered, got {offers:?}");
+        };
+        assert!(sent.has(&ClipboardFormat::Text));
+        let generation = sent.generation;
+
+        eng.on_request(&ClipboardRequest {
+            generation,
+            format: ClipboardFormat::Text,
+        });
+        let mut served = Vec::new();
+        for _ in 0..200 {
+            eng.pump(&mut tx).await.unwrap();
+            served = tx
+                .decoded::<ClipboardMsg>(ModuleId::CLIPBOARD)
+                .into_iter()
+                .filter_map(|m| match m {
+                    ClipboardMsg::Data(d) => Some(d.data),
+                    _ => None,
+                })
+                .collect();
+            if !served.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(served, vec![b"from the phone".to_vec()]);
     }
 }

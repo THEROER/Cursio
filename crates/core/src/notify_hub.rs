@@ -243,18 +243,27 @@ impl NotifyHub {
     /// The desktop the user was at last: the one with the latest input, else
     /// one saying the user is there. `None` while no desktop has said either.
     pub fn last_used_desktop(&self) -> Option<String> {
+        self.last_used(|_, l| l.name.clone())
+    }
+
+    /// [`Self::last_used_desktop`], by id.
+    pub fn last_used_desktop_id(&self) -> Option<PeerId> {
+        self.last_used(|id, _| *id)
+    }
+
+    fn last_used<T>(&self, answer: impl Fn(&PeerId, &Link) -> T) -> Option<T> {
         let now = Instant::now();
         let links = self.lock();
-        let desktops = || links.values().filter(|l| !l.phone && !l.tx.is_closed());
+        let desktops = || links.iter().filter(|(_, l)| !l.phone && !l.tx.is_closed());
         desktops()
-            .filter_map(|l| {
+            .filter_map(|(id, l)| {
                 let (active, last) = l.activity?;
-                Some((if active { now } else { last }, l))
+                Some((if active { now } else { last }, (id, l)))
             })
             .max_by_key(|(last, _)| *last)
-            .map(|(_, l)| l)
-            .or_else(|| desktops().find(|l| l.here))
-            .map(|l| l.name.clone())
+            .map(|(_, link)| link)
+            .or_else(|| desktops().find(|(_, l)| l.here))
+            .map(|(id, l)| answer(id, l))
     }
 
     /// What every desktop said about being in use, for [`crate::at_phone`].

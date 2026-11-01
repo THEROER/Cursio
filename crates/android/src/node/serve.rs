@@ -13,7 +13,7 @@ use cursio_core::control::ModuleSwitch;
 use cursio_core::control::NodeState;
 use cursio_core::live::Shared as LiveShared;
 use cursio_core::mesh::SharedRegistry;
-use cursio_core::module::ModuleRegistry;
+use cursio_core::module::{ModuleRegistry, ModuleSwitches};
 use cursio_core::node_status::NodeStatusMonitor;
 use cursio_protocol::PeerId;
 use cursio_transport::discovery;
@@ -34,6 +34,7 @@ pub(super) async fn serve(node: Node) -> anyhow::Result<()> {
         pairing,
         identity,
         mic_gate,
+        switches,
         port,
     } = node;
     tracing::info!(id = %identity.peer_id, name = %identity.display_name, "node identity");
@@ -54,7 +55,7 @@ pub(super) async fn serve(node: Node) -> anyhow::Result<()> {
         tracing::info!(peer = %peer.display_name, id = %peer.peer_id, "known peer");
     }
 
-    let modules = phone_modules(&control, mic_gate);
+    let modules = phone_modules(&control, mic_gate, switches);
     for advert in modules.advertise() {
         tracing::info!(module = %advert.id, version = advert.version, "module available");
     }
@@ -129,13 +130,24 @@ pub(super) async fn serve(node: Node) -> anyhow::Result<()> {
 
 /// What a phone runs on a link, and the platform halves the hubs reach the
 /// phone through.
-fn phone_modules(control: &NodeState, mic_gate: LiveShared<MicGate>) -> ModuleRegistry {
+fn phone_modules(
+    control: &NodeState,
+    mic_gate: LiveShared<MicGate>,
+    switches: ModuleSwitches,
+) -> ModuleRegistry {
     let modules = ModuleRegistry::new()
+        .with_switches(switches.clone())
         .with(Box::new(AudioFactory {
             enabled: true,
             render_device: LiveShared::new(None),
             mic_gate,
             mixer: control.mixer(),
+        }))
+        // Computers' copies onto Android's clipboard, and the phone's to a
+        // computer by a tap; see `clipboard_session::phone`.
+        .with(Box::new(cursio_core::clipboard_session::ClipboardFactory {
+            enabled: true,
+            phone: Some(crate::clipboard::phone(switches)),
         }))
         .with(Box::new(cursio_core::share_session::ShareFactory {
             sink: crate::share::AndroidSink::shared(),

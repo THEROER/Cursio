@@ -6,6 +6,7 @@
 -keep class dev.cursio.mesh.CursioNative {
     native <methods>;
     public static java.lang.String onShare(...);
+    public static java.lang.String putClipboard(...);
     public static void onNotificationInvoke(...);
     public static void onNotificationDismiss(...);
     public static void onRing(...);

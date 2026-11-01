@@ -366,6 +366,15 @@ rescans once a second, so the folder appears on the computer the moment the
 user allows it, without a restart. The grant is a row of the phone's setup
 card.
 
+### The phone's clipboard
+
+The clipboard module runs on the phone with a backend handed in from the
+app rather than `clipboard-core`'s, because Android reads the clipboard only
+to a focused window: a computer's copies land on the phone's clipboard by
+themselves, and the phone's go to a computer by a Quick Settings tile that
+opens an invisible window for the moment of the read. See "A phone: written
+by the mesh, read by a tap" in [clipboard-design.md](clipboard-design.md).
+
 ### Staying alive: the phone as a computer's companion
 
 HyperOS kills background apps that are not on its own Autostart list and

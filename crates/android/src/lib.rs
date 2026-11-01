@@ -39,6 +39,7 @@ mod natives;
 
 mod bt;
 mod calls;
+mod clipboard;
 mod gallery;
 mod jvm;
 mod media;

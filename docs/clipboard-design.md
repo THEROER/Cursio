@@ -286,6 +286,53 @@ RTF and app-specific `Other` types are carried by the protocol but not pulled
 until a backend can write them — adding the format to `PULLABLE` is then the
 whole change.
 
+### A phone: written by the mesh, read by a tap
+
+`clipboard-core` has no Android backend, and cannot have the one the module is
+built around: since Android 10 an app may read the clipboard only while one of
+its windows has focus, and nothing tells a background app the clipboard
+changed. Writing, though, is allowed from the background. So the phone runs the
+same `ClipboardEngine`, symmetric advert and all, over a clipboard the platform
+hands in (`ClipboardFactory::phone`, `clipboard_session/phone.rs`) instead of
+`clipboard_core::open`, and plays the two directions differently:
+
+- **Computer → phone is automatic.** An offer is pulled as anywhere, from
+  `phone::PULLABLE` — text alone, since an image on Android's clipboard is a
+  content URI some provider must keep serving for the clip's life, a file
+  store rather than a write. The worker's clipboard (`PhoneSide`) writes it
+  through `SystemClipboard`, which on the phone is `CursioNative.putClipboard`
+  → `ClipboardManager.setPrimaryClip` on the main thread, labelled `Cursio`.
+- **Phone → computer is one tap**: the Quick Settings tile *Send clipboard*
+  (`ClipboardTile`) or the service notification's button opens the invisible
+  `ClipboardSendActivity`, which reads the clip once its window has focus
+  (`onCreate` is too early: the read answers null) and hands the text to
+  `PhoneClipboard::hand` for one link. That link offers it as a local copy
+  and serves the pull as usual. Nothing else ever reads the phone's clipboard.
+  The computer is the one the user was at last (`NotifyHub::last_used_desktop_id`,
+  from the activity every desktop reports), else the only computer linked,
+  else the user picks; another phone is never one, and the tile names the
+  answer while the shade is open.
+
+**The offer a link comes up with is not taken.** It is what the computer
+already held, not a copy the user just made. Between desks it is how they
+agree from the start, but a phone leaves and rejoins Wi-Fi all day, and
+putting the computer's old clipboard over what the user copied on the phone at
+every return is a worse loss than a copy made in the link's first seconds
+(`phone::STARTUP_GRACE`, 3 s).
+
+**Echoes.** The phone never watches, so its own write never looks like a copy
+and nothing goes back by itself. With two computers linked, the second learns
+a copy from the first and offers it on as its own; what was last put on the
+phone is shared by every link, so the second write is skipped instead of
+Android showing "copied" twice. A tap sending the computer what it sent is
+offered anyway — the echo check exists to tell a write's notification from a
+copy, and a tap is neither.
+
+`modules.clipboard` is the one switch a phone follows (its other modules have
+always run whatever the file says), and `PhoneClipboard` reads it on every
+offer and tap, so turning it off stops both directions on links already up,
+not only on the next one.
+
 ### Open question: files
 
 `text/uri-list` names paths on the *owner's* filesystem, which generally do not

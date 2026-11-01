@@ -150,6 +150,7 @@ pub(crate) fn module_registry(
         }))
         .with(Box::new(cursio_core::clipboard_session::ClipboardFactory {
             enabled: true,
+            phone: None,
         }))
         .with(Box::new(cursio_core::share_session::ShareFactory {
             sink: cursio_core::share_sink::DesktopSink::shared(),
