@@ -840,9 +840,14 @@ halves when more than 30 frames are unacknowledged and grows by a quarter
 after five seconds of keeping up, within 1–12 Mbit/s: the phone's encoder takes
 only a target, so frames in flight is the signal it can be steered by.
 
-Turning the phone changes the display's size, and a transferred window's size
-is fixed by its offer, so a turn rebuilds the encoder at the new size and the
-computer's window closes and reopens at the new shape.
+Turning the phone changes the display's size, and a turn rebuilds the encoder
+at the new size — but the computer's window stays. The new encoder's first
+unit is a keyframe carrying parameter sets at the new size, and both viewers'
+decoders follow a size change mid-stream and reshape their window to it (Media
+Foundation through `MF_E_TRANSFORM_STREAM_CHANGE`). Closing and reopening the
+window instead, as it once did, destroyed it, and with it a call application's
+share of that window. The phone maps the viewer's pointer against the size the
+capture runs at now, not the one it was offered at.
 
 ### Mouse as a finger
 

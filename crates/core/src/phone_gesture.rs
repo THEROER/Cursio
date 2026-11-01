@@ -97,6 +97,12 @@ impl GestureMapper {
         }
     }
 
+    /// The picture is now `width` x `height`; a finger already down stays down.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.width = width.max(1);
+        self.height = height.max(1);
+    }
+
     fn point(&self, x: u32, y: u32) -> Point {
         Point {
             x: (x as f32 / self.width as f32).clamp(0.0, 1.0),

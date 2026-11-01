@@ -125,6 +125,13 @@ pub(super) async fn forward(
 ) {
     let mut seq = 0_u32;
     let mut frame = |data: &[u8]| {
+        // The whole picture at its size now, which a turn changes under a
+        // window that stays open.
+        let dirty = feed().running.map_or(dirty, |now| Rect {
+            width: now.width,
+            height: now.height,
+            ..dirty
+        });
         let f = WindowFrame {
             id,
             seq,
@@ -173,6 +180,17 @@ impl CaptureSession for PhoneScreenSession {
     }
 
     fn apply_input(&mut self, input: WindowInput) -> Result<(), WindowError> {
+        // The window stays open when the phone turns, so the picture the
+        // viewer points into is whatever size the capture runs at now; mapped
+        // against the size it was offered at, a tap on a turned screen lands
+        // stretched along the wrong axis.
+        if let Some(now) = feed().running {
+            if (now.width, now.height) != (self.meta.width, self.meta.height) {
+                self.meta.width = now.width;
+                self.meta.height = now.height;
+                self.mapper.resize(now.width, now.height);
+            }
+        }
         if let Some(gesture) = self.mapper.map(&input) {
             match backend() {
                 Some(backend) => backend.gesture(gesture),

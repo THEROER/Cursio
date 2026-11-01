@@ -79,9 +79,6 @@ struct Unit {
 struct Running {
     width: u32,
     height: u32,
-    /// Bumped each time the picture changes size (the phone turned), which
-    /// ends every window showing the old size so a new one opens at the new.
-    generation: u64,
 }
 
 struct Feed {
@@ -99,7 +96,6 @@ struct Feed {
     /// Whom the phone's own "show on computers" shares with once the user
     /// allows the capture, chosen in the window before the consent opens.
     chosen: Option<Vec<String>>,
-    generation: u64,
     rate_targets: HashMap<u64, u32>,
     next_rate_id: u64,
     applied_rate: Option<u32>,
@@ -127,7 +123,6 @@ fn shared() -> &'static Shared {
             viewers: HashSet::new(),
             linked: HashMap::new(),
             chosen: None,
-            generation: 0,
             rate_targets: HashMap::new(),
             next_rate_id: 0,
             applied_rate: None,
@@ -189,16 +184,10 @@ pub fn started(width: u32, height: u32) {
             .running
             .is_some_and(|r| r.width == width && r.height == height);
         if !same {
-            feed.generation += 1;
             // A new size means a new encoder, whose parameter sets will come.
             feed.parameters = None;
         }
-        let generation = feed.generation;
-        feed.running = Some(Running {
-            width,
-            height,
-            generation,
-        });
+        feed.running = Some(Running { width, height });
     }
     tracing::info!(width, height, "this phone's screen is being captured");
     notify_changed();
@@ -355,8 +344,13 @@ pub fn title(phone: &str) -> String {
 ///
 /// The engine for a link takes transfers only as requests, so this turns the
 /// shared state into them: a window when the computer wants the screen and it
-/// is up, a close when either stops, and a close-then-open when the phone
-/// turns, because a transferred window's size is fixed by its offer.
+/// is up, and a close when either stops.
+///
+/// Turning the phone is neither. The new encoder's first unit is a keyframe
+/// carrying parameter sets at the new size, and every viewer's decoder follows
+/// a size change mid-stream and resizes its window to it. Closing and
+/// reopening instead destroyed the window, and with it any screen share a
+/// call application was making of it.
 pub fn spawn_trigger(
     computer: String,
     phone: String,
@@ -367,18 +361,18 @@ pub fn spawn_trigger(
     let mut changed = shared().changed.subscribe();
     *feed().linked.entry(computer.clone()).or_default() += 1;
     tokio::spawn(async move {
-        let mut showing: Option<u64> = None;
+        let mut showing = false;
         // The engine dropping its end is the link ending; whatever the
         // computer was watching ends with it, or the capture would outlive
         // everyone who could see it.
         let _gone = Unlink(computer.clone());
         loop {
-            let want = wanted_by(&computer).map(|r| r.generation);
+            let want = wanted_by(&computer).is_some();
             if want != showing {
-                if showing.is_some() && tx.send(TransferRequest::BringBack).is_err() {
+                if showing && tx.send(TransferRequest::BringBack).is_err() {
                     return;
                 }
-                if want.is_some()
+                if want
                     && tx
                         .send(TransferRequest::Send {
                             title: title(&phone),
@@ -508,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turning_the_phone_reopens_the_window_at_the_new_size() {
+    async fn turning_the_phone_keeps_the_window_open() {
         let _turn = SERIAL.lock().await;
         let _backend = fake();
         let mut requests = spawn_trigger("Nocturne".into(), "POCO".into());
@@ -519,11 +513,41 @@ mod tests {
             Some(TransferRequest::Send { .. })
         ));
         started(2400, 1080);
-        assert_eq!(requests.recv().await, Some(TransferRequest::BringBack));
-        assert!(matches!(
+        stopped();
+        assert_eq!(
             requests.recv().await,
-            Some(TransferRequest::Send { .. })
-        ));
+            Some(TransferRequest::BringBack),
+            "the turn asked for nothing; the first request is the stop's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turned_phone_takes_touch_in_the_turned_picture() {
+        let _turn = SERIAL.lock().await;
+        let backend = fake();
+        started(1080, 2400);
+        let mut session = PhoneScreenCapture::new("Nocturne".into(), "POCO".into())
+            .begin(1)
+            .unwrap();
+        started(2400, 1080);
+        session
+            .apply_input(WindowInput::PointerButton {
+                id: 1,
+                x: 1800,
+                y: 540,
+                button: cursio_protocol::MouseButton::Left,
+                pressed: true,
+            })
+            .unwrap();
+        assert_eq!((session.meta().width, session.meta().height), (2400, 1080));
+        let gestures = backend.gestures.lock().unwrap();
+        let Some(Gesture::Down(at)) = gestures.first() else {
+            panic!("expected a finger down, got {gestures:?}");
+        };
+        assert!(
+            (at.x - 0.75).abs() < 1e-3 && (at.y - 0.5).abs() < 1e-3,
+            "{at:?}"
+        );
     }
 
     #[tokio::test]
