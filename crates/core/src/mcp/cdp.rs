@@ -349,7 +349,10 @@ impl Request {
         };
         let ms = self.ms.map(|ms| format!(" {ms:.0} ms")).unwrap_or_default();
         let size = self.size.map(|b| format!(" {b} B")).unwrap_or_default();
-        format!("{} {status} {}{ms}{size} {}", self.method, self.kind, self.url)
+        format!(
+            "{} {status} {}{ms}{size} {}",
+            self.method, self.kind, self.url
+        )
     }
 }
 
@@ -379,8 +382,14 @@ pub fn network_requests(events: &[Value], max: usize) -> (Vec<Request>, usize) {
                 }
                 let request = Request {
                     id: id.to_owned(),
-                    method: params["request"]["method"].as_str().unwrap_or("GET").to_owned(),
-                    url: params["request"]["url"].as_str().unwrap_or_default().to_owned(),
+                    method: params["request"]["method"]
+                        .as_str()
+                        .unwrap_or("GET")
+                        .to_owned(),
+                    url: params["request"]["url"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
                     kind: params["type"].as_str().unwrap_or("Other").to_owned(),
                     status: None,
                     mime: None,

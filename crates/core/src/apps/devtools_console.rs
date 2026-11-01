@@ -220,7 +220,10 @@ mod tests {
             at_ms: Some(1_761_998_400_123.5),
         };
         let line = log_line(&entry, UNIX_EPOCH);
-        assert_eq!(line, "2025-11-01T12:00:00.123500Z  WARN console.warning: slow");
+        assert_eq!(
+            line,
+            "2025-11-01T12:00:00.123500Z  WARN console.warning: slow"
+        );
         assert_eq!(
             crate::log_tail::leading_timestamp(&line),
             Some("2025-11-01T12:00:00.123500Z")
