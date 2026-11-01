@@ -68,13 +68,36 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A new build of the application, installed by the node and named by its
+/// install root's `current`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Build {
+    pub version: String,
+    /// The directory holding its files.
+    pub dir: PathBuf,
+}
+
+type OnUpdate = Arc<dyn Fn(Build) + Send + Sync>;
+
 /// An application about to introduce itself to the node.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct App {
     id: Result<AppId, cursio_app_protocol::Error>,
     version: String,
     logs: Option<LogSpec>,
     endpoint: Option<PathBuf>,
+    on_update: Option<OnUpdate>,
+}
+
+impl std::fmt::Debug for App {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("App")
+            .field("id", &self.id)
+            .field("version", &self.version)
+            .field("logs", &self.logs)
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl App {
@@ -86,7 +109,16 @@ impl App {
             version: String::new(),
             logs: None,
             endpoint: None,
+            on_update: None,
         }
+    }
+
+    /// Call `handler` when a new build of this application arrives over the
+    /// mesh. It runs on the SDK's own thread; nothing has been stopped, and
+    /// when to restart into the build is the application's choice.
+    pub fn on_update(mut self, handler: impl Fn(Build) + Send + Sync + 'static) -> Self {
+        self.on_update = Some(Arc::new(handler));
+        self
     }
 
     pub fn version(mut self, version: impl Into<String>) -> Self {
@@ -133,9 +165,10 @@ impl App {
             .build()
             .map_err(|e| Error::Thread(e.to_string()))?;
         let link = shared.clone();
+        let on_update = self.on_update;
         std::thread::Builder::new()
             .name("cursio-sdk".into())
-            .spawn(move || runtime.block_on(run(endpoint, hello, link, health_rx)))
+            .spawn(move || runtime.block_on(run(endpoint, hello, link, health_rx, on_update)))
             .map_err(|e| Error::Thread(e.to_string()))?;
         Ok(Cursio { shared, health })
     }
@@ -207,12 +240,13 @@ async fn run(
     hello: ClientMsg,
     shared: Arc<Mutex<Link>>,
     mut health: watch::Receiver<(HealthState, Option<String>)>,
+    on_update: Option<OnUpdate>,
 ) {
     let set = |link: Link| *shared.lock().unwrap_or_else(|p| p.into_inner()) = link;
     let mut wait = RETRY_MIN;
     loop {
         let ended = match connect(&endpoint).await {
-            Ok(stream) => session(stream, &hello, &set, &mut health).await,
+            Ok(stream) => session(stream, &hello, &set, &mut health, on_update.as_ref()).await,
             Err(_) => Ended::Closed,
         };
         match ended {
@@ -283,6 +317,7 @@ async fn session<S: AsyncRead + AsyncWrite>(
     hello: &ClientMsg,
     set: &impl Fn(Link),
     health: &mut watch::Receiver<(HealthState, Option<String>)>,
+    on_update: Option<&OnUpdate>,
 ) -> Ended {
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
@@ -317,11 +352,17 @@ async fn session<S: AsyncRead + AsyncWrite>(
                 }
             }
             line = read_line(&mut reader) => match line {
-                Ok(Some(line)) => {
-                    if let Ok(NodeMsg::Refused { reason }) = decode_line::<NodeMsg>(&line) {
-                        return Ended::Refused(reason);
+                Ok(Some(line)) => match decode_line::<NodeMsg>(&line) {
+                    Ok(NodeMsg::Refused { reason }) => return Ended::Refused(reason),
+                    Ok(NodeMsg::BuildReady { version, dir }) => {
+                        if let Some(handler) = on_update {
+                            handler(Build { version, dir });
+                        }
                     }
-                }
+                    // A message a newer node sends that this SDK does not
+                    // know is skipped, as the protocol promises.
+                    _ => {}
+                },
                 _ => return Ended::Closed,
             },
         }

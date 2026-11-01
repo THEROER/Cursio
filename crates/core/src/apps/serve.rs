@@ -25,6 +25,35 @@ const HELLO_WAIT: Duration = Duration::from_secs(5);
 /// Longest version string an application may give.
 const MAX_VERSION: usize = 128;
 
+type Pushers = std::collections::BTreeMap<
+    cursio_app_protocol::AppId,
+    Vec<(u64, tokio::sync::mpsc::UnboundedSender<NodeMsg>)>,
+>;
+
+/// Each connected copy of each application, for what the node tells it
+/// unasked.
+fn pushers() -> std::sync::MutexGuard<'static, Pushers> {
+    static PUSHERS: Mutex<Pushers> = Mutex::new(std::collections::BTreeMap::new());
+    PUSHERS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Tell every running copy of `app` that `version` is installed in `dir`.
+/// A copy that is not running hears nothing; it finds `current` when it
+/// next starts.
+pub fn build_ready(app: &cursio_app_protocol::AppId, version: &str, dir: &std::path::Path) {
+    let msg = NodeMsg::BuildReady {
+        version: version.to_owned(),
+        dir: dir.to_path_buf(),
+    };
+    let mut pushers = pushers();
+    let Some(copies) = pushers.get_mut(app) else {
+        tracing::info!(%app, %version, "no copy of the application is running to tell of its build");
+        return;
+    };
+    copies.retain(|(_, tx)| tx.send(msg.clone()).is_ok());
+    tracing::info!(%app, %version, copies = copies.len(), "told the application its build is ready");
+}
+
 /// Serve the apps socket for this node, named `machine` on the mesh, until
 /// the process ends.
 pub fn start(machine: String) {
@@ -183,8 +212,23 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
         protocol: protocol.min(PROTOCOL),
         machine: machine.to_owned(),
     };
-    let ended = async {
-        write.write_all(&encode_line(&welcome)).await?;
+    // Everything to the application goes through one queue, so a message the
+    // node sends unasked never interleaves with an answer mid-line, and the
+    // reading side is never cancelled halfway through a line to send one.
+    let (out, mut outbox) = tokio::sync::mpsc::unbounded_channel::<NodeMsg>();
+    let token: u64 = rand::random();
+    pushers()
+        .entry(app.clone())
+        .or_default()
+        .push((token, out.clone()));
+    let _ = out.send(welcome);
+    let writing = async {
+        while let Some(msg) = outbox.recv().await {
+            write.write_all(&encode_line(&msg)).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    let reading = async {
         while let Some(line) = read_line(&mut reader).await? {
             match decode_line::<ClientMsg>(&line) {
                 Ok(ClientMsg::Health { state, detail }) => {
@@ -203,22 +247,24 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                 }
                 Ok(ClientMsg::Hello { .. }) => {
                     let feature = "hello after hello".to_owned();
-                    write
-                        .write_all(&encode_line(&NodeMsg::Unsupported { feature }))
-                        .await?;
+                    let _ = out.send(NodeMsg::Unsupported { feature });
                 }
                 Err(_) => {
                     let feature = message_kind(&line).unwrap_or_else(|| "not a message".into());
                     tracing::debug!(%app, %feature, "an application sent a message this node does not know");
-                    write
-                        .write_all(&encode_line(&NodeMsg::Unsupported { feature }))
-                        .await?;
+                    let _ = out.send(NodeMsg::Unsupported { feature });
                 }
             }
         }
         Ok::<(), std::io::Error>(())
+    };
+    let ended = tokio::select! {
+        ended = reading => ended,
+        ended = writing => ended,
+    };
+    if let Some(copies) = pushers().get_mut(&app) {
+        copies.retain(|(t, _)| *t != token);
     }
-    .await;
     lock(registry).disconnected(&app);
     tracing::info!(%app, "application disconnected");
     ended
@@ -435,6 +481,37 @@ mod tests {
             .await;
             drop(app);
             until(&registry, |a| !a.running()).await;
+        })
+        .await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_running_application_hears_its_new_build_is_ready() {
+        let dir = scratch("build-ready");
+        let path = dir.join("apps.sock");
+        let registry = Arc::new(Mutex::new(Registry::load(None)));
+        let server = tokio::spawn(serve(path.clone(), "Nocturne".into(), registry.clone()));
+        bounded(async {
+            let (tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+            let app = cursio_sdk::App::new("ready-demo")
+                .version("1")
+                .endpoint(&path)
+                .on_update(move |build| {
+                    let _ = tx.send(build);
+                })
+                .start()
+                .unwrap();
+            while !app.is_connected() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let id = cursio_app_protocol::AppId::parse("ready-demo").unwrap();
+            build_ready(&id, "2", &dir.join("versions/2"));
+            let build = heard.recv().await.unwrap();
+            assert_eq!(build.version, "2");
+            assert_eq!(build.dir, dir.join("versions/2"));
+            drop(app);
         })
         .await;
         server.abort();

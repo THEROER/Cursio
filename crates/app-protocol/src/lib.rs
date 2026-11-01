@@ -176,6 +176,10 @@ pub enum NodeMsg {
     /// The node does not know the message named `feature`; the connection
     /// stays open.
     Unsupported { feature: String },
+    /// A new build of this application came over the mesh and is installed
+    /// in `dir`, which its install root's `current` now names. What runs is
+    /// the application's to restart; nothing has been stopped.
+    BuildReady { version: String, dir: PathBuf },
 }
 
 /// Something wrong with a message or a name.
@@ -349,6 +353,13 @@ mod tests {
                 feature: "call".into()
             }),
             "{\"msg\":\"unsupported\",\"feature\":\"call\"}\n"
+        );
+        assert_eq!(
+            line(&NodeMsg::BuildReady {
+                version: "0.6.1".into(),
+                dir: PathBuf::from("/apps/leavepulse/versions/0.6.1"),
+            }),
+            "{\"msg\":\"build_ready\",\"version\":\"0.6.1\",\"dir\":\"/apps/leavepulse/versions/0.6.1\"}\n"
         );
     }
 
