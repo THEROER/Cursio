@@ -465,6 +465,7 @@ pub(crate) async fn devtools(
     app: &str,
     port: u16,
     close: bool,
+    launch: bool,
 ) -> anyhow::Result<()> {
     use cursio_core::control::{Command, Reply};
     let (app, process) = match app.split_once('/') {
@@ -477,13 +478,24 @@ pub(crate) async fn devtools(
         process,
         port,
         close,
+        launch,
     };
+    if launch {
+        println!("asking {machine} for {app}'s DevTools, starting it with them if it must…");
+    }
     match control_client().await?.request(command).await? {
         Reply::Done => {
             println!("stopped listening for {app}'s DevTools on {machine}");
             Ok(())
         }
-        Reply::Devtools { port, token } => {
+        Reply::Devtools {
+            port,
+            token,
+            launched,
+        } => {
+            if let Some(launched) = launched {
+                println!("{machine}: {launched}");
+            }
             let http = format!("http://127.0.0.1:{port}/{token}");
             println!("{app} on {machine}: DevTools at {http}");
             println!("  the token in the path is the only way in; keep the address to yourself");

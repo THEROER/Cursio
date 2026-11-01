@@ -378,6 +378,54 @@ async fn open_there<W: Wire>(
     opened.await.map(|()| stream)
 }
 
+/// How long `--launch` waits for an application it started to declare
+/// DevTools and listen on them.
+pub const LAUNCH_WAIT: Duration = Duration::from_secs(30);
+
+/// Open with `open`; when the far side answers that no running process
+/// declares DevTools, start the application with them through `launch` and
+/// try again every `every` until it does, at most `wait`. Answers what
+/// opened and what the launch said. Any other refusal — consent, a port
+/// someone else holds — is answered at once: launching would not change it,
+/// and restarting an application its person did not allow inspecting
+/// would only cost them its state.
+pub async fn open_launching<T, O, OF, L, LF>(
+    mut open: O,
+    launch: L,
+    wait: Duration,
+    every: Duration,
+) -> Result<(T, Option<String>), String>
+where
+    O: FnMut() -> OF,
+    OF: std::future::Future<Output = Result<T, String>>,
+    L: FnOnce() -> LF,
+    LF: std::future::Future<Output = Result<String, String>>,
+{
+    use super::devtools::{NOT_DECLARED, NOT_LISTENING};
+    match open().await {
+        Ok(opened) => return Ok((opened, None)),
+        Err(why) if why.contains(NOT_DECLARED) => {}
+        Err(why) => return Err(why),
+    }
+    let launched = launch().await?;
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        tokio::time::sleep(every).await;
+        match open().await {
+            Ok(opened) => return Ok((opened, Some(launched))),
+            Err(why) if why.contains(NOT_DECLARED) || why.contains(NOT_LISTENING) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "{launched}, but it offered no DevTools within {} s: {why}",
+                        wait.as_secs()
+                    ));
+                }
+            }
+            Err(why) => return Err(why),
+        }
+    }
+}
+
 /// Listen on 127.0.0.1 for `app`'s DevTools on `machine` (`process`'s when
 /// named), on `port` or any free one when 0. The answer's token is the only
 /// way in: a request whose path does not start with it is refused here and
@@ -911,5 +959,106 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// `open` answering `answers` in turn (the last one repeated), counting
+    /// the calls.
+    fn answering(
+        answers: Vec<Result<u16, String>>,
+        calls: Arc<Mutex<usize>>,
+    ) -> impl FnMut() -> std::future::Ready<Result<u16, String>> {
+        move || {
+            let mut n = calls.lock().unwrap();
+            let answer = answers[(*n).min(answers.len() - 1)].clone();
+            *n += 1;
+            std::future::ready(answer)
+        }
+    }
+
+    const UNDECLARED: &str = "no running process of demo here declares a DevTools endpoint";
+    const SECOND: Duration = Duration::from_secs(1);
+
+    #[tokio::test(start_paused = true)]
+    async fn launch_is_not_asked_when_devtools_are_already_offered() {
+        let calls = Arc::new(Mutex::new(0));
+        let opened = open_launching(
+            answering(vec![Ok(9333)], calls.clone()),
+            || async { panic!("nothing to launch") },
+            LAUNCH_WAIT,
+            SECOND,
+        )
+        .await;
+        assert_eq!(opened, Ok((9333, None)));
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn launching_waits_through_undeclared_and_unlistened_until_offered() {
+        let calls = Arc::new(Mutex::new(0));
+        let opened = open_launching(
+            answering(
+                vec![
+                    Err(UNDECLARED.into()),
+                    Err(UNDECLARED.into()),
+                    Err("nothing listens on demo's declared DevTools port 9222".into()),
+                    Ok(9333),
+                ],
+                calls.clone(),
+            ),
+            || async { Ok("started demo 1.0".to_owned()) },
+            LAUNCH_WAIT,
+            SECOND,
+        )
+        .await;
+        assert_eq!(opened, Ok((9333, Some("started demo 1.0".to_owned()))));
+        assert_eq!(*calls.lock().unwrap(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn launching_gives_up_after_the_wait_saying_why() {
+        let calls = Arc::new(Mutex::new(0));
+        let opened = open_launching(
+            answering(vec![Err(UNDECLARED.into())], calls.clone()),
+            || async { Ok("started demo 1.0".to_owned()) },
+            Duration::from_secs(5),
+            SECOND,
+        )
+        .await;
+        let why = opened.unwrap_err();
+        assert!(why.starts_with("started demo 1.0, but it offered no DevTools within 5 s"));
+        assert_eq!(*calls.lock().unwrap(), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_answered_without_launching() {
+        let calls = Arc::new(Mutex::new(0));
+        let opened: Result<(u16, _), _> = open_launching(
+            answering(
+                vec![Err("DevTools of demo are off on that machine".into())],
+                calls,
+            ),
+            || async { panic!("a refusal must not launch") },
+            LAUNCH_WAIT,
+            SECOND,
+        )
+        .await;
+        assert_eq!(
+            opened,
+            Err("DevTools of demo are off on that machine".into())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_launch_is_the_answer() {
+        let calls = Arc::new(Mutex::new(0));
+        let opened = open_launching(
+            answering(vec![Err(UNDECLARED.into())], calls.clone()),
+            || async { Err("demo asks to run as an administrator".to_owned()) },
+            LAUNCH_WAIT,
+            SECOND,
+        )
+        .await;
+        assert_eq!(opened, Err("demo asks to run as an administrator".into()));
+        assert_eq!(*calls.lock().unwrap(), 1);
     }
 }

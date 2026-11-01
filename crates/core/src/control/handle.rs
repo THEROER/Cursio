@@ -8,6 +8,10 @@ use crate::control::NodeState;
 use crate::control::Reply;
 use crate::control::CONTROL_VERSION;
 use crate::pairing_window::PairingCode;
+
+/// How often `cursio devtools --launch` asks again whether the application
+/// it started offers DevTools yet; each ask is one round trip to that machine.
+const LAUNCH_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 use std::path::Path;
 
 /// Answer a gallery command by asking the machine it names.
@@ -271,6 +275,7 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
             process,
             port,
             close,
+            launch,
         } => {
             use crate::apps::tunnel;
             if *close {
@@ -279,20 +284,45 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                     false => error(format!("nothing listens for {app}'s DevTools on {machine}")),
                 });
             }
-            let (machine, app, process, port) =
-                (machine.clone(), app.clone(), process.clone(), *port);
-            let listening = tunnel::runtime()
-                .spawn(
-                    async move { tunnel::listen(&machine, &app, process.as_deref(), port).await },
-                )
-                .await;
-            match listening {
-                Ok(Ok(open)) => Reply::Devtools {
+            let port = *port;
+            let open = || {
+                let (machine, app, process) = (machine.clone(), app.clone(), process.clone());
+                async move {
+                    tunnel::runtime()
+                        .spawn(async move {
+                            tunnel::listen(&machine, &app, process.as_deref(), port).await
+                        })
+                        .await
+                        .map_err(|join| format!("the DevTools listener failed: {join}"))?
+                }
+            };
+            let opened = match launch {
+                false => open().await.map(|open| (open, None)),
+                true => {
+                    let start = || async {
+                        let request = DiagRequest::Launch {
+                            app: app.clone(),
+                            version: None,
+                            component: None,
+                            restart: true,
+                            start: true,
+                            args: vec!["--devtools".to_owned()],
+                        };
+                        match hub.ask(machine, request).await? {
+                            DiagResponse::Launched { what } => Ok(what),
+                            other => Err(format!("a launch was answered with {other:?}")),
+                        }
+                    };
+                    tunnel::open_launching(open, start, tunnel::LAUNCH_WAIT, LAUNCH_POLL).await
+                }
+            };
+            match opened {
+                Ok((open, launched)) => Reply::Devtools {
                     port: open.port,
                     token: open.token,
+                    launched,
                 },
-                Ok(Err(message)) => Reply::Error { message },
-                Err(join) => error(format!("the DevTools listener failed: {join}")),
+                Err(message) => Reply::Error { message },
             }
         }
         Command::WindowTree {

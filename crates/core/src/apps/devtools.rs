@@ -192,6 +192,15 @@ pub fn still_allowed(peer: &str, app: &AppId) -> bool {
         .any(|g| g.peer == peer && g.holds(now(), &pids))
 }
 
+/// Part of the refusal when no running process declares DevTools, which the
+/// inspecting side reads to start the application with them
+/// (`cursio devtools --launch`). Older nodes say it in the same words.
+pub const NOT_DECLARED: &str = "declares a DevTools endpoint";
+
+/// Part of the refusal when the declared port is not listened on yet: what
+/// an application just started answers until its web view is up.
+pub const NOT_LISTENING: &str = "nothing listens on";
+
 /// The loopback port of `app`'s DevTools (`process`'s when named), checked to
 /// be listened on by that very process.
 pub fn endpoint(app: &AppId, process: Option<&ProcessName>) -> Result<u16, String> {
@@ -200,7 +209,7 @@ pub fn endpoint(app: &AppId, process: Option<&ProcessName>) -> Result<u16, Strin
         .unwrap_or_else(|p| p.into_inner())
         .devtools(app, process)
         .ok_or_else(|| {
-            format!("no running process of {app} here declares a DevTools endpoint (App::devtools)")
+            format!("no running process of {app} here {NOT_DECLARED} (App::devtools)")
         })?;
     let Devtools::Cdp { port } = devtools;
     match listener(port)? {
@@ -214,7 +223,7 @@ pub fn endpoint(app: &AppId, process: Option<&ProcessName>) -> Result<u16, Strin
             "{app}'s DevTools port {port} listens on every interface; open it on 127.0.0.1 only"
         )),
         Listener::Nobody => Err(format!(
-            "nothing listens on {app}'s declared DevTools port {port}; was it started with \
+            "{NOT_LISTENING} {app}'s declared DevTools port {port}; was it started with \
              DevTools on?"
         )),
     }

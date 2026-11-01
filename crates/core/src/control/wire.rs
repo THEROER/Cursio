@@ -450,6 +450,11 @@ pub enum Command {
         port: u16,
         #[serde(default)]
         close: bool,
+        /// When no running process declares DevTools, start the application
+        /// with `--devtools` there (ending the copies running without them)
+        /// and wait for them; see [`crate::apps::tunnel::open_launching`].
+        #[serde(default)]
+        launch: bool,
     },
 }
 
@@ -726,6 +731,9 @@ pub enum Reply {
     Devtools {
         port: u16,
         token: String,
+        /// What starting the application said, when `launch` had to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launched: Option<String>,
     },
 }
 

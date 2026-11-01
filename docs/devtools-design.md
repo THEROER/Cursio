@@ -262,7 +262,20 @@ merged by time with the app's own log.
   when the page goes away. `Runtime.enable` replays earlier messages, so the
   newest page time written per application is remembered and nothing at or
   before it is written twice.
-- **Not built**: `--launch`, discovery of rungs in `apps status`, a notification and tray
+- **`--launch`** (`cursio devtools <m> <app> --launch`, MCP `apps_devtools
+  { launch: true }`): the node asks for the DevTools as usual; only when the
+  owning machine answers that no running process declares them does it start
+  the application there with `--devtools` through the ordinary launch path
+  (`DiagRequest::Launch`, `restart` on — a single-instance application asked
+  to start again would only hand over to the copy running without them — so
+  the launch and administrator consent there apply unchanged), then asks
+  again every second for up to 30 s, through "not declared" and "nothing
+  listens yet", and opens the listener when it is offered. Any other refusal
+  — DevTools off, the person not yet asked, a port someone else holds — is
+  answered at once without launching: restarting an application nobody
+  allowed inspecting would only cost its person its state. The waiting is
+  `apps::tunnel::open_launching`, tested with fakes.
+- **Not built**: discovery of rungs in `apps status`, a notification and tray
   entry beyond the problem, WebKitGTK through WebDriver, and a live run
   against a deployed WebView2 application.
 
@@ -271,8 +284,8 @@ merged by time with the app's own log.
 - **One command, ready to use.** `cursio devtools Lightmoon leavepulse`
   prints the URL, a Playwright snippet, and a DevTools front-end link that
   opens the inspector in a local Chromium. `--launch` starts the application
-  with `--devtools` first (`apps launch … -- --devtools`) when it is not
-  running so.
+  with `--devtools` first (`apps launch --restart … -- --devtools`) when no
+  running copy offers them, and waits up to 30 s for it to.
 - **Discovery.** `cursio apps status` and MCP `apps_peers` show, per process,
   which rungs it offers: actions by name, window, UI tree, DevTools.
 - **One mental model for agents.** Every tool takes `machine`, `app[/process]`

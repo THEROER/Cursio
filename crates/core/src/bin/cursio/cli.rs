@@ -158,6 +158,11 @@ pub(crate) enum Command {
         /// Stop listening instead.
         #[arg(long)]
         close: bool,
+        /// When no running copy offers DevTools, start the application with
+        /// `--devtools` on that machine — ending the copies running without
+        /// them — and wait up to 30 s for it to offer them.
+        #[arg(long, conflicts_with = "close")]
+        launch: bool,
     },
     /// Answer, decline, end or place a call on a connected phone. Goes through
     /// the running node.

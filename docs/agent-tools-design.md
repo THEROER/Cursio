@@ -195,6 +195,9 @@ the DevTools protocol (rung 5 in `docs/devtools-design.md`):
   — consent there is `[apps.<id>] devtools`, `deny` by default, granted for
   an hour or until the app restarts — and opens a token-gated listener on
   this machine's loopback, answering its URL for Playwright or the inspector.
+  With `launch: true`, when no running copy offers DevTools it starts the
+  application there with `--devtools` (ending the copies running without
+  them, under that machine's launch consent) and waits up to 30 s.
 - **`web_snapshot`**, **`web_query { selector }`**, **`web_screenshot`** and
   **`web_console { wait_ms? }`** read the first page target, and
   **`web_network { wait_ms?, max?, body_for? }`** lists the requests it makes

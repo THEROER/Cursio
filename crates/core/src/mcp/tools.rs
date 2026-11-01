@@ -163,9 +163,10 @@ impl<A: Ask> Tools<A> {
             process,
             port,
             close: false,
+            launch: args.get("launch").and_then(Value::as_bool).unwrap_or(false),
         };
         match self.ask.ask(command).await? {
-            Reply::Devtools { port, token } => Ok((app, port, token)),
+            Reply::Devtools { port, token, .. } => Ok((app, port, token)),
             other => Err(answered(other)),
         }
     }
@@ -252,7 +253,9 @@ impl<A: Ask> Tools<A> {
                     for entry in earlier {
                         out.push_str(&format!(
                             "{} {} {:.0} ms {} B {}\n",
-                            entry["status"].as_u64().map_or("?".to_owned(), |s| s.to_string()),
+                            entry["status"]
+                                .as_u64()
+                                .map_or("?".to_owned(), |s| s.to_string()),
                             entry["kind"].as_str().unwrap_or("other"),
                             entry["ms"].as_f64().unwrap_or(0.0),
                             entry["size"].as_u64().unwrap_or(0),
@@ -1194,7 +1197,7 @@ fn web_tools(machine: &Value) -> Vec<Value> {
         "apps_devtools",
         "Open (or reuse) this machine's loopback address for an application's DevTools on another machine and return it, token included, for Playwright's connectOverCDP or a browser. Grants code execution inside the application: ask the user first. The web_* tools do this themselves.",
         false, true,
-        json!({ "machine": machine, "app": app, "port": { "type": "integer" } }),
+        json!({ "machine": machine, "app": app, "port": { "type": "integer" }, "launch": { "type": "boolean", "description": "when no running copy offers DevTools, start the application with --devtools there (ending the copies running without them) and wait up to 30 s" } }),
         &["machine", "app"],
     )];
     if !cfg!(feature = "web-tools") {
