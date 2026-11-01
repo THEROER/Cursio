@@ -95,6 +95,52 @@ impl From<AppId> for String {
     }
 }
 
+/// One of an application's processes, when it runs several that each log —
+/// a window and a daemon. Same characters as an [`AppId`]; absent is the
+/// application's main process. Builds, `on_update` and starting it stay the
+/// application's: one application, one build, whatever its processes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ProcessName(String);
+
+impl ProcessName {
+    pub fn parse(name: &str) -> Result<Self, Error> {
+        let well_formed = !name.is_empty()
+            && name.len() <= MAX_APP_ID
+            && !name.starts_with('-')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        match well_formed {
+            true => Ok(ProcessName(name.to_owned())),
+            false => Err(Error::BadProcessName(name.to_owned())),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProcessName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for ProcessName {
+    type Error = Error;
+    fn try_from(name: String) -> Result<Self, Error> {
+        ProcessName::parse(&name)
+    }
+}
+
+impl From<ProcessName> for String {
+    fn from(name: ProcessName) -> String {
+        name.0
+    }
+}
+
 /// Where an application writes its log: the directory, and the file's base
 /// name as its appender writes it (`leavepulse.log`). Daily-rotated siblings
 /// (`leavepulse.log.2026-11-01`) are read with it.
@@ -156,6 +202,11 @@ pub enum ClientMsg {
         pid: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         logs: Option<LogSpec>,
+        /// Which of the application's processes this is; absent is its main
+        /// one. Added after protocol 1 shipped: left out when absent, so an
+        /// old node reads every hello it read before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process: Option<ProcessName>,
     },
     Health {
         state: HealthState,
@@ -187,6 +238,7 @@ pub enum NodeMsg {
 pub enum Error {
     BadAppId(String),
     ReservedAppId,
+    BadProcessName(String),
     BadLogSpec(String),
     TooLong,
     Malformed(String),
@@ -200,6 +252,10 @@ impl fmt::Display for Error {
                 "{id:?} is not an application id; use up to {MAX_APP_ID} lowercase letters, digits and `-`"
             ),
             Error::ReservedAppId => f.write_str("`cursio` is Cursio's own id; pick another"),
+            Error::BadProcessName(name) => write!(
+                f,
+                "{name:?} is not a process name; use up to {MAX_APP_ID} lowercase letters, digits and `-`"
+            ),
             Error::BadLogSpec(why) => f.write_str(why),
             Error::TooLong => write!(f, "a line is longer than {MAX_LINE} bytes"),
             Error::Malformed(why) => write!(f, "not a message: {why}"),
@@ -294,6 +350,7 @@ mod tests {
                 dir: "/home/u/.local/share/leavepulse/logs".into(),
                 file: "leavepulse.log".into(),
             }),
+            process: None,
         };
         let text = line(&hello);
         assert_eq!(
@@ -314,11 +371,38 @@ mod tests {
             version: "1".into(),
             pid: 7,
             logs: None,
+            process: None,
         };
         assert_eq!(
             line(&hello),
             "{\"msg\":\"hello\",\"protocol\":1,\"app\":\"demo\",\"version\":\"1\",\"pid\":7}\n"
         );
+    }
+
+    #[test]
+    fn a_second_process_of_an_application_names_itself_in_its_hello() {
+        let hello = ClientMsg::Hello {
+            protocol: 1,
+            app: AppId::parse("leavepulse").unwrap(),
+            version: "0.6.0".into(),
+            pid: 9,
+            logs: None,
+            process: Some(ProcessName::parse("daemon").unwrap()),
+        };
+        let text = line(&hello);
+        assert_eq!(
+            text,
+            "{\"msg\":\"hello\",\"protocol\":1,\"app\":\"leavepulse\",\"version\":\"0.6.0\",\"pid\":9,\"process\":\"daemon\"}\n"
+        );
+        assert_eq!(
+            decode_line::<ClientMsg>(text.trim_end().as_bytes()).unwrap(),
+            hello
+        );
+        assert!(ProcessName::parse("../x").is_err());
+        assert!(decode_line::<ClientMsg>(
+            br#"{"msg":"hello","protocol":1,"app":"a","version":"1","pid":1,"process":"Bad Name"}"#
+        )
+        .is_err());
     }
 
     #[test]

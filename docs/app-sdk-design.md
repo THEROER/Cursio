@@ -204,6 +204,16 @@ leavepulse -f`, `cursio report all --app leavepulse --since 1d` and the merged
 `tracing` file. The SDK offers `cursio_sdk::tracing_layer()` so the format
 matches without the application adopting `cursio-log`.
 
+**Several processes, one application.** A launcher's window and its daemon
+both log, and both are the one application `leavepulse` — one build, one
+`on_update`. Each registers under that id with its own process name
+(`App::new("leavepulse").process("daemon")`; none is the main one), and the
+registry keeps one entry per `(app, process)`. `--app leavepulse` merges every
+process's log by time, each line marked after its timestamp (`[daemon]`,
+`[main]`) so it still merges across machines; `--app leavepulse/daemon` reads
+one. A hello without a process is the main one, so the field costs old SDKs
+nothing.
+
 Crashes: an application that installs `cursio_sdk::crash::arm()` gets
 Cursio's own treatment — the previous run's panic, Windows CrashDumps for its
 executable, its own frames only — reported once into its log and its report.

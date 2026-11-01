@@ -164,12 +164,9 @@ pub fn own_log(tail: Tail) -> Result<DiagResponse, String> {
     let tail = tail.bounded()?;
     let (dir, name) = match tail.log.as_deref() {
         Some(log) => match crate::log_tail::app_log(log) {
-            Some(app) => {
-                let app = app.map_err(|e| e.to_string())?;
-                let spec = crate::apps::logs_of(&app).ok_or_else(|| {
-                    format!("no application {app} has told this machine where it logs")
-                })?;
-                (spec.dir, spec.file)
+            Some(asked) => {
+                let (app, process) = asked.map_err(|e| e.to_string())?;
+                return app_logs(&app, process.as_ref(), &tail);
             }
             None => (cursio_log::log_dir(), format!("{log}.log")),
         },
@@ -181,6 +178,48 @@ pub fn own_log(tail: Tail) -> Result<DiagResponse, String> {
         ),
     };
     crate::log_tail::read(&dir, &name, &tail, std::time::SystemTime::now())
+}
+
+/// An application's log: one process's as it is, or every process's merged by
+/// time with each line marked by its process.
+fn app_logs(
+    app: &cursio_app_protocol::AppId,
+    process: Option<&cursio_app_protocol::ProcessName>,
+    tail: &Tail,
+) -> Result<DiagResponse, String> {
+    let logs = crate::apps::logs_of(app, process);
+    let now = std::time::SystemTime::now();
+    match logs.as_slice() {
+        [] => Err(match process {
+            Some(process) => {
+                format!("no process {process} of {app} has told this machine where it logs")
+            }
+            None => format!("no application {app} has told this machine where it logs"),
+        }),
+        [(_, spec)] => crate::log_tail::read(&spec.dir, &spec.file, tail, now),
+        several => {
+            let mut truncated = false;
+            let mut labelled = Vec::new();
+            for (process, spec) in several {
+                let DiagResponse::Logs {
+                    lines,
+                    truncated: cut,
+                } = crate::log_tail::read(&spec.dir, &spec.file, tail, now)?
+                else {
+                    continue;
+                };
+                truncated |= cut;
+                let label = process.as_ref().map_or("main", |p| p.as_str()).to_owned();
+                labelled.push((label, lines));
+            }
+            let total: usize = labelled.iter().map(|(_, l)| l.len()).sum();
+            truncated |= total > tail.max_lines as usize;
+            Ok(DiagResponse::Logs {
+                lines: crate::log_tail::merge_labelled(labelled, tail.max_lines),
+                truncated,
+            })
+        }
+    }
 }
 
 /// What answers the peer: which peer, so its session's paths are found.

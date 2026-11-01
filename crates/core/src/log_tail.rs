@@ -63,14 +63,51 @@ impl Tail {
     }
 }
 
-/// The application a log name `app:<id>` asks for, or `None` when it names
-/// one of Cursio's own. The id is all a peer sends; where that application
-/// logs is what it told this node itself ([`crate::apps`]).
-pub fn app_log(
-    log: &str,
-) -> Option<Result<cursio_app_protocol::AppId, cursio_app_protocol::Error>> {
-    log.strip_prefix("app:")
-        .map(cursio_app_protocol::AppId::parse)
+/// An application's log a name asks for: `app:<id>` for every process of it,
+/// `app:<id>/<process>` for one.
+pub type AppLog = (
+    cursio_app_protocol::AppId,
+    Option<cursio_app_protocol::ProcessName>,
+);
+
+/// The application a log name `app:<id>[/<process>]` asks for, or `None`
+/// when it names one of Cursio's own. Names are all a peer sends; where that
+/// application logs is what it told this node itself ([`crate::apps`]).
+pub fn app_log(log: &str) -> Option<Result<AppLog, cursio_app_protocol::Error>> {
+    let rest = log.strip_prefix("app:")?;
+    let (app, process) = match rest.split_once('/') {
+        Some((app, process)) => (app, Some(process)),
+        None => (rest, None),
+    };
+    Some((|| {
+        let app = cursio_app_protocol::AppId::parse(app)?;
+        let process = process
+            .map(cursio_app_protocol::ProcessName::parse)
+            .transpose()?;
+        Ok((app, process))
+    })())
+}
+
+/// `lines` from several logs of one application, newest kept within
+/// `max_lines`, oldest first, each marked with its process after its
+/// timestamp so the marked lines still merge by time across machines.
+pub fn merge_labelled(logs: Vec<(String, Vec<String>)>, max_lines: u32) -> Vec<String> {
+    let mut all: Vec<(String, String)> = logs
+        .into_iter()
+        .flat_map(|(label, lines)| {
+            lines.into_iter().map(move |line| {
+                let stamp = leading_timestamp(&line).unwrap_or("").to_owned();
+                let marked = match stamp.is_empty() {
+                    true => format!("[{label}] {line}"),
+                    false => format!("{stamp} [{label}]{}", &line[stamp.len()..]),
+                };
+                (stamp, marked)
+            })
+        })
+        .collect();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    let skip = all.len().saturating_sub(max_lines as usize);
+    all.into_iter().skip(skip).map(|(_, line)| line).collect()
 }
 
 /// The log files named `file_name` and rotated from it in `dir`, newest first.
@@ -434,10 +471,30 @@ mod tests {
             .bounded()
         };
         assert!(bounded("app:leavepulse").is_ok());
+        assert!(bounded("app:leavepulse/daemon").is_ok());
+        assert!(bounded("app:leavepulse/../x").is_err());
         assert!(bounded("app:../etc").is_err());
         assert!(bounded("app:cursio").is_err());
         assert!(bounded("cursio-app").is_ok());
         assert!(bounded("leavepulse").is_err());
+    }
+
+    #[test]
+    fn an_applications_processes_merge_by_time_each_line_marked() {
+        let window = vec![
+            "2026-11-01T10:00:01.000Z  INFO opened".to_owned(),
+            "2026-11-01T10:00:03.000Z  INFO clicked play".to_owned(),
+        ];
+        let daemon = vec!["2026-11-01T10:00:02.000Z  INFO game started".to_owned()];
+        let merged = merge_labelled(vec![("main".into(), window), ("daemon".into(), daemon)], 2);
+        assert_eq!(
+            merged,
+            [
+                "2026-11-01T10:00:02.000Z [daemon]  INFO game started",
+                "2026-11-01T10:00:03.000Z [main]  INFO clicked play",
+            ],
+            "the newest two, in time order, the timestamp still first"
+        );
     }
 
     #[test]

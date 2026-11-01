@@ -24,13 +24,48 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use cursio_app_protocol::{AppId, HealthState, LogSpec};
+use cursio_app_protocol::{AppId, HealthState, LogSpec, ProcessName};
 use serde::{Deserialize, Serialize};
 
 /// The file the registry keeps in the node's data directory.
 const FILE_NAME: &str = "apps.json";
 
-/// One application as the node knows it.
+/// One registration: an application, and which of its processes. An
+/// application with a window and a daemon logs twice, and two registrations
+/// under one key overwrote each other's log.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Key {
+    pub app: AppId,
+    /// `None` is the application's main process.
+    pub process: Option<ProcessName>,
+}
+
+impl Key {
+    pub fn main(app: AppId) -> Self {
+        Key { app, process: None }
+    }
+
+    /// How the registry file names it: `app`, or `app/process`.
+    fn file_key(&self) -> String {
+        match &self.process {
+            None => self.app.to_string(),
+            Some(process) => format!("{}/{process}", self.app),
+        }
+    }
+
+    fn from_file_key(text: &str) -> Option<Self> {
+        let (app, process) = match text.split_once('/') {
+            Some((app, process)) => (app, Some(ProcessName::parse(process).ok()?)),
+            None => (text, None),
+        };
+        Some(Key {
+            app: AppId::parse(app).ok()?,
+            process,
+        })
+    }
+}
+
+/// One process of an application as the node knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registered {
     pub version: String,
@@ -55,10 +90,10 @@ struct Saved {
     logs: Option<LogSpec>,
 }
 
-/// Every application that has registered here.
+/// Every application process that has registered here.
 #[derive(Debug, Default)]
 pub struct Registry {
-    apps: BTreeMap<AppId, Registered>,
+    apps: BTreeMap<Key, Registered>,
     file: Option<PathBuf>,
 }
 
@@ -66,7 +101,7 @@ impl Registry {
     /// What `file` holds, or nothing when it is absent or unreadable; with
     /// `None`, a registry that is never saved.
     pub fn load(file: Option<PathBuf>) -> Self {
-        let saved: BTreeMap<AppId, Saved> = file
+        let saved: BTreeMap<String, Saved> = file
             .as_ref()
             .and_then(|path| match std::fs::read(path) {
                 Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -85,7 +120,7 @@ impl Registry {
             .unwrap_or_default();
         let apps = saved
             .into_iter()
-            .map(|(id, saved)| {
+            .filter_map(|(key, saved)| {
                 let registered = Registered {
                     version: saved.version,
                     pid: None,
@@ -94,15 +129,15 @@ impl Registry {
                     detail: None,
                     connections: 0,
                 };
-                (id, registered)
+                Some((Key::from_file_key(&key)?, registered))
             })
             .collect();
         Registry { apps, file }
     }
 
-    /// A copy of `app` connected and said this.
-    pub fn connected(&mut self, app: &AppId, version: String, pid: u32, logs: Option<LogSpec>) {
-        let entry = self.apps.entry(app.clone()).or_insert(Registered {
+    /// A copy of `key`'s process connected and said this.
+    pub fn connected(&mut self, key: &Key, version: String, pid: u32, logs: Option<LogSpec>) {
+        let entry = self.apps.entry(key.clone()).or_insert(Registered {
             version: String::new(),
             pid: None,
             logs: None,
@@ -120,16 +155,16 @@ impl Registry {
         }
     }
 
-    pub fn health(&mut self, app: &AppId, state: HealthState, detail: Option<String>) {
-        if let Some(entry) = self.apps.get_mut(app) {
+    pub fn health(&mut self, key: &Key, state: HealthState, detail: Option<String>) {
+        if let Some(entry) = self.apps.get_mut(key) {
             entry.health = state;
             entry.detail = detail;
         }
     }
 
-    /// A copy of `app` closed its connection.
-    pub fn disconnected(&mut self, app: &AppId) {
-        if let Some(entry) = self.apps.get_mut(app) {
+    /// A copy of `key`'s process closed its connection.
+    pub fn disconnected(&mut self, key: &Key) {
+        if let Some(entry) = self.apps.get_mut(key) {
             entry.connections = entry.connections.saturating_sub(1);
             if entry.connections == 0 {
                 entry.pid = None;
@@ -137,28 +172,40 @@ impl Registry {
         }
     }
 
-    /// Where `app` said it logs.
-    pub fn logs(&self, app: &AppId) -> Option<LogSpec> {
-        self.apps.get(app)?.logs.clone()
+    /// Where each process of `app` said it logs, the main process first.
+    pub fn logs(&self, app: &AppId) -> Vec<(Option<ProcessName>, LogSpec)> {
+        self.apps
+            .iter()
+            .filter(|(key, _)| key.app == *app)
+            .filter_map(|(key, r)| Some((key.process.clone(), r.logs.clone()?)))
+            .collect()
     }
 
-    pub fn get(&self, app: &AppId) -> Option<&Registered> {
-        self.apps.get(app)
+    pub fn get(&self, key: &Key) -> Option<&Registered> {
+        self.apps.get(key)
+    }
+
+    /// The version `app` runs as here: its main process's, else any one's.
+    pub fn version(&self, app: &AppId) -> Option<String> {
+        self.apps
+            .iter()
+            .find(|(key, _)| key.app == *app)
+            .map(|(_, r)| r.version.clone())
     }
 
     fn save(&self) {
         let Some(path) = &self.file else {
             return;
         };
-        let saved: BTreeMap<&AppId, Saved> = self
+        let saved: BTreeMap<String, Saved> = self
             .apps
             .iter()
-            .map(|(id, app)| {
+            .map(|(key, app)| {
                 let saved = Saved {
                     version: app.version.clone(),
                     logs: app.logs.clone(),
                 };
-                (id, saved)
+                (key.file_key(), saved)
             })
             .collect();
         let bytes = serde_json::to_vec_pretty(&saved).expect("the registry always serializes");
@@ -185,12 +232,17 @@ pub fn registry() -> &'static Arc<Mutex<Registry>> {
     })
 }
 
-/// Where `app` said it logs, on this node.
-pub fn logs_of(app: &AppId) -> Option<LogSpec> {
-    registry()
+/// Where `app`'s processes said they log, on this node — only `process`'s
+/// when one is named.
+pub fn logs_of(app: &AppId, process: Option<&ProcessName>) -> Vec<(Option<ProcessName>, LogSpec)> {
+    let mut logs = registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .logs(app)
+        .logs(app);
+    if let Some(process) = process {
+        logs.retain(|(p, _)| p.as_ref() == Some(process));
+    }
+    logs
 }
 
 #[cfg(test)]
@@ -216,10 +268,17 @@ mod tests {
         }
     }
 
+    fn key(app: &str, process: Option<&str>) -> Key {
+        Key {
+            app: AppId::parse(app).unwrap(),
+            process: process.map(|p| ProcessName::parse(p).unwrap()),
+        }
+    }
+
     #[test]
     fn an_application_is_running_while_any_copy_is_connected() {
         let mut registry = Registry::load(None);
-        let app = AppId::parse("demo").unwrap();
+        let app = key("demo", None);
         registry.connected(&app, "1".into(), 10, None);
         registry.connected(&app, "1".into(), 11, None);
         registry.disconnected(&app);
@@ -230,9 +289,33 @@ mod tests {
     }
 
     #[test]
+    fn a_window_and_a_daemon_of_one_application_keep_their_own_logs() {
+        let file = scratch().join("apps.json");
+        let window = key("launcher", None);
+        let daemon = key("launcher", Some("daemon"));
+        let daemon_log = LogSpec {
+            dir: "/var/log/demo".into(),
+            file: "daemon".into(),
+        };
+        {
+            let mut registry = Registry::load(Some(file.clone()));
+            registry.connected(&window, "1".into(), 1, Some(spec()));
+            registry.connected(&daemon, "1".into(), 2, Some(daemon_log.clone()));
+            assert_eq!(registry.get(&daemon).unwrap().pid, Some(2));
+        }
+        let registry = Registry::load(Some(file));
+        assert_eq!(
+            registry.logs(&window.app),
+            vec![(None, spec()), (daemon.process.clone(), daemon_log),],
+            "both survive a restart, the main process first"
+        );
+        assert_eq!(registry.version(&window.app).as_deref(), Some("1"));
+    }
+
+    #[test]
     fn where_an_application_logs_survives_the_node_restarting() {
         let file = scratch().join("apps.json");
-        let app = AppId::parse("demo").unwrap();
+        let app = key("demo", None);
         {
             let mut registry = Registry::load(Some(file.clone()));
             registry.connected(&app, "2".into(), 1, Some(spec()));
@@ -241,7 +324,7 @@ mod tests {
         }
         let registry = Registry::load(Some(file));
         let again = registry.get(&app).unwrap();
-        assert_eq!(registry.logs(&app), Some(spec()));
+        assert_eq!(registry.logs(&app.app), vec![(None, spec())]);
         assert_eq!(again.version, "2");
         assert_eq!(again.health, HealthState::Ok);
         assert!(!again.running());

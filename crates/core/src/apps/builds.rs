@@ -144,8 +144,7 @@ impl Builds {
         let running = crate::apps::registry()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(id)
-            .map(|r| r.version.clone());
+            .version(id);
         let notify = id.clone();
         let handed_on = self.switcher.clone();
         Agent::new(

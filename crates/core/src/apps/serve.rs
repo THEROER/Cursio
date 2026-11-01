@@ -182,14 +182,15 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     let Some(first) = first else {
         return Ok(());
     };
-    let (app, version, pid, logs, protocol) = match decode_line::<ClientMsg>(&first) {
+    let (app, process, version, pid, logs, protocol) = match decode_line::<ClientMsg>(&first) {
         Ok(ClientMsg::Hello {
             protocol,
             app,
             version,
             pid,
             logs,
-        }) => (app, version, pid, logs, protocol),
+            process,
+        }) => (app, process, version, pid, logs, protocol),
         Ok(_) => return refuse(&mut write, "the first message must be hello".into()).await,
         Err(error) => return refuse(&mut write, error.to_string()).await,
     };
@@ -206,8 +207,12 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     if let Some(Err(error)) = logs.as_ref().map(|spec| spec.check()) {
         return refuse(&mut write, error.to_string()).await;
     }
-    lock(registry).connected(&app, version.clone(), pid, logs.clone());
-    tracing::info!(%app, %version, pid, logs = ?logs.as_ref().map(|l| l.dir.join(&l.file)), "application connected");
+    let key = super::Key {
+        app: app.clone(),
+        process,
+    };
+    lock(registry).connected(&key, version.clone(), pid, logs.clone());
+    tracing::info!(%app, process = ?key.process, %version, pid, logs = ?logs.as_ref().map(|l| l.dir.join(&l.file)), "application connected");
     let welcome = NodeMsg::Welcome {
         protocol: protocol.min(PROTOCOL),
         machine: machine.to_owned(),
@@ -238,12 +243,12 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                     // A change of state is news; a new detail under the same
                     // state is an application narrating itself, which at once
                     // a second was most of the node's log.
-                    if registry.get(&app).map(|a| a.health) != Some(state) {
-                        tracing::info!(%app, ?state, detail = ?detail, "application health");
+                    if registry.get(&key).map(|a| a.health) != Some(state) {
+                        tracing::info!(%app, process = ?key.process, ?state, detail = ?detail, "application health");
                     } else {
                         tracing::trace!(%app, ?state, detail = ?detail, "application health");
                     }
-                    registry.health(&app, state, detail);
+                    registry.health(&key, state, detail);
                 }
                 Ok(ClientMsg::Hello { .. }) => {
                     let feature = "hello after hello".to_owned();
@@ -265,8 +270,8 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     if let Some(copies) = pushers().get_mut(&app) {
         copies.retain(|(t, _)| *t != token);
     }
-    lock(registry).disconnected(&app);
-    tracing::info!(%app, "application disconnected");
+    lock(registry).disconnected(&key);
+    tracing::info!(%app, process = ?key.process, "application disconnected");
     ended
 }
 
@@ -317,6 +322,7 @@ mod tests {
             version: "1.2".into(),
             pid: 99,
             logs,
+            process: None,
         })
     }
 
@@ -324,7 +330,7 @@ mod tests {
         registry: &Arc<Mutex<Registry>>,
         check: impl Fn(&super::super::Registered) -> bool,
     ) {
-        let id = AppId::parse("demo").unwrap();
+        let id = super::super::Key::main(AppId::parse("demo").unwrap());
         while !lock(registry).get(&id).is_some_and(&check) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -362,7 +368,7 @@ mod tests {
                     feature: "call".into()
                 }
             );
-            let app = AppId::parse("demo").unwrap();
+            let app = super::super::Key::main(AppId::parse("demo").unwrap());
             {
                 let registry = lock(&registry);
                 let entry = registry.get(&app).unwrap();
@@ -393,7 +399,7 @@ mod tests {
             assert!(matches!(answer(&mut reader).await, NodeMsg::Refused { .. }));
             task.await.unwrap().unwrap();
             assert!(lock(&registry)
-                .get(&AppId::parse("demo").unwrap())
+                .get(&super::super::Key::main(AppId::parse("demo").unwrap()))
                 .is_none());
         })
         .await;

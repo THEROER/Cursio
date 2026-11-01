@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cursio_app_protocol::{decode_line, encode_line, ClientMsg, NodeMsg, MAX_LINE, PROTOCOL};
-pub use cursio_app_protocol::{AppId, HealthState, LogSpec};
+pub use cursio_app_protocol::{AppId, HealthState, LogSpec, ProcessName};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
@@ -87,6 +87,7 @@ pub struct App {
     logs: Option<LogSpec>,
     endpoint: Option<PathBuf>,
     on_update: Option<OnUpdate>,
+    process: Option<Result<ProcessName, cursio_app_protocol::Error>>,
 }
 
 impl std::fmt::Debug for App {
@@ -110,7 +111,18 @@ impl App {
             logs: None,
             endpoint: None,
             on_update: None,
+            process: None,
         }
+    }
+
+    /// This is one of the application's several processes — `daemon` beside
+    /// the window — each registering under the same id with its own log.
+    /// `cursio logs <machine> --app <id>` merges them all, each line marked
+    /// with its process; `--app <id>/<process>` reads one. Leave it unset for
+    /// the main process.
+    pub fn process(mut self, name: &str) -> Self {
+        self.process = Some(ProcessName::parse(name));
+        self
     }
 
     /// Call `handler` when a new build of this application arrives over the
@@ -150,12 +162,14 @@ impl App {
         if let Some(logs) = &self.logs {
             logs.check().map_err(Error::Invalid)?;
         }
+        let process = self.process.transpose().map_err(Error::Invalid)?;
         let hello = ClientMsg::Hello {
             protocol: PROTOCOL,
             app: id,
             version: self.version,
             pid: std::process::id(),
             logs: self.logs,
+            process,
         };
         let endpoint = self.endpoint.unwrap_or_else(cursio_app_protocol::endpoint);
         let shared = Arc::new(Mutex::new(Link::Connecting));
