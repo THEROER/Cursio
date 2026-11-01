@@ -25,6 +25,7 @@ mod run;
 mod container;
 mod deploy;
 mod dotenv;
+mod license;
 mod livetest;
 mod logscan;
 mod remote;
@@ -158,6 +159,9 @@ enum Command_ {
     Deploy(deploy::DeployArgs),
     /// Measure the two real machines over a window and print PASS/FAIL.
     LiveTest(livetest::LiveTestArgs),
+    /// List the GPL/AGPL code one build of a package links, and fail if there
+    /// is any: whether a product embedding Cursio stays free of it.
+    LicenseCheck(license::LicenseArgs),
     /// Put the node and the app in a versioned directory with a manifest,
     /// ready for `cursio update install`.
     Stage(stage::StageArgs),
@@ -241,6 +245,7 @@ fn main() -> Result<()> {
         Command_::Logs { follow } => logs(follow),
         Command_::Deploy(args) => deploy::deploy(args),
         Command_::LiveTest(args) => livetest::live_test(args),
+        Command_::LicenseCheck(args) => license::license_check(args),
         Command_::Stage(args) => stage::stage(args),
         Command_::Publish(args) => stage::publish(args),
         Command_::SdkMirror { push, tag } => sdk_mirror::run(
