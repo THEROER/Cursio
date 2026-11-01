@@ -389,9 +389,13 @@ impl PeerRegistry {
                     .is_some_and(|(_, until)| now < *until);
                 (p.dialable() && !resting)
                     // A session waiting for its network path is called at
-                    // every sweep: it is lost once its hold runs out.
+                    // every sweep: it is lost once its hold runs out. One
+                    // Bluetooth carries is not about to be lost, so its calls
+                    // back off like any other — a laptop whose Wi-Fi was off
+                    // all night was called every 4 s until morning.
                     || (p.addr.is_some()
                         && self.needs_network_path(&p.peer_id)
+                        && !(resting && self.bluetooth_reaches(&p.peer_id))
                         && !matches!(p.state, PeerState::Connecting))
             })
             .cloned()
@@ -806,6 +810,30 @@ mod tests {
             reg.dial_candidates().len(),
             1,
             "the session's path was not dialled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_bluetooth_carries_calls_its_network_back_ever_less_often() {
+        use cursio_transport::resume::{PathKind, ResumableLink};
+
+        let (near, far, tag) = path_pair(PathKind::Bluetooth).await;
+        let (_near_link, session) = ResumableLink::new(near, tag);
+        let (_far_link, _far_session) = ResumableLink::new(far, tag);
+        let mut reg = PeerRegistry::default();
+        reg.admit(
+            peer(2),
+            "laptop".into(),
+            Some("127.0.0.1:9000".parse().unwrap()),
+        );
+        reg.set_state(peer(2), PeerState::Online);
+        reg.hold_session(peer(2), session);
+        assert_eq!(reg.dial_candidates().len(), 1, "its network is called back");
+
+        reg.dial_failed(peer(2), Instant::now());
+        assert!(
+            reg.dial_candidates().is_empty(),
+            "not again at the next sweep while Bluetooth carries it"
         );
     }
 
