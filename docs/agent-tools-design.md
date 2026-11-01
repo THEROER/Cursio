@@ -53,6 +53,8 @@ stdout carries the protocol alone; the log goes to stderr and its file.
 | `apps_ship` | changes; destructive (replaces running copies) | publish, then launch with the version until current there |
 | `apps_actions` | reads | `Command::AppActions`: what a running application declared (name, description, JSON Schema, which process, whether running) |
 | `apps_call` | destructive | `Command::CallAction`: the running process does one of its declared actions and answers JSON; the target machine's person allows calls to an application once (`[apps.<id>] actions`) |
+| `apps_peers` | reads | `Command::AppPeers`: the connected machines where an application is registered — running or not, version, the message topics its copies listen to |
+| `apps_send` | destructive | `Command::AppSend`: a text message about a topic to the copies of an application on a machine, as its copy here would send one; fails saying offline, no copy listening, or not allowed (same consent as `apps_call`) |
 | `restart_machine` | destructive | `Command::Maintain(Restart)` |
 | `apply_update` | destructive | `Command::Maintain(ApplyUpdate)` |
 

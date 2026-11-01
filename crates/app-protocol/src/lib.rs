@@ -31,8 +31,19 @@ use serde::{Deserialize, Serialize};
 /// The version of this vocabulary an SDK built from this crate speaks.
 pub const PROTOCOL: u32 = 1;
 
-/// Longest line either side accepts.
-pub const MAX_LINE: usize = 64 * 1024;
+/// Longest line either side accepts: room for a [`MAX_PAYLOAD`] message in
+/// base64 with its envelope. It was 64 KiB before messages; a node sends a
+/// [`NodeMsg::Message`] only to a process that listens to its topic, which an
+/// SDK with the older limit never does.
+pub const MAX_LINE: usize = 1024 * 1024;
+
+/// Most bytes one message between copies of an application carries. Larger
+/// data — a build, a world — belongs to the builds the node carries, or to
+/// files; a message says what changed.
+pub const MAX_PAYLOAD: usize = 512 * 1024;
+
+/// Most topics one process listens to.
+pub const MAX_TOPICS: usize = 64;
 
 /// The socket's file name inside the node's private runtime directory.
 pub const SOCKET_NAME: &str = "apps.sock";
@@ -185,6 +196,100 @@ impl From<ActionName> for String {
     }
 }
 
+/// What a message between copies of an application is about — `instances`,
+/// `sync` — and what a copy listens to. Same characters as an [`AppId`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TopicName(String);
+
+impl TopicName {
+    pub fn parse(name: &str) -> Result<Self, Error> {
+        match well_formed_name(name) {
+            true => Ok(TopicName(name.to_owned())),
+            false => Err(Error::BadTopicName(name.to_owned())),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TopicName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for TopicName {
+    type Error = Error;
+    fn try_from(name: String) -> Result<Self, Error> {
+        TopicName::parse(&name)
+    }
+}
+
+impl From<TopicName> for String {
+    fn from(name: TopicName) -> String {
+        name.0
+    }
+}
+
+/// A message's payload as a line carries it: base64, so any bytes cross a
+/// JSON line.
+pub fn encode_payload(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The bytes of a payload [`encode_payload`] wrote, at most [`MAX_PAYLOAD`].
+pub fn decode_payload(text: &str) -> Result<Vec<u8>, Error> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|e| Error::Malformed(format!("the payload is not base64: {e}")))?;
+    match bytes.len() > MAX_PAYLOAD {
+        true => Err(Error::TooLarge(bytes.len())),
+        false => Ok(bytes),
+    }
+}
+
+/// Why a message between copies did not arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendFailure {
+    /// The machine is not connected to this one now, or no machine has
+    /// that name.
+    Offline,
+    /// The machine is there, but no copy of the application on it listens
+    /// to the topic now.
+    NotRunning,
+    /// That machine's person does not let this one reach the application
+    /// there, or has not answered yet.
+    Refused,
+    /// Anything else: no answer in time, a payload too large.
+    Failed,
+}
+
+/// [`NodeMsg::Sent`]'s failure: which kind, and in words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendError {
+    pub kind: SendFailure,
+    pub reason: String,
+}
+
+/// A machine where the application is registered, as [`NodeMsg::Peers`]
+/// lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppPeer {
+    pub machine: String,
+    /// A copy is connected to that machine's node now.
+    pub running: bool,
+    pub version: String,
+    /// Topics its running copies listen to.
+    #[serde(default)]
+    pub topics: Vec<TopicName>,
+}
+
 /// An action a process declares in its hello: what it is called, what it
 /// does in a sentence, and a JSON Schema of its arguments — what an agent
 /// reads to call it right the first time.
@@ -304,6 +409,10 @@ pub enum ClientMsg {
         /// when empty, so a hello without actions has the bytes it had.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         actions: Vec<ActionSpec>,
+        /// Topics of messages from its copies on other machines this
+        /// process listens to. Left out when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        topics: Vec<TopicName>,
     },
     Health {
         state: HealthState,
@@ -319,6 +428,18 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Send `payload` (base64, at most [`MAX_PAYLOAD`] bytes) about `topic`
+    /// to the copies of this application on machine `to`; answered by
+    /// [`NodeMsg::Sent`] with the same `id`.
+    Send {
+        id: u64,
+        to: String,
+        topic: TopicName,
+        payload: String,
+    },
+    /// Which machines this application is registered on; answered by
+    /// [`NodeMsg::Peers`] with the same `id`.
+    Peers { id: u64 },
 }
 
 impl ClientMsg {
@@ -363,6 +484,24 @@ pub enum NodeMsg {
         #[serde(default)]
         args: serde_json::Value,
     },
+    /// What became of [`ClientMsg::Send`] `id`: absent `error` is delivered.
+    Sent {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<SendError>,
+    },
+    /// The answer to [`ClientMsg::Peers`] `id`.
+    Peers { id: u64, peers: Vec<AppPeer> },
+    /// A message from a copy of this application on machine `from` (its
+    /// process `from_process`, absent for the main one) about `topic`, which
+    /// this process listens to. `payload` is base64.
+    Message {
+        from: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_process: Option<ProcessName>,
+        topic: TopicName,
+        payload: String,
+    },
 }
 
 /// Something wrong with a message or a name.
@@ -373,6 +512,9 @@ pub enum Error {
     BadProcessName(String),
     BadActionName(String),
     BadAction(String),
+    BadTopicName(String),
+    /// A message's payload of this many bytes is over [`MAX_PAYLOAD`].
+    TooLarge(usize),
     BadLogSpec(String),
     TooLong,
     Malformed(String),
@@ -395,6 +537,14 @@ impl fmt::Display for Error {
                 "{name:?} is not an action name; use up to {MAX_APP_ID} lowercase letters, digits and `-`"
             ),
             Error::BadAction(why) => f.write_str(why),
+            Error::BadTopicName(name) => write!(
+                f,
+                "{name:?} is not a topic; use up to {MAX_APP_ID} lowercase letters, digits and `-`"
+            ),
+            Error::TooLarge(bytes) => write!(
+                f,
+                "a message carries at most {MAX_PAYLOAD} bytes, not {bytes}; send a build or a file for more"
+            ),
             Error::BadLogSpec(why) => f.write_str(why),
             Error::TooLong => write!(f, "a line is longer than {MAX_LINE} bytes"),
             Error::Malformed(why) => write!(f, "not a message: {why}"),
@@ -491,6 +641,7 @@ mod tests {
             }),
             process: None,
             actions: Vec::new(),
+            topics: Vec::new(),
         };
         let text = line(&hello);
         assert_eq!(
@@ -513,6 +664,7 @@ mod tests {
             logs: None,
             process: None,
             actions: Vec::new(),
+            topics: Vec::new(),
         };
         assert_eq!(
             line(&hello),
@@ -530,6 +682,7 @@ mod tests {
             logs: None,
             process: Some(ProcessName::parse("daemon").unwrap()),
             actions: Vec::new(),
+            topics: Vec::new(),
         };
         let text = line(&hello);
         assert_eq!(
@@ -548,6 +701,67 @@ mod tests {
     }
 
     #[test]
+    fn messages_between_copies_have_pinned_bytes() {
+        let hello = ClientMsg::Hello {
+            protocol: 1,
+            app: AppId::parse("leavepulse").unwrap(),
+            version: "1".into(),
+            pid: 4,
+            logs: None,
+            process: None,
+            actions: Vec::new(),
+            topics: vec![TopicName::parse("instances").unwrap()],
+        };
+        assert_eq!(
+            line(&hello),
+            "{\"msg\":\"hello\",\"protocol\":1,\"app\":\"leavepulse\",\"version\":\"1\",\"pid\":4,\"topics\":[\"instances\"]}\n"
+        );
+        let send = ClientMsg::Send {
+            id: 2,
+            to: "Lightmoon".into(),
+            topic: TopicName::parse("instances").unwrap(),
+            payload: encode_payload(b"hi"),
+        };
+        assert_eq!(
+            line(&send),
+            "{\"msg\":\"send\",\"id\":2,\"to\":\"Lightmoon\",\"topic\":\"instances\",\"payload\":\"aGk=\"}\n"
+        );
+        assert_eq!(
+            line(&ClientMsg::Peers { id: 3 }),
+            "{\"msg\":\"peers\",\"id\":3}\n"
+        );
+        assert_eq!(
+            line(&NodeMsg::Sent { id: 2, error: None }),
+            "{\"msg\":\"sent\",\"id\":2}\n"
+        );
+        assert_eq!(
+            line(&NodeMsg::Sent {
+                id: 2,
+                error: Some(SendError {
+                    kind: SendFailure::NotRunning,
+                    reason: "no".into()
+                })
+            }),
+            "{\"msg\":\"sent\",\"id\":2,\"error\":{\"kind\":\"not_running\",\"reason\":\"no\"}}\n"
+        );
+        assert_eq!(
+            line(&NodeMsg::Message {
+                from: "Nocturne".into(),
+                from_process: None,
+                topic: TopicName::parse("instances").unwrap(),
+                payload: encode_payload(b"hi"),
+            }),
+            "{\"msg\":\"message\",\"from\":\"Nocturne\",\"topic\":\"instances\",\"payload\":\"aGk=\"}\n"
+        );
+        assert_eq!(decode_payload("aGk=").unwrap(), b"hi");
+        assert!(matches!(
+            decode_payload(&encode_payload(&vec![0; MAX_PAYLOAD + 1])),
+            Err(Error::TooLarge(_))
+        ));
+        assert!(TopicName::parse("Bad Topic").is_err());
+    }
+
+    #[test]
     fn a_hello_declares_its_actions_and_a_call_and_its_answer_have_pinned_bytes() {
         let hello = ClientMsg::Hello {
             protocol: 1,
@@ -561,6 +775,7 @@ mod tests {
                 description: "Stop an instance".into(),
                 schema: serde_json::json!({"type": "object"}),
             }],
+            topics: Vec::new(),
         };
         let text = line(&hello);
         assert_eq!(

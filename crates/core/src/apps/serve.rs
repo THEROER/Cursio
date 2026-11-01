@@ -112,6 +112,32 @@ pub fn call(
     result
 }
 
+/// Hand a message from `peer`'s copy (its `from_process`) about `topic` to
+/// every running copy of the processes `keys`; how many took it.
+pub fn deliver(
+    keys: &[super::Key],
+    peer: &str,
+    from_process: Option<cursio_app_protocol::ProcessName>,
+    topic: &cursio_app_protocol::TopicName,
+    payload: &[u8],
+) -> usize {
+    let msg = NodeMsg::Message {
+        from: peer.to_owned(),
+        from_process,
+        topic: topic.clone(),
+        payload: cursio_app_protocol::encode_payload(payload),
+    };
+    let mut told = 0;
+    let mut pushers = pushers();
+    for key in keys {
+        if let Some(copies) = pushers.get_mut(key) {
+            copies.retain(|(_, tx)| tx.send(msg.clone()).is_ok());
+            told += copies.len();
+        }
+    }
+    told
+}
+
 /// `app`, or `app/process`, as a person reads it.
 fn describe(key: &super::Key) -> String {
     match &key.process {
@@ -248,7 +274,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     let Some(first) = first else {
         return Ok(());
     };
-    let (app, process, version, pid, logs, protocol, actions) =
+    let (app, process, version, pid, logs, protocol, actions, topics) =
         match decode_line::<ClientMsg>(&first) {
             Ok(ClientMsg::Hello {
                 protocol,
@@ -258,7 +284,8 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                 logs,
                 process,
                 actions,
-            }) => (app, process, version, pid, logs, protocol, actions),
+                topics,
+            }) => (app, process, version, pid, logs, protocol, actions, topics),
             Ok(_) => return refuse(&mut write, "the first message must be hello".into()).await,
             Err(error) => return refuse(&mut write, error.to_string()).await,
         };
@@ -282,6 +309,10 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     if let Some(Err(error)) = actions.iter().map(|a| a.check()).find(Result::is_err) {
         return refuse(&mut write, error.to_string()).await;
     }
+    if topics.len() > cursio_app_protocol::MAX_TOPICS {
+        let limit = cursio_app_protocol::MAX_TOPICS;
+        return refuse(&mut write, format!("at most {limit} topics per process")).await;
+    }
     let key = super::Key {
         app: app.clone(),
         process,
@@ -290,6 +321,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
         let mut registry = lock(registry);
         registry.connected(&key, version.clone(), pid, logs.clone());
         registry.set_actions(&key, actions);
+        registry.set_topics(&key, topics);
     }
     tracing::info!(%app, process = ?key.process, %version, pid, logs = ?logs.as_ref().map(|l| l.dir.join(&l.file)), "application connected");
     let welcome = NodeMsg::Welcome {
@@ -351,6 +383,40 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                             tracing::debug!(%app, id, "an answer to a call no longer waited for");
                         }
                     }
+                }
+                Ok(ClientMsg::Send {
+                    id,
+                    to,
+                    topic,
+                    payload,
+                }) => {
+                    let (app, process, out) = (app.clone(), key.process.clone(), out.clone());
+                    // Off the reading loop: a slow peer must not hold up this
+                    // copy's other messages, nor its answers to calls.
+                    tokio::spawn(async move {
+                        let sent = match cursio_app_protocol::decode_payload(&payload) {
+                            Ok(bytes) => {
+                                super::mesh::send(&app, process.as_ref(), &to, &topic, bytes)
+                                    .await
+                                    .map(drop)
+                            }
+                            Err(error) => Err(cursio_app_protocol::SendError {
+                                kind: cursio_app_protocol::SendFailure::Failed,
+                                reason: error.to_string(),
+                            }),
+                        };
+                        if let Err(error) = &sent {
+                            tracing::debug!(%app, %to, %topic, reason = %error.reason, "a message between copies did not arrive");
+                        }
+                        let _ = out.send(NodeMsg::Sent {
+                            id,
+                            error: sent.err(),
+                        });
+                    });
+                }
+                Ok(ClientMsg::Peers { id }) => {
+                    let peers = super::mesh::peers(&app);
+                    let _ = out.send(NodeMsg::Peers { id, peers });
                 }
                 Err(_) => {
                     let feature = message_kind(&line).unwrap_or_else(|| "not a message".into());
@@ -431,6 +497,7 @@ mod tests {
             logs,
             process: None,
             actions: Vec::new(),
+            topics: Vec::new(),
         })
     }
 
@@ -626,6 +693,86 @@ mod tests {
             assert_eq!(build.version, "2");
             assert_eq!(build.dir, dir.join("versions/2"));
             drop(app);
+        })
+        .await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_application_hears_its_copies_sees_its_peers_and_is_told_why_a_send_failed() {
+        let dir = scratch("messages");
+        let path = dir.join("apps.sock");
+        let registry = super::super::registry().clone();
+        let server = tokio::spawn(serve(path.clone(), "Nocturne".into(), registry.clone()));
+        bounded(async {
+            let (tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+            let app = cursio_sdk::App::new("e2e-messages")
+                .version("3")
+                .endpoint(&path)
+                .on_message("sync", move |message| {
+                    let _ = tx.send(message);
+                })
+                .start()
+                .unwrap();
+            let key = super::super::Key::main(AppId::parse("e2e-messages").unwrap());
+            let topic = cursio_app_protocol::TopicName::parse("sync").unwrap();
+            while lock(&registry).listening(&key.app, &topic).is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            // A copy elsewhere sent one: it reaches the handler whole.
+            assert_eq!(
+                deliver(
+                    std::slice::from_ref(&key),
+                    "Lightmoon",
+                    None,
+                    &topic,
+                    b"state"
+                ),
+                1
+            );
+            let message = heard.recv().await.unwrap();
+            assert_eq!(message.from_machine, "Lightmoon");
+            assert_eq!(message.payload, b"state");
+
+            // A connected machine that said it runs the application is a peer.
+            let (link_tx, _link_rx) = tokio::sync::mpsc::unbounded_channel();
+            let token = super::super::mesh::link("e2e-msg-peer", link_tx);
+            super::super::mesh::set_presence(
+                "e2e-msg-peer",
+                vec![cursio_protocol::apps::AppPresence {
+                    app: "e2e-messages".into(),
+                    running: true,
+                    version: "3".into(),
+                    topics: vec!["sync".into()],
+                }],
+            );
+            let app = std::sync::Arc::new(app);
+            let asking = app.clone();
+            let peers = tokio::task::spawn_blocking(move || asking.peers())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                peers
+                    .iter()
+                    .any(|p| p.machine == "e2e-msg-peer" && p.running),
+                "{peers:?}"
+            );
+            super::super::mesh::unlink("e2e-msg-peer", token);
+
+            let asking = app.clone();
+            let offline =
+                tokio::task::spawn_blocking(move || asking.send("e2e-nowhere", "sync", b"x"))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                offline,
+                Err(cursio_sdk::Error::Offline {
+                    machine: "e2e-nowhere".into()
+                })
+            );
         })
         .await;
         server.abort();

@@ -22,7 +22,13 @@ From any machine of the mesh:
 cursio logs Laptop --app my-app -f                 # its log, live, no SSH
 cursio apps ship my-app --to Laptop windows-x86_64=target/my-app.exe   # build there, started
 cursio apps call Laptop my-app open '{"path": "notes.txt"}'           # an action it declared
+cursio apps send Laptop my-app notes 'changed'                        # a message to its copies there
 ```
+
+Copies of the application on different machines talk to each other with
+`App::on_message(topic, handler)` and `Cursio::send` / `send_all` /
+`peers` — over the mesh's encryption, at most 512 KiB a message, delivered at
+most once to the copies running now.
 
 An application declares actions with `App::action(name, description,
 schema, handler)`; the running process does them when another machine — or

@@ -32,9 +32,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cursio_app_protocol::{
-    decode_line, encode_line, no_such_action, ClientMsg, NodeMsg, MAX_ACTIONS, MAX_LINE, PROTOCOL,
+    decode_line, encode_line, no_such_action, ClientMsg, NodeMsg, SendFailure, MAX_ACTIONS,
+    MAX_LINE, MAX_PAYLOAD, MAX_TOPICS, PROTOCOL,
 };
-pub use cursio_app_protocol::{ActionName, ActionSpec, AppId, HealthState, LogSpec, ProcessName};
+pub use cursio_app_protocol::{
+    ActionName, ActionSpec, AppId, HealthState, LogSpec, ProcessName, TopicName,
+};
 /// The JSON an action takes and answers.
 pub use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -58,6 +61,16 @@ pub enum Error {
     Refused(String),
     /// The connection's thread could not be started.
     Thread(String),
+    /// A message's machine is not connected to this one now.
+    Offline { machine: String },
+    /// The machine is there, but no copy of this application on it listens
+    /// to the message's topic now.
+    CopyNotRunning { machine: String },
+    /// That machine's person does not let this machine reach the application
+    /// there (`[apps.<id>] actions`), or has not answered yet.
+    NotAllowed { machine: String, reason: String },
+    /// A message could not be carried for another reason, said here.
+    Send(String),
 }
 
 impl std::fmt::Display for Error {
@@ -67,8 +80,57 @@ impl std::fmt::Display for Error {
             Error::NotRunning => f.write_str("no Cursio node is running on this machine"),
             Error::Refused(why) => write!(f, "the Cursio node refused this application: {why}"),
             Error::Thread(why) => write!(f, "cannot start the Cursio connection: {why}"),
+            Error::Offline { machine } => write!(f, "{machine} is not connected to this machine"),
+            Error::CopyNotRunning { machine } => write!(
+                f,
+                "no copy of this application on {machine} listens to that topic now"
+            ),
+            Error::NotAllowed { machine, reason } => write!(f, "{machine} refused: {reason}"),
+            Error::Send(why) => write!(f, "the message did not arrive: {why}"),
         }
     }
+}
+
+/// A message from a copy of this application on another machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    /// The machine it came from, as the mesh names it.
+    pub from_machine: String,
+    /// Which process of the application there sent it; `None` is its main one.
+    pub from_process: Option<ProcessName>,
+    pub topic: TopicName,
+    pub payload: Vec<u8>,
+}
+
+/// A machine of the mesh where this application is registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub machine: String,
+    /// A copy is connected to that machine's Cursio node now.
+    pub running: bool,
+    pub version: String,
+    /// Topics its running copies listen to.
+    pub topics: Vec<TopicName>,
+}
+
+type OnMessage = Arc<dyn Fn(Message) + Send + Sync>;
+
+/// One machine's outcome of [`Cursio::send_all`]: its name, and whether its
+/// copies took the message.
+pub type SentTo = (String, Result<(), Error>);
+
+/// How long [`Cursio::send`] waits for the other machine to say what became
+/// of a message: a little over the node's own wait, so the node's answer —
+/// which says why — arrives first.
+const SEND_WAIT: Duration = Duration::from_secs(35);
+/// How long [`Cursio::peers`] waits; the node answers from what it holds.
+const PEERS_WAIT: Duration = Duration::from_secs(5);
+
+/// A request to the node that is answered by id, and where its answer goes.
+struct Request {
+    msg: ClientMsg,
+    id: u64,
+    reply: std::sync::mpsc::Sender<NodeMsg>,
 }
 
 impl std::error::Error for Error {}
@@ -102,6 +164,7 @@ struct Hooks {
     app: String,
     on_update: Option<OnUpdate>,
     actions: Arc<BTreeMap<ActionName, Handler>>,
+    messages: Arc<BTreeMap<TopicName, OnMessage>>,
 }
 
 /// An application about to introduce itself to the node.
@@ -114,6 +177,7 @@ pub struct App {
     on_update: Option<OnUpdate>,
     process: Option<Result<ProcessName, cursio_app_protocol::Error>>,
     actions: Vec<Declared>,
+    topics: Vec<(Result<TopicName, cursio_app_protocol::Error>, OnMessage)>,
 }
 
 impl std::fmt::Debug for App {
@@ -139,7 +203,24 @@ impl App {
             on_update: None,
             process: None,
             actions: Vec::new(),
+            topics: Vec::new(),
         }
+    }
+
+    /// Hear messages about `topic` from copies of this application on other
+    /// machines ([`Cursio::send`] there). `handler` runs on a thread of its
+    /// own, never the connection's; one that panics loses that message only.
+    ///
+    /// A message arrives only from a machine this machine's person lets drive
+    /// the application — the same answer as for its actions.
+    pub fn on_message(
+        mut self,
+        topic: &str,
+        handler: impl Fn(Message) + Send + Sync + 'static,
+    ) -> Self {
+        self.topics
+            .push((TopicName::parse(topic), Arc::new(handler)));
+        self
     }
 
     /// Let another machine of the mesh ask this process to do `name`:
@@ -218,10 +299,12 @@ impl App {
         }
         let process = self.process.transpose().map_err(Error::Invalid)?;
         let (specs, handlers) = declared(self.actions)?;
+        let (topics, listeners) = listened(self.topics)?;
         let hooks = Hooks {
             app: id.to_string(),
             on_update: self.on_update,
             actions: Arc::new(handlers),
+            messages: Arc::new(listeners),
         };
         let hello = ClientMsg::Hello {
             protocol: PROTOCOL,
@@ -231,10 +314,12 @@ impl App {
             logs: self.logs,
             process,
             actions: specs,
+            topics,
         };
         let endpoint = self.endpoint.unwrap_or_else(cursio_app_protocol::endpoint);
         let shared = Arc::new(Mutex::new(Link::Connecting));
         let (health, health_rx) = watch::channel((HealthState::Ok, None));
+        let (requests, requests_rx) = mpsc::unbounded_channel();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -242,10 +327,69 @@ impl App {
         let link = shared.clone();
         std::thread::Builder::new()
             .name("cursio-sdk".into())
-            .spawn(move || runtime.block_on(run(endpoint, hello, link, health_rx, hooks)))
+            .spawn(move || {
+                runtime.block_on(run(endpoint, hello, link, health_rx, requests_rx, hooks))
+            })
             .map_err(|e| Error::Thread(e.to_string()))?;
-        Ok(Cursio { shared, health })
+        Ok(Cursio {
+            shared,
+            health,
+            requests,
+        })
     }
+}
+
+/// The topics the hello lists and their handlers; an invalid or repeated
+/// one, or too many, is the program's mistake.
+type Listened = (Vec<TopicName>, BTreeMap<TopicName, OnMessage>);
+
+fn listened(
+    topics: Vec<(Result<TopicName, cursio_app_protocol::Error>, OnMessage)>,
+) -> Result<Listened, Error> {
+    if topics.len() > MAX_TOPICS {
+        return Err(Error::Invalid(cursio_app_protocol::Error::BadAction(
+            format!("at most {MAX_TOPICS} topics per process"),
+        )));
+    }
+    let mut names = Vec::new();
+    let mut handlers = BTreeMap::new();
+    for (topic, handler) in topics {
+        let topic = topic.map_err(Error::Invalid)?;
+        if handlers.insert(topic.clone(), handler).is_some() {
+            return Err(Error::Invalid(cursio_app_protocol::Error::BadAction(
+                format!("topic {topic} is listened to twice"),
+            )));
+        }
+        names.push(topic);
+    }
+    Ok((names, handlers))
+}
+
+/// Hand a message to its topic's handler off the connection's thread; a
+/// message about a topic nobody here listens to, or that is not valid
+/// base64, is dropped.
+fn hear(
+    hooks: &Hooks,
+    from: String,
+    from_process: Option<ProcessName>,
+    topic: TopicName,
+    payload: &str,
+) {
+    let (Some(handler), Ok(payload)) = (
+        hooks.messages.get(&topic).cloned(),
+        cursio_app_protocol::decode_payload(payload),
+    ) else {
+        return;
+    };
+    let message = Message {
+        from_machine: from,
+        from_process,
+        topic,
+        payload,
+    };
+    tokio::task::spawn_blocking(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(message)));
+    });
 }
 
 /// The declared actions as the hello lists them, and their handlers by name;
@@ -323,6 +467,15 @@ enum Link {
 pub struct Cursio {
     shared: Arc<Mutex<Link>>,
     health: watch::Sender<(HealthState, Option<String>)>,
+    requests: mpsc::UnboundedSender<Request>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Cursio {
@@ -354,12 +507,116 @@ impl Cursio {
                 .collect::<String>()
         });
         self.health.send_replace((state, detail));
+        self.connected()
+    }
+
+    fn connected(&self) -> Result<(), Error> {
         match self.link() {
             Link::Connected { .. } => Ok(()),
             Link::Connecting => Err(Error::NotRunning),
             Link::Refused { reason } => Err(Error::Refused(reason)),
         }
     }
+
+    /// Ask the node `msg`, which carries `id`, and wait up to `wait` for its
+    /// answer.
+    fn ask(&self, id: u64, msg: ClientMsg, wait: Duration) -> Result<NodeMsg, Error> {
+        self.connected()?;
+        let (reply, answer) = std::sync::mpsc::channel();
+        self.requests
+            .send(Request { msg, id, reply })
+            .map_err(|_| Error::NotRunning)?;
+        answer.recv_timeout(wait).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => Error::Send(format!(
+                "the node did not answer within {} s",
+                wait.as_secs()
+            )),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => Error::NotRunning,
+        })
+    }
+
+    /// Send `payload` (at most 512 KiB) about `topic` to the copies of this
+    /// application on `machine` that listen to it ([`App::on_message`]
+    /// there), and wait until that machine says it took it. Delivered at most
+    /// once, to the copies running now; nothing is kept for later, so an
+    /// error says which case it was — [`Error::Offline`],
+    /// [`Error::CopyNotRunning`], [`Error::NotAllowed`] — and whether trying
+    /// again means anything is the application's call.
+    ///
+    /// Blocks, up to about half a minute for a slow link: call it off an
+    /// async executor's worker (`spawn_blocking`).
+    pub fn send(&self, machine: &str, topic: &str, payload: &[u8]) -> Result<(), Error> {
+        let topic = TopicName::parse(topic).map_err(Error::Invalid)?;
+        if payload.len() > MAX_PAYLOAD {
+            return Err(Error::Invalid(cursio_app_protocol::Error::TooLarge(
+                payload.len(),
+            )));
+        }
+        let id = next_id();
+        let msg = ClientMsg::Send {
+            id,
+            to: machine.to_owned(),
+            topic,
+            payload: cursio_app_protocol::encode_payload(payload),
+        };
+        match self.ask(id, msg, SEND_WAIT)? {
+            NodeMsg::Sent { error: None, .. } => Ok(()),
+            NodeMsg::Sent {
+                error: Some(error), ..
+            } => {
+                let machine = machine.to_owned();
+                Err(match error.kind {
+                    SendFailure::Offline => Error::Offline { machine },
+                    SendFailure::NotRunning => Error::CopyNotRunning { machine },
+                    SendFailure::Refused => Error::NotAllowed {
+                        machine,
+                        reason: error.reason,
+                    },
+                    SendFailure::Failed => Error::Send(error.reason),
+                })
+            }
+            other => Err(Error::Send(format!("the node answered {other:?}"))),
+        }
+    }
+
+    /// [`Cursio::send`] to every machine whose running copy listens to
+    /// `topic`, answering each machine's outcome.
+    pub fn send_all(&self, topic: &str, payload: &[u8]) -> Result<Vec<SentTo>, Error> {
+        let wanted = TopicName::parse(topic).map_err(Error::Invalid)?;
+        Ok(self
+            .peers()?
+            .into_iter()
+            .filter(|p| p.running && p.topics.contains(&wanted))
+            .map(|p| {
+                let sent = self.send(&p.machine, topic, payload);
+                (p.machine, sent)
+            })
+            .collect())
+    }
+
+    /// The connected machines where this application is registered, by what
+    /// their nodes last said: whether a copy runs, its version, what it
+    /// listens to.
+    pub fn peers(&self) -> Result<Vec<Peer>, Error> {
+        let id = next_id();
+        match self.ask(id, ClientMsg::Peers { id }, PEERS_WAIT)? {
+            NodeMsg::Peers { peers, .. } => Ok(peers
+                .into_iter()
+                .map(|p| Peer {
+                    machine: p.machine,
+                    running: p.running,
+                    version: p.version,
+                    topics: p.topics,
+                })
+                .collect()),
+            other => Err(Error::Send(format!("the node answered {other:?}"))),
+        }
+    }
+}
+
+fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 enum Ended {
@@ -376,13 +633,14 @@ async fn run(
     hello: ClientMsg,
     shared: Arc<Mutex<Link>>,
     mut health: watch::Receiver<(HealthState, Option<String>)>,
+    mut requests: mpsc::UnboundedReceiver<Request>,
     hooks: Hooks,
 ) {
     let set = |link: Link| *shared.lock().unwrap_or_else(|p| p.into_inner()) = link;
     let mut wait = RETRY_MIN;
     loop {
         let ended = match connect(&endpoint).await {
-            Ok(stream) => session(stream, &hello, &set, &mut health, &hooks).await,
+            Ok(stream) => session(stream, &hello, &set, &mut health, &mut requests, &hooks).await,
             Err(_) => Ended::Closed,
         };
         match ended {
@@ -462,6 +720,7 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
     hello: &ClientMsg,
     set: &impl Fn(Link),
     health: &mut watch::Receiver<(HealthState, Option<String>)>,
+    requests: &mut mpsc::UnboundedReceiver<Request>,
     hooks: &Hooks,
 ) -> Ended {
     let (read, mut write) = tokio::io::split(stream);
@@ -497,8 +756,17 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
         }
     }));
     let (answers_tx, mut answers) = mpsc::unbounded_channel::<ClientMsg>();
+    // Requests sent and waiting for the node's answer, by id; dropped with
+    // the session, which tells each waiter the node went.
+    let mut waiting: BTreeMap<u64, std::sync::mpsc::Sender<NodeMsg>> = BTreeMap::new();
     loop {
         tokio::select! {
+            Some(request) = requests.recv() => {
+                if write.write_all(&encode_line(&request.msg)).await.is_err() {
+                    return Ended::Closed;
+                }
+                waiting.insert(request.id, request.reply);
+            }
             changed = health.changed() => {
                 if changed.is_err() {
                     return Ended::Stop;
@@ -523,6 +791,14 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
                     }
                     Ok(NodeMsg::Call { id, action, args }) => {
                         dispatch(hooks, id, action, args, &answers_tx);
+                    }
+                    Ok(answer @ (NodeMsg::Sent { id, .. } | NodeMsg::Peers { id, .. })) => {
+                        if let Some(reply) = waiting.remove(&id) {
+                            let _ = reply.send(answer);
+                        }
+                    }
+                    Ok(NodeMsg::Message { from, from_process, topic, payload }) => {
+                        hear(hooks, from, from_process, topic, &payload);
                     }
                     // A message a newer node sends that this SDK does not
                     // know is skipped, as the protocol promises.

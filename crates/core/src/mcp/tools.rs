@@ -278,6 +278,8 @@ impl<A: Ask> Tools<A> {
             "apps_ship" => apps_ship(args).await,
             "apps_actions" => apps_actions(args).await,
             "apps_call" => apps_call(args).await,
+            "apps_peers" => apps_peers(args).await,
+            "apps_send" => apps_send(args).await,
             "restart_machine" => {
                 self.maintain(args, cursio_protocol::diag::Maintenance::Restart)
                     .await
@@ -443,6 +445,27 @@ async fn apps_call(args: &Value) -> Result<String, Failure> {
     crate::apps::cli::call(&machine, &target, &action, &call_args)
         .await
         .map_err(|e| e.to_string().into())
+}
+
+async fn apps_peers(args: &Value) -> Result<String, Failure> {
+    let app = need_str(args, "app")?;
+    let peers = crate::apps::cli::peers(&app)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(crate::apps::cli::describe_peers(&app, &peers))
+}
+
+async fn apps_send(args: &Value) -> Result<String, Failure> {
+    let machine = need_str(args, "machine")?;
+    let app = need_str(args, "app")?;
+    let topic = need_str(args, "topic")?;
+    let text = need_str(args, "text")?;
+    let copies = crate::apps::cli::send(&machine, &app, &topic, &text)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{machine}: {app} took it ({copies} running copies)"
+    ))
 }
 
 async fn apps_launch(args: &Value) -> Result<String, Failure> {
@@ -654,6 +677,25 @@ pub fn list() -> Vec<Value> {
                 "args": { "description": "the action's arguments, as its schema describes" },
             }),
             &["machine", "app", "action"],
+        ),
+        tool(
+            "apps_peers",
+            "The connected machines where an application is registered: whether a copy runs there, its version, and the message topics its copies listen to.",
+            true, false,
+            json!({ "app": { "type": "string" } }),
+            &["app"],
+        ),
+        tool(
+            "apps_send",
+            "Send a text message about a topic to the running copies of an application on a machine that listen to it, as its copy here would. Fails saying whether the machine is offline, no copy listens, or its person has not allowed this machine.",
+            false, true,
+            json!({
+                "machine": machine.clone(),
+                "app": { "type": "string" },
+                "topic": { "type": "string" },
+                "text": { "type": "string" },
+            }),
+            &["machine", "app", "topic", "text"],
         ),
         tool(
             "apps_launch",

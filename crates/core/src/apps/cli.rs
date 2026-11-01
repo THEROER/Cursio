@@ -102,6 +102,17 @@ pub enum AppsAction {
         /// The arguments, as JSON; none when absent.
         json: Option<String>,
     },
+    /// Send a text message about `topic` to the copies of an application on
+    /// a connected machine that listen to it — what its copy here would send
+    /// with `Cursio::send`; for trying an application's messages by hand.
+    Send {
+        machine: String,
+        app: String,
+        topic: String,
+        text: String,
+    },
+    /// The connected machines where an application is registered.
+    Peers { app: String },
 }
 
 /// Where progress lines go: the terminal for the CLI, a tool's answer for
@@ -172,7 +183,77 @@ pub async fn run(action: AppsAction, config_path: &Path) -> anyhow::Result<()> {
             println!("{answer}");
             Ok(())
         }
+        AppsAction::Send {
+            machine,
+            app,
+            topic,
+            text,
+        } => {
+            let copies = send(&machine, &app, &topic, &text).await?;
+            println!(
+                "{machine}: {app} took it ({copies} running cop{})",
+                if copies == 1 { "y" } else { "ies" }
+            );
+            Ok(())
+        }
+        AppsAction::Peers { app } => {
+            print!("{}", describe_peers(&app, &peers(&app).await?));
+            Ok(())
+        }
     }
+}
+
+/// Send `text` about `topic` to `app`'s copies on `machine`; how many took it.
+pub async fn send(machine: &str, app: &str, topic: &str, text: &str) -> anyhow::Result<u32> {
+    use crate::control::{Command, Reply};
+    let command = Command::AppSend {
+        machine: machine.to_owned(),
+        app: app.to_owned(),
+        topic: topic.to_owned(),
+        text: text.to_owned(),
+    };
+    match client().await?.request(command).await? {
+        Reply::AppSent { copies } => Ok(copies),
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("the running node answered {other:?}"),
+    }
+}
+
+/// The connected machines where `app` is registered.
+pub async fn peers(app: &str) -> anyhow::Result<Vec<cursio_app_protocol::AppPeer>> {
+    use crate::control::{Command, Reply};
+    let command = Command::AppPeers {
+        app: app.to_owned(),
+    };
+    match client().await?.request(command).await? {
+        Reply::AppPeers { peers } => Ok(peers),
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("the running node answered {other:?}"),
+    }
+}
+
+/// Peers as a person reads them, one per line.
+pub fn describe_peers(app: &str, peers: &[cursio_app_protocol::AppPeer]) -> String {
+    if peers.is_empty() {
+        return format!("no connected machine has {app} registered\n");
+    }
+    peers
+        .iter()
+        .map(|p| {
+            let state = if p.running { "running" } else { "not running" };
+            let topics: Vec<&str> = p.topics.iter().map(|t| t.as_str()).collect();
+            format!(
+                "{} — {app} {}, {state}; listens to: {}\n",
+                p.machine,
+                p.version,
+                if topics.is_empty() {
+                    "nothing".to_owned()
+                } else {
+                    topics.join(", ")
+                }
+            )
+        })
+        .collect()
 }
 
 /// The actions `app` declared on `machine`.

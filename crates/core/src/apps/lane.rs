@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use cursio_protocol::apps::AppsMsg;
+use cursio_protocol::apps::{AppsContent, AppsMsg, AppsWire};
 use cursio_protocol::update::UpdateMsg;
 use cursio_protocol::{Message, ModuleAdvert, ModuleId, PeerId};
 use cursio_transport::{TransportError, TransportTx};
@@ -28,9 +28,38 @@ pub struct AppsModule {
     peer_id: PeerId,
     lanes: BTreeMap<String, Lane>,
     outbox: Vec<AppsMsg>,
+    /// Messages between copies that this machine's applications send to the
+    /// peer ([`super::mesh::send`]).
+    inbox: tokio::sync::mpsc::UnboundedReceiver<AppsMsg>,
+    /// This link in [`super::mesh`], to leave it when the link goes.
+    token: u64,
+    /// The registry's generation last told to the peer; `None` until the
+    /// first presence goes out.
+    told: Option<u64>,
+}
+
+impl Drop for AppsModule {
+    fn drop(&mut self) {
+        super::mesh::unlink(&self.peer, self.token);
+    }
 }
 
 impl AppsModule {
+    fn new(builds: &'static Builds, peer: &str, peer_id: PeerId) -> Self {
+        let (tx, inbox) = tokio::sync::mpsc::unbounded_channel();
+        let token = super::mesh::link(peer, tx);
+        AppsModule {
+            builds,
+            peer: peer.to_owned(),
+            peer_id,
+            lanes: BTreeMap::new(),
+            outbox: Vec::new(),
+            inbox,
+            token,
+            told: None,
+        }
+    }
+
     fn lane(&mut self, app: &str) -> Option<&mut Lane> {
         if !self.lanes.contains_key(app) {
             let agent = self.builds.agent(app)?;
@@ -55,10 +84,48 @@ impl AppsModule {
             .extend(msgs.iter().map(|msg| AppsMsg::new(app, msg)));
     }
 
+    /// What the peer should hear: messages this machine's copies sent it, and
+    /// what runs here when that changed.
+    fn gather(&mut self) {
+        while let Ok(msg) = self.inbox.try_recv() {
+            self.outbox.push(msg);
+        }
+        let (generation, apps) = {
+            let registry = super::registry().lock().unwrap_or_else(|p| p.into_inner());
+            (registry.generation(), registry.presence())
+        };
+        if self.told != Some(generation) {
+            self.told = Some(generation);
+            self.outbox
+                .push(AppsMsg::wire("", &AppsWire::Present { apps }));
+        }
+    }
+
+    fn on_wire(&mut self, app: &str, wire: AppsWire) {
+        match wire {
+            AppsWire::Datagram {
+                id,
+                from_process,
+                topic,
+                payload,
+            } => {
+                let outcome = super::mesh::arrived(&self.peer, app, from_process, &topic, payload);
+                self.outbox
+                    .push(AppsMsg::wire(app, &AppsWire::Delivered { id, outcome }));
+            }
+            AppsWire::Delivered { id, outcome } => super::mesh::delivered(id, outcome),
+            AppsWire::Present { apps } => super::mesh::set_presence(&self.peer, apps),
+        }
+    }
+
     fn on_message(&mut self, msg: AppsMsg) {
-        let Some(update) = msg.update() else {
-            tracing::debug!(app = %msg.app, "an application's build message of a kind this build does not know");
-            return;
+        let update = match msg.content() {
+            Some(AppsContent::Update(update)) => update,
+            Some(AppsContent::Wire(wire)) => return self.on_wire(&msg.app.clone(), wire),
+            None => {
+                tracing::debug!(app = %msg.app, "an application message of a kind this build does not know");
+                return;
+            }
         };
         let Some(lane) = self.lane(&msg.app) else {
             tracing::debug!(app = %msg.app, peer = %self.peer, "a build message for something that is not an application id");
@@ -102,6 +169,7 @@ impl crate::module::SessionModule for AppsModule {
         for (app, msgs) in polled {
             self.queue(&app, msgs);
         }
+        self.gather();
         for msg in std::mem::take(&mut self.outbox) {
             let message = Message::module(ModuleId::APPS, msg.priority(), &msg)?;
             tx.send(&message).await?;
@@ -110,7 +178,7 @@ impl crate::module::SessionModule for AppsModule {
     }
 
     fn has_pending_work(&self) -> bool {
-        !self.outbox.is_empty()
+        !self.outbox.is_empty() || !self.inbox.is_empty()
     }
 
     fn handle_message(&mut self, msg: &Message) -> bool {
@@ -147,13 +215,11 @@ impl crate::module::ModuleFactory for AppsFactory {
     ) -> anyhow::Result<Box<dyn crate::module::SessionModule>> {
         let builds =
             builds().ok_or_else(|| anyhow::anyhow!("this node takes no applications' builds"))?;
-        Ok(Box::new(AppsModule {
+        Ok(Box::new(AppsModule::new(
             builds,
-            peer: ctx.peer_name().to_owned(),
-            peer_id: ctx.peer.peer_id,
-            lanes: BTreeMap::new(),
-            outbox: Vec::new(),
-        }))
+            ctx.peer_name(),
+            ctx.peer.peer_id,
+        )))
     }
 }
 
@@ -174,13 +240,7 @@ mod tests {
     }
 
     fn module(builds: &'static Builds, peer: &str) -> AppsModule {
-        AppsModule {
-            builds,
-            peer: peer.into(),
-            peer_id: PeerId::nil(),
-            lanes: BTreeMap::new(),
-            outbox: Vec::new(),
-        }
+        AppsModule::new(builds, peer, PeerId::nil())
     }
 
     /// Carry every queued message across until neither side has more.
@@ -379,5 +439,88 @@ mod tests {
         assert_eq!(layout.installed(), ["1.0.0"]);
         crate::diagnostics::clear("app.demo2.refused");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Run `send` from A to B while carrying both modules' traffic across.
+    async fn send_across(
+        at_a: &mut AppsModule,
+        at_b: &mut AppsModule,
+        app: &str,
+        topic: &str,
+    ) -> Result<u32, cursio_app_protocol::SendError> {
+        let (app, topic) = (
+            cursio_app_protocol::AppId::parse(app).unwrap(),
+            cursio_app_protocol::TopicName::parse(topic).unwrap(),
+        );
+        let to = at_a.peer.clone();
+        let sending = tokio::spawn(async move {
+            super::super::mesh::send(&app, None, &to, &topic, b"hello".to_vec()).await
+        });
+        for _ in 0..200 {
+            if sending.is_finished() {
+                break;
+            }
+            at_a.gather();
+            at_b.gather();
+            settle(at_a, at_b);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        sending.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_message_to_a_copy_that_is_not_there_or_not_allowed_says_which() {
+        let root = scratch("messages");
+        let a: &'static Builds =
+            Box::leak(Box::new(Builds::at(root.join("a"), root.join("a.toml"))));
+        let b: &'static Builds =
+            Box::leak(Box::new(Builds::at(root.join("b"), root.join("b.toml"))));
+        // Each module is named after the machine at its far end.
+        let (mut at_a, mut at_b) = (module(a, "msg-b"), module(b, "msg-a"));
+
+        let unheard = send_across(&mut at_a, &mut at_b, "msg-nobody", "sync").await;
+        assert_eq!(
+            unheard.unwrap_err().kind,
+            cursio_app_protocol::SendFailure::NotRunning
+        );
+
+        // A copy listens on B — the registry is the one process both modules
+        // share here — but B's person has not allowed A yet.
+        let key = super::super::Key::main(cursio_app_protocol::AppId::parse("msg-asks").unwrap());
+        {
+            let mut registry = super::super::registry().lock().unwrap();
+            registry.connected(&key, "1".into(), 1, None);
+            registry.set_topics(
+                &key,
+                vec![cursio_app_protocol::TopicName::parse("sync").unwrap()],
+            );
+        }
+        let refused = send_across(&mut at_a, &mut at_b, "msg-asks", "sync").await;
+        let refused = refused.unwrap_err();
+        assert_eq!(refused.kind, cursio_app_protocol::SendFailure::Refused);
+        assert!(refused.reason.contains("allow"), "{}", refused.reason);
+
+        // What runs on each side reached the other as presence.
+        let seen = super::super::mesh::peers(&key.app);
+        assert!(
+            seen.iter().any(|p| p.machine == "msg-a" && p.running),
+            "{seen:?}"
+        );
+        super::super::registry().lock().unwrap().disconnected(&key);
+        crate::diagnostics::clear("app.msg-asks.actions");
+
+        let offline = super::super::mesh::send(
+            &cursio_app_protocol::AppId::parse("msg-asks").unwrap(),
+            None,
+            "msg-nowhere",
+            &cursio_app_protocol::TopicName::parse("sync").unwrap(),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            offline.unwrap_err().kind,
+            cursio_app_protocol::SendFailure::Offline
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -179,6 +179,34 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                 Err(message) => Reply::Error { message },
             }
         }
+        Command::AppSend {
+            machine,
+            app,
+            topic,
+            text,
+        } => {
+            let (id, topic) = match (
+                cursio_app_protocol::AppId::parse(app),
+                cursio_app_protocol::TopicName::parse(topic),
+            ) {
+                (Ok(id), Ok(topic)) => (id, topic),
+                (Err(e), _) | (_, Err(e)) => return Some(error(e.to_string())),
+            };
+            match crate::apps::mesh::send(&id, None, machine, &topic, text.clone().into_bytes())
+                .await
+            {
+                Ok(copies) => Reply::AppSent { copies },
+                Err(failure) => Reply::Error {
+                    message: failure.reason,
+                },
+            }
+        }
+        Command::AppPeers { app } => match cursio_app_protocol::AppId::parse(app) {
+            Ok(id) => Reply::AppPeers {
+                peers: crate::apps::mesh::peers(&id),
+            },
+            Err(e) => error(e.to_string()),
+        },
         Command::CallAction {
             machine,
             app,
@@ -596,6 +624,8 @@ impl NodeState {
             | Command::PhoneAct { .. }
             | Command::AppActions { .. }
             | Command::CallAction { .. }
+            | Command::AppSend { .. }
+            | Command::AppPeers { .. }
             | Command::WindowShot { .. }
             | Command::WindowAct { .. } => {
                 error("logs and paths are asked through a desktop's control socket")

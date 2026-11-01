@@ -381,6 +381,19 @@ pub enum Command {
         machine: String,
         app: String,
     },
+    /// Send `text` about `topic` to the copies of application `app` on a
+    /// connected machine, as one of its copies here would; see
+    /// [`crate::apps::mesh`].
+    AppSend {
+        machine: String,
+        app: String,
+        topic: String,
+        text: String,
+    },
+    /// The connected machines where application `app` is registered.
+    AppPeers {
+        app: String,
+    },
     /// Ask application `app` (`process`, or its main one) on a connected
     /// machine to do the declared `action` with the JSON `args_json`.
     CallAction {
@@ -549,6 +562,8 @@ impl Command {
                     | Command::PhoneAct { .. }
                     | Command::AppActions { .. }
                     | Command::CallAction { .. }
+                    | Command::AppSend { .. }
+                    | Command::AppPeers { .. }
                     | Command::WindowShot { .. }
                     | Command::WindowAct { .. }
             )
@@ -656,6 +671,14 @@ pub enum Reply {
     /// What the action answered for [`Command::CallAction`], as JSON text.
     Called {
         result_json: String,
+    },
+    /// [`Command::AppSend`] reached this many running copies.
+    AppSent {
+        copies: u32,
+    },
+    /// The answer to [`Command::AppPeers`].
+    AppPeers {
+        peers: Vec<cursio_app_protocol::AppPeer>,
     },
 }
 

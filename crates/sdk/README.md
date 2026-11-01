@@ -45,4 +45,25 @@ Handlers run off the connection's thread; a panic answers that it happened
 and later calls go on. The machine's person allows calls to an application
 once, with a button.
 
+## Messages between copies
+
+Copies of one application on different machines talk to each other over the
+mesh's encryption, with no server of their own:
+
+```rust
+let cursio = App::new("my-app")
+    .on_message("notes", |m| println!("{} sent {} bytes", m.from_machine, m.payload.len()))
+    .start()?;
+cursio.send("Laptop", "notes", b"changed: notes.txt")?;  // blocks until taken
+cursio.send_all("notes", b"changed: notes.txt")?;        // every copy listening
+let where_it_runs = cursio.peers()?;
+```
+
+At most 512 KiB a message, delivered at most once to the copies running now;
+nothing is kept for later. A failure says which case it was —
+`Error::Offline`, `Error::CopyNotRunning`, `Error::NotAllowed` — so the
+application decides whether trying again means anything. A machine takes
+messages only from a machine its person lets drive the application, the same
+answer as for actions.
+
 `MIT OR Apache-2.0`. See the [repository](https://github.com/THEROER/cursio-sdk).

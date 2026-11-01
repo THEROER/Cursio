@@ -1,6 +1,6 @@
 [package]
 name = "cursio-app-protocol"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 # Not the workspace's GPL: applications link `cursio-sdk`, which depends on
 # this, and an Apache-2.0 program linking GPL code would itself become GPL.
@@ -17,6 +17,7 @@ categories = ["development-tools", "network-programming"]
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+base64.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

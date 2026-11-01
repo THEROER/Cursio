@@ -257,20 +257,55 @@ cursio apps call Lightmoon leavepulse/daemon running
   a build is installed and started by the person, an action does something
   the moment it is called.
 
-Still a plan:
+**Messages between copies — built (SDK 0.3).** The base for an application
+keeping its copies on several machines in step — the launcher's instances and
+builds across a desk — without a server of its own:
 
-- `on_command("name", handler)` exposes a named command; `cursio app
-  Lightmoon leavepulse reload-config` or `sdk.call("Lightmoon",
-  "reload-config", args)` invokes it. Only the application's own copies and
-  the CLI may call; nothing else on the mesh can. (Actions above are this,
-  for a caller that is a person or an agent.)
-- `send(peer, topic, bytes)` / `on_message(topic, handler)`: a datagram to the
-  same application on another machine, over the mesh's encryption, with the
-  application choosing a priority class (`Control`, `Metadata`, `Bulk`, never
-  `Input`). Lossy or reliable is the application's choice, delivered as the
-  existing `Message::is_lossy` rule.
-- A request whose peer has the application closed fails with
-  `NotRunning { peer }`, distinct from `Offline { peer }`.
+```rust
+let cursio = App::new("leavepulse")
+    .on_message("instances", |m| merge(&m.from_machine, &m.payload))
+    .start()?;
+cursio.send("Lightmoon", "instances", &bytes)?;        // blocks until taken
+cursio.send_all("instances", &bytes)?;                 // every peer listening
+cursio.peers()?;                                       // where it is registered
+```
+
+```sh
+cursio apps send Lightmoon leavepulse instances 'hello'   # by hand
+cursio apps peers leavepulse
+```
+
+- **Delivered at most once, to the copies running now; nothing is kept.** A
+  failure says which case it was — `Offline` (the machine is not connected),
+  `CopyNotRunning` (no copy there listens to the topic), `NotAllowed` (its
+  person has not allowed this machine) — and whether trying again means
+  anything is the application's call: only it knows whether a late message
+  still means anything.
+- **At most 512 KiB a message** (`MAX_PAYLOAD`); a build or a world belongs to
+  builds or files, a message says what changed. Over 16 KiB it rides the bulk
+  class, under it metadata; never input.
+- **Local socket:** the hello lists `topics`; `ClientMsg::Send { id, to,
+  topic, payload }` (base64) is answered by `NodeMsg::Sent { id, error? }`,
+  `ClientMsg::Peers { id }` by `NodeMsg::Peers`, and a message arrives as
+  `NodeMsg::Message { from, from_process, topic, payload }` — sent only to a
+  process listening to that topic, so an SDK that predates messages never
+  meets one (`MAX_LINE` grew from 64 KiB to 1 MiB for them).
+- **Between nodes** (`core/src/apps/mesh.rs`): the `apps` module's envelope
+  carries `AppsWire::{Datagram, Delivered, Present}` behind the magic `CAPW`,
+  beside update-lane messages (`CUPD`). The module's version stays 1 —
+  peers run a module only on an exact match, and a bump would have stopped
+  builds crossing between an updated machine and one not yet updated; a node
+  that predates it finds no lane message in such a payload and skips it.
+- **Which machines run it is pushed:** each link's module sends what is
+  registered on its machine (`Present`) whenever the registry's generation
+  moves, so `peers()` answers from what is already there.
+- **Consent is the actions' one.** A machine hands its copy a message only from
+  a machine its person lets drive that application (`[apps.<id>] actions`):
+  a message is input to a running program exactly as a call is, and a second
+  consent for the same trust would be a second question with one answer. No
+  listener there is checked first, so nobody is asked about an application
+  nothing listens for.
+- MCP: `apps_peers` (reads), `apps_send` (destructive).
 
 ### 4. State of the desk
 
@@ -334,6 +369,6 @@ private directory, which another app cannot open. Two steps:
    `run mesh:<machine>`.
 4. Phones: install by notification for apps (reusing Cursio's own path).
    **Built.**
-5. Commands and messages between copies. **Actions built**; messages between
-   copies are not.
+5. Commands and messages between copies. **Built** (actions in SDK 0.2,
+   messages in 0.3).
 6. SDK on Android.

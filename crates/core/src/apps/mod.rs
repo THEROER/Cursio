@@ -19,6 +19,7 @@ pub mod builds;
 pub mod cli;
 pub mod lane;
 pub mod launch;
+pub mod mesh;
 pub mod serve;
 
 use std::collections::BTreeMap;
@@ -79,6 +80,9 @@ pub struct Registered {
     /// What it lets another machine ask it to do, as its latest hello said.
     /// Live state, never saved: a process that is not running does nothing.
     pub actions: Vec<cursio_app_protocol::ActionSpec>,
+    /// Topics of messages from its copies elsewhere it listens to, as its
+    /// latest hello said. Live state, like `actions`.
+    pub topics: Vec<cursio_app_protocol::TopicName>,
 }
 
 impl Registered {
@@ -99,6 +103,10 @@ struct Saved {
 pub struct Registry {
     apps: BTreeMap<Key, Registered>,
     file: Option<PathBuf>,
+    /// Raised whenever what runs here changes — a copy connecting or going,
+    /// what it listens to — so each link resends this machine's presence
+    /// only then.
+    generation: u64,
 }
 
 impl Registry {
@@ -133,11 +141,65 @@ impl Registry {
                     detail: None,
                     connections: 0,
                     actions: Vec::new(),
+                    topics: Vec::new(),
                 };
                 Some((Key::from_file_key(&key)?, registered))
             })
             .collect();
-        Registry { apps, file }
+        Registry {
+            apps,
+            file,
+            generation: 0,
+        }
+    }
+
+    /// What has changed counts this high; see [`Registry::presence`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Every application registered here, as a peer is told of it: whether a
+    /// copy runs, its version, and what its running copies listen to.
+    pub fn presence(&self) -> Vec<cursio_protocol::apps::AppPresence> {
+        let mut apps: BTreeMap<&AppId, cursio_protocol::apps::AppPresence> = BTreeMap::new();
+        for (key, r) in &self.apps {
+            let entry =
+                apps.entry(&key.app)
+                    .or_insert_with(|| cursio_protocol::apps::AppPresence {
+                        app: key.app.to_string(),
+                        running: false,
+                        version: r.version.clone(),
+                        topics: Vec::new(),
+                    });
+            if r.running() {
+                entry.running = true;
+                for topic in &r.topics {
+                    if !entry.topics.iter().any(|t| t == topic.as_str()) {
+                        entry.topics.push(topic.to_string());
+                    }
+                }
+            }
+        }
+        apps.into_values().collect()
+    }
+
+    /// The running processes of `app` listening to `topic`.
+    pub fn listening(&self, app: &AppId, topic: &cursio_app_protocol::TopicName) -> Vec<Key> {
+        self.apps
+            .iter()
+            .filter(|(key, r)| key.app == *app && r.running() && r.topics.contains(topic))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// What `key`'s process listens to, as its hello said.
+    pub fn set_topics(&mut self, key: &Key, topics: Vec<cursio_app_protocol::TopicName>) {
+        if let Some(entry) = self.apps.get_mut(key) {
+            if entry.topics != topics {
+                entry.topics = topics;
+                self.generation += 1;
+            }
+        }
     }
 
     /// A copy of `key`'s process connected and said this.
@@ -150,12 +212,14 @@ impl Registry {
             detail: None,
             connections: 0,
             actions: Vec::new(),
+            topics: Vec::new(),
         });
         let changed = entry.version != version || entry.logs != logs;
         entry.version = version;
         entry.pid = Some(pid);
         entry.logs = logs;
         entry.connections += 1;
+        self.generation += 1;
         if changed {
             self.save();
         }
@@ -191,7 +255,9 @@ impl Registry {
             entry.connections = entry.connections.saturating_sub(1);
             if entry.connections == 0 {
                 entry.pid = None;
+                entry.topics.clear();
             }
+            self.generation += 1;
         }
     }
 
