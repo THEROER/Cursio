@@ -86,16 +86,29 @@ pub enum AppsAction {
     },
 }
 
+/// Where progress lines go: the terminal for the CLI, a tool's answer for
+/// `cursio mcp`, whose stdout is its protocol.
+pub type Say<'a> = &'a mut (dyn FnMut(String) + Send);
+
+/// Where applications' builds live on this machine.
+pub fn apps_root() -> anyhow::Result<PathBuf> {
+    Ok(InstallLayout::for_user()?.root().join(APPS_DIR))
+}
+
 pub async fn run(action: AppsAction, config_path: &Path) -> anyhow::Result<()> {
-    let root = InstallLayout::for_user()?.root().join(APPS_DIR);
+    let root = apps_root()?;
+    let mut print = |line: String| println!("{line}");
     match action {
-        AppsAction::Status => status(&root, config_path),
+        AppsAction::Status => {
+            print!("{}", status(&root, config_path)?);
+            Ok(())
+        }
         AppsAction::Publish {
             app,
             version,
             admin,
             files,
-        } => publish(&root, &app, version, &admin, &files).map(drop),
+        } => publish(&root, &app, version, &admin, &files, &mut print).map(drop),
         AppsAction::Launch {
             machine,
             app,
@@ -117,8 +130,8 @@ pub async fn run(action: AppsAction, config_path: &Path) -> anyhow::Result<()> {
             wait,
             files,
         } => {
-            let version = publish(&root, &app, version, &admin, &files)?;
-            ship(&to, &app, &version, component, !no_launch, wait).await
+            let version = publish(&root, &app, version, &admin, &files, &mut print)?;
+            ship(&to, &app, &version, component, !no_launch, wait, &mut print).await
         }
     }
 }
@@ -131,7 +144,9 @@ async fn client() -> anyhow::Result<crate::control::transport::Client> {
     Ok(client)
 }
 
-async fn launch(
+/// Start (or, with `start` false, only check) `app` on `machine`, answering
+/// what that machine did.
+pub async fn launch(
     machine: &str,
     app: &str,
     version: Option<String>,
@@ -178,18 +193,20 @@ async fn targets(to: &str) -> anyhow::Result<Vec<String>> {
 }
 
 /// Wait until `version` of `app` is current on each target, then start it.
-async fn ship(
+#[allow(clippy::too_many_arguments)]
+pub async fn ship(
     to: &str,
     app: &str,
     version: &str,
     component: Option<String>,
     start: bool,
     wait: u64,
+    say: Say<'_>,
 ) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
     let mut failed = Vec::new();
     for machine in targets(to).await? {
-        println!("{machine}: waiting for {app} {version}…");
+        say(format!("{machine}: waiting for {app} {version}…"));
         let mut said = String::new();
         loop {
             // A launch that names the version is refused until it is current
@@ -205,19 +222,19 @@ async fn ship(
             .await;
             match attempt {
                 Ok(what) => {
-                    println!("{machine}: {what}");
+                    say(format!("{machine}: {what}"));
                     break;
                 }
                 Err(error) => {
                     let message = error.to_string();
                     let waiting = message.contains("not current here yet");
                     if !waiting || std::time::Instant::now() >= deadline {
-                        println!("{machine}: {message}");
+                        say(format!("{machine}: {message}"));
                         failed.push(machine.clone());
                         break;
                     }
                     if message != said {
-                        println!("{machine}: {message}");
+                        say(format!("{machine}: {message}"));
                         said = message;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -256,12 +273,13 @@ fn by_platform(files: &[String]) -> anyhow::Result<BTreeMap<String, Vec<PathBuf>
 
 /// Sign `files` into `app`'s store as one build, answering its version.
 /// `admin` names files (by file name) that ask to run as an administrator.
-fn publish(
+pub fn publish(
     root: &Path,
     app: &str,
     version: Option<String>,
     admin: &[String],
     files: &[String],
+    say: Say<'_>,
 ) -> anyhow::Result<String> {
     let id = AppId::parse(app).map_err(|e| anyhow::anyhow!("{e}"))?;
     let version = version.unwrap_or_else(|| format!("dev.{}", now()));
@@ -314,24 +332,27 @@ fn publish(
     let _ = std::fs::remove_dir_all(&staging);
     let statement = statement?;
     let platforms: Vec<&str> = builds.iter().map(|(p, _)| p.as_str()).collect();
-    println!(
+    say(format!(
         "published {id} {} for {}, signed by {}",
         statement.version,
         platforms.join(", "),
         sign::short_key(&key.public())
-    );
-    println!(
+    ));
+    say(format!(
         "a running node offers it to its peers within {} s; each takes it once its \
          person trusts this machine for {id}",
         crate::update::lane::REOFFER.as_secs()
-    );
+    ));
     for gone in store.prune(3) {
-        println!("stopped holding {gone}");
+        say(format!("stopped holding {gone}"));
     }
     Ok(statement.version)
 }
 
-fn status(root: &Path, config_path: &Path) -> anyhow::Result<()> {
+/// Applications whose builds this machine holds, as lines of text.
+pub fn status(root: &Path, config_path: &Path) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+    let mut out = String::new();
     let config = Config::load(config_path)?;
     let mut ids: Vec<String> = std::fs::read_dir(root)
         .map(|entries| {
@@ -346,8 +367,10 @@ fn status(root: &Path, config_path: &Path) -> anyhow::Result<()> {
     ids.sort();
     ids.dedup();
     if ids.is_empty() {
-        println!("no application's builds are here; `cursio apps publish <app> <file>` offers one");
-        return Ok(());
+        out.push_str(
+            "no application's builds are here; `cursio apps publish <app> <file>` offers one\n",
+        );
+        return Ok(out);
     }
     for id in ids {
         let Ok(app) = AppId::parse(&id) else {
@@ -355,19 +378,21 @@ fn status(root: &Path, config_path: &Path) -> anyhow::Result<()> {
         };
         let layout = layout_of(root, &app);
         let current = layout.current();
-        println!("{id}");
+        let _ = writeln!(out, "{id}");
         for version in layout.installed() {
             let mark = match current.as_deref() == Some(version.as_str()) {
                 true => " (current)",
                 false => "",
             };
-            println!(
+            let _ = writeln!(
+                out,
                 "  installed {version}{mark}  {}",
                 layout.version_dir(&version).display()
             );
         }
         for held in Store::of(&layout).held() {
-            println!(
+            let _ = writeln!(
+                out,
                 "  holds {} for {}",
                 held.statement.version,
                 held.offer.have.join(", ")
@@ -380,12 +405,12 @@ fn status(root: &Path, config_path: &Path) -> anyhow::Result<()> {
                     .iter()
                     .map(|b| b.name.as_str())
                     .collect();
-                println!("  takes builds from {}", names.join(", "));
+                let _ = writeln!(out, "  takes builds from {}", names.join(", "));
             }
-            _ => println!("  takes builds from nobody yet"),
+            _ => out.push_str("  takes builds from nobody yet\n"),
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 #[cfg(test)]
