@@ -493,9 +493,13 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let log = match app {
                 Some(app) => {
-                    let app = cursio_app_protocol::AppId::parse(&app)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    Some(format!("app:{app}"))
+                    // `<id>` or `<id>/<process>`, checked by the rule the
+                    // answering node applies.
+                    let log = format!("app:{app}");
+                    if let Some(Err(e)) = cursio_core::log_tail::app_log(&log) {
+                        anyhow::bail!("{e}");
+                    }
+                    Some(log)
                 }
                 None => log,
             };

@@ -100,7 +100,11 @@ pub fn launch(
         (false, Some(pid)) => format!("pid {pid}"),
         (false, None) => String::new(),
     };
-    tracing::info!(%id, %version, component = %name, as_admin, ?pid, ended, "started an application asked for by a peer");
+    let how = match args.is_empty() {
+        true => how,
+        false => format!("{how}, args {args:?}"),
+    };
+    tracing::info!(%id, %version, component = %name, ?args, as_admin, ?pid, ended, "started an application asked for by a peer");
     Ok(match ended {
         0 => format!("started {id} {version} ({name}, {how})"),
         n => format!(
