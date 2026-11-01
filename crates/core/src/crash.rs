@@ -54,9 +54,25 @@ pub fn arm() {
             actions: Vec::new(),
             since: SystemTime::now(),
         });
+        // A crash is history, not a condition: once this run has stood for a
+        // while it says nothing about the node any more, and a problem with
+        // no way to end it sat in the app for a day after its fix shipped.
+        // `cursio report` still counts it from the log.
+        let cleared = std::thread::Builder::new()
+            .name("crash-shown".into())
+            .spawn(|| {
+                std::thread::sleep(SHOWN_FOR);
+                diagnostics::clear(PROBLEM);
+            });
+        if let Err(error) = cleared {
+            tracing::warn!(%error, "cannot schedule the crash notice to end; it stays until the next start");
+        }
     }
     install_hook(dir);
 }
+
+/// How long a crash of the previous run stays among the node's problems.
+const SHOWN_FOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// The panic the previous run wrote, as one line; the file is consumed.
 fn take_panic(dir: &Path) -> Option<String> {
