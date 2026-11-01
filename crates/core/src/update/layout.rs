@@ -311,8 +311,16 @@ pub fn stable_executable(component: &str) -> Option<PathBuf> {
 /// `None` means "run as you are" — not started from the root, no current
 /// version, the component missing, or already handed over once. Development
 /// builds in `target/` are never under the root, so they always run as they are.
+///
+/// Called first thing, before anything else reads the environment.
 pub fn handover(component: &str) -> Option<PathBuf> {
     if std::env::var_os(HANDED_OVER_ENV).is_some() {
+        // The mark is for this process alone. Left in its environment, every
+        // stable copy it started later — the app's "restart this window",
+        // the node starting the app — inherited it, ran itself instead of
+        // the current version, and no longer knew its own version: a Windows
+        // window restarted once never again said it was older than its node.
+        std::env::remove_var(HANDED_OVER_ENV);
         return None;
     }
     let layout = InstallLayout::for_user().ok()?;
@@ -462,6 +470,16 @@ fn make_executable(path: &Path) -> Result<(), UpdateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_handed_over_process_does_not_pass_its_mark_to_what_it_starts() {
+        std::env::set_var(HANDED_OVER_ENV, "1");
+        assert_eq!(handover("cursio-app"), None, "it runs as it is");
+        assert!(
+            std::env::var_os(HANDED_OVER_ENV).is_none(),
+            "a stable copy it starts later hands over again"
+        );
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
