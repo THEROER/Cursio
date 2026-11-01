@@ -305,6 +305,17 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    /** Nearby devices answered on the way to pairing as companion: go on, or say why not. */
+    @PermissionCallback
+    private fun companionAfterNearby(invoke: Invoke) {
+        afterGrant()
+        if (nearbyGranted()) {
+            requestCompanion(invoke)
+        } else {
+            invoke.reject("Nearby devices was not allowed; Cursio needs it to see the computers this phone is paired with")
+        }
+    }
+
     @PermissionCallback
     private fun permissionAnswered(invoke: Invoke) {
         afterGrant()
@@ -344,7 +355,10 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         when {
             ComputerCompanion.associated(activity) && ComputerCompanion.unassociatedComputers(activity).isEmpty() ->
                 invoke.resolve(setupState())
-            !nearbyGranted() -> invoke.reject("allow Nearby devices first, so Cursio can see the paired computers")
+            // Asked here rather than refused: a button that only said "allow
+            // Nearby devices first" opened nothing and left the person to
+            // find the permission themselves.
+            !nearbyGranted() -> requestPermissionForAlias(NEARBY, invoke, "companionAfterNearby")
             ComputerCompanion.unassociatedComputers(activity).isEmpty() ->
                 invoke.reject("pair this phone with your computer over Bluetooth first")
             else -> try {
