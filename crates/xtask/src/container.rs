@@ -68,11 +68,19 @@ pub fn build() -> Result<()> {
     // Root inside, so the toolchain under /root is usable; the output is then
     // handed back to whoever runs this, or `cargo clean` would need sudo.
     let owner = format!("{}:{}", id("-u")?, id("-g")?);
+    // The target directory is mounted on its own, as what it resolves to: a
+    // `target` that is a symlink to another disk is a dangling link inside
+    // the container, and cargo stopped at "failed to create directory".
+    let out = root.join(TARGET_DIR);
+    std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+    let out = out
+        .canonicalize()
+        .with_context(|| format!("resolving {}", out.display()))?;
     let script = format!(
         "set -e; \
          cargo build --release -p cursio-core; \
          cargo build --release -p cursio-app; \
-         chown -R {owner} {TARGET_DIR}"
+         chown -R {owner} /target"
     );
     println!("→ building cursio + cursio-app (release, Ubuntu 24.04)");
     let mut cmd = Command::new("docker");
@@ -80,13 +88,15 @@ pub fn build() -> Result<()> {
         .arg("-v")
         .arg(format!("{}:/src", root.display()))
         .arg("-v")
+        .arg(format!("{}:/target", out.display()))
+        .arg("-v")
         .arg(format!(
             "{}:/root/.cargo/registry",
             home.join("registry").display()
         ))
         .arg("-v")
         .arg(format!("{}:/root/.cargo/git", home.join("git").display()))
-        .args(["-e", &format!("CARGO_TARGET_DIR=/src/{TARGET_DIR}")])
+        .args(["-e", "CARGO_TARGET_DIR=/target"])
         .args(["-e", &format!("OPUS_TARGET={}", crate::OPUS_TARGET_LINUX)])
         .args([IMAGE, "bash", "-c", &script]);
     crate::run(cmd)
