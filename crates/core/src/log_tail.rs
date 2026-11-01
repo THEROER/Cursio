@@ -47,15 +47,30 @@ impl Tail {
             return Err("not a log timestamp".into());
         }
         if let Some(log) = &self.log {
-            if !cursio_protocol::diag::valid_log_name(log) {
-                return Err(format!(
-                    "{log:?} is not one of Cursio's logs; try cursio-mount-helper or cursio-app"
-                ));
+            match app_log(log) {
+                Some(Err(error)) => return Err(error.to_string()),
+                Some(Ok(_)) => {}
+                None if !cursio_protocol::diag::valid_log_name(log) => {
+                    return Err(format!(
+                        "{log:?} is not one of Cursio's logs; try cursio-mount-helper, cursio-app or app:<id>"
+                    ));
+                }
+                None => {}
             }
         }
         self.max_lines = self.max_lines.clamp(1, MAX_LINES);
         Ok(self)
     }
+}
+
+/// The application a log name `app:<id>` asks for, or `None` when it names
+/// one of Cursio's own. The id is all a peer sends; where that application
+/// logs is what it told this node itself ([`crate::apps`]).
+pub fn app_log(
+    log: &str,
+) -> Option<Result<cursio_app_protocol::AppId, cursio_app_protocol::Error>> {
+    log.strip_prefix("app:")
+        .map(cursio_app_protocol::AppId::parse)
 }
 
 /// The log files named `file_name` and rotated from it in `dir`, newest first.
@@ -406,6 +421,23 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("new"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_application_log_is_named_by_its_id_and_nothing_else() {
+        let bounded = |log: &str| {
+            Tail {
+                log: Some(log.into()),
+                max_lines: 1,
+                ..Tail::default()
+            }
+            .bounded()
+        };
+        assert!(bounded("app:leavepulse").is_ok());
+        assert!(bounded("app:../etc").is_err());
+        assert!(bounded("app:cursio").is_err());
+        assert!(bounded("cursio-app").is_ok());
+        assert!(bounded("leavepulse").is_err());
     }
 
     #[test]

@@ -124,6 +124,7 @@ session's paths, so neither needs a shell on the other machine:
 cursio logs all -n 300 --since 10m          # this machine and every connected one, merged by time
 cursio logs Lightmoon --grep "path of the session" -f
 cursio logs Lightmoon --log mount-helper    # a helper process's own log (Windows' drive helper, the app)
+cursio logs all --app leavepulse -f         # an application's log, where it registered through cursio-sdk
 cursio path Lightmoon                       # which path carries input, seen from both ends
 cursio path Lightmoon bluetooth             # carry the session over Bluetooth on both ends
 cursio path Lightmoon network               # keep it on the network even while that fails
@@ -132,6 +133,12 @@ cursio report all --since 1d                # each machine's day, counted by its
 cursio restart Lightmoon                    # restart a connected machine's node
 cursio apply-update Lightmoon               # switch it to its waiting build now
 ```
+
+`--app <id>` reads an application's log instead (`app:<id>` on the wire):
+one that linked `cursio-sdk` and told its machine's node where it writes
+(`core/src/apps`, `docs/app-sdk-design.md`). The peer sends only the id; the
+directory and file are what the application registered, kept in the node's
+`apps.json` so the log stays readable after the application has quit.
 
 `cursio report` is counted by each node from its own log
 (`core/src/log_report.rs`): per peer, the sessions it started and why they

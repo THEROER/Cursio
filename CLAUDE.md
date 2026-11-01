@@ -54,6 +54,7 @@ cargo run -p cursio-core -- mesh --airplay 1080p60 --airplay-window
 cargo run -p cursio-core -- peers
 RUST_LOG=cursio_airplay=debug,info cargo run -p cursio-core -- mesh
 cursio logs all --since 10m --grep path     # every connected machine's log, merged by time
+cursio logs Lightmoon --app leavepulse -f   # an application's log, registered through cursio-sdk
 cursio path Lightmoon [auto|network|bluetooth]   # see or choose the path, on both ends
 cursio report all --since 1d                # every machine's day: drops, warnings, memory
 cursio restart Lightmoon | apply-update Lightmoon   # maintain a machine through the mesh
@@ -271,6 +272,10 @@ Over the mesh the `calls` module (12) carries every call as state, resent whole,
 `NodeStatus` (battery, power source, network kind, Wi-Fi signal) rides `Hello` and is re-sent as `Message::NodeStatus` when it changes. It is deliberately **not** a `SessionModule`: modules are optional and negotiable, but every node has an answer here, and the peer sharing least with us is exactly the one whose "about to vanish" is worth knowing. Every field is `Option` and `None` means *cannot say*, never zero — a missing battery rendered as 0% would show every desktop as flat. The wire is event-driven (sent on change); the *reading* is a 30 s poll, because no platform offers one event source covering power and network both. One monitor per machine with a generation per reading, one cursor per link: the machine changes, not the link, so every peer must hear it exactly once. See `docs/mesh-design.md`.
 
 This is the second class of thing on the channel — **state and events of a device**, as opposed to a stream of data between machines. Notifications and media control belong to it too. Adding to that class is fine; conflating it with the module story is not.
+
+### Applications on the mesh
+
+Other programs (the LeavePulse launcher first) link `crates/sdk` (`cursio-sdk`) and talk to the node on their own machine over a separate apps socket (`apps.sock` beside `control.sock`, `\\.\pipe\cursio-apps-<user>`), never joining the mesh themselves; `core/src/apps` is the node's side. Both `cursio-sdk` and its vocabulary `crates/app-protocol` are **MIT OR Apache-2.0** and must stay free of any GPL crate or code taken from one — an application linking them must not become GPL. That vocabulary is pinned like the update lane: add messages, never change them. See `docs/app-sdk-design.md`.
 
 ### Wire compatibility
 

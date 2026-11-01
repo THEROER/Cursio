@@ -162,18 +162,25 @@ pub fn carried_by_bluetooth(peer: &PeerId) -> bool {
 /// This node's own log, as a peer or the control socket asks for it.
 pub fn own_log(tail: Tail) -> Result<DiagResponse, String> {
     let tail = tail.bounded()?;
-    let name = match &tail.log {
-        Some(log) => format!("{log}.log"),
-        None => cursio_log::log_file_name()
-            .ok_or("this node keeps no log file")?
-            .to_string(),
+    let (dir, name) = match tail.log.as_deref() {
+        Some(log) => match crate::log_tail::app_log(log) {
+            Some(app) => {
+                let app = app.map_err(|e| e.to_string())?;
+                let spec = crate::apps::logs_of(&app).ok_or_else(|| {
+                    format!("no application {app} has told this machine where it logs")
+                })?;
+                (spec.dir, spec.file)
+            }
+            None => (cursio_log::log_dir(), format!("{log}.log")),
+        },
+        None => (
+            cursio_log::log_dir(),
+            cursio_log::log_file_name()
+                .ok_or("this node keeps no log file")?
+                .to_string(),
+        ),
     };
-    crate::log_tail::read(
-        &cursio_log::log_dir(),
-        &name,
-        &tail,
-        std::time::SystemTime::now(),
-    )
+    crate::log_tail::read(&dir, &name, &tail, std::time::SystemTime::now())
 }
 
 /// What answers the peer: which peer, so its session's paths are found.

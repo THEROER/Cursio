@@ -143,8 +143,12 @@ pub(crate) enum Command {
         follow: bool,
         /// Another of Cursio's logs instead of the node's: `mount-helper`
         /// (Windows' drive helper) or `app`.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "app")]
         log: Option<String>,
+        /// An application's log instead of Cursio's: one that registered
+        /// with each machine's node through `cursio-sdk`, by its id.
+        #[arg(long)]
+        app: Option<String>,
     },
     /// How machines have fared, each counted from its own log by itself:
     /// sessions and paths lost per peer and why, time with no path, repeated

@@ -52,6 +52,7 @@ airplay = ["dep:cursio-airplay", "window"]
 [dependencies]
 cursio-queue.workspace = true
 cursio-protocol.workspace = true
+cursio-app-protocol.workspace = true
 cursio-transport.workspace = true
 cursio-airplay = { workspace = true, optional = true }
 cursio-input = { workspace = true, optional = true }
@@ -169,3 +170,5 @@ windows = { version = "0.61", features = [
 # `start_paused` for time-dependent tests (liveness timeouts) — lets a 15s
 # timeout elapse in virtual time instead of really waiting.
 tokio = { version = "1", features = ["full", "test-util"] }
+# The real client against the real apps socket (`apps::serve`'s tests).
+cursio-sdk.workspace = true

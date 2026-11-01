@@ -74,7 +74,9 @@ pub enum DiagRequest {
     /// `within_secs` by the answering machine's clock, and contain
     /// `contains`. `log` names another of Cursio's logs in the same
     /// directory instead — `cursio-mount-helper`, `cursio-app` — since a
-    /// helper process writes its own; see [`valid_log_name`].
+    /// helper process writes its own; see [`valid_log_name`] — or
+    /// `app:<id>`, the log an application on that machine registered with
+    /// its node (`docs/app-sdk-design.md`).
     Logs {
         after: Option<String>,
         within_secs: Option<u64>,

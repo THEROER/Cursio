@@ -65,9 +65,10 @@ pub(crate) async fn logs(args: LogsArgs) -> anyhow::Result<()> {
                     contains: args.grep.clone(),
                     max_lines: args.lines,
                     // `mount-helper` is read as `cursio-mount-helper`, the
-                    // name the helper's log file carries.
+                    // name the helper's log file carries; `app:<id>` is an
+                    // application's, passed as it is.
                     log: args.log.as_ref().map(|log| {
-                        if log.starts_with("cursio") {
+                        if log.starts_with("cursio") || log.starts_with("app:") {
                             log.clone()
                         } else {
                             format!("cursio-{log}")

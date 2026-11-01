@@ -264,6 +264,7 @@ async fn run() -> anyhow::Result<()> {
             }
             watch_screens(live.clone(), control.clone());
             start_control(control.clone());
+            cursio_core::apps::serve::start(identity.display_name.clone());
             let cursio_core::config::Config {
                 port,
                 modules,
@@ -476,7 +477,16 @@ async fn run() -> anyhow::Result<()> {
             grep,
             follow,
             log,
+            app,
         } => {
+            let log = match app {
+                Some(app) => {
+                    let app = cursio_app_protocol::AppId::parse(&app)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    Some(format!("app:{app}"))
+                }
+                None => log,
+            };
             diag::logs(diag::LogsArgs {
                 machines,
                 lines,

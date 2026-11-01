@@ -38,7 +38,7 @@ pub enum ControlError {
     TooLong,
     #[error("the node closed the control connection")]
     Closed,
-    #[error("a cursio node is already running for this user (control socket {0})")]
+    #[error("a cursio node is already running for this user (socket {0})")]
     AlreadyRunning(String),
     #[error("no cursio node is running (nothing at {0}); start one with `cursio mesh`")]
     NotRunning(String),
@@ -456,13 +456,13 @@ pub async fn serve(_endpoint: PathBuf, _state: super::NodeState) -> Result<(), C
 }
 
 #[cfg(unix)]
-mod unix {
+pub(crate) mod unix {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     use super::ControlError;
 
-    pub(super) fn socket_dir() -> Result<PathBuf, ControlError> {
+    pub(crate) fn socket_dir() -> Result<PathBuf, ControlError> {
         let (root, shared) = match std::env::var_os("XDG_RUNTIME_DIR") {
             Some(dir) if !dir.is_empty() => (PathBuf::from(dir), false),
             _ => (std::env::temp_dir(), true),
@@ -485,12 +485,12 @@ mod unix {
         Ok(dir)
     }
 
-    pub(super) async fn bind(path: &Path) -> Result<tokio::net::UnixListener, ControlError> {
+    pub(crate) async fn bind(path: &Path) -> Result<tokio::net::UnixListener, ControlError> {
         if tokio::net::UnixStream::connect(path).await.is_ok() {
             return Err(ControlError::AlreadyRunning(path.display().to_string()));
         }
         match std::fs::remove_file(path) {
-            Ok(()) => tracing::debug!(socket = %path.display(), "removed a stale control socket"),
+            Ok(()) => tracing::debug!(socket = %path.display(), "removed a stale socket"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
