@@ -1095,7 +1095,7 @@ pub fn list() -> Vec<Value> {
         ),
         tool(
             "window_screenshot",
-            "A picture of a window of an application on a computer of the mesh. The application must be registered there through cursio-sdk and running; that machine's person allows driving it once (the same answer as for its actions). Built for Windows computers.",
+            "A picture of a window of an application on a computer of the mesh. The application must be registered there through cursio-sdk and running; that machine's person allows driving it once (the same answer as for its actions). Windows, and GNOME on Linux through Cursio's Shell extension.",
             true, false,
             json!({
                 "machine": window_machine.clone(),
@@ -1132,7 +1132,7 @@ pub fn list() -> Vec<Value> {
         ),
         tool(
             "window_tree",
-            "An application's window as the tree of elements it publishes to screen readers (UI Automation): role, name, value, states, centre as fractions of the window, and an id. Prefer this to a screenshot: it is small, exact, and lets window_invoke press a button by its name instead of by coordinates. Built for Windows computers; web views (WebView2, Electron) show their buttons and tabs too.",
+            "An application's window as the tree of elements it publishes to screen readers (UI Automation on Windows, AT-SPI on Linux): role, name, value, states, centre as fractions of the window, and an id. Prefer this to a screenshot: it is small, exact, and lets window_invoke press a button by its name instead of by coordinates. Web views (WebView2, Electron) show their buttons and tabs too; on Linux the desktop's accessibility must be on, and the answer says how when it is not.",
             true, false,
             json!({
                 "machine": window_machine.clone(), "app": window_app.clone(), "title": window_title.clone(),

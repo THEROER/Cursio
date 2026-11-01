@@ -1068,6 +1068,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_application_names_its_files_and_a_fetch_with_no_copy_around_finds_none() {
         let dir = scratch("blobs");
@@ -1188,6 +1189,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn lines_an_application_sends_become_its_log_read_like_any_other() {
         let dir = scratch("sdk-logs");
