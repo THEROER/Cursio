@@ -76,11 +76,13 @@ pub fn build() -> Result<()> {
     let out = out
         .canonicalize()
         .with_context(|| format!("resolving {}", out.display()))?;
+    // Handed back however the build ends: a failed build used to leave
+    // root-owned files behind, which `cargo clean` then cannot remove.
     let script = format!(
-        "set -e; \
+        "trap 'chown -R {owner} /target' EXIT; \
+         set -e; \
          cargo build --release -p cursio-core; \
-         cargo build --release -p cursio-app; \
-         chown -R {owner} /target"
+         cargo build --release -p cursio-app"
     );
     println!("→ building cursio + cursio-app (release, Ubuntu 24.04)");
     let mut cmd = Command::new("docker");
