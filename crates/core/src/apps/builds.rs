@@ -169,7 +169,8 @@ impl Builds {
             .version(id);
         let notify = id.clone();
         let handed_on = self.switcher.clone();
-        Agent::new(
+        let to_installer = handed_on.is_some();
+        let agent = Agent::new(
             layout_of(&self.root, id),
             cursio_protocol::update::this_platform(),
             move || match Config::load(&config_path) {
@@ -191,7 +192,14 @@ impl Builds {
                 hand_on(&notify, layout, version)
             }
             None => switch(&notify, layout, version),
-        }))
+        }));
+        // A computer has switched to whatever it installed; a phone may hold
+        // one its installer never got to finish.
+        if to_installer {
+            agent.recover_ready()
+        } else {
+            agent
+        }
     }
 }
 

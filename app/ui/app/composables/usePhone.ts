@@ -48,6 +48,12 @@ export type PhoneGrant =
 
 export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 
+/**
+ * Open the system installer on the build waiting for `name` (`null`: Cursio
+ * itself), or first the setting that lets Cursio install apps.
+ */
+export const mobileInstallBuild = (name: string | null) => invoke<void>("mobile_install_build", { name })
+
 /** Resolves once the system dialog or settings screen has been shown. */
 export const mobileRequest = (what: PhoneGrant) => invoke<PhoneSetup>("mobile_request", { what })
 

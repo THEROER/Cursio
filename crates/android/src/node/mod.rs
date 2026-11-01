@@ -47,7 +47,7 @@ mod apps;
 mod bluetooth;
 mod link;
 mod serve;
-mod update;
+pub(crate) mod update;
 
 /// Where the phone stands in the layout. It never takes the cursor
 /// (`DeviceKind::Phone`), so no edge of it is ever crossed; the position only

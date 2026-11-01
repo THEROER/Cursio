@@ -70,6 +70,10 @@ pub struct Status {
     /// from a v19 node.
     #[serde(default)]
     pub desk: crate::desk::DeskView,
+    /// Builds installed here that only the person can put on — a phone's,
+    /// waiting on its system installer. Defaulted from a v21 node.
+    #[serde(default)]
+    pub waiting_builds: Vec<crate::update::agent::WaitingBuild>,
 }
 
 /// A machine this node has heard announce itself on the LAN.
@@ -337,6 +341,7 @@ impl NodeState {
             gallery: crate::gallery_hub::hub().peers(),
             call_setup: crate::calls_hub::hub().setup(),
             desk,
+            waiting_builds: crate::update::agent::waiting(),
         }
     }
 }
@@ -578,6 +583,25 @@ mod tests {
         json.as_object_mut().unwrap().remove("update");
         let read: Status = serde_json::from_value(json).unwrap();
         assert_eq!(read.update, crate::update::agent::UpdateStatus::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_status_carries_waiting_builds_and_reads_without_them() {
+        let dir = temp_dir("waiting");
+        let mut status = state(&dir, Overrides::default()).status();
+        status.waiting_builds = vec![crate::update::agent::WaitingBuild {
+            app: Some("leavepulse".into()),
+            version: "0.6.0+x".into(),
+            from: "Nocturne".into(),
+            published_at: 9,
+        }];
+        let mut json = serde_json::to_value(&status).unwrap();
+        let read: Status = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(read.waiting_builds, status.waiting_builds);
+        json.as_object_mut().unwrap().remove("waiting_builds");
+        let old: Status = serde_json::from_value(json).unwrap();
+        assert!(old.waiting_builds.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

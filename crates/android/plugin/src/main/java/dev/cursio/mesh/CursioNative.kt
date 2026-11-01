@@ -206,6 +206,10 @@ object CursioNative {
     fun offerAppUpdate(path: String, app: String, version: String): String =
         UpdateOffer.offerApp(path, app, version)
 
+    /** Whether the package in the APK at [path] is installed at its version or later. */
+    @JvmStatic
+    fun apkInstalled(path: String): Boolean = UpdateOffer.installed(java.io.File(path))
+
     /** Paired computers, as `address\tname` lines; see [BtLink]. */
     @JvmStatic
     fun btComputers(): String = BtLink.computers()

@@ -601,6 +601,12 @@
     "bluetoothHint": "Pair this phone with the computer and pick it as the speaker: every app's sound then plays there through Cursio, with no prompt after a restart. Bluetooth adds about a fifth of a second of delay, fine for music and video; for games the option above is quicker.",
     "bluetoothFailed": "The Bluetooth settings did not open"
   },
+  "phoneUpdate": {
+    "ready": "{name} {version} is ready to install",
+    "from": "from {machine}",
+    "install": "Install",
+    "failed": "The installer did not open"
+  },
   "phoneScreen": {
     "title": "This screen → computer",
     "description": "Show this phone's screen in a window on a computer you choose, and use it there with the mouse.",

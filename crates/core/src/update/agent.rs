@@ -105,6 +105,21 @@ pub struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ready {
     pub version: String,
+    /// The machine it came from; empty for one found on disk at startup,
+    /// whose sender was not kept.
+    pub from: String,
+    pub published_at: u64,
+}
+
+/// A build installed here that only the person can put on: on a phone, one
+/// handed to the system installer and not installed yet. Listed so the app's
+/// window can offer it again — a notification swiped away, or an installer
+/// left by mistake, was otherwise the end of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingBuild {
+    /// The application, or `None` for Cursio itself.
+    pub app: Option<String>,
+    pub version: String,
     pub from: String,
     pub published_at: u64,
 }
@@ -199,6 +214,77 @@ impl Agent {
         self
     }
 
+    /// Whether builds are handed to `switcher` rather than to the update
+    /// helper: what a phone does.
+    pub fn hands_on(&self) -> bool {
+        self.switcher.is_some()
+    }
+
+    /// The build installed and waiting, if any.
+    pub fn ready(&self) -> Option<Ready> {
+        self.status().ready
+    }
+
+    /// The application whose builds these are, or `None` for Cursio's own.
+    pub fn app(&self) -> Option<&str> {
+        self.subject
+            .problems
+            .starts_with("app.")
+            .then_some(self.subject.name.as_str())
+    }
+
+    /// The ready build, when only the person can put it on.
+    pub fn waiting(&self) -> Option<WaitingBuild> {
+        if !self.hands_on() {
+            return None;
+        }
+        let ready = self.ready()?;
+        Some(WaitingBuild {
+            app: self.app().map(str::to_owned),
+            version: ready.version,
+            from: ready.from,
+            published_at: ready.published_at,
+        })
+    }
+
+    /// `version` is what this machine has now: the person put it on.
+    pub fn now_running(&self, version: &str) {
+        self.state().status.running = version.to_owned();
+    }
+
+    /// Pick up a build a previous run installed and handed on but that was
+    /// never put on. `ready` lives in memory and the store already holds the
+    /// build's statement, so a phone whose app restarted before the person
+    /// tapped Install treated every later offer of it as old news, and the
+    /// build sat in `versions/` with nothing left to start its installer.
+    ///
+    /// The newest installed build published after the running one was made,
+    /// other than the running one and the one a rollback left behind.
+    pub fn recover_ready(self) -> Self {
+        let running = self.state().status.running.clone();
+        let previous = self.layout.previous();
+        let floor = self.built_at.unwrap_or(0);
+        let found = self
+            .layout
+            .installed()
+            .into_iter()
+            .filter(|v| *v != running && previous.as_deref() != Some(v.as_str()))
+            .filter_map(|v| {
+                let at = self.store.load(&v)?.statement.published_at;
+                (at > floor).then_some((at, v))
+            })
+            .max();
+        if let Some((published_at, version)) = found {
+            tracing::info!(subject = %self.subject.name, %version, "a build installed by an earlier run is still waiting");
+            self.state().status.ready = Some(Ready {
+                version,
+                from: String::new(),
+                published_at,
+            });
+        }
+        self
+    }
+
     /// Switch through `switcher`, as soon as a build is installed, rather
     /// than through the update helper at a quiet moment; see the module docs.
     pub fn with_switcher(mut self, switcher: Switcher) -> Self {
@@ -233,7 +319,22 @@ impl Agent {
 
     pub fn status(&self) -> UpdateStatus {
         let config = self.config();
-        let mut status = self.state().status.clone();
+        let mut status = {
+            let mut state = self.state();
+            // Once what runs is the ready build it is no longer waiting: a
+            // phone installs over the running process, and an application
+            // reports its version only after it has been put on.
+            if state
+                .status
+                .ready
+                .as_ref()
+                .is_some_and(|r| r.version == state.status.running)
+            {
+                state.status.ready = None;
+                diagnostics::clear(&self.problem(READY));
+            }
+            state.status.clone()
+        };
         status.policy = policy_name(config.policy).into();
         status.channel = match config.channel {
             crate::config::UpdateChannel::Stable => "stable",
@@ -571,6 +672,20 @@ pub fn status() -> UpdateStatus {
     global().map(|a| a.status()).unwrap_or_default()
 }
 
+/// Every build on this machine waiting for the person: Cursio's own, then
+/// each application's. Empty on a computer, which switches by itself.
+pub fn waiting() -> Vec<WaitingBuild> {
+    let apps = crate::apps::builds::builds()
+        .filter(|b| b.hands_to_installer())
+        .map(|b| b.known())
+        .unwrap_or_default();
+    global()
+        .into_iter()
+        .chain(apps)
+        .filter_map(|agent| agent.waiting())
+        .collect()
+}
+
 /// Start taking and handing on builds for this node, reading the `[update]`
 /// table of `config_path` afresh at every decision.
 pub fn start(config_path: std::path::PathBuf) {
@@ -828,6 +943,82 @@ mod tests {
             "already installed: nothing to fetch"
         );
         assert_eq!(agent.status().ready.unwrap().version, "0.4.0+d");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn handing_on(agent: Agent) -> Agent {
+        agent.with_switcher(Box::new(|_, _| Ok(())))
+    }
+
+    #[test]
+    fn a_build_handed_to_an_installer_is_listed_as_waiting_until_it_runs() {
+        let root = scratch("waiting");
+        let key = BuilderKey::from_seed([5; 32]);
+        let agent = handing_on(agent_at(&root, &key, UpdatePolicy::Ask));
+        let statement = Statement::from_bytes(&offer(&key, "0.9.0+apk", 9).statement).unwrap();
+        agent.installed(&statement, "Nocturne");
+        assert_eq!(
+            agent.waiting(),
+            Some(WaitingBuild {
+                app: None,
+                version: "0.9.0+apk".into(),
+                from: "Nocturne".into(),
+                published_at: 9,
+            })
+        );
+        agent.now_running("0.9.0+apk");
+        assert_eq!(agent.waiting(), None);
+        assert_eq!(agent.status().ready, None, "ready means not running yet");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_applications_waiting_build_names_the_application() {
+        let root = scratch("waiting-app");
+        let key = BuilderKey::from_seed([5; 32]);
+        let agent = handing_on(
+            agent_at(&root, &key, UpdatePolicy::Ask).for_subject(Subject::app("leavepulse"), None),
+        );
+        let statement = Statement::from_bytes(&offer(&key, "0.6.0+x", 9).statement).unwrap();
+        agent.installed(&statement, "Nocturne");
+        let waiting = agent.waiting().unwrap();
+        assert_eq!(waiting.app.as_deref(), Some("leavepulse"));
+        assert_eq!(waiting.version, "0.6.0+x");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_computer_lists_no_waiting_build_since_it_switches_by_itself() {
+        let root = scratch("waiting-desktop");
+        let key = BuilderKey::from_seed([5; 32]);
+        let agent = agent_at(&root, &key, UpdatePolicy::Ask);
+        let statement = Statement::from_bytes(&offer(&key, "0.9.0+d", 9).statement).unwrap();
+        agent.installed(&statement, "Nocturne");
+        assert!(agent.status().ready.is_some());
+        assert_eq!(agent.waiting(), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_build_an_earlier_run_handed_on_is_still_waiting_after_a_restart() {
+        let root = scratch("recover");
+        let key = BuilderKey::from_seed([5; 32]);
+        let first = agent_at(&root, &key, UpdatePolicy::Ask);
+        for (version, at) in [("0.8.0+old", 5), ("0.9.0+new", 9)] {
+            install_by_hand(&root, version);
+            first.store().remember(&offer(&key, version, at)).unwrap();
+        }
+        let again = handing_on(agent_at(&root, &key, UpdatePolicy::Ask))
+            .with_built_at(Some(7))
+            .recover_ready();
+        let waiting = again.waiting().expect("the newer build still waits");
+        assert_eq!(waiting.version, "0.9.0+new");
+        assert_eq!(waiting.from, "");
+
+        let caught_up = handing_on(agent_at(&root, &key, UpdatePolicy::Ask))
+            .with_built_at(Some(9))
+            .recover_ready();
+        assert_eq!(caught_up.waiting(), None, "nothing newer than what runs");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -184,6 +184,18 @@ export interface NodeStatusReply {
   call_setup?: CallSetup | null
   /** Every connected machine on the shared desk; absent from a node older than control v20. */
   desk?: DeskView
+  /** Builds a phone holds that only the person can install; absent from a node older than control v22. */
+  waiting_builds?: WaitingBuild[]
+}
+
+/** Mirrors `cursio_core::update::agent::WaitingBuild`. */
+export interface WaitingBuild {
+  /** The application, or `null` for Cursio itself. */
+  app: string | null
+  version: string
+  /** The machine it came from; empty when found on disk after a restart. */
+  from: string
+  published_at: number
 }
 
 /** Mirrors `cursio_core::desk::DeskView`: millimetres on the desk. */

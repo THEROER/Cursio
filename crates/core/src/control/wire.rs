@@ -36,7 +36,8 @@ use std::path::PathBuf;
 /// v19: `dir` on `gallery_save`, a folder to save into other than
 /// Pictures/Cursio. v20: `desk` in the status, `arrange` and `barrier`.
 /// v21: `arrange_screen`, and each desk screen's `dx_mm`/`dy_mm`.
-pub const CONTROL_VERSION: u32 = 21;
+/// v22: `waiting_builds` in the status.
+pub const CONTROL_VERSION: u32 = 22;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;

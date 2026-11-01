@@ -311,6 +311,7 @@ pub fn run() {
             node::commands::gallery_thumbnail,
             node::commands::gallery_read,
             mobile::commands::mobile_setup,
+            mobile::commands::mobile_install_build,
             mobile::commands::mobile_request,
             mobile::commands::mobile_restart,
             mobile::commands::mobile_system_bars,

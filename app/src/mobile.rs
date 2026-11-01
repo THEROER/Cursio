@@ -305,13 +305,41 @@ pub mod commands {
             .map_err(|e| e.to_string())
     }
 
+    /// Asked whenever the window comes back to the front, so it is also when
+    /// waiting builds are looked at again: an application put on meanwhile
+    /// stops waiting, and every build still waiting gets its notification back.
     #[tauri::command]
     pub async fn mobile_setup(app: AppHandle) -> Result<Setup, String> {
         let plugin = plugin(&app)?;
-        tauri::async_runtime::spawn_blocking(move || plugin.run_mobile_plugin("setup", ()))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())
+        tauri::async_runtime::spawn_blocking(move || {
+            cursio_android::window_shown();
+            plugin.run_mobile_plugin("setup", ())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+    }
+
+    /// Open the system installer on the build waiting for `app` (`None`:
+    /// Cursio's own) from this window, or the setting that lets Cursio
+    /// install apps first when that is still off. Resolves once the installer
+    /// is open, which may be after minutes in that setting.
+    #[tauri::command]
+    pub async fn mobile_install_build(app: AppHandle, name: Option<String>) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Args {
+            path: String,
+        }
+        let plugin = plugin(&app)?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let path = cursio_android::waiting_apk(name.as_deref())?;
+            plugin
+                .run_mobile_plugin::<serde_json::Value>("installBuild", Args { path })
+                .map(drop)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     /// Ask for one grant. Resolves once the user is back from the system

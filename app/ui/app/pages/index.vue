@@ -102,6 +102,7 @@ function presenceTone(p: PeerView) {
       <LpSkeleton rounded="card" class="h-64" />
     </div>
 
+    <div v-if="isMobile" class="mb-6 empty:hidden"><PhoneUpdateCard /></div>
     <div v-if="isMobile" class="mb-6 empty:hidden"><PhoneSetupCard /></div>
 
     <div v-if="status" class="flex flex-col gap-6">

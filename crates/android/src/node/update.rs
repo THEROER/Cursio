@@ -40,7 +40,8 @@ pub fn start(config_path: PathBuf) {
         },
     )
     .with_switcher(Box::new(offer_to_installer))
-    .with_built_at(cursio_core::update::running_built_at());
+    .with_built_at(cursio_core::update::running_built_at())
+    .recover_ready();
     let agent: Arc<Agent> = cursio_core::update::agent::install(agent);
     tracing::info!(platform = agent.platform(), "taking builds from the mesh");
 }
@@ -60,6 +61,90 @@ pub fn start_apps(config_path: PathBuf) {
         Arc::new(open_package),
     );
     tracing::info!("taking applications' builds from the mesh");
+}
+
+/// The agent whose builds `app` names: Cursio's own for `None`.
+fn agent_for(app: Option<&str>) -> Result<Arc<Agent>, String> {
+    match app {
+        None => cursio_core::update::agent::global()
+            .ok_or_else(|| "this phone is not taking builds from the mesh".to_owned()),
+        Some(app) => cursio_core::apps::builds::builds()
+            .and_then(|b| b.agent(app))
+            .ok_or_else(|| format!("this phone takes no builds of {app}")),
+    }
+}
+
+/// The APK of the build waiting for `app` (`None`: Cursio's own), for the
+/// window's Install button to hand straight to the installer.
+pub fn waiting_apk(app: Option<&str>) -> Result<String, String> {
+    let agent = agent_for(app)?;
+    let ready = agent.ready().ok_or_else(|| match app {
+        None => "no Cursio build is waiting to be installed".to_owned(),
+        Some(app) => format!("no build of {app} is waiting to be installed"),
+    })?;
+    let apk = match app {
+        None => agent.layout().executable(&ready.version, APK_COMPONENT),
+        Some(_) => app_apk(agent.layout(), &ready.version),
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(apk.to_string_lossy().into_owned())
+}
+
+/// The window came to the front: drop application builds the person has put
+/// on since, then post the notification again for each build still waiting.
+/// Swiping it away, or backing out of the installer, used to lose the only
+/// way back to it.
+pub fn window_shown() {
+    if let Some(builds) = cursio_core::apps::builds::builds() {
+        for agent in builds.known() {
+            let Some(waiting) = agent.waiting() else {
+                continue;
+            };
+            match app_apk(agent.layout(), &waiting.version) {
+                Ok(apk) if apk_installed(&apk) => agent.now_running(&waiting.version),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(app = agent.subject(), %error, "a waiting build has no APK to offer")
+                }
+            }
+        }
+    }
+    for waiting in cursio_core::update::agent::waiting() {
+        let Ok(agent) = agent_for(waiting.app.as_deref()) else {
+            continue;
+        };
+        let offered = match waiting
+            .app
+            .as_deref()
+            .map(cursio_app_protocol::AppId::parse)
+        {
+            None => offer_to_installer(agent.layout(), &waiting.version),
+            Some(Ok(app)) => offer_app_to_installer(&app, agent.layout(), &waiting.version),
+            Some(Err(_)) => continue,
+        };
+        if let Err(error) = offered {
+            tracing::warn!(app = ?waiting.app, version = %waiting.version, %error, "could not offer a waiting build again");
+        }
+    }
+}
+
+/// Whether the package `apk` holds is installed at its version or later.
+fn apk_installed(apk: &std::path::Path) -> bool {
+    let path = apk.to_string_lossy().into_owned();
+    crate::jvm::with_native(|env, class| {
+        let path = env.new_string(&path)?;
+        env.call_static_method(
+            class,
+            "apkInstalled",
+            "(Ljava/lang/String;)Z",
+            &[JValue::Object(&path)],
+        )?
+        .z()
+    })
+    .unwrap_or_else(|why| {
+        tracing::warn!(%why, "could not ask whether a build is installed");
+        false
+    })
 }
 
 /// The APK of an application's build: the component named `apk`, else the

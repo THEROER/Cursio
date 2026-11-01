@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.Settings
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.result.ActivityResult
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.view.WindowCompat
@@ -232,6 +233,71 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
     fun stopScreenShare(invoke: Invoke) {
         MeshService.stopScreen()
         invoke.resolve()
+    }
+
+    /**
+     * Open the system installer on a build the node holds (`path`, found by
+     * the node from what is waiting), straight from the window in front —
+     * the notification is no longer the only way to it.
+     *
+     * Android installs for an app only once the person allows "Install
+     * unknown apps" for it, and no app can allow that itself; without it the
+     * installer would open only to send them to the setting anyway. So the
+     * setting is opened here first, saying why, and the installer follows if
+     * they allowed it.
+     */
+    @Command
+    fun installBuild(invoke: Invoke) {
+        val path = invoke.getArgs().getString("path", "") ?: ""
+        val apk = java.io.File(path)
+        UpdateOffer.refusal(apk)?.let {
+            invoke.reject(it)
+            return
+        }
+        if (activity.packageManager.canRequestPackageInstalls()) {
+            openInstaller(invoke, apk)
+            return
+        }
+        pendingInstall = apk
+        val settings = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+            .setData(Uri.fromParts("package", activity.packageName, null))
+        try {
+            activity.runOnUiThread {
+                Toast.makeText(activity, "Allow Cursio to install apps, then come back", Toast.LENGTH_LONG).show()
+            }
+            startActivityForResult(invoke, settings, "installAllowed")
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "no install-unknown-apps screen", e)
+            pendingInstall = null
+            invoke.reject("this phone has no screen to let Cursio install apps")
+        }
+    }
+
+    /** The build [installBuild] was asked for, while its setting is open. */
+    private var pendingInstall: java.io.File? = null
+
+    @ActivityCallback
+    private fun installAllowed(invoke: Invoke, @Suppress("UNUSED_PARAMETER") result: ActivityResult) {
+        val apk = pendingInstall
+        pendingInstall = null
+        when {
+            apk == null -> invoke.reject("the build to install was lost while the setting was open")
+            activity.packageManager.canRequestPackageInstalls() -> openInstaller(invoke, apk)
+            else -> invoke.reject("Cursio may not install apps: allow \"Install unknown apps\" for Cursio to put this build on")
+        }
+    }
+
+    private fun openInstaller(invoke: Invoke, apk: java.io.File) {
+        try {
+            activity.startActivity(UpdateOffer.installIntent(activity, apk))
+            invoke.resolve()
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "no package installer", e)
+            invoke.reject("this phone has no package installer to open")
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "the build is outside what the update provider serves", e)
+            invoke.reject("the build's APK cannot be handed to the installer")
+        }
     }
 
     @Command

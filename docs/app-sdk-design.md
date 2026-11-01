@@ -176,7 +176,7 @@ On the receiving machine:
 |---|---|---|
 | Windows / Linux | `apps/<app>/versions/<v>/` + `current` + rollback, the `InstallLayout` of `update-design.md`, rooted per app | `current` is pointed at it at once and every running copy hears `NodeMsg::BuildReady` (the SDK's `on_update`); when to restart into it is the application's choice. Starting it is asked for (`cursio apps launch`, below) |
 | Windows, NSIS bundle (not built) | the installer is run with `/S` once, its exit code is the result | as above |
-| Android | the APK is handed to the system installer through the phone's notification, one per application (`crates/android/src/node/update.rs`); see "Phones" | the person taps |
+| Android | the APK is handed to the system installer through the phone's notification, one per application, and the app's window lists it with an Install button (`crates/android/src/node/update.rs`); see "Phones" | the person taps |
 
 **Taking builds is per application and explicit.** A machine takes builds of
 `leavepulse` only after its person pressed "Take leavepulse builds from
@@ -413,7 +413,16 @@ private directory, which another app cannot open. Two steps:
    phone compares the APK's signer with the installed package's
    (`GET_SIGNING_CERTIFICATES`); a mismatch is raised as
    `app.<id>.signer` with the `applicationIdSuffix ".dev"` advice instead of
-   a notification the installer would refuse after the tap.
+   a notification the installer would refuse after the tap. The
+   notification is not the only way: every waiting build is in the
+   status's `waiting_builds` with its `app`, and the Cursio app's status
+   page offers an Install button for each, which opens the installer from
+   the window (or first the "Install unknown apps" setting, saying so);
+   see "Phones" in `docs/update-design.md`. An application's build stops
+   waiting when the window comes back and its package is installed at the
+   APK's version code or later (`CursioNative.apkInstalled`) — the phone
+   has no running copy of it to report a version — and each one still
+   waiting gets its notification posted again then.
    `cursio apps launch <phone> <app>` **opens** the application
    (`core/src/apps/phone_open.rs`): the package opened is the one the
    phone's person allowed as that id (step 6's `package_access`), never one

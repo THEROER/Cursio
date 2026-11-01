@@ -253,6 +253,25 @@ installer on the file, served by the plugin's own `UpdateFileProvider`. The
 first time, Android also asks to let Cursio install apps. The installer
 replaces the app and Android restarts it; there is no helper and no pointer.
 
+The notification is not the only way to the installer: swiped away, or the
+installer backed out of by a mis-tap, it used to leave nothing to press. The
+control status lists every build waiting for the person (`waiting_builds`,
+control v22: Cursio's own and each application's, from `Agent::waiting`,
+empty on a computer), and the app's status page shows each with an Install
+button (`PhoneUpdateCard`). The button goes `mobile_install_build` →
+`cursio_android::waiting_apk` (the ready version's APK) →
+`MeshPlugin.installBuild`, which opens the installer from the activity in
+front with the same intent the notification carries. When "Install unknown
+apps" is still off for Cursio it opens that setting first and says so, and
+the installer follows only if the person allowed it; Cursio never changes
+the setting itself. Each time the window comes back to the front
+(`mobile_setup`) the notification of every waiting build is posted again,
+silently after the first. `ready` stays meaningful: it is dropped once the
+running version equals it, and a phone whose app restarted before the
+person installed recovers it from `versions/` and the store
+(`Agent::recover_ready`) — the store already held the statement, so later
+offers of that build were old news and nothing would offer it again.
+
 Every APK is signed with the building machine's debug key, so builds from one
 machine install over each other; a build from another machine would be refused
 by the installer as a different signer.

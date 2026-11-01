@@ -143,6 +143,10 @@ pub use phone_audio::{
     set_playback_volume,
 };
 
+/// The waiting build's APK, and what to do when the window comes back; see
+/// `node/update.rs`.
+pub use node::update::{waiting_apk, window_shown};
+
 /// One line for the service notification.
 pub fn status_line() -> String {
     slot()
