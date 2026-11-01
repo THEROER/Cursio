@@ -37,9 +37,11 @@ use windows::Win32::UI::Accessibility::{
     TreeScope_Children, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
     UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_ExpandCollapsePatternId,
     UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId, UIA_IsEnabledPropertyId,
-    UIA_IsOffscreenPropertyId, UIA_NamePropertyId, UIA_SelectionItemIsSelectedPropertyId,
-    UIA_SelectionItemPatternId, UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId,
-    UIA_ValuePatternId, UIA_ValueValuePropertyId, UIA_PROPERTY_ID,
+    UIA_IsExpandCollapsePatternAvailablePropertyId, UIA_IsOffscreenPropertyId,
+    UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
+    UIA_NamePropertyId, UIA_SelectionItemIsSelectedPropertyId, UIA_SelectionItemPatternId,
+    UIA_TogglePatternId, UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId,
+    UIA_ValueValuePropertyId, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
@@ -254,23 +256,35 @@ impl Walk {
         if focused {
             states.push("focused");
         }
-        if Value::read(element, UIA_SelectionItemIsSelectedPropertyId)
-            .and_then(|v| v.flag())
-            .unwrap_or(false)
+        // A pattern's state means something only where the element has the
+        // pattern: read anyway, every WebView2 element came back "mixed".
+        let has = |pattern| {
+            Value::read(element, pattern)
+                .and_then(|v| v.flag())
+                .unwrap_or(false)
+        };
+        if has(UIA_IsSelectionItemPatternAvailablePropertyId)
+            && Value::read(element, UIA_SelectionItemIsSelectedPropertyId)
+                .and_then(|v| v.flag())
+                .unwrap_or(false)
         {
             states.push("selected");
         }
-        match Value::read(element, UIA_ToggleToggleStatePropertyId).and_then(|v| v.int()) {
-            Some(1) => states.push("checked"),
-            Some(2) => states.push("mixed"),
-            _ => {}
+        if has(UIA_IsTogglePatternAvailablePropertyId) {
+            match Value::read(element, UIA_ToggleToggleStatePropertyId).and_then(|v| v.int()) {
+                Some(1) => states.push("checked"),
+                Some(2) => states.push("mixed"),
+                _ => {}
+            }
         }
-        match Value::read(element, UIA_ExpandCollapseExpandCollapseStatePropertyId)
-            .and_then(|v| v.int())
-        {
-            Some(0) => states.push("collapsed"),
-            Some(1) | Some(2) => states.push("expanded"),
-            _ => {}
+        if has(UIA_IsExpandCollapsePatternAvailablePropertyId) {
+            match Value::read(element, UIA_ExpandCollapseExpandCollapseStatePropertyId)
+                .and_then(|v| v.int())
+            {
+                Some(0) => states.push("collapsed"),
+                Some(1) | Some(2) => states.push("expanded"),
+                _ => {}
+            }
         }
         if offscreen {
             states.push("offscreen");
@@ -339,6 +353,9 @@ fn walk(
             UIA_ToggleToggleStatePropertyId,
             UIA_SelectionItemIsSelectedPropertyId,
             UIA_ExpandCollapseExpandCollapseStatePropertyId,
+            UIA_IsTogglePatternAvailablePropertyId,
+            UIA_IsSelectionItemPatternAvailablePropertyId,
+            UIA_IsExpandCollapsePatternAvailablePropertyId,
         ] {
             cache
                 .AddProperty(property)
