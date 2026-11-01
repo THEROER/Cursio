@@ -60,6 +60,25 @@ pub async fn ask_gallery(command: &Command) -> Option<Reply> {
 
 /// Answer a diagnostics command: a log here or on a peer, or a session's
 /// paths seen, or chosen, from both ends.
+/// A peer's window still, kept beside this machine's phone screenshots.
+fn save_window_shot(machine: &str, app: &str, png: &[u8]) -> Result<std::path::PathBuf, String> {
+    let dir = crate::data_dir::data_dir()
+        .map(|d| d.join("screenshots"))
+        .ok_or("no data directory to write the still in")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let safe: String = format!("{machine}-{app}")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let path = dir.join(format!("{safe}-{stamp}.png"));
+    std::fs::write(&path, png).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 async fn ask_diag(command: &Command) -> Option<Reply> {
     use cursio_protocol::diag::{DiagRequest, DiagResponse};
     let hub = crate::diag_session::hub();
@@ -176,6 +195,45 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
             match hub.ask(machine, request).await {
                 Ok(DiagResponse::Called { result_json }) => Reply::Called { result_json },
                 Ok(other) => error(format!("a call was answered with {other:?}")),
+                Err(message) => Reply::Error { message },
+            }
+        }
+        Command::WindowShot {
+            machine,
+            target,
+            max_side,
+        } => {
+            let request = DiagRequest::WindowShot {
+                target: target.clone(),
+                max_side: *max_side,
+            };
+            match hub.ask(machine, request).await {
+                Ok(DiagResponse::WindowShot {
+                    png, width, height, ..
+                }) => match save_window_shot(machine, &target.app, &png) {
+                    Ok(path) => Reply::Screenshot {
+                        path,
+                        width,
+                        height,
+                    },
+                    Err(message) => Reply::Error { message },
+                },
+                Ok(other) => error(format!("a window still was answered with {other:?}")),
+                Err(message) => Reply::Error { message },
+            }
+        }
+        Command::WindowAct {
+            machine,
+            target,
+            input,
+        } => {
+            let request = DiagRequest::WindowInput {
+                target: target.clone(),
+                input: input.clone(),
+            };
+            match hub.ask(machine, request).await {
+                Ok(DiagResponse::WindowDone { what }) => Reply::Acted { what },
+                Ok(other) => error(format!("window input was answered with {other:?}")),
                 Err(message) => Reply::Error { message },
             }
         }
@@ -537,7 +595,9 @@ impl NodeState {
             | Command::PhoneScreenshot { .. }
             | Command::PhoneAct { .. }
             | Command::AppActions { .. }
-            | Command::CallAction { .. } => {
+            | Command::CallAction { .. }
+            | Command::WindowShot { .. }
+            | Command::WindowAct { .. } => {
                 error("logs and paths are asked through a desktop's control socket")
             }
         }

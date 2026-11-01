@@ -64,6 +64,7 @@ cursio apps call Lightmoon leavepulse launch '{"instance":"vanilla"}'   # the ru
 cargo xtask sdk-mirror [--push] [--tag]    # sync the public cursio-sdk repo; --tag publishes it to crates.io
 claude mcp add cursio -- cursio mcp         # the same as tools for an AI agent (docs/agent-tools-design.md)
 cursio phone "POCO X7 Pro" screenshot --ask | tap 0.5 0.8 | swipe 0.5 0.8 0.5 0.2 | key back | text "hi"
+cursio window Lightmoon leavepulse screenshot | click 0.5 0.9 | type "текст" | key enter   # a registered app's window (Windows)
 cursio path Lightmoon [auto|network|bluetooth]   # see or choose the path, on both ends
 cursio report all --since 1d                # every machine's day: drops, warnings, memory
 cursio restart Lightmoon | apply-update Lightmoon   # maintain a machine through the mesh

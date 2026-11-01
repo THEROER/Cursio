@@ -129,6 +129,20 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: PhoneCommand,
     },
+    /// Read or drive a window of an application on a connected computer: a
+    /// still, a click, text, a key. The application must be registered there
+    /// through cursio-sdk, and that machine's person must allow driving it.
+    /// Points are fractions of the window (0 to 1).
+    Window {
+        machine: String,
+        /// The application's id, or `<id>/<process>`.
+        app: String,
+        /// The window whose title contains this; the largest otherwise.
+        #[arg(long)]
+        title: Option<String>,
+        #[command(subcommand)]
+        action: WindowCommand,
+    },
     /// Answer, decline, end or place a call on a connected phone. Goes through
     /// the running node.
     Call {
@@ -478,6 +492,29 @@ pub(crate) enum PhoneCommand {
     },
     /// Type TEXT into the focused field, any script.
     Text { text: String },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WindowCommand {
+    /// Save a still of the window as PNG here and print where.
+    Screenshot {
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        #[arg(long)]
+        max_side: Option<u32>,
+    },
+    /// Click at X, Y (fractions of width and height).
+    Click {
+        x: f32,
+        y: f32,
+        #[arg(long)]
+        right: bool,
+    },
+    /// Type TEXT into the window's focused control, any script.
+    Type { text: String },
+    /// Press a key: enter, escape, tab, backspace, delete, up, down, left,
+    /// right, home, end, pageup, pagedown, f1…f12.
+    Key { key: String },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

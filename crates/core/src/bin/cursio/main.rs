@@ -478,6 +478,12 @@ async fn run() -> anyhow::Result<()> {
         Command::Ring { phone } => ring_phone(&phone).await,
         Command::Screen { phone, stop } => phone_screen(&phone, !stop).await,
         Command::Phone { phone, action } => crate::client::phone(&phone, action).await,
+        Command::Window {
+            machine,
+            app,
+            title,
+            action,
+        } => crate::client::window(&machine, &app, title, action).await,
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Call { action } => call(action).await,
         Command::Bluetooth { action } => bluetooth(action),

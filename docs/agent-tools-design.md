@@ -132,6 +132,38 @@ What is built on top — **nothing new crosses the link**
   (`ListConversations`/`ListMessages`, reads; `SendMessage` destructive),
   `clipboard_get/set`, `gallery_list/fetch`, `ring`.
 
+## A desktop application's window
+
+An application's declared actions (`apps_call`) are the first way to drive it;
+its window is the fallback beside them, and what checks what a person sees —
+that a button now shows "Running". `core/src/desktop_window.rs`:
+
+- **`window_screenshot { machine, app, title?, max_side? }`** (read-only) and
+  **`window_click { machine, app, title?, x, y, right? }`,
+  `window_type { …, text }`, `window_key { …, key }`** (destructive); the same
+  as `cursio window <machine> <app>[/process] [--title T] screenshot | click X Y
+  [--right] | type TEXT | key K`. Wire: `DiagRequest::WindowShot` /
+  `WindowInput`, appended last.
+- **Only registered applications.** `app` (or `app/process`) names one that
+  registered through cursio-sdk; the node finds its visible top-level windows
+  by the process ids it registered with, the largest first, `title` choosing
+  among them. Nothing a peer sends is a handle or a path.
+- **Consent: `[apps.<id>] actions`.** Clicking a window does at least what
+  calling the application's actions does, so the one answer covers both,
+  asked once with buttons on that machine (`apps::actions::allowed`).
+- **Windows** (`cursio_window::windows_app`): the still is `PrintWindow` with
+  `PW_RENDERFULLCONTENT` — one picture, not a capture session, and the flag
+  is what makes WebView2/DirectComposition content print instead of black; a
+  minimised window is reported, not returned black. Input is posted
+  (`PostMessage`) to the deepest child under the point — where a WebView2 page
+  takes clicks — through the replay a transferred window uses, so the
+  person's real cursor never moves; text is `WM_CHAR` per UTF-16 unit to the
+  focused control, any script. An application reading raw input or
+  DirectInput ignores posted input, as with window transfer.
+- **Linux: not built.** Reading another application's window there is the
+  ScreenCast portal with its per-session consent dialog, and input is libei;
+  the tools answer that plainly rather than faking a picture.
+
 ## The same surface in cursio-sdk
 
 Applications and xtasks drive the same things programmatically:

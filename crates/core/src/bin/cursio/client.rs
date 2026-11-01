@@ -458,3 +458,80 @@ pub(crate) async fn forget_machine(
     println!("to bring it back, pair the two machines again");
     Ok(())
 }
+
+/// `cursio window`: read or drive an application's window on a computer.
+pub(crate) async fn window(
+    machine: &str,
+    app: &str,
+    title: Option<String>,
+    action: crate::cli::WindowCommand,
+) -> anyhow::Result<()> {
+    use crate::cli::WindowCommand;
+    use cursio_core::control::{Command, Reply};
+    use cursio_protocol::diag::{window_fraction, DesktopInput, WindowTarget};
+    let (app, process) = match app.split_once('/') {
+        Some((app, process)) => (app.to_owned(), Some(process.to_owned())),
+        None => (app.to_owned(), None),
+    };
+    let target = WindowTarget {
+        app,
+        process,
+        title,
+    };
+    let act = |input| Command::WindowAct {
+        machine: machine.to_owned(),
+        target: target.clone(),
+        input,
+    };
+    let (command, out) = match action {
+        WindowCommand::Screenshot { out, max_side } => (
+            Command::WindowShot {
+                machine: machine.to_owned(),
+                target: target.clone(),
+                max_side,
+            },
+            out,
+        ),
+        WindowCommand::Click { x, y, right } => (
+            act(DesktopInput::Click {
+                x: window_fraction(x).map_err(|e| anyhow::anyhow!("{e}"))?,
+                y: window_fraction(y).map_err(|e| anyhow::anyhow!("{e}"))?,
+                right,
+            }),
+            None,
+        ),
+        WindowCommand::Type { text } => (act(DesktopInput::Type { text }), None),
+        WindowCommand::Key { key } => (act(DesktopInput::Key { key }), None),
+    };
+    let client = control_client().await.map_err(|e| {
+        anyhow::anyhow!(
+            "no running node to reach {machine} through ({e}); start `cursio mesh` first"
+        )
+    })?;
+    match client.request(command).await? {
+        Reply::Screenshot {
+            path,
+            width,
+            height,
+        } => {
+            let shown = match out {
+                Some(out) => {
+                    std::fs::copy(&path, &out)
+                        .map_err(|e| anyhow::anyhow!("cannot copy to {}: {e}", out.display()))?;
+                    out
+                }
+                None => path,
+            };
+            println!("{} ({width}x{height})", shown.display());
+            Ok(())
+        }
+        Reply::Acted { what } => {
+            println!("{machine}: {what}");
+            Ok(())
+        }
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!(
+            "the running node does not know how to reach an application's window ({other:?}); restart it with this version of Cursio"
+        ),
+    }
+}

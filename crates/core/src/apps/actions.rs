@@ -92,22 +92,29 @@ pub fn call(
             return Err(no_such_action(id.as_str(), action, &names));
         }
     }
+    allowed(peer, &id)?;
+    tracing::info!(%peer, app = %describe(&key), %action_name, "a peer called an application's action");
+    let answer = super::serve::call(&key, &action_name, args, CALL_WAIT)?;
+    Ok(answer.to_string())
+}
+
+/// Whether this machine's person lets `peer` drive `id` — call its actions,
+/// or read and click its windows ([`crate::desktop_window`]): asked once,
+/// kept per application.
+pub fn allowed(peer: &str, id: &AppId) -> Result<(), String> {
     let consent = super::builds::builds()
         .map(|b| b.app_config(id.as_str()).actions)
         .unwrap_or_default();
     match consent {
-        AdminConsent::Allow => {}
-        AdminConsent::Deny => {
-            return Err(format!(
-                "this machine's person does not let other machines call {id}'s actions"
-            ))
+        AdminConsent::Allow => {
+            crate::diagnostics::clear(&problem(id));
+            Ok(())
         }
-        AdminConsent::Ask => return Err(ask(&id, peer)),
+        AdminConsent::Deny => Err(format!(
+            "this machine's person does not let other machines drive {id}"
+        )),
+        AdminConsent::Ask => Err(ask(id, peer)),
     }
-    crate::diagnostics::clear(&problem(&id));
-    tracing::info!(%peer, app = %describe(&key), %action_name, "a peer called an application's action");
-    let answer = super::serve::call(&key, &action_name, args, CALL_WAIT)?;
-    Ok(answer.to_string())
 }
 
 fn problem(id: &AppId) -> String {

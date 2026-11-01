@@ -79,7 +79,103 @@ impl<A: Ask> Tools<A> {
             "phone_tap" | "phone_swipe" | "phone_key" | "phone_text" => {
                 self.phone_act(name, args).await.map(Output::Text)
             }
+            "window_screenshot" => self.window_screenshot(args).await,
+            "window_click" | "window_type" | "window_key" => {
+                self.window_act(name, args).await.map(Output::Text)
+            }
             _ => self.call_text(name, args).await.map(Output::Text),
+        }
+    }
+
+    /// Which window a `window_*` call means: `app` (or `app/process`) and
+    /// an optional `title`.
+    fn window_target(args: &Value) -> Result<cursio_protocol::diag::WindowTarget, Failure> {
+        let app = need_str(args, "app")?;
+        let (app, process) = match app.split_once('/') {
+            Some((app, process)) => (app.to_owned(), Some(process.to_owned())),
+            None => (app, None),
+        };
+        Ok(cursio_protocol::diag::WindowTarget {
+            app,
+            process,
+            title: opt_str(args, "title"),
+        })
+    }
+
+    /// A still of an application's window on a computer, as the image.
+    async fn window_screenshot(&self, args: &Value) -> Result<Output, Failure> {
+        let machine = need_str(args, "machine")?;
+        let target = Self::window_target(args)?;
+        let max_side = args
+            .get("max_side")
+            .and_then(Value::as_u64)
+            .map_or(Some(DEFAULT_SHOT_SIDE), |m| (m > 0).then_some(m as u32));
+        match self
+            .ask
+            .ask(Command::WindowShot {
+                machine: machine.clone(),
+                target: target.clone(),
+                max_side,
+            })
+            .await?
+        {
+            Reply::Screenshot {
+                path,
+                width,
+                height,
+            } => {
+                let png = std::fs::read(&path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                Ok(Output::Image {
+                    png,
+                    note: format!(
+                        "{}'s window on {machine}, {width}x{height} (saved as {}). Points for \
+                         window_click are fractions of this picture, 0 to 1.",
+                        target.app,
+                        path.display()
+                    ),
+                })
+            }
+            other => Err(answered(other)),
+        }
+    }
+
+    /// A click, text or a key into an application's window on a computer.
+    async fn window_act(&self, name: &str, args: &Value) -> Result<String, Failure> {
+        use cursio_protocol::diag::{window_fraction, DesktopInput};
+        let machine = need_str(args, "machine")?;
+        let target = Self::window_target(args)?;
+        let fraction = |key: &str| -> Result<u16, Failure> {
+            let value = args
+                .get(key)
+                .and_then(Value::as_f64)
+                .ok_or_else(|| Failure::Failed(format!("{key} is required, a fraction 0 to 1")))?;
+            window_fraction(value as f32).map_err(Failure::Failed)
+        };
+        let input = match name {
+            "window_click" => DesktopInput::Click {
+                x: fraction("x")?,
+                y: fraction("y")?,
+                right: args.get("right").and_then(Value::as_bool).unwrap_or(false),
+            },
+            "window_type" => DesktopInput::Type {
+                text: need_str(args, "text")?,
+            },
+            _ => DesktopInput::Key {
+                key: need_str(args, "key")?,
+            },
+        };
+        match self
+            .ask
+            .ask(Command::WindowAct {
+                machine,
+                target,
+                input,
+            })
+            .await?
+        {
+            Reply::Acted { what } => Ok(what),
+            other => Err(answered(other)),
         }
     }
 
@@ -481,6 +577,12 @@ pub fn list() -> Vec<Value> {
     let machine = json!({ "type": "string", "description": "a machine's name as `machines` lists it; `this` for this one" });
     let phone = json!({ "type": "string", "description": "a phone's name as `machines` lists it" });
     let fraction = json!({ "type": "number", "minimum": 0, "maximum": 1 });
+    let window_fraction = fraction.clone();
+    let window_machine =
+        json!({ "type": "string", "description": "the computer's name as `machines` lists it" });
+    let window_app =
+        json!({ "type": "string", "description": "the application's id, or `<id>/<process>`" });
+    let window_title = json!({ "type": "string", "description": "the window whose title contains this; the largest otherwise" });
     vec![
         tool(
             "machines",
@@ -640,6 +742,43 @@ pub fn list() -> Vec<Value> {
             false, true,
             json!({ "phone": phone, "text": { "type": "string" } }),
             &["phone", "text"],
+        ),
+        tool(
+            "window_screenshot",
+            "A picture of a window of an application on a computer of the mesh. The application must be registered there through cursio-sdk and running; that machine's person allows driving it once (the same answer as for its actions). Built for Windows computers.",
+            true, false,
+            json!({
+                "machine": window_machine.clone(),
+                "app": window_app.clone(),
+                "title": window_title.clone(),
+                "max_side": { "type": "integer", "description": "scale the long side to at most this many pixels (default 1280, 0 for full size)" },
+            }),
+            &["machine", "app"],
+        ),
+        tool(
+            "window_click",
+            "Click in an application's window on a computer at a point given as fractions of its screenshot (0 to 1). Posted to the window: the person's real cursor does not move.",
+            false, true,
+            json!({
+                "machine": window_machine.clone(), "app": window_app.clone(), "title": window_title.clone(),
+                "x": window_fraction.clone(), "y": window_fraction,
+                "right": { "type": "boolean", "description": "a right click" },
+            }),
+            &["machine", "app", "x", "y"],
+        ),
+        tool(
+            "window_type",
+            "Type text, any script, into the focused control of an application's window on a computer.",
+            false, true,
+            json!({ "machine": window_machine.clone(), "app": window_app.clone(), "title": window_title.clone(), "text": { "type": "string" } }),
+            &["machine", "app", "text"],
+        ),
+        tool(
+            "window_key",
+            "Press a key in an application's window on a computer: enter, escape, tab, backspace, delete, up, down, left, right, home, end, pageup, pagedown, f1…f12.",
+            false, true,
+            json!({ "machine": window_machine, "app": window_app, "title": window_title, "key": { "type": "string" } }),
+            &["machine", "app", "key"],
         ),
     ]
 }

@@ -85,6 +85,9 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    # PrintWindow: one still of an application's window for a program
+    # elsewhere (windows_app.rs), where a capture session would be a stream.
+    "Win32_Storage_Xps",
     # `DWMWA_CLOAKED`: the remote-screen source list leaves out windows DWM
     # hides (suspended UWP apps, other virtual desktops), which are visible
     # and titled by every other measure and capture as blank.

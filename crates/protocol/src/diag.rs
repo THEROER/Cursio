@@ -128,10 +128,67 @@ pub enum DiagRequest {
     /// Type `text` into the field that has focus on this phone, any script:
     /// set by the accessibility service, not keyed as a US keyboard.
     PhoneType { text: String },
+    /// A still of one window of an application registered here, its long
+    /// side at most `max_side`.
+    WindowShot {
+        target: WindowTarget,
+        max_side: Option<u32>,
+    },
+    /// Input to one window of an application registered here.
+    WindowInput {
+        target: WindowTarget,
+        input: DesktopInput,
+    },
 }
 
-/// Most text one [`DiagRequest::PhoneType`] carries.
+/// Which window of an application a request means. Only an application that
+/// registered here can be named: the node finds its windows by the process
+/// ids it registered with, never by a handle or a path a peer chose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowTarget {
+    pub app: String,
+    pub process: Option<String>,
+    /// The window whose title contains this, when the application has
+    /// several; the largest otherwise.
+    pub title: Option<String>,
+}
+
+/// Something done to a desktop window. Points are ten-thousandths of the
+/// window (0 to [`WINDOW_SPAN`]), so the asker need not know its size and
+/// the request stays comparable, as floats would not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DesktopInput {
+    Click {
+        x: u16,
+        y: u16,
+        right: bool,
+    },
+    Type {
+        text: String,
+    },
+    /// A named key: `enter`, `escape`, `tab`, `backspace`, `delete`, `up`,
+    /// `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`,
+    /// `f1`…`f12`.
+    Key {
+        key: String,
+    },
+}
+
+/// Most text one [`DiagRequest::PhoneType`] or [`DesktopInput::Type`] carries.
 pub const MAX_TYPED: usize = 4000;
+
+/// A whole window's width or height in a [`DesktopInput::Click`].
+pub const WINDOW_SPAN: u16 = 10_000;
+
+/// A fraction of a window, 0 to 1, as a [`DesktopInput::Click`] carries it.
+pub fn window_fraction(fraction: f32) -> Result<u16, String> {
+    if !(0.0..=1.0).contains(&fraction) {
+        return Err(format!(
+            "{fraction} is outside the window; points are fractions from 0 to 1"
+        ));
+    }
+    Ok((fraction * f32::from(WINDOW_SPAN)).round() as u16)
+}
 
 /// Most arguments a launch may carry, and the longest one.
 pub const MAX_LAUNCH_ARGS: usize = 32;
@@ -195,6 +252,17 @@ pub enum DiagResponse {
     /// The text was set in the focused field.
     Typed {
         chars: u32,
+    },
+    /// The answer to [`DiagRequest::WindowShot`]: a PNG of the window.
+    WindowShot {
+        png: Vec<u8>,
+        width: u32,
+        height: u32,
+        title: String,
+    },
+    /// What [`DiagRequest::WindowInput`] did, in a sentence.
+    WindowDone {
+        what: String,
     },
 }
 
@@ -292,7 +360,12 @@ impl DiagMsg {
     pub fn priority(&self) -> Priority {
         match self {
             DiagMsg::Response {
-                response: Ok(DiagResponse::Logs { .. } | DiagResponse::Report(_)),
+                response:
+                    Ok(
+                        DiagResponse::Logs { .. }
+                        | DiagResponse::Report(_)
+                        | DiagResponse::WindowShot { .. },
+                    ),
                 ..
             } => Priority::Bulk,
             _ => Priority::Metadata,

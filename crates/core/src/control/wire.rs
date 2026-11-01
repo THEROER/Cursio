@@ -392,6 +392,21 @@ pub enum Command {
         #[serde(default)]
         args_json: String,
     },
+    /// Write a still of one window of application `target` on a connected
+    /// machine as a PNG here; see [`crate::desktop_window`].
+    WindowShot {
+        machine: String,
+        target: cursio_protocol::diag::WindowTarget,
+        #[serde(default)]
+        max_side: Option<u32>,
+    },
+    /// A click, text or a key into one window of application `target` on a
+    /// connected machine.
+    WindowAct {
+        machine: String,
+        target: cursio_protocol::diag::WindowTarget,
+        input: cursio_protocol::diag::DesktopInput,
+    },
 }
 
 pub(super) fn default_page() -> u32 {
@@ -534,6 +549,8 @@ impl Command {
                     | Command::PhoneAct { .. }
                     | Command::AppActions { .. }
                     | Command::CallAction { .. }
+                    | Command::WindowShot { .. }
+                    | Command::WindowAct { .. }
             )
     }
 }

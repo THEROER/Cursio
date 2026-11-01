@@ -160,6 +160,19 @@ pub fn carried_by_bluetooth(peer: &PeerId) -> bool {
 }
 
 /// This node's own log, as a peer or the control socket asks for it.
+/// A window target names an application by the rules every name off the
+/// wire is held to; a title only picks among its windows.
+fn check_target(target: &cursio_protocol::diag::WindowTarget) -> Result<(), String> {
+    cursio_app_protocol::AppId::parse(&target.app).map_err(|e| e.to_string())?;
+    if let Some(process) = &target.process {
+        cursio_app_protocol::ProcessName::parse(process).map_err(|e| e.to_string())?;
+    }
+    if target.title.as_ref().is_some_and(|t| t.len() > 256) {
+        return Err("a window title to look for is at most 256 bytes".into());
+    }
+    Ok(())
+}
+
 pub fn own_log(tail: Tail) -> Result<DiagResponse, String> {
     let tail = tail.bounded()?;
     let (dir, name) = match tail.log.as_deref() {
@@ -315,6 +328,12 @@ impl Exchange for Diag {
                 tracing::info!(peer = %store.peer_name, chars = text.chars().count(), "a peer typed on this phone");
                 crate::phone_hands::type_text(text)
             }
+            DiagRequest::WindowShot { target, max_side } => {
+                crate::desktop_window::shot(&store.peer_name, target, *max_side)
+            }
+            DiagRequest::WindowInput { target, input } => {
+                crate::desktop_window::input(&store.peer_name, target, input)
+            }
         }
     }
 
@@ -413,6 +432,15 @@ impl Exchange for Diag {
                     return Err(format!("one request types at most {MAX_TYPED} characters"));
                 }
                 Ok(DiagRequest::PhoneType { text })
+            }
+            DiagRequest::WindowShot { target, max_side } => {
+                check_target(&target)?;
+                Ok(DiagRequest::WindowShot { target, max_side })
+            }
+            DiagRequest::WindowInput { target, input } => {
+                check_target(&target)?;
+                crate::desktop_window::check(&input)?;
+                Ok(DiagRequest::WindowInput { target, input })
             }
             other @ (DiagRequest::Paths { .. }
             | DiagRequest::Maintain(_)

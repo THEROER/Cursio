@@ -116,6 +116,7 @@ pub mod module;
 /// shared cursor rides.
 pub(crate) mod module_host;
 pub use module_host::modules_busy;
+pub mod desktop_window;
 /// The unelevated process that keeps a peer's drives where Explorer sees them.
 #[cfg(feature = "files")]
 pub mod mount_helper;

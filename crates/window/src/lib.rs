@@ -98,6 +98,9 @@ pub mod video_encoder_win;
 #[cfg(target_os = "windows")]
 pub mod windows_drag;
 
+/// One application's window, read and driven for a program elsewhere.
+#[cfg(target_os = "windows")]
+pub mod windows_app;
 #[cfg(target_os = "windows")]
 mod windows_capture;
 #[cfg(target_os = "windows")]
