@@ -438,6 +438,19 @@ pub enum Command {
         pick: cursio_protocol::diag::ElementPick,
         act: cursio_protocol::diag::ElementAct,
     },
+    /// Listen on this machine's loopback for `app`'s DevTools on a
+    /// connected machine (`process`'s when named), on `port` or any free
+    /// one; with `close`, stop listening instead.
+    Devtools {
+        machine: String,
+        app: String,
+        #[serde(default)]
+        process: Option<String>,
+        #[serde(default)]
+        port: u16,
+        #[serde(default)]
+        close: bool,
+    },
 }
 
 pub(super) fn default_page() -> u32 {
@@ -586,6 +599,7 @@ impl Command {
                     | Command::WindowAct { .. }
                     | Command::WindowTree { .. }
                     | Command::WindowElement { .. }
+                    | Command::Devtools { .. }
             )
     }
 }
@@ -706,6 +720,12 @@ pub enum Reply {
         text: String,
         nodes: u32,
         truncated: bool,
+    },
+    /// The answer to [`Command::Devtools`]: where this machine listens, the
+    /// token in its path being the only way in.
+    Devtools {
+        port: u16,
+        token: String,
     },
 }
 

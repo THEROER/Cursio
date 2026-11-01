@@ -90,6 +90,23 @@ pub enum AppsWire {
         data: Vec<u8>,
         error: Option<String>,
     },
+    /// Open stream `stream` to the DevTools endpoint the application's copy
+    /// (`process` when named) declared on the receiving machine; answered by
+    /// [`Self::TunnelOpened`]. Added after the variants above, so their
+    /// numbers stand.
+    TunnelOpen {
+        stream: u64,
+        process: Option<String>,
+    },
+    /// The answer to [`Self::TunnelOpen`]: the stream is open, or why not.
+    TunnelOpened { stream: u64, error: Option<String> },
+    /// Bytes of an open stream, either way.
+    TunnelData { stream: u64, data: Vec<u8> },
+    /// The receiving side wrote `bytes` more of the stream out: the sender
+    /// may have that many more in flight.
+    TunnelAck { stream: u64, bytes: u64 },
+    /// The stream ended, from either side; why, when it was not just closed.
+    TunnelClose { stream: u64, reason: Option<String> },
 }
 
 /// What became of a datagram on the receiving machine.
@@ -159,6 +176,11 @@ impl AppsMsg {
             Some(AppsContent::Update(UpdateMsg::Chunk(_))) => Priority::Bulk,
             Some(AppsContent::Wire(AppsWire::Datagram { payload, .. }))
                 if payload.len() > BULK_FROM =>
+            {
+                Priority::Bulk
+            }
+            Some(AppsContent::Wire(AppsWire::TunnelData { data, .. }))
+                if data.len() > BULK_FROM =>
             {
                 Priority::Bulk
             }

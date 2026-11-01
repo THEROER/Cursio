@@ -142,6 +142,11 @@ impl AppsModule {
             }
             answer @ AppsWire::BlobHas { id, .. } => super::mesh::answered(id, answer),
             answer @ AppsWire::BlobChunk { id, .. } => super::mesh::answered(id, answer),
+            tunnel @ (AppsWire::TunnelOpen { .. }
+            | AppsWire::TunnelOpened { .. }
+            | AppsWire::TunnelData { .. }
+            | AppsWire::TunnelAck { .. }
+            | AppsWire::TunnelClose { .. }) => super::tunnel::on_wire(&self.peer, app, tunnel),
         }
     }
 

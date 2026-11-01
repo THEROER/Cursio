@@ -448,7 +448,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     let Some(first) = first else {
         return Ok(());
     };
-    let (app, process, version, pid, logs, protocol, actions, topics, blobs) =
+    let (app, process, version, pid, logs, protocol, actions, topics, blobs, devtools) =
         match decode_line::<ClientMsg>(&first) {
             Ok(ClientMsg::Hello {
                 protocol,
@@ -460,8 +460,9 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                 actions,
                 topics,
                 blobs,
+                devtools,
             }) => (
-                app, process, version, pid, logs, protocol, actions, topics, blobs,
+                app, process, version, pid, logs, protocol, actions, topics, blobs, devtools,
             ),
             Ok(_) => return refuse(&mut write, "the first message must be hello".into()).await,
             Err(error) => return refuse(&mut write, error.to_string()).await,
@@ -503,6 +504,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
         registry.set_actions(&key, actions);
         registry.set_topics(&key, topics);
         registry.set_blobs(&key, blobs);
+        registry.set_devtools(&key, devtools);
     }
     tracing::info!(%app, process = ?key.process, %version, pid, logs = ?logs.as_ref().map(|l| l.dir.join(&l.file)), "application connected");
     let welcome = NodeMsg::Welcome {
@@ -684,6 +686,7 @@ mod tests {
             actions: Vec::new(),
             topics: Vec::new(),
             blobs: false,
+            devtools: None,
         })
     }
 

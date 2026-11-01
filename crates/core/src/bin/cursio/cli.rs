@@ -143,6 +143,22 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: WindowCommand,
     },
+    /// Inspect an application's web view on a connected machine through its
+    /// DevTools: listen on this machine's loopback and print the address
+    /// Playwright (`connectOverCDP`) or a browser's DevTools take. The
+    /// application must declare DevTools (cursio-sdk `App::devtools`) and
+    /// that machine's person must allow it, for a limited time.
+    Devtools {
+        machine: String,
+        /// The application's id, or `<id>/<process>`.
+        app: String,
+        /// Listen on this port; any free one when absent.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Stop listening instead.
+        #[arg(long)]
+        close: bool,
+    },
     /// Answer, decline, end or place a call on a connected phone. Goes through
     /// the running node.
     Call {

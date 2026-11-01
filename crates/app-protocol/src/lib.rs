@@ -419,6 +419,17 @@ pub struct AppPeer {
     pub topics: Vec<TopicName>,
 }
 
+/// A DevTools endpoint a process opened on loopback (`docs/devtools-design.md`,
+/// rung 5). Only the port crosses: the node forwards nothing but a loopback
+/// port that this very process listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Devtools {
+    /// The Chrome DevTools Protocol: WebView2 (Tauri on Windows), Electron,
+    /// CEF — `--remote-debugging-port=<port>`.
+    Cdp { port: u16 },
+}
+
 /// An action a process declares in its hello: what it is called, what it
 /// does in a sentence, and a JSON Schema of its arguments — what an agent
 /// reads to call it right the first time.
@@ -546,6 +557,11 @@ pub enum ClientMsg {
         /// machines may fetch files from it. Left out when false.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         blobs: bool,
+        /// A DevTools endpoint this process opened on loopback, for another
+        /// machine to inspect it through once this one's person allows it.
+        /// Left out when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        devtools: Option<Devtools>,
     },
     Health {
         state: HealthState,
@@ -891,6 +907,7 @@ mod tests {
             actions: Vec::new(),
             topics: Vec::new(),
             blobs: false,
+            devtools: None,
         };
         let text = line(&hello);
         assert_eq!(
@@ -915,6 +932,7 @@ mod tests {
             actions: Vec::new(),
             topics: Vec::new(),
             blobs: false,
+            devtools: None,
         };
         assert_eq!(
             line(&hello),
@@ -934,6 +952,7 @@ mod tests {
             actions: Vec::new(),
             topics: Vec::new(),
             blobs: false,
+            devtools: None,
         };
         let text = line(&hello);
         assert_eq!(
@@ -963,6 +982,7 @@ mod tests {
             actions: Vec::new(),
             topics: vec![TopicName::parse("instances").unwrap()],
             blobs: false,
+            devtools: None,
         };
         assert_eq!(
             line(&hello),
@@ -1014,6 +1034,31 @@ mod tests {
     }
 
     #[test]
+    fn a_hello_declares_a_devtools_endpoint_with_pinned_bytes() {
+        let hello = ClientMsg::Hello {
+            protocol: 1,
+            app: AppId::parse("leavepulse").unwrap(),
+            version: "0.6.0".into(),
+            pid: 3,
+            logs: None,
+            process: None,
+            actions: Vec::new(),
+            topics: Vec::new(),
+            blobs: false,
+            devtools: Some(Devtools::Cdp { port: 9222 }),
+        };
+        let text = line(&hello);
+        assert_eq!(
+            text,
+            "{\"msg\":\"hello\",\"protocol\":1,\"app\":\"leavepulse\",\"version\":\"0.6.0\",\"pid\":3,\"devtools\":{\"kind\":\"cdp\",\"port\":9222}}\n"
+        );
+        assert_eq!(
+            decode_line::<ClientMsg>(text.trim_end().as_bytes()).unwrap(),
+            hello
+        );
+    }
+
+    #[test]
     fn a_hello_declares_its_actions_and_a_call_and_its_answer_have_pinned_bytes() {
         let hello = ClientMsg::Hello {
             protocol: 1,
@@ -1029,6 +1074,7 @@ mod tests {
             }],
             topics: Vec::new(),
             blobs: false,
+            devtools: None,
         };
         let text = line(&hello);
         assert_eq!(

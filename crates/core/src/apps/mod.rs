@@ -19,11 +19,13 @@ pub mod actions;
 pub mod blobs;
 pub mod builds;
 pub mod cli;
+pub mod devtools;
 pub mod lane;
 pub mod launch;
 pub mod mesh;
 pub mod phone_open;
 pub mod serve;
+pub mod tunnel;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -89,6 +91,9 @@ pub struct Registered {
     /// It names files for its copies elsewhere to fetch (`on_blob`). Live
     /// state, like `actions`.
     pub blobs: bool,
+    /// The DevTools endpoint it declared (`App::devtools`). Live state, like
+    /// `actions`; checked against the socket table before it is forwarded.
+    pub devtools: Option<cursio_app_protocol::Devtools>,
 }
 
 impl Registered {
@@ -149,6 +154,7 @@ impl Registry {
                     actions: Vec::new(),
                     topics: Vec::new(),
                     blobs: false,
+                    devtools: None,
                 };
                 Some((Key::from_file_key(&key)?, registered))
             })
@@ -206,6 +212,36 @@ impl Registry {
         }
     }
 
+    /// The DevTools endpoint `key`'s process declared.
+    pub fn set_devtools(&mut self, key: &Key, devtools: Option<cursio_app_protocol::Devtools>) {
+        if let Some(entry) = self.apps.get_mut(key) {
+            entry.devtools = devtools;
+        }
+    }
+
+    /// The running process of `app` (only `process` when named) that
+    /// declared a DevTools endpoint, with its pid.
+    pub fn devtools(
+        &self,
+        app: &AppId,
+        process: Option<&ProcessName>,
+    ) -> Option<(Key, u32, cursio_app_protocol::Devtools)> {
+        self.apps
+            .iter()
+            .filter(|(key, r)| key.app == *app && r.running())
+            .filter(|(key, _)| process.is_none_or(|p| key.process.as_ref() == Some(p)))
+            .find_map(|(key, r)| Some((key.clone(), r.pid?, r.devtools?)))
+    }
+
+    /// Every pid `app`'s running processes registered with.
+    pub fn pids(&self, app: &AppId) -> Vec<u32> {
+        self.apps
+            .iter()
+            .filter(|(key, r)| key.app == *app && r.running())
+            .filter_map(|(_, r)| r.pid)
+            .collect()
+    }
+
     /// The running processes of `app` that name files, the main one first.
     pub fn blob_servers(&self, app: &AppId) -> Vec<Key> {
         self.apps
@@ -237,6 +273,7 @@ impl Registry {
             actions: Vec::new(),
             topics: Vec::new(),
             blobs: false,
+            devtools: None,
         });
         let changed = entry.version != version || entry.logs != logs;
         entry.version = version;

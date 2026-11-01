@@ -37,7 +37,10 @@ required-features = ["files-mount"]
 # module that is off costs nothing to compile and cannot be negotiated on.
 [features]
 default = ["desktop"]
-desktop = ["audio", "input", "window", "files", "files-mount", "airplay", "usb", "calls", "bluetooth", "gallery", "phone-control"]
+desktop = ["audio", "input", "window", "files", "files-mount", "airplay", "usb", "calls", "bluetooth", "gallery", "phone-control", "web-tools"]
+# `cursio mcp`'s `web_*` tools: a DevTools-protocol client for an
+# application's web view on another machine (docs/devtools-design.md).
+web-tools = ["dep:tokio-tungstenite", "dep:futures"]
 audio = ["dep:cursio-audio"]
 input = ["dep:cursio-input"]
 window = ["dep:cursio-window"]
@@ -82,6 +85,8 @@ cursio-bluetooth = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 # Thumbnails cross the control socket's JSON as text.
 base64.workspace = true
+tokio-tungstenite = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 # Compresses file chunks when it pays; see files_session::pack.
 zstd = "0.13"
 # Build manifests: every installed file is checked against its sha256.

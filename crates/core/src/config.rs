@@ -135,6 +135,45 @@ pub struct AppConfig {
     /// the person installs and starts, an action does something the moment
     /// it is called. `allow` and `deny` as for `admin`.
     pub actions: AdminConsent,
+    /// Whether another machine may inspect the application's DevTools
+    /// endpoint (`docs/devtools-design.md`, rung 5). `deny` unless changed:
+    /// DevTools run any code inside the application.
+    pub devtools: DevtoolsConsent,
+    /// Machines this one's person let inspect the application, each for a
+    /// limited time. Never permanent: a grant ends at its time or with the
+    /// processes it was given for, whichever comes first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub devtools_grants: Vec<DevtoolsGrant>,
+}
+
+/// Whether another machine may ask to inspect an application at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DevtoolsConsent {
+    /// Refused, with a button to start asking instead.
+    #[default]
+    Deny,
+    /// Each request raises a problem whose buttons grant it for a while.
+    Ask,
+}
+
+/// One machine allowed to inspect an application, until `until` (Unix
+/// seconds), and, when `pids` is not empty, only while one of those
+/// processes runs: "until the application restarts".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevtoolsGrant {
+    pub peer: String,
+    pub until: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pids: Vec<u32>,
+}
+
+impl DevtoolsGrant {
+    /// Whether it still holds at `now` (Unix seconds) with `running` pids.
+    pub fn holds(&self, now: u64, running: &[u32]) -> bool {
+        now < self.until && (self.pids.is_empty() || self.pids.iter().any(|p| running.contains(p)))
+    }
 }
 
 /// This machine's answer to an application's build asking for administrator
@@ -160,6 +199,8 @@ impl Default for AppConfig {
             trusted_builders: Vec::new(),
             admin: AdminConsent::Ask,
             actions: AdminConsent::Ask,
+            devtools: DevtoolsConsent::Deny,
+            devtools_grants: Vec::new(),
         }
     }
 }
@@ -252,6 +293,20 @@ pub enum ConfigEdit {
         app: String,
         consent: AdminConsent,
     },
+    /// Whether another machine may ask to inspect `app` at all.
+    AppDevtools {
+        app: String,
+        consent: DevtoolsConsent,
+    },
+    /// Let a machine inspect `app` for a while (the request's buttons).
+    GrantDevtools {
+        app: String,
+        grant: DevtoolsGrant,
+    },
+    /// End every grant to inspect `app`: the "Stop" while it is inspected.
+    StopDevtools {
+        app: String,
+    },
     /// On a phone: answer whether `package` may talk to the node as `app`.
     PackageAccess {
         package: String,
@@ -285,6 +340,23 @@ impl ConfigEdit {
             }
             ConfigEdit::AppActions { app, consent } => {
                 config.apps.entry(app).or_default().actions = consent;
+            }
+            ConfigEdit::AppDevtools { app, consent } => {
+                let entry = config.apps.entry(app).or_default();
+                entry.devtools = consent;
+                if consent == DevtoolsConsent::Deny {
+                    entry.devtools_grants.clear();
+                }
+            }
+            ConfigEdit::GrantDevtools { app, grant } => {
+                let grants = &mut config.apps.entry(app).or_default().devtools_grants;
+                grants.retain(|g| g.peer != grant.peer);
+                grants.push(grant);
+            }
+            ConfigEdit::StopDevtools { app } => {
+                if let Some(entry) = config.apps.get_mut(&app) {
+                    entry.devtools_grants.clear();
+                }
             }
             ConfigEdit::PackageAccess {
                 package,

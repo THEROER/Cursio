@@ -265,6 +265,36 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                 Err(message) => Reply::Error { message },
             }
         }
+        Command::Devtools {
+            machine,
+            app,
+            process,
+            port,
+            close,
+        } => {
+            use crate::apps::tunnel;
+            if *close {
+                return Some(match tunnel::close(machine, app, process.as_deref()) {
+                    true => Reply::Done,
+                    false => error(format!("nothing listens for {app}'s DevTools on {machine}")),
+                });
+            }
+            let (machine, app, process, port) =
+                (machine.clone(), app.clone(), process.clone(), *port);
+            let listening = tunnel::runtime()
+                .spawn(
+                    async move { tunnel::listen(&machine, &app, process.as_deref(), port).await },
+                )
+                .await;
+            match listening {
+                Ok(Ok(open)) => Reply::Devtools {
+                    port: open.port,
+                    token: open.token,
+                },
+                Ok(Err(message)) => Reply::Error { message },
+                Err(join) => error(format!("the DevTools listener failed: {join}")),
+            }
+        }
         Command::WindowTree {
             machine,
             target,
@@ -674,7 +704,8 @@ impl NodeState {
             | Command::WindowShot { .. }
             | Command::WindowAct { .. }
             | Command::WindowTree { .. }
-            | Command::WindowElement { .. } => {
+            | Command::WindowElement { .. }
+            | Command::Devtools { .. } => {
                 error("logs and paths are asked through a desktop's control socket")
             }
         }

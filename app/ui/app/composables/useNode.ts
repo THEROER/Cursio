@@ -104,6 +104,14 @@ export type ConfigEdit =
     }
   | { app_admin: { app: string; consent: "ask" | "allow" | "deny" } }
   | { app_actions: { app: string; consent: "ask" | "allow" | "deny" } }
+  | { app_devtools: { app: string; consent: "ask" | "deny" } }
+  | {
+      grant_devtools: {
+        app: string;
+        grant: { peer: string; until: number; pids?: number[] };
+      };
+    }
+  | { stop_devtools: { app: string } }
   | { package_access: { package: string; app: string; allowed: boolean } }
 
 export interface ProblemAction {

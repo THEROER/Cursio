@@ -71,7 +71,14 @@ pub fn unlink(peer: &str, token: u64) {
     if mesh.links.get(peer).is_some_and(|l| l.token == token) {
         mesh.links.remove(peer);
         mesh.presence.remove(peer);
+        drop(mesh);
+        super::tunnel::streams().peer_gone(peer);
     }
+}
+
+/// Whether a link to `peer` carries the `apps` module now.
+pub fn is_linked(peer: &str) -> bool {
+    mesh().links.contains_key(peer)
 }
 
 /// What `peer` says is registered on it now.

@@ -36,7 +36,7 @@ use cursio_app_protocol::{
     MAX_LINE, MAX_PAYLOAD, MAX_TOPICS, PROTOCOL,
 };
 pub use cursio_app_protocol::{
-    ActionName, ActionSpec, AppId, BlobAlgo, BlobEntry, BlobHash, HealthState, LogSpec,
+    ActionName, ActionSpec, AppId, BlobAlgo, BlobEntry, BlobHash, Devtools, HealthState, LogSpec,
     ProcessName, TopicName,
 };
 /// The JSON an action takes and answers.
@@ -213,6 +213,7 @@ pub struct App {
         OnMessage,
     )>,
     on_blob: Option<OnBlob>,
+    devtools: Option<Devtools>,
 }
 
 /// In a debug build, a name that cannot be declared panics where it is
@@ -248,6 +249,7 @@ impl App {
             actions: Vec::new(),
             topics: Vec::new(),
             on_blob: None,
+            devtools: None,
         }
     }
 
@@ -261,6 +263,20 @@ impl App {
         handler: impl Fn(&BlobHash) -> Option<PathBuf> + Send + Sync + 'static,
     ) -> Self {
         self.on_blob = Some(Arc::new(handler));
+        self
+    }
+
+    /// This process opened a DevTools endpoint on loopback — for a Chromium
+    /// web view, `--remote-debugging-port=<port>` — which another machine may
+    /// inspect through Cursio (`cursio devtools`, `cursio mcp`'s `web_*`).
+    ///
+    /// DevTools run any code inside the application and read what it
+    /// stores, so declare it only in a build or a run meant for it (behind
+    /// a `--devtools` flag, never by default). The node forwards only a port
+    /// this very process listens on, and only to a machine this machine's
+    /// person allows for a limited time each time.
+    pub fn devtools(mut self, endpoint: Devtools) -> Self {
+        self.devtools = Some(endpoint);
         self
     }
 
@@ -393,6 +409,7 @@ impl App {
             actions: specs,
             topics,
             blobs: self.on_blob.is_some(),
+            devtools: self.devtools,
         };
         let endpoint = self.endpoint.unwrap_or_else(cursio_app_protocol::endpoint);
         let shared = Arc::new(Mutex::new(Link::Connecting));

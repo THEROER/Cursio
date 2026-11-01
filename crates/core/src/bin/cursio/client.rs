@@ -460,6 +460,46 @@ pub(crate) async fn forget_machine(
 }
 
 /// `cursio window`: read or drive an application's window on a computer.
+pub(crate) async fn devtools(
+    machine: &str,
+    app: &str,
+    port: u16,
+    close: bool,
+) -> anyhow::Result<()> {
+    use cursio_core::control::{Command, Reply};
+    let (app, process) = match app.split_once('/') {
+        Some((app, process)) => (app.to_owned(), Some(process.to_owned())),
+        None => (app.to_owned(), None),
+    };
+    let command = Command::Devtools {
+        machine: machine.to_owned(),
+        app: app.clone(),
+        process,
+        port,
+        close,
+    };
+    match control_client().await?.request(command).await? {
+        Reply::Done => {
+            println!("stopped listening for {app}'s DevTools on {machine}");
+            Ok(())
+        }
+        Reply::Devtools { port, token } => {
+            let http = format!("http://127.0.0.1:{port}/{token}");
+            println!("{app} on {machine}: DevTools at {http}");
+            println!("  the token in the path is the only way in; keep the address to yourself");
+            println!();
+            println!("  Playwright:  const browser = await chromium.connectOverCDP('{http}');");
+            println!("  targets:     {http}/json/list");
+            println!("  front end:   open a target's devtoolsFrontendUrl, prefixed with http://127.0.0.1:{port}");
+            println!();
+            println!("it stays open 15 minutes after its last connection; `--close` ends it now");
+            Ok(())
+        }
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("the running node answered {other:?}"),
+    }
+}
+
 pub(crate) async fn window(
     machine: &str,
     app: &str,
