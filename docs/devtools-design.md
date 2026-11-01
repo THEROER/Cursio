@@ -233,11 +233,21 @@ app's own log.
   into `webSocketDebuggerUrl` and `devtoolsFrontendUrl` with
   `Content-Length` fixed. The listener closes after 15 minutes idle.
 - **MCP**: `apps_devtools` (destructive) opens the listener; `web_snapshot`,
-  `web_query`, `web_screenshot`, `web_console`, `web_click`, `web_fill` and
-  `web_eval` (destructive, with its own title) speak CDP to the first page
-  target through it (`core/src/mcp/cdp.rs`, tokio-tungstenite behind the
-  `web-tools` feature).
-- **Not built**: `web_network`, the console as a `cursio logs` source,
+  `web_query`, `web_screenshot`, `web_console`, `web_network`, `web_click`,
+  `web_fill` and `web_eval` (destructive, with its own title) speak CDP to
+  the first page target through it (`core/src/mcp/cdp.rs`, tokio-tungstenite
+  behind the `web-tools` feature).
+- **`web_network`**: every tool call is a CDP session of its own, so it
+  enables `Network` and records what the page requests while it waits
+  (`wait_ms`, 2 s by default, 15 s at most): method, status, type, time,
+  wire size and URL, the newest `max` (100) rows of at most 4000 events, a
+  redirect as its own row. What the page fetched *before* the call comes
+  from its performance timeline (URL, initiator, time, size, status where
+  Chromium reports it), since a fresh session has no record of it. A body is
+  fetched only when asked — `body_for` names part of a URL, and the newest
+  finished request matching it is read with `Network.getResponseBody`, cut at
+  64 KiB, binary bodies only measured. Read only.
+- **Not built**: the console as a `cursio logs` source,
   `--launch`, discovery of rungs in `apps status`, a notification and tray
   entry beyond the problem, WebKitGTK through WebDriver, and a live run
   against a deployed WebView2 application.
@@ -275,6 +285,6 @@ trusted with input and files already. What this design adds on top:
    (**built**).
 2. Rung 5's tunnel with the token, the time-limited consent, the visible
    indicator and the audit line (**built**).
-3. The `web_*` tools in `cursio mcp` (**built**, but not `web_network`), and
-   the web view's console as a log.
+3. The `web_*` tools in `cursio mcp` (**built**), and the web view's console
+   as a log.
 4. WebKitGTK through WebDriver, as its own mode.

@@ -196,7 +196,10 @@ the DevTools protocol (rung 5 in `docs/devtools-design.md`):
   an hour or until the app restarts — and opens a token-gated listener on
   this machine's loopback, answering its URL for Playwright or the inspector.
 - **`web_snapshot`**, **`web_query { selector }`**, **`web_screenshot`** and
-  **`web_console { wait_ms? }`** read the first page target;
+  **`web_console { wait_ms? }`** read the first page target, and
+  **`web_network { wait_ms?, max?, body_for? }`** lists the requests it makes
+  while waiting (plus its earlier resources from the performance timeline),
+  with one response body, capped, only when `body_for` names it;
   **`web_click { selector }`** and **`web_fill { selector, text }`** change
   it; **`web_eval { expression }`** runs JavaScript in it and is destructive
   with its own title, so a client asks before each call. They reuse the

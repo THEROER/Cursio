@@ -180,10 +180,13 @@ impl<A: Ask> Tools<A> {
         ))
     }
 
-    /// A `web_*` tool: the application's page through its DevTools.
+    /// A `web_*` tool: the application's page through its DevTools. Each
+    /// call is a session of its own, so `web_network` sees only what the
+    /// page requests while it waits — and, for what came before, the page's
+    /// own performance timeline, which has no methods or failures.
     #[cfg(feature = "web-tools")]
     async fn web(&self, name: &str, args: &Value) -> Result<Output, Failure> {
-        use super::cdp::{ax_outline, console_lines, Cdp};
+        use super::cdp::{ax_outline, console_lines, network_requests, Cdp};
         use base64::Engine as _;
         let (app, port, token) = self.devtools_listener(args).await?;
         let mut page = Cdp::page(port, &token).await?;
@@ -233,6 +236,75 @@ impl<A: Ask> Tools<A> {
                     true => "nothing in the console".to_owned(),
                     false => lines.join("\n"),
                 }
+            }
+            "web_network" => {
+                let wait = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(2000);
+                let max = args.get("max").and_then(Value::as_u64).unwrap_or(100) as usize;
+                page.keep = NETWORK_EVENTS;
+                page.call("Network.enable", json!({})).await?;
+                page.listen(std::time::Duration::from_millis(wait.min(15_000)))
+                    .await;
+                let (rows, dropped) = network_requests(&page.events, max.clamp(1, 500));
+                let earlier = page.eval(EARLIER_REQUESTS).await.unwrap_or(Value::Null);
+                let mut out = String::new();
+                if let Some(earlier) = earlier.as_array().filter(|e| !e.is_empty()) {
+                    out.push_str("before this call (the page's performance timeline):\n");
+                    for entry in earlier {
+                        out.push_str(&format!(
+                            "{} {} {:.0} ms {} B {}\n",
+                            entry["status"].as_u64().map_or("?".to_owned(), |s| s.to_string()),
+                            entry["kind"].as_str().unwrap_or("other"),
+                            entry["ms"].as_f64().unwrap_or(0.0),
+                            entry["size"].as_u64().unwrap_or(0),
+                            entry["url"].as_str().unwrap_or_default(),
+                        ));
+                    }
+                    out.push('\n');
+                }
+                out.push_str(&format!("during {wait} ms:\n"));
+                if dropped > 0 {
+                    out.push_str(&format!("… {dropped} older requests left out\n"));
+                }
+                if rows.is_empty() {
+                    out.push_str("no requests\n");
+                }
+                for row in &rows {
+                    out.push_str(&row.line());
+                    out.push('\n');
+                }
+                if let Some(wanted) = args.get("body_for").and_then(Value::as_str) {
+                    let row = rows
+                        .iter()
+                        .rev()
+                        .find(|r| r.url.contains(wanted) && r.size.is_some() && r.failed.is_none())
+                        .ok_or_else(|| {
+                            Failure::Failed(format!(
+                                "no finished request during the wait has {wanted:?} in its URL"
+                            ))
+                        })?;
+                    let body = page
+                        .call("Network.getResponseBody", json!({ "requestId": row.id }))
+                        .await?;
+                    let text = body["body"].as_str().unwrap_or_default();
+                    out.push_str(&format!("\nbody of {}:\n", row.url));
+                    match body["base64Encoded"].as_bool() == Some(true) {
+                        true => out.push_str(&format!(
+                            "(binary, {} bytes as base64; not shown)\n",
+                            text.len()
+                        )),
+                        false => {
+                            let mut cut = text.len().min(BODY_CAP);
+                            while !text.is_char_boundary(cut) {
+                                cut -= 1;
+                            }
+                            out.push_str(&text[..cut]);
+                            if cut < text.len() {
+                                out.push_str(&format!("\n… cut at {} KiB", BODY_CAP / 1024));
+                            }
+                        }
+                    }
+                }
+                out
             }
             "web_click" => {
                 let expression = format!(
@@ -1097,6 +1169,21 @@ pub fn list() -> Vec<Value> {
     tools
 }
 
+/// Network events one `web_network` call keeps: a request is four or five.
+#[cfg(feature = "web-tools")]
+const NETWORK_EVENTS: usize = 4000;
+
+/// Most of one response body `web_network` returns.
+#[cfg(feature = "web-tools")]
+const BODY_CAP: usize = 64 * 1024;
+
+/// The newest 50 resources the page fetched before the call, from its
+/// performance timeline (`responseStatus` is absent before Chromium 109).
+#[cfg(feature = "web-tools")]
+const EARLIER_REQUESTS: &str = "performance.getEntriesByType('resource').slice(-50).map(e => ({ \
+     url: e.name, kind: e.initiatorType, ms: e.duration, size: e.transferSize, \
+     status: e.responseStatus || null }))";
+
 /// The DevTools tools: the strongest reach there is — they run code inside
 /// the application — so every one that acts is marked destructive, and the
 /// one that runs arbitrary JavaScript says so in its title.
@@ -1140,6 +1227,13 @@ fn web_tools(machine: &Value) -> Vec<Value> {
             "What an application's page logs: console calls, uncaught exceptions and browser log entries, collected for a moment (wait_ms, default 1000).",
             true, false,
             json!({ "machine": machine, "app": app, "wait_ms": { "type": "integer" } }),
+            &["machine", "app"],
+        ),
+        tool(
+            "web_network",
+            "Requests an application's page makes while this waits (wait_ms, default 2000, at most 15000): method, status, type, time, size and URL, the newest `max` (default 100); plus the resources it fetched before, from its performance timeline. `body_for` returns the response body (up to 64 KiB) of the newest finished request whose URL contains it.",
+            true, false,
+            json!({ "machine": machine, "app": app, "wait_ms": { "type": "integer" }, "max": { "type": "integer" }, "body_for": { "type": "string", "description": "part of a request's URL whose response body to return" } }),
             &["machine", "app"],
         ),
         tool(
