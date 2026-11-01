@@ -28,6 +28,7 @@ mod dotenv;
 mod livetest;
 mod logscan;
 mod remote;
+mod sdk_mirror;
 mod stage;
 #[cfg(target_os = "linux")]
 mod uinput;
@@ -164,6 +165,17 @@ enum Command_ {
     /// them, and let the running nodes offer them to the mesh on the `dev`
     /// channel.
     Publish(stage::PublishArgs),
+    /// Sync the public cursio-sdk repository from crates/sdk and
+    /// crates/app-protocol, checked to build on its own; `--tag` publishes
+    /// both crates to crates.io through that repository's workflow.
+    SdkMirror {
+        /// Push the synced mirror.
+        #[arg(long)]
+        push: bool,
+        /// Tag the SDK's version, which publishes it.
+        #[arg(long)]
+        tag: bool,
+    },
     /// live-test's child that touches the peer mount under a deadline.
     #[command(hide = true)]
     FileProbe {
@@ -231,6 +243,13 @@ fn main() -> Result<()> {
         Command_::LiveTest(args) => livetest::live_test(args),
         Command_::Stage(args) => stage::stage(args),
         Command_::Publish(args) => stage::publish(args),
+        Command_::SdkMirror { push, tag } => sdk_mirror::run(
+            &checkout_dir(),
+            sdk_mirror::Options {
+                push: push || tag,
+                tag,
+            },
+        ),
         Command_::FileProbe { path, seed, remove } => livetest::file_probe(&path, seed, remove),
     }
 }

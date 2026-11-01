@@ -6,8 +6,13 @@ edition.workspace = true
 # this, and an Apache-2.0 program linking GPL code would itself become GPL.
 # Nothing here is taken from the GPL crates; see docs/app-sdk-design.md.
 license = "MIT OR Apache-2.0"
-repository.workspace = true
+# The public mirror it is published from (`cargo xtask sdk-mirror`), not
+# Cursio's own repository.
+repository = "https://github.com/THEROER/cursio-sdk"
 description = "What an application and the Cursio node on its machine say to each other"
+readme = "README.md"
+keywords = ["cursio", "mesh", "ipc", "devtools"]
+categories = ["development-tools", "network-programming"]
 
 [dependencies]
 serde.workspace = true

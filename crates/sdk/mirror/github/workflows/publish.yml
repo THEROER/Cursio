@@ -1,0 +1,24 @@
+name: publish
+
+# A `v<version>` tag, pushed by `cargo xtask sdk-mirror --tag` in Cursio,
+# publishes both crates. The protocol goes first: the SDK depends on it.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+      - name: publish cursio-app-protocol
+        run: cargo publish -p cursio-app-protocol
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: publish cursio-sdk
+        run: cargo publish -p cursio-sdk
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

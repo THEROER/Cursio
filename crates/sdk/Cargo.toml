@@ -5,8 +5,14 @@ edition.workspace = true
 # Linked into applications of any license: depends on nothing GPL, takes no
 # code from Cursio's GPL crates, and reaches the node only over its socket.
 license = "MIT OR Apache-2.0"
-repository.workspace = true
+# The public mirror it is published from (`cargo xtask sdk-mirror`), not
+# Cursio's own repository.
+repository = "https://github.com/THEROER/cursio-sdk"
 description = "Put an application on a Cursio mesh: let the node on its machine carry its logs, and more"
+readme = "README.md"
+keywords = ["cursio", "mesh", "devtools", "deploy", "logs"]
+categories = ["development-tools", "network-programming"]
+exclude = ["mirror/"]
 
 [dependencies]
 cursio-app-protocol.workspace = true
