@@ -111,6 +111,24 @@ pub struct AppConfig {
     pub policy: UpdatePolicy,
     /// Machines whose builds of this application are accepted.
     pub trusted_builders: Vec<TrustedBuilder>,
+    /// What to do when a build asks to run as an administrator.
+    pub admin: AdminConsent,
+}
+
+/// This machine's answer to an application's build asking for administrator
+/// rights when started from another machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminConsent {
+    /// Not answered yet: the start waits, and the problem asking offers both
+    /// answers as buttons.
+    #[default]
+    Ask,
+    /// Run it as administrator. Where the node is not elevated, Windows' own
+    /// prompt (or polkit's) still asks at every start.
+    Allow,
+    /// Run it as the person, whatever the build asks.
+    Deny,
 }
 
 impl Default for AppConfig {
@@ -118,6 +136,7 @@ impl Default for AppConfig {
         Self {
             policy: UpdatePolicy::Auto,
             trusted_builders: Vec::new(),
+            admin: AdminConsent::Ask,
         }
     }
 }
@@ -200,6 +219,11 @@ pub enum ConfigEdit {
         app: String,
         builder: TrustedBuilder,
     },
+    /// Answer whether `app` may run as an administrator when it asks.
+    AppAdmin {
+        app: String,
+        consent: AdminConsent,
+    },
     /// Narrow one edge to the part that crosses; `None` gives it back whole.
     Crossing {
         edge: Edge,
@@ -221,6 +245,9 @@ impl ConfigEdit {
                 let builders = &mut config.apps.entry(app).or_default().trusted_builders;
                 builders.retain(|b| b.key != builder.key && b.peer != builder.peer);
                 builders.push(builder);
+            }
+            ConfigEdit::AppAdmin { app, consent } => {
+                config.apps.entry(app).or_default().admin = consent;
             }
             ConfigEdit::Crossing { edge, span } => {
                 let span = span.filter(|s| *s != EdgeSpan::WHOLE);

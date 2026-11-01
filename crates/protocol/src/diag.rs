@@ -93,6 +93,21 @@ pub enum DiagRequest {
     /// Restart the node, or switch it to the build from the mesh that is
     /// installed and waiting; see [`Maintenance`].
     Maintain(Maintenance),
+    /// Start the current build of application `app` — only one installed
+    /// through the `apps` module, never a path — once `version` is it when
+    /// given; `restart` ends the copies already running from its install
+    /// first. Added last, so the variants before it keep their numbers.
+    Launch {
+        app: String,
+        version: Option<String>,
+        /// Which of the build's files to run, by component name; the one
+        /// that is plainly the application when absent.
+        component: Option<String>,
+        restart: bool,
+        /// `false` only answers whether `version` is current, starting
+        /// nothing: how a ship that installs only waits for it.
+        start: bool,
+    },
 }
 
 /// Something a person at another machine asks a node to do to itself.
@@ -117,6 +132,10 @@ pub enum DiagResponse {
     /// The node took the request and is about to do it; the link drops as
     /// it does.
     Maintaining(Maintenance),
+    /// The application was started; `what` says which build, as what.
+    Launched {
+        what: String,
+    },
 }
 
 /// A node's own memory. `None` is "cannot say".

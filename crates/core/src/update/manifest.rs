@@ -38,6 +38,13 @@ pub struct Component {
     /// File name relative to the build directory.
     pub path: String,
     pub sha256: String,
+    /// The build asks for this file to run as an administrator. Part of the
+    /// signed build — the manifest is one of its hashed files — so nobody on
+    /// the way can add the ask; the receiving machine's person still decides
+    /// (`[apps.<id>] admin`). Absent from every Cursio build, whose node
+    /// elevates itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +89,7 @@ impl Manifest {
                 Component {
                     path: (*file).to_owned(),
                     sha256: sha256_file(&dir.join(file))?,
+                    admin: false,
                 },
             );
         }

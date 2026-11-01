@@ -145,7 +145,7 @@ async fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Update { action } => cursio_core::update::cli::run(action, &config_path).await,
-        Command::Apps { action } => cursio_core::apps::cli::run(action, &config_path),
+        Command::Apps { action } => cursio_core::apps::cli::run(action, &config_path).await,
         Command::Config => {
             let config = cursio_core::config::Config::load(&config_path)?;
             let origin = match config_path.exists() {

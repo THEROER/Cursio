@@ -136,7 +136,28 @@ cursio apps publish leavepulse --version 0.6.1 \
     windows-x86_64=target/x86_64-pc-windows-msvc/release/leavepulse-launcher.exe \
     linux-x86_64=target/release/leavepulse-launcher
 cursio apps status
+cursio apps launch Lightmoon leavepulse --restart
+cursio apps ship leavepulse --to Lightmoon windows-x86_64=target/.../leavepulse-launcher.exe
 ```
+
+**Starting it from another machine** (`core/src/apps/launch.rs`) is a diag
+request, `DiagRequest::Launch`, so it rides what `cursio restart` does. The
+request names an application and a component, never a path: only a build
+the `apps` module installed can start, and `--restart` ends only processes
+whose executable lies in that application's install root. `ship` is publish,
+then launch with the version until the machine answers that it is current —
+its refusals ("not current here yet; last: refused …") are the progress.
+
+**As whom.** A build asks for administrator rights per file
+(`cursio apps publish --admin <file>`, `Component::admin` in the signed
+manifest); the receiving machine answers once per application
+(`[apps.<id>] admin = "ask" | "allow" | "deny"`, default `ask`, raised as a
+problem with both answers as buttons). Without the ask, or answered `deny`,
+it runs as the person — on Windows with the desktop shell's token even
+when the node is elevated, since a child of the elevated node would inherit
+its token. Answered `allow`: an elevated node starts it directly, an
+unelevated one through `runas`, so Windows' own prompt confirms each start;
+on Linux through `pkexec`.
 
 `publish` needs no running node: it signs into the application's store with
 this machine's builder key (`cursio update key`), and the node offers it to
@@ -148,7 +169,7 @@ On the receiving machine:
 
 | Machine | Install | Switch |
 |---|---|---|
-| Windows / Linux | `apps/<app>/versions/<v>/` + `current` + rollback, the `InstallLayout` of `update-design.md`, rooted per app | `current` is pointed at it at once and every running copy hears `NodeMsg::BuildReady` (the SDK's `on_update`); when to restart into it is the application's choice. Relaunching a copy that is not running is not built: a node that self-elevates on Windows would start it elevated |
+| Windows / Linux | `apps/<app>/versions/<v>/` + `current` + rollback, the `InstallLayout` of `update-design.md`, rooted per app | `current` is pointed at it at once and every running copy hears `NodeMsg::BuildReady` (the SDK's `on_update`); when to restart into it is the application's choice. Starting it is asked for (`cursio apps launch`, below) |
 | Windows, NSIS bundle (not built) | the installer is run with `/S` once, its exit code is the result | as above |
 | Android | the APK is handed to the system installer through the phone's notification (built for Cursio's own APK, `crates/android/src/node/update.rs`) | the person taps |
 

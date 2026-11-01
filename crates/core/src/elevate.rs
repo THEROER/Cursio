@@ -135,11 +135,6 @@ pub fn is_elevated() -> bool {
 /// declined. Arguments are forwarded so the new process runs the same command.
 #[cfg(target_os = "windows")]
 fn relaunch_as_admin() -> Result<bool, String> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::ERROR_CANCELLED;
-    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
-    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
-
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
 
     // Rebuild the command line, quoting each argument so paths with spaces
@@ -149,10 +144,29 @@ fn relaunch_as_admin() -> Result<bool, String> {
         .map(|a| format!("\"{}\"", a.replace('"', "\\\"")))
         .collect::<Vec<_>>()
         .join(" ");
+    // An elevated process cannot share an unelevated console, so the copy
+    // always gets a new one; it is shown only if this one had one to show.
+    run_as_admin(&exe, &args, None, has_console())
+}
+
+/// Start `exe` with `args` through the `runas` verb: Windows' own UAC prompt,
+/// on this machine's screen, decides. `Ok(false)` when the person declined.
+#[cfg(target_os = "windows")]
+pub fn run_as_admin(
+    exe: &std::path::Path,
+    args: &str,
+    dir: Option<&std::path::Path>,
+    show: bool,
+) -> Result<bool, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_CANCELLED;
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 
     let verb = to_wide("runas");
     let file = to_wide(&exe.to_string_lossy());
-    let params = to_wide(&args);
+    let params = to_wide(args);
+    let directory = dir.map(|d| to_wide(&d.to_string_lossy()));
 
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -160,13 +174,10 @@ fn relaunch_as_admin() -> Result<bool, String> {
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(params.as_ptr()),
-        // An elevated process cannot share an unelevated console, so the copy
-        // always gets a new one; it is shown only if this one had one to show.
-        nShow: if has_console() {
-            SW_SHOWNORMAL.0
-        } else {
-            SW_HIDE.0
-        },
+        lpDirectory: directory
+            .as_ref()
+            .map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
+        nShow: if show { SW_SHOWNORMAL.0 } else { SW_HIDE.0 },
         ..Default::default()
     };
 

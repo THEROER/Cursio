@@ -102,6 +102,7 @@ export type ConfigEdit =
         builder: { peer: string; name: string; key: string };
       };
     }
+  | { app_admin: { app: string; consent: "ask" | "allow" | "deny" } }
 
 export interface ProblemAction {
   label: string

@@ -39,20 +39,195 @@ pub enum AppsAction {
         /// absent.
         #[arg(long)]
         version: Option<String>,
+        /// Mark this file of the build as asking to run as an administrator;
+        /// each receiving machine's person answers that once.
+        #[arg(long, value_name = "FILE")]
+        admin: Vec<String>,
+        #[arg(required = true, value_name = "[PLATFORM=]FILE")]
+        files: Vec<String>,
+    },
+    /// Start an application's current build on a connected machine.
+    Launch {
+        machine: String,
+        app: String,
+        /// Start it only once this version is current there.
+        #[arg(long)]
+        version: Option<String>,
+        /// The file of the build to run, when it has several.
+        #[arg(long)]
+        component: Option<String>,
+        /// End the copies already running from its install first.
+        #[arg(long)]
+        restart: bool,
+    },
+    /// Publish a build, wait until it is current on `--to`, and start it
+    /// there: the whole round from a build on this machine to it running on
+    /// another.
+    Ship {
+        app: String,
+        /// The machine to run it on (`all` for every connected one that
+        /// takes it).
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long, value_name = "FILE")]
+        admin: Vec<String>,
+        #[arg(long)]
+        component: Option<String>,
+        /// Install only; start nothing.
+        #[arg(long)]
+        no_launch: bool,
+        /// How long to wait for the build to arrive, in seconds.
+        #[arg(long, default_value_t = 300)]
+        wait: u64,
         #[arg(required = true, value_name = "[PLATFORM=]FILE")]
         files: Vec<String>,
     },
 }
 
-pub fn run(action: AppsAction, config_path: &Path) -> anyhow::Result<()> {
+pub async fn run(action: AppsAction, config_path: &Path) -> anyhow::Result<()> {
     let root = InstallLayout::for_user()?.root().join(APPS_DIR);
     match action {
         AppsAction::Status => status(&root, config_path),
         AppsAction::Publish {
             app,
             version,
+            admin,
             files,
-        } => publish(&root, &app, version, &files),
+        } => publish(&root, &app, version, &admin, &files).map(drop),
+        AppsAction::Launch {
+            machine,
+            app,
+            version,
+            component,
+            restart,
+        } => {
+            let what = launch(&machine, &app, version, component, restart, true).await?;
+            println!("{machine}: {what}");
+            Ok(())
+        }
+        AppsAction::Ship {
+            app,
+            to,
+            version,
+            admin,
+            component,
+            no_launch,
+            wait,
+            files,
+        } => {
+            let version = publish(&root, &app, version, &admin, &files)?;
+            ship(&to, &app, &version, component, !no_launch, wait).await
+        }
+    }
+}
+
+async fn client() -> anyhow::Result<crate::control::transport::Client> {
+    let endpoint = crate::control::transport::endpoint()?;
+    let (client, _pushes) = crate::control::transport::connect(&endpoint)
+        .await
+        .map_err(|e| anyhow::anyhow!("no running node to ask ({e}); start `cursio mesh` first"))?;
+    Ok(client)
+}
+
+async fn launch(
+    machine: &str,
+    app: &str,
+    version: Option<String>,
+    component: Option<String>,
+    restart: bool,
+    start: bool,
+) -> anyhow::Result<String> {
+    use crate::control::{Command, Reply};
+    let command = Command::Launch {
+        machine: machine.to_owned(),
+        app: app.to_owned(),
+        version,
+        component,
+        restart,
+        start,
+    };
+    match client().await?.request(command).await? {
+        Reply::Launched { what } => Ok(what),
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("the running node answered {other:?}"),
+    }
+}
+
+/// Machines `to` names: one, or every connected desktop for `all`.
+async fn targets(to: &str) -> anyhow::Result<Vec<String>> {
+    use crate::control::{Command, Reply};
+    if to != "all" {
+        return Ok(vec![to.to_owned()]);
+    }
+    let Reply::Status(status) = client().await?.request(Command::Status).await? else {
+        anyhow::bail!("the running node did not answer with its status");
+    };
+    // Machines whose link carries the apps module: those that can take it.
+    Ok(status
+        .peers
+        .iter()
+        .filter(|p| {
+            p.link
+                .as_ref()
+                .is_some_and(|l| l.modules.iter().any(|m| m == "apps"))
+        })
+        .map(|p| p.name.clone())
+        .collect())
+}
+
+/// Wait until `version` of `app` is current on each target, then start it.
+async fn ship(
+    to: &str,
+    app: &str,
+    version: &str,
+    component: Option<String>,
+    start: bool,
+    wait: u64,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    let mut failed = Vec::new();
+    for machine in targets(to).await? {
+        println!("{machine}: waiting for {app} {version}…");
+        let mut said = String::new();
+        loop {
+            // A launch that names the version is refused until it is current
+            // there, with why, which is the progress worth showing.
+            let attempt = launch(
+                &machine,
+                app,
+                Some(version.to_owned()),
+                component.clone(),
+                start,
+                start,
+            )
+            .await;
+            match attempt {
+                Ok(what) => {
+                    println!("{machine}: {what}");
+                    break;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let waiting = message.contains("not current here yet");
+                    if !waiting || std::time::Instant::now() >= deadline {
+                        println!("{machine}: {message}");
+                        failed.push(machine.clone());
+                        break;
+                    }
+                    if message != said {
+                        println!("{machine}: {message}");
+                        said = message;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            }
+        }
+    }
+    match failed.is_empty() {
+        true => Ok(()),
+        false => anyhow::bail!("{app} {version} did not reach {}", failed.join(", ")),
     }
 }
 
@@ -79,12 +254,15 @@ fn by_platform(files: &[String]) -> anyhow::Result<BTreeMap<String, Vec<PathBuf>
     Ok(grouped)
 }
 
+/// Sign `files` into `app`'s store as one build, answering its version.
+/// `admin` names files (by file name) that ask to run as an administrator.
 fn publish(
     root: &Path,
     app: &str,
     version: Option<String>,
+    admin: &[String],
     files: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let id = AppId::parse(app).map_err(|e| anyhow::anyhow!("{e}"))?;
     let version = version.unwrap_or_else(|| format!("dev.{}", now()));
     if !crate::update::layout::valid_version(&version) {
@@ -116,8 +294,20 @@ fn publish(
             names.push(name);
         }
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        Manifest::describe(&dir, &version, &refs)?.write(&dir)?;
+        let mut manifest = Manifest::describe(&dir, &version, &refs)?;
+        for component in manifest.components.values_mut() {
+            component.admin = admin.contains(&component.path);
+        }
+        manifest.write(&dir)?;
         builds.push((platform, dir));
+    }
+    if let Some(unknown) = admin.iter().find(|name| {
+        !builds
+            .iter()
+            .any(|(_, dir)| dir.join(name.as_str()).is_file())
+    }) {
+        let _ = std::fs::remove_dir_all(&staging);
+        anyhow::bail!("--admin {unknown} names no file of this build; name it by file name");
     }
     let key = BuilderKey::load_or_create()?;
     let statement = store.publish(&key, Channel::Dev, &builds, now());
@@ -138,7 +328,7 @@ fn publish(
     for gone in store.prune(3) {
         println!("stopped holding {gone}");
     }
-    Ok(())
+    Ok(statement.version)
 }
 
 fn status(root: &Path, config_path: &Path) -> anyhow::Result<()> {

@@ -232,6 +232,25 @@ impl Exchange for Diag {
                 tracing::info!(?what, "a peer asked this node for maintenance");
                 maintain(*what).map(|()| DiagResponse::Maintaining(*what))
             }
+            DiagRequest::Launch {
+                app,
+                version,
+                component,
+                restart,
+                start,
+            } => {
+                if *start {
+                    tracing::info!(%app, ?version, restart, "a peer asked this node to start an application");
+                }
+                crate::apps::launch::launch(
+                    app,
+                    version.as_deref(),
+                    component.as_deref(),
+                    *restart,
+                    *start,
+                )
+                .map(|what| DiagResponse::Launched { what })
+            }
         }
     }
 
@@ -263,6 +282,27 @@ impl Exchange for Diag {
             DiagRequest::Report { since_secs } => Ok(DiagRequest::Report {
                 since_secs: since_secs.min(MAX_REPORT_SPAN.as_secs()),
             }),
+            DiagRequest::Launch {
+                app,
+                version,
+                component,
+                restart,
+                start,
+            } => {
+                if version.as_ref().is_some_and(|v| v.len() > 128)
+                    || component.as_ref().is_some_and(|c| c.len() > 128)
+                {
+                    return Err("a version or a file name is at most 128 bytes".into());
+                }
+                cursio_app_protocol::AppId::parse(&app).map_err(|e| e.to_string())?;
+                Ok(DiagRequest::Launch {
+                    app,
+                    version,
+                    component,
+                    restart,
+                    start,
+                })
+            }
             other @ (DiagRequest::Paths { .. } | DiagRequest::Maintain(_)) => Ok(other),
         }
     }

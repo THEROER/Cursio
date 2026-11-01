@@ -89,6 +89,14 @@ impl Builds {
         Some(agent)
     }
 
+    /// This machine's settings for `app`, read now.
+    pub fn app_config(&self, app: &str) -> crate::config::AppConfig {
+        Config::load(&self.config_path)
+            .ok()
+            .and_then(|config| config.apps.get(app).cloned())
+            .unwrap_or_default()
+    }
+
     /// Every application with an agent, and every one with builds on disk.
     pub fn known(&self) -> Vec<Arc<Agent>> {
         if let Ok(entries) = std::fs::read_dir(&self.root) {

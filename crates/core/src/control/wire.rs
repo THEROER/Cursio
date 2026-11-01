@@ -120,6 +120,11 @@ impl ModuleSwitch {
     }
 }
 
+/// A launch starts the application unless it says otherwise.
+fn starts() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
@@ -320,6 +325,20 @@ pub enum Command {
         machine: String,
         what: cursio_protocol::diag::Maintenance,
     },
+    /// Start application `app`'s current build on a connected machine; see
+    /// [`cursio_protocol::diag::DiagRequest::Launch`].
+    Launch {
+        machine: String,
+        app: String,
+        #[serde(default)]
+        version: Option<String>,
+        #[serde(default)]
+        component: Option<String>,
+        #[serde(default)]
+        restart: bool,
+        #[serde(default = "starts")]
+        start: bool,
+    },
     /// Report the paths of the session with `peer` from both ends, first
     /// choosing `choice` on both when given; see
     /// [`cursio_protocol::diag::PathChoice`].
@@ -475,6 +494,7 @@ impl Command {
                     | Command::Paths { .. }
                     | Command::Report { .. }
                     | Command::Maintain { .. }
+                    | Command::Launch { .. }
             )
     }
 }
@@ -550,6 +570,10 @@ pub enum Reply {
     },
     /// How a machine has fared; see [`Command::Report`].
     Report(Box<cursio_protocol::diag::NodeReport>),
+    /// What a machine started for [`Command::Launch`].
+    Launched {
+        what: String,
+    },
     /// The session with a peer as each end sees it. `there` is absent when
     /// the peer could not be asked, and `there_error` says why.
     Paths {

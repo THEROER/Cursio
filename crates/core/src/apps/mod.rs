@@ -17,6 +17,7 @@
 pub mod builds;
 pub mod cli;
 pub mod lane;
+pub mod launch;
 pub mod serve;
 
 use std::collections::BTreeMap;

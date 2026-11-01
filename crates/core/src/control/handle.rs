@@ -129,6 +129,27 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                 Err(message) => Reply::Error { message },
             }
         }
+        Command::Launch {
+            machine,
+            app,
+            version,
+            component,
+            restart,
+            start,
+        } => {
+            let request = DiagRequest::Launch {
+                app: app.clone(),
+                version: version.clone(),
+                component: component.clone(),
+                restart: *restart,
+                start: *start,
+            };
+            match hub.ask(machine, request).await {
+                Ok(DiagResponse::Launched { what }) => Reply::Launched { what },
+                Ok(other) => error(format!("a launch was answered with {other:?}")),
+                Err(message) => Reply::Error { message },
+            }
+        }
         Command::Paths { peer, choice } => {
             let Some(id) = hub
                 .peers()
@@ -400,7 +421,8 @@ impl NodeState {
             Command::Logs { .. }
             | Command::Paths { .. }
             | Command::Report { .. }
-            | Command::Maintain { .. } => {
+            | Command::Maintain { .. }
+            | Command::Launch { .. } => {
                 error("logs and paths are asked through a desktop's control socket")
             }
         }

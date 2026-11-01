@@ -57,6 +57,7 @@ cursio logs all --since 10m --grep path     # every connected machine's log, mer
 cursio logs Lightmoon --app leavepulse -f   # an application's log, registered through cursio-sdk
 cursio apps publish leavepulse windows-x86_64=app.exe   # offer an application's build to the mesh
 cursio apps status                          # applications' builds held here, and whose are taken
+cursio apps ship leavepulse --to Lightmoon windows-x86_64=app.exe   # publish, wait until current there, start it
 cursio path Lightmoon [auto|network|bluetooth]   # see or choose the path, on both ends
 cursio report all --since 1d                # every machine's day: drops, warnings, memory
 cursio restart Lightmoon | apply-update Lightmoon   # maintain a machine through the mesh
