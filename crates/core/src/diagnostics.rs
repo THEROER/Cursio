@@ -66,10 +66,27 @@ pub struct Problem {
     /// Changes the person can make from where the problem is shown, each a
     /// button. A problem that is a decision the node made on the person's
     /// behalf offers both ways out, so answering it also ends it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "known_actions"
+    )]
     pub actions: Vec<ProblemAction>,
     /// When the condition was first seen. Kept across repeated raises.
     pub since: SystemTime,
+}
+
+/// The buttons this build knows, leaving out any a newer node offers: the
+/// app reads the status whole, and one button it had no name for failed the
+/// read, so it showed the status from before that problem — without it.
+fn known_actions<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ProblemAction>, D::Error> {
+    let raw: Vec<serde_json::Value> = Deserialize::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|action| serde_json::from_value(action).ok())
+        .collect())
 }
 
 /// One button on a problem: what it says, and the config change it makes.
@@ -183,6 +200,21 @@ mod tests {
     use super::*;
     use crate::config::BluetoothMesh;
     use std::time::Duration;
+
+    #[test]
+    fn a_button_from_a_newer_node_is_left_out_rather_than_failing_the_problem() {
+        let json = r#"{
+            "id": "app.x.refused", "severity": "Warning", "summary": "s", "hint": null,
+            "since": {"secs_since_epoch": 1, "nanos_since_epoch": 0},
+            "actions": [
+                {"label": "new", "edit": {"something_newer": {"a": 1}}},
+                {"label": "old", "edit": {"bluetooth_mesh": "on"}}
+            ]
+        }"#;
+        let problem: Problem = serde_json::from_str(json).unwrap();
+        assert_eq!(problem.actions.len(), 1);
+        assert_eq!(problem.actions[0].label, "old");
+    }
 
     /// The registry is process-wide and tests run in parallel, so each test
     /// names its own ids and reads back only those.
