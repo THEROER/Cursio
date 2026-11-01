@@ -1200,6 +1200,7 @@ dependencies = [
  "clap",
  "clipboard-core",
  "cursio-airplay",
+ "cursio-app-protocol",
  "cursio-audio",
  "cursio-bluetooth",
  "cursio-files",
@@ -1207,6 +1208,7 @@ dependencies = [
  "cursio-log",
  "cursio-protocol",
  "cursio-queue",
+ "cursio-sdk",
  "cursio-transport",
  "cursio-usb",
  "cursio-window",
@@ -1303,6 +1305,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "cursio-sdk"
+version = "0.1.0"
+dependencies = [
+ "cursio-app-protocol",
+ "tokio",
 ]
 
 [[package]]

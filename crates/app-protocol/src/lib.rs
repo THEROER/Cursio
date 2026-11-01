@@ -262,10 +262,12 @@ pub fn runtime_dir() -> PathBuf {
 #[cfg_attr(unix, allow(dead_code))]
 fn pipe_safe(user: &str) -> String {
     user.chars()
-        .map(|c| match c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-            true => c,
-            false => '_',
-        })
+        .map(
+            |c| match c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                true => c,
+                false => '_',
+            },
+        )
         .collect()
 }
 
@@ -294,7 +296,10 @@ mod tests {
             text,
             "{\"msg\":\"hello\",\"protocol\":1,\"app\":\"leavepulse\",\"version\":\"0.6.0\",\"pid\":42,\"logs\":{\"dir\":\"/home/u/.local/share/leavepulse/logs\",\"file\":\"leavepulse.log\"}}\n"
         );
-        assert_eq!(decode_line::<ClientMsg>(text.trim_end().as_bytes()).unwrap(), hello);
+        assert_eq!(
+            decode_line::<ClientMsg>(text.trim_end().as_bytes()).unwrap(),
+            hello
+        );
     }
 
     #[test]

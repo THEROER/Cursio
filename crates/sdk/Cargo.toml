@@ -1,0 +1,13 @@
+[package]
+name = "cursio-sdk"
+version = "0.1.0"
+edition.workspace = true
+# Linked into applications of any license: depends on nothing GPL, takes no
+# code from Cursio's GPL crates, and reaches the node only over its socket.
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+description = "Put an application on a Cursio mesh: let the node on its machine carry its logs, and more"
+
+[dependencies]
+cursio-app-protocol.workspace = true
+tokio.workspace = true

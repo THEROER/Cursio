@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/protocol",
     "crates/app-protocol",
+    "crates/sdk",
     "crates/queue",
     "crates/logging",
     "crates/clipboard-core",
@@ -33,6 +34,7 @@ repository = "https://github.com/THEROER/cursio"
 cursio-queue = { path = "crates/queue" }
 cursio-protocol = { path = "crates/protocol" }
 cursio-app-protocol = { path = "crates/app-protocol" }
+cursio-sdk = { path = "crates/sdk" }
 cursio-transport = { path = "crates/transport" }
 cursio-bluetooth = { path = "crates/bluetooth" }
 cursio-airplay = { path = "crates/airplay" }
