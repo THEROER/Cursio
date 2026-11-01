@@ -20,6 +20,26 @@ contains them is a GPL-3.0 work whatever the rest of the source says:
 Licensing the libraries permissively while every shipped binary is GPL would
 describe a choice nobody can actually make, so the whole project is GPL.
 
+## Where the GPL code sits
+
+Both components are kept to builds that ask for them, so a product that
+embeds Cursio can leave them out. The declared licenses above are unchanged;
+this is what makes a different one possible later.
+
+| GPL code | Comes in through | Left out by |
+|---|---|---|
+| playfair | the `airplay` feature of `cursio-core` (in `desktop`) | building without `airplay`; keeping AirPlay without it in the node is designed in [`docs/airplay-sidecar-design.md`](docs/airplay-sidecar-design.md) |
+| winfsp, winfsp-sys | the `files-mount` feature of `cursio-core` (`cursio-files/mount`, in `desktop`), Windows MSVC only | building with `files` but without `files-mount`: the node then serves its disks and mounts a peer's through the separate `cursio-mount-helper` executable, the only one that links WinFsp |
+
+`cargo xtask license-check [--no-default-features] [--features …] [--target …]`
+resolves one build of a package and fails if it links GPL or AGPL code —
+dependencies by their license field, and playfair, which no field can show,
+by name. Run it for any feature set an embedding product uses.
+
+Separate executables are separate programs: the drive helper, like the
+Windows audio driver below, is started by the node and talks to it over a
+pipe, and nothing of it is compiled into the node.
+
 ## Vendored source
 
 | Path | Origin | License |

@@ -24,6 +24,7 @@ Linux native builds need `OPUS_TARGET=ubuntu-24.04_x86_64` (`cargo xtask` sets i
 ```sh
 cargo xtask build | install | macos | windows | android | logs --follow
 cargo xtask deploy [--windows-only|--linux-only] [--no-restart]   # ship to the Windows peer (.env), restart there
+cargo xtask license-check --no-default-features --features audio,input,window,files [--target T]   # fail if this build links GPL code
 cargo xtask live-test [--seconds N] [--yes]                       # PASS/FAIL over both real machines
 ```
 
@@ -203,6 +204,8 @@ PipeWire and WASAPI both run thread-bound main loops, so each stream owns a dedi
 Request/response, never push: a volume is far larger than any link, so nothing crosses until a program actually asks. Requests are **untrusted input** — a path is a string off a socket, not something this process built.
 
 FUSE calls block their own threads and expect an answer before returning; the session that fetches bytes is async. `bridge.rs` joins them **without** `block_on` (which deadlocks the runtime). Disk I/O and compression run on the dedicated pool in `background.rs`, deliberately kept out of the way of the cursor.
+
+Windows mounting links WinFsp's GPL bindings, so it is its own feature, `files-mount` (in `desktop`), and its own executable, `cursio-mount-helper`: a node built with `files` alone serves its disks and mounts a peer's through that helper, linking no GPL code itself (`core/src/mount_helper.rs`, `THIRD-PARTY.md`). Keep anything WinFsp behind `feature = "mount"` in `cursio-files`.
 
 ### Clipboard
 
