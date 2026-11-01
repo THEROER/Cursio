@@ -752,7 +752,10 @@ mod tests {
             .into_iter()
             .find(|p| p.id == "app.leavepulse.refused")
             .expect("the refusal is the application's own");
-        assert_eq!(problem.actions[0].label, "Take leavepulse builds from Nocturne");
+        assert_eq!(
+            problem.actions[0].label,
+            "Take leavepulse builds from Nocturne"
+        );
         assert!(matches!(
             problem.actions[0].edit,
             ConfigEdit::TrustAppBuilder { ref app, .. } if app == "leavepulse"

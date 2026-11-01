@@ -335,8 +335,12 @@ impl Music {
             let captured = hub().phone_sound_captured(&self.name);
             if captured != self.captured {
                 match &captured {
-                    Some(to) => tracing::info!(phone = %self.name, %to, "the phone's sound already goes to the device chosen for it; its Bluetooth copy plays nowhere"),
-                    None => tracing::info!(phone = %self.name, "the phone's sound no longer goes anywhere by capture; playing its Bluetooth copy"),
+                    Some(to) => {
+                        tracing::info!(phone = %self.name, %to, "the phone's sound already goes to the device chosen for it; its Bluetooth copy plays nowhere")
+                    }
+                    None => {
+                        tracing::info!(phone = %self.name, "the phone's sound no longer goes anywhere by capture; playing its Bluetooth copy")
+                    }
                 }
                 self.captured = captured;
             }
