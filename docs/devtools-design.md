@@ -187,9 +187,9 @@ either, so `cursio mcp` speaks CDP itself for the common cases:
 | `web_click`, `web_fill` | resolve a selector, dispatch input | changes state |
 | `web_eval` | `Runtime.evaluate` | **runs code**; its own MCP annotation |
 
-The web view's console also becomes a log: `cursio logs Lightmoon --app
-leavepulse/console` while a DevTools session is open, merged by time with the
-app's own log.
+The web view's console also becomes a log: while a machine is allowed to
+inspect the app, `cursio logs Lightmoon --app leavepulse/console` reads it,
+merged by time with the app's own log.
 
 ### Built (CDP)
 
@@ -247,8 +247,22 @@ app's own log.
   fetched only when asked — `body_for` names part of a URL, and the newest
   finished request matching it is read with `Network.getResponseBody`, cut at
   64 KiB, binary bodies only measured. Read only.
-- **Not built**: the console as a `cursio logs` source,
-  `--launch`, discovery of rungs in `apps status`, a notification and tray
+- **The console as a log** (`core/src/apps/devtools_console.rs`): the first
+  stream a granted machine opens into an application starts, on the owning
+  machine, one watcher per application. It connects to the page straight on
+  the loopback port (no tunnel, no token), enables `Runtime` and `Log`, and
+  writes every console call, uncaught exception and browser log entry
+  through the node-kept app logs as process `console` — the page's own time
+  in UTC to the microsecond first, then `ERROR`/`WARN`/`INFO`/`DEBUG`, then
+  the line `web_console` would show. The registry records that log like a
+  process's, so `cursio logs Lightmoon --app leavepulse/console` (or the
+  whole app, merged) reads it during the session and after. The watcher
+  checks every 3 s that one of the machines it serves still holds a grant
+  and stops with *Stop* or the end of the hour; it reconnects while allowed
+  when the page goes away. `Runtime.enable` replays earlier messages, so the
+  newest page time written per application is remembered and nothing at or
+  before it is written twice.
+- **Not built**: `--launch`, discovery of rungs in `apps status`, a notification and tray
   entry beyond the problem, WebKitGTK through WebDriver, and a live run
   against a deployed WebView2 application.
 
@@ -285,6 +299,6 @@ trusted with input and files already. What this design adds on top:
    (**built**).
 2. Rung 5's tunnel with the token, the time-limited consent, the visible
    indicator and the audit line (**built**).
-3. The `web_*` tools in `cursio mcp` (**built**), and the web view's console
-   as a log.
+3. The `web_*` tools in `cursio mcp`, and the web view's console as a log
+   (**built**).
 4. WebKitGTK through WebDriver, as its own mode.

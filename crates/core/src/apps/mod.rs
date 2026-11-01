@@ -21,6 +21,8 @@ pub mod blobs;
 pub mod builds;
 pub mod cli;
 pub mod devtools;
+#[cfg(feature = "web-tools")]
+pub mod devtools_console;
 pub mod lane;
 pub mod launch;
 pub mod mesh;
@@ -314,6 +316,32 @@ impl Registry {
         }
     }
 
+    /// `key`'s log is kept by the node although no process connects as
+    /// `key`: the web view's console, which the node reads itself while a
+    /// DevTools session lasts. Recorded like any process's, so `cursio logs
+    /// --app <id>/console` finds it after the session and after a restart.
+    pub fn kept_without_process(&mut self, key: &Key, spec: LogSpec) -> bool {
+        if !self.apps.contains_key(key) {
+            let version = self.version(&key.app).unwrap_or_default();
+            self.apps.insert(
+                key.clone(),
+                Registered {
+                    version,
+                    pid: None,
+                    logs: None,
+                    health: HealthState::default(),
+                    detail: None,
+                    connections: 0,
+                    actions: Vec::new(),
+                    topics: Vec::new(),
+                    blobs: false,
+                    devtools: None,
+                },
+            );
+        }
+        self.logs_through_node(key, spec)
+    }
+
     /// What `key`'s process declared it can be asked to do.
     pub fn set_actions(&mut self, key: &Key, actions: Vec<cursio_app_protocol::ActionSpec>) {
         if let Some(entry) = self.apps.get_mut(key) {
@@ -518,6 +546,41 @@ mod tests {
             "both survive a restart, the main process first"
         );
         assert_eq!(registry.version(&window.app).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_log_the_node_keeps_without_a_process_is_found_and_never_runs() {
+        let file = scratch().join("apps.json");
+        let main = key("launcher", None);
+        let console = key("launcher", Some("console"));
+        let kept = LogSpec {
+            dir: "/data/apps/launcher/logs".into(),
+            file: "console.log".into(),
+        };
+        {
+            let mut registry = Registry::load(Some(file.clone()));
+            registry.connected(&main, "3".into(), 1, Some(spec()));
+            assert!(registry.kept_without_process(&console, kept.clone()));
+            assert!(!registry.get(&console).unwrap().running());
+            assert_eq!(registry.get(&console).unwrap().version, "3");
+            assert!(registry.pids(&main.app) == vec![1]);
+        }
+        let registry = Registry::load(Some(file));
+        assert!(registry
+            .logs(&main.app)
+            .contains(&(console.process.clone(), kept)));
+    }
+
+    #[test]
+    fn a_process_with_its_own_log_file_is_not_given_the_node_kept_one() {
+        let mut registry = Registry::load(None);
+        let console = key("launcher", Some("console"));
+        registry.connected(&console, "1".into(), 1, Some(spec()));
+        let kept = LogSpec {
+            dir: "/data/apps/launcher/logs".into(),
+            file: "console.log".into(),
+        };
+        assert!(!registry.kept_without_process(&console, kept));
     }
 
     #[test]

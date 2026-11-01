@@ -281,6 +281,12 @@ pub fn on_wire(peer: &str, app: &str, wire: AppsWire) {
                 MeshWire.send(&peer, &app, AppsWire::TunnelOpened { stream, error });
                 if let Ok(socket) = opened {
                     let id = AppId::parse(&app).expect("checked when opened");
+                    #[cfg(feature = "web-tools")]
+                    super::devtools_console::watch(
+                        &peer,
+                        &id,
+                        process.as_deref().and_then(|p| ProcessName::parse(p).ok()),
+                    );
                     let still_peer = peer.clone();
                     let still: Box<dyn Fn() -> bool + Send + Sync> =
                         Box::new(move || super::devtools::still_allowed(&still_peer, &id));
