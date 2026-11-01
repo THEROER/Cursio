@@ -297,6 +297,7 @@ impl NodeState {
         let mut running = self.running_config();
         if *running != next {
             (self.applier)(&running, &next);
+            crate::apps::consent_answered(&next);
             self.inner().node.position = next.position;
             *running = next;
             self.changed();

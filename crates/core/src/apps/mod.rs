@@ -415,6 +415,31 @@ pub fn registry() -> &'static Arc<Mutex<Registry>> {
     })
 }
 
+/// Take down the questions `config` now answers: an application's actions,
+/// administrator rights and devtools, and a phone package's access.
+///
+/// Each question is raised when a request arrives and was otherwise taken
+/// down only by the next request; pressing its button saved the answer and
+/// left the question on screen, looking ignored, until the other machine
+/// happened to ask again.
+pub fn consent_answered(config: &crate::config::Config) {
+    use crate::config::{AdminConsent, DevtoolsConsent};
+    for (app, settings) in &config.apps {
+        if settings.actions != AdminConsent::Ask {
+            crate::diagnostics::clear(&format!("app.{app}.actions"));
+        }
+        if settings.admin != AdminConsent::Ask {
+            crate::diagnostics::clear(&format!("app.{app}.admin"));
+        }
+        if settings.devtools == DevtoolsConsent::Deny || !settings.devtools_grants.is_empty() {
+            crate::diagnostics::clear(&format!("app.{app}.devtools"));
+        }
+    }
+    for grant in &config.package_access {
+        crate::diagnostics::clear(&format!("android.package.{}", grant.package));
+    }
+}
+
 /// Where `app`'s processes said they log, on this node — only `process`'s
 /// when one is named.
 pub fn logs_of(app: &AppId, process: Option<&ProcessName>) -> Vec<(Option<ProcessName>, LogSpec)> {
