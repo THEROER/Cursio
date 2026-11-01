@@ -33,7 +33,7 @@ repository = "https://github.com/THEROER/cursio"
 # Internal crates
 cursio-queue = { path = "crates/queue" }
 cursio-protocol = { path = "crates/protocol" }
-cursio-app-protocol = { path = "crates/app-protocol", version = "0.5.0" }
+cursio-app-protocol = { path = "crates/app-protocol", version = "0.6.0" }
 cursio-sdk = { path = "crates/sdk" }
 cursio-transport = { path = "crates/transport" }
 cursio-bluetooth = { path = "crates/bluetooth" }

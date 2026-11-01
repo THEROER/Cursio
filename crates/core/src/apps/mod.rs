@@ -16,6 +16,7 @@
 
 pub mod access;
 pub mod actions;
+pub mod app_logs;
 pub mod blobs;
 pub mod builds;
 pub mod cli;
@@ -275,6 +276,15 @@ impl Registry {
             blobs: false,
             devtools: None,
         });
+        // A process whose lines the node keeps says nothing about a log in
+        // its hello; forgetting the file at every reconnect would leave its
+        // log unreadable until it next logged — and for good if it never did.
+        let logs = logs.or_else(|| {
+            entry
+                .logs
+                .clone()
+                .filter(|spec| app_logs::app_logs().keeps(spec))
+        });
         let changed = entry.version != version || entry.logs != logs;
         entry.version = version;
         entry.pid = Some(pid);
@@ -283,6 +293,24 @@ impl Registry {
         self.generation += 1;
         if changed {
             self.save();
+        }
+    }
+
+    /// `key`'s log is `spec`, which the node keeps from the lines it sends —
+    /// unless it named a file of its own, which wins. Answers whether the
+    /// node is to keep its lines.
+    pub fn logs_through_node(&mut self, key: &Key, spec: LogSpec) -> bool {
+        let Some(entry) = self.apps.get_mut(key) else {
+            return false;
+        };
+        match &entry.logs {
+            Some(own) if *own != spec => false,
+            Some(_) => true,
+            None => {
+                entry.logs = Some(spec);
+                self.save();
+                true
+            }
         }
     }
 

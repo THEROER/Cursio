@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-app-protocol"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1314,11 +1314,13 @@ dependencies = [
 
 [[package]]
 name = "cursio-sdk"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cursio-app-protocol",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -605,6 +605,39 @@ pub enum ClientMsg {
         entries: Vec<BlobEntry>,
         dest: PathBuf,
     },
+    /// Log lines, oldest first, for the node to keep in a file of its own:
+    /// the way to a readable log for a process whose own files the node
+    /// cannot open — an Android app's private directory — or that keeps
+    /// none. `dropped` lines were lost before these, because the process
+    /// produced them faster than they could leave; left out when none.
+    Log {
+        lines: Vec<String>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        dropped: u64,
+    },
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Longest log line kept, in bytes; a longer one is cut at a character.
+pub const MAX_LOG_LINE: usize = 8 * 1024;
+
+/// Most bytes of lines one [`ClientMsg::Log`] carries, well inside
+/// [`MAX_LINE`] with JSON's escaping.
+pub const MAX_LOG_BATCH: usize = 256 * 1024;
+
+/// `line` cut to at most [`MAX_LOG_LINE`] bytes, at a character boundary.
+pub fn clip_log_line(line: &str) -> &str {
+    if line.len() <= MAX_LOG_LINE {
+        return line;
+    }
+    let mut end = MAX_LOG_LINE;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 impl ClientMsg {
@@ -1126,6 +1159,39 @@ mod tests {
             no_such_action("leavepulse", "foo", &[]),
             "leavepulse declares no actions"
         );
+    }
+
+    #[test]
+    fn log_lines_have_pinned_bytes_and_leave_out_a_zero_drop_count() {
+        let log = ClientMsg::Log {
+            lines: vec!["2026-11-01T10:00:00.000000Z  INFO app: up".into()],
+            dropped: 0,
+        };
+        assert_eq!(
+            line(&log),
+            "{\"msg\":\"log\",\"lines\":[\"2026-11-01T10:00:00.000000Z  INFO app: up\"]}\n"
+        );
+        let lossy = ClientMsg::Log {
+            lines: Vec::new(),
+            dropped: 3,
+        };
+        assert_eq!(
+            line(&lossy),
+            "{\"msg\":\"log\",\"lines\":[],\"dropped\":3}\n"
+        );
+        assert_eq!(
+            decode_line::<ClientMsg>(line(&lossy).trim_end().as_bytes()).unwrap(),
+            lossy
+        );
+    }
+
+    #[test]
+    fn a_long_log_line_is_cut_at_a_character() {
+        let long = "я".repeat(MAX_LOG_LINE);
+        let cut = clip_log_line(&long);
+        assert!(cut.len() <= MAX_LOG_LINE);
+        assert!(cut.chars().all(|c| c == 'я'));
+        assert_eq!(clip_log_line("short"), "short");
     }
 
     #[test]

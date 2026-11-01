@@ -201,8 +201,26 @@ An application registers its log directory and file prefix. `diag`'s
 the node still never reads a path a peer named. `cursio logs Lightmoon --app
 leavepulse -f`, `cursio report all --app leavepulse --since 1d` and the merged
 `logs all` work unchanged, because `log_tail` and `log_report` read any
-`tracing` file. The SDK offers `cursio_sdk::tracing_layer()` so the format
-matches without the application adopting `cursio-log`.
+`tracing` file.
+
+**When the node cannot open the application's log** — an Android app writes
+in a private directory no other app may read, and some applications keep no
+log file — the lines come over the SDK's connection instead
+(`ClientMsg::Log`, built): `Cursio::log(level, target, message)`, or
+`cursio_sdk::tracing_layer(&cursio)` behind the SDK's `tracing` feature,
+which formats each event as `tracing`'s default formatter does (RFC 3339 UTC
+first). Neither ever waits: lines go on a queue of 1000, sent in batches every
+250 ms or at 64 lines; when the application logs faster than they leave, the
+oldest are dropped and the node writes how many where they were. The queue
+outlives a connection, so a start's lines from before the node answered
+arrive. The node keeps them in `<data>/apps/<app>/logs/<process|main>.log.
+<date>` (`core/src/apps/app_logs.rs`): daily files named as Cursio's own, 14
+days kept, at most 64 MiB a day per process — past it one line says so —
+lines cut at 8 KiB with their breaks flattened. The registry records that
+file as the process's log, kept across reconnects, so every reader above takes
+it unchanged, including after the application exits. A process that also
+named its own directory (`App::logs`) is read from there; the lines it sends
+are not kept twice.
 
 **Several processes, one application.** A launcher's window and its daemon
 both log, and both are the one application `leavepulse` — one build, one

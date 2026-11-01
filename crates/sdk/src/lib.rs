@@ -44,6 +44,12 @@ pub use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
+mod log;
+#[cfg(feature = "tracing")]
+pub use log::CursioLayer;
+pub use log::LogLevel;
+use log::LogShared;
+
 /// First wait before connecting again.
 const RETRY_MIN: Duration = Duration::from_millis(500);
 /// Longest wait between attempts, and the wait after the node refused.
@@ -420,10 +426,20 @@ impl App {
             .build()
             .map_err(|e| Error::Thread(e.to_string()))?;
         let link = shared.clone();
+        let logs = Arc::new(LogShared::default());
+        let queued = logs.clone();
         std::thread::Builder::new()
             .name("cursio-sdk".into())
             .spawn(move || {
-                runtime.block_on(run(endpoint, hello, link, health_rx, requests_rx, hooks))
+                runtime.block_on(run(
+                    endpoint,
+                    hello,
+                    link,
+                    health_rx,
+                    requests_rx,
+                    hooks,
+                    queued,
+                ))
             })
             .map_err(|e| Error::Thread(e.to_string()))?;
         Ok(Cursio {
@@ -431,6 +447,7 @@ impl App {
             health,
             requests,
             rejected,
+            logs,
         })
     }
 }
@@ -649,6 +666,23 @@ pub struct Cursio {
     health: watch::Sender<(HealthState, Option<String>)>,
     requests: mpsc::UnboundedSender<Request>,
     rejected: Vec<Rejected>,
+    logs: Arc<LogShared>,
+}
+
+/// A `tracing` layer that hands the application's events to its node, for
+/// `cursio logs <machine> --app <id>` to read anywhere — the way to a log
+/// for an application with no log file the node can open:
+///
+/// ```ignore
+/// use tracing_subscriber::layer::SubscriberExt;
+/// let cursio = cursio_sdk::App::new("my-app").start()?;
+/// tracing_subscriber::registry().with(cursio_sdk::tracing_layer(&cursio)).init();
+/// ```
+#[cfg(feature = "tracing")]
+pub fn tracing_layer(cursio: &Cursio) -> CursioLayer {
+    CursioLayer {
+        shared: cursio.logs.clone(),
+    }
 }
 
 impl std::fmt::Debug for Request {
@@ -664,6 +698,22 @@ impl Cursio {
     /// a debug build panics at them instead. Empty when all registered.
     pub fn rejected(&self) -> &[Rejected] {
         &self.rejected
+    }
+
+    /// Hand the node one log line, for it to keep in a file of its own that
+    /// `cursio logs <machine> --app <id>` reads — for an application with no
+    /// log file the node can open. Returns at once: the line is queued and
+    /// sent in a batch, kept while the node is away, and when the
+    /// application logs faster than lines leave, the oldest are dropped and
+    /// counted in the log. With [`App::logs`] given, the application's own
+    /// file is what the node reads, and these lines are not kept.
+    pub fn log(&self, level: LogLevel, target: &str, message: &str) {
+        self.logs.push(&log::format_line(
+            std::time::SystemTime::now(),
+            level,
+            target,
+            message,
+        ));
     }
 
     fn link(&self) -> Link {
@@ -921,12 +971,24 @@ async fn run(
     mut health: watch::Receiver<(HealthState, Option<String>)>,
     mut requests: mpsc::UnboundedReceiver<Request>,
     hooks: Hooks,
+    logs: Arc<LogShared>,
 ) {
     let set = |link: Link| *shared.lock().unwrap_or_else(|p| p.into_inner()) = link;
     let mut wait = RETRY_MIN;
     loop {
         let ended = match connect(&endpoint).await {
-            Ok(stream) => session(stream, &hello, &set, &mut health, &mut requests, &hooks).await,
+            Ok(stream) => {
+                session(
+                    stream,
+                    &hello,
+                    &set,
+                    &mut health,
+                    &mut requests,
+                    &hooks,
+                    &logs,
+                )
+                .await
+            }
             Err(_) => Ended::Closed,
         };
         match ended {
@@ -1017,6 +1079,22 @@ async fn read_line<R: AsyncRead + Unpin>(
     Ok(Some(line))
 }
 
+/// Send every queued log line, in batches. A batch the connection would not
+/// take goes back on the queue, for the next connection.
+async fn send_logs<W: AsyncWrite + Unpin>(write: &mut W, logs: &LogShared) -> std::io::Result<()> {
+    while let Some((lines, dropped)) = logs.take_batch() {
+        let line = encode_line(&ClientMsg::Log {
+            lines: lines.clone(),
+            dropped,
+        });
+        if let Err(error) = write.write_all(&line).await {
+            logs.put_back(lines, dropped);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// Abort a task when its owner is done with it.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -1033,6 +1111,7 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
     health: &mut watch::Receiver<(HealthState, Option<String>)>,
     requests: &mut mpsc::UnboundedReceiver<Request>,
     hooks: &Hooks,
+    logs: &LogShared,
 ) -> Ended {
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
@@ -1070,8 +1149,22 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
     // Requests sent and waiting for the node's answer, by id; dropped with
     // the session, which tells each waiter the node went.
     let mut waiting: BTreeMap<u64, std::sync::mpsc::Sender<NodeMsg>> = BTreeMap::new();
+    // The first tick is at once: lines queued before the node answered go
+    // out first.
+    let mut flush = tokio::time::interval(log::FLUSH_EVERY);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = flush.tick() => {
+                if send_logs(&mut write, logs).await.is_err() {
+                    return Ended::Closed;
+                }
+            }
+            () = logs.ready.notified() => {
+                if send_logs(&mut write, logs).await.is_err() {
+                    return Ended::Closed;
+                }
+            }
             Some(request) = requests.recv() => {
                 if write.write_all(&encode_line(&request.msg)).await.is_err() {
                     return Ended::Closed;

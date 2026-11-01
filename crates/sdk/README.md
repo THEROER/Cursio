@@ -23,6 +23,25 @@ abstract socket `@cursio-apps` — no Java or Kotlin on your side. The first
 connection asks the phone's person to let your app talk to Cursio under the
 id it registered; until then `start` keeps retrying in the background.
 
+## Logs without a log file the node can read
+
+An Android app's files are private, and some applications keep no log file.
+Send the lines instead, and the node keeps the file:
+
+```rust
+// With the `tracing` feature:
+use tracing_subscriber::layer::SubscriberExt;
+tracing_subscriber::registry().with(cursio_sdk::tracing_layer(&cursio)).init();
+// Or by hand:
+cursio.log(cursio_sdk::LogLevel::Info, "my_app::ui", "window opened");
+```
+
+Neither waits: lines are queued (1000 at most, the oldest dropped and
+counted) and sent in batches, and lines from before the node answered arrive
+once it does. `cursio logs <machine> --app my-app` then reads them like any
+log, also after the app exits. With `.logs(dir, file)` given, that file is
+read instead.
+
 ## Actions
 
 A running process can let another machine of the mesh — a person, or an AI

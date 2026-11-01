@@ -548,6 +548,19 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                     let feature = "hello after hello".to_owned();
                     let _ = out.send(NodeMsg::Unsupported { feature });
                 }
+                Ok(ClientMsg::Log { lines, dropped }) => {
+                    let keeper = super::app_logs::app_logs();
+                    let keep = lock(registry).logs_through_node(&key, keeper.spec(&key));
+                    if keep {
+                        if let Err(error) =
+                            keeper.append(&key, &lines, dropped, std::time::SystemTime::now())
+                        {
+                            tracing::warn!(%app, %error, "cannot keep an application's log lines");
+                        }
+                    } else {
+                        tracing::trace!(%app, "log lines from an application that logs to a file of its own");
+                    }
+                }
                 // Only the connection a call or question went out on answers it.
                 Ok(ClientMsg::Answer { id, ok, error }) => {
                     let result = match error {
@@ -1173,5 +1186,64 @@ mod tests {
             server.abort();
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn lines_an_application_sends_become_its_log_read_like_any_other() {
+        let dir = scratch("sdk-logs");
+        let path = dir.join("apps.sock");
+        // The process's registry: what a peer's `app:<id>` read resolves
+        // through. A test's is never saved.
+        let registry = super::super::registry().clone();
+        let server = tokio::spawn(serve(path.clone(), "Nocturne".into(), registry.clone()));
+        bounded(async {
+            let app = cursio_sdk::App::new("sends-logs")
+                .version("1")
+                .endpoint(&path)
+                .start()
+                .unwrap();
+            app.log(
+                cursio_sdk::LogLevel::Info,
+                "sends_logs::ui",
+                "window opened",
+            );
+            let tail = || crate::log_tail::Tail {
+                log: Some("app:sends-logs".into()),
+                max_lines: 10,
+                ..Default::default()
+            };
+            let lines = loop {
+                if let Ok(cursio_protocol::diag::DiagResponse::Logs { lines, .. }) =
+                    crate::diag_session::own_log(tail())
+                {
+                    if !lines.is_empty() {
+                        break lines;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines[0].ends_with("  INFO sends_logs::ui: window opened"),
+                "{}",
+                lines[0]
+            );
+            drop(app);
+            let key = super::super::Key::main(AppId::parse("sends-logs").unwrap());
+            until_gone(&registry, &key).await;
+            assert!(
+                crate::diag_session::own_log(tail()).is_ok(),
+                "still readable once the application is gone"
+            );
+        })
+        .await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn until_gone(registry: &Arc<Mutex<Registry>>, key: &super::super::Key) {
+        while lock(registry).get(key).is_some_and(|a| a.running()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

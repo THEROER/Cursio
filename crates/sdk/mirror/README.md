@@ -61,6 +61,13 @@ person is asked to let it talk to Cursio, under the application id it
 registered; until then `start` keeps retrying in the background, and no
 other app can later register under that id.
 
+An Android app's log files are private to it, so the node cannot read them.
+Send the lines instead — `cursio.log(level, target, message)`, or
+`cursio_sdk::tracing_layer(&cursio)` with the `tracing` feature — and the
+node keeps the file that `cursio logs <machine> --app <id>` reads. Lines are
+queued and batched, never blocking the app; the oldest are dropped and
+counted when it logs faster than they leave.
+
 ## Cursio being absent is ordinary
 
 `App::start` fails only for a mistake in the program (an invalid id or log

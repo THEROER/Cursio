@@ -1,6 +1,6 @@
 [package]
 name = "cursio-app-protocol"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 # Not the workspace's GPL: applications link `cursio-sdk`, which depends on
 # this, and an Apache-2.0 program linking GPL code would itself become GPL.
