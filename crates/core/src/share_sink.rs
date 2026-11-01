@@ -195,6 +195,20 @@ fn send_to(
 /// files. A trusted peer may drive this machine's cursor, but `file:`,
 /// `javascript:` or a custom scheme registered by some installed program is a
 /// command, not a page.
+/// The one web link in `text`, when it holds exactly one: the whole text, or
+/// a title around it. Punctuation a sentence ends with is not the link's.
+pub fn the_link(text: &str) -> Option<String> {
+    let links: Vec<&str> = text
+        .split_whitespace()
+        .map(|word| word.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '»', '"', '\'']))
+        .filter(|word| openable_url(word))
+        .collect();
+    match links.as_slice() {
+        [one] => Some((*one).to_owned()),
+        _ => None,
+    }
+}
+
 pub fn openable_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     (lower.starts_with("https://") || lower.starts_with("http://"))
@@ -307,11 +321,13 @@ impl ShareSink for DesktopSink {
             (ShareContent::Url(_), ShareAction::Open) => {
                 ShareOutcome::Refused("only http and https links are opened".into())
             }
-            // Text that is a link opens like one; any other text has nowhere
-            // to open, so it is put where it can be pasted.
-            (ShareContent::Text(text), ShareAction::Open) if openable_url(text) => self.act(
+            // Text that is or holds one link opens that link — Android's share
+            // sheet sends "Title\nhttps://…" from most apps, which used to be
+            // copied with nothing opened. Other text has nowhere to open, so
+            // it is put where it can be pasted.
+            (ShareContent::Text(text), ShareAction::Open) if the_link(text).is_some() => self.act(
                 from,
-                &ShareContent::Url(text.trim().to_string()),
+                &ShareContent::Url(the_link(text).unwrap_or_default()),
                 None,
                 action,
             ),
@@ -347,6 +363,22 @@ impl ShareSink for DesktopSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_title_around_one_link_opens_that_link() {
+        assert_eq!(
+            the_link("Funny cat video\nhttps://youtu.be/abc?t=12").as_deref(),
+            Some("https://youtu.be/abc?t=12")
+        );
+        assert_eq!(
+            the_link("see https://maps.example/@55.75,37.61,15z.").as_deref(),
+            Some("https://maps.example/@55.75,37.61,15z"),
+            "commas inside stay; the sentence's full stop goes"
+        );
+        assert_eq!(the_link("two: https://a.example https://b.example"), None);
+        assert_eq!(the_link("no link here"), None);
+        assert_eq!(the_link("ftp://x.example"), None);
+    }
 
     #[test]
     fn only_web_links_are_openable() {

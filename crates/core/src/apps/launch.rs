@@ -372,8 +372,9 @@ fn spawn(exe: &Path, dir: &Path, args: &[String]) -> Result<u32, String> {
 }
 
 /// Start `exe` with the desktop shell's token: the person's, unelevated.
+/// Also how the opener starts a link's handler from an elevated node.
 #[cfg(windows)]
-fn as_the_desktop_user(exe: &Path, dir: &Path, args: &[String]) -> Result<u32, String> {
+pub(crate) fn as_the_desktop_user(exe: &Path, dir: &Path, args: &[String]) -> Result<u32, String> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
