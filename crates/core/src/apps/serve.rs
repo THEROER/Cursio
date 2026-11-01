@@ -190,8 +190,16 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                 Ok(ClientMsg::Health { state, detail }) => {
                     let detail =
                         detail.map(|d| d.chars().take(cursio_app_protocol::MAX_DETAIL).collect());
-                    tracing::info!(%app, ?state, detail = ?detail, "application health");
-                    lock(registry).health(&app, state, detail);
+                    let mut registry = lock(registry);
+                    // A change of state is news; a new detail under the same
+                    // state is an application narrating itself, which at once
+                    // a second was most of the node's log.
+                    if registry.get(&app).map(|a| a.health) != Some(state) {
+                        tracing::info!(%app, ?state, detail = ?detail, "application health");
+                    } else {
+                        tracing::trace!(%app, ?state, detail = ?detail, "application health");
+                    }
+                    registry.health(&app, state, detail);
                 }
                 Ok(ClientMsg::Hello { .. }) => {
                     let feature = "hello after hello".to_owned();
