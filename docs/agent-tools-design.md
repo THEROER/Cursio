@@ -116,8 +116,9 @@ What is built on top — **nothing new crosses the link**
   with the service off answers what to turn on, which the tool returns as
   its error. Cursio never turns the setting on itself.
 - **Text in any script.** `phone_text` goes as `DiagRequest::PhoneType`: the
-  accessibility service sets the focused field's text itself
-  (`ACTION_SET_TEXT`), so Cyrillic or emoji reach it, and "no text field has
+  accessibility service commits it through the focused field's input
+  connection (Android 13+) or sets the field's text itself (`ACTION_SET_TEXT`),
+  so Cyrillic or emoji reach it, and "no text field has
   focus" comes back as an error instead of keys falling nowhere. A phone
   older than these questions drops them unanswered; after 3 s the computer
   falls back to the old way — touch unchecked, text as US-layout keys,

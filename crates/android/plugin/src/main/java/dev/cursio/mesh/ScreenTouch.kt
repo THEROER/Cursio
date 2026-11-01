@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.util.Log
+import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -30,10 +31,14 @@ import android.view.accessibility.AccessibilityNodeInfo
  * next piece rather than queued — the finger goes where the pointer is now,
  * not where it was.
  *
- * Typing goes into whichever field has focus, by setting its text: the
- * service sees text fields but holds no keyboard, so a character is appended
- * at the end of what is there rather than at the caret, and keys that are
- * not characters, Backspace and Enter excepted, do nothing.
+ * Typing goes into whichever field has focus. From Android 13 it goes through
+ * that field's input connection, at the caret, as a keyboard's would. Before
+ * that the service holds no keyboard and can only set the field's whole text,
+ * so a character is appended at the end of what the field reports — which is
+ * not always its text: Telegram's message box reports its placeholder when
+ * empty and "placeholder, text" otherwise, for screen readers, and appending
+ * to that put the placeholder into the message. Keys that are not
+ * characters, Backspace and Enter excepted, do nothing.
  *
  * Gestures arrive from the node's thread and are carried out on the main one.
  */
@@ -171,9 +176,7 @@ class ScreenTouch : AccessibilityService() {
             Log.i(TAG, "typed from a computer with no text field focused on the phone")
             return
         }
-        // A field showing its hint reports the hint as its text.
-        val current = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && field.isShowingHintText) "" else field.text ?: ""
-        val next = edit(current) ?: return
+        val next = edit(textOf(field)) ?: return
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, next)
         }
@@ -186,11 +189,44 @@ class ScreenTouch : AccessibilityService() {
         if (field == null || !field.isEditable) {
             return "no text field has focus on the phone; tap one first"
         }
-        val current = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && field.isShowingHintText) "" else field.text ?: ""
+        if (commit(text)) return ""
         val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "$current$text")
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "${textOf(field)}$text")
         }
         return if (field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) "" else "the focused field refused the text"
+    }
+
+    /** Put [text] in at the caret through the focused field's connection; `false` when there is none. */
+    private fun commit(text: String): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        val connection = inputMethod?.currentInputConnection ?: return false
+        connection.commitText(text, 1, null)
+        return true
+    }
+
+    /** Backspace through the focused field's connection; `false` when there is none. */
+    private fun backspace(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        val connection = inputMethod?.currentInputConnection ?: return false
+        // A key rather than deleteSurroundingText, which leaves a selection
+        // standing and removes the character before it instead.
+        connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL))
+        connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DEL))
+        return true
+    }
+
+    /** The field's own text, without a placeholder it reports in its place. */
+    private fun textOf(field: AccessibilityNodeInfo): CharSequence {
+        val text = field.text ?: return ""
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return text
+        if (field.isShowingHintText) return ""
+        val hint = field.hintText?.toString()?.takeIf { it.isNotEmpty() } ?: return text
+        val shown = text.toString()
+        return when {
+            shown == hint -> ""
+            shown.startsWith("$hint, ") -> shown.removePrefix("$hint, ")
+            else -> text
+        }
     }
 
     private fun enter() {
@@ -215,8 +251,8 @@ class ScreenTouch : AccessibilityService() {
             6 -> scroll(a, dx, dy)
             7 -> performGlobalAction(GLOBAL_ACTION_BACK)
             8 -> performGlobalAction(GLOBAL_ACTION_HOME)
-            9 -> if (text != null) type { "$it$text" }
-            10 -> type { if (it.isEmpty()) null else it.subSequence(0, it.length - 1) }
+            9 -> if (text != null && !commit(text)) type { "$it$text" }
+            10 -> if (!backspace()) type { if (it.isEmpty()) null else it.subSequence(0, it.length - 1) }
             11 -> enter()
             12 -> performGlobalAction(GLOBAL_ACTION_RECENTS)
             else -> Log.w(TAG, "a touch of kind $kind is not known")

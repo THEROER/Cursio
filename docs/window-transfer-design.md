@@ -865,10 +865,15 @@ accessibility service the user turns on once by hand ("Cursio: control from a
 computer"). A held button is one continuous stroke (`continueStroke`); Android
 takes a continuation only once the previous piece is dispatched, so moves
 arriving meanwhile are folded into the next piece — the finger goes where the
-pointer is now. Typing sets the focused field's text through the accessibility
-tree: a character lands at the end of the field rather than at the caret, and
-keys that are not characters (arrows, shortcuts) do nothing. That is the limit
-of not being a keyboard; an input method would lift it and is not built.
+pointer is now. From Android 13 typing goes through the focused field's input
+connection, which the service gets with `flagInputMethodEditor`: a character
+lands at the caret, as a keyboard's would. Before that it sets the field's
+whole text through the accessibility tree, so a character lands at the end, and
+only after reading what the field reports — which is not always its text:
+Telegram's message box reports its placeholder when empty and
+"placeholder, text" otherwise, for screen readers, and appending to that put
+"Message" into the message. Keys that are not characters (arrows, shortcuts)
+do nothing either way.
 
 The service can stop without looking off. Swiping Cursio away from recent apps
 kills its process, the service with it, and Android then counts the service as
