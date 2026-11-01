@@ -180,6 +180,8 @@ impl<A: Ask> Tools<A> {
             "apps_publish" => apps_publish(args),
             "apps_launch" => apps_launch(args).await,
             "apps_ship" => apps_ship(args).await,
+            "apps_actions" => apps_actions(args).await,
+            "apps_call" => apps_call(args).await,
             "restart_machine" => {
                 self.maintain(args, cursio_protocol::diag::Maintenance::Restart)
                     .await
@@ -319,6 +321,32 @@ fn apps_publish(args: &Value) -> Result<String, Failure> {
     )
     .map_err(|e| e.to_string())?;
     Ok(said.join("\n"))
+}
+
+async fn apps_actions(args: &Value) -> Result<String, Failure> {
+    let machine = need_str(args, "machine")?;
+    let app = need_str(args, "app")?;
+    let actions = crate::apps::cli::actions(&machine, &app)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(crate::apps::cli::describe_actions(&actions))
+}
+
+async fn apps_call(args: &Value) -> Result<String, Failure> {
+    let machine = need_str(args, "machine")?;
+    let app = need_str(args, "app")?;
+    let action = need_str(args, "action")?;
+    let target = match opt_str(args, "process") {
+        Some(process) => format!("{app}/{process}"),
+        None => app,
+    };
+    let call_args = match args.get("args") {
+        None | Some(Value::Null) => String::new(),
+        Some(value) => value.to_string(),
+    };
+    crate::apps::cli::call(&machine, &target, &action, &call_args)
+        .await
+        .map_err(|e| e.to_string().into())
 }
 
 async fn apps_launch(args: &Value) -> Result<String, Failure> {
@@ -501,6 +529,29 @@ pub fn list() -> Vec<Value> {
                 "admin": { "type": "array", "items": { "type": "string" }, "description": "file names that ask to run as administrator" },
             }),
             &["app", "files"],
+        ),
+        tool(
+            "apps_actions",
+            "List what a running application on a machine lets you ask it to do: each action's name, description and JSON Schema of its arguments, per process.",
+            true, false,
+            json!({
+                "machine": machine.clone(),
+                "app": { "type": "string" },
+            }),
+            &["machine", "app"],
+        ),
+        tool(
+            "apps_call",
+            "Ask a running application on a machine to do one of its declared actions (see apps_actions) and get its JSON answer. It is done by the process already running, as its own buttons would. The machine's person allows calls to an application once.",
+            false, true,
+            json!({
+                "machine": machine.clone(),
+                "app": { "type": "string" },
+                "process": { "type": "string", "description": "one of the application's processes; its main one when absent" },
+                "action": { "type": "string" },
+                "args": { "description": "the action's arguments, as its schema describes" },
+            }),
+            &["machine", "app", "action"],
         ),
         tool(
             "apps_launch",

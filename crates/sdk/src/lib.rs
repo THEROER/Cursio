@@ -26,14 +26,19 @@
 //! Calls made while no node is connected return [`Error::NotRunning`] and are
 //! remembered, so the node hears the latest state as soon as it is back.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cursio_app_protocol::{decode_line, encode_line, ClientMsg, NodeMsg, MAX_LINE, PROTOCOL};
-pub use cursio_app_protocol::{AppId, HealthState, LogSpec, ProcessName};
+use cursio_app_protocol::{
+    decode_line, encode_line, no_such_action, ClientMsg, NodeMsg, MAX_ACTIONS, MAX_LINE, PROTOCOL,
+};
+pub use cursio_app_protocol::{ActionName, ActionSpec, AppId, HealthState, LogSpec, ProcessName};
+/// The JSON an action takes and answers.
+pub use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 /// First wait before connecting again.
 const RETRY_MIN: Duration = Duration::from_millis(500);
@@ -79,6 +84,26 @@ pub struct Build {
 
 type OnUpdate = Arc<dyn Fn(Build) + Send + Sync>;
 
+/// What an action does with its arguments: a JSON answer, or why not.
+type Handler = Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
+
+/// An action as the application declared it, checked at `start`.
+#[derive(Clone)]
+struct Declared {
+    name: Result<ActionName, cursio_app_protocol::Error>,
+    description: String,
+    schema: serde_json::Value,
+    handler: Handler,
+}
+
+/// What the connection does with what the node sends unasked.
+#[derive(Clone, Default)]
+struct Hooks {
+    app: String,
+    on_update: Option<OnUpdate>,
+    actions: Arc<BTreeMap<ActionName, Handler>>,
+}
+
 /// An application about to introduce itself to the node.
 #[derive(Clone)]
 pub struct App {
@@ -88,6 +113,7 @@ pub struct App {
     endpoint: Option<PathBuf>,
     on_update: Option<OnUpdate>,
     process: Option<Result<ProcessName, cursio_app_protocol::Error>>,
+    actions: Vec<Declared>,
 }
 
 impl std::fmt::Debug for App {
@@ -112,7 +138,35 @@ impl App {
             endpoint: None,
             on_update: None,
             process: None,
+            actions: Vec::new(),
         }
+    }
+
+    /// Let another machine of the mesh ask this process to do `name`:
+    /// `cursio apps call <machine> <id> <name> '<json>'`, or an agent through
+    /// `cursio mcp`. `description` is one sentence of what it does, `schema`
+    /// a JSON Schema of its arguments (`serde_json::Value::Null` for none) —
+    /// what a caller reads to call it right the first time.
+    ///
+    /// `handler` gets the arguments and answers JSON or why not. It runs on
+    /// a thread of its own, never the connection's, so a slow one holds up
+    /// nothing else; one that panics answers that it did, and later calls
+    /// are served as before. Call what the application's own buttons call,
+    /// and what an agent does is what a person would see.
+    pub fn action(
+        mut self,
+        name: &str,
+        description: impl Into<String>,
+        schema: serde_json::Value,
+        handler: impl Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.actions.push(Declared {
+            name: ActionName::parse(name),
+            description: description.into(),
+            schema,
+            handler: Arc::new(handler),
+        });
+        self
     }
 
     /// This is one of the application's several processes — `daemon` beside
@@ -163,6 +217,12 @@ impl App {
             logs.check().map_err(Error::Invalid)?;
         }
         let process = self.process.transpose().map_err(Error::Invalid)?;
+        let (specs, handlers) = declared(self.actions)?;
+        let hooks = Hooks {
+            app: id.to_string(),
+            on_update: self.on_update,
+            actions: Arc::new(handlers),
+        };
         let hello = ClientMsg::Hello {
             protocol: PROTOCOL,
             app: id,
@@ -170,6 +230,7 @@ impl App {
             pid: std::process::id(),
             logs: self.logs,
             process,
+            actions: specs,
         };
         let endpoint = self.endpoint.unwrap_or_else(cursio_app_protocol::endpoint);
         let shared = Arc::new(Mutex::new(Link::Connecting));
@@ -179,13 +240,74 @@ impl App {
             .build()
             .map_err(|e| Error::Thread(e.to_string()))?;
         let link = shared.clone();
-        let on_update = self.on_update;
         std::thread::Builder::new()
             .name("cursio-sdk".into())
-            .spawn(move || runtime.block_on(run(endpoint, hello, link, health_rx, on_update)))
+            .spawn(move || runtime.block_on(run(endpoint, hello, link, health_rx, hooks)))
             .map_err(|e| Error::Thread(e.to_string()))?;
         Ok(Cursio { shared, health })
     }
+}
+
+/// The declared actions as the hello lists them, and their handlers by name;
+/// an invalid, oversized or repeated one is the program's mistake.
+type DeclaredActions = (Vec<ActionSpec>, BTreeMap<ActionName, Handler>);
+
+fn declared(actions: Vec<Declared>) -> Result<DeclaredActions, Error> {
+    if actions.len() > MAX_ACTIONS {
+        return Err(Error::Invalid(cursio_app_protocol::Error::BadAction(
+            format!("at most {MAX_ACTIONS} actions per process"),
+        )));
+    }
+    let mut specs = Vec::new();
+    let mut handlers = BTreeMap::new();
+    for action in actions {
+        let name = action.name.map_err(Error::Invalid)?;
+        let spec = ActionSpec {
+            name: name.clone(),
+            description: action.description,
+            schema: action.schema,
+        };
+        spec.check().map_err(Error::Invalid)?;
+        if handlers.insert(name.clone(), action.handler).is_some() {
+            return Err(Error::Invalid(cursio_app_protocol::Error::BadAction(
+                format!("action {name} is declared twice"),
+            )));
+        }
+        specs.push(spec);
+    }
+    Ok((specs, handlers))
+}
+
+/// Run `action` with `args` off the connection's thread and send its answer;
+/// a panic in it is an answer too.
+fn dispatch(
+    hooks: &Hooks,
+    id: u64,
+    action: ActionName,
+    args: serde_json::Value,
+    answers: &mpsc::UnboundedSender<ClientMsg>,
+) {
+    let Some(handler) = hooks.actions.get(&action).cloned() else {
+        let names: Vec<ActionName> = hooks.actions.keys().cloned().collect();
+        let error = no_such_action(&hooks.app, action.as_str(), &names);
+        let _ = answers.send(ClientMsg::answer(id, Err(error)));
+        return;
+    };
+    let answers = answers.clone();
+    tokio::task::spawn_blocking(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(args)));
+        let result = outcome.unwrap_or_else(|panic| {
+            let why = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned());
+            Err(match why {
+                Some(why) => format!("action {action} panicked: {why}"),
+                None => format!("action {action} panicked"),
+            })
+        });
+        let _ = answers.send(ClientMsg::answer(id, result));
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,13 +376,13 @@ async fn run(
     hello: ClientMsg,
     shared: Arc<Mutex<Link>>,
     mut health: watch::Receiver<(HealthState, Option<String>)>,
-    on_update: Option<OnUpdate>,
+    hooks: Hooks,
 ) {
     let set = |link: Link| *shared.lock().unwrap_or_else(|p| p.into_inner()) = link;
     let mut wait = RETRY_MIN;
     loop {
         let ended = match connect(&endpoint).await {
-            Ok(stream) => session(stream, &hello, &set, &mut health, on_update.as_ref()).await,
+            Ok(stream) => session(stream, &hello, &set, &mut health, &hooks).await,
             Err(_) => Ended::Closed,
         };
         match ended {
@@ -326,12 +448,21 @@ async fn read_line<R: AsyncRead + Unpin>(
     Ok(Some(line))
 }
 
-async fn session<S: AsyncRead + AsyncWrite>(
+/// Abort a task when its owner is done with it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
     stream: S,
     hello: &ClientMsg,
     set: &impl Fn(Link),
     health: &mut watch::Receiver<(HealthState, Option<String>)>,
-    on_update: Option<&OnUpdate>,
+    hooks: &Hooks,
 ) -> Ended {
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
@@ -354,6 +485,18 @@ async fn session<S: AsyncRead + AsyncWrite>(
     if current != (HealthState::Ok, None) && write.write_all(&send_health(current)).await.is_err() {
         return Ended::Closed;
     }
+    // Lines are read by a task of their own and handed over whole: reading
+    // inside the `select!` below lost the part of a line already read
+    // whenever another branch won.
+    let (lines_tx, mut lines) = mpsc::unbounded_channel::<Vec<u8>>();
+    let _reader = AbortOnDrop(tokio::spawn(async move {
+        while let Ok(Some(line)) = read_line(&mut reader).await {
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    }));
+    let (answers_tx, mut answers) = mpsc::unbounded_channel::<ClientMsg>();
     loop {
         tokio::select! {
             changed = health.changed() => {
@@ -365,19 +508,27 @@ async fn session<S: AsyncRead + AsyncWrite>(
                     return Ended::Closed;
                 }
             }
-            line = read_line(&mut reader) => match line {
-                Ok(Some(line)) => match decode_line::<NodeMsg>(&line) {
+            Some(answer) = answers.recv() => {
+                if write.write_all(&encode_line(&answer)).await.is_err() {
+                    return Ended::Closed;
+                }
+            }
+            line = lines.recv() => match line {
+                Some(line) => match decode_line::<NodeMsg>(&line) {
                     Ok(NodeMsg::Refused { reason }) => return Ended::Refused(reason),
                     Ok(NodeMsg::BuildReady { version, dir }) => {
-                        if let Some(handler) = on_update {
+                        if let Some(handler) = &hooks.on_update {
                             handler(Build { version, dir });
                         }
+                    }
+                    Ok(NodeMsg::Call { id, action, args }) => {
+                        dispatch(hooks, id, action, args, &answers_tx);
                     }
                     // A message a newer node sends that this SDK does not
                     // know is skipped, as the protocol promises.
                     _ => {}
                 },
-                _ => return Ended::Closed,
+                None => return Ended::Closed,
             },
         }
     }
@@ -413,6 +564,13 @@ mod tests {
     /// A node that answers each connection with `answer` and hands back
     /// every line it is sent.
     fn fake_node(path: PathBuf, answer: NodeMsg) -> std::sync::mpsc::Receiver<ClientMsg> {
+        fake_node_saying(path, vec![answer])
+    }
+
+    /// A node that answers every hello with `said`, in order, and reports
+    /// every line it hears.
+    fn fake_node_saying(path: PathBuf, said: Vec<NodeMsg>) -> std::sync::mpsc::Receiver<ClientMsg> {
+        let answer = said;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -432,7 +590,9 @@ mod tests {
                             let _ = tx.send(decode_line::<ClientMsg>(&line).unwrap());
                             if first {
                                 first = false;
-                                let _ = write.write_all(&encode_line(&answer)).await;
+                                for message in &answer {
+                                    let _ = write.write_all(&encode_line(message)).await;
+                                }
                             }
                         }
                     });
@@ -440,6 +600,81 @@ mod tests {
             });
         });
         rx
+    }
+
+    #[test]
+    fn a_declared_action_is_called_off_the_socket_and_a_panic_or_a_wrong_name_is_answered() {
+        let path = socket();
+        let call = |id, action: &str, args| NodeMsg::Call {
+            id,
+            action: ActionName::parse(action).unwrap(),
+            args,
+        };
+        let heard = fake_node_saying(
+            path.clone(),
+            vec![
+                NodeMsg::Welcome {
+                    protocol: 1,
+                    machine: "Nocturne".into(),
+                },
+                call(1, "boom", Value::Null),
+                call(2, "foo", Value::Null),
+                call(3, "echo", json!({"instance": "vanilla"})),
+            ],
+        );
+        let _app = App::new("leavepulse")
+            .endpoint(&path)
+            .action(
+                "echo",
+                "Answer the arguments",
+                json!({"type": "object"}),
+                Ok,
+            )
+            .action("boom", "Panic", Value::Null, |_| {
+                panic!("the instance vanished")
+            })
+            .start()
+            .unwrap();
+        let ClientMsg::Hello { actions, .. } = heard.recv_timeout(Duration::from_secs(10)).unwrap()
+        else {
+            panic!("expected hello");
+        };
+        let names: Vec<&str> = actions.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["echo", "boom"]);
+        let mut answers = std::collections::BTreeMap::new();
+        while answers.len() < 3 {
+            if let ClientMsg::Answer { id, ok, error } =
+                heard.recv_timeout(Duration::from_secs(10)).unwrap()
+            {
+                answers.insert(id, (ok, error));
+            }
+        }
+        assert_eq!(
+            answers[&1].1.as_deref(),
+            Some("action boom panicked: the instance vanished")
+        );
+        assert_eq!(
+            answers[&2].1.as_deref(),
+            Some("leavepulse has no action foo; it has: boom, echo")
+        );
+        assert_eq!(
+            answers[&3].0,
+            Some(json!({"instance": "vanilla"})),
+            "a later call is served after the panic"
+        );
+    }
+
+    #[test]
+    fn an_action_declared_twice_or_misnamed_is_the_programs_mistake() {
+        let twice = App::new("demo")
+            .action("go", "", Value::Null, |_| Ok(Value::Null))
+            .action("go", "", Value::Null, |_| Ok(Value::Null))
+            .start();
+        assert!(matches!(twice, Err(Error::Invalid(_))));
+        let misnamed = App::new("demo")
+            .action("Go Now", "", Value::Null, |_| Ok(Value::Null))
+            .start();
+        assert!(matches!(misnamed, Err(Error::Invalid(_))));
     }
 
     #[test]

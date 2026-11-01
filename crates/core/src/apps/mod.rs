@@ -14,6 +14,7 @@
 //! Only what describes the application is kept; whether it is running and
 //! how it said it was doing are live state, and start over with the node.
 
+pub mod actions;
 pub mod builds;
 pub mod cli;
 pub mod lane;
@@ -75,6 +76,9 @@ pub struct Registered {
     pub detail: Option<String>,
     /// Open connections from it: two running copies are two.
     pub connections: u32,
+    /// What it lets another machine ask it to do, as its latest hello said.
+    /// Live state, never saved: a process that is not running does nothing.
+    pub actions: Vec<cursio_app_protocol::ActionSpec>,
 }
 
 impl Registered {
@@ -128,6 +132,7 @@ impl Registry {
                     health: HealthState::default(),
                     detail: None,
                     connections: 0,
+                    actions: Vec::new(),
                 };
                 Some((Key::from_file_key(&key)?, registered))
             })
@@ -144,6 +149,7 @@ impl Registry {
             health: HealthState::default(),
             detail: None,
             connections: 0,
+            actions: Vec::new(),
         });
         let changed = entry.version != version || entry.logs != logs;
         entry.version = version;
@@ -153,6 +159,23 @@ impl Registry {
         if changed {
             self.save();
         }
+    }
+
+    /// What `key`'s process declared it can be asked to do.
+    pub fn set_actions(&mut self, key: &Key, actions: Vec<cursio_app_protocol::ActionSpec>) {
+        if let Some(entry) = self.apps.get_mut(key) {
+            entry.actions = actions;
+        }
+    }
+
+    /// Every registered process of `app`, the main one first, with whether it
+    /// runs and what it declared.
+    pub fn processes(&self, app: &AppId) -> Vec<(Key, &Registered)> {
+        self.apps
+            .iter()
+            .filter(|(key, _)| key.app == *app)
+            .map(|(key, r)| (key.clone(), r))
+            .collect()
     }
 
     pub fn health(&mut self, key: &Key, state: HealthState, detail: Option<String>) {

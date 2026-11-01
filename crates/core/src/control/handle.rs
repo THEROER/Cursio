@@ -152,6 +152,33 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                 Err(message) => Reply::Error { message },
             }
         }
+        Command::AppActions { machine, app } => {
+            let request = DiagRequest::AppActions { app: app.clone() };
+            match hub.ask(machine, request).await {
+                Ok(DiagResponse::Actions(actions)) => Reply::Actions { actions },
+                Ok(other) => error(format!("a list of actions was answered with {other:?}")),
+                Err(message) => Reply::Error { message },
+            }
+        }
+        Command::CallAction {
+            machine,
+            app,
+            process,
+            action,
+            args_json,
+        } => {
+            let request = DiagRequest::CallAction {
+                app: app.clone(),
+                process: process.clone(),
+                action: action.clone(),
+                args_json: args_json.clone(),
+            };
+            match hub.ask(machine, request).await {
+                Ok(DiagResponse::Called { result_json }) => Reply::Called { result_json },
+                Ok(other) => error(format!("a call was answered with {other:?}")),
+                Err(message) => Reply::Error { message },
+            }
+        }
         Command::Paths { peer, choice } => {
             let Some(id) = hub
                 .peers()
@@ -508,7 +535,9 @@ impl NodeState {
             | Command::Maintain { .. }
             | Command::Launch { .. }
             | Command::PhoneScreenshot { .. }
-            | Command::PhoneAct { .. } => {
+            | Command::PhoneAct { .. }
+            | Command::AppActions { .. }
+            | Command::CallAction { .. } => {
                 error("logs and paths are asked through a desktop's control socket")
             }
         }

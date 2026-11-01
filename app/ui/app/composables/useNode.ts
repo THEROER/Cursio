@@ -103,6 +103,7 @@ export type ConfigEdit =
       };
     }
   | { app_admin: { app: string; consent: "ask" | "allow" | "deny" } }
+  | { app_actions: { app: string; consent: "ask" | "allow" | "deny" } }
 
 export interface ProblemAction {
   label: string

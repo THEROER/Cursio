@@ -225,6 +225,8 @@ fn app_logs(
 /// What answers the peer: which peer, so its session's paths are found.
 pub struct DiagStore {
     peer: PeerId,
+    /// What the person here knows the peer as, for a question about it.
+    peer_name: String,
 }
 
 pub struct Diag;
@@ -292,6 +294,22 @@ impl Exchange for Diag {
                 )
                 .map(|what| DiagResponse::Launched { what })
             }
+            DiagRequest::AppActions { app } => {
+                crate::apps::actions::list(app).map(DiagResponse::Actions)
+            }
+            DiagRequest::CallAction {
+                app,
+                process,
+                action,
+                args_json,
+            } => crate::apps::actions::call(
+                &store.peer_name,
+                app,
+                process.as_deref(),
+                action,
+                args_json,
+            )
+            .map(|result_json| DiagResponse::Called { result_json }),
         }
     }
 
@@ -356,6 +374,34 @@ impl Exchange for Diag {
                     args,
                 })
             }
+            DiagRequest::AppActions { app } => {
+                cursio_app_protocol::AppId::parse(&app).map_err(|e| e.to_string())?;
+                Ok(DiagRequest::AppActions { app })
+            }
+            DiagRequest::CallAction {
+                app,
+                process,
+                action,
+                args_json,
+            } => {
+                use cursio_protocol::diag::MAX_CALL_ARGS;
+                if args_json.len() > MAX_CALL_ARGS {
+                    return Err(format!(
+                        "a call's arguments are at most {MAX_CALL_ARGS} bytes"
+                    ));
+                }
+                cursio_app_protocol::AppId::parse(&app).map_err(|e| e.to_string())?;
+                if let Some(process) = &process {
+                    cursio_app_protocol::ProcessName::parse(process).map_err(|e| e.to_string())?;
+                }
+                cursio_app_protocol::ActionName::parse(&action).map_err(|e| e.to_string())?;
+                Ok(DiagRequest::CallAction {
+                    app,
+                    process,
+                    action,
+                    args_json,
+                })
+            }
             other @ (DiagRequest::Paths { .. } | DiagRequest::Maintain(_)) => Ok(other),
         }
     }
@@ -389,7 +435,10 @@ impl crate::module::ModuleFactory for DiagFactory {
         Ok(Box::new(DiagEngine::new(
             peer,
             ctx.peer_name().to_string(),
-            Some(std::sync::Arc::new(DiagStore { peer })),
+            Some(std::sync::Arc::new(DiagStore {
+                peer,
+                peer_name: ctx.peer_name().to_string(),
+            })),
             true,
         )))
     }
@@ -444,6 +493,7 @@ mod tests {
             "Nocturne".into(),
             Some(std::sync::Arc::new(DiagStore {
                 peer: PeerId::from_bytes([0x72; 16]),
+                peer_name: "Lightmoon".into(),
             })),
             false,
         );

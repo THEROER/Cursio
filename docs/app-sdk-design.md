@@ -220,10 +220,50 @@ executable, its own frames only — reported once into its log and its report.
 
 ### 3. Commands and messages between copies of one application
 
+**Actions — built (SDK 0.2).** A process declares what another machine may
+ask it to do, each with a sentence and a JSON Schema of its arguments:
+
+```rust
+App::new("leavepulse")
+    .action("launch", "Launch an instance", json!({"type": "object",
+        "properties": {"instance": {"type": "string"}}, "required": ["instance"]}),
+        |args| launcher.launch(&args["instance"]).map(|pid| json!({"pid": pid})))
+```
+
+```sh
+cursio apps actions Lightmoon leavepulse
+cursio apps call Lightmoon leavepulse launch '{"instance":"vanilla"}'
+cursio apps call Lightmoon leavepulse/daemon running
+```
+
+- The declarations ride the hello (`ActionSpec`, left out when there are
+  none). A call is `NodeMsg::Call { id, action, args }` down the connection
+  the process already holds, answered by `ClientMsg::Answer { id, ok | error
+  }`; the node (`core/src/apps/{actions,serve}.rs`) correlates by id, answers
+  a call whose process closes at once, and gives up after 25 s — under the
+  asking side's 30 s for any diag answer, so a slow action reads as slow.
+- What runs is the process that is already running, on the SDK's blocking
+  pool and never the connection's thread; a handler that panics answers
+  `action <name> panicked: <message>` and later calls are served. A wrong name
+  answers `<app> has no action <x>; it has: <sorted names>`, in the same words
+  from the SDK and the node (`no_such_action`), so a caller learns the right
+  name from the error.
+- Over the mesh it is `DiagRequest::AppActions` / `CallAction`, JSON as text
+  (the diag vocabulary is bincode). MCP: `apps_actions` (reads), `apps_call`
+  (destructive).
+- **Its own consent**: `[apps.<id>] actions = "ask" | "allow" | "deny"`,
+  `ask` until the machine's person presses **Allow Nocturne to call
+  leavepulse's actions** (or Deny). Trusting builds does not extend to it:
+  a build is installed and started by the person, an action does something
+  the moment it is called.
+
+Still a plan:
+
 - `on_command("name", handler)` exposes a named command; `cursio app
   Lightmoon leavepulse reload-config` or `sdk.call("Lightmoon",
   "reload-config", args)` invokes it. Only the application's own copies and
-  the CLI may call; nothing else on the mesh can.
+  the CLI may call; nothing else on the mesh can. (Actions above are this,
+  for a caller that is a person or an agent.)
 - `send(peer, topic, bytes)` / `on_message(topic, handler)`: a datagram to the
   same application on another machine, over the mesh's encryption, with the
   application choosing a priority class (`Control`, `Metadata`, `Bulk`, never
@@ -294,5 +334,6 @@ private directory, which another app cannot open. Two steps:
    `run mesh:<machine>`.
 4. Phones: install by notification for apps (reusing Cursio's own path).
    **Built.**
-5. Commands and messages between copies.
+5. Commands and messages between copies. **Actions built**; messages between
+   copies are not.
 6. SDK on Android.

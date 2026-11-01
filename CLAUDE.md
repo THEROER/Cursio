@@ -59,6 +59,8 @@ cursio logs Lightmoon --app leavepulse -f   # an application's log, registered t
 cursio apps publish leavepulse windows-x86_64=app.exe   # offer an application's build to the mesh
 cursio apps status                          # applications' builds held here, and whose are taken
 cursio apps ship leavepulse --to Lightmoon windows-x86_64=app.exe   # publish, wait until current there, start it
+cursio apps actions Lightmoon leavepulse    # what the running application lets another machine ask it
+cursio apps call Lightmoon leavepulse launch '{"instance":"vanilla"}'   # the running process does it, answers JSON
 cargo xtask sdk-mirror [--push] [--tag]    # sync the public cursio-sdk repo; --tag publishes it to crates.io
 claude mcp add cursio -- cursio mcp         # the same as tools for an AI agent (docs/agent-tools-design.md)
 cursio phone "POCO X7 Pro" screenshot --ask | tap 0.5 0.8 | swipe 0.5 0.8 0.5 0.2 | key back | text "hi"

@@ -90,6 +90,18 @@ pub enum AppsAction {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// The actions a running application declared on a connected machine.
+    Actions { machine: String, app: String },
+    /// Ask a running application on a connected machine to do one of its
+    /// declared actions; prints its JSON answer.
+    Call {
+        machine: String,
+        /// `<app>`, or `<app>/<process>` for one of its processes.
+        target: String,
+        action: String,
+        /// The arguments, as JSON; none when absent.
+        json: Option<String>,
+    },
 }
 
 /// Where progress lines go: the terminal for the CLI, a tool's answer for
@@ -146,6 +158,86 @@ pub async fn run(action: AppsAction, config_path: &Path) -> anyhow::Result<()> {
             };
             ship(&to, &app, &version, start, wait, &mut print).await
         }
+        AppsAction::Actions { machine, app } => {
+            print!("{}", describe_actions(&actions(&machine, &app).await?));
+            Ok(())
+        }
+        AppsAction::Call {
+            machine,
+            target,
+            action,
+            json,
+        } => {
+            let answer = call(&machine, &target, &action, json.as_deref().unwrap_or("")).await?;
+            println!("{answer}");
+            Ok(())
+        }
+    }
+}
+
+/// The actions `app` declared on `machine`.
+pub async fn actions(
+    machine: &str,
+    app: &str,
+) -> anyhow::Result<Vec<cursio_protocol::diag::AppAction>> {
+    use crate::control::{Command, Reply};
+    let command = Command::AppActions {
+        machine: machine.to_owned(),
+        app: app.to_owned(),
+    };
+    match client().await?.request(command).await? {
+        Reply::Actions { actions } => Ok(actions),
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("the running node answered {other:?}"),
+    }
+}
+
+/// Actions as a person reads them: one per line, its arguments' schema
+/// beneath.
+pub fn describe_actions(actions: &[cursio_protocol::diag::AppAction]) -> String {
+    if actions.is_empty() {
+        return "it declares no actions\n".to_owned();
+    }
+    let mut out = String::new();
+    for action in actions {
+        let process = action
+            .process
+            .as_deref()
+            .map(|p| format!(" [{p}]"))
+            .unwrap_or_default();
+        let running = if action.running { "" } else { " (not running)" };
+        out.push_str(&format!(
+            "{}{process}{running} — {}\n    args: {}\n",
+            action.name, action.description, action.schema_json
+        ));
+    }
+    out
+}
+
+/// Ask `target` (`app` or `app/process`) on `machine` to do `action` with the
+/// JSON `args_json`; its answer, as JSON text.
+pub async fn call(
+    machine: &str,
+    target: &str,
+    action: &str,
+    args_json: &str,
+) -> anyhow::Result<String> {
+    use crate::control::{Command, Reply};
+    let (app, process) = match target.split_once('/') {
+        Some((app, process)) => (app, Some(process.to_owned())),
+        None => (target, None),
+    };
+    let command = Command::CallAction {
+        machine: machine.to_owned(),
+        app: app.to_owned(),
+        process,
+        action: action.to_owned(),
+        args_json: args_json.to_owned(),
+    };
+    match client().await?.request(command).await? {
+        Reply::Called { result_json } => Ok(result_json),
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("the running node answered {other:?}"),
     }
 }
 

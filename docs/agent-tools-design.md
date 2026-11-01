@@ -51,6 +51,8 @@ stdout carries the protocol alone; the log goes to stderr and its file.
 | `apps_publish` | changes (offers a build) | `apps::cli::publish` |
 | `apps_launch` | changes; destructive with `restart` | `Command::Launch` |
 | `apps_ship` | changes; destructive (replaces running copies) | publish, then launch with the version until current there |
+| `apps_actions` | reads | `Command::AppActions`: what a running application declared (name, description, JSON Schema, which process, whether running) |
+| `apps_call` | destructive | `Command::CallAction`: the running process does one of its declared actions and answers JSON; the target machine's person allows calls to an application once (`[apps.<id>] actions`) |
 | `restart_machine` | destructive | `Command::Maintain(Restart)` |
 | `apply_update` | destructive | `Command::Maintain(ApplyUpdate)` |
 

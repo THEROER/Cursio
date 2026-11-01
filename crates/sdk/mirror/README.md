@@ -21,7 +21,13 @@ From any machine of the mesh:
 ```sh
 cursio logs Laptop --app my-app -f                 # its log, live, no SSH
 cursio apps ship my-app --to Laptop windows-x86_64=target/my-app.exe   # build there, started
+cursio apps call Laptop my-app open '{"path": "notes.txt"}'           # an action it declared
 ```
+
+An application declares actions with `App::action(name, description,
+schema, handler)`; the running process does them when another machine — or
+an AI agent through `cursio mcp` — calls, once that machine's person allows
+calls to it.
 
 A machine takes an application's builds only after its person trusts the
 builder for that application, once, with a button.

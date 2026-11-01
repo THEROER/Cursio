@@ -16,4 +16,33 @@ Without a running node the application works exactly as before: `start`
 fails only for an invalid id or log path, and the connection is made, and made
 again, in the background.
 
+## Actions
+
+A running process can let another machine of the mesh — a person, or an AI
+agent through `cursio mcp` — ask it to do something, by name:
+
+```rust
+use cursio_sdk::{json, App};
+
+let cursio = App::new("my-app")
+    .action("open", "Open a document", json!({
+        "type": "object",
+        "properties": { "path": { "type": "string" } },
+        "required": ["path"]
+    }), |args| {
+        let path = args["path"].as_str().ok_or("path is required")?;
+        open(path).map(|_| json!({ "opened": path })).map_err(|e| e.to_string())
+    })
+    .start()?;
+```
+
+```sh
+cursio apps actions Laptop my-app
+cursio apps call Laptop my-app open '{"path": "notes.txt"}'
+```
+
+Handlers run off the connection's thread; a panic answers that it happened
+and later calls go on. The machine's person allows calls to an application
+once, with a button.
+
 `MIT OR Apache-2.0`. See the [repository](https://github.com/THEROER/cursio-sdk).

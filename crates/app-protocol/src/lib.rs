@@ -40,8 +40,26 @@ pub const SOCKET_NAME: &str = "apps.sock";
 /// Longest [`AppId`].
 pub const MAX_APP_ID: usize = 32;
 
-/// Longest detail a [`ClientMsg::Health`] carries.
+/// Longest detail a [`ClientMsg::Health`] carries, and the longest
+/// description of an [`ActionSpec`].
 pub const MAX_DETAIL: usize = 512;
+
+/// Most bytes an action's argument schema takes, as JSON.
+pub const MAX_SCHEMA: usize = 16 * 1024;
+
+/// Most actions one process declares.
+pub const MAX_ACTIONS: usize = 64;
+
+/// The shape every name here takes — id, process, action: lowercase ASCII
+/// letters, digits and `-`, not starting with `-`, at most [`MAX_APP_ID`].
+fn well_formed_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_APP_ID
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
 
 /// An application's name on the mesh: what a machine agrees to take builds
 /// of, and what `cursio logs --app` asks for. The same id on two machines is
@@ -56,13 +74,7 @@ pub struct AppId(String);
 
 impl AppId {
     pub fn parse(id: &str) -> Result<Self, Error> {
-        let well_formed = !id.is_empty()
-            && id.len() <= MAX_APP_ID
-            && !id.starts_with('-')
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-        if !well_formed {
+        if !well_formed_name(id) {
             return Err(Error::BadAppId(id.to_owned()));
         }
         if id == "cursio" {
@@ -105,13 +117,7 @@ pub struct ProcessName(String);
 
 impl ProcessName {
     pub fn parse(name: &str) -> Result<Self, Error> {
-        let well_formed = !name.is_empty()
-            && name.len() <= MAX_APP_ID
-            && !name.starts_with('-')
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-        match well_formed {
+        match well_formed_name(name) {
             true => Ok(ProcessName(name.to_owned())),
             false => Err(Error::BadProcessName(name.to_owned())),
         }
@@ -138,6 +144,93 @@ impl TryFrom<String> for ProcessName {
 impl From<ProcessName> for String {
     fn from(name: ProcessName) -> String {
         name.0
+    }
+}
+
+/// The name of something a running application lets another machine ask it
+/// to do — `launch`, `stop`, `instances`. Same characters as an [`AppId`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ActionName(String);
+
+impl ActionName {
+    pub fn parse(name: &str) -> Result<Self, Error> {
+        match well_formed_name(name) {
+            true => Ok(ActionName(name.to_owned())),
+            false => Err(Error::BadActionName(name.to_owned())),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ActionName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for ActionName {
+    type Error = Error;
+    fn try_from(name: String) -> Result<Self, Error> {
+        ActionName::parse(&name)
+    }
+}
+
+impl From<ActionName> for String {
+    fn from(name: ActionName) -> String {
+        name.0
+    }
+}
+
+/// An action a process declares in its hello: what it is called, what it
+/// does in a sentence, and a JSON Schema of its arguments — what an agent
+/// reads to call it right the first time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionSpec {
+    pub name: ActionName,
+    pub description: String,
+    /// JSON Schema of the arguments; `null` for none.
+    #[serde(default)]
+    pub schema: serde_json::Value,
+}
+
+impl ActionSpec {
+    /// Whether the node should take it: a description and a schema of a size
+    /// that fits a line beside the rest of a hello.
+    pub fn check(&self) -> Result<(), Error> {
+        if self.description.len() > MAX_DETAIL {
+            return Err(Error::BadAction(format!(
+                "{}'s description is longer than {MAX_DETAIL} bytes",
+                self.name
+            )));
+        }
+        let schema = serde_json::to_vec(&self.schema).map_or(usize::MAX, |s| s.len());
+        if schema > MAX_SCHEMA {
+            return Err(Error::BadAction(format!(
+                "{}'s schema is longer than {MAX_SCHEMA} bytes",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// What a call to an action not in `declared` answers — the same words from
+/// the SDK and from the node, naming what there is, so an agent that guessed
+/// wrong learns the right name from the error itself.
+pub fn no_such_action(app: &str, action: &str, declared: &[ActionName]) -> String {
+    match declared {
+        [] => format!("{app} declares no actions"),
+        names => {
+            // Sorted here, so the SDK and the node, holding them in
+            // different orders, still say the same words.
+            let mut names: Vec<&str> = names.iter().map(ActionName::as_str).collect();
+            names.sort_unstable();
+            format!("{app} has no action {action}; it has: {}", names.join(", "))
+        }
     }
 }
 
@@ -207,12 +300,43 @@ pub enum ClientMsg {
         /// old node reads every hello it read before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         process: Option<ProcessName>,
+        /// What this process lets another machine ask it to do. Left out
+        /// when empty, so a hello without actions has the bytes it had.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        actions: Vec<ActionSpec>,
     },
     Health {
         state: HealthState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    /// The answer to [`NodeMsg::Call`] `id`: `error` when it failed, else
+    /// `ok` (absent for an action that returns nothing).
+    Answer {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ok: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+impl ClientMsg {
+    /// The answer to call `id` carrying `result`.
+    pub fn answer(id: u64, result: Result<serde_json::Value, String>) -> Self {
+        match result {
+            Ok(value) => ClientMsg::Answer {
+                id,
+                ok: Some(value),
+                error: None,
+            },
+            Err(error) => ClientMsg::Answer {
+                id,
+                ok: None,
+                error: Some(error),
+            },
+        }
+    }
 }
 
 /// What the node says to an application.
@@ -231,6 +355,14 @@ pub enum NodeMsg {
     /// in `dir`, which its install root's `current` now names. What runs is
     /// the application's to restart; nothing has been stopped.
     BuildReady { version: String, dir: PathBuf },
+    /// Do the declared `action` with `args`; answer with
+    /// [`ClientMsg::Answer`] carrying the same `id`.
+    Call {
+        id: u64,
+        action: ActionName,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
 }
 
 /// Something wrong with a message or a name.
@@ -239,6 +371,8 @@ pub enum Error {
     BadAppId(String),
     ReservedAppId,
     BadProcessName(String),
+    BadActionName(String),
+    BadAction(String),
     BadLogSpec(String),
     TooLong,
     Malformed(String),
@@ -256,6 +390,11 @@ impl fmt::Display for Error {
                 f,
                 "{name:?} is not a process name; use up to {MAX_APP_ID} lowercase letters, digits and `-`"
             ),
+            Error::BadActionName(name) => write!(
+                f,
+                "{name:?} is not an action name; use up to {MAX_APP_ID} lowercase letters, digits and `-`"
+            ),
+            Error::BadAction(why) => f.write_str(why),
             Error::BadLogSpec(why) => f.write_str(why),
             Error::TooLong => write!(f, "a line is longer than {MAX_LINE} bytes"),
             Error::Malformed(why) => write!(f, "not a message: {why}"),
@@ -351,6 +490,7 @@ mod tests {
                 file: "leavepulse.log".into(),
             }),
             process: None,
+            actions: Vec::new(),
         };
         let text = line(&hello);
         assert_eq!(
@@ -372,6 +512,7 @@ mod tests {
             pid: 7,
             logs: None,
             process: None,
+            actions: Vec::new(),
         };
         assert_eq!(
             line(&hello),
@@ -388,6 +529,7 @@ mod tests {
             pid: 9,
             logs: None,
             process: Some(ProcessName::parse("daemon").unwrap()),
+            actions: Vec::new(),
         };
         let text = line(&hello);
         assert_eq!(
@@ -403,6 +545,73 @@ mod tests {
             br#"{"msg":"hello","protocol":1,"app":"a","version":"1","pid":1,"process":"Bad Name"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_hello_declares_its_actions_and_a_call_and_its_answer_have_pinned_bytes() {
+        let hello = ClientMsg::Hello {
+            protocol: 1,
+            app: AppId::parse("leavepulse").unwrap(),
+            version: "0.6.0".into(),
+            pid: 3,
+            logs: None,
+            process: None,
+            actions: vec![ActionSpec {
+                name: ActionName::parse("stop").unwrap(),
+                description: "Stop an instance".into(),
+                schema: serde_json::json!({"type": "object"}),
+            }],
+        };
+        let text = line(&hello);
+        assert_eq!(
+            text,
+            "{\"msg\":\"hello\",\"protocol\":1,\"app\":\"leavepulse\",\"version\":\"0.6.0\",\"pid\":3,\"actions\":[{\"name\":\"stop\",\"description\":\"Stop an instance\",\"schema\":{\"type\":\"object\"}}]}\n"
+        );
+        assert_eq!(
+            decode_line::<ClientMsg>(text.trim_end().as_bytes()).unwrap(),
+            hello
+        );
+
+        let call = NodeMsg::Call {
+            id: 7,
+            action: ActionName::parse("stop").unwrap(),
+            args: serde_json::json!({"instance": "vanilla"}),
+        };
+        assert_eq!(
+            line(&call),
+            "{\"msg\":\"call\",\"id\":7,\"action\":\"stop\",\"args\":{\"instance\":\"vanilla\"}}\n"
+        );
+        assert_eq!(
+            line(&ClientMsg::answer(7, Ok(serde_json::json!(true)))),
+            "{\"msg\":\"answer\",\"id\":7,\"ok\":true}\n"
+        );
+        assert_eq!(
+            line(&ClientMsg::answer(7, Err("no such instance".into()))),
+            "{\"msg\":\"answer\",\"id\":7,\"error\":\"no such instance\"}\n"
+        );
+    }
+
+    #[test]
+    fn an_action_too_big_to_declare_is_refused_and_a_wrong_name_lists_the_right_ones() {
+        let huge = ActionSpec {
+            name: ActionName::parse("launch").unwrap(),
+            description: "x".repeat(MAX_DETAIL + 1),
+            schema: serde_json::Value::Null,
+        };
+        assert!(huge.check().is_err());
+        assert!(ActionName::parse("Launch!").is_err());
+        let declared = [
+            ActionName::parse("instances").unwrap(),
+            ActionName::parse("launch").unwrap(),
+        ];
+        assert_eq!(
+            no_such_action("leavepulse", "foo", &declared),
+            "leavepulse has no action foo; it has: instances, launch"
+        );
+        assert_eq!(
+            no_such_action("leavepulse", "foo", &[]),
+            "leavepulse declares no actions"
+        );
     }
 
     #[test]

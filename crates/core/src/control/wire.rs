@@ -375,6 +375,23 @@ pub enum Command {
         phone: String,
         action: crate::phone_action::PhoneAction,
     },
+    /// The actions application `app` declared on a connected machine; see
+    /// [`crate::apps::actions`].
+    AppActions {
+        machine: String,
+        app: String,
+    },
+    /// Ask application `app` (`process`, or its main one) on a connected
+    /// machine to do the declared `action` with the JSON `args_json`.
+    CallAction {
+        machine: String,
+        app: String,
+        #[serde(default)]
+        process: Option<String>,
+        action: String,
+        #[serde(default)]
+        args_json: String,
+    },
 }
 
 pub(super) fn default_page() -> u32 {
@@ -515,6 +532,8 @@ impl Command {
                     | Command::Launch { .. }
                     | Command::PhoneScreenshot { .. }
                     | Command::PhoneAct { .. }
+                    | Command::AppActions { .. }
+                    | Command::CallAction { .. }
             )
     }
 }
@@ -612,6 +631,14 @@ pub enum Reply {
     /// What [`Command::PhoneAct`] did.
     Acted {
         what: String,
+    },
+    /// The answer to [`Command::AppActions`].
+    Actions {
+        actions: Vec<cursio_protocol::diag::AppAction>,
+    },
+    /// What the action answered for [`Command::CallAction`], as JSON text.
+    Called {
+        result_json: String,
     },
 }
 

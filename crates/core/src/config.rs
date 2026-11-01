@@ -113,6 +113,11 @@ pub struct AppConfig {
     pub trusted_builders: Vec<TrustedBuilder>,
     /// What to do when a build asks to run as an administrator.
     pub admin: AdminConsent,
+    /// Whether other machines may call the actions the running application
+    /// declares (`cursio apps call`). Apart from trusting its builds: a build
+    /// the person installs and starts, an action does something the moment
+    /// it is called. `allow` and `deny` as for `admin`.
+    pub actions: AdminConsent,
 }
 
 /// This machine's answer to an application's build asking for administrator
@@ -137,6 +142,7 @@ impl Default for AppConfig {
             policy: UpdatePolicy::Auto,
             trusted_builders: Vec::new(),
             admin: AdminConsent::Ask,
+            actions: AdminConsent::Ask,
         }
     }
 }
@@ -224,6 +230,11 @@ pub enum ConfigEdit {
         app: String,
         consent: AdminConsent,
     },
+    /// Answer whether other machines may call `app`'s declared actions.
+    AppActions {
+        app: String,
+        consent: AdminConsent,
+    },
     /// Narrow one edge to the part that crosses; `None` gives it back whole.
     Crossing {
         edge: Edge,
@@ -248,6 +259,9 @@ impl ConfigEdit {
             }
             ConfigEdit::AppAdmin { app, consent } => {
                 config.apps.entry(app).or_default().admin = consent;
+            }
+            ConfigEdit::AppActions { app, consent } => {
+                config.apps.entry(app).or_default().actions = consent;
             }
             ConfigEdit::Crossing { edge, span } => {
                 let span = span.filter(|s| *s != EdgeSpan::WHOLE);

@@ -111,11 +111,39 @@ pub enum DiagRequest {
         /// is still only the installed build's own file.
         args: Vec<String>,
     },
+    /// The actions application `app`'s running processes declared.
+    AppActions { app: String },
+    /// Ask application `app` (its `process`, or its main one) to do the
+    /// declared `action` with the JSON `args_json`. JSON travels as text:
+    /// this vocabulary is bincode, which cannot carry a free-form value.
+    CallAction {
+        app: String,
+        process: Option<String>,
+        action: String,
+        args_json: String,
+    },
 }
 
 /// Most arguments a launch may carry, and the longest one.
 pub const MAX_LAUNCH_ARGS: usize = 32;
 pub const MAX_LAUNCH_ARG: usize = 1024;
+
+/// Longest arguments a call to an application's action carries, as JSON —
+/// under the line the application's socket takes.
+pub const MAX_CALL_ARGS: usize = 32 * 1024;
+
+/// One action an application declared, as a peer sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppAction {
+    /// Which process declared it; `None` is the main one.
+    pub process: Option<String>,
+    pub name: String,
+    pub description: String,
+    /// JSON Schema of its arguments, as text.
+    pub schema_json: String,
+    /// Whether that process runs now; a call reaches only one that does.
+    pub running: bool,
+}
 
 /// Something a person at another machine asks a node to do to itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +170,12 @@ pub enum DiagResponse {
     /// The application was started; `what` says which build, as what.
     Launched {
         what: String,
+    },
+    /// The answer to [`DiagRequest::AppActions`].
+    Actions(Vec<AppAction>),
+    /// What the action answered, as JSON text.
+    Called {
+        result_json: String,
     },
 }
 

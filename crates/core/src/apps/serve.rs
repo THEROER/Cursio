@@ -25,33 +25,99 @@ const HELLO_WAIT: Duration = Duration::from_secs(5);
 /// Longest version string an application may give.
 const MAX_VERSION: usize = 128;
 
-type Pushers = std::collections::BTreeMap<
-    cursio_app_protocol::AppId,
-    Vec<(u64, tokio::sync::mpsc::UnboundedSender<NodeMsg>)>,
->;
+type Pushers =
+    std::collections::BTreeMap<super::Key, Vec<(u64, tokio::sync::mpsc::UnboundedSender<NodeMsg>)>>;
 
-/// Each connected copy of each application, for what the node tells it
-/// unasked.
+/// Each connected copy of each application process, for what the node tells
+/// it unasked.
 fn pushers() -> std::sync::MutexGuard<'static, Pushers> {
     static PUSHERS: Mutex<Pushers> = Mutex::new(std::collections::BTreeMap::new());
     PUSHERS.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Tell every running copy of `app` that `version` is installed in `dir`.
-/// A copy that is not running hears nothing; it finds `current` when it
-/// next starts.
+/// What a call's answer resolves to.
+pub type CallResult = Result<serde_json::Value, String>;
+
+/// Calls sent and not yet answered, by id: the connection (token) that
+/// carries each, and where its answer goes.
+type Pending = std::collections::HashMap<u64, (u64, std::sync::mpsc::Sender<CallResult>)>;
+
+fn pending() -> std::sync::MutexGuard<'static, Pending> {
+    static PENDING: std::sync::OnceLock<Mutex<Pending>> = std::sync::OnceLock::new();
+    PENDING
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Tell every running copy of every process of `app` that `version` is
+/// installed in `dir`. A copy that is not running hears nothing; it finds
+/// `current` when it next starts.
 pub fn build_ready(app: &cursio_app_protocol::AppId, version: &str, dir: &std::path::Path) {
     let msg = NodeMsg::BuildReady {
         version: version.to_owned(),
         dir: dir.to_path_buf(),
     };
-    let mut pushers = pushers();
-    let Some(copies) = pushers.get_mut(app) else {
-        tracing::info!(%app, %version, "no copy of the application is running to tell of its build");
-        return;
+    let mut told = 0;
+    for (key, copies) in pushers().iter_mut() {
+        if key.app == *app {
+            copies.retain(|(_, tx)| tx.send(msg.clone()).is_ok());
+            told += copies.len();
+        }
+    }
+    match told {
+        0 => {
+            tracing::info!(%app, %version, "no copy of the application is running to tell of its build")
+        }
+        copies => tracing::info!(%app, %version, copies, "told the application its build is ready"),
+    }
+}
+
+/// Ask the running copy of `key`'s process to do `action` with `args`, and
+/// wait up to `wait` for its answer. Blocks: called from a diag answer, which
+/// is already off the session's loop.
+pub fn call(
+    key: &super::Key,
+    action: &cursio_app_protocol::ActionName,
+    args: serde_json::Value,
+    wait: Duration,
+) -> CallResult {
+    let copy = pushers()
+        .get(key)
+        .and_then(|copies| copies.first().cloned());
+    let Some((token, tx)) = copy else {
+        return Err(format!("{} is not running on this machine", describe(key)));
     };
-    copies.retain(|(_, tx)| tx.send(msg.clone()).is_ok());
-    tracing::info!(%app, %version, copies = copies.len(), "told the application its build is ready");
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (answer_tx, answer) = std::sync::mpsc::channel();
+    pending().insert(id, (token, answer_tx));
+    let msg = NodeMsg::Call {
+        id,
+        action: action.clone(),
+        args,
+    };
+    if tx.send(msg).is_err() {
+        pending().remove(&id);
+        return Err(format!("{} closed as it was called", describe(key)));
+    }
+    let result = answer.recv_timeout(wait).unwrap_or_else(|_| {
+        Err(format!(
+            "{} did not answer {action} within {} s",
+            describe(key),
+            wait.as_secs()
+        ))
+    });
+    pending().remove(&id);
+    result
+}
+
+/// `app`, or `app/process`, as a person reads it.
+fn describe(key: &super::Key) -> String {
+    match &key.process {
+        Some(process) => format!("{}/{process}", key.app),
+        None => key.app.to_string(),
+    }
 }
 
 /// Serve the apps socket for this node, named `machine` on the mesh, until
@@ -182,18 +248,20 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     let Some(first) = first else {
         return Ok(());
     };
-    let (app, process, version, pid, logs, protocol) = match decode_line::<ClientMsg>(&first) {
-        Ok(ClientMsg::Hello {
-            protocol,
-            app,
-            version,
-            pid,
-            logs,
-            process,
-        }) => (app, process, version, pid, logs, protocol),
-        Ok(_) => return refuse(&mut write, "the first message must be hello".into()).await,
-        Err(error) => return refuse(&mut write, error.to_string()).await,
-    };
+    let (app, process, version, pid, logs, protocol, actions) =
+        match decode_line::<ClientMsg>(&first) {
+            Ok(ClientMsg::Hello {
+                protocol,
+                app,
+                version,
+                pid,
+                logs,
+                process,
+                actions,
+            }) => (app, process, version, pid, logs, protocol, actions),
+            Ok(_) => return refuse(&mut write, "the first message must be hello".into()).await,
+            Err(error) => return refuse(&mut write, error.to_string()).await,
+        };
     if protocol == 0 {
         return refuse(&mut write, "protocol version 0 does not exist".into()).await;
     }
@@ -207,11 +275,22 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     if let Some(Err(error)) = logs.as_ref().map(|spec| spec.check()) {
         return refuse(&mut write, error.to_string()).await;
     }
+    if actions.len() > cursio_app_protocol::MAX_ACTIONS {
+        let limit = cursio_app_protocol::MAX_ACTIONS;
+        return refuse(&mut write, format!("at most {limit} actions per process")).await;
+    }
+    if let Some(Err(error)) = actions.iter().map(|a| a.check()).find(Result::is_err) {
+        return refuse(&mut write, error.to_string()).await;
+    }
     let key = super::Key {
         app: app.clone(),
         process,
     };
-    lock(registry).connected(&key, version.clone(), pid, logs.clone());
+    {
+        let mut registry = lock(registry);
+        registry.connected(&key, version.clone(), pid, logs.clone());
+        registry.set_actions(&key, actions);
+    }
     tracing::info!(%app, process = ?key.process, %version, pid, logs = ?logs.as_ref().map(|l| l.dir.join(&l.file)), "application connected");
     let welcome = NodeMsg::Welcome {
         protocol: protocol.min(PROTOCOL),
@@ -223,7 +302,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     let (out, mut outbox) = tokio::sync::mpsc::unbounded_channel::<NodeMsg>();
     let token: u64 = rand::random();
     pushers()
-        .entry(app.clone())
+        .entry(key.clone())
         .or_default()
         .push((token, out.clone()));
     let _ = out.send(welcome);
@@ -254,6 +333,25 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                     let feature = "hello after hello".to_owned();
                     let _ = out.send(NodeMsg::Unsupported { feature });
                 }
+                Ok(ClientMsg::Answer { id, ok, error }) => {
+                    let waiting = pending().remove(&id);
+                    match waiting {
+                        // Only the connection a call went out on answers it.
+                        Some((carrier, answer)) if carrier == token => {
+                            let result = match error {
+                                Some(error) => Err(error),
+                                None => Ok(ok.unwrap_or(serde_json::Value::Null)),
+                            };
+                            let _ = answer.send(result);
+                        }
+                        Some(other) => {
+                            pending().insert(id, other);
+                        }
+                        None => {
+                            tracing::debug!(%app, id, "an answer to a call no longer waited for");
+                        }
+                    }
+                }
                 Err(_) => {
                     let feature = message_kind(&line).unwrap_or_else(|| "not a message".into());
                     tracing::debug!(%app, %feature, "an application sent a message this node does not know");
@@ -267,9 +365,18 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
         ended = reading => ended,
         ended = writing => ended,
     };
-    if let Some(copies) = pushers().get_mut(&app) {
+    if let Some(copies) = pushers().get_mut(&key) {
         copies.retain(|(t, _)| *t != token);
     }
+    // A call this copy will now never answer is answered for it, rather than
+    // left to run out its wait.
+    pending().retain(|_, (carrier, answer)| {
+        if *carrier == token {
+            let _ = answer.send(Err(format!("{} closed before answering", describe(&key))));
+            return false;
+        }
+        true
+    });
     lock(registry).disconnected(&key);
     tracing::info!(%app, process = ?key.process, "application disconnected");
     ended
@@ -323,6 +430,7 @@ mod tests {
             pid: 99,
             logs,
             process: None,
+            actions: Vec::new(),
         })
     }
 
@@ -517,6 +625,93 @@ mod tests {
             let build = heard.recv().await.unwrap();
             assert_eq!(build.version, "2");
             assert_eq!(build.dir, dir.join("versions/2"));
+            drop(app);
+        })
+        .await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_calls_an_action_the_running_application_declared() {
+        use serde_json::json;
+        let dir = scratch("actions");
+        let path = dir.join("apps.sock");
+        // The node's own registry: what a peer's call looks in.
+        let registry = super::super::registry().clone();
+        let server = tokio::spawn(serve(path.clone(), "Nocturne".into(), registry.clone()));
+        bounded(async {
+            let app = cursio_sdk::App::new("e2e-actions")
+                .endpoint(&path)
+                .action(
+                    "echo",
+                    "Answer the arguments",
+                    json!({"type": "object"}),
+                    Ok,
+                )
+                .action("boom", "Panic", serde_json::Value::Null, |_| {
+                    panic!("no such instance")
+                })
+                .start()
+                .unwrap();
+            let key = super::super::Key::main(AppId::parse("e2e-actions").unwrap());
+            while !lock(&registry).get(&key).is_some_and(|r| r.running()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            let listed = crate::apps::actions::list("e2e-actions").unwrap();
+            let names: Vec<&str> = listed.iter().map(|a| a.name.as_str()).collect();
+            assert_eq!(names, ["echo", "boom"]);
+            assert!(listed.iter().all(|a| a.running));
+
+            let (echo, boom) = {
+                let key = key.clone();
+                tokio::task::spawn_blocking(move || {
+                    let echo = call(
+                        &key,
+                        &cursio_app_protocol::ActionName::parse("echo").unwrap(),
+                        json!({"instance": "vanilla"}),
+                        Duration::from_secs(5),
+                    );
+                    let boom = call(
+                        &key,
+                        &cursio_app_protocol::ActionName::parse("boom").unwrap(),
+                        serde_json::Value::Null,
+                        Duration::from_secs(5),
+                    );
+                    (echo, boom)
+                })
+                .await
+                .unwrap()
+            };
+            assert_eq!(echo, Ok(json!({"instance": "vanilla"})));
+            assert_eq!(
+                boom,
+                Err("action boom panicked: no such instance".to_owned())
+            );
+
+            let wrong = tokio::task::spawn_blocking(|| {
+                crate::apps::actions::call("Nocturne", "e2e-actions", None, "nope", "{}")
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                wrong,
+                Err("e2e-actions has no action nope; it has: boom, echo".to_owned()),
+                "the node's words are the SDK's"
+            );
+            let unasked = tokio::task::spawn_blocking(|| {
+                crate::apps::actions::call("Nocturne", "e2e-actions", None, "echo", "{}")
+            })
+            .await
+            .unwrap();
+            assert!(
+                unasked
+                    .unwrap_err()
+                    .contains("wait for this machine's person"),
+                "nothing is called before this machine's person allows it"
+            );
+            crate::diagnostics::clear("app.e2e-actions.actions");
             drop(app);
         })
         .await;
