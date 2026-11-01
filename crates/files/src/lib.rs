@@ -35,8 +35,10 @@ pub mod share;
 /// Which process is walking a mounted peer volume, directory after directory.
 pub mod walk;
 /// Windows mounting, present only where `winfsp` can be built — see this
-/// crate's `Cargo.toml` for why that means MSVC rather than Windows in general.
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
+/// crate's `Cargo.toml` for why that means MSVC rather than Windows in general
+/// — and only with the `mount` feature, which is what brings the GPL-3.0
+/// `winfsp-sys` in.
+#[cfg(all(target_os = "windows", target_env = "msvc", feature = "mount"))]
 pub mod winmount;
 /// Several writes in flight against one handle, without acknowledging any of
 /// them before the peer has stored it.
@@ -156,7 +158,10 @@ pub fn winfsp_filesystem_name(peer_name: &str) -> String {
 
 /// Now, as seconds since the epoch — for a file just created here, whose
 /// timestamp the peer has not yet told us.
-#[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "windows", target_env = "msvc", feature = "mount")
+))]
 pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

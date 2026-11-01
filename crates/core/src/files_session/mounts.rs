@@ -119,11 +119,12 @@ pub(super) fn excluded_paths(_peer_name: &str) -> Vec<std::path::PathBuf> {
 /// A live mount of the peer's volumes, whichever OS is presenting them.
 #[cfg(target_os = "linux")]
 pub(super) type Mount = cursio_files::mount::MountHandle;
-/// On Windows a drive is mounted here only when the node runs unelevated;
-/// elevated, the helper holds it, in the session Explorer runs in (see
-/// [`crate::mount_helper`]).
+/// On Windows a drive is mounted here only when the node runs unelevated and
+/// was built with `files-mount`; otherwise the helper holds it, in the
+/// session Explorer runs in (see [`crate::mount_helper`]).
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 pub(super) enum Mount {
+    #[cfg(feature = "files-mount")]
     Here {
         _drive: cursio_files::winmount::MountHandle,
     },
@@ -141,6 +142,7 @@ pub(super) fn mount_is_alive(_mount: &Mount) -> bool {
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 pub(super) fn mount_is_alive(mount: &Mount) -> bool {
     match mount {
+        #[cfg(feature = "files-mount")]
         Mount::Here { .. } => true,
         Mount::Helper(relayed) => relayed.is_alive(),
     }
@@ -181,20 +183,29 @@ pub(super) fn mount_one_volume(
     volume: &Volume,
 ) -> anyhow::Result<Mount> {
     let name = cursio_files::peer_volume_name(peer_name, &volume.id, volume.removable);
-    if crate::elevate::is_elevated() {
-        match crate::mount_helper::mount(peer.clone(), peer_name, &volume.id, &name) {
-            Ok(relayed) => return Ok(Mount::Helper(relayed)),
-            Err(e) => tracing::warn!(
-                peer = %peer_name,
-                volume = %volume.id,
-                error = %format!("{e:#}"),
-                "cannot start the drive helper; mounting here, where Explorer will not show the \
-                 drive (it stays reachable by its \\\\cursio\\ path)"
-            ),
+    #[cfg(feature = "files-mount")]
+    {
+        if crate::elevate::is_elevated() {
+            match crate::mount_helper::mount(peer.clone(), peer_name, &volume.id, &name) {
+                Ok(relayed) => return Ok(Mount::Helper(relayed)),
+                Err(e) => tracing::warn!(
+                    peer = %peer_name,
+                    volume = %volume.id,
+                    error = %format!("{e:#}"),
+                    "cannot start the drive helper; mounting here, where Explorer will not show \
+                     the drive (it stays reachable by its \\\\cursio\\ path)"
+                ),
+            }
         }
+        cursio_files::winmount::mount(peer, peer_name, &volume.id, &name)
+            .map(|drive| Mount::Here { _drive: drive })
     }
-    cursio_files::winmount::mount(peer, peer_name, &volume.id, &name)
-        .map(|drive| Mount::Here { _drive: drive })
+    // Without WinFsp in this binary the helper is the only way to mount,
+    // elevated or not.
+    #[cfg(not(feature = "files-mount"))]
+    {
+        crate::mount_helper::mount(peer, peer_name, &volume.id, &name).map(Mount::Helper)
+    }
 }
 
 /// What makes a volume *this* volume, for deciding whether the offered set has

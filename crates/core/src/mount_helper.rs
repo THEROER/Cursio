@@ -28,25 +28,40 @@
 //! process it started: anyone running as this user could create a pipe of that
 //! name first and be handed the peer's files.
 
-/// The subcommand the node runs the helper as.
+//!
+//! **Its own executable, `cursio-mount-helper`.** The helper is the one side
+//! that needs WinFsp, whose Rust bindings are GPL-3.0; the node's side is a
+//! pipe and a relay. So the helper is also built apart (`files-mount`), and a
+//! node built without `files-mount` — or a closed product embedding Cursio —
+//! mounts a peer's disks through that executable beside it, linking none of
+//! WinFsp, and mounts through it when unelevated too, where it would
+//! otherwise have mounted in-process. A node built with `files-mount` keeps
+//! running a copy of itself as `cursio mount-helper`: certainly the same
+//! build, wherever it was started from.
+
+/// The subcommand a node built with `files-mount` runs a copy of itself as.
 pub const HELPER_COMMAND: &str = "mount-helper";
 
+/// The helper's own executable, looked for beside the node's.
+pub const HELPER_EXE: &str = "cursio-mount-helper";
+
 /// Run as the helper for the node with process id `parent`, until it exits.
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
+#[cfg(all(target_os = "windows", target_env = "msvc", feature = "files-mount"))]
 pub async fn run_helper(parent: u32) -> anyhow::Result<()> {
     imp::run_helper(parent).await
 }
 
-#[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+#[cfg(not(all(target_os = "windows", target_env = "msvc", feature = "files-mount")))]
 pub async fn run_helper(_parent: u32) -> anyhow::Result<()> {
     anyhow::bail!(
-        "the mount helper exists only in the Windows (MSVC) build: elsewhere the node \
-         mounts a peer's volumes itself"
+        "the mount helper exists only in a Windows (MSVC) build with `files-mount`: elsewhere \
+         the node mounts a peer's volumes itself, and a node without it starts \
+         `{HELPER_EXE}` instead"
     )
 }
 
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
+#[cfg(all(target_os = "windows", target_env = "msvc", feature = "files"))]
 pub use imp::{mount, RelayedMount};
 
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
+#[cfg(all(target_os = "windows", target_env = "msvc", feature = "files"))]
 mod imp;

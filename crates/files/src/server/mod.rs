@@ -22,7 +22,7 @@ mod io;
 pub(crate) use capacity::capacity_of;
 #[cfg(any(
     target_os = "linux",
-    all(target_os = "windows", target_env = "msvc"),
+    all(target_os = "windows", target_env = "msvc", feature = "mount"),
     test
 ))]
 pub(crate) use capacity::{FALLBACK_FREE, FALLBACK_TOTAL};

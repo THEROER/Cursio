@@ -39,6 +39,15 @@ libc = "0.2"
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
 
+[features]
+# Mounting a peer's volumes on Windows: WinFsp. `winfsp-sys` is GPL-3.0, so a
+# build that only serves this machine's disks — a product embedding Cursio,
+# or a node that leaves mounting to the separate `cursio-mount-helper`
+# executable — leaves it out and links no GPL code for files. Linux mounting
+# (`fuser`, MIT) is not behind it: it carries no such license, and a Linux
+# node that cannot mount is not a build anyone asked for.
+mount = ["dep:winfsp", "dep:widestring", "dep:windows"]
+
 # Windows mounting goes through WinFsp. Gated on the MSVC environment, not just
 # on Windows: `winfsp-sys` refuses any other triple outright (its build script
 # panics with "unsupported triple" on MinGW), so the MinGW cross-build that
@@ -49,9 +58,9 @@ libc = "0.2"
 # `GetStdHandle(...).unwrap()`, which panics or yields a useless handle when the
 # process has no console — and the filesystem then stops answering entirely,
 # losing even the UNC path that worked without it.
-winfsp = "0.13"
-widestring = "1"
-windows = { version = "0.61", features = ["Win32_Foundation"] }
+winfsp = { version = "0.13", optional = true }
+widestring = { version = "1", optional = true }
+windows = { version = "0.61", features = ["Win32_Foundation"], optional = true }
 
 # Just `GetDiskFreeSpaceExW`, for the capacity a volume reports. `windows-sys`
 # rather than `windows`: this is one raw call with no COM or lifetime handling

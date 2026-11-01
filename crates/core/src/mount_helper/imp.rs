@@ -16,12 +16,12 @@ use windows::Win32::Security::{
 use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows::Win32::System::Threading::{
     CreateProcessWithTokenW, OpenProcess, OpenProcessToken, WaitForSingleObject, CREATE_NO_WINDOW,
-    CREATE_PROCESS_LOGON_FLAGS, INFINITE, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, STARTUPINFOW,
+    CREATE_PROCESS_LOGON_FLAGS, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    STARTUPINFOW,
 };
+#[cfg(feature = "files-mount")]
+use windows::Win32::System::Threading::{INFINITE, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
-
-use super::HELPER_COMMAND;
 
 /// How long the node waits for a helper it just started to open its pipe.
 const HELPER_START: Duration = Duration::from_secs(10);
@@ -123,46 +123,109 @@ impl EncodeWideNul for std::ffi::OsStr {
 /// The helper this node started, while it runs.
 struct Helper {
     pid: u32,
-    /// Kept as an integer: a `HANDLE` is a raw pointer and not `Send`.
-    process: isize,
+    process: HelperProcess,
+}
+
+enum HelperProcess {
+    /// Started with the shell's token. Kept as an integer: a `HANDLE` is a
+    /// raw pointer and not `Send`.
+    Token(isize),
+    /// Started as this node's own child, the node being unelevated already.
+    Child(std::process::Child),
 }
 
 impl Helper {
-    fn is_running(&self) -> bool {
-        // SAFETY: the handle stays open for as long as `Helper` exists.
-        unsafe { WaitForSingleObject(HANDLE(self.process as _), 0) == WAIT_TIMEOUT }
+    fn is_running(&mut self) -> bool {
+        match &mut self.process {
+            // SAFETY: the handle stays open for as long as `Helper` exists.
+            HelperProcess::Token(process) => unsafe {
+                WaitForSingleObject(HANDLE(*process as _), 0) == WAIT_TIMEOUT
+            },
+            HelperProcess::Child(child) => matches!(child.try_wait(), Ok(None)),
+        }
     }
 }
 
 impl Drop for Helper {
     fn drop(&mut self) {
-        drop(Owned(HANDLE(self.process as _)));
+        if let HelperProcess::Token(process) = self.process {
+            drop(Owned(HANDLE(process as _)));
+        }
     }
 }
 
 static HELPER: Mutex<Option<Helper>> = Mutex::new(None);
 
+/// What to run as the helper: a copy of this executable when it carries the
+/// mount itself (`files-mount`), else `cursio-mount-helper` beside it.
+///
+/// A copy first, because it is this very build: a helper executable beside a
+/// node is only certainly the same version inside an install's `versions/`
+/// directory, and one left in a `deploy` directory would serve a node of
+/// another commit.
+fn helper_command() -> anyhow::Result<(PathBuf, Vec<String>)> {
+    let exe = std::env::current_exe().context("cannot locate this executable")?;
+    let parent = std::process::id().to_string();
+    #[cfg(feature = "files-mount")]
+    {
+        Ok((
+            exe,
+            vec![
+                super::HELPER_COMMAND.to_string(),
+                "--parent".to_string(),
+                parent,
+            ],
+        ))
+    }
+    #[cfg(not(feature = "files-mount"))]
+    {
+        let beside = exe.with_file_name(format!("{}.exe", super::HELPER_EXE));
+        if !beside.is_file() {
+            anyhow::bail!(
+                "{} is missing; this build mounts a peer's disks only through it",
+                beside.display()
+            );
+        }
+        Ok((beside, vec!["--parent".to_string(), parent]))
+    }
+}
+
 /// The running helper's process id, starting one if there is none.
 fn helper_pid() -> anyhow::Result<u32> {
     let mut helper = HELPER.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(running) = helper.as_ref().filter(|h| h.is_running()) {
+    if let Some(running) = helper.as_mut().filter(|h| h.is_running()) {
         return Ok(running.pid);
     }
-    let exe = std::env::current_exe().context("cannot locate this executable")?;
-    let args = vec![
-        HELPER_COMMAND.to_string(),
-        "--parent".to_string(),
-        std::process::id().to_string(),
-    ];
-    let (pid, process) = spawn_unelevated(&exe, &args)?;
-    tracing::info!(pid, "started the drive helper in the desktop's session");
-    *helper = Some(Helper {
-        pid,
-        process: process.0 as isize,
-    });
+    let (exe, args) = helper_command()?;
+    let started = match crate::elevate::is_elevated() {
+        true => {
+            let (pid, process) = spawn_unelevated(&exe, &args)?;
+            tracing::info!(pid, exe = %exe.display(), "started the drive helper in the desktop's session");
+            Helper {
+                pid,
+                process: HelperProcess::Token(process.0 as isize),
+            }
+        }
+        false => {
+            use std::os::windows::process::CommandExt;
+            let child = std::process::Command::new(&exe)
+                .args(&args)
+                .creation_flags(CREATE_NO_WINDOW.0)
+                .spawn()
+                .with_context(|| format!("cannot start {}", exe.display()))?;
+            tracing::info!(pid = child.id(), exe = %exe.display(), "started the drive helper");
+            Helper {
+                pid: child.id(),
+                process: HelperProcess::Child(child),
+            }
+        }
+    };
+    let pid = started.pid;
+    *helper = Some(started);
     Ok(pid)
 }
 
+#[cfg(feature = "files-mount")]
 pub(super) async fn run_helper(parent: u32) -> anyhow::Result<()> {
     // SAFETY: the handle is only waited on, and closed when the process exits.
     let parent_process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent) }
@@ -184,6 +247,7 @@ pub(super) async fn run_helper(parent: u32) -> anyhow::Result<()> {
     serve(pipe_name(parent)).await
 }
 
+#[cfg(feature = "files-mount")]
 async fn serve(path: PathBuf) -> anyhow::Result<()> {
     let create = |first| {
         crate::control::transport::windows::create(&path, first)
@@ -205,6 +269,7 @@ async fn serve(path: PathBuf) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "files-mount")]
 fn mount_volume(
     link: PeerLink,
     request: MountRequest,
