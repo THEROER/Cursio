@@ -42,6 +42,7 @@ pub struct Builds {
     config_path: PathBuf,
     agents: Mutex<BTreeMap<String, Arc<Agent>>>,
     switcher: Option<AppSwitcher>,
+    opener: Option<super::phone_open::AppOpener>,
 }
 
 static BUILDS: OnceLock<Builds> = OnceLock::new();
@@ -61,9 +62,16 @@ pub fn start(config_path: PathBuf) {
 
 /// [`start`] with the builds under `root` and handed on by `switcher`: a
 /// phone, whose writable directory the system chooses per install and whose
-/// applications only its installer may replace.
-pub fn start_with(root: PathBuf, config_path: PathBuf, switcher: AppSwitcher) {
-    let _ = BUILDS.set(Builds::at(root, config_path).with_switcher(switcher));
+/// applications only its installer may replace — and are opened by `opener`.
+pub fn start_with(
+    root: PathBuf,
+    config_path: PathBuf,
+    switcher: AppSwitcher,
+    opener: super::phone_open::AppOpener,
+) {
+    let mut builds = Builds::at(root, config_path).with_switcher(switcher);
+    builds.opener = Some(opener);
+    let _ = BUILDS.set(builds);
 }
 
 /// The machine's applications' builds, once [`start`]ed.
@@ -84,7 +92,21 @@ impl Builds {
             config_path,
             agents: Mutex::new(BTreeMap::new()),
             switcher: None,
+            opener: None,
         }
+    }
+
+    /// What opens an application here, where builds go to an installer.
+    pub fn opener(&self) -> Option<&super::phone_open::AppOpener> {
+        self.opener.as_ref()
+    }
+
+    /// Which packages this phone's person allowed as which application, read
+    /// now: a button pressed takes effect at once.
+    pub fn package_grants(&self) -> Vec<crate::config::PackageGrant> {
+        Config::load(&self.config_path)
+            .map(|c| c.package_access)
+            .unwrap_or_default()
     }
 
     pub fn with_switcher(mut self, switcher: AppSwitcher) -> Self {

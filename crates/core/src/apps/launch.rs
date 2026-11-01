@@ -56,15 +56,30 @@ pub fn launch(
             ));
         }
     }
-    let version = current.ok_or_else(|| format!("no build of {id} is installed here"))?;
     // A phone replaces an application only through its installer, which asks
-    // the person: being current there means the notification is up, and no
-    // process can be started for them.
+    // the person: being current there means the notification is up. Starting
+    // it is opening the package its person allowed as this application —
+    // which may have been installed some other way, so no build from the
+    // mesh is needed for that.
     if builds.hands_to_installer() {
-        return Ok(format!(
-            "{id} {version} is offered to this phone's installer; it runs once its person installs and opens it"
-        ));
+        if !start {
+            let version = current.ok_or_else(|| format!("no build of {id} is installed here"))?;
+            return Ok(format!(
+                "{id} {version} is offered to this phone's installer; it runs once its person installs and opens it"
+            ));
+        }
+        let opener = builds
+            .opener()
+            .ok_or("this phone cannot open applications")?;
+        return super::phone_open::open(
+            &builds.package_grants(),
+            &id,
+            version,
+            restart,
+            opener.as_ref(),
+        );
     }
+    let version = current.ok_or_else(|| format!("no build of {id} is installed here"))?;
     if !start {
         return Ok(format!("{id} {version} is installed and current"));
     }

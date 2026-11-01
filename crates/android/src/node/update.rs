@@ -53,7 +53,12 @@ pub fn start_apps(config_path: PathBuf) {
         tracing::warn!("no data directory; this phone takes no applications' builds");
         return;
     };
-    cursio_core::apps::builds::start_with(root, config_path, Arc::new(offer_app_to_installer));
+    cursio_core::apps::builds::start_with(
+        root,
+        config_path,
+        Arc::new(offer_app_to_installer),
+        Arc::new(open_package),
+    );
     tracing::info!("taking applications' builds from the mesh");
 }
 
@@ -142,6 +147,40 @@ fn offer_app_to_installer(
     Ok(())
 }
 
+/// Open `package`'s launcher screen, as `CursioNative.openPackage` answers:
+/// `direct` or `asked`, then the installed versionName, tab-separated; or
+/// `error` and why.
+fn open_package(package: &str) -> Result<cursio_core::apps::phone_open::Opened, String> {
+    let answer = crate::jvm::with_native(|env, class| {
+        let package = env.new_string(package)?;
+        let answer = env
+            .call_static_method(
+                class,
+                "openPackage",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&package)],
+            )?
+            .l()?;
+        let answer = jni::objects::JString::from(answer);
+        let answer: String = env.get_string(&answer)?.into();
+        Ok(answer)
+    })
+    .map_err(|why| format!("the phone could not open {package}: {why}"))?;
+    parse_opened(&answer)
+}
+
+fn parse_opened(answer: &str) -> Result<cursio_core::apps::phone_open::Opened, String> {
+    use cursio_core::apps::phone_open::Opened;
+    let (kind, rest) = answer.split_once('\t').unwrap_or((answer, ""));
+    let version_name = (!rest.is_empty()).then(|| rest.to_owned());
+    match kind {
+        "direct" => Ok(Opened::Direct { version_name }),
+        "asked" => Ok(Opened::Asked { version_name }),
+        "error" => Err(rest.to_owned()),
+        other => Err(format!("the phone answered {other:?} to opening an app")),
+    }
+}
+
 /// Hand an installed build's APK to the system installer, through a
 /// notification the person taps.
 fn offer_to_installer(layout: &InstallLayout, version: &str) -> Result<(), UpdateError> {
@@ -161,4 +200,29 @@ fn offer_to_installer(layout: &InstallLayout, version: &str) -> Result<(), Updat
     .map_err(|why| UpdateError::Refused(format!("the phone could not offer the update: {why}")))?;
     tracing::info!(%version, "handed the build to the system installer");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cursio_core::apps::phone_open::Opened;
+
+    #[test]
+    fn the_phones_answer_to_opening_an_app_reads_back() {
+        assert_eq!(
+            parse_opened("direct\t0.6.1").unwrap(),
+            Opened::Direct {
+                version_name: Some("0.6.1".into())
+            }
+        );
+        assert_eq!(
+            parse_opened("asked\t").unwrap(),
+            Opened::Asked { version_name: None }
+        );
+        assert_eq!(
+            parse_opened("error\tx is not installed on this phone").unwrap_err(),
+            "x is not installed on this phone"
+        );
+        assert!(parse_opened("what").is_err());
+    }
 }

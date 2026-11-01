@@ -306,4 +306,13 @@ object CursioNative {
             "$name\t$label"
         }
     }
+
+    /**
+     * Open [pkg]'s launcher screen for a computer (`apps launch`), answering
+     * `direct` or `asked` then the installed versionName, tab-separated, or
+     * `error` and why. The package is the one the person allowed as that
+     * application (`apps/phone_open.rs`), never one a computer named.
+     */
+    @JvmStatic
+    fun openPackage(pkg: String): String = AppOpener.open(pkg)
 }

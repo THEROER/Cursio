@@ -12,6 +12,7 @@
     public static void offerUpdate(...);
     public static java.lang.String offerAppUpdate(...);
     public static java.lang.String packagesForUid(...);
+    public static java.lang.String openPackage(...);
     public static java.lang.String onSmsRequest(...);
     public static java.lang.String onCallRequest(...);
     public static java.lang.String onMediaCommand(...);

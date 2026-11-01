@@ -255,6 +255,9 @@ class ScreenTouch : AccessibilityService() {
             }
         }
 
+        /** Whether the system has bound this service now. */
+        fun connected(): Boolean = instance != null
+
         /** What a computer's touch needs and lacks, or `""` when it works. */
         @JvmStatic
         fun state(): String =

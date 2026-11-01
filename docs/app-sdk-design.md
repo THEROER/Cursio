@@ -396,10 +396,24 @@ private directory, which another app cannot open. Two steps:
    (`GET_SIGNING_CERTIFICATES`); a mismatch is raised as
    `app.<id>.signer` with the `applicationIdSuffix ".dev"` advice instead of
    a notification the installer would refuse after the tap.
-   `cursio apps launch <phone> <app>` answers that the build is offered to
-   the installer and runs once its person installs and opens it — a phone
-   starts no process for a peer. Logs are served only if the app writes
-   into a directory it shares.
+   `cursio apps launch <phone> <app>` **opens** the application
+   (`core/src/apps/phone_open.rs`): the package opened is the one the
+   phone's person allowed as that id (step 6's `package_access`), never one
+   the request names, and no build from the mesh is needed — it may have been
+   installed any other way. Android 10+ refuses activity starts from the
+   background except for an app whose accessibility service the system has
+   bound, so with Cursio's touch service on the launcher screen is started
+   directly (`CursioNative.openPackage` → `AppOpener.kt`); without it the
+   person gets an "Open <label>" notification and the answer says so.
+   MIUI/HyperOS can still drop a direct start silently unless Cursio may
+   "display pop-up windows while running in the background" — the answer
+   names that setting; nothing changes it. A requested version that differs
+   from the installed versionName is reported (the build may still be at the
+   installer). `--restart` only opens: one app cannot end another without
+   root. `ship`'s waiting (`start=false`) still answers about the build
+   offered to the installer. Logs are served only if the app writes into a
+   directory Cursio can read (its `Android/media/<package>/` folder, under
+   Cursio's all-files access).
 2. **SDK on Android (built, step 6).** The node listens on the abstract
    socket `@cursio-apps` (`cursio_app_protocol::ABSTRACT_NAME`;
    `crates/android/src/node/apps.rs`), and `cursio-sdk` connects there on

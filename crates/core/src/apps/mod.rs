@@ -22,6 +22,7 @@ pub mod cli;
 pub mod lane;
 pub mod launch;
 pub mod mesh;
+pub mod phone_open;
 pub mod serve;
 
 use std::collections::BTreeMap;
