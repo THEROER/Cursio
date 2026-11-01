@@ -28,6 +28,12 @@
  *   GetDraggedWindow() -> (s, i, i, i, i) — title + frame rect, or ("",0,0,0,0)
  *   InhibitDirectScanout()                — composite every frame, see below
  *   UninhibitDirectScanout()              — undo one InhibitDirectScanout
+ *   AppWindows(au pids) -> a(usuu)        — an application's windows: id,
+ *                                           title, width, height
+ *   ShotAppWindow(u id) -> ay             — that window raised, as PNG
+ *   ClickAppWindow(u id, d x, d y, b right), TypeAppWindow(u id, s text),
+ *   KeyAppWindow(u id, u evdev)           — drive it; x, y are fractions
+ *   (`appWindows.js`; answered only to the Cursio node)
  *
  * Coordinates are the pointer's, in compositor-global pixels, which is what
  * the daemon's edge logic already speaks.
@@ -41,6 +47,7 @@ import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Meta from 'gi://Meta';
 
+import {APP_WINDOWS_IFACE, AppWindows} from './appWindows.js';
 import {CallWindowPlacer} from './callWindow.js';
 import {CursioIndicator} from './menu.js';
 
@@ -69,6 +76,7 @@ const IFACE = `
     </method>
     <method name="InhibitDirectScanout"/>
     <method name="UninhibitDirectScanout"/>
+    ${APP_WINDOWS_IFACE}
   </interface>
 </node>`;
 
@@ -116,6 +124,7 @@ export default class CursioExtension {
 
         this._window = null;
         this._pollId = 0;
+        this._appWindows = new AppWindows();
         // Sender -> how many inhibitions it holds.
         this._scanoutHolders = new Map();
 
@@ -149,6 +158,8 @@ export default class CursioExtension {
         this._indicator = null;
         this._callPlacer?.destroy();
         this._callPlacer = null;
+        this._appWindows?.destroy();
+        this._appWindows = null;
         this._stopPolling();
         global.display.disconnectObject(this);
         for (const sender of [...this._scanoutHolders.keys()])
@@ -163,6 +174,30 @@ export default class CursioExtension {
             this._dbus = null;
         }
         this._window = null;
+    }
+
+    /* --- Application windows (appWindows.js) ---------------------------- */
+
+    /* `wrapJSObject` looks the methods up on this object; the work and the
+     * check of who asks live in `AppWindows`. */
+    AppWindowsAsync(params, invocation) {
+        return this._appWindows.AppWindowsAsync(params, invocation);
+    }
+
+    ShotAppWindowAsync(params, invocation) {
+        return this._appWindows.ShotAppWindowAsync(params, invocation);
+    }
+
+    ClickAppWindowAsync(params, invocation) {
+        return this._appWindows.ClickAppWindowAsync(params, invocation);
+    }
+
+    TypeAppWindowAsync(params, invocation) {
+        return this._appWindows.TypeAppWindowAsync(params, invocation);
+    }
+
+    KeyAppWindowAsync(params, invocation) {
+        return this._appWindows.KeyAppWindowAsync(params, invocation);
     }
 
     /* --- Direct scanout -------------------------------------------------- */

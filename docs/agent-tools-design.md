@@ -160,9 +160,23 @@ that a button now shows "Running". `core/src/desktop_window.rs`:
   person's real cursor never moves; text is `WM_CHAR` per UTF-16 unit to the
   focused control, any script. An application reading raw input or
   DirectInput ignores posted input, as with window transfer.
-- **Linux: not built.** Reading another application's window there is the
-  ScreenCast portal with its per-session consent dialog, and input is libei;
-  the tools answer that plainly rather than faking a picture.
+- **Linux, GNOME** (`cursio_window::linux_app` → the Shell extension's
+  `appWindows.js`), Wayland and X11 sessions alike. The ScreenCast portal was
+  the first candidate and does not fit: it streams only a window the person
+  picks in its dialog, and nothing in the stream names the process, so "the
+  window of the application registered as pid N" has no portal answer. Inside
+  the compositor it is `Meta.Window.get_pid()`. The extension raises and
+  focuses the window, takes the Shell's own screenshot of its frame
+  (`Shell.Screenshot.screenshot_area`), and drives it with Clutter virtual
+  devices — absolute pointer motion and a button for a click (the pointer is
+  put back afterwards), keysyms for text (Mutter maps one missing from the
+  layout onto a spare key code, so any script types), evdev codes for keys.
+  Unlike Windows the window is brought to the front: on Wayland nothing else
+  reaches it. The extension answers only a caller whose executable is named
+  `cursio`; the node asks only after `[apps.<id>] actions`. A desktop without
+  the extension, or with an older one, is told which (`linux_app::explain`).
+  A non-GNOME X11 desktop is not built (no XTest/`get_image` path): it answers
+  that it needs GNOME with the extension.
 
 ## The same surface in cursio-sdk
 

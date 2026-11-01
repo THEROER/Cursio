@@ -17,9 +17,11 @@
 //! at least what calling its actions does, so `[apps.<id>] actions` decides
 //! both, asked once with buttons on this machine.
 //!
-//! Built for Windows (`cursio_window::windows_app`). On Linux, reading another
-//! application's window means the ScreenCast portal and its per-session
-//! consent, and input means libei — not built yet, and said so.
+//! Built for Windows (`cursio_window::windows_app`) and for GNOME, on Wayland
+//! and X11 alike (`cursio_window::linux_app`, through Cursio's Shell
+//! extension: a Wayland client cannot find another's window, and the
+//! ScreenCast portal streams only one the person picks, with no process to
+//! match it to). Elsewhere it says it is not built.
 
 use cursio_app_protocol::{AppId, ProcessName};
 use cursio_protocol::diag::{DesktopInput, DiagResponse, WindowTarget, MAX_TYPED, WINDOW_SPAN};
@@ -93,6 +95,47 @@ pub fn check(input: &DesktopInput) -> Result<(), String> {
     }
 }
 
+/// `image` no longer than `max_side` on its long side, as the answer to a
+/// still.
+#[cfg(all(any(windows, target_os = "linux"), feature = "phone-control"))]
+fn answer_still(
+    mut image: image::RgbaImage,
+    max_side: Option<u32>,
+    title: String,
+) -> Result<DiagResponse, String> {
+    let (w, h) = image.dimensions();
+    if let Some(max) = max_side.filter(|m| *m > 0) {
+        let long = w.max(h);
+        if long > max {
+            let scale = max as f32 / long as f32;
+            let (sw, sh) = (
+                ((w as f32 * scale).round() as u32).max(1),
+                ((h as f32 * scale).round() as u32).max(1),
+            );
+            image = image::imageops::resize(&image, sw, sh, image::imageops::FilterType::Triangle);
+        }
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|e| format!("cannot encode the picture: {e}"))?;
+    Ok(DiagResponse::WindowShot {
+        png: png.into_inner(),
+        width: image.width(),
+        height: image.height(),
+        title,
+    })
+}
+
+/// Turn a click's fixed-point position into fractions of the window.
+#[cfg(all(any(windows, target_os = "linux"), feature = "phone-control"))]
+fn fractions(x: u16, y: u16) -> (f32, f32) {
+    (
+        f32::from(x) / f32::from(WINDOW_SPAN),
+        f32::from(y) / f32::from(WINDOW_SPAN),
+    )
+}
+
 #[cfg(all(windows, feature = "phone-control"))]
 mod imp {
     use super::*;
@@ -122,31 +165,10 @@ mod imp {
         let (id, pids) = pids(peer, target)?;
         let found = window(target, &pids, &id)?;
         let (w, h, rgba) = windows_app::still(found.hwnd)?;
-        let mut image =
+        let image =
             image::RgbaImage::from_raw(w, h, rgba).ok_or("the picture has the wrong size")?;
-        if let Some(max) = max_side.filter(|m| *m > 0) {
-            let long = w.max(h);
-            if long > max {
-                let scale = max as f32 / long as f32;
-                let (sw, sh) = (
-                    ((w as f32 * scale).round() as u32).max(1),
-                    ((h as f32 * scale).round() as u32).max(1),
-                );
-                image =
-                    image::imageops::resize(&image, sw, sh, image::imageops::FilterType::Triangle);
-            }
-        }
-        let mut png = std::io::Cursor::new(Vec::new());
-        image
-            .write_to(&mut png, image::ImageFormat::Png)
-            .map_err(|e| format!("cannot encode the picture: {e}"))?;
         tracing::info!(%peer, app = %id, title = %found.title, "a peer took a still of an application's window");
-        Ok(DiagResponse::WindowShot {
-            png: png.into_inner(),
-            width: image.width(),
-            height: image.height(),
-            title: found.title,
-        })
+        answer_still(image, max_side, found.title)
     }
 
     pub fn input(
@@ -159,10 +181,7 @@ mod imp {
         let found = window(target, &pids, &id)?;
         let what = match input {
             DesktopInput::Click { x, y, right } => {
-                let (fx, fy) = (
-                    f32::from(*x) / f32::from(WINDOW_SPAN),
-                    f32::from(*y) / f32::from(WINDOW_SPAN),
-                );
+                let (fx, fy) = fractions(*x, *y);
                 windows_app::click(found.hwnd, fx, fy, *right)?;
                 format!("clicked {:?} at {fx:.3}, {fy:.3}", found.title)
             }
@@ -184,14 +203,82 @@ mod imp {
     }
 }
 
-#[cfg(not(all(windows, feature = "phone-control")))]
+#[cfg(all(target_os = "linux", feature = "phone-control"))]
+mod imp {
+    use super::*;
+    use cursio_window::linux_app::{self, AppWindow};
+
+    fn window(target: &WindowTarget, pids: &[u32], id: &AppId) -> Result<AppWindow, String> {
+        let windows = linux_app::windows_of(pids)?;
+        let wanted = target.title.as_deref().map(str::to_lowercase);
+        windows
+            .into_iter()
+            .find(|w| {
+                wanted
+                    .as_deref()
+                    .is_none_or(|t| w.title.to_lowercase().contains(t))
+            })
+            .ok_or_else(|| match &target.title {
+                Some(title) => format!("{id} has no window titled like {title:?}"),
+                None => format!("{id} has no window"),
+            })
+    }
+
+    pub fn shot(
+        peer: &str,
+        target: &WindowTarget,
+        max_side: Option<u32>,
+    ) -> Result<DiagResponse, String> {
+        let (id, pids) = pids(peer, target)?;
+        let found = window(target, &pids, &id)?;
+        let png = linux_app::still(found.id)?;
+        let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .map_err(|e| format!("the Shell's picture is unreadable: {e}"))?
+            .to_rgba8();
+        tracing::info!(%peer, app = %id, title = %found.title, "a peer took a still of an application's window");
+        answer_still(image, max_side, found.title)
+    }
+
+    pub fn input(
+        peer: &str,
+        target: &WindowTarget,
+        input: &DesktopInput,
+    ) -> Result<DiagResponse, String> {
+        check(input)?;
+        let (id, pids) = pids(peer, target)?;
+        let found = window(target, &pids, &id)?;
+        let what = match input {
+            DesktopInput::Click { x, y, right } => {
+                let (fx, fy) = fractions(*x, *y);
+                linux_app::click(found.id, fx, fy, *right)?;
+                format!("clicked {:?} at {fx:.3}, {fy:.3}", found.title)
+            }
+            DesktopInput::Type { text } => {
+                linux_app::type_text(found.id, text)?;
+                format!(
+                    "typed {} characters into {:?}",
+                    text.chars().count(),
+                    found.title
+                )
+            }
+            DesktopInput::Key { key } => {
+                linux_app::key(found.id, named_key(key)?)?;
+                format!("pressed {key} in {:?}", found.title)
+            }
+        };
+        tracing::info!(%peer, app = %id, %what, "a peer drove an application's window");
+        Ok(DiagResponse::WindowDone { what })
+    }
+}
+
+#[cfg(not(all(any(windows, target_os = "linux"), feature = "phone-control")))]
 mod imp {
     use super::*;
 
     fn not_built() -> String {
         format!(
-            "reading or driving an application's window is built for Windows only; on {} it \
-             needs the ScreenCast portal and libei, not built yet",
+            "reading or driving an application's window is built for Windows and GNOME; not \
+             for {}",
             std::env::consts::OS
         )
     }

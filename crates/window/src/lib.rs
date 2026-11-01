@@ -74,6 +74,11 @@ pub mod drag_trigger;
 #[cfg(target_os = "linux")]
 pub mod linux_drag;
 
+/// One application's window, read and driven for a program elsewhere,
+/// through the GNOME Shell extension.
+#[cfg(target_os = "linux")]
+pub mod linux_app;
+
 #[cfg(target_os = "linux")]
 mod linux_capture;
 #[cfg(target_os = "linux")]
