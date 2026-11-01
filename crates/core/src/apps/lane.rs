@@ -292,6 +292,31 @@ mod tests {
         settle(&mut at_a, &mut at_b);
         let layout = super::super::builds::layout_of(&root.join("b"), &app);
         assert!(layout.installed().is_empty());
+
+        // The person presses the refusal's button: the same link, offered
+        // nothing new, takes the build.
+        let mut config = Config::default();
+        config
+            .apps
+            .entry("demo2".into())
+            .or_default()
+            .trusted_builders
+            .push(TrustedBuilder {
+                peer: PeerId::nil(),
+                name: "A".into(),
+                key: hex(&key.public()),
+            });
+        config.save(&root.join("b.toml")).unwrap();
+        let retried: Vec<(String, Vec<UpdateMsg>)> = at_b
+            .lanes
+            .iter_mut()
+            .map(|(app, lane)| (app.clone(), lane.poll()))
+            .collect();
+        for (app, msgs) in retried {
+            at_b.queue(&app, msgs);
+        }
+        settle(&mut at_a, &mut at_b);
+        assert_eq!(layout.installed(), ["1.0.0"]);
         crate::diagnostics::clear("app.demo2.refused");
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -36,7 +36,18 @@ pub struct Lane {
     fetch: Option<Fetch>,
     offered: Vec<(String, Vec<String>)>,
     last_look: Option<Instant>,
+    /// Offers refused for whose signature they carry. The peer offers a
+    /// build once per link, so pressing "accept builds from …" changed
+    /// nothing until the link was next made; these are weighed again instead.
+    refused: Vec<Offer>,
+    last_retry: Option<Instant>,
 }
+
+/// How often refused offers are weighed again against the config.
+const RETRY_REFUSED: Duration = Duration::from_secs(2);
+
+/// Most refused offers kept per link.
+const MAX_REFUSED: usize = 8;
 
 struct Fetch {
     statement: Statement,
@@ -57,6 +68,8 @@ impl Lane {
             fetch: None,
             offered: Vec::new(),
             last_look: None,
+            refused: Vec::new(),
+            last_retry: None,
         }
     }
 
@@ -81,10 +94,37 @@ impl Lane {
 
     /// Offers again once in a while, for builds published since.
     pub fn poll(&mut self) -> Vec<UpdateMsg> {
+        let mut out = self.retry_refused();
         match self.last_look {
-            Some(at) if at.elapsed() < REOFFER => Vec::new(),
-            _ => self.offers(),
+            Some(at) if at.elapsed() < REOFFER => {}
+            _ => out.extend(self.offers()),
         }
+        out
+    }
+
+    /// Weigh refused offers again, now and then: the person may have trusted
+    /// their builder since.
+    fn retry_refused(&mut self) -> Vec<UpdateMsg> {
+        if self.refused.is_empty()
+            || self.fetch.is_some()
+            || self
+                .last_retry
+                .is_some_and(|at| at.elapsed() < RETRY_REFUSED)
+        {
+            return Vec::new();
+        }
+        self.last_retry = Some(Instant::now());
+        let config = self.agent.config();
+        let (now_trusted, still): (Vec<Offer>, Vec<Offer>) = std::mem::take(&mut self.refused)
+            .into_iter()
+            .partition(|offer| super::sign::verify(offer, &config).is_ok());
+        self.refused = still;
+        let mut out = Vec::new();
+        for offer in now_trusted {
+            tracing::info!(peer = %self.peer, subject = %self.agent.subject(), "a build refused earlier is trusted now; taking it");
+            out.extend(self.on_offer(offer));
+        }
+        out
     }
 
     pub fn handle(&mut self, msg: UpdateMsg) -> Vec<UpdateMsg> {
@@ -112,6 +152,14 @@ impl Lane {
             return Vec::new();
         }
         let Decision::Fetch(statement) = self.agent.consider(&offer, &self.peer) else {
+            if super::sign::verify(&offer, &self.agent.config()).is_err()
+                && !self.refused.iter().any(|o| o.statement == offer.statement)
+            {
+                if self.refused.len() == MAX_REFUSED {
+                    self.refused.remove(0);
+                }
+                self.refused.push(offer);
+            }
             return Vec::new();
         };
         if let Err(e) = self.agent.store().remember(&offer) {
