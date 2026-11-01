@@ -8,7 +8,8 @@
 
 use std::time::Duration;
 
-use cursio_core::control::{Command, Presence, Reply};
+use cursio_core::control::query::{log_name, merge_by_time, Source};
+use cursio_core::control::{Command, Reply};
 use cursio_core::log_tail::leading_timestamp;
 use cursio_protocol::diag::{Maintenance, NodeReport, PathChoice, PathReport};
 
@@ -28,14 +29,6 @@ pub(crate) struct LogsArgs {
     pub(crate) grep: Option<String>,
     pub(crate) follow: bool,
     pub(crate) log: Option<String>,
-}
-
-/// One machine to read: `None` is this one, otherwise a peer's name or id.
-struct Source {
-    machine: Option<String>,
-    label: String,
-    /// The last line shown, which a follower asks for lines after.
-    mark: Option<String>,
 }
 
 pub(crate) async fn logs(args: LogsArgs) -> anyhow::Result<()> {
@@ -64,16 +57,7 @@ pub(crate) async fn logs(args: LogsArgs) -> anyhow::Result<()> {
                     },
                     contains: args.grep.clone(),
                     max_lines: args.lines,
-                    // `mount-helper` is read as `cursio-mount-helper`, the
-                    // name the helper's log file carries; `app:<id>` is an
-                    // application's, passed as it is.
-                    log: args.log.as_ref().map(|log| {
-                        if log.starts_with("cursio") || log.starts_with("app:") {
-                            log.clone()
-                        } else {
-                            format!("cursio-{log}")
-                        }
-                    }),
+                    log: args.log.as_deref().map(log_name),
                 })
                 .await?;
             match reply {
@@ -93,15 +77,7 @@ pub(crate) async fn logs(args: LogsArgs) -> anyhow::Result<()> {
             }
         }
         if tag {
-            // Stable, so a machine's own continuation lines stay under the
-            // line they belong to.
-            merged.sort_by(|a, b| {
-                let at = |line: &str| leading_timestamp(line).map(str::to_owned);
-                match (at(&a.1), at(&b.1)) {
-                    (Some(x), Some(y)) => x.cmp(&y),
-                    _ => std::cmp::Ordering::Equal,
-                }
-            });
+            merge_by_time(&mut merged);
         }
         for (label, line) in merged {
             if tag {
@@ -123,67 +99,14 @@ async fn sources(
     client: &cursio_core::control::transport::Client,
     names: &[String],
 ) -> anyhow::Result<Vec<Source>> {
-    let this = |label: String| Source {
-        machine: None,
-        label,
-        mark: None,
-    };
-    let status = match client.request(Command::Status).await? {
-        Reply::Status(status) => status,
-        other => anyhow::bail!("the running node answered status with {other:?}"),
-    };
-    let own = status.node.name.clone();
-    if names.is_empty() {
-        return Ok(vec![this(own)]);
-    }
-    let mut out = Vec::new();
-    for name in names {
-        if name == "all" {
-            out.push(this(own.clone()));
-            for peer in &status.peers {
-                let answers = peer.presence == Presence::Online
-                    && peer
-                        .link
-                        .as_ref()
-                        .is_some_and(|l| l.modules.iter().any(|m| m == "diag"));
-                if answers {
-                    out.push(Source {
-                        machine: Some(peer.name.clone()),
-                        label: peer.name.clone(),
-                        mark: None,
-                    });
-                }
-            }
-        } else if name == "this" || name.eq_ignore_ascii_case(&own) {
-            out.push(this(own.clone()));
-        } else {
-            out.push(Source {
-                machine: Some(name.clone()),
-                label: name.clone(),
-                mark: None,
-            });
-        }
-    }
-    Ok(out)
+    cursio_core::control::query::sources(client, names)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// `30s`, `10m`, `2h`, `1d` as seconds.
 fn parse_since(text: &str) -> anyhow::Result<u64> {
-    let (number, unit) = text.split_at(
-        text.find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(text.len()),
-    );
-    let n: u64 = number.parse().map_err(|_| {
-        anyhow::anyhow!("--since takes a number and a unit, like 10m; got {text:?}")
-    })?;
-    let scale = match unit {
-        "" | "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        _ => anyhow::bail!("--since takes s, m, h or d; got {text:?}"),
-    };
-    Ok(n * scale)
+    cursio_core::control::query::parse_since(text).map_err(|e| anyhow::anyhow!("--since: {e}"))
 }
 
 pub(crate) async fn report(machines: &[String], since: &str) -> anyhow::Result<()> {

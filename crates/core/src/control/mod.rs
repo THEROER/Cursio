@@ -52,6 +52,7 @@ pub use view::{
 };
 pub use wire::{Command, ModuleSwitch, Reply, Request, Response, CONTROL_VERSION, PUSH_ID};
 
+pub mod query;
 pub mod transport;
 
 use std::collections::BTreeMap;
