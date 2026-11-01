@@ -42,7 +42,10 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::phone_gesture::Gesture;
 
 mod asking;
+pub mod remote;
 mod session;
+#[cfg(all(feature = "phone-control", any(target_os = "linux", windows)))]
+pub mod shot;
 
 pub use asking::{ask, register_phone, PhoneScreenSources};
 pub use session::{PhoneScreenCapture, PhoneScreenSession};

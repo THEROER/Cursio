@@ -47,6 +47,8 @@ pub enum Gesture {
     },
     Back,
     Home,
+    /// The list of recent apps.
+    Recents,
     /// Type this into the field that has focus.
     Text(char),
     Backspace,
@@ -167,6 +169,8 @@ impl GestureMapper {
             // and a button acts when it goes down.
             (MouseButton::Right | MouseButton::Back, true) => Some(Gesture::Back),
             (MouseButton::Middle, true) => Some(Gesture::Home),
+            // scrcpy's "app switch" sits on a side button too.
+            (MouseButton::Forward, true) => Some(Gesture::Recents),
             _ => None,
         }
     }
@@ -196,19 +200,41 @@ impl GestureMapper {
     }
 }
 
+/// The evdev Shift key, for a caller typing through this mapping.
+pub const LEFT_SHIFT: u16 = key::LEFT_SHIFT;
+
+/// Each row of a US keyboard: its first evdev code, then the characters it
+/// gives without and with Shift.
+const US_ROWS: [(u16, &str, &str); 4] = [
+    (2, "1234567890-=", "!@#$%^&*()_+"),
+    (16, "qwertyuiop[]", "QWERTYUIOP{}"),
+    (30, "asdfghjkl;'`", "ASDFGHJKL:\"~"),
+    (43, "\\zxcvbnm,./", "|ZXCVBNM<>?"),
+];
+
+/// The evdev key, and whether Shift is held, that this mapping turns into
+/// `c` — the way back from [`us_char`], for typing text through it.
+pub fn us_key(c: char) -> Option<(u16, bool)> {
+    match c {
+        ' ' => return Some((key::SPACE, false)),
+        '\n' => return Some((key::ENTER, false)),
+        _ => {}
+    }
+    US_ROWS.iter().find_map(|(first, plain, shifted)| {
+        let at = |row: &str| row.chars().position(|r| r == c);
+        at(plain)
+            .map(|i| (first + i as u16, false))
+            .or_else(|| at(shifted).map(|i| (first + i as u16, true)))
+    })
+}
+
 /// The character a US layout gives an evdev key, with or without Shift.
 ///
 /// US because the wire keycode is a physical position and the phone has no
 /// layout of the computer's to consult; anything beyond ASCII is pasted, not
 /// typed.
 fn us_char(key: u16, shift: bool) -> Option<char> {
-    const ROWS: [(u16, &str, &str); 4] = [
-        (2, "1234567890-=", "!@#$%^&*()_+"),
-        (16, "qwertyuiop[]", "QWERTYUIOP{}"),
-        (30, "asdfghjkl;'`", "ASDFGHJKL:\"~"),
-        (43, "\\zxcvbnm,./", "|ZXCVBNM<>?"),
-    ];
-    ROWS.iter().find_map(|(first, plain, shifted)| {
+    US_ROWS.iter().find_map(|(first, plain, shifted)| {
         let index = usize::from(key.checked_sub(*first)?);
         let row = if shift { shifted } else { plain };
         row.chars().nth(index)

@@ -184,12 +184,94 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
 }
 
 /// Answer a command that waits on a peer; anything else goes to `state`.
+/// How long a screenshot with `ask` waits for the phone's person to allow
+/// sharing and the first picture to arrive.
+const SCREEN_ALLOW_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// A phone's screen read or driven by a program here; `None` for any other
+/// command.
+async fn phone_remote(command: &Command) -> Option<Reply> {
+    let answer = |result: Result<Reply, String>| match result {
+        Ok(reply) => reply,
+        Err(message) => Reply::Error { message },
+    };
+    Some(match command {
+        Command::PhoneAct { phone, action } => answer(phone_act(phone, action).await),
+        Command::PhoneScreenshot {
+            phone,
+            max_side,
+            ask,
+        } => answer(phone_screenshot(phone, *max_side, *ask).await),
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "window")]
+async fn phone_act(
+    phone: &str,
+    action: &crate::phone_action::PhoneAction,
+) -> Result<Reply, String> {
+    crate::phone_screen::remote::act(phone, action)
+        .await
+        .map(|what| Reply::Acted { what })
+}
+
+#[cfg(not(feature = "window"))]
+async fn phone_act(
+    phone: &str,
+    _action: &crate::phone_action::PhoneAction,
+) -> Result<Reply, String> {
+    Err(format!(
+        "this build cannot reach {phone}'s screen: it has no window module"
+    ))
+}
+
+#[cfg(all(feature = "phone-control", any(target_os = "linux", windows)))]
+async fn phone_screenshot(phone: &str, max_side: Option<u32>, ask: bool) -> Result<Reply, String> {
+    use crate::phone_screen::{remote, shot};
+    let mut stream = remote::stream(phone);
+    if ask && stream.is_err() {
+        crate::phone_screen::ask(phone, true)?;
+        let deadline = tokio::time::Instant::now() + SCREEN_ALLOW_WAIT;
+        while stream.is_err() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            stream = remote::stream(phone);
+        }
+    }
+    let stream = stream?;
+    let dir = shot::dir().ok_or("no data directory to write the screenshot in")?;
+    // Decoding a phone's stream from its keyframe is tens of milliseconds of
+    // CPU: off the runtime's workers.
+    let shot = tokio::task::spawn_blocking(move || shot::take(&stream, max_side, &dir))
+        .await
+        .map_err(|e| format!("the screenshot did not finish: {e}"))??;
+    Ok(Reply::Screenshot {
+        path: shot.path,
+        width: shot.width,
+        height: shot.height,
+    })
+}
+
+#[cfg(not(all(feature = "phone-control", any(target_os = "linux", windows))))]
+async fn phone_screenshot(
+    phone: &str,
+    _max_side: Option<u32>,
+    _ask: bool,
+) -> Result<Reply, String> {
+    Err(format!(
+        "this build cannot take a still of {phone}'s screen: it has no video decoder"
+    ))
+}
+
 pub async fn handle_waiting(state: &NodeState, command: Command) -> Reply {
     use cursio_protocol::messages::MessagesResponse;
     if let Some(reply) = ask_gallery(&command).await {
         return reply;
     }
     if let Some(reply) = ask_diag(&command).await {
+        return reply;
+    }
+    if let Some(reply) = phone_remote(&command).await {
         return reply;
     }
     if let Command::Ring { peer } = &command {
@@ -424,7 +506,9 @@ impl NodeState {
             | Command::Paths { .. }
             | Command::Report { .. }
             | Command::Maintain { .. }
-            | Command::Launch { .. } => {
+            | Command::Launch { .. }
+            | Command::PhoneScreenshot { .. }
+            | Command::PhoneAct { .. } => {
                 error("logs and paths are asked through a desktop's control socket")
             }
         }

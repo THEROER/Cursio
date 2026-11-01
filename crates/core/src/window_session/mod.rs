@@ -125,6 +125,10 @@ pub struct WindowEngine<C: WindowCapture, R: WindowRenderer> {
     /// What this host does when the peer asks for its screen. Set on a phone;
     /// elsewhere the request is ignored.
     on_screen_request: Option<Box<dyn FnMut(bool) + Send>>,
+    /// A program here reading and driving the phone's screen (`cursio
+    /// phone`, the MCP tools); see [`crate::phone_screen::remote`]. Set for a
+    /// link to a phone.
+    phone_remote: Option<crate::phone_screen::remote::Link>,
 }
 
 /// A transfer asked for from outside the session loop.
@@ -158,7 +162,14 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             video_budget: Default::default(),
             screen_asks: None,
             on_screen_request: None,
+            phone_remote: None,
         }
+    }
+
+    /// Let a program here read and drive the phone's screen.
+    pub fn with_phone_remote(mut self, link: crate::phone_screen::remote::Link) -> Self {
+        self.phone_remote = Some(link);
+        self
     }
 
     /// Send the peer what the user here asks of its screen.
@@ -358,6 +369,9 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
             }
             WindowMsg::Offer(meta) => match self.renderer.open(&meta) {
                 Ok(surrogate) => {
+                    if let Some(remote) = &self.phone_remote {
+                        crate::phone_screen::remote::offered(&remote.phone, &meta);
+                    }
                     tracing::info!(
                         id = meta.id,
                         width = meta.width,
@@ -397,6 +411,9 @@ impl<C: WindowCapture, R: WindowRenderer> WindowEngine<C, R> {
                 tracing::info!(id, ?reason, "peer ended a window transfer");
                 // Whichever side we were playing for this id, wind it down.
                 self.keyframe_asks.remove(&id);
+                if let Some(remote) = &self.phone_remote {
+                    crate::phone_screen::remote::closed(&remote.phone, id);
+                }
                 if let Some(mut s) = self.viewed.remove(&id) {
                     s.close(reason);
                 }
@@ -465,6 +482,15 @@ where
             tracing::info!(peer = %self.peer_name, show, "asking the peer about its screen");
             send_control(tx, WindowMsg::RequestScreen { show }).await?;
         }
+        if let Some(remote) = self.phone_remote.as_mut() {
+            let inputs: Vec<_> = std::iter::from_fn(|| remote.inputs.try_recv().ok()).collect();
+            for input in inputs {
+                tx.send(&Message::WindowInput(input)).await?;
+            }
+            if let Some(id) = crate::phone_screen::remote::wants_keyframe(&remote.phone) {
+                send_control(tx, WindowMsg::KeyframeRequest { id }).await?;
+            }
+        }
         // Each offer must precede that window's first frame.
         for meta in self.take_unsent_offers() {
             tracing::info!(id = meta.id, "offering window to the peer");
@@ -532,6 +558,9 @@ where
                 true
             }
             Message::WindowFrame(frame) => {
+                if let Some(remote) = &self.phone_remote {
+                    crate::phone_screen::remote::frame(&remote.phone, frame);
+                }
                 match self.viewed.get_mut(&frame.id) {
                     Some(surrogate) => {
                         if let Err(e) = surrogate.apply_frame(frame) {

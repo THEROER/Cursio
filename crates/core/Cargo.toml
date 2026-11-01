@@ -37,7 +37,7 @@ required-features = ["files-mount"]
 # module that is off costs nothing to compile and cannot be negotiated on.
 [features]
 default = ["desktop"]
-desktop = ["audio", "input", "window", "files", "files-mount", "airplay", "usb", "calls", "bluetooth", "gallery"]
+desktop = ["audio", "input", "window", "files", "files-mount", "airplay", "usb", "calls", "bluetooth", "gallery", "phone-control"]
 audio = ["dep:cursio-audio"]
 input = ["dep:cursio-input"]
 window = ["dep:cursio-window"]
@@ -60,6 +60,9 @@ bluetooth = ["dep:cursio-bluetooth"]
 # thumbnail decoder. A phone answers from its MediaStore instead, and browses
 # a peer's gallery without this.
 gallery = ["dep:image"]
+# A phone's screen read as a picture by a program here (`cursio phone`, the
+# MCP tools): the screen's H.264 decoded once and written as PNG.
+phone-control = ["window", "dep:image"]
 # AirPlay carries a window back to the mesh, so it cannot be built without the
 # window module to carry it through.
 airplay = ["dep:cursio-airplay", "window"]

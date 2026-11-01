@@ -88,7 +88,9 @@ impl WindowFactory {
         // A phone's screen is asked for from here (the menu, the app, `cursio
         // screen`), which reaches this link through the registry.
         if ctx.peer.device_kind == cursio_protocol::DeviceKind::Phone {
-            engine = engine.with_screen_asks(crate::phone_screen::register_phone(ctx.peer_name()));
+            engine = engine
+                .with_screen_asks(crate::phone_screen::register_phone(ctx.peer_name()))
+                .with_phone_remote(crate::phone_screen::remote::register(ctx.peer_name()));
         }
         match (self.remote_screen, self.screen_hub.as_ref()) {
             (false, _) => engine,

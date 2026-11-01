@@ -359,6 +359,22 @@ pub enum Command {
         #[serde(default)]
         dir: Option<PathBuf>,
     },
+    /// Write a still of `phone`'s shared screen as a PNG file, no longer than
+    /// `max_side` on its long side when given; `ask` asks the phone for its
+    /// screen first and waits for it to be allowed there. See
+    /// [`crate::phone_screen::remote`].
+    PhoneScreenshot {
+        phone: String,
+        #[serde(default)]
+        max_side: Option<u32>,
+        #[serde(default)]
+        ask: bool,
+    },
+    /// Do something on `phone`'s shared screen: a tap, a swipe, a key, text.
+    PhoneAct {
+        phone: String,
+        action: crate::phone_action::PhoneAction,
+    },
 }
 
 pub(super) fn default_page() -> u32 {
@@ -497,6 +513,8 @@ impl Command {
                     | Command::Report { .. }
                     | Command::Maintain { .. }
                     | Command::Launch { .. }
+                    | Command::PhoneScreenshot { .. }
+                    | Command::PhoneAct { .. }
             )
     }
 }
@@ -584,6 +602,16 @@ pub enum Reply {
         there: Option<cursio_protocol::diag::PathReport>,
         #[serde(default)]
         there_error: Option<String>,
+    },
+    /// A phone's screen written to a file for [`Command::PhoneScreenshot`].
+    Screenshot {
+        path: PathBuf,
+        width: u32,
+        height: u32,
+    },
+    /// What [`Command::PhoneAct`] did.
+    Acted {
+        what: String,
     },
 }
 

@@ -343,6 +343,91 @@ pub(crate) async fn phone_screen(phone: &str, show: bool) -> anyhow::Result<()> 
     }
 }
 
+/// `cursio phone`: read or drive a phone's shared screen through the node.
+pub(crate) async fn phone(phone: &str, action: crate::cli::PhoneCommand) -> anyhow::Result<()> {
+    use crate::cli::{PhoneCommand, PhoneKeyArg};
+    use cursio_core::control::{Command, Reply};
+    use cursio_core::phone_action::{PhoneAction, PhoneKey};
+    let client = control_client().await.map_err(|e| {
+        anyhow::anyhow!(
+            "no running node to reach the phone through ({e}); start `cursio mesh` first"
+        )
+    })?;
+    let (command, out) = match action {
+        PhoneCommand::Screenshot { out, max_side, ask } => (
+            Command::PhoneScreenshot {
+                phone: phone.to_string(),
+                max_side,
+                ask,
+            },
+            out,
+        ),
+        PhoneCommand::Tap { x, y, hold } => (
+            Command::PhoneAct {
+                phone: phone.to_string(),
+                action: PhoneAction::Tap {
+                    x,
+                    y,
+                    hold_ms: hold,
+                },
+            },
+            None,
+        ),
+        PhoneCommand::Swipe { x1, y1, x2, y2, ms } => (
+            Command::PhoneAct {
+                phone: phone.to_string(),
+                action: PhoneAction::Swipe { x1, y1, x2, y2, ms },
+            },
+            None,
+        ),
+        PhoneCommand::Key { key } => (
+            Command::PhoneAct {
+                phone: phone.to_string(),
+                action: PhoneAction::Key {
+                    key: match key {
+                        PhoneKeyArg::Back => PhoneKey::Back,
+                        PhoneKeyArg::Home => PhoneKey::Home,
+                        PhoneKeyArg::Recents => PhoneKey::Recents,
+                    },
+                },
+            },
+            None,
+        ),
+        PhoneCommand::Text { text } => (
+            Command::PhoneAct {
+                phone: phone.to_string(),
+                action: PhoneAction::Text { text },
+            },
+            None,
+        ),
+    };
+    match client.request(command).await? {
+        Reply::Screenshot {
+            path,
+            width,
+            height,
+        } => {
+            match out {
+                Some(out) => {
+                    std::fs::copy(&path, &out)
+                        .map_err(|e| anyhow::anyhow!("cannot copy to {}: {e}", out.display()))?;
+                    println!("{} ({width}x{height})", out.display());
+                }
+                None => println!("{} ({width}x{height})", path.display()),
+            }
+            Ok(())
+        }
+        Reply::Acted { what } => {
+            println!("{what}");
+            Ok(())
+        }
+        Reply::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!(
+            "the running node does not know how to reach a phone's screen ({other:?}); restart it with this version of Cursio"
+        ),
+    }
+}
+
 /// Remove a machine: through the running node when there is one, so the link
 /// closes at once, otherwise only in the files.
 pub(crate) async fn forget_machine(

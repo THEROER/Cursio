@@ -135,6 +135,8 @@ pub mod notify_toast;
 pub mod opener;
 /// Who may pair right now, with what secret, and for how long.
 pub mod pairing_window;
+/// A tap, a swipe, a key or text for a phone's screen, as its window input.
+pub mod phone_action;
 /// Raising memory, swap and i/o pressure as a problem while it lasts.
 /// A mouse on a computer turned into a finger on a phone's screen.
 pub mod phone_gesture;

@@ -119,6 +119,16 @@ pub(crate) enum Command {
         #[arg(long)]
         stop: bool,
     },
+    /// Read and drive a phone's shared screen from here: a screenshot, a tap,
+    /// a swipe, a button, text. Points are fractions of the screen (0 to 1).
+    /// The screen must be shared (`cursio screen PHONE`, allowed on the
+    /// phone) and Cursio's accessibility service on there for touch.
+    Phone {
+        /// The phone's name, as `cursio status` shows it.
+        phone: String,
+        #[command(subcommand)]
+        action: PhoneCommand,
+    },
     /// Answer, decline, end or place a call on a connected phone. Goes through
     /// the running node.
     Call {
@@ -428,6 +438,53 @@ impl MeshArgs {
             mac_modifiers: self.mac_modifiers.clone(),
         }
     }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum PhoneCommand {
+    /// Save a still of the screen as PNG and print where.
+    Screenshot {
+        /// Copy it here too.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Scale the long side to at most this many pixels.
+        #[arg(long)]
+        max_side: Option<u32>,
+        /// Ask the phone for its screen first and wait for it to be allowed.
+        #[arg(long)]
+        ask: bool,
+    },
+    /// Tap at X, Y (fractions of width and height).
+    Tap {
+        x: f32,
+        y: f32,
+        /// Hold this many milliseconds: a long press.
+        #[arg(long, default_value_t = 0)]
+        hold: u32,
+    },
+    /// Drag a finger from X1, Y1 to X2, Y2.
+    Swipe {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        #[arg(long, default_value_t = 300)]
+        ms: u32,
+    },
+    /// Press back, home or recents.
+    Key {
+        #[arg(value_enum)]
+        key: PhoneKeyArg,
+    },
+    /// Type TEXT into the focused field (ASCII; a newline is Enter).
+    Text { text: String },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum PhoneKeyArg {
+    Back,
+    Home,
+    Recents,
 }
 
 #[derive(Subcommand)]

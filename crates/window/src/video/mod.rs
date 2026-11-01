@@ -34,7 +34,7 @@ pub struct DecodedFrame {
 /// bitstream scan rather than a flag on our own message: it stays correct even
 /// if the encoder's packet boundaries change, and it is what actually decides
 /// whether the decoder can start here.
-pub(crate) fn contains_keyframe(packet: &[u8]) -> bool {
+pub fn contains_keyframe(packet: &[u8]) -> bool {
     // 5 = IDR slice; 7 = SPS, which the encoder emits immediately before an
     // IDR, so either marks a valid entry point.
     nal_units(packet).any(|nal| matches!(nal[0] & 0x1F, 5 | 7))

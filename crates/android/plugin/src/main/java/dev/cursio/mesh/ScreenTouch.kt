@@ -205,6 +205,7 @@ class ScreenTouch : AccessibilityService() {
             9 -> if (text != null) type { "$it$text" }
             10 -> type { if (it.isEmpty()) null else it.subSequence(0, it.length - 1) }
             11 -> enter()
+            12 -> performGlobalAction(GLOBAL_ACTION_RECENTS)
             else -> Log.w(TAG, "a touch of kind $kind is not known")
         }
     }

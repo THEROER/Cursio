@@ -95,6 +95,7 @@ fn flat(gesture: Gesture) -> Flat {
         },
         Gesture::Backspace => simple(10),
         Gesture::Enter => simple(11),
+        Gesture::Recents => simple(12),
     }
 }
 
