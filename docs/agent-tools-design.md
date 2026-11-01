@@ -1,8 +1,9 @@
 # The mesh as tools for an AI agent (`cursio mcp`)
 
-Status: **first slice built** (machines, logs, report, path, apps status /
-publish / launch / ship, restart, apply-update). The phone's screen and touch
-are designed below and not built.
+Status: **built** — machines, logs, report, path, apps status / publish /
+launch / ship, restart, apply-update, and the phone's screen and touch
+(`phone_screenshot`, `phone_tap`, `phone_swipe`, `phone_key`, `phone_text`).
+Notifications, messages, clipboard and gallery tools are next.
 
 ## Why
 
@@ -70,32 +71,47 @@ leavepulse only from machines trusted for it"). The instructions given at
 is the rule the whole project keeps (no silent settings changes), applied to
 a caller that is not a person.
 
-## The phone: screen and touch (designed, not built)
+## The phone: screen and touch
 
-What exists: `cursio screen <phone>` / `Command::PhoneScreen` asks the phone
+What existed: `cursio screen <phone>` / `Command::PhoneScreen` asks the phone
 to share its screen (it asks its person — Android's own consent, once per
 process); the phone's MediaCodec H.264 arrives as an ordinary transferred
 window; the viewer's pointer comes back as `WindowInput` and
 `phone_gesture.rs` turns it into touch, which `ScreenTouch.kt` (an
 accessibility service the person turns on once) dispatches.
 
-What an agent needs on top:
+What is built on top — **nothing new crosses the link**
+(`core/src/phone_screen/remote.rs`):
 
-- **`phone_screenshot { phone }` → an MCP `image` content (PNG).** The node
-  that holds the phone's screen session keeps the last decoded frame of that
-  window (the surrogate's `Framebuffer` already holds it); a new control
-  command `ScreenFrame { peer }` returns it PNG-encoded. Without a session
-  open, the tool opens one (`PhoneScreen { show: true }` with no window — a
-  hidden surrogate, as remote-screen views already are on Windows) and
-  answers "waiting for the phone's person to allow sharing" until they do.
-- **`phone_tap { phone, x, y }`, `phone_swipe { phone, from, to, ms }`,
-  `phone_key { phone, key: back | home | recents }`, `phone_type { phone,
-  text }`.** Coordinates normalised 0..1, as `phone_gesture::Point` is.
-  A new control command `PhoneInput { peer, gesture }` builds the
-  `WindowInput` sequence `phone_gesture` already understands and sends it
-  into the open screen session; text goes as key events, or through the
-  clipboard plus a paste where the field takes it. All destructive-marked:
-  they act in the person's phone UI.
+- **`phone_screenshot { phone, ask?, max_side? }` → MCP `image` content.**
+  The computer's window engine for a link to a phone hands the registry the
+  screen window's id and size and every access unit from its newest keyframe
+  on (bounded at 32 MiB, past which it asks the phone for a keyframe). A
+  request decodes that run once with the viewer's own decoder and writes a
+  PNG (`phone_screen/shot.rs`, `Command::PhoneScreenshot` →
+  `Reply::Screenshot { path }`) under the data dir's `screenshots/`, keeping
+  the last ten: a phone's screen as PNG is megabytes, past one control line,
+  and every reader is on this machine. The MCP tool scales the long side to
+  1280 px unless asked otherwise. Not shared: the answer says to ask for it
+  and allow it on the phone; `ask` sends the request and waits up to 45 s.
+  The surrogate window opens as it does for `cursio screen` — a hidden
+  session was not needed.
+- **`phone_tap { phone, x, y, hold_ms? }`, `phone_swipe { phone, x1, y1, x2,
+  y2, ms? }`, `phone_key { phone, key: back | home | recents }`,
+  `phone_text { phone, text }`.** `core/src/phone_action.rs` turns each into
+  the `WindowInput` a surrogate would send — points are fractions of the
+  picture, so the caller never needs the resolution — and
+  `Command::PhoneAct` sends them into the link's window engine, paced (a
+  swipe is a move every ~16 ms). Recents is the forward side button, newly
+  `Gesture::Recents` → `GLOBAL_ACTION_RECENTS`. Text is typed as US-layout
+  keys, as `phone_gesture` reads them; a character outside ASCII refuses the
+  whole text before anything is sent (typing through the clipboard is not
+  built). All destructive-marked: they act in the person's phone UI. Touch
+  needs Cursio's accessibility service on the phone; without it the phone
+  receives the input and does nothing, which the tool cannot see.
+- The same as a CLI: `cursio phone <phone> screenshot [--ask] [--out F]`,
+  `tap X Y [--hold MS]`, `swipe X1 Y1 X2 Y2 [--ms]`, `key back|home|recents`,
+  `text "…"`.
 - **`phone_logs { phone, app? }`.** The phone's own Cursio log already reads
   through `logs` (its node keeps a file). Android gives an app no other app's
   logcat (`READ_LOGS` is a system permission), so another application's log
@@ -118,8 +134,8 @@ MIT OR Apache-2.0. A subprocess is a program boundary, not a library one.
 ## Order
 
 1. Built: the tools in the table; `control::query` shared with the CLI.
-2. `ScreenFrame` + `phone_screenshot` (image content), hidden screen session.
-3. `PhoneInput` + `phone_tap/swipe/key/type`.
+2. Built: `phone_screenshot` (image content).
+3. Built: `phone_tap/swipe/key/text`.
 4. Notifications, messages, clipboard, gallery, ring.
 5. `cursio_sdk::dev` over `cursio mcp` / `--json`.
 

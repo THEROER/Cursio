@@ -20,10 +20,28 @@ use crate::control::{Command, Reply};
 pub const INSTRUCTIONS: &str = "Cursio links this computer with the user's other machines and \
 phones into one mesh. `machines` lists them; `logs` and `report` read any of them without SSH or \
 adb (`app` reads an application registered through cursio-sdk); `apps_ship` builds nothing but \
-publishes files you built, waits until the target machine has them and starts them there. Tools \
+publishes files you built, waits until the target machine has them and starts them there. \
+`phone_screenshot` shows a phone's screen and `phone_tap`/`phone_swipe`/`phone_key`/`phone_text` \
+act on it, with points as fractions of the screenshot; the phone's person must have allowed screen \
+sharing and turned on Cursio's accessibility service, which only they can do. Tools \
 marked destructive stop or replace something running: ask the user first. Trusting a builder or \
 letting an app run as administrator is the target machine's person's decision, shown there as a \
 button; a tool hitting it says so — tell the user, do not retry in a loop.";
+
+/// The long side a screenshot is scaled to unless asked otherwise: enough to
+/// read a phone's text, a fraction of a full-resolution picture's tokens.
+const DEFAULT_SHOT_SIDE: u32 = 1280;
+
+/// What a tool call produced.
+#[derive(Debug)]
+pub enum Output {
+    Text(String),
+    /// A picture, with a line saying what it is.
+    Image {
+        png: Vec<u8>,
+        note: String,
+    },
+}
 
 /// Why a tool call produced no result.
 #[derive(Debug)]
@@ -55,7 +73,104 @@ impl<A: Ask> Tools<A> {
         &self.ask
     }
 
-    pub async fn call(&self, name: &str, args: &Value) -> Result<String, Failure> {
+    pub async fn call(&self, name: &str, args: &Value) -> Result<Output, Failure> {
+        match name {
+            "phone_screenshot" => self.phone_screenshot(args).await,
+            "phone_tap" | "phone_swipe" | "phone_key" | "phone_text" => {
+                self.phone_act(name, args).await.map(Output::Text)
+            }
+            _ => self.call_text(name, args).await.map(Output::Text),
+        }
+    }
+
+    /// A still of a phone's shared screen, as the image itself.
+    async fn phone_screenshot(&self, args: &Value) -> Result<Output, Failure> {
+        let phone = need_str(args, "phone")?;
+        let max_side = args
+            .get("max_side")
+            .and_then(Value::as_u64)
+            .map_or(Some(DEFAULT_SHOT_SIDE), |m| (m > 0).then_some(m as u32));
+        let ask = args.get("ask").and_then(Value::as_bool).unwrap_or(false);
+        match self
+            .ask
+            .ask(Command::PhoneScreenshot {
+                phone: phone.clone(),
+                max_side,
+                ask,
+            })
+            .await?
+        {
+            Reply::Screenshot {
+                path,
+                width,
+                height,
+            } => {
+                let png = std::fs::read(&path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                Ok(Output::Image {
+                    png,
+                    note: format!(
+                        "{phone}'s screen, {width}x{height} (saved as {}). Points for phone_tap \
+                         and phone_swipe are fractions of this picture, 0 to 1.",
+                        path.display()
+                    ),
+                })
+            }
+            other => Err(answered(other)),
+        }
+    }
+
+    /// A tap, swipe, key or text on a phone's shared screen.
+    async fn phone_act(&self, name: &str, args: &Value) -> Result<String, Failure> {
+        use crate::phone_action::{PhoneAction, PhoneKey};
+        let phone = need_str(args, "phone")?;
+        let num = |key: &str| -> Result<f32, Failure> {
+            args.get(key)
+                .and_then(Value::as_f64)
+                .map(|n| n as f32)
+                .ok_or_else(|| Failure::Failed(format!("{key} is required, a fraction 0 to 1")))
+        };
+        let ms = |key: &str| args.get(key).and_then(Value::as_u64).map(|n| n as u32);
+        let action = match name {
+            "phone_tap" => PhoneAction::Tap {
+                x: num("x")?,
+                y: num("y")?,
+                hold_ms: ms("hold_ms").unwrap_or(0),
+            },
+            "phone_swipe" => PhoneAction::Swipe {
+                x1: num("x1")?,
+                y1: num("y1")?,
+                x2: num("x2")?,
+                y2: num("y2")?,
+                ms: ms("ms").unwrap_or(300),
+            },
+            "phone_key" => PhoneAction::Key {
+                key: match need_str(args, "key")?.as_str() {
+                    "back" => PhoneKey::Back,
+                    "home" => PhoneKey::Home,
+                    "recents" => PhoneKey::Recents,
+                    other => {
+                        return Err(Failure::Failed(format!(
+                            "{other:?} is not a phone key; back, home or recents"
+                        )))
+                    }
+                },
+            },
+            _ => PhoneAction::Text {
+                text: args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Failure::Failed("text is required".into()))?
+                    .to_owned(),
+            },
+        };
+        match self.ask.ask(Command::PhoneAct { phone, action }).await? {
+            Reply::Acted { what } => Ok(what),
+            other => Err(answered(other)),
+        }
+    }
+
+    async fn call_text(&self, name: &str, args: &Value) -> Result<String, Failure> {
         match name {
             "machines" => self.machines().await,
             "logs" => self.logs(args).await,
@@ -336,6 +451,8 @@ fn tool(
 /// Every tool, for `tools/list`.
 pub fn list() -> Vec<Value> {
     let machine = json!({ "type": "string", "description": "a machine's name as `machines` lists it; `this` for this one" });
+    let phone = json!({ "type": "string", "description": "a phone's name as `machines` lists it" });
+    let fraction = json!({ "type": "number", "minimum": 0, "maximum": 1 });
     vec![
         tool(
             "machines",
@@ -425,6 +542,53 @@ pub fn list() -> Vec<Value> {
             "apply_update",
             "Switch a machine's Cursio to the build it has downloaded and is waiting to switch to.",
             false, true, json!({ "machine": machine }), &["machine"],
+        ),
+        tool(
+            "phone_screenshot",
+            "A picture of a phone's screen, from the stream it shares with this computer. Its screen must be shared: with ask, the phone is asked and its person must allow it there; this waits up to 45 s.",
+            true, false,
+            json!({
+                "phone": phone.clone(),
+                "ask": { "type": "boolean", "description": "ask the phone for its screen when it is not shared yet" },
+                "max_side": { "type": "integer", "description": "scale the long side to at most this many pixels (default 1280, 0 for full size)" },
+            }),
+            &["phone"],
+        ),
+        tool(
+            "phone_tap",
+            "Tap a phone's screen at a point, given as fractions of the screenshot's width and height (0 to 1). hold_ms makes it a long press. Needs the phone's screen shared and Cursio's accessibility service on there.",
+            false, true,
+            json!({
+                "phone": phone.clone(),
+                "x": fraction.clone(), "y": fraction.clone(),
+                "hold_ms": { "type": "integer", "description": "hold this long; 600+ is a long press" },
+            }),
+            &["phone", "x", "y"],
+        ),
+        tool(
+            "phone_swipe",
+            "Drag a finger across a phone's screen from (x1, y1) to (x2, y2), fractions 0 to 1, over ms (default 300). Scrolls, swipes between pages, pulls down the shade.",
+            false, true,
+            json!({
+                "phone": phone.clone(),
+                "x1": fraction.clone(), "y1": fraction.clone(), "x2": fraction.clone(), "y2": fraction,
+                "ms": { "type": "integer" },
+            }),
+            &["phone", "x1", "y1", "x2", "y2"],
+        ),
+        tool(
+            "phone_key",
+            "Press one of a phone's buttons: back, home or recents.",
+            false, true,
+            json!({ "phone": phone.clone(), "key": { "type": "string", "enum": ["back", "home", "recents"] } }),
+            &["phone", "key"],
+        ),
+        tool(
+            "phone_text",
+            "Type text into the field that has focus on a phone. ASCII only (it is typed as a US keyboard); a newline is Enter.",
+            false, true,
+            json!({ "phone": phone, "text": { "type": "string" } }),
+            &["phone", "text"],
         ),
     ]
 }

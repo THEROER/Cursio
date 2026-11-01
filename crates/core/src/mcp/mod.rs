@@ -86,7 +86,8 @@ pub async fn handle(tools: &tools::Tools<impl Ask>, line: &str) -> Option<Value>
             // A tool that fails answers as a tool result with `isError`, so
             // the agent reads why; only an unknown tool is a protocol error.
             match tools.call(name, &arguments).await {
-                Ok(text) => Ok(text_result(text, false)),
+                Ok(tools::Output::Text(text)) => Ok(text_result(text, false)),
+                Ok(tools::Output::Image { png, note }) => Ok(image_result(&png, note)),
                 Err(tools::Failure::UnknownTool) => {
                     Err((-32602, format!("there is no tool named {name:?}")))
                 }
@@ -103,6 +104,18 @@ pub async fn handle(tools: &tools::Tools<impl Ask>, line: &str) -> Option<Value>
 
 fn text_result(text: String, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+}
+
+fn image_result(png: &[u8], note: String) -> Value {
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD.encode(png);
+    json!({
+        "content": [
+            { "type": "image", "data": data, "mimeType": "image/png" },
+            { "type": "text", "text": note },
+        ],
+        "isError": false,
+    })
 }
 
 fn error(id: Value, code: i64, message: &str) -> Value {
