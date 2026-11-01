@@ -291,14 +291,26 @@ impl Agent {
                         }],
                         false => Vec::new(),
                     };
-                    let what = match self.subject.problems.as_str() {
-                        "update" => format!("build {version}"),
-                        _ => format!("{subject} build {version}"),
+                    // The refusal's own words name `cursio update
+                    // trust-builder`, which trusts a machine for Cursio; for
+                    // an application the button is the one way, so say it
+                    // without them.
+                    let summary = match (self.subject.problems.as_str(), a_choice) {
+                        ("update", _) => {
+                            format!("{from} offered build {version}, and it was refused: {refusal}")
+                        }
+                        (_, true) => format!(
+                            "{from} offered {subject} {version}; this machine takes {subject} \
+                             only from machines trusted for it"
+                        ),
+                        (_, false) => format!(
+                            "{from} offered {subject} {version}, and it was refused: {refusal}"
+                        ),
                     };
                     diagnostics::raise(Problem {
                         id: self.problem(REFUSED),
                         severity: Severity::Warning,
-                        summary: format!("{from} offered {what}, and it was refused: {refusal}"),
+                        summary,
                         hint: None,
                         actions,
                         since: SystemTime::now(),
