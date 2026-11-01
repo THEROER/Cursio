@@ -48,6 +48,12 @@ pub fn touch() -> Result<DiagResponse, String> {
     })
 }
 
+/// Why a computer's touch would not land here now, or `None` when it would.
+/// A machine that is not a phone has nothing to say.
+pub fn touch_blocked() -> Option<String> {
+    hands().ok()?.touch().err()
+}
+
 /// Type `text` into the focused field, answering how much was typed.
 pub fn type_text(text: &str) -> Result<DiagResponse, String> {
     hands()?.type_text(text)?;

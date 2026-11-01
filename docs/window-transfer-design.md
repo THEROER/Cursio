@@ -870,6 +870,12 @@ tree: a character lands at the end of the field rather than at the caret, and
 keys that are not characters (arrows, shortcuts) do nothing. That is the limit
 of not being a keyboard; an input method would lift it and is not built.
 
+The service can stop without looking off. Swiping Cursio away from recent apps
+kills its process, the service with it, and Android then counts the service as
+crashed: still on in the settings, never bound again until it is turned off and
+on. The first click on the window after that brings the computer a notification
+saying so, and the phone's own setup shows touch as off.
+
 ### Limits
 
 - One projection per app: showing the screen ends a playback capture that was

@@ -260,12 +260,24 @@ class ScreenTouch : AccessibilityService() {
 
         /** What a computer's touch needs and lacks, or `""` when it works. */
         @JvmStatic
-        fun state(): String =
-            if (instance != null) {
-                ""
+        fun state(): String {
+            if (instance != null) return ""
+            // Swiping Cursio away from recent apps kills its process, the
+            // service with it, and Android then counts the service as crashed:
+            // still on in the settings, never bound again until it is turned
+            // off and on. Saying "turn it on" to someone who sees it on would
+            // send them looking for the wrong thing.
+            val on = try {
+                enabled(UpdateOffer.context)
+            } catch (_: UninitializedPropertyAccessException) {
+                false
+            }
+            return if (on) {
+                "Android stopped touch from computers (it does when Cursio is swiped away from recent apps): turn Cursio's accessibility service off and on again on this phone (Settings → Accessibility → Cursio)"
             } else {
                 "touch from computers is off: turn on Cursio's accessibility service on this phone (Settings → Accessibility → Cursio)"
             }
+        }
 
         /**
          * Put [text] at the end of the focused field, any script, and say

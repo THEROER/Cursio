@@ -460,7 +460,9 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         state.put("nearby", nearbyGranted())
         state.put("storage", storageGranted())
         state.put("companion", ComputerCompanion.associated(activity))
-        state.put("touch", ScreenTouch.enabled(activity))
+        // Bound, not merely on in the settings: a service Android stopped
+        // stays on there and drops every touch.
+        state.put("touch", ScreenTouch.enabled(activity) && ScreenTouch.connected())
         state.put("showingScreen", MeshService.showingScreen())
         return state
     }

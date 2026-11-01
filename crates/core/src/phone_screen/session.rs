@@ -11,6 +11,7 @@ use crate::phone_screen::title;
 use crate::phone_screen::viewer_closed;
 use crate::phone_screen::Running;
 use crate::phone_screen::Unit;
+use cursio_protocol::notify::{Notification, NotifyKind};
 use cursio_protocol::{
     Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFrameAck, WindowId, WindowInput,
     WindowMeta,
@@ -63,6 +64,9 @@ pub struct PhoneScreenSession {
     /// The seq of the newest frame handed to the session, for the gap the
     /// viewer's acks are measured against.
     sent: Arc<AtomicU32>,
+    /// The viewer was told its clicks cannot land, and touch has not come
+    /// back since: once is a notice, every click would be a flood.
+    told_touch_off: bool,
 }
 
 impl PhoneScreenSession {
@@ -108,9 +112,40 @@ impl PhoneScreenSession {
             network_budget: u32::MAX,
             rate_id,
             sent,
+            told_touch_off: false,
+        }
+    }
+
+    /// A click from the viewer: if Android dropped the service touch goes
+    /// through, say so where the person clicking is. The surrogate shows the
+    /// screen either way, so without this a click simply did nothing — and
+    /// the usual cause, the service stopped by swiping Cursio from recent
+    /// apps, leaves it looking on in the phone's settings.
+    fn check_touch(&mut self) {
+        match crate::phone_hands::touch_blocked() {
+            None => self.told_touch_off = false,
+            Some(_) if self.told_touch_off => {}
+            Some(reason) => {
+                self.told_touch_off = true;
+                tracing::warn!(%reason, "a computer clicked this phone's screen, but touch cannot land");
+                crate::notify_hub::hub().post(Notification {
+                    key: TOUCH_OFF_KEY.into(),
+                    app_id: "dev.cursio.touch".into(),
+                    app_name: "Cursio".into(),
+                    title: "Clicks are not reaching the phone's screen".into(),
+                    text: reason,
+                    icon: None,
+                    when_ms: 0,
+                    kind: NotifyKind::Other,
+                    actions: Vec::new(),
+                });
+            }
         }
     }
 }
+
+/// One notice replaces the last rather than piling up.
+const TOUCH_OFF_KEY: &str = "cursio:touch-off";
 
 /// Stream units as frames from a keyframe on.
 ///
@@ -190,6 +225,9 @@ impl CaptureSession for PhoneScreenSession {
                 self.meta.height = now.height;
                 self.mapper.resize(now.width, now.height);
             }
+        }
+        if matches!(input, WindowInput::PointerButton { pressed: true, .. }) {
+            self.check_touch();
         }
         if let Some(gesture) = self.mapper.map(&input) {
             match backend() {
