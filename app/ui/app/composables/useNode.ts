@@ -96,6 +96,12 @@ export type ConfigEdit =
   | { bluetooth_mesh: BluetoothMesh }
   | { crossing: { edge: Edge; span: EdgeSpan | null } }
   | { trust_builder: { peer: string; name: string; key: string } }
+  | {
+      trust_app_builder: {
+        app: string;
+        builder: { peer: string; name: string; key: string };
+      };
+    }
 
 export interface ProblemAction {
   label: string

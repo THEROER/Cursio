@@ -37,6 +37,7 @@
 //! files module's `SharePolicy` deserializes from; this crate only stores and
 //! returns it, so the policy can evolve without a config migration here.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -93,6 +94,44 @@ pub struct Config {
     pub calls: CallsConfig,
     pub bluetooth: BluetoothConfig,
     pub layout: LayoutConfig,
+    /// Other applications this machine takes builds of over the mesh, by id
+    /// (`docs/app-sdk-design.md`). Absent means none: an application is
+    /// installed only once its builder is trusted here, for it alone.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub apps: BTreeMap<String, AppConfig>,
+}
+
+/// How this machine takes one application's builds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppConfig {
+    /// `auto` installs and hands the build to the application at once;
+    /// `never` stops taking it. `ask` behaves as `auto`: an application's
+    /// build replaces nothing that runs until the application itself agrees.
+    pub policy: UpdatePolicy,
+    /// Machines whose builds of this application are accepted.
+    pub trusted_builders: Vec<TrustedBuilder>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            policy: UpdatePolicy::Auto,
+            trusted_builders: Vec::new(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// As the update agent reads it: only trusted builders, so the dev
+    /// channel.
+    pub fn as_update(&self) -> UpdateConfig {
+        UpdateConfig {
+            policy: self.policy,
+            channel: UpdateChannel::Dev,
+            trusted_builders: self.trusted_builders.clone(),
+        }
+    }
 }
 
 /// This machine's part of the shared desk (`docs/input-design.md`, "Screens
@@ -155,6 +194,12 @@ pub enum ConfigEdit {
     /// what `cursio update trust-builder` does, as a button on the refusal
     /// of its build — the one way a phone, with no shell to type it in, can.
     TrustBuilder(TrustedBuilder),
+    /// Take `app`'s builds from `builder`: the button on the refusal of an
+    /// application's build, for that application only.
+    TrustAppBuilder {
+        app: String,
+        builder: TrustedBuilder,
+    },
     /// Narrow one edge to the part that crosses; `None` gives it back whole.
     Crossing {
         edge: Edge,
@@ -171,6 +216,11 @@ impl ConfigEdit {
                 builders.retain(|b| b.key != builder.key && b.peer != builder.peer);
                 builders.push(builder);
                 config.update.channel = UpdateChannel::Dev;
+            }
+            ConfigEdit::TrustAppBuilder { app, builder } => {
+                let builders = &mut config.apps.entry(app).or_default().trusted_builders;
+                builders.retain(|b| b.key != builder.key && b.peer != builder.peer);
+                builders.push(builder);
             }
             ConfigEdit::Crossing { edge, span } => {
                 let span = span.filter(|s| *s != EdgeSpan::WHOLE);
@@ -426,6 +476,7 @@ impl Default for Config {
             calls: CallsConfig::default(),
             bluetooth: BluetoothConfig::default(),
             layout: LayoutConfig::default(),
+            apps: BTreeMap::new(),
         }
     }
 }

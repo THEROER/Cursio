@@ -61,5 +61,7 @@ fn offer_to_installer(layout: &InstallLayout, version: &str) -> Result<(), Updat
         )?;
         Ok(())
     })
-    .map_err(|why| UpdateError::Refused(format!("the phone could not offer the update: {why}")))
+    .map_err(|why| UpdateError::Refused(format!("the phone could not offer the update: {why}")))?;
+    tracing::info!(%version, "handed the build to the system installer");
+    Ok(())
 }

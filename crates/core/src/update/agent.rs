@@ -17,6 +17,12 @@
 //! person. So the phone's agent is given a [`Switcher`] that hands the APK to
 //! that installer, and offers it as soon as it is in: the "switch" is a
 //! notification the person taps, which is already the asking `ask` means.
+//!
+//! **Other applications' builds are agents too.** An application on the mesh
+//! (`docs/app-sdk-design.md`) gets an agent of its own — its own install root,
+//! store and trusted builders — named by a [`Subject`], so its refusals, its
+//! failures and its button stand apart from Cursio's own. Trusting a builder
+//! for Cursio never extends to an application, nor the other way.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -32,6 +38,38 @@ use crate::diagnostics::{self, Problem, ProblemAction, Severity};
 /// What switches this machine to an installed build, in place of the update
 /// helper; see the module docs.
 pub type Switcher = Box<dyn Fn(&InstallLayout, &str) -> Result<(), UpdateError> + Send + Sync>;
+
+/// Whose builds an agent takes: Cursio's own, or one application's.
+pub struct Subject {
+    /// How the person knows it: `Cursio`, or the application's id.
+    pub name: String,
+    /// Prefix of the agent's problem ids: `update`, `app.<id>`.
+    problems: String,
+    /// The config change "accept builds from this machine" makes.
+    trust: Box<dyn Fn(TrustedBuilder) -> ConfigEdit + Send + Sync>,
+}
+
+impl Subject {
+    pub fn cursio() -> Self {
+        Subject {
+            name: "Cursio".into(),
+            problems: "update".into(),
+            trust: Box::new(ConfigEdit::TrustBuilder),
+        }
+    }
+
+    pub fn app(id: &str) -> Self {
+        let app = id.to_owned();
+        Subject {
+            name: id.to_owned(),
+            problems: format!("app.{id}"),
+            trust: Box::new(move |builder| ConfigEdit::TrustAppBuilder {
+                app: app.clone(),
+                builder,
+            }),
+        }
+    }
+}
 
 use super::layout::InstallLayout;
 use super::store::Store;
@@ -91,6 +129,7 @@ pub struct Agent {
     /// When the running build was made, where its store cannot say: a
     /// phone's app installed by hand holds no statement of itself.
     built_at: Option<u64>,
+    subject: Subject,
 }
 
 #[derive(Default)]
@@ -106,9 +145,9 @@ struct State {
     status: UpdateStatus,
 }
 
-const REFUSED: &str = "update.refused";
-const FAILED: &str = "update.failed";
-const READY: &str = "update.ready";
+const REFUSED: &str = "refused";
+const FAILED: &str = "failed";
+const READY: &str = "ready";
 
 impl Agent {
     pub fn new(
@@ -131,7 +170,24 @@ impl Agent {
             }),
             switcher: None,
             built_at: None,
+            subject: Subject::cursio(),
         }
+    }
+
+    /// Take `subject`'s builds rather than Cursio's, with `running` as the
+    /// build of it this machine has now.
+    pub fn for_subject(mut self, subject: Subject, running: Option<String>) -> Self {
+        self.subject = subject;
+        self.state().status.running = running.unwrap_or_default();
+        self
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.subject.name
+    }
+
+    fn problem(&self, what: &str) -> String {
+        format!("{}.{what}", self.subject.problems)
     }
 
     /// The running build was made at `at` (Unix seconds): take nothing
@@ -215,14 +271,19 @@ impl Agent {
                 // builder afterwards has to work without a restart.
                 let mut state = self.state();
                 if state.reported.insert(version.clone()) {
-                    tracing::warn!(%from, %version, %refusal, "refused a build offered over the mesh");
+                    let subject = &self.subject.name;
+                    tracing::warn!(%subject, %from, %version, %refusal, "refused a build offered over the mesh");
                     // A choice not made yet is offered as one — accepting
                     // trusts the key and follows dev, which answers both;
                     // any other refusal is a fault.
+                    let label = match self.subject.problems.as_str() {
+                        "update" => format!("Accept builds from {from}"),
+                        _ => format!("Take {subject} builds from {from}"),
+                    };
                     let actions = match a_choice {
                         true => vec![ProblemAction {
-                            label: format!("Accept builds from {from}"),
-                            edit: ConfigEdit::TrustBuilder(TrustedBuilder {
+                            label,
+                            edit: (self.subject.trust)(TrustedBuilder {
                                 peer: state.peers.get(from).copied().unwrap_or(PeerId::nil()),
                                 name: from.to_owned(),
                                 key: super::sign::hex(&offer.signer),
@@ -230,12 +291,14 @@ impl Agent {
                         }],
                         false => Vec::new(),
                     };
+                    let what = match self.subject.problems.as_str() {
+                        "update" => format!("build {version}"),
+                        _ => format!("{subject} build {version}"),
+                    };
                     diagnostics::raise(Problem {
-                        id: REFUSED.into(),
+                        id: self.problem(REFUSED),
                         severity: Severity::Warning,
-                        summary: format!(
-                            "{from} offered build {version}, and it was refused: {refusal}"
-                        ),
+                        summary: format!("{from} offered {what}, and it was refused: {refusal}"),
                         hint: None,
                         actions,
                         since: SystemTime::now(),
@@ -247,7 +310,7 @@ impl Agent {
         };
         // Accepted now: an earlier refusal (an untrusted builder since
         // trusted) is over.
-        diagnostics::clear(REFUSED);
+        diagnostics::clear(&self.problem(REFUSED));
         let version = statement.version.clone();
         let newest = self.newest_known();
         let installed_here = self.layout.installed().contains(&version);
@@ -322,11 +385,14 @@ impl Agent {
         release(&mut state, version);
         state.given_up.insert(version.to_owned());
         state.status.last = Some(format!("fetching {version} from {from} failed: {reason}"));
-        tracing::warn!(%version, %from, %reason, "a build from the mesh could not be installed");
+        let subject = &self.subject.name;
+        tracing::warn!(%subject, %version, %from, %reason, "a build from the mesh could not be installed");
         diagnostics::raise(Problem {
-            id: FAILED.into(),
+            id: self.problem(FAILED),
             severity: Severity::Warning,
-            summary: format!("build {version} from {from} could not be installed: {reason}"),
+            summary: format!(
+                "{subject} build {version} from {from} could not be installed: {reason}"
+            ),
             hint: None,
             actions: Vec::new(),
             since: SystemTime::now(),
@@ -342,8 +408,8 @@ impl Agent {
     pub fn installed(&self, statement: &Statement, from: &str) {
         let version = statement.version.clone();
         release(&mut self.state(), &version);
-        diagnostics::clear(FAILED);
-        tracing::info!(%version, %from, "installed a build from the mesh");
+        diagnostics::clear(&self.problem(FAILED));
+        tracing::info!(subject = %self.subject.name, %version, %from, "installed a build from the mesh");
         self.mark_ready(&version, from, statement.published_at);
     }
 
@@ -367,9 +433,12 @@ impl Agent {
         }
         if self.config().policy == UpdatePolicy::Ask {
             diagnostics::raise(Problem {
-                id: READY.into(),
+                id: self.problem(READY),
                 severity: Severity::Info,
-                summary: format!("Cursio {version} is installed and ready to switch to"),
+                summary: format!(
+                    "{} {version} is installed and ready to switch to",
+                    self.subject.name
+                ),
                 hint: Some(
                     "switch from the app, or run `cursio update apply` on this machine".into(),
                 ),
@@ -412,8 +481,8 @@ impl Agent {
     fn switch(&self, version: &str) -> Result<(), UpdateError> {
         if let Some(switcher) = &self.switcher {
             switcher(&self.layout, version)?;
-            self.state().status.last = Some(format!("offered {version} to the system installer"));
-            tracing::info!(%version, "handed the build to the system installer");
+            diagnostics::clear(&self.problem(READY));
+            self.state().status.last = Some(format!("switched to {version}"));
             return Ok(());
         }
         let exe = super::layout::stable_executable("cursio")
@@ -452,7 +521,7 @@ impl Agent {
         command.args(&args);
         super::apply::detach(&mut command);
         command.spawn().map_err(|e| UpdateError::io(&exe, e))?;
-        diagnostics::clear(READY);
+        diagnostics::clear(&self.problem(READY));
         self.state().status.last = Some(format!("switching to {version}"));
         tracing::info!(%version, "handed over to the update helper; this node will stop");
         Ok(())
@@ -644,6 +713,52 @@ mod tests {
         .apply(&mut config);
         assert_eq!(config.update.channel, UpdateChannel::Dev);
         assert!(crate::update::sign::verify(&o, &config.update).is_ok());
+    }
+
+    #[test]
+    fn an_application_builder_is_trusted_for_that_application_alone() {
+        let key = BuilderKey::from_seed([7; 32]);
+        let o = offer(&key, "0.6.0+launcher", 9);
+        let mut config = crate::config::Config::default();
+        let refusal = Subject::app("leavepulse");
+        let builder = TrustedBuilder {
+            peer: PeerId::nil(),
+            name: "Nocturne".into(),
+            key: hex(&o.signer),
+        };
+        (refusal.trust)(builder).apply(&mut config);
+        let app = config.apps["leavepulse"].as_update();
+        assert!(crate::update::sign::verify(&o, &app).is_ok());
+        assert!(
+            crate::update::sign::verify(&o, &config.update).is_err(),
+            "Cursio's own builds are not taken from it"
+        );
+        assert!(!config.apps.contains_key("other"));
+    }
+
+    #[test]
+    fn an_application_refusal_offers_its_own_button() {
+        let root = scratch("app-refusal");
+        let key = BuilderKey::from_seed([8; 32]);
+        let agent = Agent::new(InstallLayout::at(&root), "linux-x86_64".into(), || {
+            crate::config::AppConfig::default().as_update()
+        })
+        .for_subject(Subject::app("leavepulse"), None);
+        assert!(matches!(
+            agent.consider(&offer(&key, "0.6.0+x", 9), "Nocturne"),
+            Decision::Skip
+        ));
+        let problem = crate::diagnostics::snapshot()
+            .into_iter()
+            .find(|p| p.id == "app.leavepulse.refused")
+            .expect("the refusal is the application's own");
+        assert_eq!(problem.actions[0].label, "Take leavepulse builds from Nocturne");
+        assert!(matches!(
+            problem.actions[0].edit,
+            ConfigEdit::TrustAppBuilder { ref app, .. } if app == "leavepulse"
+        ));
+        crate::diagnostics::clear("app.leavepulse.refused");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
