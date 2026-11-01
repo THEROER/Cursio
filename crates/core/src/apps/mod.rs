@@ -317,7 +317,12 @@ impl Registry {
 pub fn registry() -> &'static Arc<Mutex<Registry>> {
     static REGISTRY: OnceLock<Arc<Mutex<Registry>>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let file = crate::data_dir::data_dir().map(|dir| dir.join(FILE_NAME));
+        // A test's registry is never saved: tests register throwaway
+        // applications, and saved they landed in the person's own registry.
+        let file = match cfg!(test) {
+            true => None,
+            false => crate::data_dir::data_dir().map(|dir| dir.join(FILE_NAME)),
+        };
         Arc::new(Mutex::new(Registry::load(file)))
     })
 }
