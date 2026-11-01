@@ -1,7 +1,8 @@
 # Inspecting and driving an application from another machine
 
-Status: rung 4 is **built on Windows** (UI Automation); AT-SPI on Linux and
-rung 5 are **design**.
+Status: rung 4 is **built on Windows** (UI Automation); rung 5 is **built
+for CDP** (Chromium web views). AT-SPI on Linux and WebKitGTK through
+WebDriver are **design**.
 
 A person — or an AI agent through `cursio mcp` — wants to work with an
 application running on another machine of the mesh the way they would with
@@ -151,6 +152,57 @@ The web view's console also becomes a log: `cursio logs Lightmoon --app
 leavepulse/console` while a DevTools session is open, merged by time with the
 app's own log.
 
+### Built (CDP)
+
+- **SDK 0.5.0** (`cursio-sdk`, `cursio-app-protocol`):
+  `App::devtools(Devtools::Cdp { port })` puts `"devtools":{"kind":"cdp",
+  "port":N}` in `Hello`. The field is omitted when absent, so a 0.4 hello is
+  byte for byte what it was (pinned by tests).
+- **The owner check** (`core/src/apps/devtools.rs`): the port must be in the
+  listening state on loopback and owned by a pid the app registered — Linux
+  maps `/proc/net/tcp{,6}`'s inode to `/proc/<pid>/fd`, Windows reads
+  `GetExtendedTcpTable` with owning pids. A port listened on everywhere is
+  refused with that reason; other platforms refuse outright.
+- **Consent**: `[apps.<id>] devtools = "deny" | "ask"`. Under `deny` a
+  request raises an information problem whose one button switches to `ask`;
+  under `ask` it raises the warning above with *Allow <peer> for 1 hour*,
+  *Allow until <app> restarts* and *Deny*. Problem buttons are config edits,
+  so a grant is stored as `[[apps.<id>.devtools_grants]]` with the peer, an
+  absolute expiry and, for *until it restarts*, the pids it was given to (and
+  an expiry of 24 hours at most). A grant past its expiry, for another
+  machine or for pids no longer running holds nothing; `deny` clears every
+  grant. Every open stream rechecks its grant every 3 seconds, so *Stop* or
+  the expiry closes them all.
+- **Visible while it lasts**: an open session raises a warning problem
+  *"<peer> is inspecting <app>"* with *Stop* (which clears the grants), and
+  logs `devtools session began` / `devtools session ended … for N s` at
+  WARN, which `cursio report` counts with the day's warnings. The session
+  ends a minute after its last stream closes, since a browser reconnects.
+- **The tunnel** (`core/src/apps/tunnel.rs`): `AppsWire::TunnelOpen`,
+  `TunnelOpened`, `TunnelData`, `TunnelAck`, `TunnelClose`, appended last.
+  Data goes in frames of at most 32 KiB against a 256 KiB credit window that
+  the far end returns as it writes, so a stalled reader stops the sender
+  rather than filling a queue; small frames ride `Metadata`, large ones
+  `Bulk`. A link going away closes its streams.
+- **The asking side** lives in the node, not the command, so the MCP tools
+  reuse one listener: `cursio devtools <machine> <app>[/process] [--port P]
+  [--close]` asks the far side once (so a refusal is an error at once),
+  listens on `127.0.0.1`, and prints the URL with its token, a Playwright
+  line and the frontend hint. A request whose path does not start with the
+  token is answered 404 and never forwarded; the token is stripped, `Host`
+  becomes `127.0.0.1:<port>`, and `/json*` answers get the token inserted
+  into `webSocketDebuggerUrl` and `devtoolsFrontendUrl` with
+  `Content-Length` fixed. The listener closes after 15 minutes idle.
+- **MCP**: `apps_devtools` (destructive) opens the listener; `web_snapshot`,
+  `web_query`, `web_screenshot`, `web_console`, `web_click`, `web_fill` and
+  `web_eval` (destructive, with its own title) speak CDP to the first page
+  target through it (`core/src/mcp/cdp.rs`, tokio-tungstenite behind the
+  `web-tools` feature).
+- **Not built**: `web_network`, the console as a `cursio logs` source,
+  `--launch`, discovery of rungs in `apps status`, a notification and tray
+  entry beyond the problem, WebKitGTK through WebDriver, and a live run
+  against a deployed WebView2 application.
+
 ## Convenience
 
 - **One command, ready to use.** `cursio devtools Lightmoon leavepulse`
@@ -182,6 +234,7 @@ trusted with input and files already. What this design adds on top:
 
 1. Rung 4, the UI tree: UI Automation on Windows (**built**), AT-SPI next.
 2. Rung 5's tunnel with the token, the time-limited consent, the visible
-   indicator and the audit line.
-3. The `web_*` tools in `cursio mcp`, and the web view's console as a log.
+   indicator and the audit line (**built**).
+3. The `web_*` tools in `cursio mcp` (**built**, but not `web_network`), and
+   the web view's console as a log.
 4. WebKitGTK through WebDriver, as its own mode.

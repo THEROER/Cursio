@@ -44,6 +44,14 @@ wherever else it keeps it.
 A machine takes an application's builds only after its person trusts the
 builder for that application, once, with a button.
 
+An application with a Chromium web view started with its own `--devtools`
+flag declares its loopback DevTools port with
+`App::devtools(Devtools::Cdp { port })`. The node checks that the port is
+this process's and opens it to another machine (`cursio devtools Laptop
+my-app`) only for a limited time its person allows, separately from
+everything above. Declare it only behind that flag: it lets the inspecting
+machine run any code inside the application.
+
 ## Android
 
 The same code runs inside an Android app on a phone where the Cursio app

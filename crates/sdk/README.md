@@ -104,4 +104,20 @@ application decides whether trying again means anything. A machine takes
 messages only from a machine its person lets drive the application, the same
 answer as for actions.
 
+## DevTools, behind the application's own flag
+
+```rust
+let mut app = App::new("my-app");
+if devtools_flag {
+    app = app.devtools(Devtools::Cdp { port });  // the web view's loopback CDP port
+}
+```
+
+The node opens the port to another machine (`cursio devtools Laptop my-app`)
+only after checking that one of the application's processes listens on it on
+loopback, and only for as long as that machine's person allows — an hour, or
+until the application restarts; `[apps.my-app] devtools` is `deny` until they
+say otherwise. It is a separate answer from actions because DevTools runs any
+code inside the application, so a release build should not declare it.
+
 `MIT OR Apache-2.0`. See the [repository](https://github.com/THEROER/cursio-sdk).

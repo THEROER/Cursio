@@ -184,6 +184,24 @@ that a button now shows "Running". `core/src/desktop_window.rs`:
   A non-GNOME X11 desktop is not built (no XTest/`get_image` path): it answers
   that it needs GNOME with the extension.
 
+## An application's web view
+
+Below the window, an application started with its own `--devtools` flag and
+declaring `App::devtools(Devtools::Cdp { port })` can be inspected through
+the DevTools protocol (rung 5 in `docs/devtools-design.md`):
+
+- **`apps_devtools { machine, app }`** (destructive) asks the owning machine
+  — consent there is `[apps.<id>] devtools`, `deny` by default, granted for
+  an hour or until the app restarts — and opens a token-gated listener on
+  this machine's loopback, answering its URL for Playwright or the inspector.
+- **`web_snapshot`**, **`web_query { selector }`**, **`web_screenshot`** and
+  **`web_console { wait_ms? }`** read the first page target;
+  **`web_click { selector }`** and **`web_fill { selector, text }`** change
+  it; **`web_eval { expression }`** runs JavaScript in it and is destructive
+  with its own title, so a client asks before each call. They reuse the
+  listener `apps_devtools` opens (opening one when none is up), and exist
+  only in a build with the `web-tools` feature (every desktop build).
+
 ## The same surface in cursio-sdk
 
 Applications and xtasks drive the same things programmatically:

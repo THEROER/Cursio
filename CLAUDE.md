@@ -68,6 +68,7 @@ claude mcp add cursio -- cursio mcp         # the same as tools for an AI agent 
 cursio phone "POCO X7 Pro" screenshot --ask | tap 0.5 0.8 | swipe 0.5 0.8 0.5 0.2 | key back | text "hi"
 cursio window Lightmoon leavepulse screenshot | click 0.5 0.9 | type "текст" | key enter   # a registered app's window (Windows)
 cursio window Lightmoon leavepulse tree | invoke --role button --name Play | set-value --role edit --name Search --value x   # by role and name (UI Automation)
+cursio devtools Lightmoon leavepulse [--port P] [--close]   # its web view's CDP on 127.0.0.1, token-gated; [apps.<id>] devtools there, time-limited
 cursio path Lightmoon [auto|network|bluetooth]   # see or choose the path, on both ends
 cursio report all --since 1d                # every machine's day: drops, warnings, memory
 cursio restart Lightmoon | apply-update Lightmoon   # maintain a machine through the mesh
