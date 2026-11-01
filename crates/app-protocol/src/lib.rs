@@ -48,6 +48,12 @@ pub const MAX_TOPICS: usize = 64;
 /// The socket's file name inside the node's private runtime directory.
 pub const SOCKET_NAME: &str = "apps.sock";
 
+/// The node's abstract socket name on Android, where Cursio's own app hosts
+/// the node and its private directory is out of every other app's reach. An
+/// abstract socket has no file to protect, so the node checks who connected
+/// (the peer's uid, its package) instead; see `docs/app-sdk-design.md`.
+pub const ABSTRACT_NAME: &str = "cursio-apps";
+
 /// Longest [`AppId`].
 pub const MAX_APP_ID: usize = 32;
 
@@ -581,8 +587,13 @@ pub fn message_kind(line: &[u8]) -> Option<String> {
 /// Unix: [`SOCKET_NAME`] in `$XDG_RUNTIME_DIR/cursio`, or in
 /// `<temp>/cursio-<uid>` when that variable is unset — the directory the
 /// node makes private to its user. Windows: `\\.\pipe\cursio-apps-<user>`.
+/// Android: the abstract socket [`ABSTRACT_NAME`], written `@cursio-apps`.
 pub fn endpoint() -> PathBuf {
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
+    {
+        PathBuf::from(format!("@{ABSTRACT_NAME}"))
+    }
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         runtime_dir().join(SOCKET_NAME)
     }
@@ -591,6 +602,15 @@ pub fn endpoint() -> PathBuf {
         let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
         PathBuf::from(format!(r"\\.\pipe\cursio-apps-{}", pipe_safe(&user)))
     }
+}
+
+/// The abstract socket name an endpoint written `@name` stands for, or `None`
+/// for a path. Abstract sockets exist on Linux and Android only.
+pub fn abstract_name(endpoint: &std::path::Path) -> Option<&str> {
+    endpoint
+        .to_str()?
+        .strip_prefix('@')
+        .filter(|name| !name.is_empty())
 }
 
 /// The node's private runtime directory, as [`endpoint`] resolves it.
@@ -869,6 +889,25 @@ mod tests {
             }),
             "{\"msg\":\"build_ready\",\"version\":\"0.6.1\",\"dir\":\"/apps/leavepulse/versions/0.6.1\"}\n"
         );
+    }
+
+    #[test]
+    fn an_at_sign_names_an_abstract_socket_and_anything_else_a_path() {
+        use std::path::Path;
+        assert_eq!(
+            abstract_name(Path::new("@cursio-apps")),
+            Some(ABSTRACT_NAME)
+        );
+        assert_eq!(
+            abstract_name(Path::new("/run/user/1000/cursio/apps.sock")),
+            None
+        );
+        assert_eq!(abstract_name(Path::new("@")), None);
+        if cfg!(target_os = "android") {
+            assert_eq!(abstract_name(&endpoint()), Some(ABSTRACT_NAME));
+        } else {
+            assert_eq!(abstract_name(&endpoint()), None);
+        }
     }
 
     #[test]

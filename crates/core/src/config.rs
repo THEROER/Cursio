@@ -99,6 +99,23 @@ pub struct Config {
     /// installed only once its builder is trusted here, for it alone.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub apps: BTreeMap<String, AppConfig>,
+    /// On a phone: which other apps may reach the node, and as which
+    /// application. Empty everywhere else.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub package_access: Vec<PackageGrant>,
+}
+
+/// On a phone, one app's answer: whether package `package` may talk to the
+/// node as application `app`. The node's socket there is abstract and any app
+/// can connect to it, so the node asks Android which package connected and
+/// takes it only once its person allowed that package — and only under the
+/// application id it was allowed as, so another app cannot claim it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageGrant {
+    pub package: String,
+    pub app: String,
+    pub allowed: bool,
 }
 
 /// How this machine takes one application's builds.
@@ -235,6 +252,12 @@ pub enum ConfigEdit {
         app: String,
         consent: AdminConsent,
     },
+    /// On a phone: answer whether `package` may talk to the node as `app`.
+    PackageAccess {
+        package: String,
+        app: String,
+        allowed: bool,
+    },
     /// Narrow one edge to the part that crosses; `None` gives it back whole.
     Crossing {
         edge: Edge,
@@ -262,6 +285,19 @@ impl ConfigEdit {
             }
             ConfigEdit::AppActions { app, consent } => {
                 config.apps.entry(app).or_default().actions = consent;
+            }
+            ConfigEdit::PackageAccess {
+                package,
+                app,
+                allowed,
+            } => {
+                let grants = &mut config.package_access;
+                grants.retain(|g| !(g.package == package && g.app == app));
+                grants.push(PackageGrant {
+                    package,
+                    app,
+                    allowed,
+                });
             }
             ConfigEdit::Crossing { edge, span } => {
                 let span = span.filter(|s| *s != EdgeSpan::WHOLE);
@@ -518,6 +554,7 @@ impl Default for Config {
             bluetooth: BluetoothConfig::default(),
             layout: LayoutConfig::default(),
             apps: BTreeMap::new(),
+            package_access: Vec::new(),
         }
     }
 }

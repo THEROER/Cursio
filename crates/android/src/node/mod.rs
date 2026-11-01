@@ -43,6 +43,7 @@ use cursio_core::pairing_window::PairingWindow;
 use cursio_core::NodeIdentity;
 use cursio_protocol::{PeerId, Position};
 
+mod apps;
 mod bluetooth;
 mod link;
 mod serve;

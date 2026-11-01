@@ -10,6 +10,13 @@
          mDNS behind the ordinary network permissions all the same. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- An app that connects to the node's abstract socket is named to the
+         person by its package and label (node/apps.rs). Since Android 11 the
+         package manager hides other apps unless asked to see them; this app
+         is installed by hand, not through a store, so it asks for all. -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
     <!-- mDNS is multicast, which Android does not deliver to an app that has
          not asked for it: without this the phone announces itself and hears
          nobody, which looks exactly like a firewall problem on the peer. -->

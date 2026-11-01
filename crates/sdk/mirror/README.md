@@ -38,6 +38,15 @@ calls to it.
 A machine takes an application's builds only after its person trusts the
 builder for that application, once, with a button.
 
+## Android
+
+The same code runs inside an Android app on a phone where the Cursio app
+runs: the SDK reaches the node on the abstract socket `@cursio-apps`, with no
+Java or Kotlin on your side. The first time your app connects, the phone's
+person is asked to let it talk to Cursio, under the application id it
+registered; until then `start` keeps retrying in the background, and no
+other app can later register under that id.
+
 ## Cursio being absent is ordinary
 
 `App::start` fails only for a mistake in the program (an invalid id or log

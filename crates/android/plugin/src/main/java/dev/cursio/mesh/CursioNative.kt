@@ -287,4 +287,23 @@ object CursioNative {
     @JvmStatic
     fun onMediaRemote(peer: String, peerName: String, json: String) =
         MediaNotifier.update(peer, peerName, json)
+
+    /**
+     * The apps running as [uid] — `package<TAB>label` per line — for the node
+     * to tell which app connected to its abstract socket (`node/apps.rs`).
+     * Empty when Android does not say.
+     */
+    @JvmStatic
+    fun packagesForUid(uid: Int): String {
+        val pm = UpdateOffer.context.packageManager
+        val packages = pm.getPackagesForUid(uid) ?: return ""
+        return packages.joinToString("\n") { name ->
+            val label = try {
+                pm.getApplicationLabel(pm.getApplicationInfo(name, 0)).toString()
+            } catch (e: Exception) {
+                name
+            }
+            "$name\t$label"
+        }
+    }
 }

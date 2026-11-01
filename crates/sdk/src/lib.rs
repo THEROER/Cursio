@@ -673,7 +673,32 @@ async fn run(
 
 #[cfg(unix)]
 async fn connect(endpoint: &Path) -> std::io::Result<tokio::net::UnixStream> {
-    tokio::net::UnixStream::connect(endpoint).await
+    match cursio_app_protocol::abstract_name(endpoint) {
+        Some(name) => connect_abstract(name),
+        None => tokio::net::UnixStream::connect(endpoint).await,
+    }
+}
+
+/// An abstract socket — the node on Android, where Cursio's app hosts it and
+/// no other app can reach a file of its. A local connect does not block.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn connect_abstract(name: &str) -> std::io::Result<tokio::net::UnixStream> {
+    #[cfg(target_os = "android")]
+    use std::os::android::net::SocketAddrExt;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+    let stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
+    stream.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(stream)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn connect_abstract(name: &str) -> std::io::Result<tokio::net::UnixStream> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("@{name} is an abstract socket, which only Linux and Android have"),
+    ))
 }
 
 #[cfg(windows)]

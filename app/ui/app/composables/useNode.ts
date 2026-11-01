@@ -104,6 +104,7 @@ export type ConfigEdit =
     }
   | { app_admin: { app: string; consent: "ask" | "allow" | "deny" } }
   | { app_actions: { app: string; consent: "ask" | "allow" | "deny" } }
+  | { package_access: { package: string; app: string; allowed: boolean } }
 
 export interface ProblemAction {
   label: string

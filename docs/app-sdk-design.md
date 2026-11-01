@@ -354,10 +354,24 @@ private directory, which another app cannot open. Two steps:
    the installer and runs once its person installs and opens it — a phone
    starts no process for a peer. Logs are served only if the app writes
    into a directory it shares.
-2. **SDK on Android.** A bound service exported by the Cursio app, guarded by
-   a signature-level permission the developer's apps hold, or a
-   `LocalSocket` in the abstract namespace with the peer's UID checked against
-   a list the person approved. Decided when the second step starts.
+2. **SDK on Android (built, step 6).** The node listens on the abstract
+   socket `@cursio-apps` (`cursio_app_protocol::ABSTRACT_NAME`;
+   `crates/android/src/node/apps.rs`), and `cursio-sdk` connects there on
+   Android with the same API — no JNI on the app's side. An abstract socket
+   has no file to protect and any app can connect, so each connection passes
+   a gate (`core/src/apps/access.rs`): the peer's uid from `SO_PEERCRED`
+   (the kernel's, not the app's word), the packages Android says run as it
+   (`CursioNative.packagesForUid`, which needs `QUERY_ALL_PACKAGES` since
+   Android 11), and the person's answer kept as `package_access` in the
+   config. An unknown package raises *"<label> (<package>) asks to talk to
+   Cursio as <app>"* with *Let … talk to Cursio* / *Don't*; until then its
+   hello is refused with that reason, so the SDK retries rarely. A package is
+   taken only under the application id it was allowed as, and an id once
+   allowed for one package is refused to every other: otherwise any app could
+   register as `leavepulse` and receive its messages and calls. A bound
+   service was the alternative; it would have put Kotlin on the app's side of
+   every SDK user and a signature permission that only the developer's own
+   key could hold.
 
 ## Order of work
 
@@ -371,4 +385,5 @@ private directory, which another app cannot open. Two steps:
    **Built.**
 5. Commands and messages between copies. **Built** (actions in SDK 0.2,
    messages in 0.3).
-6. SDK on Android.
+6. SDK on Android. **Built** (0.3.1): the abstract socket and the package
+   gate.

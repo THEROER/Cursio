@@ -188,7 +188,7 @@ pub async fn serve(
         let (stream, _) = listener.accept().await?;
         let (machine, registry) = (machine.clone(), registry.clone());
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(stream, &machine, &registry).await {
+            if let Err(error) = serve_connection(stream, &machine, &registry, None).await {
                 tracing::debug!(%error, "application connection ended");
             }
         });
@@ -209,7 +209,56 @@ pub async fn serve(
         let connected = std::mem::replace(&mut pending, create(&endpoint, false)?);
         let (machine, registry) = (machine.clone(), registry.clone());
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(connected, &machine, &registry).await {
+            if let Err(error) = serve_connection(connected, &machine, &registry, None).await {
+                tracing::debug!(%error, "application connection ended");
+            }
+        });
+    }
+}
+
+/// Serve applications on the abstract socket `name` — a phone's, where any
+/// app can connect — taking each only past `gate`, which is told the uid the
+/// kernel reports for the peer; see [`super::access`].
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn start_abstract(machine: String, name: &'static str, gate: super::access::Gate) {
+    let registry = super::registry().clone();
+    tokio::spawn(async move {
+        if let Err(error) = serve_abstract(name, machine, registry, gate).await {
+            tracing::warn!(%error, "apps socket stopped; applications cannot reach this node");
+        }
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn serve_abstract(
+    name: &str,
+    machine: String,
+    registry: Arc<Mutex<Registry>>,
+    gate: super::access::Gate,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "android")]
+    use std::os::android::net::SocketAddrExt;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+    let listener = std::os::unix::net::UnixListener::bind_addr(&addr)?;
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::UnixListener::from_std(listener)?;
+    tracing::info!(socket = %format!("@{name}"), "apps socket listening");
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let uid = match stream.peer_cred() {
+            Ok(cred) => cred.uid(),
+            Err(error) => {
+                tracing::warn!(%error, "cannot tell who connected to the apps socket; dropping it");
+                continue;
+            }
+        };
+        let gate = gate.clone();
+        let admit: Admit = Box::new(move |app| gate(uid, app));
+        let (machine, registry) = (machine.clone(), registry.clone());
+        tokio::spawn(async move {
+            if let Err(error) = serve_connection(stream, &machine, &registry, Some(admit)).await {
                 tracing::debug!(%error, "application connection ended");
             }
         });
@@ -257,10 +306,15 @@ fn lock(registry: &Mutex<Registry>) -> std::sync::MutexGuard<'_, Registry> {
     registry.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Whether the connection may register as an application; `Err` is the
+/// reason its hello is refused with.
+type Admit = Box<dyn Fn(&cursio_app_protocol::AppId) -> Result<(), String> + Send>;
+
 async fn serve_connection<S: AsyncRead + AsyncWrite>(
     stream: S,
     machine: &str,
     registry: &Arc<Mutex<Registry>>,
+    admit: Option<Admit>,
 ) -> std::io::Result<()> {
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
@@ -312,6 +366,9 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     if topics.len() > cursio_app_protocol::MAX_TOPICS {
         let limit = cursio_app_protocol::MAX_TOPICS;
         return refuse(&mut write, format!("at most {limit} topics per process")).await;
+    }
+    if let Some(Err(why)) = admit.as_ref().map(|admit| admit(&app)) {
+        return refuse(&mut write, why).await;
     }
     let key = super::Key {
         app: app.clone(),
@@ -478,7 +535,9 @@ mod tests {
         let (ours, theirs) = tokio::io::duplex(64 * 1024);
         let registry = registry.clone();
         let task =
-            tokio::spawn(async move { serve_connection(theirs, "Nocturne", &registry).await });
+            tokio::spawn(
+                async move { serve_connection(theirs, "Nocturne", &registry, None).await },
+            );
         let (read, write) = tokio::io::split(ours);
         (task, BufReader::new(read), write)
     }
@@ -864,5 +923,58 @@ mod tests {
         .await;
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A phone's socket is abstract, so any app could connect: the hello is
+    /// answered only past the gate, which is told the peer's real uid.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_app_on_an_abstract_socket_is_taken_only_past_the_gate() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        bounded(async {
+            let name: &'static str =
+                Box::leak(format!("cursio-test-apps-{}", std::process::id()).into_boxed_str());
+            let allowed = Arc::new(AtomicBool::new(false));
+            let gate: super::super::access::Gate = {
+                let allowed = allowed.clone();
+                Arc::new(move |uid, _app| {
+                    // SAFETY: getuid cannot fail and touches no memory.
+                    assert_eq!(uid, unsafe { libc::getuid() }, "the kernel's uid");
+                    match allowed.load(Ordering::SeqCst) {
+                        true => Ok(()),
+                        false => Err("not allowed yet".into()),
+                    }
+                })
+            };
+            let registry = Arc::new(Mutex::new(Registry::load(None)));
+            let server = tokio::spawn(serve_abstract(name, "POCO".into(), registry.clone(), gate));
+            let connect = || async {
+                let addr = std::os::unix::net::SocketAddr::from_abstract_name(name).unwrap();
+                loop {
+                    if let Ok(stream) = std::os::unix::net::UnixStream::connect_addr(&addr) {
+                        stream.set_nonblocking(true).unwrap();
+                        return tokio::net::UnixStream::from_std(stream).unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let (read, mut write) = tokio::io::split(connect().await);
+            let mut reader = BufReader::new(read);
+            write.write_all(&hello(None)).await.unwrap();
+            assert_eq!(
+                answer(&mut reader).await,
+                NodeMsg::Refused {
+                    reason: "not allowed yet".into()
+                }
+            );
+            allowed.store(true, Ordering::SeqCst);
+            let (read, mut write) = tokio::io::split(connect().await);
+            let mut reader = BufReader::new(read);
+            write.write_all(&hello(None)).await.unwrap();
+            assert!(matches!(answer(&mut reader).await, NodeMsg::Welcome { .. }));
+            server.abort();
+        })
+        .await;
     }
 }

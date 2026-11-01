@@ -37,6 +37,7 @@ pub(super) async fn serve(node: Node) -> anyhow::Result<()> {
         port,
     } = node;
     tracing::info!(id = %identity.peer_id, name = %identity.display_name, "node identity");
+    super::apps::start(identity.display_name.clone());
 
     let listener = TcpListenerHandle::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
     let bound = listener.local_addr();

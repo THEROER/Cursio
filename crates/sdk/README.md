@@ -16,6 +16,13 @@ Without a running node the application works exactly as before: `start`
 fails only for an invalid id or log path, and the connection is made, and made
 again, in the background.
 
+## Android
+
+On a phone where the Cursio app runs, the same code reaches its node on the
+abstract socket `@cursio-apps` — no Java or Kotlin on your side. The first
+connection asks the phone's person to let your app talk to Cursio under the
+id it registered; until then `start` keeps retrying in the background.
+
 ## Actions
 
 A running process can let another machine of the mesh — a person, or an AI
