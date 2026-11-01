@@ -72,6 +72,12 @@ pub(super) fn record_sent(
 pub(super) const BITRATE_MIN: u32 = 24_000;
 pub(super) const BITRATE_STEP: u32 = 24_000;
 
+/// Ceiling while Bluetooth carries the session. The radio is shared with the
+/// phones' links and their A2DP, and a laptop whose Wi-Fi was off sent its
+/// sound there at the network's rate: pointer moves waited 130 ms behind it,
+/// and round trips reached a second when a stream started.
+pub(super) const BLUETOOTH_BITRATE: u32 = BITRATE_MIN;
+
 /// Bitrate a stream *starts* at, before any ack has proved what the link can
 /// carry.
 ///
@@ -243,12 +249,30 @@ impl AudioEngine {
         let now = std::time::Instant::now();
         // Only streams we're actively sending have an `unacked` entry.
         let ids: Vec<u32> = self.unacked.keys().copied().collect();
+        let ceiling = match ids.is_empty() {
+            true => cursio_audio::codec::DEFAULT_BITRATE,
+            false => self.bitrate_ceiling(),
+        };
         for id in ids {
             let due = self
                 .last_adapt
                 .get(&id)
                 .is_none_or(|t| now.duration_since(*t) >= ADAPT_INTERVAL);
             if !due || !self.sent_since_adapt.contains(&id) {
+                continue;
+            }
+            let current = self
+                .stream_bitrate
+                .get(&id)
+                .copied()
+                .unwrap_or(BITRATE_START);
+            // Over a path that cannot carry it, cut at once rather than wait
+            // for a backlog: half a second of audio queued on Bluetooth is
+            // half a second every pointer move waits behind.
+            if current > ceiling {
+                self.last_adapt.insert(id, now);
+                self.sent_since_adapt.remove(&id);
+                self.set_stream_bitrate(id, current, ceiling, 0);
                 continue;
             }
             // No ack yet ⇒ assume the link is fine and leave the rate alone; a
@@ -260,14 +284,9 @@ impl AudioEngine {
             self.sent_since_adapt.remove(&id);
             let gap = self.unacked.get(&id).map_or(0, |q| q.len()) as u32;
 
-            let current = self
-                .stream_bitrate
-                .get(&id)
-                .copied()
-                .unwrap_or(BITRATE_START);
             let streak = self.caught_up_streak.entry(id).or_insert(0);
             *streak = if gap < BACKLOG_LOW { *streak + 1 } else { 0 };
-            let mut target = next_bitrate(current, gap);
+            let mut target = next_bitrate(current, gap).min(ceiling);
             if target > current {
                 if *streak < BITRATE_RAISE_AFTER {
                     target = current;
@@ -277,25 +296,41 @@ impl AudioEngine {
             }
 
             if target != current {
-                // No encoder yet means nothing to change: `pump` builds the
-                // first one at whatever `stream_bitrate` holds.
-                if let Some(encoder) = self.encoders.get_mut(&id) {
-                    if let Err(e) = encoder.set_bitrate(target) {
-                        tracing::warn!(error = %e, id, from = current, to = target,
-                            "cannot change the audio bitrate; keeping the current one");
-                        continue;
-                    }
-                }
-                tracing::info!(
-                    id,
-                    gap,
-                    from = current,
-                    to = target,
-                    "adapting audio bitrate"
-                );
-                self.stream_bitrate.insert(id, target);
+                self.set_stream_bitrate(id, current, target, gap);
             }
         }
+    }
+
+    /// The most a stream to this peer may take: the codec's default, or
+    /// [`BLUETOOTH_BITRATE`] while Bluetooth carries the session.
+    pub(super) fn bitrate_ceiling(&self) -> u32 {
+        match self
+            .peer
+            .is_some_and(|p| crate::diag_session::carried_by_bluetooth(&p))
+        {
+            true => BLUETOOTH_BITRATE,
+            false => cursio_audio::codec::DEFAULT_BITRATE,
+        }
+    }
+
+    fn set_stream_bitrate(&mut self, id: u32, current: u32, target: u32, gap: u32) {
+        // No encoder yet means nothing to change: `pump` builds the first one
+        // at whatever `stream_bitrate` holds.
+        if let Some(encoder) = self.encoders.get_mut(&id) {
+            if let Err(e) = encoder.set_bitrate(target) {
+                tracing::warn!(error = %e, id, from = current, to = target,
+                    "cannot change the audio bitrate; keeping the current one");
+                return;
+            }
+        }
+        tracing::info!(
+            id,
+            gap,
+            from = current,
+            to = target,
+            "adapting audio bitrate"
+        );
+        self.stream_bitrate.insert(id, target);
     }
 }
 

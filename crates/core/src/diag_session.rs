@@ -149,6 +149,16 @@ pub fn paths(peer: &PeerId, choice: Option<PathChoice>) -> Result<PathReport, St
     Ok(handle.report())
 }
 
+/// Whether Bluetooth carries the session with `peer` now: the one path a
+/// module's traffic shares with every pointer move, at a fraction of the
+/// network's speed.
+pub fn carried_by_bluetooth(peer: &PeerId) -> bool {
+    sessions()
+        .get(peer)
+        .filter(|h| !h.is_ended())
+        .is_some_and(|h| h.report().carrying.as_deref() == Some("bluetooth"))
+}
+
 /// This node's own log, as a peer or the control socket asks for it.
 pub fn own_log(tail: Tail) -> Result<DiagResponse, String> {
     let tail = tail.bounded()?;

@@ -238,6 +238,7 @@ impl SessionModule for AudioEngine {
         // born from Intent-Sink membership. Pump them alongside our mic taps.
         // (Device Intent Sinks carry no audio; they only observe membership.)
         let mic_kind = GateKind::Mic(self.mic_gate.get());
+        let ceiling = self.bitrate_ceiling();
         let routed = self
             .routed_apps
             .iter_mut()
@@ -337,7 +338,8 @@ impl SessionModule for AudioEngine {
                     .stream_bitrate
                     .get(id)
                     .copied()
-                    .unwrap_or(BITRATE_START);
+                    .unwrap_or(BITRATE_START)
+                    .min(ceiling);
                 let encoder = match self.encoders.entry(*id) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {

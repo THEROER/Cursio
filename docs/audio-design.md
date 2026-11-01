@@ -110,6 +110,10 @@ playback clock causes crackle or growing lag.
   sender track fill/RTT and adjust Opus bitrate under pressure. The rule is the
   same — **drop/degrade rather than buffer unboundedly** — but audio keeps a
   *small* jitter buffer on purpose, unlike video which favors freshness.
+  While Bluetooth carries the session (`diag_session::carried_by_bluetooth`)
+  every stream is held at 24 kbit/s at once, without waiting for a backlog:
+  the backlog rule reacts at half a second of queued audio, which on the
+  radio is half a second every pointer move waits behind.
 
   Playback handoff queues are bounded by bytes (200 ms plus one pull-model
   device cycle at the wire format) and packet count (128). Admission never
