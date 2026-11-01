@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-app-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde",
@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "cursio-sdk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cursio-app-protocol",
  "tokio",
