@@ -227,7 +227,7 @@ impl Registry {
 pub fn registry() -> &'static Arc<Mutex<Registry>> {
     static REGISTRY: OnceLock<Arc<Mutex<Registry>>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let file = cursio_protocol::paths::data_dir().map(|dir| dir.join(FILE_NAME));
+        let file = crate::data_dir::data_dir().map(|dir| dir.join(FILE_NAME));
         Arc::new(Mutex::new(Registry::load(file)))
     })
 }

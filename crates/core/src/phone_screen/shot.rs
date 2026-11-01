@@ -30,7 +30,7 @@ pub struct Shot {
 
 /// Where screenshots go.
 pub fn dir() -> Option<PathBuf> {
-    cursio_protocol::paths::data_dir().map(|d| d.join("screenshots"))
+    crate::data_dir::data_dir().map(|d| d.join("screenshots"))
 }
 
 /// Decode `stream` and write its newest picture as a PNG in `dir`, no longer

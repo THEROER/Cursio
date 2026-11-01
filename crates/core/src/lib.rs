@@ -52,6 +52,7 @@ pub mod config;
 pub mod control;
 /// The engine a request-and-answer module (messages, the gallery) runs on a link.
 pub mod crash;
+pub mod data_dir;
 /// This machine's current problems, each with the fix where there is one.
 pub mod desk;
 pub mod diag_session;
