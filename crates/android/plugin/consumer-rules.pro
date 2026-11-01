@@ -10,6 +10,7 @@
     public static void onNotificationDismiss(...);
     public static void onRing(...);
     public static void offerUpdate(...);
+    public static java.lang.String offerAppUpdate(...);
     public static java.lang.String onSmsRequest(...);
     public static java.lang.String onCallRequest(...);
     public static java.lang.String onMediaCommand(...);

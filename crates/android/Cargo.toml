@@ -28,6 +28,7 @@ cursio-audio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 cursio-protocol.workspace = true
+cursio-app-protocol.workspace = true
 cursio-transport.workspace = true
 cursio-log.workspace = true
 

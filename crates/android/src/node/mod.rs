@@ -102,6 +102,9 @@ impl NodeHandle {
         let config = Config::load(&config_path)?;
         let mic_gate = LiveShared::new(MicGate::from_config(config.audio.mic_gate.as_deref())?);
         update::start(config_path.clone());
+        // Before the registry: the apps module advertises only once there is
+        // somewhere to put applications' builds.
+        update::start_apps(config_path.clone());
 
         let applier: cursio_core::control::Applier = {
             let mic_gate = mic_gate.clone();

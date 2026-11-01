@@ -56,6 +56,14 @@ pub fn launch(
         }
     }
     let version = current.ok_or_else(|| format!("no build of {id} is installed here"))?;
+    // A phone replaces an application only through its installer, which asks
+    // the person: being current there means the notification is up, and no
+    // process can be started for them.
+    if builds.hands_to_installer() {
+        return Ok(format!(
+            "{id} {version} is offered to this phone's installer; it runs once its person installs and opens it"
+        ));
+    }
     if !start {
         return Ok(format!("{id} {version} is installed and current"));
     }

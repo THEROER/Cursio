@@ -185,6 +185,11 @@ object CursioNative {
     @JvmStatic
     fun offerUpdate(path: String, version: String) = UpdateOffer.offer(path, version)
 
+    /** Another application's build arrived; `""` or why it cannot be offered. */
+    @JvmStatic
+    fun offerAppUpdate(path: String, app: String, version: String): String =
+        UpdateOffer.offerApp(path, app, version)
+
     /** Paired computers, as `address\tname` lines; see [BtLink]. */
     @JvmStatic
     fun btComputers(): String = BtLink.computers()

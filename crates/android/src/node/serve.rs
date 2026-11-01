@@ -172,6 +172,8 @@ fn phone_modules(control: &NodeState, mic_gate: LiveShared<MicGate>) -> ModuleRe
         .with(Box::new(cursio_core::diag_session::DiagFactory))
         // Builds for this phone, and for any machine it relays them to.
         .with(Box::new(cursio_core::update::lane::UpdateFactory))
+        // Other applications' builds, taken and handed on like this app's.
+        .with(Box::new(cursio_core::apps::lane::AppsFactory))
         // The phone's screen, shown on a computer and driven from it.
         .with(Box::new(
             cursio_core::window_session::WindowFactory::default(),

@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Builds from the mesh: cursio_protocol::paths::data_dir()/updates. -->
+<!-- Builds from the mesh: cursio_protocol::paths::data_dir()/updates for this
+     app, data_dir()/apps for other applications' (docs/app-sdk-design.md). -->
 <paths>
     <files-path name="updates" path="data/updates/" />
+    <files-path name="apps" path="data/apps/" />
 </paths>

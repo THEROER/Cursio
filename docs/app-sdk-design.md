@@ -171,7 +171,7 @@ On the receiving machine:
 |---|---|---|
 | Windows / Linux | `apps/<app>/versions/<v>/` + `current` + rollback, the `InstallLayout` of `update-design.md`, rooted per app | `current` is pointed at it at once and every running copy hears `NodeMsg::BuildReady` (the SDK's `on_update`); when to restart into it is the application's choice. Starting it is asked for (`cursio apps launch`, below) |
 | Windows, NSIS bundle (not built) | the installer is run with `/S` once, its exit code is the result | as above |
-| Android | the APK is handed to the system installer through the phone's notification (built for Cursio's own APK, `crates/android/src/node/update.rs`) | the person taps |
+| Android | the APK is handed to the system installer through the phone's notification, one per application (`crates/android/src/node/update.rs`); see "Phones" | the person taps |
 
 **Taking builds is per application and explicit.** A machine takes builds of
 `leavepulse` only after its person pressed "Take leavepulse builds from
@@ -248,10 +248,22 @@ read its log for warnings, PASS/FAIL.
 The node on a phone lives inside the Cursio app; its sockets are in that app's
 private directory, which another app cannot open. Two steps:
 
-1. **Without SDK on the phone (first release).** The phone receives builds of
-   registered applications through the installer notification and serves
-   their logs only if the app writes into a directory it shares. Enough for
-   "ship the launcher to the phone".
+1. **Without SDK on the phone (built, step 4).** The phone runs the `apps`
+   module like a desktop: builds land under `data_dir/apps/<id>/`
+   (`Builds::start_with`, its root chosen per install), per-app trust is the
+   same button, and an installed build is handed to the system installer
+   (`crates/android/src/node/update.rs` `offer_app_to_installer` →
+   `UpdateOffer.offerApp`) as one notification per application, "<app>
+   update ready — Tap to install <version>". The build's APK is the
+   component named `apk`, else its one `.apk` file. Before offering, the
+   phone compares the APK's signer with the installed package's
+   (`GET_SIGNING_CERTIFICATES`); a mismatch is raised as
+   `app.<id>.signer` with the `applicationIdSuffix ".dev"` advice instead of
+   a notification the installer would refuse after the tap.
+   `cursio apps launch <phone> <app>` answers that the build is offered to
+   the installer and runs once its person installs and opens it — a phone
+   starts no process for a peer. Logs are served only if the app writes
+   into a directory it shares.
 2. **SDK on Android.** A bound service exported by the Cursio app, guarded by
    a signature-level permission the developer's apps hold, or a
    `LocalSocket` in the abstract namespace with the peer's UID checked against
@@ -266,5 +278,6 @@ private directory, which another app cannot open. Two steps:
 3. `cursio-sdk` client + `dev::ship`/`logs`/`status`; the launcher's
    `run mesh:<machine>`.
 4. Phones: install by notification for apps (reusing Cursio's own path).
+   **Built.**
 5. Commands and messages between copies.
 6. SDK on Android.

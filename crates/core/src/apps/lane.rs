@@ -264,6 +264,66 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_hands_an_application_build_to_its_installer() {
+        let root = scratch("phone");
+        let key = BuilderKey::from_seed([11; 32]);
+        let app = cursio_app_protocol::AppId::parse("demo3").unwrap();
+        let staged = root.join("staged");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("demo3.apk"), b"apk").unwrap();
+        Manifest::describe(&staged, "2.0.0", &["demo3.apk"])
+            .unwrap()
+            .write(&staged)
+            .unwrap();
+        Store::of(&super::super::builds::layout_of(&root.join("a"), &app))
+            .publish(
+                &key,
+                cursio_protocol::update::Channel::Dev,
+                &[(cursio_protocol::update::this_platform(), staged)],
+                5,
+            )
+            .unwrap();
+        let mut config = Config::default();
+        config
+            .apps
+            .entry("demo3".into())
+            .or_default()
+            .trusted_builders
+            .push(TrustedBuilder {
+                peer: PeerId::nil(),
+                name: "A".into(),
+                key: hex(&key.public()),
+            });
+        config.save(&root.join("phone.toml")).unwrap();
+
+        let offered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = offered.clone();
+        let phone = Builds::at(root.join("phone"), root.join("phone.toml")).with_switcher(
+            std::sync::Arc::new(move |app, _layout, version| {
+                seen.lock()
+                    .unwrap()
+                    .push((app.to_string(), version.to_owned()));
+                Ok(())
+            }),
+        );
+        assert!(phone.hands_to_installer());
+        let a: &'static Builds =
+            Box::leak(Box::new(Builds::at(root.join("a"), root.join("a.toml"))));
+        let phone: &'static Builds = Box::leak(Box::new(phone));
+        let (mut at_a, mut at_phone) = (module(a, "phone"), module(phone, "A"));
+        offer_everything(&mut at_a);
+        settle(&mut at_a, &mut at_phone);
+
+        assert_eq!(
+            offered.lock().unwrap().as_slice(),
+            [("demo3".to_owned(), "2.0.0".to_owned())]
+        );
+        let layout = super::super::builds::layout_of(&root.join("phone"), &app);
+        assert_eq!(layout.current().as_deref(), Some("2.0.0"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn a_machine_that_trusts_nobody_for_an_application_takes_none_of_it() {
         let root = scratch("untrusted");
         let key = BuilderKey::from_seed([10; 32]);

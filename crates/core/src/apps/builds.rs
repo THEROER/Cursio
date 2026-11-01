@@ -14,7 +14,9 @@
 //!
 //! "Switching" an application is pointing its `current` at the new build.
 //! What runs is the application's business: the running copy is told
-//! through its apps socket and decides when to restart into it.
+//! through its apps socket and decides when to restart into it. A phone
+//! hands the build to its system installer instead ([`start_with`]), as it
+//! does Cursio's own APK.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,10 +32,16 @@ use crate::update::UpdateError;
 /// Where every application's builds live, under Cursio's install root.
 pub const APPS_DIR: &str = "apps";
 
+/// What hands an application's installed build on, in place of telling its
+/// running copies: a phone's is its system installer (`crates/android`).
+pub type AppSwitcher =
+    Arc<dyn Fn(&AppId, &InstallLayout, &str) -> Result<(), UpdateError> + Send + Sync>;
+
 pub struct Builds {
     root: PathBuf,
     config_path: PathBuf,
     agents: Mutex<BTreeMap<String, Arc<Agent>>>,
+    switcher: Option<AppSwitcher>,
 }
 
 static BUILDS: OnceLock<Builds> = OnceLock::new();
@@ -49,6 +57,13 @@ pub fn start(config_path: PathBuf) {
         }
     };
     let _ = BUILDS.set(Builds::at(root, config_path));
+}
+
+/// [`start`] with the builds under `root` and handed on by `switcher`: a
+/// phone, whose writable directory the system chooses per install and whose
+/// applications only its installer may replace.
+pub fn start_with(root: PathBuf, config_path: PathBuf, switcher: AppSwitcher) {
+    let _ = BUILDS.set(Builds::at(root, config_path).with_switcher(switcher));
 }
 
 /// The machine's applications' builds, once [`start`]ed.
@@ -68,7 +83,19 @@ impl Builds {
             root,
             config_path,
             agents: Mutex::new(BTreeMap::new()),
+            switcher: None,
         }
+    }
+
+    pub fn with_switcher(mut self, switcher: AppSwitcher) -> Self {
+        self.switcher = Some(switcher);
+        self
+    }
+
+    /// Whether builds here are handed to an installer rather than run from
+    /// their install root: what a phone does.
+    pub fn hands_to_installer(&self) -> bool {
+        self.switcher.is_some()
     }
 
     fn agents(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<Agent>>> {
@@ -120,6 +147,7 @@ impl Builds {
             .get(id)
             .map(|r| r.version.clone());
         let notify = id.clone();
+        let handed_on = self.switcher.clone();
         Agent::new(
             layout_of(&self.root, id),
             cursio_protocol::update::this_platform(),
@@ -136,8 +164,12 @@ impl Builds {
             },
         )
         .for_subject(Subject::app(id.as_str()), running)
-        .with_switcher(Box::new(move |layout, version| {
-            switch(&notify, layout, version)
+        .with_switcher(Box::new(move |layout, version| match &handed_on {
+            Some(hand_on) => {
+                layout.activate(version)?;
+                hand_on(&notify, layout, version)
+            }
+            None => switch(&notify, layout, version),
         }))
     }
 }

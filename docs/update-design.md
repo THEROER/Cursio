@@ -257,6 +257,11 @@ Every APK is signed with the building machine's debug key, so builds from one
 machine install over each other; a build from another machine would be refused
 by the installer as a different signer.
 
+Other applications' APKs take the same path through the `apps` module, under
+`data_dir/apps/<id>/` with a notification per application, and are checked
+against the installed package's signer before they are offered; see "Phones"
+in `docs/app-sdk-design.md`.
+
 A phone has no shell for `cursio update trust-builder`. So a refusal because
 the builder is not trusted carries a button, "Accept builds from <machine>",
 which is `ConfigEdit::TrustBuilder`: the same pinned key and the switch to
