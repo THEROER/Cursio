@@ -387,12 +387,19 @@ mod tests {
             dir: dir.into(),
             file: file.into(),
         };
-        assert!(spec("/var/log/app", "app.log").check().is_ok());
+        // Absolute as each platform reads it: `/var/log` is relative to the
+        // current drive on Windows.
+        let abs = if cfg!(windows) {
+            r"C:\logs\app"
+        } else {
+            "/var/log/app"
+        };
+        assert!(spec(abs, "app.log").check().is_ok());
         assert!(spec("logs", "app.log").check().is_err());
-        assert!(spec("/var/log/app", "../secret").check().is_err());
-        assert!(spec("/var/log/app", "a\\b").check().is_err());
-        assert!(spec("/var/log/app", "..").check().is_err());
-        assert!(spec("/var/log/app", "").check().is_err());
+        assert!(spec(abs, "../secret").check().is_err());
+        assert!(spec(abs, "a\\b").check().is_err());
+        assert!(spec(abs, "..").check().is_err());
+        assert!(spec(abs, "").check().is_err());
     }
 
     #[test]
