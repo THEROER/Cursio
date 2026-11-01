@@ -218,6 +218,7 @@ async fn apps_launch(args: &Value) -> Result<String, Failure> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         true,
+        str_list(args, "args"),
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -246,12 +247,16 @@ async fn apps_ship(args: &Value) -> Result<String, Failure> {
             &mut say,
         ) {
             Ok(version) => {
+                let start = crate::apps::cli::Start {
+                    component: opt_str(args, "component"),
+                    launch: args.get("launch").and_then(Value::as_bool).unwrap_or(true),
+                    args: str_list(args, "args"),
+                };
                 crate::apps::cli::ship(
                     &to,
                     &app,
                     &version,
-                    opt_str(args, "component"),
-                    args.get("launch").and_then(Value::as_bool).unwrap_or(true),
+                    start,
                     args.get("wait").and_then(Value::as_u64).unwrap_or(300),
                     &mut say,
                 )
@@ -390,6 +395,7 @@ pub fn list() -> Vec<Value> {
                 "version": { "type": "string", "description": "start only once this version is current there" },
                 "component": { "type": "string", "description": "which file of the build, when it has several" },
                 "restart": { "type": "boolean" },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "arguments for the started file, e.g. [\"ui\", \"--no-daemon\"]" },
             }),
             &["machine", "app"],
         ),
@@ -405,6 +411,7 @@ pub fn list() -> Vec<Value> {
                 "admin": { "type": "array", "items": { "type": "string" } },
                 "component": { "type": "string" },
                 "launch": { "type": "boolean", "description": "start it (default true)" },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "arguments for the started file" },
                 "wait": { "type": "integer", "description": "seconds to wait for it to arrive (default 300)" },
             }),
             &["app", "to", "files"],

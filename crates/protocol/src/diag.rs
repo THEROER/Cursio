@@ -107,8 +107,15 @@ pub enum DiagRequest {
         /// `false` only answers whether `version` is current, starting
         /// nothing: how a ship that installs only waits for it.
         start: bool,
+        /// Arguments for the started file. Only arguments cross: what runs
+        /// is still only the installed build's own file.
+        args: Vec<String>,
     },
 }
+
+/// Most arguments a launch may carry, and the longest one.
+pub const MAX_LAUNCH_ARGS: usize = 32;
+pub const MAX_LAUNCH_ARG: usize = 1024;
 
 /// Something a person at another machine asks a node to do to itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

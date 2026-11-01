@@ -36,6 +36,7 @@ pub fn launch(
     component: Option<&str>,
     restart: bool,
     start: bool,
+    args: &[String],
 ) -> Result<String, String> {
     let id = AppId::parse(app).map_err(|e| e.to_string())?;
     let builds = builds().ok_or("this machine takes no applications' builds")?;
@@ -90,8 +91,8 @@ pub fn launch(
     }
     let dir = layout.version_dir(&version);
     let pid = match as_admin {
-        true => spawn_admin(&exe, &dir)?,
-        false => Some(spawn(&exe, &dir)?),
+        true => spawn_admin(&exe, &dir, args)?,
+        false => Some(spawn(&exe, &dir, args)?),
     };
     let how = match (as_admin, pid) {
         (true, Some(pid)) => format!("as administrator, pid {pid}"),
@@ -216,10 +217,46 @@ fn terminate(pid: u32) {
     }
 }
 
+/// `args` as one Windows command line, the way the C runtime splits it back
+/// apart: quoted where they hold a space, a tab or a quote (or are empty),
+/// with backslashes before a quote doubled and the quote escaped. APIs that
+/// take a single string — `CreateProcessWithTokenW`, `ShellExecuteExW` —
+/// would otherwise hand `--name "a b"` over as two arguments.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_command_line(args: &[String]) -> String {
+    let quote = |arg: &str| -> String {
+        if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+            return arg.to_owned();
+        }
+        let mut out = String::from('"');
+        let mut backslashes = 0;
+        for c in arg.chars() {
+            match c {
+                '\\' => backslashes += 1,
+                '"' => {
+                    out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                    out.push('"');
+                    backslashes = 0;
+                }
+                other => {
+                    out.push_str(&"\\".repeat(backslashes));
+                    out.push(other);
+                    backslashes = 0;
+                }
+            }
+        }
+        out.push_str(&"\\".repeat(backslashes * 2));
+        out.push('"');
+        out
+    };
+    args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(target_os = "linux")]
-fn spawn(exe: &Path, dir: &Path) -> Result<u32, String> {
+fn spawn(exe: &Path, dir: &Path, args: &[String]) -> Result<u32, String> {
     use std::os::unix::process::CommandExt;
     std::process::Command::new(exe)
+        .args(args)
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -300,23 +337,24 @@ fn terminate(pid: u32) {
 }
 
 #[cfg(windows)]
-fn spawn(exe: &Path, dir: &Path) -> Result<u32, String> {
+fn spawn(exe: &Path, dir: &Path, args: &[String]) -> Result<u32, String> {
     if !crate::elevate::is_elevated() {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         return std::process::Command::new(exe)
+            .args(args)
             .current_dir(dir)
             .creation_flags(DETACHED_PROCESS)
             .spawn()
             .map(|child| child.id())
             .map_err(|e| format!("cannot start {}: {e}", exe.display()));
     }
-    as_the_desktop_user(exe, dir)
+    as_the_desktop_user(exe, dir, args)
 }
 
 /// Start `exe` with the desktop shell's token: the person's, unelevated.
 #[cfg(windows)]
-fn as_the_desktop_user(exe: &Path, dir: &Path) -> Result<u32, String> {
+fn as_the_desktop_user(exe: &Path, dir: &Path, args: &[String]) -> Result<u32, String> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
@@ -334,7 +372,12 @@ fn as_the_desktop_user(exe: &Path, dir: &Path) -> Result<u32, String> {
         s.encode_wide().chain(std::iter::once(0)).collect()
     };
     let app = wide(exe.as_os_str());
-    let mut command_line = wide(std::ffi::OsStr::new(&format!("\"{}\"", exe.display())));
+    let mut line = format!("\"{}\"", exe.display());
+    if !args.is_empty() {
+        line.push(' ');
+        line.push_str(&windows_command_line(args));
+    }
+    let mut command_line = wide(std::ffi::OsStr::new(&line));
     let cwd = wide(dir.as_os_str());
     // SAFETY: every handle is checked, used for its documented purpose and
     // closed; the strings outlive the call that reads them.
@@ -399,7 +442,7 @@ fn running_from(_root: &Path) -> Vec<u32> {
 fn terminate(_pid: u32) {}
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn spawn(exe: &Path, _dir: &Path) -> Result<u32, String> {
+fn spawn(exe: &Path, _dir: &Path, _args: &[String]) -> Result<u32, String> {
     Err(format!(
         "starting {} for a peer is not built for this platform",
         exe.display()
@@ -409,11 +452,12 @@ fn spawn(exe: &Path, _dir: &Path) -> Result<u32, String> {
 /// Start `exe` as an administrator. `None` for the pid where the system's
 /// own prompt starts it and does not say which process it became.
 #[cfg(target_os = "linux")]
-fn spawn_admin(exe: &Path, dir: &Path) -> Result<Option<u32>, String> {
+fn spawn_admin(exe: &Path, dir: &Path, args: &[String]) -> Result<Option<u32>, String> {
     use std::os::unix::process::CommandExt;
     // polkit asks on this machine's screen, as Windows' prompt does there.
     std::process::Command::new("pkexec")
         .arg(exe)
+        .args(args)
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -430,25 +474,26 @@ fn spawn_admin(exe: &Path, dir: &Path) -> Result<Option<u32>, String> {
 }
 
 #[cfg(windows)]
-fn spawn_admin(exe: &Path, dir: &Path) -> Result<Option<u32>, String> {
+fn spawn_admin(exe: &Path, dir: &Path, args: &[String]) -> Result<Option<u32>, String> {
     if crate::elevate::is_elevated() {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         return std::process::Command::new(exe)
+            .args(args)
             .current_dir(dir)
             .creation_flags(DETACHED_PROCESS)
             .spawn()
             .map(|child| Some(child.id()))
             .map_err(|e| format!("cannot start {}: {e}", exe.display()));
     }
-    match crate::elevate::run_as_admin(exe, "", Some(dir), true)? {
+    match crate::elevate::run_as_admin(exe, &windows_command_line(args), Some(dir), true)? {
         true => Ok(None),
         false => Err("declined at this machine's administrator prompt".into()),
     }
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn spawn_admin(exe: &Path, _dir: &Path) -> Result<Option<u32>, String> {
+fn spawn_admin(exe: &Path, _dir: &Path, _args: &[String]) -> Result<Option<u32>, String> {
     Err(format!(
         "starting {} as an administrator is not built for this platform",
         exe.display()
@@ -461,6 +506,26 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn arguments_reach_a_windows_program_as_they_were_given() {
+        assert_eq!(
+            windows_command_line(&names(&["ui", "--no-daemon"])),
+            "ui --no-daemon"
+        );
+        assert_eq!(
+            windows_command_line(&names(&["--name", "a b", ""])),
+            r#"--name "a b" """#
+        );
+        assert_eq!(
+            windows_command_line(&names(&[r#"say "hi""#])),
+            r#""say \"hi\"""#
+        );
+        assert_eq!(
+            windows_command_line(&names(&[r"C:\dir with space\"])),
+            r#""C:\dir with space\\""#
+        );
     }
 
     #[test]

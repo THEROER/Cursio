@@ -238,9 +238,10 @@ impl Exchange for Diag {
                 component,
                 restart,
                 start,
+                args,
             } => {
                 if *start {
-                    tracing::info!(%app, ?version, restart, "a peer asked this node to start an application");
+                    tracing::info!(%app, ?version, restart, ?args, "a peer asked this node to start an application");
                 }
                 crate::apps::launch::launch(
                     app,
@@ -248,6 +249,7 @@ impl Exchange for Diag {
                     component.as_deref(),
                     *restart,
                     *start,
+                    args,
                 )
                 .map(|what| DiagResponse::Launched { what })
             }
@@ -288,11 +290,22 @@ impl Exchange for Diag {
                 component,
                 restart,
                 start,
+                args,
             } => {
+                use cursio_protocol::diag::{MAX_LAUNCH_ARG, MAX_LAUNCH_ARGS};
                 if version.as_ref().is_some_and(|v| v.len() > 128)
                     || component.as_ref().is_some_and(|c| c.len() > 128)
                 {
                     return Err("a version or a file name is at most 128 bytes".into());
+                }
+                if args.len() > MAX_LAUNCH_ARGS
+                    || args
+                        .iter()
+                        .any(|a| a.len() > MAX_LAUNCH_ARG || a.contains('\0'))
+                {
+                    return Err(format!(
+                        "at most {MAX_LAUNCH_ARGS} arguments of at most {MAX_LAUNCH_ARG} bytes, without NUL"
+                    ));
                 }
                 cursio_app_protocol::AppId::parse(&app).map_err(|e| e.to_string())?;
                 Ok(DiagRequest::Launch {
@@ -301,6 +314,7 @@ impl Exchange for Diag {
                     component,
                     restart,
                     start,
+                    args,
                 })
             }
             other @ (DiagRequest::Paths { .. } | DiagRequest::Maintain(_)) => Ok(other),

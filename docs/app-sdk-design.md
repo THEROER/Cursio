@@ -136,9 +136,14 @@ cursio apps publish leavepulse --version 0.6.1 \
     windows-x86_64=target/x86_64-pc-windows-msvc/release/leavepulse-launcher.exe \
     linux-x86_64=target/release/leavepulse-launcher
 cursio apps status
-cursio apps launch Lightmoon leavepulse --restart
+cursio apps launch Lightmoon leavepulse --restart -- ui --no-daemon
 cursio apps ship leavepulse --to Lightmoon windows-x86_64=target/.../leavepulse-launcher.exe
 ```
+
+Arguments after `--` cross with the request (at most 32, each at most 1 KiB):
+what runs is still only a file of the installed build, so they choose a mode
+of the application, never another program. Windows gets them as one command
+line quoted the way its C runtime splits it back apart.
 
 **Starting it from another machine** (`core/src/apps/launch.rs`) is a diag
 request, `DiagRequest::Launch`, so it rides what `cursio restart` does. The

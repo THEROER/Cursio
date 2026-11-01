@@ -59,6 +59,9 @@ pub enum AppsAction {
         /// End the copies already running from its install first.
         #[arg(long)]
         restart: bool,
+        /// Arguments for the started file, after `--`.
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Publish a build, wait until it is current on `--to`, and start it
     /// there: the whole round from a build on this machine to it running on
@@ -83,6 +86,9 @@ pub enum AppsAction {
         wait: u64,
         #[arg(required = true, value_name = "[PLATFORM=]FILE")]
         files: Vec<String>,
+        /// Arguments for the started file, after `--`.
+        #[arg(last = true)]
+        args: Vec<String>,
     },
 }
 
@@ -115,8 +121,9 @@ pub async fn run(action: AppsAction, config_path: &Path) -> anyhow::Result<()> {
             version,
             component,
             restart,
+            args,
         } => {
-            let what = launch(&machine, &app, version, component, restart, true).await?;
+            let what = launch(&machine, &app, version, component, restart, true, args).await?;
             println!("{machine}: {what}");
             Ok(())
         }
@@ -129,9 +136,15 @@ pub async fn run(action: AppsAction, config_path: &Path) -> anyhow::Result<()> {
             no_launch,
             wait,
             files,
+            args,
         } => {
             let version = publish(&root, &app, version, &admin, &files, &mut print)?;
-            ship(&to, &app, &version, component, !no_launch, wait, &mut print).await
+            let start = Start {
+                component,
+                launch: !no_launch,
+                args,
+            };
+            ship(&to, &app, &version, start, wait, &mut print).await
         }
     }
 }
@@ -153,6 +166,7 @@ pub async fn launch(
     component: Option<String>,
     restart: bool,
     start: bool,
+    args: Vec<String>,
 ) -> anyhow::Result<String> {
     use crate::control::{Command, Reply};
     let command = Command::Launch {
@@ -162,6 +176,7 @@ pub async fn launch(
         component,
         restart,
         start,
+        args,
     };
     match client().await?.request(command).await? {
         Reply::Launched { what } => Ok(what),
@@ -192,14 +207,22 @@ async fn targets(to: &str) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// How a shipped build is started once it is current.
+#[derive(Debug, Clone, Default)]
+pub struct Start {
+    /// The file to run, when the build has several.
+    pub component: Option<String>,
+    /// `false` installs only.
+    pub launch: bool,
+    pub args: Vec<String>,
+}
+
 /// Wait until `version` of `app` is current on each target, then start it.
-#[allow(clippy::too_many_arguments)]
 pub async fn ship(
     to: &str,
     app: &str,
     version: &str,
-    component: Option<String>,
-    start: bool,
+    start: Start,
     wait: u64,
     say: Say<'_>,
 ) -> anyhow::Result<()> {
@@ -215,9 +238,10 @@ pub async fn ship(
                 &machine,
                 app,
                 Some(version.to_owned()),
-                component.clone(),
-                start,
-                start,
+                start.component.clone(),
+                start.launch,
+                start.launch,
+                start.args.clone(),
             )
             .await;
             match attempt {

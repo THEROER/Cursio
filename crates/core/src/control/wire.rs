@@ -338,6 +338,8 @@ pub enum Command {
         restart: bool,
         #[serde(default = "starts")]
         start: bool,
+        #[serde(default)]
+        args: Vec<String>,
     },
     /// Report the paths of the session with `peer` from both ends, first
     /// choosing `choice` on both when given; see

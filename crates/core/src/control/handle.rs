@@ -136,6 +136,7 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
             component,
             restart,
             start,
+            args,
         } => {
             let request = DiagRequest::Launch {
                 app: app.clone(),
@@ -143,6 +144,7 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                 component: component.clone(),
                 restart: *restart,
                 start: *start,
+                args: args.clone(),
             };
             match hub.ask(machine, request).await {
                 Ok(DiagResponse::Launched { what }) => Reply::Launched { what },
