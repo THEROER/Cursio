@@ -207,4 +207,5 @@ pub(crate) fn module_registry(
         // which is why it is constructed rather than built from fields.
         .with(Box::new(cursio_core::usb_session::UsbFactory::new(true)))
         .with(Box::new(cursio_core::update::lane::UpdateFactory))
+        .with(Box::new(cursio_core::apps::lane::AppsFactory))
 }

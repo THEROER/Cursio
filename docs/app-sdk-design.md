@@ -120,12 +120,36 @@ compatibility" in `CLAUDE.md`). Builds of other applications travel in the
 `apps` module (16), which carries the same offer/want/chunk shapes keyed by
 `(app, version, platform)`.
 
+**Built (step 2).** Each application has its own update agent
+(`core/src/apps/builds.rs`), made the first time it is named and found again
+on disk: install root `apps/<id>/` under Cursio's, its own store, its own
+`[apps.<id>]` in the config (`policy`, `trusted_builders`), its own problems
+(`app.<id>.refused`, …). The agent is Cursio's own, given a `Subject`
+(`update/agent.rs`); one update `Lane` per application per link rides the
+`apps` module (`core/src/apps/lane.rs`), every lane message wrapped in
+`AppsMsg { app, update }` (`protocol/src/apps.rs`). Platform names are the
+bare `<os>-<arch>` (`windows-x86_64`, `linux-x86_64`, `android-aarch64`):
+the FFmpeg suffix is Cursio's own concern.
+
+```sh
+cursio apps publish leavepulse --version 0.6.1 \
+    windows-x86_64=target/x86_64-pc-windows-msvc/release/leavepulse-launcher.exe \
+    linux-x86_64=target/release/leavepulse-launcher
+cursio apps status
+```
+
+`publish` needs no running node: it signs into the application's store with
+this machine's builder key (`cursio update key`), and the node offers it to
+every link within 30 s. A machine that has not trusted this builder for that
+application refuses with **Take leavepulse builds from Nocturne**; pressing it
+writes `ConfigEdit::TrustAppBuilder`, and the next offer comes through.
+
 On the receiving machine:
 
 | Machine | Install | Switch |
 |---|---|---|
-| Windows / Linux | `apps/<app>/versions/<v>/` + `current` + rollback, the `InstallLayout` of `update-design.md`, rooted per app | the running app is told (`on_update`) and switches itself; one that did not register, or does not answer in 10 s, is stopped and relaunched by the node only if it declared `restartable` |
-| Windows, NSIS bundle | the installer is run with `/S` once, its exit code is the result | as above |
+| Windows / Linux | `apps/<app>/versions/<v>/` + `current` + rollback, the `InstallLayout` of `update-design.md`, rooted per app | `current` is pointed at it at once and every running copy hears `NodeMsg::BuildReady` (the SDK's `on_update`); when to restart into it is the application's choice. Relaunching a copy that is not running is not built: a node that self-elevates on Windows would start it elevated |
+| Windows, NSIS bundle (not built) | the installer is run with `/S` once, its exit code is the result | as above |
 | Android | the APK is handed to the system installer through the phone's notification (built for Cursio's own APK, `crates/android/src/node/update.rs`) | the person taps |
 
 **Taking builds is per application and explicit.** A machine takes builds of
@@ -217,7 +241,7 @@ private directory, which another app cannot open. Two steps:
 1. `cursio-app-protocol` + the node's app socket: register, health, logs
    (`app:<id>` in `diag`). Smallest useful slice: remote logs of the launcher.
 2. The `apps` module: per-app builds, per-app trust with its button,
-   desktop install/switch.
+   desktop install/switch. **Built**; running the NSIS installer is not.
 3. `cursio-sdk` client + `dev::ship`/`logs`/`status`; the launcher's
    `run mesh:<machine>`.
 4. Phones: install by notification for apps (reusing Cursio's own path).

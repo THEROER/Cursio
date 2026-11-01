@@ -145,6 +145,7 @@ async fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Update { action } => cursio_core::update::cli::run(action, &config_path).await,
+        Command::Apps { action } => cursio_core::apps::cli::run(action, &config_path),
         Command::Config => {
             let config = cursio_core::config::Config::load(&config_path)?;
             let origin = match config_path.exists() {
@@ -169,6 +170,7 @@ async fn run() -> anyhow::Result<()> {
             // Before the registry: the update module advertises only once
             // there is an agent to hand builds to.
             cursio_core::update::agent::start(config_path.clone());
+            cursio_core::apps::builds::start(config_path.clone());
             let MeshArgs {
                 pair,
                 pair_addr,

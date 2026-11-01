@@ -14,6 +14,9 @@
 //! Only what describes the application is kept; whether it is running and
 //! how it said it was doing are live state, and start over with the node.
 
+pub mod builds;
+pub mod cli;
+pub mod lane;
 pub mod serve;
 
 use std::collections::BTreeMap;

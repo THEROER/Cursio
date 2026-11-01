@@ -44,6 +44,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: cursio_core::update::cli::UpdateAction,
     },
+    /// Other applications' builds: publish one to the mesh, or see what is
+    /// held here (`docs/app-sdk-design.md`).
+    Apps {
+        #[command(subcommand)]
+        action: cursio_core::apps::cli::AppsAction,
+    },
     /// Ask the running node what it is doing: peers, modules, latency, problems.
     Status {
         /// Print the raw control reply instead of a summary.

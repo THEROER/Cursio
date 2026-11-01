@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod apps;
 pub mod audio;
 pub mod calls;
 pub mod capability;
