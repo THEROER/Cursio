@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use cursio_protocol::diag::{DiagRequest, DiagResponse};
 use cursio_protocol::{TileCodec, WindowFrame, WindowId, WindowInput, WindowMeta};
 use tokio::sync::mpsc;
 
@@ -201,8 +202,57 @@ pub fn stream(phone: &str) -> Result<Stream, String> {
     })
 }
 
+/// How long a phone gets to answer whether its touch works, or to take text.
+/// A phone older than the question drops it unanswered; past this the action
+/// goes ahead the old way.
+const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Ask `phone` over diag; `None` when its link carries no diag or it did not
+/// answer in [`ASK_WAIT`].
+async fn ask(phone: &str, request: DiagRequest) -> Option<Result<DiagResponse, String>> {
+    let hub = crate::diag_session::hub();
+    if !hub
+        .peers()
+        .iter()
+        .any(|p| p.name.eq_ignore_ascii_case(phone))
+    {
+        return None;
+    }
+    tokio::time::timeout(ASK_WAIT, hub.ask(phone, request))
+        .await
+        .ok()
+}
+
 /// Do `action` on `phone`'s screen, pacing the steps as asked.
+///
+/// Text is set in the focused field by the phone itself, any script; touch
+/// is checked first, since a phone with its accessibility service off takes
+/// a tap and does nothing with it.
 pub async fn act(phone: &str, action: &PhoneAction) -> Result<String, String> {
+    let name = known(&phones(), phone)?;
+    match action {
+        PhoneAction::Text { text } => {
+            let typed = ask(&name, DiagRequest::PhoneType { text: text.clone() }).await;
+            match typed {
+                Some(Ok(_)) => return Ok(describe(&name, action)),
+                Some(Err(why)) => return Err(format!("{name}: {why}")),
+                // An older phone: type it key by key, ASCII only.
+                None => {}
+            }
+        }
+        _ => {
+            if let Some(Ok(DiagResponse::Touch {
+                ready: false,
+                reason,
+            })) = ask(&name, DiagRequest::PhoneTouch).await
+            {
+                return Err(format!(
+                    "{name}: {}",
+                    reason.unwrap_or_else(|| "touch from computers is off".into())
+                ));
+            }
+        }
+    }
     let (name, tx, steps) = {
         let phones = phones();
         let name = known(&phones, phone)?;

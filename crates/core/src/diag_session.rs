@@ -310,6 +310,11 @@ impl Exchange for Diag {
                 args_json,
             )
             .map(|result_json| DiagResponse::Called { result_json }),
+            DiagRequest::PhoneTouch => crate::phone_hands::touch(),
+            DiagRequest::PhoneType { text } => {
+                tracing::info!(peer = %store.peer_name, chars = text.chars().count(), "a peer typed on this phone");
+                crate::phone_hands::type_text(text)
+            }
         }
     }
 
@@ -402,7 +407,16 @@ impl Exchange for Diag {
                     args_json,
                 })
             }
-            other @ (DiagRequest::Paths { .. } | DiagRequest::Maintain(_)) => Ok(other),
+            DiagRequest::PhoneType { text } => {
+                use cursio_protocol::diag::MAX_TYPED;
+                if text.chars().count() > MAX_TYPED {
+                    return Err(format!("one request types at most {MAX_TYPED} characters"));
+                }
+                Ok(DiagRequest::PhoneType { text })
+            }
+            other @ (DiagRequest::Paths { .. }
+            | DiagRequest::Maintain(_)
+            | DiagRequest::PhoneTouch) => Ok(other),
         }
     }
 

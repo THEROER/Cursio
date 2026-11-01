@@ -250,6 +250,14 @@ object CursioNative {
     fun onScreenGesture(kind: Int, x1: Float, y1: Float, x2: Float, y2: Float, dx: Int, dy: Int, text: String?) =
         ScreenTouch.gesture(kind, x1, y1, x2, y2, dx, dy, text)
 
+    /** Whether a computer's touch can work now: `""`, or what to turn on. */
+    @JvmStatic
+    fun onTouchState(): String = ScreenTouch.state()
+
+    /** Text from a computer into the focused field: `""`, or why not. */
+    @JvmStatic
+    fun onTypeText(text: String): String = ScreenTouch.typeText(text)
+
     @JvmStatic
     fun onCallRequest(kind: String, number: String?, muted: Boolean): String? =
         CallMonitor.act(kind, number, muted)

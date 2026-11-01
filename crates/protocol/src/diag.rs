@@ -122,7 +122,16 @@ pub enum DiagRequest {
         action: String,
         args_json: String,
     },
+    /// Can this phone carry out touch from a computer now? A tap sent to a
+    /// phone whose accessibility service is off did nothing and said nothing.
+    PhoneTouch,
+    /// Type `text` into the field that has focus on this phone, any script:
+    /// set by the accessibility service, not keyed as a US keyboard.
+    PhoneType { text: String },
 }
+
+/// Most text one [`DiagRequest::PhoneType`] carries.
+pub const MAX_TYPED: usize = 4000;
 
 /// Most arguments a launch may carry, and the longest one.
 pub const MAX_LAUNCH_ARGS: usize = 32;
@@ -176,6 +185,16 @@ pub enum DiagResponse {
     /// What the action answered, as JSON text.
     Called {
         result_json: String,
+    },
+    /// The answer to [`DiagRequest::PhoneTouch`]: `reason` says what the
+    /// phone's person has to do when it cannot.
+    Touch {
+        ready: bool,
+        reason: Option<String>,
+    },
+    /// The text was set in the focused field.
+    Typed {
+        chars: u32,
     },
 }
 

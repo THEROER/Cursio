@@ -181,6 +181,7 @@ fn phone_modules(control: &NodeState, mic_gate: LiveShared<MicGate>) -> ModuleRe
     cursio_core::media_hub::hub().set_backend(crate::media::AndroidBackend::shared());
     cursio_core::media_hub::hub().set_display(crate::media::AndroidDisplay::shared());
     cursio_core::phone_screen::set_backend(crate::screen::AndroidScreen::shared());
+    cursio_core::phone_hands::install(std::sync::Arc::new(crate::screen::AndroidHands));
     modules
 }
 

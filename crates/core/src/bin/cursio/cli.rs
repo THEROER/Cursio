@@ -476,7 +476,7 @@ pub(crate) enum PhoneCommand {
         #[arg(value_enum)]
         key: PhoneKeyArg,
     },
-    /// Type TEXT into the focused field (ASCII; a newline is Enter).
+    /// Type TEXT into the focused field, any script.
     Text { text: String },
 }
 

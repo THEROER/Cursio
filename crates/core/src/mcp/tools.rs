@@ -636,7 +636,7 @@ pub fn list() -> Vec<Value> {
         ),
         tool(
             "phone_text",
-            "Type text into the field that has focus on a phone. ASCII only (it is typed as a US keyboard); a newline is Enter.",
+            "Type text into the field that has focus on a phone, any script; it is appended to what the field holds. Fails when no text field has focus — tap one first.",
             false, true,
             json!({ "phone": phone, "text": { "type": "string" } }),
             &["phone", "text"],

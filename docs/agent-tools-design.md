@@ -105,12 +105,21 @@ What is built on top — **nothing new crosses the link**
   picture, so the caller never needs the resolution — and
   `Command::PhoneAct` sends them into the link's window engine, paced (a
   swipe is a move every ~16 ms). Recents is the forward side button, newly
-  `Gesture::Recents` → `GLOBAL_ACTION_RECENTS`. Text is typed as US-layout
-  keys, as `phone_gesture` reads them; a character outside ASCII refuses the
-  whole text before anything is sent (typing through the clipboard is not
-  built). All destructive-marked: they act in the person's phone UI. Touch
-  needs Cursio's accessibility service on the phone; without it the phone
-  receives the input and does nothing, which the tool cannot see.
+  `Gesture::Recents` → `GLOBAL_ACTION_RECENTS`. All destructive-marked: they
+  act in the person's phone UI.
+- **Touch says when it cannot land** (`core/src/phone_hands.rs`). Touch
+  needs Cursio's accessibility service on the phone, which its person turns
+  on by hand; with it off Android drops the gesture silently. So before a
+  tap, swipe or key the computer asks `DiagRequest::PhoneTouch`, and a phone
+  with the service off answers what to turn on, which the tool returns as
+  its error. Cursio never turns the setting on itself.
+- **Text in any script.** `phone_text` goes as `DiagRequest::PhoneType`: the
+  accessibility service sets the focused field's text itself
+  (`ACTION_SET_TEXT`), so Cyrillic or emoji reach it, and "no text field has
+  focus" comes back as an error instead of keys falling nowhere. A phone
+  older than these questions drops them unanswered; after 3 s the computer
+  falls back to the old way — touch unchecked, text as US-layout keys,
+  ASCII only.
 - The same as a CLI: `cursio phone <phone> screenshot [--ask] [--out F]`,
   `tap X Y [--hold MS]`, `swipe X1 Y1 X2 Y2 [--ms]`, `key back|home|recents`,
   `text "…"`.

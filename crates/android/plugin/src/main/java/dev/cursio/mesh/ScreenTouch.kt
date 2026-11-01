@@ -180,6 +180,19 @@ class ScreenTouch : AccessibilityService() {
         field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 
+    /** [type] with an answer: why the text did not land, or `""`. */
+    private fun append(text: String): String {
+        val field = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (field == null || !field.isEditable) {
+            return "no text field has focus on the phone; tap one first"
+        }
+        val current = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && field.isShowingHintText) "" else field.text ?: ""
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "$current$text")
+        }
+        return if (field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) "" else "the focused field refused the text"
+    }
+
     private fun enter() {
         val field = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -241,6 +254,36 @@ class ScreenTouch : AccessibilityService() {
                 service.gesture(kind, x1, y1, x2, y2, dx, dy, text)
             }
         }
+
+        /** What a computer's touch needs and lacks, or `""` when it works. */
+        @JvmStatic
+        fun state(): String =
+            if (instance != null) {
+                ""
+            } else {
+                "touch from computers is off: turn on Cursio's accessibility service on this phone (Settings → Accessibility → Cursio)"
+            }
+
+        /**
+         * Put [text] at the end of the focused field, any script, and say
+         * why not or `""`. Waits for the main thread, where the field lives,
+         * at most [TYPE_WAIT_MS]: a caller asking from a computer wants to
+         * know it landed.
+         */
+        @JvmStatic
+        fun typeText(text: String): String {
+            val service = instance ?: return state()
+            val answer = java.util.concurrent.atomic.AtomicReference("the phone did not answer in time")
+            val done = java.util.concurrent.CountDownLatch(1)
+            main.post {
+                answer.set(service.append(text))
+                done.countDown()
+            }
+            done.await(TYPE_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+            return answer.get()
+        }
+
+        private const val TYPE_WAIT_MS = 2000L
 
         /** Whether the user turned this service on in the accessibility settings. */
         fun enabled(context: Context): Boolean {

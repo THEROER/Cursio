@@ -23,6 +23,8 @@
     public static void onScreenKeyframe(...);
     public static void onScreenBitrate(...);
     public static void onScreenGesture(...);
+    public static java.lang.String onTouchState(...);
+    public static java.lang.String onTypeText(...);
     public static java.lang.String btComputers(...);
     public static java.lang.String btConnect(...);
 }

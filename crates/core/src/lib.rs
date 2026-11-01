@@ -141,6 +141,7 @@ pub mod phone_action;
 /// Raising memory, swap and i/o pressure as a problem while it lasts.
 /// A mouse on a computer turned into a finger on a phone's screen.
 pub mod phone_gesture;
+pub mod phone_hands;
 /// A phone's screen shown on a computer as a window it can be driven from.
 #[cfg(feature = "window")]
 pub mod phone_screen;

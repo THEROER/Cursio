@@ -99,6 +99,46 @@ fn flat(gesture: Gesture) -> Flat {
     }
 }
 
+/// The accessibility service answering for itself: whether touch from a
+/// computer lands, and text set in the focused field.
+pub struct AndroidHands;
+
+/// Call a `CursioNative` method answering `""` or why not.
+fn answer(method: &str, text: Option<&str>) -> Result<(), String> {
+    let why = crate::jvm::with_native(|env, class| {
+        let value = match text {
+            Some(text) => {
+                let text = JObject::from(env.new_string(text)?);
+                env.call_static_method(
+                    class,
+                    method,
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Object(&text)],
+                )?
+            }
+            None => env.call_static_method(class, method, "()Ljava/lang/String;", &[])?,
+        };
+        let answer = jni::objects::JString::from(value.l()?);
+        let answer: String = env.get_string(&answer)?.into();
+        Ok(answer)
+    })
+    .map_err(|e| format!("the phone could not answer: {e}"))?;
+    match why.is_empty() {
+        true => Ok(()),
+        false => Err(why),
+    }
+}
+
+impl cursio_core::phone_hands::PhoneHands for AndroidHands {
+    fn touch(&self) -> Result<(), String> {
+        answer("onTouchState", None)
+    }
+
+    fn type_text(&self, text: &str) -> Result<(), String> {
+        answer("onTypeText", Some(text))
+    }
+}
+
 impl ScreenBackend for AndroidScreen {
     fn ask(&self, computer: &str) {
         if let Err(e) = crate::jvm::with_native(|env, class| {
