@@ -193,8 +193,10 @@ fn helper_command() -> anyhow::Result<(PathBuf, Vec<String>)> {
 /// The running helper's process id, starting one if there is none.
 fn helper_pid() -> anyhow::Result<u32> {
     let mut helper = HELPER.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(running) = helper.as_mut().filter(|h| h.is_running()) {
-        return Ok(running.pid);
+    if let Some(running) = helper.as_mut() {
+        if running.is_running() {
+            return Ok(running.pid);
+        }
     }
     let (exe, args) = helper_command()?;
     let started = match crate::elevate::is_elevated() {
