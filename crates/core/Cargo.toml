@@ -10,8 +10,17 @@ name = "cursio"
 path = "src/bin/cursio/main.rs"
 # The CLI drives every platform module, so it exists only in a build that has
 # them. A phone links the library into an app; there is no terminal to run this
-# from and nothing on Android that `--send-input` could capture.
-required-features = ["desktop"]
+# from and nothing on Android that `--send-input` could capture. Spelled out
+# rather than `desktop` so the node builds without `files-mount` too: then it
+# mounts through `cursio-mount-helper` and links no WinFsp itself.
+required-features = ["audio", "input", "window", "files", "airplay", "usb", "calls", "bluetooth", "gallery"]
+
+[[bin]]
+name = "cursio-mount-helper"
+path = "src/bin/cursio-mount-helper.rs"
+# The process that holds a peer's drives on Windows, apart from the node: the
+# one executable that carries WinFsp's GPL bindings. See `mount_helper.rs`.
+required-features = ["files-mount"]
 
 # What a build of this crate includes. The default is every desktop subsystem,
 # so a plain `cargo build -p cursio-core` is exactly what it always was.

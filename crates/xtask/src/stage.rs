@@ -141,7 +141,14 @@ pub fn stage_build(
         StageTarget::Android => unreachable!("staged by stage_android above"),
     };
 
-    let files: Vec<String> = ["cursio", "cursio-app"]
+    // Windows carries the drive helper as its own executable: the one that
+    // links WinFsp's GPL bindings, kept apart so a node built without them
+    // still mounts (see `mount_helper.rs` and THIRD-PARTY.md).
+    let bins: &[&str] = match target_kind {
+        StageTarget::Windows => &["cursio", "cursio-app", "cursio-mount-helper"],
+        _ => &["cursio", "cursio-app"],
+    };
+    let files: Vec<String> = bins
         .iter()
         .map(|bin| crate::exe_name(bin, target))
         .collect();
