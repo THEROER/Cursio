@@ -190,8 +190,42 @@ impl CallsHub {
                 calls: phone.calls.clone(),
             });
         }
+        if phone.sound.is_some() {
+            now.push(CallsMsg::Sound {
+                captured_to: phone.sound.clone(),
+            });
+        }
         phone.links.push((token, tx));
         (now, rx, token)
+    }
+
+    /// Where this phone's sound goes by playback capture now, told to every
+    /// computer so one that is also its Bluetooth speaker stands aside.
+    pub fn set_phone_sound(&self, captured_to: Option<String>) {
+        let mut phone = lock(&self.phone);
+        if phone.sound == captured_to {
+            return;
+        }
+        phone.sound = captured_to.clone();
+        phone.links.retain(|(_, tx)| {
+            tx.send(CallsMsg::Sound {
+                captured_to: captured_to.clone(),
+            })
+            .is_ok()
+        });
+    }
+
+    /// Where the phone a Bluetooth speaker stream comes from sends its sound
+    /// by capture, matched as hands-free is: by the name it goes by over
+    /// Bluetooth, else its mesh name.
+    pub fn phone_sound_captured(&self, bluetooth_name: &str) -> Option<String> {
+        let desk = lock(&self.desk);
+        desk.mesh
+            .values()
+            .find(|p| {
+                p.bluetooth_name.as_deref() == Some(bluetooth_name) || p.name == bluetooth_name
+            })
+            .and_then(|p| p.sound.clone())
     }
 
     pub fn unregister_phone_link(&self, token: u64) {
@@ -279,6 +313,7 @@ impl CallsHub {
                 bluetooth_name: None,
                 unavailable: None,
                 calls: Vec::new(),
+                sound: None,
                 tx,
             },
         );
@@ -318,6 +353,13 @@ impl CallsHub {
                     phone.bluetooth_name = bluetooth_name;
                 }
                 CallsMsg::Calls { calls } => phone.calls = calls,
+                CallsMsg::Sound { captured_to } => {
+                    if phone.sound != captured_to {
+                        tracing::info!(phone = %phone.name, to = ?captured_to, "the phone's sound goes by capture");
+                    }
+                    phone.sound = captured_to;
+                    return;
+                }
                 CallsMsg::Refused { reason } => {
                     tracing::warn!(phone = %phone.name, %reason, "the phone refused a call request");
                     return;
@@ -564,6 +606,38 @@ mod tests {
             self.0.lock().unwrap().push((phone.into(), action.clone()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_phone_whose_sound_goes_by_capture_is_known_by_its_bluetooth_name() {
+        let phone = CallsHub::default();
+        phone.set_phone_sound(Some("Cursio(Lightmoon): Speakers".into()));
+        let (told, _rx, _) = phone.register_phone_link();
+        let sound = told
+            .into_iter()
+            .find(|m| matches!(m, CallsMsg::Sound { .. }))
+            .expect("a computer coming up is told where the sound goes");
+
+        let computer = CallsHub::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let peer = PeerId::from_u128(1);
+        computer.register_mesh_phone(peer, "POCO X7 Pro".into(), tx);
+        computer.from_mesh_phone(
+            &peer,
+            CallsMsg::Status {
+                available: true,
+                reason: None,
+                bluetooth_name: Some("POCO X7 Pro BT".into()),
+            },
+        );
+        assert_eq!(computer.phone_sound_captured("POCO X7 Pro BT"), None);
+        computer.from_mesh_phone(&peer, sound);
+        assert_eq!(
+            computer.phone_sound_captured("POCO X7 Pro BT").as_deref(),
+            Some("Cursio(Lightmoon): Speakers")
+        );
+        computer.from_mesh_phone(&peer, CallsMsg::Sound { captured_to: None });
+        assert_eq!(computer.phone_sound_captured("POCO X7 Pro BT"), None);
     }
 
     #[test]

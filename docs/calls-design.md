@@ -128,6 +128,13 @@ PipeWire Bluetooth node the desktop routes on its own.
   slider and is applied to the samples, so the phone's buttons keep working.
 - The decoded sound plays through a Cursio playback node named
   `Cursio — <phone>`.
+- **One route, the chosen one.** Android sends everything to a Bluetooth
+  speaker it is connected to, while playback capture hears the mix whatever
+  the output — so a phone whose sound the person sent to another machine also
+  played it on the computer it was paired with. The phone tells every
+  computer where its sound goes by capture (`CallsMsg::Sound`), and while it
+  goes somewhere, the speaker's copy plays nowhere. Kept connected rather
+  than refused, or Android would fall back to the phone's own speaker.
 
 AAC is not offered: A2DP carries it as LATM inside RTP, which means a second
 codec library; every A2DP source must offer SBC.

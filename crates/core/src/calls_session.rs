@@ -70,7 +70,10 @@ impl CallsEngine {
         match (&self.actor, msg) {
             (
                 _,
-                msg @ (CallsMsg::Status { .. } | CallsMsg::Calls { .. } | CallsMsg::Refused { .. }),
+                msg @ (CallsMsg::Status { .. }
+                | CallsMsg::Calls { .. }
+                | CallsMsg::Refused { .. }
+                | CallsMsg::Sound { .. }),
             ) => {
                 if self.computer {
                     hub().from_mesh_phone(&self.peer, msg);

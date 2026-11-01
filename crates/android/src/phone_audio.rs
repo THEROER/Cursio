@@ -103,6 +103,7 @@ pub fn route_playback(target: Option<u64>) -> anyhow::Result<()> {
         None => None,
     };
     android_backend::route_playback(target)?;
+    cursio_core::calls_hub::hub().set_phone_sound(device.clone());
     *remembered() = None;
     let mut saved = load().unwrap_or_else(|| Saved {
         volume: android_backend::playback_volume(),

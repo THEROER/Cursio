@@ -319,9 +319,31 @@ struct Music {
     resampler: MusicResampler,
     rate: u32,
     seq: u32,
+    /// Where the phone sends its sound by capture, looked at every
+    /// [`LOOK_EVERY`]; while it does, this copy plays nowhere.
+    captured: Option<String>,
+    next_capture_look: Instant,
 }
 
 impl Music {
+    /// Whether the phone's sound already goes somewhere by capture, saying
+    /// so when that changes.
+    fn captured_elsewhere(&mut self) -> bool {
+        let now = Instant::now();
+        if now >= self.next_capture_look {
+            self.next_capture_look = now + LOOK_EVERY;
+            let captured = hub().phone_sound_captured(&self.name);
+            if captured != self.captured {
+                match &captured {
+                    Some(to) => tracing::info!(phone = %self.name, %to, "the phone's sound already goes to the device chosen for it; its Bluetooth copy plays nowhere"),
+                    None => tracing::info!(phone = %self.name, "the phone's sound no longer goes anywhere by capture; playing its Bluetooth copy"),
+                }
+                self.captured = captured;
+            }
+        }
+        self.captured.is_some()
+    }
+
     fn go(&mut self, target: Target) -> Result<(), String> {
         self.sink = None;
         self.sink = Some(match target {
@@ -345,6 +367,9 @@ impl Music {
 
 impl MediaAudio for Music {
     fn play(&mut self, pcm: &[i16], rate: u32, channels: u8) {
+        if self.captured_elsewhere() {
+            return;
+        }
         if let Some(target) = self.placement.moved() {
             if let Err(e) = self.go(target) {
                 tracing::warn!(error = %e, "the phone's sound could not move");
@@ -389,6 +414,8 @@ impl MediaAudioFactory for MusicFactory {
             resampler: MusicResampler::new(48_000),
             rate: 48_000,
             seq: 0,
+            captured: None,
+            next_capture_look: Instant::now(),
         };
         music.go(first)?;
         Ok(Box::new(music))

@@ -111,6 +111,14 @@ pub enum CallsMsg {
     /// Phone -> desktop: a request could not be carried out, and why.
     /// Silence would be indistinguishable from a request that never arrived.
     Refused { reason: String },
+    /// Phone -> desktop: the phone's own sound already goes to `captured_to`
+    /// (a device by name) by playback capture, or to nothing that way.
+    ///
+    /// A phone that picked a computer as its Bluetooth speaker sends that
+    /// computer everything too, and capture hears the mix whatever the
+    /// output — so without this the same sound played on two machines. The
+    /// person's choice is the captured route; the Bluetooth copy stands aside.
+    Sound { captured_to: Option<String> },
 }
 
 impl CallsMsg {

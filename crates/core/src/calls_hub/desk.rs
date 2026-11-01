@@ -16,6 +16,8 @@ use tokio::sync::mpsc;
 pub(super) struct PhoneSide {
     pub(super) status: Option<CallsMsg>,
     pub(super) calls: Vec<Call>,
+    /// Where this phone's sound goes by playback capture.
+    pub(super) sound: Option<String>,
     pub(super) links: Vec<(u64, mpsc::UnboundedSender<CallsMsg>)>,
 }
 
@@ -25,6 +27,8 @@ pub(super) struct MeshPhone {
     pub(super) bluetooth_name: Option<String>,
     pub(super) unavailable: Option<String>,
     pub(super) calls: Vec<Call>,
+    /// Where the phone said its sound goes by playback capture.
+    pub(super) sound: Option<String>,
     pub(super) tx: mpsc::UnboundedSender<CallsMsg>,
 }
 
