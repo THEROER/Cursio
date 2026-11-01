@@ -50,6 +50,9 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: cursio_core::apps::cli::AppsAction,
     },
+    /// Serve the mesh as tools to an AI agent over MCP on stdin/stdout:
+    /// `claude mcp add cursio -- cursio mcp` (`docs/agent-tools-design.md`).
+    Mcp,
     /// Ask the running node what it is doing: peers, modules, latency, problems.
     Status {
         /// Print the raw control reply instead of a summary.

@@ -91,6 +91,8 @@ pub mod live;
 pub mod log_report;
 pub mod log_tail;
 pub mod logging;
+/// `cursio mcp`: the mesh as tools for an AI agent.
+pub mod mcp;
 /// Where this machine's players meet the mesh and peers' are shown.
 pub mod media_hub;
 /// This desktop's MPRIS players, and peers' players offered as MPRIS ones.

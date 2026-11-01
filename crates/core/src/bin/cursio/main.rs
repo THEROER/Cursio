@@ -146,6 +146,15 @@ async fn run() -> anyhow::Result<()> {
     match cli.command {
         Command::Update { action } => cursio_core::update::cli::run(action, &config_path).await,
         Command::Apps { action } => cursio_core::apps::cli::run(action, &config_path).await,
+        Command::Mcp => {
+            let tools = cursio_core::mcp::tools::Tools::new(
+                cursio_core::mcp::tools::NodeAsk,
+                config_path.clone(),
+            );
+            let input = tokio::io::BufReader::new(tokio::io::stdin());
+            cursio_core::mcp::serve(input, tokio::io::stdout(), &tools).await?;
+            Ok(())
+        }
         Command::Config => {
             let config = cursio_core::config::Config::load(&config_path)?;
             let origin = match config_path.exists() {
