@@ -1,6 +1,7 @@
 # Inspecting and driving an application from another machine
 
-Status: **design**. Nothing in this document is built yet.
+Status: rung 4 is **built on Windows** (UI Automation); AT-SPI on Linux and
+rung 5 are **design**.
 
 A person — or an AI agent through `cursio mcp` — wants to work with an
 application running on another machine of the mesh the way they would with
@@ -42,6 +43,33 @@ WebKitGTK and Chromium web views all speak it), NSAccessibility on macOS.
 - It needs nothing from the application and works for native windows as well
   as web views; it is the default way an agent drives an interface.
 - Same consent as rung 3: it reaches exactly what clicks reach, more reliably.
+
+**Built (Windows).** `cursio window <machine> <app>[/process] [--title T]
+tree [--depth N] [--max N] | invoke --role R --name N [--nth K] [--id ID]
+[--action invoke|toggle|select|expand|collapse|focus] | set-value … --value V`;
+MCP `window_tree` (read-only), `window_invoke` and `window_set_value`
+(destructive). Wire: `DiagRequest::WindowTree` / `WindowElement`, appended
+last.
+
+- `cursio_window::ui_tree` is the platform-neutral half: the tree, its text
+  form (`- button "Play" = value [focused] @0.85,0.12 #42-7-1`, the centre
+  as fractions of the window, nameless one-child groups folded away), and
+  finding an element — exact name ignoring case, else the only one
+  containing it; a miss lists the names it could have meant.
+- `cursio_window::windows_uia` walks the control view on a thread of its own
+  in the multi-threaded apartment, each child list fetched with a cache
+  request for the shown properties (one cross-process call per element, not
+  per property). Ids are UI Automation runtime ids; acting re-walks the tree
+  (at the request maximum) to find the element by id or by role and name, so
+  nothing is held between requests.
+- Acting uses the element's own pattern (Invoke, Toggle, SelectionItem,
+  ExpandCollapse, Value, `SetFocus`). An element that takes clicks but
+  publishes no Invoke pattern is clicked at its centre, as a person would,
+  and the answer says so.
+- Limits: 40 levels and 3000 elements by default, at most 64 and 10 000.
+- Not built: AT-SPI on Linux (the answer says so; screenshots and clicks
+  work there through the Shell extension) and live checks against a running
+  WebView2 page, which wait on a deployed build.
 
 ## Rung 5: DevTools
 
@@ -152,7 +180,7 @@ trusted with input and files already. What this design adds on top:
 
 ## Order of work
 
-1. Rung 4, the UI tree: UI Automation on Windows first, AT-SPI next.
+1. Rung 4, the UI tree: UI Automation on Windows (**built**), AT-SPI next.
 2. Rung 5's tunnel with the token, the time-limited consent, the visible
    indicator and the audit line.
 3. The `web_*` tools in `cursio mcp`, and the web view's console as a log.

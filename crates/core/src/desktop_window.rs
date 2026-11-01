@@ -141,7 +141,11 @@ mod imp {
     use super::*;
     use cursio_window::windows_app::{self, AppWindow};
 
-    fn window(target: &WindowTarget, pids: &[u32], id: &AppId) -> Result<AppWindow, String> {
+    pub(super) fn window(
+        target: &WindowTarget,
+        pids: &[u32],
+        id: &AppId,
+    ) -> Result<AppWindow, String> {
         let windows = windows_app::windows_of(pids);
         let wanted = target.title.as_deref().map(str::to_lowercase);
         windows
@@ -305,9 +309,186 @@ mod imp {
 
 pub use imp::{input, shot};
 
+/// Check a tree or element request before anything is found or done.
+pub fn check_ui(depth: u16, max_nodes: u32) -> Result<(), String> {
+    use cursio_protocol::diag::{MAX_TREE_DEPTH, MAX_TREE_NODES};
+    if depth == 0 || depth > MAX_TREE_DEPTH {
+        return Err(format!("a tree is 1 to {MAX_TREE_DEPTH} levels deep"));
+    }
+    if max_nodes == 0 || max_nodes > MAX_TREE_NODES {
+        return Err(format!("a tree holds 1 to {MAX_TREE_NODES} elements"));
+    }
+    Ok(())
+}
+
+/// Check how an element is picked and what is done to it.
+pub fn check_element(
+    pick: &cursio_protocol::diag::ElementPick,
+    act: &cursio_protocol::diag::ElementAct,
+) -> Result<(), String> {
+    use cursio_protocol::diag::{ElementAct, ElementPick, MAX_PICK};
+    let long = match pick {
+        ElementPick::Id(id) => id.len() > MAX_PICK,
+        ElementPick::Match { role, name, .. } => role.len() > MAX_PICK || name.len() > MAX_PICK,
+    };
+    if long {
+        return Err(format!(
+            "a role, a name or an id is at most {MAX_PICK} bytes"
+        ));
+    }
+    match act {
+        ElementAct::SetValue(value) if value.chars().count() > MAX_TYPED => {
+            Err(format!("one request sets at most {MAX_TYPED} characters"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The interface of `target`'s window, as one line per element.
+pub fn tree(
+    peer: &str,
+    target: &WindowTarget,
+    depth: u16,
+    max_nodes: u32,
+) -> Result<DiagResponse, String> {
+    check_ui(depth, max_nodes)?;
+    let (id, pids) = pids(peer, target)?;
+    ui::tree(peer, target, &id, &pids, depth, max_nodes)
+}
+
+/// Do `act` to the element `pick` names in `target`'s window.
+pub fn element(
+    peer: &str,
+    target: &WindowTarget,
+    pick: &cursio_protocol::diag::ElementPick,
+    act: &cursio_protocol::diag::ElementAct,
+) -> Result<DiagResponse, String> {
+    check_element(pick, act)?;
+    let (id, pids) = pids(peer, target)?;
+    ui::element(peer, target, &id, &pids, pick, act)
+}
+
+/// The UI tree is read through UI Automation on Windows; AT-SPI would be
+/// Linux's, and is not built.
+#[cfg(all(windows, feature = "phone-control"))]
+mod ui {
+    use super::*;
+    use cursio_protocol::diag::{ElementAct, ElementPick};
+    use cursio_window::ui_tree::{self, Limits};
+    use cursio_window::windows_uia;
+
+    use super::imp::window;
+
+    pub fn tree(
+        peer: &str,
+        target: &WindowTarget,
+        id: &AppId,
+        pids: &[u32],
+        depth: u16,
+        max_nodes: u32,
+    ) -> Result<DiagResponse, String> {
+        let found = window(target, pids, id)?;
+        let snapshot = windows_uia::tree(
+            found.hwnd,
+            Limits {
+                depth,
+                nodes: max_nodes,
+            },
+        )?;
+        tracing::info!(%peer, app = %id, nodes = snapshot.nodes, "a peer read an application's interface");
+        Ok(DiagResponse::WindowTree {
+            title: found.title,
+            text: ui_tree::render(&snapshot.root),
+            nodes: snapshot.nodes,
+            truncated: snapshot.truncated,
+        })
+    }
+
+    pub fn element(
+        peer: &str,
+        target: &WindowTarget,
+        id: &AppId,
+        pids: &[u32],
+        pick: &ElementPick,
+        act: &ElementAct,
+    ) -> Result<DiagResponse, String> {
+        let found = window(target, pids, id)?;
+        // Acting re-walks the tree to find the element, with room for a
+        // whole page.
+        let what = windows_uia::act(found.hwnd, pick, act, Limits::most())?;
+        tracing::info!(%peer, app = %id, %what, "a peer acted on an application's interface");
+        Ok(DiagResponse::WindowDone { what })
+    }
+}
+
+#[cfg(not(all(windows, feature = "phone-control")))]
+mod ui {
+    use super::*;
+    use cursio_protocol::diag::{ElementAct, ElementPick};
+
+    fn not_built() -> String {
+        format!(
+            "an application's interface tree is read through UI Automation on Windows; not \
+             built for {} yet — use its window's screenshot and clicks there",
+            std::env::consts::OS
+        )
+    }
+
+    pub fn tree(
+        _peer: &str,
+        _target: &WindowTarget,
+        _id: &AppId,
+        _pids: &[u32],
+        _depth: u16,
+        _max_nodes: u32,
+    ) -> Result<DiagResponse, String> {
+        Err(not_built())
+    }
+
+    pub fn element(
+        _peer: &str,
+        _target: &WindowTarget,
+        _id: &AppId,
+        _pids: &[u32],
+        _pick: &ElementPick,
+        _act: &ElementAct,
+    ) -> Result<DiagResponse, String> {
+        Err(not_built())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tree_or_element_request_out_of_bounds_is_refused_before_anything_is_walked() {
+        use cursio_protocol::diag::{ElementAct, ElementPick, MAX_PICK};
+        assert!(check_ui(40, 3000).is_ok());
+        assert!(check_ui(0, 3000).is_err());
+        assert!(check_ui(65, 3000).is_err());
+        assert!(check_ui(40, 10_001).is_err());
+        let pick = ElementPick::Match {
+            role: "button".into(),
+            name: "x".repeat(MAX_PICK + 1),
+            nth: 0,
+        };
+        assert!(check_element(&pick, &ElementAct::Invoke).is_err());
+        let ok = ElementPick::Id("1-2".into());
+        assert!(check_element(&ok, &ElementAct::SetValue("y".repeat(MAX_TYPED + 1))).is_err());
+        assert!(check_element(&ok, &ElementAct::Invoke).is_ok());
+    }
+
+    #[test]
+    fn a_tree_of_an_application_not_running_here_is_refused() {
+        let target = WindowTarget {
+            app: "not-registered-app".into(),
+            process: None,
+            title: None,
+        };
+        let error = tree("Nocturne", &target, 10, 100).unwrap_err();
+        assert!(error.contains("not running"), "{error}");
+    }
 
     #[test]
     fn named_keys_are_the_evdev_codes_and_others_are_refused() {

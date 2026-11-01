@@ -265,6 +265,51 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                 Err(message) => Reply::Error { message },
             }
         }
+        Command::WindowTree {
+            machine,
+            target,
+            depth,
+            max_nodes,
+        } => {
+            use cursio_protocol::diag::{DEFAULT_TREE_DEPTH, DEFAULT_TREE_NODES};
+            let request = DiagRequest::WindowTree {
+                target: target.clone(),
+                depth: depth.unwrap_or(DEFAULT_TREE_DEPTH),
+                max_nodes: max_nodes.unwrap_or(DEFAULT_TREE_NODES),
+            };
+            match hub.ask(machine, request).await {
+                Ok(DiagResponse::WindowTree {
+                    title,
+                    text,
+                    nodes,
+                    truncated,
+                }) => Reply::WindowTree {
+                    title,
+                    text,
+                    nodes,
+                    truncated,
+                },
+                Ok(other) => error(format!("a window tree was answered with {other:?}")),
+                Err(message) => Reply::Error { message },
+            }
+        }
+        Command::WindowElement {
+            machine,
+            target,
+            pick,
+            act,
+        } => {
+            let request = DiagRequest::WindowElement {
+                target: target.clone(),
+                pick: pick.clone(),
+                act: act.clone(),
+            };
+            match hub.ask(machine, request).await {
+                Ok(DiagResponse::WindowDone { what }) => Reply::Acted { what },
+                Ok(other) => error(format!("an element action was answered with {other:?}")),
+                Err(message) => Reply::Error { message },
+            }
+        }
         Command::Paths { peer, choice } => {
             let Some(id) = hub
                 .peers()
@@ -627,7 +672,9 @@ impl NodeState {
             | Command::AppSend { .. }
             | Command::AppPeers { .. }
             | Command::WindowShot { .. }
-            | Command::WindowAct { .. } => {
+            | Command::WindowAct { .. }
+            | Command::WindowTree { .. }
+            | Command::WindowElement { .. } => {
                 error("logs and paths are asked through a desktop's control socket")
             }
         }

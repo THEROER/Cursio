@@ -83,6 +83,10 @@ impl<A: Ask> Tools<A> {
             "window_click" | "window_type" | "window_key" => {
                 self.window_act(name, args).await.map(Output::Text)
             }
+            "window_tree" => self.window_tree(args).await.map(Output::Text),
+            "window_invoke" | "window_set_value" => {
+                self.window_element(name, args).await.map(Output::Text)
+            }
             _ => self.call_text(name, args).await.map(Output::Text),
         }
     }
@@ -136,6 +140,96 @@ impl<A: Ask> Tools<A> {
                     ),
                 })
             }
+            other => Err(answered(other)),
+        }
+    }
+
+    /// An application's window as the tree of elements it publishes.
+    async fn window_tree(&self, args: &Value) -> Result<String, Failure> {
+        let machine = need_str(args, "machine")?;
+        let target = Self::window_target(args)?;
+        let depth = args
+            .get("depth")
+            .and_then(Value::as_u64)
+            .map(|d| d.min(u64::from(u16::MAX)) as u16);
+        let max_nodes = args
+            .get("max_nodes")
+            .and_then(Value::as_u64)
+            .map(|n| n.min(u64::from(u32::MAX)) as u32);
+        match self
+            .ask
+            .ask(Command::WindowTree {
+                machine: machine.clone(),
+                target: target.clone(),
+                depth,
+                max_nodes,
+            })
+            .await?
+        {
+            Reply::WindowTree {
+                title,
+                text,
+                nodes,
+                truncated,
+            } => {
+                let cut = match truncated {
+                    true => "; cut at the limits — raise depth or max_nodes to see more",
+                    false => "",
+                };
+                Ok(format!(
+                    "{}'s window {title:?} on {machine}, {nodes} elements{cut}. Each line: role \
+                     \"name\" = value [states] @centre-x,centre-y #id. Act with window_invoke by \
+                     role and name, or by id.\n{text}",
+                    target.app
+                ))
+            }
+            other => Err(answered(other)),
+        }
+    }
+
+    /// One element of an application's window acted on by role and name.
+    async fn window_element(&self, name: &str, args: &Value) -> Result<String, Failure> {
+        use cursio_protocol::diag::{ElementAct, ElementPick};
+        let machine = need_str(args, "machine")?;
+        let target = Self::window_target(args)?;
+        let pick = match opt_str(args, "id") {
+            Some(id) => ElementPick::Id(id),
+            None => ElementPick::Match {
+                role: need_str(args, "role")?,
+                name: need_str(args, "name")?,
+                nth: args
+                    .get("nth")
+                    .and_then(Value::as_u64)
+                    .map_or(0, |n| n.min(u64::from(u32::MAX)) as u32),
+            },
+        };
+        let act = match name {
+            "window_set_value" => ElementAct::SetValue(need_str(args, "value")?),
+            _ => match opt_str(args, "action").as_deref().unwrap_or("invoke") {
+                "invoke" => ElementAct::Invoke,
+                "toggle" => ElementAct::Toggle,
+                "select" => ElementAct::Select,
+                "expand" => ElementAct::Expand,
+                "collapse" => ElementAct::Collapse,
+                "focus" => ElementAct::Focus,
+                other => {
+                    return Err(Failure::Failed(format!(
+                        "{other} is not an action; use invoke, toggle, select, expand, collapse or focus"
+                    )))
+                }
+            },
+        };
+        match self
+            .ask
+            .ask(Command::WindowElement {
+                machine,
+                target,
+                pick,
+                act,
+            })
+            .await?
+        {
+            Reply::Acted { what } => Ok(what),
             other => Err(answered(other)),
         }
     }
@@ -819,8 +913,45 @@ pub fn list() -> Vec<Value> {
             "window_key",
             "Press a key in an application's window on a computer: enter, escape, tab, backspace, delete, up, down, left, right, home, end, pageup, pagedown, f1…f12.",
             false, true,
-            json!({ "machine": window_machine, "app": window_app, "title": window_title, "key": { "type": "string" } }),
+            json!({ "machine": window_machine.clone(), "app": window_app.clone(), "title": window_title.clone(), "key": { "type": "string" } }),
             &["machine", "app", "key"],
+        ),
+        tool(
+            "window_tree",
+            "An application's window as the tree of elements it publishes to screen readers (UI Automation): role, name, value, states, centre as fractions of the window, and an id. Prefer this to a screenshot: it is small, exact, and lets window_invoke press a button by its name instead of by coordinates. Built for Windows computers; web views (WebView2, Electron) show their buttons and tabs too.",
+            true, false,
+            json!({
+                "machine": window_machine.clone(), "app": window_app.clone(), "title": window_title.clone(),
+                "depth": { "type": "integer", "description": "levels to walk (default 40, at most 64)" },
+                "max_nodes": { "type": "integer", "description": "elements to list (default 3000, at most 10000)" },
+            }),
+            &["machine", "app"],
+        ),
+        tool(
+            "window_invoke",
+            "Act on one element of an application's window, named by role and name as window_tree prints them (or by its id): invoke (press a button, follow a link), toggle, select, expand, collapse or focus. Does what the element itself does; the real cursor does not move. A miss lists the names it could have meant.",
+            false, true,
+            json!({
+                "machine": window_machine.clone(), "app": window_app.clone(), "title": window_title.clone(),
+                "role": { "type": "string", "description": "button, edit, checkbox, tabitem, listitem, hyperlink, …" },
+                "name": { "type": "string", "description": "exactly, ignoring case; or the only one containing it" },
+                "nth": { "type": "integer", "description": "which of several with that role and name, from 0" },
+                "id": { "type": "string", "description": "the #id from window_tree, in place of role and name" },
+                "action": { "type": "string", "enum": ["invoke", "toggle", "select", "expand", "collapse", "focus"] },
+            }),
+            &["machine", "app"],
+        ),
+        tool(
+            "window_set_value",
+            "Set the value of one element of an application's window — a text field — named by role and name (or id), any script, without typing key by key.",
+            false, true,
+            json!({
+                "machine": window_machine, "app": window_app, "title": window_title,
+                "role": { "type": "string" }, "name": { "type": "string" },
+                "nth": { "type": "integer" }, "id": { "type": "string" },
+                "value": { "type": "string" },
+            }),
+            &["machine", "app", "value"],
         ),
     ]
 }

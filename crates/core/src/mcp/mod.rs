@@ -246,6 +246,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_window_tree_comes_back_as_text_with_how_to_act_on_it() {
+        let t = tools(Reply::WindowTree {
+            title: "LeavePulse".into(),
+            text: "- window \"LeavePulse\" #1\n  - button \"Play\" @0.80,0.12 #1-2\n".into(),
+            nodes: 2,
+            truncated: false,
+        });
+        let answer = handle(
+            &t,
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"window_tree","arguments":{"machine":"Lightmoon","app":"leavepulse","depth":5}}}"#,
+        )
+        .await
+        .unwrap();
+        let text = answer["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("button \"Play\""), "{text}");
+        assert!(text.contains("window_invoke"), "it says how to act: {text}");
+        let asked = t.ask_ref().asked.lock().unwrap().clone();
+        assert!(asked.iter().any(|c| matches!(
+            c,
+            Command::WindowTree { machine, depth: Some(5), max_nodes: None, .. } if machine == "Lightmoon"
+        )));
+    }
+
+    #[tokio::test]
+    async fn an_element_is_invoked_by_role_and_name_or_by_id() {
+        use cursio_protocol::diag::{ElementAct, ElementPick};
+        let t = tools(Reply::Acted {
+            what: "invoked button \"Play\"".into(),
+        });
+        for call in [
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"window_invoke","arguments":{"machine":"Lightmoon","app":"leavepulse","role":"button","name":"Play"}}}"#,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"window_invoke","arguments":{"machine":"Lightmoon","app":"leavepulse","id":"1-2","action":"focus"}}}"#,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"window_set_value","arguments":{"machine":"Lightmoon","app":"leavepulse","role":"edit","name":"Search","value":"Привет"}}}"#,
+        ] {
+            let answer = handle(&t, call).await.unwrap();
+            assert_eq!(answer["result"]["isError"], false, "{answer}");
+        }
+        let asked = t.ask_ref().asked.lock().unwrap().clone();
+        let elements: Vec<_> = asked
+            .iter()
+            .filter_map(|c| match c {
+                Command::WindowElement { pick, act, .. } => Some((pick.clone(), act.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            elements,
+            [
+                (
+                    ElementPick::Match {
+                        role: "button".into(),
+                        name: "Play".into(),
+                        nth: 0
+                    },
+                    ElementAct::Invoke
+                ),
+                (ElementPick::Id("1-2".into()), ElementAct::Focus),
+                (
+                    ElementPick::Match {
+                        role: "edit".into(),
+                        name: "Search".into(),
+                        nth: 0
+                    },
+                    ElementAct::SetValue("Привет".into())
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn a_missing_argument_is_named() {
         let t = tools(Reply::Done);
         let answer = handle(

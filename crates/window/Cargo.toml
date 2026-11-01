@@ -113,6 +113,11 @@ windows = { version = "0.61", features = [
     # hardware decoder is used when the machine has one.
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    # UI Automation: a window's elements by role and name for a program
+    # elsewhere (windows_uia.rs). Ole for the runtime ids' SAFEARRAY and the
+    # VARIANTs cached properties come back as.
+    "Win32_UI_Accessibility",
+    "Win32_System_Ole",
     # `ICodecAPI` passes its encoder settings as VARIANTs.
     "Win32_System_Variant",
 ] }

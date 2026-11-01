@@ -334,6 +334,14 @@ impl Exchange for Diag {
             DiagRequest::WindowInput { target, input } => {
                 crate::desktop_window::input(&store.peer_name, target, input)
             }
+            DiagRequest::WindowTree {
+                target,
+                depth,
+                max_nodes,
+            } => crate::desktop_window::tree(&store.peer_name, target, *depth, *max_nodes),
+            DiagRequest::WindowElement { target, pick, act } => {
+                crate::desktop_window::element(&store.peer_name, target, pick, act)
+            }
         }
     }
 
@@ -441,6 +449,24 @@ impl Exchange for Diag {
                 check_target(&target)?;
                 crate::desktop_window::check(&input)?;
                 Ok(DiagRequest::WindowInput { target, input })
+            }
+            DiagRequest::WindowTree {
+                target,
+                depth,
+                max_nodes,
+            } => {
+                check_target(&target)?;
+                crate::desktop_window::check_ui(depth, max_nodes)?;
+                Ok(DiagRequest::WindowTree {
+                    target,
+                    depth,
+                    max_nodes,
+                })
+            }
+            DiagRequest::WindowElement { target, pick, act } => {
+                check_target(&target)?;
+                crate::desktop_window::check_element(&pick, &act)?;
+                Ok(DiagRequest::WindowElement { target, pick, act })
             }
             other @ (DiagRequest::Paths { .. }
             | DiagRequest::Maintain(_)

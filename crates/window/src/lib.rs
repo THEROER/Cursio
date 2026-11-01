@@ -106,6 +106,14 @@ pub mod windows_drag;
 /// One application's window, read and driven for a program elsewhere.
 #[cfg(target_os = "windows")]
 pub mod windows_app;
+/// A window's interface as UI Automation publishes it, read and acted on by
+/// role and name.
+#[cfg(target_os = "windows")]
+pub mod windows_uia;
+
+/// A window's interface as a tree of elements, whatever the platform
+/// publishing it.
+pub mod ui_tree;
 #[cfg(target_os = "windows")]
 mod windows_capture;
 #[cfg(target_os = "windows")]

@@ -515,6 +515,57 @@ pub(crate) enum WindowCommand {
     /// Press a key: enter, escape, tab, backspace, delete, up, down, left,
     /// right, home, end, pageup, pagedown, f1…f12.
     Key { key: String },
+    /// Print the window's interface as the tree of elements it publishes to
+    /// screen readers: role, name, value, states, where it is, and an id.
+    Tree {
+        #[arg(long)]
+        depth: Option<u16>,
+        #[arg(long)]
+        max: Option<u32>,
+    },
+    /// Act on one element of the window's interface, named by role and name
+    /// (or by `--id` from a tree).
+    Invoke {
+        #[command(flatten)]
+        element: ElementArgs,
+        /// What to do to it.
+        #[arg(long, value_enum, default_value = "invoke")]
+        action: ElementActionArg,
+    },
+    /// Give one element of the window's interface (a text field) a value.
+    SetValue {
+        #[command(flatten)]
+        element: ElementArgs,
+        #[arg(long)]
+        value: String,
+    },
+}
+
+/// Which element of a window's interface.
+#[derive(clap::Args)]
+pub(crate) struct ElementArgs {
+    /// Its role as a tree prints it: button, edit, checkbox, tabitem, …
+    #[arg(long, required_unless_present = "id")]
+    pub role: Option<String>,
+    /// Its name, exactly (ignoring case) or the only one containing this.
+    #[arg(long, required_unless_present = "id")]
+    pub name: Option<String>,
+    /// Which of several with that role and name, counting from 0.
+    #[arg(long, default_value_t = 0)]
+    pub nth: u32,
+    /// The id a tree printed after `#`, in place of role and name.
+    #[arg(long, conflicts_with_all = ["role", "name"])]
+    pub id: Option<String>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum ElementActionArg {
+    Invoke,
+    Toggle,
+    Select,
+    Expand,
+    Collapse,
+    Focus,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

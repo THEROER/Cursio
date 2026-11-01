@@ -139,7 +139,57 @@ pub enum DiagRequest {
         target: WindowTarget,
         input: DesktopInput,
     },
+    /// The interface of one window of an application registered here, as
+    /// the tree of elements the platform publishes to assistive technology:
+    /// at most `depth` levels and `max_nodes` elements.
+    WindowTree {
+        target: WindowTarget,
+        depth: u16,
+        max_nodes: u32,
+    },
+    /// Do `act` to the element `pick` names in one window of an application
+    /// registered here.
+    WindowElement {
+        target: WindowTarget,
+        pick: ElementPick,
+        act: ElementAct,
+    },
 }
+
+/// How a request names an element of a window's interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElementPick {
+    /// The id a tree printed after `#`.
+    Id(String),
+    /// The `nth` (from 0) element of `role` named `name`.
+    Match {
+        role: String,
+        name: String,
+        nth: u32,
+    },
+}
+
+/// What to do to an element of a window's interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElementAct {
+    Invoke,
+    Toggle,
+    Select,
+    Expand,
+    Collapse,
+    Focus,
+    SetValue(String),
+}
+
+/// Most a tree request may ask for.
+pub const MAX_TREE_DEPTH: u16 = 64;
+pub const MAX_TREE_NODES: u32 = 10_000;
+/// What a tree request asks for unless told otherwise: deep enough for a web
+/// view's nesting, a whole launcher page, a few hundred kilobytes at most.
+pub const DEFAULT_TREE_DEPTH: u16 = 40;
+pub const DEFAULT_TREE_NODES: u32 = 3000;
+/// Longest role, name or id an element is picked by.
+pub const MAX_PICK: usize = 256;
 
 /// Which window of an application a request means. Only an application that
 /// registered here can be named: the node finds its windows by the process
@@ -264,6 +314,13 @@ pub enum DiagResponse {
     WindowDone {
         what: String,
     },
+    /// The answer to [`DiagRequest::WindowTree`]: one line per element.
+    WindowTree {
+        title: String,
+        text: String,
+        nodes: u32,
+        truncated: bool,
+    },
 }
 
 /// A node's own memory. `None` is "cannot say".
@@ -364,7 +421,8 @@ impl DiagMsg {
                     Ok(
                         DiagResponse::Logs { .. }
                         | DiagResponse::Report(_)
-                        | DiagResponse::WindowShot { .. },
+                        | DiagResponse::WindowShot { .. }
+                        | DiagResponse::WindowTree { .. },
                     ),
                 ..
             } => Priority::Bulk,

@@ -468,7 +468,9 @@ pub(crate) async fn window(
 ) -> anyhow::Result<()> {
     use crate::cli::WindowCommand;
     use cursio_core::control::{Command, Reply};
-    use cursio_protocol::diag::{window_fraction, DesktopInput, WindowTarget};
+    use cursio_protocol::diag::{
+        window_fraction, DesktopInput, ElementAct, ElementPick, WindowTarget,
+    };
     let (app, process) = match app.split_once('/') {
         Some((app, process)) => (app.to_owned(), Some(process.to_owned())),
         None => (app.to_owned(), None),
@@ -482,6 +484,19 @@ pub(crate) async fn window(
         machine: machine.to_owned(),
         target: target.clone(),
         input,
+    };
+    let element_command = |element: crate::cli::ElementArgs, act| Command::WindowElement {
+        machine: machine.to_owned(),
+        target: target.clone(),
+        pick: match element.id {
+            Some(id) => ElementPick::Id(id),
+            None => ElementPick::Match {
+                role: element.role.unwrap_or_default(),
+                name: element.name.unwrap_or_default(),
+                nth: element.nth,
+            },
+        },
+        act,
     };
     let (command, out) = match action {
         WindowCommand::Screenshot { out, max_side } => (
@@ -502,6 +517,30 @@ pub(crate) async fn window(
         ),
         WindowCommand::Type { text } => (act(DesktopInput::Type { text }), None),
         WindowCommand::Key { key } => (act(DesktopInput::Key { key }), None),
+        WindowCommand::Tree { depth, max } => (
+            Command::WindowTree {
+                machine: machine.to_owned(),
+                target: target.clone(),
+                depth,
+                max_nodes: max,
+            },
+            None,
+        ),
+        WindowCommand::Invoke { element, action } => {
+            use crate::cli::ElementActionArg as A;
+            let act = match action {
+                A::Invoke => ElementAct::Invoke,
+                A::Toggle => ElementAct::Toggle,
+                A::Select => ElementAct::Select,
+                A::Expand => ElementAct::Expand,
+                A::Collapse => ElementAct::Collapse,
+                A::Focus => ElementAct::Focus,
+            };
+            (element_command(element, act), None)
+        }
+        WindowCommand::SetValue { element, value } => {
+            (element_command(element, ElementAct::SetValue(value)), None)
+        }
     };
     let client = control_client().await.map_err(|e| {
         anyhow::anyhow!(
@@ -527,6 +566,19 @@ pub(crate) async fn window(
         }
         Reply::Acted { what } => {
             println!("{machine}: {what}");
+            Ok(())
+        }
+        Reply::WindowTree {
+            title,
+            text,
+            nodes,
+            truncated,
+        } => {
+            println!("{machine}: {title:?}, {nodes} elements");
+            print!("{text}");
+            if truncated {
+                println!("(cut at the limits; --depth and --max reach further)");
+            }
             Ok(())
         }
         Reply::Error { message } => anyhow::bail!("{message}"),

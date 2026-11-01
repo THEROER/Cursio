@@ -420,6 +420,24 @@ pub enum Command {
         target: cursio_protocol::diag::WindowTarget,
         input: cursio_protocol::diag::DesktopInput,
     },
+    /// The interface of one window of application `target` on a connected
+    /// machine, one line per element; see [`crate::desktop_window`].
+    WindowTree {
+        machine: String,
+        target: cursio_protocol::diag::WindowTarget,
+        #[serde(default)]
+        depth: Option<u16>,
+        #[serde(default)]
+        max_nodes: Option<u32>,
+    },
+    /// Do something to one element of a window's interface on a connected
+    /// machine, named by role and name or by the id a tree printed.
+    WindowElement {
+        machine: String,
+        target: cursio_protocol::diag::WindowTarget,
+        pick: cursio_protocol::diag::ElementPick,
+        act: cursio_protocol::diag::ElementAct,
+    },
 }
 
 pub(super) fn default_page() -> u32 {
@@ -566,6 +584,8 @@ impl Command {
                     | Command::AppPeers { .. }
                     | Command::WindowShot { .. }
                     | Command::WindowAct { .. }
+                    | Command::WindowTree { .. }
+                    | Command::WindowElement { .. }
             )
     }
 }
@@ -679,6 +699,13 @@ pub enum Reply {
     /// The answer to [`Command::AppPeers`].
     AppPeers {
         peers: Vec<cursio_app_protocol::AppPeer>,
+    },
+    /// The answer to [`Command::WindowTree`].
+    WindowTree {
+        title: String,
+        text: String,
+        nodes: u32,
+        truncated: bool,
     },
 }
 
