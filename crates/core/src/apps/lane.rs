@@ -115,6 +115,33 @@ impl AppsModule {
             }
             AppsWire::Delivered { id, outcome } => super::mesh::delivered(id, outcome),
             AppsWire::Present { apps } => super::mesh::set_presence(&self.peer, apps),
+            question @ (AppsWire::BlobHave { .. } | AppsWire::BlobWant { .. }) => {
+                // Off this module's thread: answering asks the running copy
+                // for a path and reads the disk, and the update lanes and
+                // messages on this link must not wait for either.
+                let (peer, app) = (self.peer.clone(), app.to_owned());
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("apps-blob".into())
+                        .spawn(move || {
+                            let holder = super::blobs::NodeHolder;
+                            let answer = super::blobs::serve(
+                                &peer,
+                                &app,
+                                question,
+                                &holder,
+                                &super::actions::allowed,
+                            );
+                            if let Some(answer) = answer {
+                                super::mesh::reply(&peer, &app, &answer);
+                            }
+                        });
+                if let Err(error) = spawned {
+                    tracing::warn!(%error, "cannot answer a question about blobs");
+                }
+            }
+            answer @ AppsWire::BlobHas { id, .. } => super::mesh::answered(id, answer),
+            answer @ AppsWire::BlobChunk { id, .. } => super::mesh::answered(id, answer),
         }
     }
 

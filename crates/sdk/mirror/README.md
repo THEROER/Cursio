@@ -35,6 +35,12 @@ schema, handler)`; the running process does them when another machine — or
 an AI agent through `cursio mcp` — calls, once that machine's person allows
 calls to it.
 
+Copies on different machines fetch files from each other by content hash
+(`App::on_blob` names the file for a hash, `Cursio::fetch` gets a list of
+them): verified before they count, resumed after a dropped link, and what no
+copy nearby holds comes back as not found, for the application to get from
+wherever else it keeps it.
+
 A machine takes an application's builds only after its person trusts the
 builder for that application, once, with a button.
 

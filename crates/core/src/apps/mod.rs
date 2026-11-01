@@ -16,6 +16,7 @@
 
 pub mod access;
 pub mod actions;
+pub mod blobs;
 pub mod builds;
 pub mod cli;
 pub mod lane;
@@ -84,6 +85,9 @@ pub struct Registered {
     /// Topics of messages from its copies elsewhere it listens to, as its
     /// latest hello said. Live state, like `actions`.
     pub topics: Vec<cursio_app_protocol::TopicName>,
+    /// It names files for its copies elsewhere to fetch (`on_blob`). Live
+    /// state, like `actions`.
+    pub blobs: bool,
 }
 
 impl Registered {
@@ -143,6 +147,7 @@ impl Registry {
                     connections: 0,
                     actions: Vec::new(),
                     topics: Vec::new(),
+                    blobs: false,
                 };
                 Some((Key::from_file_key(&key)?, registered))
             })
@@ -193,6 +198,22 @@ impl Registry {
             .collect()
     }
 
+    /// Whether `key`'s process names files for its copies elsewhere.
+    pub fn set_blobs(&mut self, key: &Key, blobs: bool) {
+        if let Some(entry) = self.apps.get_mut(key) {
+            entry.blobs = blobs;
+        }
+    }
+
+    /// The running processes of `app` that name files, the main one first.
+    pub fn blob_servers(&self, app: &AppId) -> Vec<Key> {
+        self.apps
+            .iter()
+            .filter(|(key, r)| key.app == *app && r.running() && r.blobs)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// What `key`'s process listens to, as its hello said.
     pub fn set_topics(&mut self, key: &Key, topics: Vec<cursio_app_protocol::TopicName>) {
         if let Some(entry) = self.apps.get_mut(key) {
@@ -214,6 +235,7 @@ impl Registry {
             connections: 0,
             actions: Vec::new(),
             topics: Vec::new(),
+            blobs: false,
         });
         let changed = entry.version != version || entry.logs != logs;
         entry.version = version;

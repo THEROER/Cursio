@@ -112,6 +112,49 @@ pub fn call(
     result
 }
 
+/// Ask the running copy of `key`'s process which file holds blob `hash`,
+/// waiting up to `wait`. `None` when it has none, does not answer, or is not
+/// running. Blocks, like [`call`].
+pub fn blob_path(
+    key: &super::Key,
+    hash: &cursio_app_protocol::BlobHash,
+    wait: Duration,
+) -> Option<PathBuf> {
+    let (token, tx) = pushers().get(key).and_then(|c| c.first().cloned())?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 62);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (answer_tx, answer) = std::sync::mpsc::channel();
+    pending().insert(id, (token, answer_tx));
+    let asked = tx.send(NodeMsg::BlobPath {
+        id,
+        hash: hash.clone(),
+    });
+    let result = match asked {
+        Ok(()) => answer.recv_timeout(wait).ok(),
+        Err(_) => None,
+    };
+    pending().remove(&id);
+    match result {
+        Some(Ok(serde_json::Value::String(path))) => Some(PathBuf::from(path)),
+        _ => None,
+    }
+}
+
+/// An answer `result` to call or question `id` came on connection `token`:
+/// hand it to whoever waits, if it is that connection's to answer.
+fn resolve(id: u64, token: u64, result: CallResult) {
+    let waiting = pending().remove(&id);
+    match waiting {
+        Some((carrier, answer)) if carrier == token => {
+            let _ = answer.send(result);
+        }
+        Some(other) => {
+            pending().insert(id, other);
+        }
+        None => tracing::debug!(id, "an answer no longer waited for"),
+    }
+}
+
 /// Hand a message from `peer`'s copy (its `from_process`) about `topic` to
 /// every running copy of the processes `keys`; how many took it.
 pub fn deliver(
@@ -136,6 +179,83 @@ pub fn deliver(
         }
     }
     told
+}
+
+/// Fetch `entries` of `app` from its copies on the connected machines into
+/// `dest`, telling the asking copy how far each blob is, and answer what
+/// became of them.
+async fn fetch_for(
+    app: &cursio_app_protocol::AppId,
+    id: u64,
+    entries: Vec<cursio_app_protocol::BlobEntry>,
+    dest: PathBuf,
+    out: tokio::sync::mpsc::UnboundedSender<NodeMsg>,
+) -> NodeMsg {
+    use cursio_app_protocol::{BlobFailure, MAX_FETCH};
+    let refuse_all =
+        |entries: Vec<cursio_app_protocol::BlobEntry>, reason: String| NodeMsg::Fetched {
+            id,
+            fetched: Vec::new(),
+            not_found: Vec::new(),
+            failed: entries
+                .into_iter()
+                .map(|e| BlobFailure {
+                    hash: e.hash,
+                    reason: reason.clone(),
+                })
+                .collect(),
+        };
+    if !dest.is_absolute() {
+        let why = format!("{} is not an absolute directory", dest.display());
+        return refuse_all(entries, why);
+    }
+    if entries.len() > MAX_FETCH {
+        let why = format!("one fetch names at most {MAX_FETCH} blobs");
+        return refuse_all(entries, why);
+    }
+    let peers: Vec<String> = super::mesh::peers(app)
+        .into_iter()
+        .filter(|p| p.running)
+        .map(|p| p.machine)
+        .collect();
+    // At most a few progress lines a second per blob, and always the last.
+    let said = Arc::new(Mutex::new(std::collections::HashMap::<
+        cursio_app_protocol::BlobHash,
+        std::time::Instant,
+    >::new()));
+    let progress = Arc::new(
+        move |hash: &cursio_app_protocol::BlobHash, received: u64, size: u64| {
+            let now = std::time::Instant::now();
+            let mut said = said.lock().unwrap_or_else(|p| p.into_inner());
+            let due = said
+                .get(hash)
+                .is_none_or(|at| now.duration_since(*at) >= Duration::from_millis(250));
+            if due || received == size {
+                said.insert(hash.clone(), now);
+                let _ = out.send(NodeMsg::Fetching {
+                    id,
+                    hash: hash.clone(),
+                    received,
+                    size,
+                });
+            }
+        },
+    );
+    let report = super::blobs::fetch(
+        Arc::new(super::mesh::MeshPeers),
+        peers,
+        app,
+        entries,
+        &dest,
+        progress,
+    )
+    .await;
+    NodeMsg::Fetched {
+        id,
+        fetched: report.fetched,
+        not_found: report.not_found,
+        failed: report.failed,
+    }
 }
 
 /// `app`, or `app/process`, as a person reads it.
@@ -328,7 +448,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
     let Some(first) = first else {
         return Ok(());
     };
-    let (app, process, version, pid, logs, protocol, actions, topics) =
+    let (app, process, version, pid, logs, protocol, actions, topics, blobs) =
         match decode_line::<ClientMsg>(&first) {
             Ok(ClientMsg::Hello {
                 protocol,
@@ -339,7 +459,10 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                 process,
                 actions,
                 topics,
-            }) => (app, process, version, pid, logs, protocol, actions, topics),
+                blobs,
+            }) => (
+                app, process, version, pid, logs, protocol, actions, topics, blobs,
+            ),
             Ok(_) => return refuse(&mut write, "the first message must be hello".into()).await,
             Err(error) => return refuse(&mut write, error.to_string()).await,
         };
@@ -379,6 +502,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
         registry.connected(&key, version.clone(), pid, logs.clone());
         registry.set_actions(&key, actions);
         registry.set_topics(&key, topics);
+        registry.set_blobs(&key, blobs);
     }
     tracing::info!(%app, process = ?key.process, %version, pid, logs = ?logs.as_ref().map(|l| l.dir.join(&l.file)), "application connected");
     let welcome = NodeMsg::Welcome {
@@ -422,24 +546,26 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                     let feature = "hello after hello".to_owned();
                     let _ = out.send(NodeMsg::Unsupported { feature });
                 }
+                // Only the connection a call or question went out on answers it.
                 Ok(ClientMsg::Answer { id, ok, error }) => {
-                    let waiting = pending().remove(&id);
-                    match waiting {
-                        // Only the connection a call went out on answers it.
-                        Some((carrier, answer)) if carrier == token => {
-                            let result = match error {
-                                Some(error) => Err(error),
-                                None => Ok(ok.unwrap_or(serde_json::Value::Null)),
-                            };
-                            let _ = answer.send(result);
-                        }
-                        Some(other) => {
-                            pending().insert(id, other);
-                        }
-                        None => {
-                            tracing::debug!(%app, id, "an answer to a call no longer waited for");
-                        }
-                    }
+                    let result = match error {
+                        Some(error) => Err(error),
+                        None => Ok(ok.unwrap_or(serde_json::Value::Null)),
+                    };
+                    resolve(id, token, result);
+                }
+                Ok(ClientMsg::BlobPath { id, path }) => {
+                    let path = path
+                        .map(|p| serde_json::Value::String(p.to_string_lossy().into_owned()))
+                        .unwrap_or(serde_json::Value::Null);
+                    resolve(id, token, Ok(path));
+                }
+                Ok(ClientMsg::Fetch { id, entries, dest }) => {
+                    let (app, out) = (app.clone(), out.clone());
+                    tokio::spawn(async move {
+                        let answer = fetch_for(&app, id, entries, dest, out.clone()).await;
+                        let _ = out.send(answer);
+                    });
                 }
                 Ok(ClientMsg::Send {
                     id,
@@ -557,6 +683,7 @@ mod tests {
             process: None,
             actions: Vec::new(),
             topics: Vec::new(),
+            blobs: false,
         })
     }
 
@@ -919,6 +1046,73 @@ mod tests {
             );
             crate::diagnostics::clear("app.e2e-actions.actions");
             drop(app);
+        })
+        .await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_application_names_its_files_and_a_fetch_with_no_copy_around_finds_none() {
+        let dir = scratch("blobs");
+        let path = dir.join("apps.sock");
+        let registry = super::super::registry().clone();
+        let server = tokio::spawn(serve(path.clone(), "Nocturne".into(), registry.clone()));
+        let held = cursio_app_protocol::BlobHash::new(
+            cursio_app_protocol::BlobAlgo::Sha1,
+            &"c".repeat(40),
+        )
+        .unwrap();
+        let file = dir.join("mod.jar");
+        std::fs::write(&file, b"jar").unwrap();
+        bounded(async {
+            let (named, wanted) = (file.clone(), held.clone());
+            let app = cursio_sdk::App::new("e2e-blobs")
+                .endpoint(&path)
+                .on_blob(move |hash| (*hash == wanted).then(|| named.clone()))
+                .start()
+                .unwrap();
+            let key = super::super::Key::main(AppId::parse("e2e-blobs").unwrap());
+            while !lock(&registry).get(&key).is_some_and(|r| r.running()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                lock(&registry).blob_servers(&key.app),
+                vec![key.clone()],
+                "its hello said it serves files"
+            );
+
+            let other = cursio_app_protocol::BlobHash::new(
+                cursio_app_protocol::BlobAlgo::Sha1,
+                &"d".repeat(40),
+            )
+            .unwrap();
+            let (found, missing) = {
+                let (key, held, other) = (key.clone(), held.clone(), other.clone());
+                tokio::task::spawn_blocking(move || {
+                    let wait = Duration::from_secs(5);
+                    (blob_path(&key, &held, wait), blob_path(&key, &other, wait))
+                })
+                .await
+                .unwrap()
+            };
+            assert_eq!(found, Some(file.clone()));
+            assert_eq!(missing, None);
+
+            let entry = cursio_app_protocol::BlobEntry {
+                path: "mods/mod.jar".into(),
+                hash: other,
+                size: 3,
+            };
+            let dest = dir.join("fetched");
+            let report = tokio::task::spawn_blocking(move || {
+                app.fetch(std::slice::from_ref(&entry), &dest, |_| {})
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(report.fetched.is_empty());
+            assert_eq!(report.not_found.len(), 1, "no copy elsewhere holds it");
         })
         .await;
         server.abort();

@@ -67,6 +67,129 @@ pub const MAX_SCHEMA: usize = 16 * 1024;
 /// Most actions one process declares.
 pub const MAX_ACTIONS: usize = 64;
 
+/// Largest single blob a copy fetches from another: a mod, a world region,
+/// an archive. It streams to disk; nothing holds it whole in memory.
+pub const MAX_BLOB: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Most blobs one [`ClientMsg::Fetch`] names — a modpack's whole list.
+pub const MAX_FETCH: usize = 10_000;
+
+/// The hash function a blob is named by. Sha1 because Modrinth and
+/// CurseForge manifests carry it, and an application should be able to ask
+/// for a file by the hash its own manifest already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlobAlgo {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+impl BlobAlgo {
+    /// Hex digits of a digest of this kind.
+    pub fn hex_len(self) -> usize {
+        match self {
+            BlobAlgo::Sha1 => 40,
+            BlobAlgo::Sha256 => 64,
+            BlobAlgo::Sha512 => 128,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            BlobAlgo::Sha1 => "sha1",
+            BlobAlgo::Sha256 => "sha256",
+            BlobAlgo::Sha512 => "sha512",
+        }
+    }
+}
+
+/// A blob's content hash, written `sha1:<hex>`: what a copy asks its peers
+/// for, and what the received bytes must hash to before they count.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct BlobHash {
+    algo: BlobAlgo,
+    hex: String,
+}
+
+impl BlobHash {
+    /// `hex` (any case) as a digest of `algo`.
+    pub fn new(algo: BlobAlgo, hex: &str) -> Result<Self, Error> {
+        let hex = hex.to_ascii_lowercase();
+        let well_formed = hex.len() == algo.hex_len() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+        match well_formed {
+            true => Ok(BlobHash { algo, hex }),
+            false => Err(Error::BadBlobHash(format!("{}:{hex}", algo.name()))),
+        }
+    }
+
+    /// `sha1:<hex>`, `sha256:<hex>` or `sha512:<hex>`.
+    pub fn parse(text: &str) -> Result<Self, Error> {
+        let bad = || Error::BadBlobHash(text.to_owned());
+        let (algo, hex) = text.split_once(':').ok_or_else(bad)?;
+        let algo = match algo {
+            "sha1" => BlobAlgo::Sha1,
+            "sha256" => BlobAlgo::Sha256,
+            "sha512" => BlobAlgo::Sha512,
+            _ => return Err(bad()),
+        };
+        BlobHash::new(algo, hex).map_err(|_| bad())
+    }
+
+    pub fn algo(&self) -> BlobAlgo {
+        self.algo
+    }
+
+    /// The digest, lowercase hex.
+    pub fn hex(&self) -> &str {
+        &self.hex
+    }
+
+    /// The file a fetched blob is kept under in its destination directory.
+    /// Its own name, not the caller's path: two entries with one content are
+    /// one file, and a name off the wire never becomes a path.
+    pub fn file_name(&self) -> String {
+        format!("{}-{}", self.algo.name(), self.hex)
+    }
+}
+
+impl fmt::Display for BlobHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.algo.name(), self.hex)
+    }
+}
+
+impl TryFrom<String> for BlobHash {
+    type Error = Error;
+    fn try_from(text: String) -> Result<Self, Error> {
+        BlobHash::parse(&text)
+    }
+}
+
+impl From<BlobHash> for String {
+    fn from(hash: BlobHash) -> String {
+        hash.to_string()
+    }
+}
+
+/// One file an application wants: its content hash and size, and the path
+/// the application knows it by — carried back in the report for its own
+/// bookkeeping, never used as a place to write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobEntry {
+    pub path: String,
+    pub hash: BlobHash,
+    pub size: u64,
+}
+
+/// A blob that could not be fetched, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobFailure {
+    pub hash: BlobHash,
+    pub reason: String,
+}
+
 /// The shape every name here takes — id, process, action: lowercase ASCII
 /// letters, digits and `-`, not starting with `-`, at most [`MAX_APP_ID`].
 fn well_formed_name(name: &str) -> bool {
@@ -419,6 +542,10 @@ pub enum ClientMsg {
         /// process listens to. Left out when empty.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         topics: Vec<TopicName>,
+        /// This process answers [`NodeMsg::BlobPath`]: its copies on other
+        /// machines may fetch files from it. Left out when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        blobs: bool,
     },
     Health {
         state: HealthState,
@@ -446,6 +573,22 @@ pub enum ClientMsg {
     /// Which machines this application is registered on; answered by
     /// [`NodeMsg::Peers`] with the same `id`.
     Peers { id: u64 },
+    /// The answer to [`NodeMsg::BlobPath`] `id`: the file holding that blob,
+    /// or nothing when this process does not have it.
+    BlobPath {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
+    /// Fetch `entries` from this application's copies on other machines into
+    /// the absolute directory `dest`, each under [`BlobHash::file_name`];
+    /// progress comes as [`NodeMsg::Fetching`], the outcome as
+    /// [`NodeMsg::Fetched`], both with the same `id`.
+    Fetch {
+        id: u64,
+        entries: Vec<BlobEntry>,
+        dest: PathBuf,
+    },
 }
 
 impl ClientMsg {
@@ -508,6 +651,25 @@ pub enum NodeMsg {
         topic: TopicName,
         payload: String,
     },
+    /// Which file holds blob `hash`, if this process has it; answer with
+    /// [`ClientMsg::BlobPath`] carrying the same `id`. The node reads only a
+    /// path the application named here.
+    BlobPath { id: u64, hash: BlobHash },
+    /// Fetch `id` has `received` of blob `hash`'s `size` bytes.
+    Fetching {
+        id: u64,
+        hash: BlobHash,
+        received: u64,
+        size: u64,
+    },
+    /// What became of [`ClientMsg::Fetch`] `id`: blobs now in its
+    /// destination, blobs no connected copy has, and blobs that failed.
+    Fetched {
+        id: u64,
+        fetched: Vec<BlobHash>,
+        not_found: Vec<BlobHash>,
+        failed: Vec<BlobFailure>,
+    },
 }
 
 /// Something wrong with a message or a name.
@@ -519,6 +681,7 @@ pub enum Error {
     BadActionName(String),
     BadAction(String),
     BadTopicName(String),
+    BadBlobHash(String),
     /// A message's payload of this many bytes is over [`MAX_PAYLOAD`].
     TooLarge(usize),
     BadLogSpec(String),
@@ -546,6 +709,10 @@ impl fmt::Display for Error {
             Error::BadTopicName(name) => write!(
                 f,
                 "{name:?} is not a topic; use up to {MAX_APP_ID} lowercase letters, digits and `-`"
+            ),
+            Error::BadBlobHash(text) => write!(
+                f,
+                "{text:?} is not a blob hash; write sha1:, sha256: or sha512: and the digest in hex"
             ),
             Error::TooLarge(bytes) => write!(
                 f,
@@ -649,6 +816,67 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_is_named_by_its_algorithm_and_digest_and_nothing_else() {
+        let sha1 = "a".repeat(40);
+        let hash = BlobHash::parse(&format!("sha1:{}", sha1.to_uppercase())).unwrap();
+        assert_eq!(hash.to_string(), format!("sha1:{sha1}"), "kept lowercase");
+        assert_eq!(hash.file_name(), format!("sha1-{sha1}"));
+        assert!(BlobHash::parse(&format!("sha1:{}", "a".repeat(39))).is_err());
+        assert!(BlobHash::parse(&format!("md5:{}", "a".repeat(32))).is_err());
+        assert!(BlobHash::parse(&format!("sha256:{}", "g".repeat(64))).is_err());
+        assert!(BlobHash::parse("sha1:../../etc/passwd").is_err());
+        assert!(BlobHash::new(BlobAlgo::Sha512, &"0".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn blob_messages_have_the_bytes_both_sides_read() {
+        let hash = BlobHash::new(BlobAlgo::Sha1, &"b".repeat(40)).unwrap();
+        let fetch = ClientMsg::Fetch {
+            id: 3,
+            entries: vec![BlobEntry {
+                path: "mods/a.jar".into(),
+                hash: hash.clone(),
+                size: 10,
+            }],
+            dest: PathBuf::from("/tmp/blobs"),
+        };
+        let text = line(&fetch);
+        assert_eq!(
+            text,
+            format!(
+                "{{\"msg\":\"fetch\",\"id\":3,\"entries\":[{{\"path\":\"mods/a.jar\",\"hash\":\"sha1:{}\",\"size\":10}}],\"dest\":\"/tmp/blobs\"}}\n",
+                "b".repeat(40)
+            )
+        );
+        assert_eq!(
+            decode_line::<ClientMsg>(text.trim_end().as_bytes()).unwrap(),
+            fetch
+        );
+        assert_eq!(
+            line(&ClientMsg::BlobPath { id: 4, path: None }),
+            "{\"msg\":\"blob_path\",\"id\":4}\n"
+        );
+        let fetched = NodeMsg::Fetched {
+            id: 3,
+            fetched: vec![hash.clone()],
+            not_found: Vec::new(),
+            failed: vec![BlobFailure {
+                hash,
+                reason: "corrupt".into(),
+            }],
+        };
+        let text = line(&fetched);
+        assert_eq!(
+            decode_line::<NodeMsg>(text.trim_end().as_bytes()).unwrap(),
+            fetched
+        );
+        assert!(decode_line::<ClientMsg>(
+            br#"{"msg":"fetch","id":1,"entries":[{"path":"x","hash":"sha1:nope","size":1}],"dest":"/d"}"#
+        )
+        .is_err(), "a malformed hash is refused at the door");
+    }
+
+    #[test]
     fn hello_has_the_bytes_old_nodes_read() {
         let hello = ClientMsg::Hello {
             protocol: 1,
@@ -662,6 +890,7 @@ mod tests {
             process: None,
             actions: Vec::new(),
             topics: Vec::new(),
+            blobs: false,
         };
         let text = line(&hello);
         assert_eq!(
@@ -685,6 +914,7 @@ mod tests {
             process: None,
             actions: Vec::new(),
             topics: Vec::new(),
+            blobs: false,
         };
         assert_eq!(
             line(&hello),
@@ -703,6 +933,7 @@ mod tests {
             process: Some(ProcessName::parse("daemon").unwrap()),
             actions: Vec::new(),
             topics: Vec::new(),
+            blobs: false,
         };
         let text = line(&hello);
         assert_eq!(
@@ -731,6 +962,7 @@ mod tests {
             process: None,
             actions: Vec::new(),
             topics: vec![TopicName::parse("instances").unwrap()],
+            blobs: false,
         };
         assert_eq!(
             line(&hello),
@@ -796,6 +1028,7 @@ mod tests {
                 schema: serde_json::json!({"type": "object"}),
             }],
             topics: Vec::new(),
+            blobs: false,
         };
         let text = line(&hello);
         assert_eq!(

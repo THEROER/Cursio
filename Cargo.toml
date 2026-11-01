@@ -33,7 +33,7 @@ repository = "https://github.com/THEROER/cursio"
 # Internal crates
 cursio-queue = { path = "crates/queue" }
 cursio-protocol = { path = "crates/protocol" }
-cursio-app-protocol = { path = "crates/app-protocol", version = "0.3.1" }
+cursio-app-protocol = { path = "crates/app-protocol", version = "0.4.0" }
 cursio-sdk = { path = "crates/sdk" }
 cursio-transport = { path = "crates/transport" }
 cursio-bluetooth = { path = "crates/bluetooth" }
@@ -94,6 +94,9 @@ snow = "0.9"
 spake2 = "0.4"
 rand = "0.8"
 sha2 = "0.10"
+# Applications name the files they share by the hash their manifests carry,
+# and Modrinth's and CurseForge's carry sha1.
+sha1 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Native build helpers

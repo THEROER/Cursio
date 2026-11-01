@@ -36,7 +36,8 @@ use cursio_app_protocol::{
     MAX_LINE, MAX_PAYLOAD, MAX_TOPICS, PROTOCOL,
 };
 pub use cursio_app_protocol::{
-    ActionName, ActionSpec, AppId, HealthState, LogSpec, ProcessName, TopicName,
+    ActionName, ActionSpec, AppId, BlobAlgo, BlobEntry, BlobHash, HealthState, LogSpec,
+    ProcessName, TopicName,
 };
 /// The JSON an action takes and answers.
 pub use serde_json::{json, Value};
@@ -125,6 +126,10 @@ pub type SentTo = (String, Result<(), Error>);
 const SEND_WAIT: Duration = Duration::from_secs(35);
 /// How long [`Cursio::peers`] waits; the node answers from what it holds.
 const PEERS_WAIT: Duration = Duration::from_secs(5);
+/// How long a fetch may go with no word from the node — progress or the
+/// end — before it is given up: a node asking a slow machine answers within
+/// half a minute, and progress comes every quarter second while bytes move.
+pub const FETCH_QUIET: Duration = Duration::from_secs(120);
 
 /// A request to the node that is answered by id, and where its answer goes.
 struct Request {
@@ -145,6 +150,28 @@ pub struct Build {
 }
 
 type OnUpdate = Arc<dyn Fn(Build) + Send + Sync>;
+
+/// Which file holds a blob, as the application names it.
+type OnBlob = Arc<dyn Fn(&BlobHash) -> Option<PathBuf> + Send + Sync>;
+
+/// How far one blob of a [`Cursio::fetch`] is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    pub hash: BlobHash,
+    pub received: u64,
+    pub size: u64,
+}
+
+/// What became of a [`Cursio::fetch`], by the entries it was given: each
+/// fetched one is in the destination under [`BlobHash::file_name`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchReport {
+    pub fetched: Vec<BlobEntry>,
+    /// No connected copy holds these; where else to get them is the
+    /// application's to know.
+    pub not_found: Vec<BlobEntry>,
+    pub failed: Vec<(BlobEntry, String)>,
+}
 
 /// What an action does with its arguments: a JSON answer, or why not.
 type Handler = Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
@@ -167,6 +194,7 @@ struct Hooks {
     on_update: Option<OnUpdate>,
     actions: Arc<BTreeMap<ActionName, Handler>>,
     messages: Arc<BTreeMap<TopicName, OnMessage>>,
+    on_blob: Option<OnBlob>,
 }
 
 /// An application about to introduce itself to the node.
@@ -184,6 +212,7 @@ pub struct App {
         String,
         OnMessage,
     )>,
+    on_blob: Option<OnBlob>,
 }
 
 /// In a debug build, a name that cannot be declared panics where it is
@@ -218,7 +247,21 @@ impl App {
             process: None,
             actions: Vec::new(),
             topics: Vec::new(),
+            on_blob: None,
         }
+    }
+
+    /// Let this application's copies on other machines fetch files from
+    /// this one by content hash ([`Cursio::fetch`] there): `handler` names
+    /// the file holding a hash, or `None`. The node reads only a file named
+    /// here, and gives it only to a machine this machine's person lets drive
+    /// the application. Runs off the connection's thread.
+    pub fn on_blob(
+        mut self,
+        handler: impl Fn(&BlobHash) -> Option<PathBuf> + Send + Sync + 'static,
+    ) -> Self {
+        self.on_blob = Some(Arc::new(handler));
+        self
     }
 
     /// Hear messages about `topic` from copies of this application on other
@@ -338,6 +381,7 @@ impl App {
             on_update: self.on_update,
             actions: Arc::new(handlers),
             messages: Arc::new(listeners),
+            on_blob: self.on_blob.clone(),
         };
         let hello = ClientMsg::Hello {
             protocol: PROTOCOL,
@@ -348,6 +392,7 @@ impl App {
             process,
             actions: specs,
             topics,
+            blobs: self.on_blob.is_some(),
         };
         let endpoint = self.endpoint.unwrap_or_else(cursio_app_protocol::endpoint);
         let shared = Arc::new(Mutex::new(Link::Connecting));
@@ -739,6 +784,105 @@ impl Cursio {
     }
 }
 
+impl Cursio {
+    /// Fetch `entries` from this application's copies on the connected
+    /// machines ([`App::on_blob`] there) into the absolute directory `dest`,
+    /// each under [`BlobHash::file_name`], calling `progress` as bytes
+    /// arrive. A blob counts only once its bytes hash to what was asked; a
+    /// fetch cut short keeps what arrived and goes on from there next time.
+    /// What no connected copy has comes back in
+    /// [`FetchReport::not_found`].
+    ///
+    /// Blocks until every blob is done: call it off an async executor's
+    /// worker. Fails only when the node goes away or stops saying anything
+    /// for [`FETCH_QUIET`].
+    pub fn fetch(
+        &self,
+        entries: &[BlobEntry],
+        dest: &Path,
+        mut progress: impl FnMut(Progress),
+    ) -> Result<FetchReport, Error> {
+        self.connected()?;
+        let id = next_id();
+        let (reply, answers) = std::sync::mpsc::channel();
+        let msg = ClientMsg::Fetch {
+            id,
+            entries: entries.to_vec(),
+            dest: dest.to_path_buf(),
+        };
+        self.requests
+            .send(Request { msg, id, reply })
+            .map_err(|_| Error::NotRunning)?;
+        loop {
+            let answer = answers.recv_timeout(FETCH_QUIET).map_err(|e| match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => Error::Send(format!(
+                    "the node said nothing about the fetch for {} s",
+                    FETCH_QUIET.as_secs()
+                )),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => Error::NotRunning,
+            })?;
+            match answer {
+                NodeMsg::Fetching {
+                    hash,
+                    received,
+                    size,
+                    ..
+                } => progress(Progress {
+                    hash,
+                    received,
+                    size,
+                }),
+                NodeMsg::Fetched {
+                    fetched,
+                    not_found,
+                    failed,
+                    ..
+                } => return Ok(report_of(entries, &fetched, &not_found, &failed)),
+                other => return Err(Error::Send(format!("the node answered {other:?}"))),
+            }
+        }
+    }
+}
+
+/// The node's answer, by hash, as the caller's entries.
+fn report_of(
+    entries: &[BlobEntry],
+    fetched: &[BlobHash],
+    not_found: &[BlobHash],
+    failed: &[cursio_app_protocol::BlobFailure],
+) -> FetchReport {
+    let mut report = FetchReport::default();
+    for entry in entries {
+        if fetched.contains(&entry.hash) {
+            report.fetched.push(entry.clone());
+        } else if let Some(failure) = failed.iter().find(|f| f.hash == entry.hash) {
+            report.failed.push((entry.clone(), failure.reason.clone()));
+        } else if not_found.contains(&entry.hash) {
+            report.not_found.push(entry.clone());
+        } else {
+            let why = "the node said nothing of it".to_owned();
+            report.failed.push((entry.clone(), why));
+        }
+    }
+    report
+}
+
+/// Name the file for `hash` off the connection's thread; a handler that
+/// panics names none.
+fn name_blob(hooks: &Hooks, id: u64, hash: BlobHash, answers: &mpsc::UnboundedSender<ClientMsg>) {
+    let Some(handler) = hooks.on_blob.clone() else {
+        let _ = answers.send(ClientMsg::BlobPath { id, path: None });
+        return;
+    };
+    let answers = answers.clone();
+    tokio::task::spawn_blocking(move || {
+        let path = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&hash)))
+            .ok()
+            .flatten();
+        let _ = answers.send(ClientMsg::BlobPath { id, path });
+    });
+}
+
 fn next_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -942,10 +1086,21 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
                     Ok(NodeMsg::Call { id, action, args }) => {
                         dispatch(hooks, id, action, args, &answers_tx);
                     }
-                    Ok(answer @ (NodeMsg::Sent { id, .. } | NodeMsg::Peers { id, .. })) => {
+                    Ok(answer @ (NodeMsg::Sent { id, .. }
+                        | NodeMsg::Peers { id, .. }
+                        | NodeMsg::Fetched { id, .. })) => {
                         if let Some(reply) = waiting.remove(&id) {
                             let _ = reply.send(answer);
                         }
+                    }
+                    // Progress: the fetch goes on waiting for its outcome.
+                    Ok(progress @ NodeMsg::Fetching { id, .. }) => {
+                        if let Some(reply) = waiting.get(&id) {
+                            let _ = reply.send(progress);
+                        }
+                    }
+                    Ok(NodeMsg::BlobPath { id, hash }) => {
+                        name_blob(hooks, id, hash, &answers_tx);
                     }
                     Ok(NodeMsg::Message { from, from_process, topic, payload }) => {
                         hear(hooks, from, from_process, topic, &payload);
@@ -1238,5 +1393,41 @@ mod tests {
         eventually("refused", || {
             app.set_health(HealthState::Ok, None) == Err(Error::Refused("not today".into()))
         });
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    fn entry(path: &str, digit: char) -> BlobEntry {
+        BlobEntry {
+            path: path.into(),
+            hash: BlobHash::new(BlobAlgo::Sha1, &digit.to_string().repeat(40)).unwrap(),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn the_report_speaks_of_the_callers_own_entries_two_paths_one_content() {
+        let (a, b, c, d) = (
+            entry("mods/a.jar", 'a'),
+            entry("mods/copy-of-a.jar", 'a'),
+            entry("mods/c.jar", 'c'),
+            entry("mods/d.jar", 'd'),
+        );
+        let failed = vec![cursio_app_protocol::BlobFailure {
+            hash: c.hash.clone(),
+            reason: "corrupt".into(),
+        }];
+        let report = report_of(
+            &[a.clone(), b.clone(), c.clone(), d.clone()],
+            std::slice::from_ref(&a.hash),
+            std::slice::from_ref(&d.hash),
+            &failed,
+        );
+        assert_eq!(report.fetched, vec![a, b], "one file serves both paths");
+        assert_eq!(report.failed, vec![(c, "corrupt".to_owned())]);
+        assert_eq!(report.not_found, vec![d]);
     }
 }

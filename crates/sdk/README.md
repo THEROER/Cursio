@@ -52,6 +52,31 @@ Handlers run off the connection's thread; a panic answers that it happened
 and later calls go on. The machine's person allows calls to an application
 once, with a button.
 
+## Files between copies
+
+Copies of an application on different machines fetch files from each other
+by content hash — the hash a modpack manifest already carries:
+
+```rust
+use cursio_sdk::{App, BlobAlgo, BlobEntry, BlobHash};
+
+let cursio = App::new("my-app")
+    .on_blob(|hash| library.path_of(hash)) // the file holding it, or None
+    .start()?;
+let wanted = vec![BlobEntry {
+    path: "mods/sodium.jar".into(),
+    hash: BlobHash::new(BlobAlgo::Sha1, "…40 hex digits…")?,
+    size: 1_234_567,
+}];
+let report = cursio.fetch(&wanted, &cache_dir, |p| println!("{}/{}", p.received, p.size))?;
+// report.fetched — in cache_dir under BlobHash::file_name()
+// report.not_found — no copy nearby has it: get it from your CDN
+```
+
+Bytes count only once they hash right; an interrupted fetch resumes. The node
+reads only files `on_blob` names, and gives them only to machines whose
+person lets the asker drive the application.
+
 Names of actions, topics and the process are lowercase letters, digits and
 `-` (`game-log`, not `game_log`). A debug build panics at a bad one where it
 is written; a release build leaves that one out, registers everything else,

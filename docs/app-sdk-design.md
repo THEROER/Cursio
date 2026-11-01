@@ -315,6 +315,44 @@ cursio apps peers leavepulse
   nothing listens for.
 - MCP: `apps_peers` (reads), `apps_send` (destructive).
 
+### Files by their content (built, SDK 0.4)
+
+Messages stop at 512 KiB; a modpack's mods and a world do not. Copies of an
+application move files by **content hash**, the way its own manifest already
+names them (Modrinth and CurseForge carry sha1; sha256 and sha512 work too):
+
+```rust
+let cursio = cursio_sdk::App::new("leavepulse")
+    .on_blob(|hash| library.path_of(hash))   // the file holding it, or None
+    .start()?;
+let report = cursio.fetch(&manifest, &cache_dir, |p| bar.set(p.received, p.size))?;
+// report.fetched / report.not_found (get those from the CDN) / report.failed
+```
+
+- **The node reads only what the application names.** A peer asks by hash;
+  the node asks its running copy (`NodeMsg::BlobPath`) which file holds it and
+  reads that one — never a path off the wire. The answer is remembered for the
+  chunks that follow.
+- **Who holds what.** The fetching node asks every connected machine where the
+  application runs which hashes it holds (`AppsWire::BlobHave`), then takes
+  each blob from one holder, spreading the bytes across them, machines in
+  parallel.
+- **Chunks, a window, the bulk class.** 256 KiB per `BlobWant`, at most eight
+  outstanding per blob, on the bulk class: a LAN link stays full and a pointer
+  moving meanwhile is not held up. Written to disk as they come; nothing holds
+  a blob whole in memory (up to 4 GiB each).
+- **Nothing counts until it hashes right.** Chunks land in
+  `<dest>/<algo>-<hex>.partial`; the whole file is hashed, then renamed to
+  `<dest>/<algo>-<hex>` (`BlobHash::file_name`). A mismatch deletes it. A
+  partial file left by a dropped link is resumed from its last whole chunk.
+  A blob already in place is checked, not fetched.
+- **Not found is an answer.** What no connected copy holds comes back in
+  `FetchReport::not_found`; where else to get it — a CDN, the cloud — is the
+  application's to know, so Cursio never decides it.
+- **Consent is the actions' one** (`[apps.<id>] actions`), on the serving
+  machine: files leave only to a machine its person lets drive the
+  application, as messages arrive only from one.
+
 ### 4. State of the desk
 
 `peers()` and `on_peers` give what `NodeStatus` already carries — online,

@@ -86,6 +86,8 @@ base64.workspace = true
 zstd = "0.13"
 # Build manifests: every installed file is checked against its sha256.
 sha2.workspace = true
+# Blobs between copies of an application, named by their manifests' sha1.
+sha1.workspace = true
 # Builds arriving from the mesh are signed; a peer being paired is not enough
 # to replace the program.
 ed25519-dalek.workspace = true

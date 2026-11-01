@@ -46,6 +46,8 @@ struct Mesh {
     presence: BTreeMap<String, Vec<AppPresence>>,
     /// Messages sent and not yet answered, by id.
     pending: HashMap<u64, oneshot::Sender<Delivery>>,
+    /// Questions about blobs sent and not yet answered, by id.
+    asked: HashMap<u64, oneshot::Sender<AppsWire>>,
 }
 
 fn mesh() -> MutexGuard<'static, Mesh> {
@@ -156,6 +158,67 @@ pub async fn send(
             SendFailure::Failed,
             format!("{to} did not answer within {} s", SEND_WAIT.as_secs()),
         )),
+    }
+}
+
+/// The id a question about blobs carries, which its answer carries back.
+fn question_id(wire: &AppsWire) -> Option<u64> {
+    match wire {
+        AppsWire::BlobHave { id, .. } | AppsWire::BlobWant { id, .. } => Some(*id),
+        _ => None,
+    }
+}
+
+/// Send `wire` about `app` to `to` as is: an answer to its question.
+pub fn reply(to: &str, app: &str, wire: &AppsWire) {
+    if let Some(link) = mesh().links.get(to) {
+        let _ = link.tx.send(AppsMsg::wire(app, wire));
+    }
+}
+
+/// Ask `to` a question about `app`'s blobs and wait up to `wait` for its
+/// answer.
+pub async fn ask(
+    to: &str,
+    app: &AppId,
+    wire: AppsWire,
+    wait: Duration,
+) -> Result<AppsWire, String> {
+    let id = question_id(&wire).ok_or("not a question about blobs")?;
+    let (answer_tx, answer) = oneshot::channel();
+    {
+        let mut mesh = mesh();
+        let Some(link) = mesh.links.get(to) else {
+            return Err(format!("{to} is not connected to this machine"));
+        };
+        if link.tx.send(AppsMsg::wire(app.as_str(), &wire)).is_err() {
+            return Err(format!("the link to {to} closed as it was asked"));
+        }
+        mesh.asked.insert(id, answer_tx);
+    }
+    let outcome = tokio::time::timeout(wait, answer).await;
+    mesh().asked.remove(&id);
+    match outcome {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(_)) => Err(format!("the link to {to} closed before it answered")),
+        Err(_) => Err(format!("{to} did not answer within {} s", wait.as_secs())),
+    }
+}
+
+/// An answer `id` to a question about blobs arrived.
+pub fn answered(id: u64, wire: AppsWire) {
+    if let Some(answer) = mesh().asked.remove(&id) {
+        let _ = answer.send(wire);
+    }
+}
+
+/// The mesh, as the fetching side of [`super::blobs`] reaches it.
+pub struct MeshPeers;
+
+#[async_trait::async_trait]
+impl super::blobs::Peers for MeshPeers {
+    async fn ask(&self, peer: &str, app: &AppId, wire: AppsWire) -> Result<AppsWire, String> {
+        ask(peer, app, wire, super::blobs::ASK_WAIT).await
     }
 }
 

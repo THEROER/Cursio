@@ -64,6 +64,32 @@ pub enum AppsWire {
     /// Every application registered on the sending machine now, resent whole
     /// whenever that changes.
     Present { apps: Vec<AppPresence> },
+    /// Which of these blobs (`sha1:<hex>`, …) the application's copy on the
+    /// receiving machine holds; answered by [`Self::BlobHas`]. Added after
+    /// the variants above, so their numbers stand.
+    BlobHave { id: u64, hashes: Vec<String> },
+    /// The answer to [`Self::BlobHave`] `id`: each held blob with its size,
+    /// or why that machine gives none to the sender.
+    BlobHas {
+        id: u64,
+        have: Vec<(String, u64)>,
+        refused: Option<String>,
+    },
+    /// Part of a blob: `length` bytes from `offset`; answered by
+    /// [`Self::BlobChunk`].
+    BlobWant {
+        id: u64,
+        hash: String,
+        offset: u64,
+        length: u32,
+    },
+    /// The answer to [`Self::BlobWant`] `id`: the bytes, or why there are
+    /// none.
+    BlobChunk {
+        id: u64,
+        data: Vec<u8>,
+        error: Option<String>,
+    },
 }
 
 /// What became of a datagram on the receiving machine.
@@ -136,6 +162,7 @@ impl AppsMsg {
             {
                 Priority::Bulk
             }
+            Some(AppsContent::Wire(AppsWire::BlobChunk { .. })) => Priority::Bulk,
             _ => Priority::Metadata,
         }
     }
@@ -192,6 +219,39 @@ mod tests {
             payload: vec![0; BULK_FROM + 1],
         };
         assert_eq!(AppsMsg::wire("a", &big).priority(), Priority::Bulk);
+    }
+
+    #[test]
+    fn a_blobs_bytes_ride_bulk_and_its_questions_do_not() {
+        let chunk = AppsWire::BlobChunk {
+            id: 1,
+            data: vec![0; 64],
+            error: None,
+        };
+        assert_eq!(AppsMsg::wire("a", &chunk).priority(), Priority::Bulk);
+        let want = AppsWire::BlobWant {
+            id: 2,
+            hash: format!("sha1:{}", "a".repeat(40)),
+            offset: 0,
+            length: 1,
+        };
+        let msg = AppsMsg::wire("a", &want);
+        assert_eq!(msg.priority(), Priority::Metadata);
+        assert_eq!(msg.content(), Some(AppsContent::Wire(want)));
+    }
+
+    #[test]
+    fn the_wire_kinds_before_blobs_keep_their_numbers() {
+        // bincode numbers enum variants by position: the blob kinds were
+        // added last so a node from before them reads every older kind.
+        let present = bincode::serialize(&AppsWire::Present { apps: Vec::new() }).unwrap();
+        assert_eq!(&present[..4], &[2, 0, 0, 0]);
+        let have = bincode::serialize(&AppsWire::BlobHave {
+            id: 0,
+            hashes: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(&have[..4], &[3, 0, 0, 0]);
     }
 
     #[test]
