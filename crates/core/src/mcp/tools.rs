@@ -87,6 +87,9 @@ impl<A: Ask> Tools<A> {
             "window_invoke" | "window_set_value" => {
                 self.window_element(name, args).await.map(Output::Text)
             }
+            "apps_devtools" => self.apps_devtools(args).await.map(Output::Text),
+            #[cfg(feature = "web-tools")]
+            name if name.starts_with("web_") => self.web(name, args).await,
             _ => self.call_text(name, args).await.map(Output::Text),
         }
     }
@@ -142,6 +145,142 @@ impl<A: Ask> Tools<A> {
             }
             other => Err(answered(other)),
         }
+    }
+
+    /// This machine's listener for an application's DevTools on `machine`,
+    /// opened when there is none: its port and token.
+    async fn devtools_listener(&self, args: &Value) -> Result<(String, u16, String), Failure> {
+        let machine = need_str(args, "machine")?;
+        let app = need_str(args, "app")?;
+        let (app, process) = match app.split_once('/') {
+            Some((app, process)) => (app.to_owned(), Some(process.to_owned())),
+            None => (app, None),
+        };
+        let port = args.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+        let command = Command::Devtools {
+            machine,
+            app: app.clone(),
+            process,
+            port,
+            close: false,
+        };
+        match self.ask.ask(command).await? {
+            Reply::Devtools { port, token } => Ok((app, port, token)),
+            other => Err(answered(other)),
+        }
+    }
+
+    async fn apps_devtools(&self, args: &Value) -> Result<String, Failure> {
+        let (app, port, token) = self.devtools_listener(args).await?;
+        let http = format!("http://127.0.0.1:{port}/{token}");
+        Ok(format!(
+            "{app}'s DevTools: {http} (Playwright: chromium.connectOverCDP('{http}'); targets: \
+             {http}/json/list). The token is the only way in; it closes 15 minutes after its \
+             last connection. The web_* tools use it themselves."
+        ))
+    }
+
+    /// A `web_*` tool: the application's page through its DevTools.
+    #[cfg(feature = "web-tools")]
+    async fn web(&self, name: &str, args: &Value) -> Result<Output, Failure> {
+        use super::cdp::{ax_outline, console_lines, Cdp};
+        use base64::Engine as _;
+        let (app, port, token) = self.devtools_listener(args).await?;
+        let mut page = Cdp::page(port, &token).await?;
+        let selector = || -> Result<String, Failure> { need_str(args, "selector") };
+        let text = match name {
+            "web_snapshot" => {
+                let max = args.get("max").and_then(Value::as_u64).unwrap_or(1500) as usize;
+                let tree = page.call("Accessibility.getFullAXTree", json!({})).await?;
+                let nodes = tree["nodes"].as_array().cloned().unwrap_or_default();
+                let (outline, truncated) = ax_outline(&nodes, max);
+                match truncated {
+                    true => format!("{outline}… cut at {max} lines; pass a larger `max`"),
+                    false => outline,
+                }
+            }
+            "web_query" => {
+                let max = args.get("max").and_then(Value::as_u64).unwrap_or(20);
+                let expression = format!(
+                    "Array.from(document.querySelectorAll({sel})).slice(0, {max}).map(e => ({{ \
+                     tag: e.tagName.toLowerCase(), text: (e.innerText || '').slice(0, 300), \
+                     html: e.outerHTML.slice(0, 600) }}))",
+                    sel = Value::String(selector()?)
+                );
+                let found = page.eval(&expression).await?;
+                serde_json::to_string_pretty(&found).unwrap_or_default()
+            }
+            "web_screenshot" => {
+                let shot = page
+                    .call("Page.captureScreenshot", json!({ "format": "png" }))
+                    .await?;
+                let png = base64::engine::general_purpose::STANDARD
+                    .decode(shot["data"].as_str().unwrap_or_default())
+                    .map_err(|e| format!("not a picture: {e}"))?;
+                return Ok(Output::Image {
+                    png,
+                    note: format!("{app}'s page, as its web view renders it"),
+                });
+            }
+            "web_console" => {
+                let wait = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(1000);
+                page.call("Runtime.enable", json!({})).await?;
+                page.call("Log.enable", json!({})).await?;
+                page.listen(std::time::Duration::from_millis(wait.min(10_000)))
+                    .await;
+                let lines = console_lines(&page.events);
+                match lines.is_empty() {
+                    true => "nothing in the console".to_owned(),
+                    false => lines.join("\n"),
+                }
+            }
+            "web_click" => {
+                let expression = format!(
+                    "(() => {{ const e = document.querySelector({sel}); if (!e) return null; \
+                     e.scrollIntoView({{ block: 'center' }}); const r = e.getBoundingClientRect(); \
+                     return [r.left + r.width / 2, r.top + r.height / 2]; }})()",
+                    sel = Value::String(selector()?)
+                );
+                let point = page.eval(&expression).await?;
+                let (Some(x), Some(y)) = (point[0].as_f64(), point[1].as_f64()) else {
+                    return Err(Failure::Failed(format!("nothing matches {}", selector()?)));
+                };
+                for kind in ["mousePressed", "mouseReleased"] {
+                    page.call(
+                        "Input.dispatchMouseEvent",
+                        json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 }),
+                    )
+                    .await?;
+                }
+                format!("clicked {} at {x:.0},{y:.0}", selector()?)
+            }
+            "web_fill" => {
+                let text = need_str(args, "text")?;
+                let expression = format!(
+                    "(() => {{ const e = document.querySelector({sel}); if (!e) return false; \
+                     e.focus(); if (e.select) e.select(); return true; }})()",
+                    sel = Value::String(selector()?)
+                );
+                if page.eval(&expression).await? != Value::Bool(true) {
+                    return Err(Failure::Failed(format!("nothing matches {}", selector()?)));
+                }
+                page.call("Input.insertText", json!({ "text": text }))
+                    .await?;
+                format!("typed into {}", selector()?)
+            }
+            "web_eval" => {
+                let expression = need_str(args, "expression")?;
+                let value = page.eval(&expression).await?;
+                let mut text = serde_json::to_string_pretty(&value).unwrap_or_default();
+                if text.len() > 64 * 1024 {
+                    text.truncate(64 * 1024);
+                    text.push_str("\n… cut at 64 KiB");
+                }
+                text
+            }
+            _ => return Err(Failure::UnknownTool),
+        };
+        Ok(Output::Text(text))
     }
 
     /// An application's window as the tree of elements it publishes.
@@ -700,7 +839,7 @@ pub fn list() -> Vec<Value> {
     let window_app =
         json!({ "type": "string", "description": "the application's id, or `<id>/<process>`" });
     let window_title = json!({ "type": "string", "description": "the window whose title contains this; the largest otherwise" });
-    vec![
+    let mut tools = vec![
         tool(
             "machines",
             "The machines and phones on the mesh: online or not, kind, battery and network, modules, and this machine's problems.",
@@ -953,7 +1092,81 @@ pub fn list() -> Vec<Value> {
             }),
             &["machine", "app", "value"],
         ),
-    ]
+    ];
+    tools.extend(web_tools(&machine));
+    tools
+}
+
+/// The DevTools tools: the strongest reach there is — they run code inside
+/// the application — so every one that acts is marked destructive, and the
+/// one that runs arbitrary JavaScript says so in its title.
+fn web_tools(machine: &Value) -> Vec<Value> {
+    let app = json!({ "type": "string", "description": "the application's id, or `<id>/<process>`; it must declare DevTools (cursio-sdk App::devtools) and that machine's person must allow inspecting it, for a limited time" });
+    let selector = json!({ "type": "string", "description": "a CSS selector" });
+    let mut tools = vec![tool(
+        "apps_devtools",
+        "Open (or reuse) this machine's loopback address for an application's DevTools on another machine and return it, token included, for Playwright's connectOverCDP or a browser. Grants code execution inside the application: ask the user first. The web_* tools do this themselves.",
+        false, true,
+        json!({ "machine": machine, "app": app, "port": { "type": "integer" } }),
+        &["machine", "app"],
+    )];
+    if !cfg!(feature = "web-tools") {
+        return tools;
+    }
+    tools.extend([
+        tool(
+            "web_snapshot",
+            "An application's page as its accessibility tree (roles and names, one line each) — the cheapest way to read a web view's interface.",
+            true, false,
+            json!({ "machine": machine, "app": app, "max": { "type": "integer", "description": "most lines (default 1500)" } }),
+            &["machine", "app"],
+        ),
+        tool(
+            "web_query",
+            "Elements of an application's page matching a CSS selector: tag, text and HTML, bounded.",
+            true, false,
+            json!({ "machine": machine, "app": app, "selector": selector, "max": { "type": "integer" } }),
+            &["machine", "app", "selector"],
+        ),
+        tool(
+            "web_screenshot",
+            "A picture of an application's page as its web view renders it.",
+            true, false,
+            json!({ "machine": machine, "app": app }),
+            &["machine", "app"],
+        ),
+        tool(
+            "web_console",
+            "What an application's page logs: console calls, uncaught exceptions and browser log entries, collected for a moment (wait_ms, default 1000).",
+            true, false,
+            json!({ "machine": machine, "app": app, "wait_ms": { "type": "integer" } }),
+            &["machine", "app"],
+        ),
+        tool(
+            "web_click",
+            "Click the element of an application's page matching a CSS selector, as a mouse would.",
+            false, true,
+            json!({ "machine": machine, "app": app, "selector": selector }),
+            &["machine", "app", "selector"],
+        ),
+        tool(
+            "web_fill",
+            "Type text (any script) into the field of an application's page matching a CSS selector, replacing what it holds.",
+            false, true,
+            json!({ "machine": machine, "app": app, "selector": selector, "text": { "type": "string" } }),
+            &["machine", "app", "selector", "text"],
+        ),
+    ]);
+    let mut eval = tool(
+        "web_eval",
+        "Run JavaScript inside an application's page and return its value as JSON. Arbitrary code execution in the application: ask the user first, and prefer web_snapshot/web_query/web_click.",
+        false, true,
+        json!({ "machine": machine, "app": app, "expression": { "type": "string" } }),
+        &["machine", "app", "expression"],
+    );
+    eval["annotations"]["title"] = json!("Run JavaScript inside the application");
+    tools.push(eval);
+    tools
 }
 
 /// The running node, reached afresh for every call: the calls this exists

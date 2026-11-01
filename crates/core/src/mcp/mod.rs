@@ -17,6 +17,8 @@
 //! stderr and the log file, and the apps functions this calls report progress
 //! through a sink rather than printing.
 
+#[cfg(feature = "web-tools")]
+pub mod cdp;
 pub mod tools;
 
 use serde_json::{json, Value};
