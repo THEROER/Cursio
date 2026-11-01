@@ -12,7 +12,7 @@
 //! compact text form (the shape of Playwright's ARIA snapshot, a few
 //! kilobytes where a screenshot is a megabyte), and finding one element in it
 //! by role and name, or by the id a snapshot printed. Backends:
-//! [`crate::windows_uia`].
+//! `windows_uia` (UI Automation) and `linux_atspi` (AT-SPI).
 
 /// One element of a window's interface.
 #[derive(Debug, Clone, PartialEq, Default)]

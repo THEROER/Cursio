@@ -144,7 +144,8 @@ that a button now shows "Running". `core/src/desktop_window.rs`:
   **`window_click { machine, app, title?, x, y, right? }`,
   `window_type { …, text }`, `window_key { …, key }`** (destructive). Above
   them, **`window_tree`** (read-only) and **`window_invoke` /
-  `window_set_value`** (destructive) read the window's UI Automation tree and
+  `window_set_value`** (destructive) read the window's accessibility tree (UI
+  Automation on Windows, AT-SPI on Linux) and
   act on an element by role and name — the way an agent should drive an
   interface first; see rung 4 in `docs/devtools-design.md`. The clicks are
   `cursio window <machine> <app>[/process] [--title T] screenshot | click X Y

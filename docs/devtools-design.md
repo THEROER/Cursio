@@ -1,8 +1,8 @@
 # Inspecting and driving an application from another machine
 
-Status: rung 4 is **built on Windows** (UI Automation); rung 5 is **built
-for CDP** (Chromium web views). AT-SPI on Linux and WebKitGTK through
-WebDriver are **design**.
+Status: rung 4 is **built on Windows** (UI Automation) **and Linux**
+(AT-SPI); rung 5 is **built for CDP** (Chromium web views). WebKitGTK
+through WebDriver is **design**.
 
 A person — or an AI agent through `cursio mcp` — wants to work with an
 application running on another machine of the mesh the way they would with
@@ -68,9 +68,48 @@ last.
   publishes no Invoke pattern is clicked at its centre, as a person would,
   and the answer says so.
 - Limits: 40 levels and 3000 elements by default, at most 64 and 10 000.
-- Not built: AT-SPI on Linux (the answer says so; screenshots and clicks
-  work there through the Shell extension) and live checks against a running
-  WebView2 page, which wait on a deployed build.
+- Not checked live: a running WebView2 page, which waits on a deployed
+  build.
+
+**Built (Linux).** The same commands, tools and wire, answered by
+`cursio_window::linux_atspi`:
+
+- The accessibility bus's address comes from `org.a11y.Bus.GetAddress` on
+  the session bus; the registry root lists applications as bus names, and
+  the one the request means is the one whose owner pid
+  (`GetConnectionUnixProcessID`) is among the pids it registered with. Its
+  top-level accessible whose name contains `--title` is the window, else
+  the active one, else the first on screen. The Shell extension is not
+  involved.
+- Each element is `GetRoleName` (names, not numbers, which toolkits number
+  differently), `Name`, `GetState`, `GetInterfaces` and, when showing,
+  `Component.GetExtents` in *window* coordinates divided by the frame's size
+  — screen coordinates mean nothing to a Wayland client. Roles and states
+  map onto UI Automation's vocabulary (`push button` → `button`, `page tab`
+  → `tabitem`; disabled is neither ENABLED nor SENSITIVE, since GTK 4 sets
+  only the latter); defunct elements are skipped. A value is `Value`'s
+  number, or the text of an entry, never of a password field or a document.
+- Ids are the last part of the object path (GTK 4 uses UUIDs, so they are
+  long). Acting re-walks, as on Windows.
+- Invoke, toggle, select, expand and collapse run the element's
+  `Action` by the names toolkits give it (`click`, `press`, `activate`,
+  `toggle`, `expand or contract`, …); a miss lists the actions it does
+  offer. Expand on an expanded element answers so instead of toggling it
+  shut. Focus is `Component.GrabFocus`; set-value is
+  `EditableText.SetTextContents`, else `Value.CurrentValue`.
+- Every call runs on a thread of its own (zbus's blocking calls cannot run
+  inside the node's runtime) with a 2 s method timeout, so a hung
+  application fails the request instead of holding it.
+- GTK registers whether or not assistive technology is on; Chromium and
+  Electron publish only if `org.a11y.Status.IsEnabled` was true when they
+  started, or with `--force-renderer-accessibility`. An application missing
+  from the bus while it is off is answered with how the person turns it on
+  (`gsettings set org.gnome.desktop.interface toolkit-accessibility true`,
+  then restart the application); Cursio never changes the setting.
+- Checked live on Nocturne, read only, with
+  `cargo run -p cursio-window --example atspi_tree -- <pid> [title]`:
+  Nautilus' window, 400 elements in about a second (six D-Bus calls per
+  element); the snap Firefox, with the bus off, gets the message above.
 
 ## Rung 5: DevTools
 
@@ -232,7 +271,8 @@ trusted with input and files already. What this design adds on top:
 
 ## Order of work
 
-1. Rung 4, the UI tree: UI Automation on Windows (**built**), AT-SPI next.
+1. Rung 4, the UI tree: UI Automation on Windows and AT-SPI on Linux
+   (**built**).
 2. Rung 5's tunnel with the token, the time-limited consent, the visible
    indicator and the audit line (**built**).
 3. The `web_*` tools in `cursio mcp` (**built**, but not `web_network`), and

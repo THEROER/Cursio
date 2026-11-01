@@ -79,6 +79,10 @@ pub mod linux_drag;
 #[cfg(target_os = "linux")]
 pub mod linux_app;
 
+/// One application's interface tree, through AT-SPI.
+#[cfg(target_os = "linux")]
+pub mod linux_atspi;
+
 #[cfg(target_os = "linux")]
 mod linux_capture;
 #[cfg(target_os = "linux")]

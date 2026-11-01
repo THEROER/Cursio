@@ -368,8 +368,7 @@ pub fn element(
     ui::element(peer, target, &id, &pids, pick, act)
 }
 
-/// The UI tree is read through UI Automation on Windows; AT-SPI would be
-/// Linux's, and is not built.
+/// The UI tree is read through UI Automation on Windows and AT-SPI on Linux.
 #[cfg(all(windows, feature = "phone-control"))]
 mod ui {
     use super::*;
@@ -421,15 +420,71 @@ mod ui {
     }
 }
 
-#[cfg(not(all(windows, feature = "phone-control")))]
+/// AT-SPI matches the application by its pids and the window by its
+/// accessible name, so the Shell extension's window list is not consulted:
+/// an application can be on the accessibility bus while the extension is not
+/// loaded, and the other way round.
+#[cfg(all(target_os = "linux", feature = "phone-control"))]
+mod ui {
+    use super::*;
+    use cursio_protocol::diag::{ElementAct, ElementPick};
+    use cursio_window::linux_atspi;
+    use cursio_window::ui_tree::{self, Limits};
+
+    pub fn tree(
+        peer: &str,
+        target: &WindowTarget,
+        id: &AppId,
+        pids: &[u32],
+        depth: u16,
+        max_nodes: u32,
+    ) -> Result<DiagResponse, String> {
+        let snapshot = linux_atspi::tree(
+            pids.to_vec(),
+            target.title.clone(),
+            Limits {
+                depth,
+                nodes: max_nodes,
+            },
+        )?;
+        tracing::info!(%peer, app = %id, nodes = snapshot.nodes, "a peer read an application's interface");
+        Ok(DiagResponse::WindowTree {
+            title: snapshot.title,
+            text: ui_tree::render(&snapshot.root),
+            nodes: snapshot.nodes,
+            truncated: snapshot.truncated,
+        })
+    }
+
+    pub fn element(
+        peer: &str,
+        target: &WindowTarget,
+        id: &AppId,
+        pids: &[u32],
+        pick: &ElementPick,
+        act: &ElementAct,
+    ) -> Result<DiagResponse, String> {
+        let what = linux_atspi::act(
+            pids.to_vec(),
+            target.title.clone(),
+            pick.clone(),
+            act.clone(),
+            Limits::most(),
+        )?;
+        tracing::info!(%peer, app = %id, %what, "a peer acted on an application's interface");
+        Ok(DiagResponse::WindowDone { what })
+    }
+}
+
+#[cfg(not(all(any(windows, target_os = "linux"), feature = "phone-control")))]
 mod ui {
     use super::*;
     use cursio_protocol::diag::{ElementAct, ElementPick};
 
     fn not_built() -> String {
         format!(
-            "an application's interface tree is read through UI Automation on Windows; not \
-             built for {} yet — use its window's screenshot and clicks there",
+            "an application's interface tree is read through UI Automation on Windows and \
+             AT-SPI on Linux; not built for {} yet — use its window's screenshot and clicks there",
             std::env::consts::OS
         )
     }
