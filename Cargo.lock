@@ -1151,6 +1151,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cursio-app-protocol"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cursio-audio"
 version = "0.9.0"
 dependencies = [
