@@ -248,6 +248,14 @@ cursio apps call Lightmoon leavepulse/daemon running
   answers `<app> has no action <x>; it has: <sorted names>`, in the same words
   from the SDK and the node (`no_such_action`), so a caller learns the right
   name from the error.
+- A declaration that cannot stand — an action, topic or process name outside
+  lowercase letters, digits and `-`, a repeat, one past the limit — is
+  refused on its own: a debug build panics where it is written, a release
+  build leaves it out, registers the rest, and lists it in
+  `Cursio::rejected()`. `App::start` fails only for the application id or the
+  log location. One mistyped `game_log` used to fail `start` and take the
+  whole application — logs, presence, every other action — off the mesh
+  without a word.
 - Over the mesh it is `DiagRequest::AppActions` / `CallAction`, JSON as text
   (the diag vocabulary is bincode). MCP: `apps_actions` (reads), `apps_call`
   (destructive).

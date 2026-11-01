@@ -52,6 +52,12 @@ Handlers run off the connection's thread; a panic answers that it happened
 and later calls go on. The machine's person allows calls to an application
 once, with a button.
 
+Names of actions, topics and the process are lowercase letters, digits and
+`-` (`game-log`, not `game_log`). A debug build panics at a bad one where it
+is written; a release build leaves that one out, registers everything else,
+and lists what it skipped in `Cursio::rejected()` — one mistyped name never
+takes the whole application out of the mesh.
+
 ## Messages between copies
 
 Copies of one application on different machines talk to each other over the

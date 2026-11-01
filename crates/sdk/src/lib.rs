@@ -153,6 +153,8 @@ type Handler = Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String
 #[derive(Clone)]
 struct Declared {
     name: Result<ActionName, cursio_app_protocol::Error>,
+    /// The name as the program wrote it, for saying which one was refused.
+    asked: String,
     description: String,
     schema: serde_json::Value,
     handler: Handler,
@@ -175,9 +177,21 @@ pub struct App {
     logs: Option<LogSpec>,
     endpoint: Option<PathBuf>,
     on_update: Option<OnUpdate>,
-    process: Option<Result<ProcessName, cursio_app_protocol::Error>>,
+    process: Option<(Result<ProcessName, cursio_app_protocol::Error>, String)>,
     actions: Vec<Declared>,
-    topics: Vec<(Result<TopicName, cursio_app_protocol::Error>, OnMessage)>,
+    topics: Vec<(
+        Result<TopicName, cursio_app_protocol::Error>,
+        String,
+        OnMessage,
+    )>,
+}
+
+/// In a debug build, a name that cannot be declared panics where it is
+/// written; in a release build [`App::start`] skips it ([`reject`]).
+fn check_now<T>(kind: RejectedKind, name: &str, parsed: &Result<T, cursio_app_protocol::Error>) {
+    if let (true, Err(error)) = (cfg!(debug_assertions), parsed) {
+        reject(kind, name, &error.to_string());
+    }
 }
 
 impl std::fmt::Debug for App {
@@ -218,8 +232,10 @@ impl App {
         topic: &str,
         handler: impl Fn(Message) + Send + Sync + 'static,
     ) -> Self {
+        let parsed = TopicName::parse(topic);
+        check_now(RejectedKind::Topic, topic, &parsed);
         self.topics
-            .push((TopicName::parse(topic), Arc::new(handler)));
+            .push((parsed, topic.to_owned(), Arc::new(handler)));
         self
     }
 
@@ -241,8 +257,11 @@ impl App {
         schema: serde_json::Value,
         handler: impl Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync + 'static,
     ) -> Self {
+        let parsed = ActionName::parse(name);
+        check_now(RejectedKind::Action, name, &parsed);
         self.actions.push(Declared {
-            name: ActionName::parse(name),
+            name: parsed,
+            asked: name.to_owned(),
             description: description.into(),
             schema,
             handler: Arc::new(handler),
@@ -256,7 +275,9 @@ impl App {
     /// with its process; `--app <id>/<process>` reads one. Leave it unset for
     /// the main process.
     pub fn process(mut self, name: &str) -> Self {
-        self.process = Some(ProcessName::parse(name));
+        let parsed = ProcessName::parse(name);
+        check_now(RejectedKind::Process, name, &parsed);
+        self.process = Some((parsed, name.to_owned()));
         self
     }
 
@@ -291,15 +312,27 @@ impl App {
     }
 
     /// Start talking to the node, in the background. Fails only when the id
-    /// or the log location is invalid.
+    /// or the log location is invalid. An invalid action, topic or process
+    /// name panics in a debug build; a release build leaves it out, registers
+    /// everything else, and lists it in [`Cursio::rejected`].
     pub fn start(self) -> Result<Cursio, Error> {
         let id = self.id.map_err(Error::Invalid)?;
         if let Some(logs) = &self.logs {
             logs.check().map_err(Error::Invalid)?;
         }
-        let process = self.process.transpose().map_err(Error::Invalid)?;
-        let (specs, handlers) = declared(self.actions)?;
-        let (topics, listeners) = listened(self.topics)?;
+        let mut rejected = Vec::new();
+        let process = match self.process {
+            Some((Ok(process), _)) => Some(process),
+            Some((Err(error), asked)) => {
+                rejected.push(reject(RejectedKind::Process, &asked, &error.to_string()));
+                None
+            }
+            None => None,
+        };
+        let (specs, handlers, skipped_actions) = declared(self.actions, reject);
+        let (topics, listeners, skipped_topics) = listened(self.topics, reject);
+        rejected.extend(skipped_actions);
+        rejected.extend(skipped_topics);
         let hooks = Hooks {
             app: id.to_string(),
             on_update: self.on_update,
@@ -335,34 +368,55 @@ impl App {
             shared,
             health,
             requests,
+            rejected,
         })
     }
 }
 
+/// What judges a bad declaration: [`reject`] in the program, [`skipped`] to
+/// test what a release build does.
+type Judge = fn(RejectedKind, &str, &str) -> Rejected;
+
 /// The topics the hello lists and their handlers; an invalid or repeated
-/// one, or too many, is the program's mistake.
-type Listened = (Vec<TopicName>, BTreeMap<TopicName, OnMessage>);
+/// one, or one past the limit, is judged and left out.
+type Listened = (
+    Vec<TopicName>,
+    BTreeMap<TopicName, OnMessage>,
+    Vec<Rejected>,
+);
 
 fn listened(
-    topics: Vec<(Result<TopicName, cursio_app_protocol::Error>, OnMessage)>,
-) -> Result<Listened, Error> {
-    if topics.len() > MAX_TOPICS {
-        return Err(Error::Invalid(cursio_app_protocol::Error::BadAction(
-            format!("at most {MAX_TOPICS} topics per process"),
-        )));
-    }
+    topics: Vec<(
+        Result<TopicName, cursio_app_protocol::Error>,
+        String,
+        OnMessage,
+    )>,
+    judge: Judge,
+) -> Listened {
     let mut names = Vec::new();
     let mut handlers = BTreeMap::new();
-    for (topic, handler) in topics {
-        let topic = topic.map_err(Error::Invalid)?;
-        if handlers.insert(topic.clone(), handler).is_some() {
-            return Err(Error::Invalid(cursio_app_protocol::Error::BadAction(
-                format!("topic {topic} is listened to twice"),
-            )));
+    let mut rejected = Vec::new();
+    for (topic, asked, handler) in topics {
+        let topic = match topic {
+            Ok(topic) => topic,
+            Err(error) => {
+                rejected.push(judge(RejectedKind::Topic, &asked, &error.to_string()));
+                continue;
+            }
+        };
+        if names.len() == MAX_TOPICS {
+            let why = format!("at most {MAX_TOPICS} topics per process");
+            rejected.push(judge(RejectedKind::Topic, &asked, &why));
+            continue;
         }
+        if handlers.contains_key(&topic) {
+            rejected.push(judge(RejectedKind::Topic, &asked, "listened to twice"));
+            continue;
+        }
+        handlers.insert(topic.clone(), handler);
         names.push(topic);
     }
-    Ok((names, handlers))
+    (names, handlers, rejected)
 }
 
 /// Hand a message to its topic's handler off the connection's thread; a
@@ -393,33 +447,46 @@ fn hear(
 }
 
 /// The declared actions as the hello lists them, and their handlers by name;
-/// an invalid, oversized or repeated one is the program's mistake.
-type DeclaredActions = (Vec<ActionSpec>, BTreeMap<ActionName, Handler>);
+/// an invalid, oversized, repeated or surplus one is judged and left out.
+type DeclaredActions = (
+    Vec<ActionSpec>,
+    BTreeMap<ActionName, Handler>,
+    Vec<Rejected>,
+);
 
-fn declared(actions: Vec<Declared>) -> Result<DeclaredActions, Error> {
-    if actions.len() > MAX_ACTIONS {
-        return Err(Error::Invalid(cursio_app_protocol::Error::BadAction(
-            format!("at most {MAX_ACTIONS} actions per process"),
-        )));
-    }
+fn declared(actions: Vec<Declared>, judge: Judge) -> DeclaredActions {
     let mut specs = Vec::new();
     let mut handlers = BTreeMap::new();
+    let mut rejected = Vec::new();
     for action in actions {
-        let name = action.name.map_err(Error::Invalid)?;
+        let asked = action.asked;
+        let name = match action.name {
+            Ok(name) => name,
+            Err(error) => {
+                rejected.push(judge(RejectedKind::Action, &asked, &error.to_string()));
+                continue;
+            }
+        };
         let spec = ActionSpec {
             name: name.clone(),
             description: action.description,
             schema: action.schema,
         };
-        spec.check().map_err(Error::Invalid)?;
-        if handlers.insert(name.clone(), action.handler).is_some() {
-            return Err(Error::Invalid(cursio_app_protocol::Error::BadAction(
-                format!("action {name} is declared twice"),
-            )));
+        let refusal = if specs.len() == MAX_ACTIONS {
+            Some(format!("at most {MAX_ACTIONS} actions per process"))
+        } else if handlers.contains_key(&name) {
+            Some("declared twice".to_owned())
+        } else {
+            spec.check().err().map(|e| e.to_string())
+        };
+        if let Some(why) = refusal {
+            rejected.push(judge(RejectedKind::Action, &asked, &why));
+            continue;
         }
+        handlers.insert(name, action.handler);
         specs.push(spec);
     }
-    Ok((specs, handlers))
+    (specs, handlers, rejected)
 }
 
 /// Run `action` with `args` off the connection's thread and send its answer;
@@ -461,6 +528,57 @@ enum Link {
     Refused { reason: String },
 }
 
+/// What a declaration was: an action, a topic, the process name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectedKind {
+    Action,
+    Topic,
+    Process,
+}
+
+impl std::fmt::Display for RejectedKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RejectedKind::Action => "action",
+            RejectedKind::Topic => "topic",
+            RejectedKind::Process => "process",
+        })
+    }
+}
+
+/// A declaration [`App::start`] left out, and why. Everything else registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejected {
+    pub kind: RejectedKind,
+    pub name: String,
+    pub reason: String,
+}
+
+/// A bad declaration: at once in a debug build, where the developer is
+/// looking; noted and skipped in a release build, where one misnamed action
+/// took the whole application out of the mesh — its logs, its presence,
+/// every other action — with nothing said.
+fn reject(kind: RejectedKind, name: &str, reason: &str) -> Rejected {
+    if cfg!(debug_assertions) {
+        panic!(
+            "cursio-sdk: {kind} {name:?} cannot be declared: {reason} \
+             (names are lowercase letters, digits and `-`)"
+        );
+    }
+    skipped(kind, name, reason)
+}
+
+/// A declaration left out, said once on standard error — the SDK takes no
+/// logging dependency — and kept for [`Cursio::rejected`].
+fn skipped(kind: RejectedKind, name: &str, reason: &str) -> Rejected {
+    eprintln!("cursio-sdk: skipped {kind} {name:?}: {reason}");
+    Rejected {
+        kind,
+        name: name.to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
 /// The application's connection to the node. Dropping it closes the
 /// connection and stops its thread.
 #[derive(Debug)]
@@ -468,6 +586,7 @@ pub struct Cursio {
     shared: Arc<Mutex<Link>>,
     health: watch::Sender<(HealthState, Option<String>)>,
     requests: mpsc::UnboundedSender<Request>,
+    rejected: Vec<Rejected>,
 }
 
 impl std::fmt::Debug for Request {
@@ -479,6 +598,12 @@ impl std::fmt::Debug for Request {
 }
 
 impl Cursio {
+    /// The declarations a release build skipped because they were invalid;
+    /// a debug build panics at them instead. Empty when all registered.
+    pub fn rejected(&self) -> &[Rejected] {
+        &self.rejected
+    }
+
     fn link(&self) -> Link {
         self.shared
             .lock()
@@ -842,6 +967,64 @@ mod tests {
     use std::time::Instant;
     use tokio::net::UnixListener;
 
+    fn action(name: &str) -> Declared {
+        Declared {
+            name: ActionName::parse(name),
+            asked: name.to_owned(),
+            description: "does it".into(),
+            schema: serde_json::Value::Null,
+            handler: Arc::new(|_| Ok(serde_json::Value::Null)),
+        }
+    }
+
+    #[test]
+    fn a_misnamed_action_is_left_out_and_the_rest_still_register() {
+        // What a release build does: `skipped` is its judge.
+        let (specs, handlers, rejected) = declared(
+            vec![
+                action("launch"),
+                action("game_log"),
+                action("stop"),
+                action("launch"),
+            ],
+            skipped,
+        );
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["launch", "stop"]);
+        assert_eq!(handlers.len(), 2);
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(rejected[0].kind, RejectedKind::Action);
+        assert_eq!(rejected[0].name, "game_log");
+        assert_eq!(rejected[1].reason, "declared twice");
+    }
+
+    #[test]
+    fn a_misnamed_topic_is_left_out_and_the_rest_still_listen() {
+        let on: OnMessage = Arc::new(|_| {});
+        let (names, _, rejected) = listened(
+            vec![
+                (TopicName::parse("sync"), "sync".into(), on.clone()),
+                (
+                    TopicName::parse("Bad Topic"),
+                    "Bad Topic".into(),
+                    on.clone(),
+                ),
+            ],
+            skipped,
+        );
+        assert_eq!(names.len(), 1);
+        assert_eq!(rejected[0].kind, RejectedKind::Topic);
+        assert_eq!(rejected[0].name, "Bad Topic");
+    }
+
+    #[test]
+    #[should_panic(expected = "game_log")]
+    fn a_debug_build_names_a_misnamed_action_where_it_is_written() {
+        let _ = App::new("demo").action("game_log", "", serde_json::Value::Null, |_| {
+            Ok(serde_json::Value::Null)
+        });
+    }
+
     fn socket() -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -966,16 +1149,13 @@ mod tests {
     }
 
     #[test]
-    fn an_action_declared_twice_or_misnamed_is_the_programs_mistake() {
-        let twice = App::new("demo")
+    #[should_panic(expected = "declared twice")]
+    fn a_debug_build_names_an_action_declared_twice_when_it_starts() {
+        let _ = App::new("demo")
             .action("go", "", Value::Null, |_| Ok(Value::Null))
             .action("go", "", Value::Null, |_| Ok(Value::Null))
+            .endpoint(socket())
             .start();
-        assert!(matches!(twice, Err(Error::Invalid(_))));
-        let misnamed = App::new("demo")
-            .action("Go Now", "", Value::Null, |_| Ok(Value::Null))
-            .start();
-        assert!(matches!(misnamed, Err(Error::Invalid(_))));
     }
 
     #[test]
