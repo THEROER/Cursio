@@ -118,16 +118,35 @@ pub async fn pair(addr: &str, code: &str, key: &AdbKey) -> Result<String, ShellE
 /// debugging port at `addr`, answering what it printed (stdout and stderr
 /// together, at most [`MAX_OUTPUT`] bytes).
 pub async fn exec(addr: &str, key: &mut AdbKey, command: &str) -> Result<Vec<u8>, ShellError> {
+    let failed = |why: String| ShellError::Command {
+        command: command.to_owned(),
+        why,
+    };
     let mut conn = connect(addr, key).await?;
-    let mut out = vec![0u8; MAX_OUTPUT];
-    let len = libadb::exec::run(&mut conn, command, &mut out)
+    let mut dest = vec![0u8; command.len() + 16];
+    let mut session = libadb::exec::open(&mut conn, command, &mut dest)
         .await
-        .map_err(|e| ShellError::Command {
-            command: command.to_owned(),
-            why: e.to_string(),
-        })?;
-    out.truncate(len);
-    Ok(out)
+        .map_err(|e| failed(e.to_string()))?;
+    // Read into a growing buffer: most commands print a line, a screenshot
+    // prints megabytes, and a fixed buffer of the largest was allocated for
+    // every `true`.
+    let mut out = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match session.read(&mut chunk).await {
+            Ok(n) => {
+                if out.len() + n > MAX_OUTPUT {
+                    return Err(failed(format!(
+                        "it printed more than {} MiB",
+                        MAX_OUTPUT / (1024 * 1024)
+                    )));
+                }
+                out.extend_from_slice(&chunk[..n]);
+            }
+            Err(libadb::Error::ChannelClosed) => return Ok(out),
+            Err(e) => return Err(failed(e.to_string())),
+        }
+    }
 }
 
 /// Install (or replace) the APK at `apk` as the phone's `shell`, which no
@@ -247,8 +266,9 @@ pub async fn find_debugging_port(host: &str, key: &mut AdbKey) -> Option<u16> {
 /// Connections the port sweep opens at once.
 const SWEEP_AT_ONCE: usize = 512;
 
-/// Most a command's output may be; past it [`exec`] fails rather than cut.
-pub const MAX_OUTPUT: usize = 1024 * 1024;
+/// Most a command's output may be — room for a phone's screen as PNG; past
+/// it [`exec`] fails rather than cut.
+pub const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 
 async fn connect(
     addr: &str,

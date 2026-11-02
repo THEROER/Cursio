@@ -137,6 +137,10 @@ impl cursio_core::phone_hands::PhoneHands for AndroidHands {
     fn type_text(&self, text: &str) -> Result<(), String> {
         answer("onTypeText", Some(text))
     }
+
+    fn screencap(&self) -> Result<Vec<u8>, String> {
+        crate::shell::run_bytes("screencap -p")
+    }
 }
 
 impl ScreenBackend for AndroidScreen {

@@ -154,6 +154,13 @@ pub enum DiagRequest {
         pick: ElementPick,
         act: ElementAct,
     },
+    /// A still of this phone's whole screen, taken by its own shell
+    /// (`screencap`), answered as [`DiagResponse::WindowShot`]. No stream,
+    /// no consent and no window on the computer, and the picture is of now,
+    /// not of a stream seconds behind. A phone whose shell is not paired
+    /// answers why; an older phone does not answer, and the computer takes
+    /// the picture from the stream as before.
+    PhoneShot,
 }
 
 /// How a request names an element of a window's interface.

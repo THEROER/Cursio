@@ -24,6 +24,11 @@ pub trait PhoneHands: Send + Sync {
     fn touch(&self) -> Result<(), String>;
     /// Put `text` into the field that has focus.
     fn type_text(&self, text: &str) -> Result<(), String>;
+    /// The whole screen as PNG, taken by the phone's own shell; why not
+    /// when it has none.
+    fn screencap(&self) -> Result<Vec<u8>, String> {
+        Err("this phone takes no screenshot of its own".into())
+    }
 }
 
 static HANDS: OnceLock<Arc<dyn PhoneHands>> = OnceLock::new();
@@ -52,6 +57,29 @@ pub fn touch() -> Result<DiagResponse, String> {
 /// A machine that is not a phone has nothing to say.
 pub fn touch_blocked() -> Option<String> {
     hands().ok()?.touch().err()
+}
+
+/// The answer to a computer asking for a still of the screen.
+pub fn screencap() -> Result<DiagResponse, String> {
+    let png = hands()?.screencap()?;
+    let (width, height) = png_size(&png).ok_or("the phone's screenshot is not a PNG")?;
+    Ok(DiagResponse::WindowShot {
+        png,
+        width,
+        height,
+        title: "screen".into(),
+    })
+}
+
+/// A PNG's size, from its header.
+fn png_size(png: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if png.len() < 24 || !png.starts_with(SIGNATURE) || &png[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(png[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(png[20..24].try_into().ok()?);
+    Some((width, height))
 }
 
 /// Type `text` into the focused field, answering how much was typed.
@@ -95,5 +123,14 @@ mod tests {
             DiagResponse::Typed { chars: 11 }
         );
         assert_eq!(off.0.lock().unwrap().as_slice(), ["Привет, мир"]);
+    }
+
+    #[test]
+    fn a_screenshot_is_sized_from_its_png_header() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&1220u32.to_be_bytes());
+        png.extend_from_slice(&2712u32.to_be_bytes());
+        assert_eq!(png_size(&png), Some((1220, 2712)));
+        assert_eq!(png_size(b"not a png at all, longer than 24"), None);
     }
 }

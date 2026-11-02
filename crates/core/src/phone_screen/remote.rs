@@ -223,6 +223,26 @@ async fn ask(phone: &str, request: DiagRequest) -> Option<Result<DiagResponse, S
         .ok()
 }
 
+/// A still `phone` took of its own screen through its shell, as PNG; `None`
+/// when it did not answer — an older phone, or one not linked — so the
+/// caller takes the picture from the stream instead.
+pub async fn screencap(phone: &str) -> Option<Result<Vec<u8>, String>> {
+    let name = known(&phones(), phone).ok()?;
+    let hub = crate::diag_session::hub();
+    let answer = tokio::time::timeout(SCREENCAP_WAIT, hub.ask(&name, DiagRequest::PhoneShot))
+        .await
+        .ok()?;
+    Some(match answer {
+        Ok(DiagResponse::WindowShot { png, .. }) => Ok(png),
+        Ok(other) => Err(format!("{name} answered a screenshot with {other:?}")),
+        Err(why) => Err(why),
+    })
+}
+
+/// How long a phone gets to take and send its screenshot: megabytes of PNG
+/// behind a sweep for its debugging port, when that moved.
+const SCREENCAP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Do `action` on `phone`'s screen, pacing the steps as asked.
 ///
 /// Text is set in the focused field by the phone itself, any script; touch

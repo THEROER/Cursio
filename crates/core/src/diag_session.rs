@@ -324,6 +324,7 @@ impl Exchange for Diag {
             )
             .map(|result_json| DiagResponse::Called { result_json }),
             DiagRequest::PhoneTouch => crate::phone_hands::touch(),
+            DiagRequest::PhoneShot => crate::phone_hands::screencap(),
             DiagRequest::PhoneType { text } => {
                 tracing::info!(peer = %store.peer_name, chars = text.chars().count(), "a peer typed on this phone");
                 crate::phone_hands::type_text(text)
@@ -470,7 +471,8 @@ impl Exchange for Diag {
             }
             other @ (DiagRequest::Paths { .. }
             | DiagRequest::Maintain(_)
-            | DiagRequest::PhoneTouch) => Ok(other),
+            | DiagRequest::PhoneTouch
+            | DiagRequest::PhoneShot) => Ok(other),
         }
     }
 

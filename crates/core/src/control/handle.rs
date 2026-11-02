@@ -447,7 +447,38 @@ async fn phone_act(
 #[cfg(all(feature = "phone-control", any(target_os = "linux", windows)))]
 async fn phone_screenshot(phone: &str, max_side: Option<u32>, ask: bool) -> Result<Reply, String> {
     use crate::phone_screen::{remote, shot};
+    // The phone's own shell first: no consent, no window here, and the
+    // screen as it is now. A phone that cannot answers why, which is said
+    // only when there is no stream to fall back on either.
+    let mut own = None;
+    if let Some(answer) = remote::screencap(phone).await {
+        match answer {
+            Ok(png) => {
+                let dir = shot::dir().ok_or("no data directory to write the screenshot in")?;
+                let phone = phone.to_owned();
+                let shot = tokio::task::spawn_blocking(move || {
+                    shot::from_png(&png, &phone, max_side, &dir)
+                })
+                .await
+                .map_err(|e| format!("the screenshot did not finish: {e}"))??;
+                return Ok(Reply::Screenshot {
+                    path: shot.path,
+                    width: shot.width,
+                    height: shot.height,
+                });
+            }
+            Err(why) => own = Some(why),
+        }
+    }
     let mut stream = remote::stream(phone);
+    if stream.is_err() && !ask {
+        if let Some(why) = own {
+            return Err(format!(
+                "{} (the phone could not take one itself: {why})",
+                stream.err().unwrap_or_default()
+            ));
+        }
+    }
     if ask && stream.is_err() {
         crate::phone_screen::ask(phone, true)?;
         let deadline = tokio::time::Instant::now() + SCREEN_ALLOW_WAIT;

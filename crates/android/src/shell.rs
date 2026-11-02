@@ -83,11 +83,14 @@ pub fn pair(addr: &str, code: &str) -> Result<(), String> {
 /// Run shell source `command` as the phone's `shell` user, finding the
 /// debugging port first when it is not known or no longer answers.
 pub fn run(command: &str) -> Result<String, String> {
+    run_bytes(command).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// [`run`], answering the output byte for byte: a PNG from `screencap -p`.
+pub fn run_bytes(command: &str) -> Result<Vec<u8>, String> {
     let mut key = paired_key()?;
     let addr = address(&mut key)?;
-    let out =
-        block(cursio_phone_shell::exec(&addr, &mut key, command))?.map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&out).into_owned())
+    block(cursio_phone_shell::exec(&addr, &mut key, command))?.map_err(|e| e.to_string())
 }
 
 /// Install the APK at `apk` as the phone's `shell`: no person is asked.

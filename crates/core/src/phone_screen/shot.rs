@@ -1,7 +1,11 @@
-//! One still picture of a phone's screen, from the stream already arriving.
+//! One still picture of a phone's screen: taken by the phone's own shell
+//! when it has one ([`from_png`]), else from the stream already arriving.
 //!
 //! The stream is decoded from its newest keyframe with the decoder a viewer
-//! window uses, and only the last picture is kept. It is written as a PNG
+//! window uses, and only the last picture is kept. That needed the screen
+//! shared — a consent on the phone and a window on the computer — and showed
+//! the screen as the stream had it, seconds behind; `screencap` needs
+//! neither and shows now. It is written as a PNG
 //! file in this user's data directory rather than handed back over the
 //! control socket: a phone's screen as PNG is a few megabytes, past what one
 //! control line carries, and the reader (the CLI, the MCP server) is on the
@@ -60,8 +64,33 @@ pub fn take(stream: &Stream, max_side: Option<u32>, dir: &Path) -> Result<Shot, 
         px.swap(0, 2);
         px[3] = 255;
     }
-    let mut image = image::RgbaImage::from_raw(frame.width, frame.height, rgba)
+    let image = image::RgbaImage::from_raw(frame.width, frame.height, rgba)
         .ok_or("the decoded picture has the wrong size for its pixels")?;
+    save(image, &stream.phone, max_side, dir)
+}
+
+/// Write the PNG `png` the phone took itself (`screencap`, through its own
+/// shell) in `dir`, scaled as [`take`] scales.
+pub fn from_png(
+    png: &[u8],
+    phone: &str,
+    max_side: Option<u32>,
+    dir: &Path,
+) -> Result<Shot, String> {
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .map_err(|e| format!("{phone}'s screenshot is not a picture: {e}"))?
+        .into_rgba8();
+    save(image, phone, max_side, dir)
+}
+
+/// Scale `image` to `max_side` on its long side when given, and write it as
+/// a PNG in `dir`.
+fn save(
+    mut image: image::RgbaImage,
+    phone: &str,
+    max_side: Option<u32>,
+    dir: &Path,
+) -> Result<Shot, String> {
     if let Some(max) = max_side.filter(|m| *m > 0) {
         let long = image.width().max(image.height());
         if long > max {
@@ -78,8 +107,7 @@ pub fn take(stream: &Stream, max_side: Option<u32>, dir: &Path) -> Result<Shot, 
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let safe: String = stream
-        .phone
+    let safe: String = phone
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
@@ -99,6 +127,21 @@ pub fn take(stream: &Stream, max_side: Option<u32>, dir: &Path) -> Result<Shot, 
 mod tests {
     use super::*;
     use cursio_window::video_encoder::{Fidelity, VideoEncoder};
+
+    #[test]
+    fn a_screenshot_the_phone_took_is_kept_scaled_to_fit() {
+        let image = image::RgbaImage::from_pixel(600, 1200, image::Rgba([0, 255, 0, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("cursio-own-shot-{}", std::process::id()));
+        let shot = from_png(&png, "Test Phone", Some(600), &dir).unwrap();
+        assert_eq!((shot.width, shot.height), (300, 600));
+        assert!(shot.path.exists());
+        assert!(from_png(b"no picture", "Test Phone", None, &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_phones_stream_becomes_a_png_of_its_newest_picture_scaled_to_fit() {

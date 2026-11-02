@@ -60,7 +60,10 @@ async fn main() {
         }
     };
     match result {
-        Ok(out) => print!("{}", String::from_utf8_lossy(&out)),
+        Ok(out) => {
+            use std::io::Write as _;
+            let _ = std::io::stdout().write_all(&out);
+        }
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);

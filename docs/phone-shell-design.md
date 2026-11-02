@@ -111,5 +111,12 @@ command from a computer — whether a phone of a given make accepts it.
    own builds still go through the notification: installing them replaces
    the running node, which should wait for a quiet moment, as a computer's
    switch does.
-4. The `shell` helper: sound by `REMOTE_SUBMIX`/playback capture, then the
-   screen, both without the projection's consent.
+4. Screenshots by `screencap -p` (**built**): a computer asks
+   `DiagRequest::PhoneShot` and the phone answers the PNG its shell took
+   (`phone_hands::screencap`), so `cursio phone … screenshot` and MCP
+   `phone_screenshot` need no consent, open no window on the computer and
+   show the screen as it is, not as a stream seconds behind. A phone that
+   cannot says why; an older one does not answer, and the computer takes the
+   picture from the stream as before. 1220×2712 in 0.7 s, measured.
+5. The `shell` helper: sound by `REMOTE_SUBMIX`/playback capture, then the
+   screen as a stream, both without the projection's consent.
