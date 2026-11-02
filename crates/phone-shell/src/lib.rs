@@ -50,13 +50,47 @@ pub enum ShellError {
     Command { command: String, why: String },
 }
 
-/// The key this side presents, kept in `dir` (generated there the first
-/// time). The phone trusts it once paired; losing it means pairing again.
+/// The key this side presents, kept in `dir` as `adbkey` (generated there
+/// the first time). The phone trusts it once paired; losing it means
+/// pairing again.
+///
+/// Written here rather than by `libadb`'s store, which publishes a new key
+/// with a hard link so as never to overwrite one; Android's SELinux refuses
+/// an app hard links even in its own files, and pairing on the phone failed
+/// with "Permission denied". A temporary file renamed into place is atomic
+/// as well, and the one process holding this directory has nothing to race.
 pub fn key(dir: &Path, name: &str) -> Result<AdbKey, ShellError> {
-    store::load_or_generate(dir, &mut OsRng, name).map_err(|e| ShellError::Key {
+    let failed = |why: String| ShellError::Key {
         dir: dir.display().to_string(),
-        why: e.to_string(),
-    })
+        why,
+    };
+    let path = dir.join(KEY_FILE);
+    if !path.exists() {
+        std::fs::create_dir_all(dir).map_err(|e| failed(e.to_string()))?;
+        let key = AdbKey::generate(&mut OsRng, name).map_err(|e| failed(e.to_string()))?;
+        let pem = key.to_pkcs8_pem().map_err(|e| failed(e.to_string()))?;
+        let tmp = dir.join(format!("{KEY_FILE}.tmp"));
+        write_private(&tmp, pem.as_bytes()).map_err(|e| failed(e.to_string()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| failed(e.to_string()))?;
+        return Ok(key);
+    }
+    store::load(dir, &mut OsRng, name).map_err(|e| failed(e.to_string()))
+}
+
+/// The private key's file name, as `adb` names it.
+const KEY_FILE: &str = "adbkey";
+
+/// Write `bytes` readable by this user alone.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
 }
 
 /// Pair with the phone's pairing service at `addr` (host:port, from the
@@ -204,6 +238,25 @@ mod tests {
                 Err(ShellError::BadCode)
             ));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_key_is_kept_private_and_the_same_key_is_read_back() {
+        let dir = std::env::temp_dir().join(format!("cursio-shell-keep-{}", std::process::id()));
+        let first = key(&dir, "cursio@test").unwrap();
+        let again = key(&dir, "cursio@test").unwrap();
+        assert_eq!(first.public_key_wire(), again.public_key_wire());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.join(KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "readable by others: {mode:o}");
+        }
+        assert!(!dir.join("adbkey.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
