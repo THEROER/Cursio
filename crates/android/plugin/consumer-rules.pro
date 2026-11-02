@@ -30,4 +30,5 @@
     public static java.lang.String onTypeText(...);
     public static java.lang.String btComputers(...);
     public static java.lang.String btConnect(...);
+    public static boolean apkInstalled(...);
 }
