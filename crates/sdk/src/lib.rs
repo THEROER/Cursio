@@ -431,7 +431,7 @@ impl App {
             devtools: in_hello,
         };
         let endpoint = self.endpoint.unwrap_or_else(cursio_app_protocol::endpoint);
-        let shared = Arc::new(Mutex::new(Link::Connecting));
+        let shared = Arc::new(Mutex::new(Link::Connecting { last: None }));
         let (health, health_rx) = watch::channel((HealthState::Ok, None));
         let (requests, requests_rx) = mpsc::unbounded_channel();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -627,9 +627,16 @@ fn dispatch(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Link {
-    Connecting,
-    Connected { machine: String },
-    Refused { reason: String },
+    /// Not connected; with why the last attempt failed, once one has.
+    Connecting {
+        last: Option<String>,
+    },
+    Connected {
+        machine: String,
+    },
+    Refused {
+        reason: String,
+    },
 }
 
 /// What a declaration was: an action, a topic, the process name.
@@ -760,6 +767,21 @@ impl Cursio {
         matches!(self.link(), Link::Connected { .. })
     }
 
+    /// Why this process is not connected to its node, or `None` while it is
+    /// (or before the first attempt ended). [`Error::NotRunning`] says only
+    /// that no node answered; this says what the system said — a socket
+    /// refused, permission denied — for the application's own log, where an
+    /// SDK that keeps trying in the background would otherwise leave nothing.
+    pub fn connection_problem(&self) -> Option<String> {
+        match self.link() {
+            Link::Connected { .. } => None,
+            Link::Connecting { last } => last,
+            Link::Refused { reason } => {
+                Some(format!("the node refused this application: {reason}"))
+            }
+        }
+    }
+
     /// Say how the application is doing. Kept and sent again whenever the
     /// node reconnects; [`Error::NotRunning`] says it is only kept for now.
     pub fn set_health(&self, state: HealthState, detail: Option<&str>) -> Result<(), Error> {
@@ -775,7 +797,7 @@ impl Cursio {
     fn connected(&self) -> Result<(), Error> {
         match self.link() {
             Link::Connected { .. } => Ok(()),
-            Link::Connecting => Err(Error::NotRunning),
+            Link::Connecting { .. } => Err(Error::NotRunning),
             Link::Refused { reason } => Err(Error::Refused(reason)),
         }
     }
@@ -981,8 +1003,10 @@ fn next_id() -> u64 {
 }
 
 enum Ended {
-    /// The connection closed or never opened; try again soon.
+    /// The connection closed; try again soon.
     Closed,
+    /// The connection never opened, and why; try again soon.
+    Unreached(String),
     /// The node said no; try again rarely, in case a newer node says yes.
     Refused(String),
     /// The application dropped its handle.
@@ -1024,7 +1048,10 @@ async fn run(
                 )
                 .await
             }
-            Err(_) => Ended::Closed,
+            Err(error) => Ended::Unreached(format!(
+                "cannot connect to the node at {}: {error}",
+                endpoint.display()
+            )),
         };
         match ended {
             Ended::Stop => return,
@@ -1039,8 +1066,11 @@ async fn run(
                 ) {
                     wait = RETRY_MIN;
                 }
-                set(Link::Connecting);
+                set(Link::Connecting {
+                    last: Some("the node closed the connection".into()),
+                });
             }
+            Ended::Unreached(why) => set(Link::Connecting { last: Some(why) }),
         }
         // A health change while waiting cuts the wait short, which is
         // harmless; the handle being dropped ends the thread.
@@ -1560,6 +1590,16 @@ mod tests {
                 detail: None
             }
         );
+    }
+
+    #[test]
+    fn a_node_that_cannot_be_reached_is_reported_with_what_the_system_said() {
+        let path = socket();
+        let app = App::new("demo").endpoint(&path).start().unwrap();
+        eventually("a failed attempt", || app.connection_problem().is_some());
+        let problem = app.connection_problem().unwrap();
+        assert!(problem.contains("cannot connect to the node at"), "{problem}");
+        assert_eq!(app.set_health(HealthState::Ok, None), Err(Error::NotRunning));
     }
 
     #[test]
