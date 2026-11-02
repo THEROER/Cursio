@@ -70,7 +70,11 @@ command from a computer — whether a phone of a given make accepts it.
 ## Order of work
 
 1. `crates/phone-shell`: pairing and a command over TLS, and the probe that
-   tries them against a real phone (**built**; not yet run against one).
+   tries them against a real phone (**built**). Run against a POCO X7 Pro on
+   HyperOS 3 / Android 16 from a computer: a fresh key paired by its code,
+   and a command over TLS on the debugging port ran as `uid=2000(shell)`.
+   Commands go through ADB's `exec:` service — `sh -c`, no terminal, output
+   byte for byte — not `cmd`, which names a binder service.
 2. Pairing from the phone's own window, the key in its files, finding the
    port by mDNS, and the node's connection with its fallback when debugging
    is off.

@@ -37,10 +37,7 @@ async fn main() {
                 std::process::exit(2);
             }
         },
-        "exec" => {
-            let command: Vec<&str> = args[3..].iter().map(String::as_str).collect();
-            cursio_phone_shell::exec(addr, key, &command).await
-        }
+        "exec" => cursio_phone_shell::exec(addr, key, &args[3..].join(" ")).await,
         _ => {
             eprintln!("{usage}");
             std::process::exit(2);

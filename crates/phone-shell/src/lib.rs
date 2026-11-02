@@ -78,19 +78,25 @@ pub async fn pair(addr: &str, code: &str, key: &AdbKey) -> Result<String, ShellE
     Ok(paired.guid.escape_debug().to_string())
 }
 
-/// Run `command` (its words) as the phone's `shell` user through its
-/// debugging port at `addr`, answering what it printed.
-pub async fn exec(addr: &str, key: AdbKey, command: &[&str]) -> Result<Vec<u8>, ShellError> {
+/// Run `command` — shell source, reaching `sh -c` verbatim, so quoting what
+/// goes into it is the caller's — as the phone's `shell` user through its
+/// debugging port at `addr`, answering what it printed (stdout and stderr
+/// together, at most [`MAX_OUTPUT`] bytes).
+pub async fn exec(addr: &str, key: AdbKey, command: &str) -> Result<Vec<u8>, ShellError> {
     let mut conn = connect(addr, key).await?;
-    let mut rx = vec![0u8; 64 * 1024];
-    libadb::cmd::exec(&mut conn, command, &mut rx)
+    let mut out = vec![0u8; MAX_OUTPUT];
+    let len = libadb::exec::run(&mut conn, command, &mut out)
         .await
-        .map(|out| out.to_vec())
         .map_err(|e| ShellError::Command {
-            command: command.join(" "),
+            command: command.to_owned(),
             why: e.to_string(),
-        })
+        })?;
+    out.truncate(len);
+    Ok(out)
 }
+
+/// Most a command's output may be; past it [`exec`] fails rather than cut.
+pub const MAX_OUTPUT: usize = 1024 * 1024;
 
 async fn connect(
     addr: &str,
