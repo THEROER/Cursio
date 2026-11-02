@@ -1598,8 +1598,14 @@ mod tests {
         let app = App::new("demo").endpoint(&path).start().unwrap();
         eventually("a failed attempt", || app.connection_problem().is_some());
         let problem = app.connection_problem().unwrap();
-        assert!(problem.contains("cannot connect to the node at"), "{problem}");
-        assert_eq!(app.set_health(HealthState::Ok, None), Err(Error::NotRunning));
+        assert!(
+            problem.contains("cannot connect to the node at"),
+            "{problem}"
+        );
+        assert_eq!(
+            app.set_health(HealthState::Ok, None),
+            Err(Error::NotRunning)
+        );
     }
 
     #[test]
