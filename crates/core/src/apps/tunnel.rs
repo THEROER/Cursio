@@ -306,13 +306,27 @@ async fn open_here(
     app: &str,
     process: Option<&str>,
 ) -> Result<Box<dyn super::devtools::Socket>, String> {
+    let id = AppId::parse(app).map_err(|e| e.to_string())?;
+    super::devtools::allowed(peer, &id)?;
+    open_local(app, process).await
+}
+
+/// `app`'s DevTools on this machine, for an agent here.
+///
+/// No consent is asked: the endpoint is on this machine's loopback, or an
+/// abstract socket, which every program of this user can already open
+/// without Cursio. Still only an endpoint the application's own process
+/// listens on, and still behind the listener's token.
+async fn open_local(
+    app: &str,
+    process: Option<&str>,
+) -> Result<Box<dyn super::devtools::Socket>, String> {
     use super::devtools::Endpoint;
     let id = AppId::parse(app).map_err(|e| e.to_string())?;
     let process = process
         .map(ProcessName::parse)
         .transpose()
         .map_err(|e| e.to_string())?;
-    super::devtools::allowed(peer, &id)?;
     match super::devtools::endpoint(&id, process.as_ref())? {
         Endpoint::Port(port) => tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -320,6 +334,13 @@ async fn open_here(
             .map_err(|e| format!("cannot reach {app}'s DevTools on port {port}: {e}")),
         Endpoint::Abstract { name, pids } => super::devtools::connect_abstract(&name, &pids),
     }
+}
+
+/// Whether `machine` names this one: `this`, or its own name.
+fn is_this_machine(machine: &str) -> bool {
+    machine == "this"
+        || crate::NodeIdentity::load_or_create()
+            .is_ok_and(|me| me.display_name.eq_ignore_ascii_case(machine))
 }
 
 /// How long a listener with no connection stays.
@@ -441,24 +462,31 @@ pub async fn listen(
     process: Option<&str>,
     port: u16,
 ) -> Result<Listening, String> {
+    let local = is_this_machine(machine);
+    let machine = if local { "this" } else { machine };
     let key = listener_key(machine, app, process);
     if let Some(open) = listeners().get(&key) {
         return Ok(open.listening.clone());
     }
-    if !super::mesh::is_linked(machine) {
-        return Err(format!("{machine} is not connected to this machine"));
+    if local {
+        // Checked once before anything listens, as a far machine is asked.
+        drop(open_local(app, process).await?);
+    } else {
+        if !super::mesh::is_linked(machine) {
+            return Err(format!("{machine} is not connected to this machine"));
+        }
+        // Asked once before anything listens, so the person sees at once that
+        // the other machine refuses or is asking its person.
+        let probe = open_there(&MeshWire, machine, app, process).await?;
+        MeshWire.send(
+            machine,
+            app,
+            AppsWire::TunnelClose {
+                stream: probe,
+                reason: None,
+            },
+        );
     }
-    // Asked once before anything listens, so the person sees at once that
-    // the other machine refuses or is asking its person.
-    let probe = open_there(&MeshWire, machine, app, process).await?;
-    MeshWire.send(
-        machine,
-        app,
-        AppsWire::TunnelClose {
-            stream: probe,
-            reason: None,
-        },
-    );
     let socket = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|e| format!("cannot listen on 127.0.0.1:{port}: {e}"))?;
@@ -562,6 +590,32 @@ async fn serve_client(
         reply(&mut client, "404 Not Found", "not found\n").await;
         return Err("a request without the token".into());
     };
+    let mut first = request.head.into_bytes();
+    first.extend_from_slice(&rest);
+    if machine == "this" {
+        let mut page = match open_local(app, process).await {
+            Ok(page) => page,
+            Err(why) => {
+                reply(&mut client, "403 Forbidden", &format!("{why}\n")).await;
+                return Err(why);
+            }
+        };
+        page.write_all(&first).await.map_err(|e| e.to_string())?;
+        if request.upgrade {
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut page).await;
+            return Ok(());
+        }
+        let mut answer = Vec::new();
+        (&mut page)
+            .take(MAX_ANSWER as u64)
+            .read_to_end(&mut answer)
+            .await
+            .map_err(|e| e.to_string())?;
+        let answer = rewrite_answer(&answer, listening);
+        client.write_all(&answer).await.map_err(|e| e.to_string())?;
+        let _ = client.shutdown().await;
+        return Ok(());
+    }
     let stream = match open_there(&MeshWire, machine, app, process).await {
         Ok(stream) => stream,
         Err(why) => {
@@ -569,8 +623,6 @@ async fn serve_client(
             return Err(why);
         }
     };
-    let mut first = request.head.into_bytes();
-    first.extend_from_slice(&rest);
     if request.upgrade {
         MeshWire.send(
             machine,
