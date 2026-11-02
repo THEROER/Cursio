@@ -237,6 +237,9 @@ object CursioNative {
     /** The screen capture is up, or the phone turned, at this many pixels. */
     external fun nativeScreenStarted(width: Int, height: Int)
 
+    /** A line from the screen capture into the node's log, which computers read without ADB. */
+    external fun nativeScreenLog(warn: Boolean, message: String)
+
     /**
      * One unit of the screen's encoder: [size] bytes at [offset] of the
      * codec's direct output [buffer], read before this returns.

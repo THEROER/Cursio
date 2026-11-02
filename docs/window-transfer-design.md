@@ -849,6 +849,15 @@ window instead, as it once did, destroyed it, and with it a call application's
 share of that window. The phone maps the viewer's pointer against the size the
 capture runs at now, not the one it was offered at.
 
+The phone moves its virtual display onto the new encoder before releasing the
+old one, never leaving it drawing into a released surface. Turning used to
+leave the new encoder silent for good: the reopened window got no picture, and
+nothing on a computer could say why, because the capture's Kotlin half spoke
+only to logcat. It now writes into the node's log (`nativeScreenLog`, read with
+`cursio logs <phone>`), and an encoder that gives nothing for two seconds after
+a turn is said there, with what the virtual display reports, and given the
+display's surface once more.
+
 ### Mouse as a finger
 
 | Computer | Phone |

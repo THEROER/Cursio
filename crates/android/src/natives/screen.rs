@@ -61,6 +61,35 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeScreenUnit(
     })
 }
 
+/// Something the screen capture's Kotlin half has to say, into the node's
+/// own log.
+///
+/// That half drives the projection, the virtual display and the encoder, and
+/// logcat is where it would say what they did — which needs ADB, while the
+/// node's log reaches every computer (`cursio logs <phone>`). A turn that left
+/// the encoder silent was invisible from a computer until this.
+///
+/// # Safety
+///
+/// Called by the JVM with valid arguments; not callable from Rust.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeScreenLog(
+    mut env: JNIEnv,
+    _this: JObject,
+    warn: jboolean,
+    message: jni::objects::JString,
+) {
+    guard(&mut env, (), |env| {
+        let message: String = env.get_string(&message)?.into();
+        if warn != JNI_FALSE {
+            tracing::warn!(target: "cursio_android::screen", "{message}");
+        } else {
+            tracing::info!(target: "cursio_android::screen", "{message}");
+        }
+        Ok(())
+    })
+}
+
 /// The screen capture ended on the phone.
 ///
 /// # Safety

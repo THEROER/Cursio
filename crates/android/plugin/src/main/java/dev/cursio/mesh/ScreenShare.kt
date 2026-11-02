@@ -33,9 +33,13 @@ import android.view.WindowManager
  * asked for, which is what a viewer that just opened or fell behind does.
  *
  * Turning the phone changes the display's size, and an encoder's size is fixed
- * when it is configured, so a turn tears the encoder down and builds one at the
- * new size; the node is told first ([CursioNative.nativeScreenStarted]), which
- * reopens the computer's window at the new shape.
+ * when it is configured, so a turn builds an encoder at the new size; the node
+ * is told first ([CursioNative.nativeScreenStarted]) and the computer's window
+ * follows the new shape. The display is moved onto the new encoder before the
+ * old one is released, never left drawing into a released surface, and a
+ * turn after which the new encoder stays silent is said in the node's log
+ * ([CursioNative.nativeScreenLog]) — the one place a computer can read
+ * without ADB.
  *
  * Everything here runs on [thread]; the node's requests are posted to it.
  */
@@ -53,6 +57,9 @@ class ScreenShare private constructor(
     private var size: Size? = null
     private var bitrate = START_BITRATE
     private var stopped = false
+    /** Units the current encoder has given; read on [thread] after a turn. */
+    @Volatile
+    private var units = 0
 
     private data class Size(val width: Int, val height: Int, val dpi: Int)
 
@@ -150,6 +157,7 @@ class ScreenShare private constructor(
 
             override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
                 if (codec !== this@ScreenShare.codec) return
+                units += 1
                 try {
                     val buffer = codec.getOutputBuffer(index)
                     if (buffer != null && info.size > 0) {
@@ -196,12 +204,57 @@ class ScreenShare private constructor(
         val same = listOf(measure(8), measure(16)).any { it.width == was.width && it.height == was.height }
         if (same) return
         val old = codec
-        codec = null
-        releaseCodec(old)
-        val (now, surface) = configureFitted()
-        Log.i(TAG, "the phone turned; screen ${now.width}x${now.height}")
+        val (now, surface) = try {
+            configureFitted()
+        } catch (e: RuntimeException) {
+            say(true, "the phone turned, and no encoder could be built at the new size: ${e.message}")
+            stop()
+            return
+        }
+        units = 0
         display?.resize(now.width, now.height, now.dpi)
         display?.surface = surface
+        releaseCodec(old)
+        say(false, "the phone turned; screen ${now.width}x${now.height}, display ${shown()}")
+        val turned = codec
+        handler.postDelayed({ checkTurn(turned, surface, retried = false) }, TURN_CHECK_MS)
+    }
+
+    /**
+     * The encoder built for a turn has given nothing yet: say so with what the
+     * display reports, and point the display at it once more.
+     */
+    private fun checkTurn(turned: MediaCodec?, surface: Surface, retried: Boolean) {
+        if (stopped || turned == null || turned !== codec) return
+        if (units > 0) {
+            if (retried) say(false, "the encoder came back after the display was pointed at it again")
+            return
+        }
+        if (retried) {
+            say(true, "the encoder still gives nothing after the turn; display ${shown()}")
+            return
+        }
+        say(true, "the encoder gave nothing ${TURN_CHECK_MS} ms after the turn; display ${shown()}; pointing the display at it again")
+        display?.surface = null
+        display?.surface = surface
+        keyframe()
+        handler.postDelayed({ checkTurn(turned, surface, retried = true) }, TURN_CHECK_MS)
+    }
+
+    /** What the virtual display says of itself, for the log. */
+    private fun shown(): String {
+        val shown = display?.display ?: return "gone"
+        val mode = shown.mode
+        return "${mode.physicalWidth}x${mode.physicalHeight} rotation ${shown.rotation} state ${shown.state}"
+    }
+
+    private fun say(warn: Boolean, message: String) {
+        if (warn) Log.w(TAG, message) else Log.i(TAG, message)
+        try {
+            CursioNative.nativeScreenLog(warn, message)
+        } catch (e: UnsatisfiedLinkError) {
+            Log.w(TAG, "the node's log is not reachable", e)
+        }
     }
 
     private fun releaseCodec(codec: MediaCodec?) {
@@ -251,6 +304,8 @@ class ScreenShare private constructor(
         private const val START_BITRATE = 6_000_000
         private const val MIN_BITRATE = 1_000_000
         private const val MAX_BITRATE = 12_000_000
+        /** How long a turned encoder may stay silent before it is said. */
+        private const val TURN_CHECK_MS = 2_000L
 
         /**
          * Start sharing through [projection]; [ended] runs once, on the
