@@ -15,6 +15,7 @@ members = [
     "crates/files",
     "crates/usb",
     "crates/bluetooth",
+    "crates/phone-shell",
     "crates/core",
     "crates/android",
     "app",
@@ -72,6 +73,8 @@ tauri-plugin-dialog = "~2.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_ignored = "0.1"
+# ADB over the phone's own wireless debugging, pairing included (MIT).
+libadb = { version = "0.7", default-features = false, features = ["tokio", "pairing", "host-keys", "tls"] }
 bincode = "1.3"
 plist = "1"
 

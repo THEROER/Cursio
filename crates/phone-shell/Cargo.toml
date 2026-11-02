@@ -1,0 +1,12 @@
+[package]
+name = "cursio-phone-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libadb.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
