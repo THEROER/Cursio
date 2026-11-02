@@ -527,6 +527,11 @@ async function restartNode() {
           <PhoneScreenCard />
         </section>
 
+        <section v-if="status && isMobile" id="phone-shell" class="flex scroll-mt-4 flex-col gap-3">
+          <LpSection :title="t('phoneShell.section')" :description="t('phoneShell.description')" icon="lucide:terminal" />
+          <PhoneShellCard />
+        </section>
+
         <section v-if="status && !isMobile" id="crossing" class="flex scroll-mt-4 flex-col gap-3">
           <LpSection :title="t('crossing.title')" :description="t('crossing.description')" icon="lucide:panel-bottom" />
           <EdgeCrossingCard />

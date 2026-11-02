@@ -213,6 +213,12 @@
             </intent-filter>
         </receiver>
 
+        <!-- The code typed into the shell-pairing notification. Only that
+             notification's own PendingIntent reaches it. -->
+        <receiver
+            android:name="dev.cursio.mesh.ShellPairReceiver"
+            android:exported="false" />
+
         <!-- The system's "start recording or casting?" for a computer that
              asked to show this screen; invisible, it only hosts the dialog. -->
         <activity

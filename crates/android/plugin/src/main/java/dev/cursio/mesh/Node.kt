@@ -58,6 +58,7 @@ object Node {
             initialized = CursioNative.nativeInit(context.filesDir.absolutePath)
             if (!initialized) loadError = "the native node refused its data directory"
             if (initialized) {
+                ShellAccess.watch(context)
                 SmsStore.watch(context)
                 MediaBridge.watch(context)
                 GalleryStore.watch(context)

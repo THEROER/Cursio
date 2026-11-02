@@ -77,7 +77,15 @@ command from a computer — whether a phone of a given make accepts it.
    byte for byte — not `cmd`, which names a binder service.
 2. Pairing from the phone's own window, the key in its files, finding the
    port by mDNS, and the node's connection with its fallback when debugging
-   is off.
+   is off. **Built, not yet run on a phone**: Settings → "This phone's
+   shell" → Pair opens the developer settings at wireless debugging and
+   starts looking for the pairing service (`ShellAccess.kt`, NsdManager,
+   only addresses of this phone); when it appears a notification asks for
+   the code with an inline field (`ShellPairReceiver`), and
+   `nativeShellPair` pairs from Rust (`crates/android/src/shell.rs`, the key
+   under the node's data directory, `shell/`). The debugging port is
+   watched for as long as the node runs; once paired the node runs `id -un`
+   through it and says the answer in its log, readable from a computer.
 3. `pm install` for builds from a trusted builder, with no tap.
 4. The `shell` helper: sound by `REMOTE_SUBMIX`/playback capture, then the
    screen, both without the projection's consent.

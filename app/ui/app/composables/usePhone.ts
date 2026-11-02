@@ -30,6 +30,10 @@ export interface PhoneSetup {
   touch: boolean
   /** The screen is being shown on computers now. */
   showingScreen: boolean
+  /** This phone's own shell is paired with its wireless debugging; absent from an older app. */
+  shell?: boolean
+  /** Wireless debugging is on now, so the paired shell can be reached. */
+  shellOn?: boolean
 }
 export type PhoneGrant =
   | "notifications"
@@ -45,6 +49,7 @@ export type PhoneGrant =
   | "companion"
   | "gallery"
   | "touch"
+  | "shell"
 
 export const mobileSetup = () => invoke<PhoneSetup>("mobile_setup")
 

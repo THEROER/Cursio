@@ -608,6 +608,18 @@
     "install": "Install",
     "failed": "The installer did not open"
   },
+  "phoneShell": {
+    "section": "This phone's shell",
+    "description": "Through wireless debugging Cursio gets what adb gets: sound without the screen-recording prompt, installs without a tap. Paired once; only Cursio holds the key.",
+    "title": "Shell through wireless debugging",
+    "hint": "Not paired yet",
+    "ready": "Paired, and wireless debugging is on",
+    "off": "Paired. Wireless debugging is off — Android turns it off after a reboot or a new network",
+    "on": "On",
+    "pair": "Pair",
+    "turnOn": "Turn on",
+    "how": "Pair opens wireless debugging. Turn it on, tap “Pair device with pairing code”, keep that dialog open and type its six digits into Cursio's notification."
+  },
   "phoneScreen": {
     "title": "This screen → computer",
     "description": "Show this phone's screen in a window on a computer you choose, and use it there with the mouse.",

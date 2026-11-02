@@ -50,6 +50,7 @@ mod notify;
 mod phone_audio;
 mod screen;
 mod share;
+mod shell;
 
 use node::NodeHandle;
 

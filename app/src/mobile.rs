@@ -82,6 +82,13 @@ pub struct Setup {
     /// The screen is being shown on computers now.
     #[serde(default)]
     pub showing_screen: bool,
+    /// This phone's own shell is paired with its wireless debugging
+    /// (`docs/phone-shell-design.md`). Defaulted for a plugin built before.
+    #[serde(default)]
+    pub shell: bool,
+    /// Wireless debugging is on now, so the paired shell can be reached.
+    #[serde(default)]
+    pub shell_on: bool,
 }
 
 /// One of the things [`Setup`] lists, for the user to grant.
@@ -105,6 +112,9 @@ pub enum Grant {
     /// Not a grant either: the accessibility list, where the user turns on
     /// touch from computers.
     Touch,
+    /// Not a grant: pairing this phone's own shell, which ends in a
+    /// notification the code is typed into.
+    Shell,
 }
 
 #[derive(Serialize)]

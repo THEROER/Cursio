@@ -31,6 +31,8 @@ cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true
 cursio-transport.workspace = true
 cursio-log.workspace = true
+# The phone's own shell, through its wireless debugging (docs/phone-shell-design.md).
+cursio-phone-shell = { path = "../phone-shell" }
 
 jni = "0.21"
 tokio.workspace = true

@@ -258,6 +258,19 @@ object CursioNative {
     /** The screen capture is up, or the phone turned, at this many pixels. */
     external fun nativeScreenStarted(width: Int, height: Int)
 
+    /** Pair this phone's shell with its pairing service at [addr]; why it failed, or `""`. Blocks. */
+    external fun nativeShellPair(addr: String, code: String): String
+
+    /** Run [command] as this phone's `shell` through [addr]: `ok\t` and its output, or `error\t` and why. Blocks. */
+    external fun nativeShellExec(addr: String, command: String): String
+
+    /** Whether this phone's shell is paired. */
+    external fun nativeShellPaired(): Boolean
+
+    /** This phone's debugging port while wireless debugging is on, or `""`; asked by the node. */
+    @JvmStatic
+    fun shellAddr(): String = ShellAccess.connectAddr ?: ""
+
     /** A line from the screen capture into the node's log, which computers read without ADB. */
     external fun nativeScreenLog(warn: Boolean, message: String)
 

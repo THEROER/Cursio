@@ -344,6 +344,13 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
             // Android lets no app turn an accessibility service on, so the
             // list is where the user goes to do it.
             TOUCH -> launchFirst(invoke, listOf(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)))
+            // Pairing ends in a notification: the system's pairing dialog
+            // must stay open while its code is typed, so the code cannot be
+            // asked for here.
+            SHELL -> {
+                ShellAccess.startPairing(activity)
+                launchFirst(invoke, listOf(ShellAccess.settingsIntent()))
+            }
             CALLS -> if (CallMonitor.granted(activity)) {
                 invoke.resolve(setupState())
             } else {
@@ -530,6 +537,8 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         // stays on there and drops every touch.
         state.put("touch", ScreenTouch.enabled(activity) && ScreenTouch.connected())
         state.put("showingScreen", MeshService.showingScreen())
+        state.put("shell", CursioNative.nativeShellPaired())
+        state.put("shellOn", ShellAccess.connectAddr != null)
         return state
     }
 
@@ -606,5 +615,6 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         const val STORAGE = "storage"
         const val COMPANION = "companion"
         const val TOUCH = "touch"
+        const val SHELL = "shell"
     }
 }

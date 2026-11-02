@@ -1121,6 +1121,7 @@ dependencies = [
  "cursio-core",
  "cursio-files",
  "cursio-log",
+ "cursio-phone-shell",
  "cursio-protocol",
  "cursio-transport",
  "jni",

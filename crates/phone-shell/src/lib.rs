@@ -27,7 +27,8 @@
 use std::path::Path;
 
 use libadb::keys::rsa::rand_core::OsRng;
-use libadb::keys::{store, AdbKey};
+use libadb::keys::store;
+pub use libadb::keys::AdbKey;
 use libadb::tls::{TlsClientConfig, TlsIdentity};
 use libadb::transport::tls::MaybeTls;
 use libadb::{Connection, Feature};
