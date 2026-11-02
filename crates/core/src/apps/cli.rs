@@ -644,7 +644,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(grouped["windows-x86_64"], [exe]);
-        assert_eq!(grouped["android-aarch64"], [apk.clone()]);
+        assert_eq!(grouped["android-aarch64"], std::slice::from_ref(&apk));
         assert!(by_platform(&[dir.join("missing").display().to_string()]).is_err());
         let bare = by_platform(&[apk.display().to_string()]).unwrap();
         assert_eq!(
