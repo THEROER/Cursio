@@ -108,11 +108,13 @@
 
     <!-- No backup: the files directory holds this node's identity and trust
          store, and restoring them onto another phone would make two devices
-         answer as one peer. -->
+         answer as one peer. The extraction rules carry that to Android 12's
+         device-to-device transfer, which allowBackup alone no longer stops. -->
     <!-- Legacy storage: Android 10's way of reading /storage as files, the
          one release between the old permissions and "All files access". -->
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/cursio_no_extraction"
         android:requestLegacyExternalStorage="true">
 
         <!-- One service, every type it may ever hold. Which of them a given
