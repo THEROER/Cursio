@@ -48,6 +48,14 @@ fn request_problem(app: &AppId) -> String {
     format!("app.{app}.devtools")
 }
 
+/// The problem saying DevTools are off here, apart from the question asked
+/// under `ask`: its one button switches to asking, after which it no longer
+/// holds — sharing an id with the question, nothing knew to take it down
+/// then, and the button stayed to be pressed again and again.
+pub fn off_problem(app: &str) -> String {
+    format!("app.{app}.devtools.off")
+}
+
 /// What this machine's settings answer for `peer` inspecting `app` now.
 pub enum Verdict {
     Allowed,
@@ -76,7 +84,7 @@ pub fn decide(
                  in Cursio there"
             )),
             Some(Problem {
-                id: request_problem(app),
+                id: off_problem(app.as_str()),
                 severity: Severity::Info,
                 summary: format!("{peer} asked to inspect {app}, and DevTools of it are off here"),
                 hint: Some(
@@ -165,6 +173,7 @@ pub fn allowed(peer: &str, app: &AppId) -> Result<(), String> {
     ) {
         (Verdict::Allowed, _) => {
             diagnostics::clear(&request_problem(app));
+            diagnostics::clear(&off_problem(app.as_str()));
             Ok(())
         }
         (Verdict::Refused(why), problem) => {
@@ -533,5 +542,18 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn switching_to_asking_takes_down_the_problem_whose_button_did_it() {
+        let app = AppId::parse("devtools-off-test").unwrap();
+        let (_, problem) = decide(&app, "Nocturne", DevtoolsConsent::Deny, &[], &[], 0);
+        diagnostics::raise(problem.unwrap());
+        let up = |id: &str| diagnostics::snapshot().iter().any(|p| p.id == id);
+        assert!(up(&off_problem(app.as_str())));
+        let mut config = crate::config::Config::default();
+        config.apps.entry(app.to_string()).or_default().devtools = DevtoolsConsent::Ask;
+        super::super::consent_answered(&config);
+        assert!(!up(&off_problem(app.as_str())));
     }
 }

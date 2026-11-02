@@ -462,6 +462,9 @@ pub fn consent_answered(config: &crate::config::Config) {
         if settings.devtools == DevtoolsConsent::Deny || !settings.devtools_grants.is_empty() {
             crate::diagnostics::clear(&format!("app.{app}.devtools"));
         }
+        if settings.devtools != DevtoolsConsent::Deny {
+            crate::diagnostics::clear(&devtools::off_problem(app));
+        }
     }
     for grant in &config.package_access {
         crate::diagnostics::clear(&format!("android.package.{}", grant.package));
