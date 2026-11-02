@@ -618,7 +618,7 @@
     "on": "On",
     "pair": "Pair",
     "turnOn": "Turn on",
-    "how": "Pair opens wireless debugging. Turn it on, tap “Pair device with pairing code”, keep that dialog open and type its six digits into Cursio's notification."
+    "how": "Pair opens wireless debugging. Turn it on, tap “Pair device with pairing code” and keep that dialog open. Into Cursio's notification type the port after the dialog's address, then its six digits — for example 37421 123456."
   },
   "phoneScreen": {
     "title": "This screen → computer",

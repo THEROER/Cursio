@@ -261,15 +261,22 @@ object CursioNative {
     /** Pair this phone's shell with its pairing service at [addr]; why it failed, or `""`. Blocks. */
     external fun nativeShellPair(addr: String, code: String): String
 
-    /** Run [command] as this phone's `shell` through [addr]: `ok\t` and its output, or `error\t` and why. Blocks. */
-    external fun nativeShellExec(addr: String, command: String): String
+    /** Run [command] as this phone's `shell`: `ok\t` and its output, or `error\t` and why. Blocks. */
+    external fun nativeShellExec(command: String): String
 
     /** Whether this phone's shell is paired. */
     external fun nativeShellPaired(): Boolean
 
-    /** This phone's debugging port while wireless debugging is on, or `""`; asked by the node. */
+    /** A line from [ShellAccess] into the node's log. */
+    external fun nativeShellLog(warn: Boolean, message: String)
+
+    /** This phone's debugging port as mDNS showed it, or `""`; asked by the node. */
     @JvmStatic
     fun shellAddr(): String = ShellAccess.connectAddr ?: ""
+
+    /** This phone's Wi-Fi address, or `""`; asked by the node. */
+    @JvmStatic
+    fun shellHost(): String = ShellAccess.wifiAddress() ?: ""
 
     /** A line from the screen capture into the node's log, which computers read without ADB. */
     external fun nativeScreenLog(warn: Boolean, message: String)

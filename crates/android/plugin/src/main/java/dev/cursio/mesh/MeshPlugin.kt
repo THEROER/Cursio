@@ -538,7 +538,7 @@ class MeshPlugin(private val activity: Activity) : Plugin(activity) {
         state.put("touch", ScreenTouch.enabled(activity) && ScreenTouch.connected())
         state.put("showingScreen", MeshService.showingScreen())
         state.put("shell", CursioNative.nativeShellPaired())
-        state.put("shellOn", ShellAccess.connectAddr != null)
+        state.put("shellOn", ShellAccess.on(activity))
         return state
     }
 

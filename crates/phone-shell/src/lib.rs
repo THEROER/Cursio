@@ -83,7 +83,7 @@ pub async fn pair(addr: &str, code: &str, key: &AdbKey) -> Result<String, ShellE
 /// goes into it is the caller's — as the phone's `shell` user through its
 /// debugging port at `addr`, answering what it printed (stdout and stderr
 /// together, at most [`MAX_OUTPUT`] bytes).
-pub async fn exec(addr: &str, key: AdbKey, command: &str) -> Result<Vec<u8>, ShellError> {
+pub async fn exec(addr: &str, key: &mut AdbKey, command: &str) -> Result<Vec<u8>, ShellError> {
     let mut conn = connect(addr, key).await?;
     let mut out = vec![0u8; MAX_OUTPUT];
     let len = libadb::exec::run(&mut conn, command, &mut out)
@@ -96,18 +96,70 @@ pub async fn exec(addr: &str, key: AdbKey, command: &str) -> Result<Vec<u8>, She
     Ok(out)
 }
 
+/// The ports wireless debugging picks from, for its pairing and its
+/// debugging service alike.
+pub const PORTS: std::ops::RangeInclusive<u16> = 30000..=49999;
+
+/// Find the debugging port of the phone at `host` by trying every port of
+/// [`PORTS`]: the ones that open are asked to run `true` with `key`, and the
+/// first that does is the one.
+///
+/// What a program on the phone is left with: Android's own mDNS does not show
+/// an app the services the same phone advertises (seen on HyperOS 3 /
+/// Android 16), and the port changes every time debugging is turned on. A
+/// connection to a closed port on the phone's own address is refused at once,
+/// so the sweep takes a second or two.
+pub async fn find_debugging_port(host: &str, key: &mut AdbKey) -> Option<u16> {
+    use tokio::task::JoinSet;
+    let mut open = Vec::new();
+    let mut probes = JoinSet::new();
+    for port in PORTS {
+        if probes.len() >= SWEEP_AT_ONCE {
+            if let Some(Ok(Some(found))) = probes.join_next().await {
+                open.push(found);
+            }
+        }
+        let addr = format!("{host}:{port}");
+        probes.spawn(async move {
+            let attempt = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                tokio::net::TcpStream::connect(&addr),
+            );
+            matches!(attempt.await, Ok(Ok(_))).then_some(port)
+        });
+    }
+    while let Some(done) = probes.join_next().await {
+        if let Ok(Some(found)) = done {
+            open.push(found);
+        }
+    }
+    open.sort_unstable();
+    for port in open {
+        let addr = format!("{host}:{port}");
+        let tried =
+            tokio::time::timeout(std::time::Duration::from_secs(5), exec(&addr, key, "true"));
+        if matches!(tried.await, Ok(Ok(_))) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Connections the port sweep opens at once.
+const SWEEP_AT_ONCE: usize = 512;
+
 /// Most a command's output may be; past it [`exec`] fails rather than cut.
 pub const MAX_OUTPUT: usize = 1024 * 1024;
 
 async fn connect(
     addr: &str,
-    key: AdbKey,
+    key: &mut AdbKey,
 ) -> Result<Connection<MaybeTls<libadb::TokioTcp>>, ShellError> {
     let refused = |why: String| ShellError::Refused {
         addr: addr.to_owned(),
         why,
     };
-    let tls = tls_config(&key).map_err(refused)?;
+    let tls = tls_config(key).map_err(refused)?;
     let socket = tcp(addr).await?;
     Connection::connect_tls(
         MaybeTls::plain(socket),

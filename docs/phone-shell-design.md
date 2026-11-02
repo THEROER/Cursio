@@ -21,8 +21,16 @@ phone's node reaches its own `shell`, with no computer and no cable.
    six digits its "Pair device with pairing code" screen shows. Cursio's key
    (RSA, generated on the phone, kept in its private files) is then on the
    phone's **Paired devices** list, where the person can remove it.
-2. The node connects to the phone's own debugging port (found by mDNS,
-   `_adb-tls-connect._tcp`, on its own address) and gets `shell`.
+2. The node connects to the phone's own debugging port and gets `shell`.
+   The port is found by trying the ports wireless debugging picks from
+   (30000–49999) on the phone's Wi-Fi address and asking each open one to
+   run `true` with Cursio's key — about a second — and kept until it stops
+   answering, since it changes only when debugging is turned on again.
+   Android's mDNS was the plan and is still listened to, but on HyperOS 3 /
+   Android 16 it does not show an app the services its own phone
+   advertises: discovery ran and found neither. For the same reason the
+   pairing notification asks for the port beside the code (both are on the
+   pairing dialog), and takes the code alone only when mDNS did show it.
 3. Through that connection it starts a helper from its own APK as `shell`
    (`app_process`, the way scrcpy starts its server). The helper does what
    only `shell` may: sound, screen, `pm install`. It speaks to the node over

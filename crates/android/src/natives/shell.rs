@@ -25,22 +25,20 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeShellPair<'a>(
         .unwrap_or_else(|_| JString::default())
 }
 
-/// Run shell source `command` through the debugging port at `addr`; answers
-/// `ok\t` and the output, or `error\t` and why.
+/// Run shell source `command` as this phone's `shell`; answers `ok\t` and
+/// the output, or `error\t` and why. Blocks, a sweep for the port included.
 #[no_mangle]
 pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeShellExec<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass<'a>,
-    addr: JString<'a>,
     command: JString<'a>,
 ) -> JString<'a> {
     let answer = guard(
         &mut env,
         "error\tthe phone's node failed".to_string(),
         |env| {
-            let addr: String = env.get_string(&addr)?.into();
             let command: String = env.get_string(&command)?.into();
-            Ok(match crate::shell::exec(&addr, &command) {
+            Ok(match crate::shell::run(&command) {
                 Ok(out) => format!("ok\t{out}"),
                 Err(why) => format!("error\t{why}"),
             })
@@ -48,6 +46,27 @@ pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeShellExec<'a>(
     );
     env.new_string(answer)
         .unwrap_or_else(|_| JString::default())
+}
+
+/// A line from the shell's Kotlin half into the node's log, which computers
+/// read without ADB: what mDNS saw and what pairing did happened in logcat
+/// only, out of sight from a computer.
+#[no_mangle]
+pub extern "system" fn Java_dev_cursio_mesh_CursioNative_nativeShellLog<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    warn: jboolean,
+    message: JString<'a>,
+) {
+    guard(&mut env, (), |env| {
+        let message: String = env.get_string(&message)?.into();
+        if warn != JNI_FALSE {
+            tracing::warn!(target: "cursio_android::shell", "{message}");
+        } else {
+            tracing::info!(target: "cursio_android::shell", "{message}");
+        }
+        Ok(())
+    })
 }
 
 /// Whether this phone's key was paired with its wireless debugging.

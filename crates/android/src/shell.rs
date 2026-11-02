@@ -1,17 +1,23 @@
 //! This phone's own `shell`, reached through its wireless debugging
 //! (`docs/phone-shell-design.md`).
 //!
-//! Kotlin finds the phone's pairing and debugging services by mDNS — Android's
-//! own `NsdManager` sees them, where a library browsing the network may not —
-//! and hands the addresses down; the key, the pairing and every command are
-//! here. The key lives in the node's data directory, which neither backup nor
-//! device-to-device transfer copies: it is this phone's shell.
+//! The key, the pairing and every command are here; Kotlin says where the
+//! phone is (its Wi-Fi address) and, when Android's mDNS shows it, where the
+//! debugging port is. On HyperOS 3 / Android 16 it shows neither of the
+//! phone's own services to an app, so the debugging port is found by trying
+//! the ports wireless debugging picks from ([`find_debugging_port`]) and kept
+//! until it stops answering — it changes only when debugging is turned on
+//! again.
 //!
-//! Paired is a file beside the key holding the phone's answer. Losing it only
-//! costs saying "paired" in the window; the phone's own Paired devices list
-//! is what decides, and an unpaired key is refused there with a reason.
+//! The key lives in the node's data directory, which neither backup nor
+//! device-to-device transfer copies: it is this phone's shell. Paired is a
+//! file beside it holding the phone's answer; losing that only costs saying
+//! "paired" in the window, since the phone's own Paired devices list decides.
+//!
+//! [`find_debugging_port`]: cursio_phone_shell::find_debugging_port
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Where the key and the paired marker live.
 fn dir() -> Result<PathBuf, String> {
@@ -23,14 +29,15 @@ fn dir() -> Result<PathBuf, String> {
 const PAIRED: &str = "paired";
 
 /// The name the phone lists this key under in its Paired devices.
-fn key_name() -> String {
-    "cursio@this-phone".to_owned()
-}
+const KEY_NAME: &str = "cursio@this-phone";
+
+/// The debugging port last found by trying, `host:port`.
+static FOUND: Mutex<Option<String>> = Mutex::new(None);
 
 fn key() -> Result<cursio_phone_shell::AdbKey, String> {
     let dir = dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot keep the debugging key: {e}"))?;
-    cursio_phone_shell::key(&dir, &key_name()).map_err(|e| e.to_string())
+    cursio_phone_shell::key(&dir, KEY_NAME).map_err(|e| e.to_string())
 }
 
 /// Whether this phone's key was paired with its wireless debugging.
@@ -49,7 +56,8 @@ fn block<T>(future: impl std::future::Future<Output = T>) -> Result<T, String> {
 }
 
 /// Pair with the phone's pairing service at `addr` with the six-digit
-/// `code` its screen shows.
+/// `code` its screen shows, then say in the node's log — which every
+/// computer reads — whether the shell now really answers.
 pub fn pair(addr: &str, code: &str) -> Result<(), String> {
     let key = key()?;
     let guid = block(cursio_phone_shell::pair(addr, code, &key))?.map_err(|e| e.to_string())?;
@@ -57,44 +65,67 @@ pub fn pair(addr: &str, code: &str) -> Result<(), String> {
     std::fs::write(dir.join(PAIRED), &guid)
         .map_err(|e| format!("paired, but cannot note it: {e}"))?;
     tracing::info!(%guid, "this phone's shell is paired");
-    // Said in the node's log, which every computer reads: whether the key
-    // now really reaches the shell, not only whether pairing answered.
-    match connect_addr() {
-        Some(addr) => match exec(&addr, "id -un") {
-            Ok(user) => tracing::info!(user = %user.trim(), %addr, "this phone's shell answers"),
-            Err(why) => {
-                tracing::warn!(%why, %addr, "paired, but this phone's shell does not answer")
-            }
-        },
-        None => {
-            tracing::info!("paired; the debugging port is not seen yet, so the shell is not tried")
-        }
+    match run("id -un") {
+        Ok(user) => tracing::info!(user = %user.trim(), "this phone's shell answers"),
+        Err(why) => tracing::warn!(%why, "paired, but this phone's shell does not answer"),
     }
     Ok(())
 }
 
-/// This phone's debugging port while wireless debugging is on, as Kotlin's
-/// mDNS sees it.
-pub fn connect_addr() -> Option<String> {
-    let addr = crate::jvm::with_native(|env, class| {
-        let addr = env
-            .call_static_method(class, "shellAddr", "()Ljava/lang/String;", &[])?
-            .l()?;
-        let addr: String = env.get_string(&jni::objects::JString::from(addr))?.into();
-        Ok(addr)
-    })
-    .map_err(|why| tracing::warn!(%why, "cannot ask where this phone's debugging port is"))
-    .ok()?;
-    (!addr.is_empty()).then_some(addr)
+/// Run shell source `command` as the phone's `shell` user, finding the
+/// debugging port first when it is not known or no longer answers.
+pub fn run(command: &str) -> Result<String, String> {
+    if !paired() {
+        return Err("this phone's shell is not paired yet: pair it in Cursio's settings".into());
+    }
+    let mut key = key()?;
+    let known = known_addr();
+    if let Some(addr) = &known {
+        match block(cursio_phone_shell::exec(addr, &mut key, command))? {
+            Ok(out) => return Ok(String::from_utf8_lossy(&out).into_owned()),
+            Err(why) => {
+                tracing::debug!(%addr, %why, "the known debugging port did not answer; looking again")
+            }
+        }
+    }
+    *lock() = None;
+    let host = host().ok_or("this phone has no Wi-Fi address; wireless debugging needs Wi-Fi")?;
+    let port = block(cursio_phone_shell::find_debugging_port(&host, &mut key))?.ok_or(
+        "wireless debugging is off, or this key is not on the phone's Paired devices: \
+         turn it on in the developer settings, or pair again",
+    )?;
+    let addr = format!("{host}:{port}");
+    tracing::info!(%addr, "found this phone's debugging port");
+    *lock() = Some(addr.clone());
+    let out =
+        block(cursio_phone_shell::exec(&addr, &mut key, command))?.map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Run shell source `command` as the phone's `shell` user through its
-/// debugging port at `addr`.
-pub fn exec(addr: &str, command: &str) -> Result<String, String> {
-    if !paired() {
-        return Err("this phone's shell is not paired yet: pair it in Cursio's window".into());
-    }
-    let key = key()?;
-    let out = block(cursio_phone_shell::exec(addr, key, command))?.map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&out).into_owned())
+fn lock() -> std::sync::MutexGuard<'static, Option<String>> {
+    FOUND.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The debugging port as mDNS showed it, else as last found by trying.
+fn known_addr() -> Option<String> {
+    ask("shellAddr").or_else(|| lock().clone())
+}
+
+/// This phone's Wi-Fi address.
+fn host() -> Option<String> {
+    ask("shellHost")
+}
+
+/// A `CursioNative` method answering a string, `""` meaning none.
+fn ask(method: &str) -> Option<String> {
+    let answer = crate::jvm::with_native(|env, class| {
+        let answer = env
+            .call_static_method(class, method, "()Ljava/lang/String;", &[])?
+            .l()?;
+        let answer: String = env.get_string(&jni::objects::JString::from(answer))?.into();
+        Ok(answer)
+    })
+    .map_err(|why| tracing::warn!(%method, %why, "cannot ask Kotlin about this phone's debugging"))
+    .ok()?;
+    (!answer.is_empty()).then_some(answer)
 }

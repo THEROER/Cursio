@@ -37,4 +37,5 @@
     public static void onBuildProgressDone(...);
     public static void onAppInstalled(...);
     public static java.lang.String shellAddr(...);
+    public static java.lang.String shellHost(...);
 }

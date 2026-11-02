@@ -15,12 +15,12 @@ use std::path::PathBuf;
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: shell_probe KEYDIR pair HOST:PORT CODE | KEYDIR exec HOST:PORT COMMAND...";
+    let usage = "usage: shell_probe KEYDIR pair HOST:PORT CODE | KEYDIR exec HOST:PORT COMMAND... | KEYDIR find HOST";
     let (Some(dir), Some(what), Some(addr)) = (args.first(), args.get(1), args.get(2)) else {
         eprintln!("{usage}");
         std::process::exit(2);
     };
-    let key = match cursio_phone_shell::key(&PathBuf::from(dir), "cursio@probe") {
+    let mut key = match cursio_phone_shell::key(&PathBuf::from(dir), "cursio@probe") {
         Ok(key) => key,
         Err(e) => {
             eprintln!("{e}");
@@ -37,7 +37,14 @@ async fn main() {
                 std::process::exit(2);
             }
         },
-        "exec" => cursio_phone_shell::exec(addr, key, &args[3..].join(" ")).await,
+        "exec" => cursio_phone_shell::exec(addr, &mut key, &args[3..].join(" ")).await,
+        "find" => cursio_phone_shell::find_debugging_port(addr, &mut key)
+            .await
+            .map(|port| format!("debugging port {port}\n").into_bytes())
+            .ok_or_else(|| cursio_phone_shell::ShellError::Unreachable {
+                addr: addr.clone(),
+                why: "no port answered as this key's shell".into(),
+            }),
         _ => {
             eprintln!("{usage}");
             std::process::exit(2);
