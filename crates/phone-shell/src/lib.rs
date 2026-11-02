@@ -130,6 +130,71 @@ pub async fn exec(addr: &str, key: &mut AdbKey, command: &str) -> Result<Vec<u8>
     Ok(out)
 }
 
+/// Install (or replace) the APK at `apk` as the phone's `shell`, which no
+/// person is asked to confirm. Answers the package manager's last word,
+/// `Success` when it took the APK.
+///
+/// The bytes go down the command's stdin, the way `adb install` streams
+/// them (`cmd package install -S <size>`): the `shell` user cannot read the
+/// files of the app holding the APK, so the package manager could not be
+/// handed a path.
+pub async fn install(addr: &str, key: &mut AdbKey, apk: &Path) -> Result<String, ShellError> {
+    use tokio::io::AsyncReadExt as _;
+    let command = |why: String| ShellError::Command {
+        command: format!("install {}", apk.display()),
+        why,
+    };
+    let mut file = tokio::fs::File::open(apk)
+        .await
+        .map_err(|e| command(e.to_string()))?;
+    let size = file
+        .metadata()
+        .await
+        .map_err(|e| command(e.to_string()))?
+        .len();
+    let mut conn = connect(addr, key).await?;
+    let mut dest = vec![0u8; 128];
+    let line = format!("cmd package install -r -S {size}");
+    let mut session = libadb::exec::open(&mut conn, &line, &mut dest)
+        .await
+        .map_err(|e| command(e.to_string()))?;
+    let mut chunk = vec![0u8; INSTALL_CHUNK];
+    loop {
+        let read = file
+            .read(&mut chunk)
+            .await
+            .map_err(|e| command(e.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        session
+            .write_stdin(&chunk[..read])
+            .await
+            .map_err(|e| command(e.to_string()))?;
+    }
+    let mut said = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    loop {
+        match session.read(&mut buf).await {
+            Ok(n) => said.extend_from_slice(&buf[..n]),
+            Err(libadb::Error::ChannelClosed) => break,
+            Err(e) => return Err(command(e.to_string())),
+        }
+    }
+    let said = String::from_utf8_lossy(&said).trim().to_owned();
+    match said.lines().last() {
+        Some(last) if last.starts_with("Success") => Ok(last.to_owned()),
+        _ => Err(command(if said.is_empty() {
+            "the package manager said nothing".into()
+        } else {
+            said
+        })),
+    }
+}
+
+/// Bytes sent at a time while streaming an APK.
+const INSTALL_CHUNK: usize = 64 * 1024;
+
 /// The ports wireless debugging picks from, for its pairing and its
 /// debugging service alike.
 pub const PORTS: std::ops::RangeInclusive<u16> = 30000..=49999;

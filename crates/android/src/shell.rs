@@ -45,14 +45,22 @@ pub fn paired() -> bool {
     dir().is_ok_and(|d| d.join(PAIRED).is_file())
 }
 
-/// Run `future` to its end on a runtime of its own: Kotlin calls in from a
-/// thread of its own, which is no Tokio worker.
-fn block<T>(future: impl std::future::Future<Output = T>) -> Result<T, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map(|rt| rt.block_on(future))
-        .map_err(|e| format!("cannot start a runtime: {e}"))
+/// Run `future` to its end on a runtime of its own, on a thread of its own:
+/// called from Kotlin's threads and from the update agent's Tokio tasks
+/// alike, and a runtime cannot be started inside another.
+fn block<T: Send>(future: impl std::future::Future<Output = T> + Send) -> Result<T, String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map(|rt| rt.block_on(future))
+                    .map_err(|e| format!("cannot start a runtime: {e}"))
+            })
+            .join()
+            .map_err(|_| "the shell's thread panicked".to_owned())?
+    })
 }
 
 /// Pair with the phone's pairing service at `addr` with the six-digit
@@ -75,14 +83,36 @@ pub fn pair(addr: &str, code: &str) -> Result<(), String> {
 /// Run shell source `command` as the phone's `shell` user, finding the
 /// debugging port first when it is not known or no longer answers.
 pub fn run(command: &str) -> Result<String, String> {
+    let mut key = paired_key()?;
+    let addr = address(&mut key)?;
+    let out =
+        block(cursio_phone_shell::exec(&addr, &mut key, command))?.map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Install the APK at `apk` as the phone's `shell`: no person is asked.
+/// What the update agent does with a build from a trusted builder once this
+/// phone's shell is paired; without it, the installer and its tap.
+pub fn install(apk: &std::path::Path) -> Result<(), String> {
+    let mut key = paired_key()?;
+    let addr = address(&mut key)?;
+    block(cursio_phone_shell::install(&addr, &mut key, apk))?.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn paired_key() -> Result<cursio_phone_shell::AdbKey, String> {
     if !paired() {
         return Err("this phone's shell is not paired yet: pair it in Cursio's settings".into());
     }
-    let mut key = key()?;
-    let known = known_addr();
-    if let Some(addr) = &known {
-        match block(cursio_phone_shell::exec(addr, &mut key, command))? {
-            Ok(out) => return Ok(String::from_utf8_lossy(&out).into_owned()),
+    key()
+}
+
+/// The debugging port that answers this key now: the known one if it
+/// still does, else found again by trying.
+fn address(key: &mut cursio_phone_shell::AdbKey) -> Result<String, String> {
+    if let Some(addr) = known_addr() {
+        match block(cursio_phone_shell::exec(&addr, key, "true"))? {
+            Ok(_) => return Ok(addr),
             Err(why) => {
                 tracing::debug!(%addr, %why, "the known debugging port did not answer; looking again")
             }
@@ -90,16 +120,14 @@ pub fn run(command: &str) -> Result<String, String> {
     }
     *lock() = None;
     let host = host().ok_or("this phone has no Wi-Fi address; wireless debugging needs Wi-Fi")?;
-    let port = block(cursio_phone_shell::find_debugging_port(&host, &mut key))?.ok_or(
+    let port = block(cursio_phone_shell::find_debugging_port(&host, key))?.ok_or(
         "wireless debugging is off, or this key is not on the phone's Paired devices: \
          turn it on in the developer settings, or pair again",
     )?;
     let addr = format!("{host}:{port}");
     tracing::info!(%addr, "found this phone's debugging port");
     *lock() = Some(addr.clone());
-    let out =
-        block(cursio_phone_shell::exec(&addr, &mut key, command))?.map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&out).into_owned())
+    Ok(addr)
 }
 
 fn lock() -> std::sync::MutexGuard<'static, Option<String>> {

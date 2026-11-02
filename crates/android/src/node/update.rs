@@ -349,6 +349,23 @@ fn offer_app_to_installer(
     version: &str,
 ) -> Result<(), UpdateError> {
     let apk = app_apk(layout, version)?;
+    let problem = format!("app.{app}.signer");
+    // A paired shell installs it with no tap (`docs/phone-shell-design.md`);
+    // the build already came from a builder this phone trusts. Without one —
+    // debugging off, or the package manager refusing — the installer and its
+    // notification, which also say why a signature does not match.
+    if crate::shell::paired() {
+        match crate::shell::install(&apk) {
+            Ok(()) => {
+                tracing::info!(%app, %version, "installed an application's build through this phone's shell, with no tap");
+                cursio_core::diagnostics::clear(&problem);
+                return Ok(());
+            }
+            Err(why) => {
+                tracing::warn!(%app, %version, %why, "could not install through this phone's shell; offering it to the installer")
+            }
+        }
+    }
     let path = apk.to_string_lossy().into_owned();
     let refusal = crate::jvm::with_native(|env, class| {
         let path = env.new_string(&path)?;
@@ -371,7 +388,6 @@ fn offer_app_to_installer(
         Ok(answer)
     })
     .map_err(|why| UpdateError::Refused(format!("the phone could not offer {app}: {why}")))?;
-    let problem = format!("app.{app}.signer");
     if !refusal.is_empty() {
         tracing::warn!(%app, %version, %refusal, "an application's build cannot replace what is installed");
         cursio_core::diagnostics::raise(cursio_core::diagnostics::Problem {

@@ -98,6 +98,18 @@ command from a computer — whether a phone of a given make accepts it.
    under the node's data directory, `shell/`). The debugging port is
    watched for as long as the node runs; once paired the node runs `id -un`
    through it and says the answer in its log, readable from a computer.
-3. `pm install` for builds from a trusted builder, with no tap.
+3. `pm install` for builds from a trusted builder, with no tap. **Built for
+   applications' builds**: `offer_app_to_installer` installs through the
+   shell when it is paired (`cursio_phone_shell::install`, the APK streamed
+   down the command's stdin as `adb install` does — `cmd package install -r
+   -S <size>` — since `shell` cannot read Cursio's files), and falls back to
+   the installer's notification when debugging is off or the package
+   manager refuses (a different signing key, which the installer's check
+   then names). The phone notices the install within 3 s, so `apps ship`
+   returns or opens the application on its own. Streaming measured from a
+   computer: Cursio's own APK replaced in 5 s with nothing asked. Cursio's
+   own builds still go through the notification: installing them replaces
+   the running node, which should wait for a quiet moment, as a computer's
+   switch does.
 4. The `shell` helper: sound by `REMOTE_SUBMIX`/playback capture, then the
    screen, both without the projection's consent.

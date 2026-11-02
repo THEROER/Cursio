@@ -15,7 +15,7 @@ use std::path::PathBuf;
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: shell_probe KEYDIR pair HOST:PORT CODE | KEYDIR exec HOST:PORT COMMAND... | KEYDIR find HOST";
+    let usage = "usage: shell_probe KEYDIR pair HOST:PORT CODE | KEYDIR exec HOST:PORT COMMAND... | KEYDIR install HOST:PORT APK | KEYDIR find HOST";
     let (Some(dir), Some(what), Some(addr)) = (args.first(), args.get(1), args.get(2)) else {
         eprintln!("{usage}");
         std::process::exit(2);
@@ -38,6 +38,15 @@ async fn main() {
             }
         },
         "exec" => cursio_phone_shell::exec(addr, &mut key, &args[3..].join(" ")).await,
+        "install" => match args.get(3) {
+            Some(apk) => cursio_phone_shell::install(addr, &mut key, std::path::Path::new(apk))
+                .await
+                .map(|said| format!("{said}\n").into_bytes()),
+            None => {
+                eprintln!("{usage}");
+                std::process::exit(2);
+            }
+        },
         "find" => cursio_phone_shell::find_debugging_port(addr, &mut key)
             .await
             .map(|port| format!("debugging port {port}\n").into_bytes())
