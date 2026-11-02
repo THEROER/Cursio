@@ -95,20 +95,7 @@ pub fn waiting_apk(app: Option<&str>) -> Result<String, String> {
 /// Swiping it away, or backing out of the installer, used to lose the only
 /// way back to it.
 pub fn window_shown() {
-    if let Some(builds) = cursio_core::apps::builds::builds() {
-        for agent in builds.known() {
-            let Some(waiting) = agent.waiting() else {
-                continue;
-            };
-            match app_apk(agent.layout(), &waiting.version) {
-                Ok(apk) if apk_installed(&apk) => agent.now_running(&waiting.version),
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(app = agent.subject(), %error, "a waiting build has no APK to offer")
-                }
-            }
-        }
-    }
+    note_installed();
     for waiting in cursio_core::update::agent::waiting() {
         let Ok(agent) = agent_for(waiting.app.as_deref()) else {
             continue;
@@ -132,7 +119,8 @@ pub fn window_shown() {
 /// progress, from the first byte to the last: a launcher sent from a
 /// computer was otherwise invisible on the phone until the installer opened.
 /// Polled once a second rather than pushed from the lane, which runs per
-/// link and per window of bytes; the first call starts it.
+/// link and per window of bytes; the first call starts it. The same thread
+/// notices builds the person installed ([`note_installed`]).
 pub fn watch_fetches() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
@@ -140,8 +128,11 @@ pub fn watch_fetches() {
             .name("cursio-fetches".into())
             .spawn(|| {
                 let mut shown: std::collections::HashMap<String, i32> = Default::default();
-                loop {
+                for tick in 0u64.. {
                     std::thread::sleep(std::time::Duration::from_secs(1));
+                    if tick % INSTALLED_EVERY == 0 {
+                        note_installed();
+                    }
                     let now = cursio_core::update::agent::fetching();
                     let mut seen = std::collections::HashSet::new();
                     for fetch in now {
@@ -177,6 +168,9 @@ pub fn watch_fetches() {
         }
     });
 }
+
+/// How many seconds apart installed builds are looked for.
+const INSTALLED_EVERY: u64 = 3;
 
 fn progress(key: &str, title: &str, text: &str, percent: i32) {
     if let Err(why) = crate::jvm::with_native(|env, class| {
@@ -246,6 +240,35 @@ pub fn look(app: &str, version: &str) -> cursio_core::update::agent::Look {
     cursio_core::update::agent::Look {
         label: ask("apkLabel"),
         icon: ask("apkIcon"),
+    }
+}
+
+/// Mark every application build the person has put on since it was offered
+/// as running. Asked when the window comes to the front and every few
+/// seconds besides: a build counts as current for `apps ship` only once it is
+/// installed, so whoever shipped it learns when it really is — an agent about
+/// to test it on the phone included — not when the installer was offered it.
+fn note_installed() {
+    let Some(builds) = cursio_core::apps::builds::builds() else {
+        return;
+    };
+    for agent in builds.known() {
+        let Some(ready) = agent.ready().filter(|_| agent.hands_on()) else {
+            continue;
+        };
+        if agent.status().running == ready.version {
+            continue;
+        }
+        match app_apk(agent.layout(), &ready.version) {
+            Ok(apk) if apk_installed(&apk) => {
+                tracing::info!(app = agent.subject(), version = %ready.version, "an application's build was installed");
+                agent.now_running(&ready.version);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(app = agent.subject(), %error, "a waiting build has no APK to check")
+            }
+        }
     }
 }
 

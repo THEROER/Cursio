@@ -62,6 +62,17 @@ pub fn launch(
     // which may have been installed some other way, so no build from the
     // mesh is needed for that.
     if builds.hands_to_installer() {
+        // Current here means handed to the installer; installed is when the
+        // phone saw the package at that version. `apps ship` waits on this
+        // answer, so it reports the build arrived only once it is on.
+        if let Some(wanted) = version {
+            if agent.status().running != wanted {
+                return Err(format!(
+                    "{id} {wanted} is not current here yet: it waits for this phone's person \
+                     to install it (the notification, or Install in Cursio's window)"
+                ));
+            }
+        }
         if !start {
             let version = current.ok_or_else(|| format!("no build of {id} is installed here"))?;
             return Ok(format!(

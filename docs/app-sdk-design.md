@@ -437,8 +437,12 @@ private directory, which another app cannot open. Two steps:
    names that setting; nothing changes it. A requested version that differs
    from the installed versionName is reported (the build may still be at the
    installer). `--restart` only opens: one app cannot end another without
-   root. `ship`'s waiting (`start=false`) still answers about the build
-   offered to the installer. Logs are served only if the app writes into a
+   root. A version named to a phone (`ship`, `launch --version`) counts as
+   current only once it is **installed**, not when it is offered to the
+   installer: the phone looks every 3 s whether the package is on at that
+   version, so `ship` returns — or opens it — when the build is really
+   there, which is what an agent about to test it needs to know. Logs are
+   served only if the app writes into a
    directory Cursio can read (its `Android/media/<package>/` folder, under
    Cursio's all-files access).
 2. **SDK on Android (built, step 6).** The node listens on the abstract
