@@ -253,6 +253,15 @@ installer on the file, served by the plugin's own `UpdateFileProvider`. The
 first time, Android also asks to let Cursio install apps. The installer
 replaces the app and Android restarts it; there is no helper and no pointer.
 
+While a build comes in, the phone shows it: the control status lists every
+fetch with its bytes (`fetching_builds`, control v23, from each agent's
+`progress`), the same card shows a bar for each, and a silent ongoing
+notification carries the same bar, refreshed once a second by a thread of
+the node (`watch_fetches`) and taken down when the fetch ends. An APK sent
+from a computer was otherwise invisible on the phone until the installer
+opened. A waiting application build is named by its APK's label and icon
+(`UpdateOffer.label`/`icon`, through `agent::set_looker`), not its id.
+
 The notification is not the only way to the installer: swiped away, or the
 installer backed out of by a mis-tap, it used to leave nothing to press. The
 control status lists every build waiting for the person (`waiting_builds`,
