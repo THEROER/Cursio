@@ -74,6 +74,10 @@ pub struct Status {
     /// waiting on its system installer. Defaulted from a v21 node.
     #[serde(default)]
     pub waiting_builds: Vec<crate::update::agent::WaitingBuild>,
+    /// Builds coming in over the mesh now, with how far each is. Defaulted
+    /// from a v22 node.
+    #[serde(default)]
+    pub fetching_builds: Vec<crate::update::agent::FetchingBuild>,
 }
 
 /// A machine this node has heard announce itself on the LAN.
@@ -342,6 +346,7 @@ impl NodeState {
             call_setup: crate::calls_hub::hub().setup(),
             desk,
             waiting_builds: crate::update::agent::waiting(),
+            fetching_builds: crate::update::agent::fetching(),
         }
     }
 }

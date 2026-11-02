@@ -214,6 +214,15 @@ object CursioNative {
     @JvmStatic
     fun apkLabel(path: String): String = UpdateOffer.label(java.io.File(path)) ?: ""
 
+    /** A build coming in over the mesh, [percent] of the way; see [UpdateOffer.progress]. */
+    @JvmStatic
+    fun onBuildProgress(key: String, title: String, text: String, percent: Int) =
+        UpdateOffer.progress(key, title, text, percent)
+
+    /** The build [key] stopped coming in, received or not. */
+    @JvmStatic
+    fun onBuildProgressDone(key: String) = UpdateOffer.progressDone(key)
+
     /** The icon the APK at [path] carries, as base64 PNG, or `""`. */
     @JvmStatic
     fun apkIcon(path: String): String = UpdateOffer.icon(java.io.File(path)) ?: ""

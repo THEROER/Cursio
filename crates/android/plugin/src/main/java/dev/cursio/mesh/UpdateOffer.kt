@@ -84,6 +84,38 @@ object UpdateOffer {
         return encoded
     }
 
+    /**
+     * A build coming in over the mesh, as an ongoing silent notification
+     * with a bar: sent from a computer, it was otherwise invisible here until
+     * the installer opened.
+     */
+    fun progress(key: String, title: String, text: String, percent: Int) {
+        val ctx = context
+        val manager = ctx.getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(PROGRESS_CHANNEL_ID, "Builds coming in", NotificationManager.IMPORTANCE_LOW),
+        )
+        val notification = NotificationCompat.Builder(ctx, PROGRESS_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setContentTitle(title)
+            .setContentText("$text · $percent%")
+            .setProgress(100, percent, false)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .build()
+        manager.notify(progressId(key), notification)
+    }
+
+    fun progressDone(key: String) {
+        context.getSystemService(NotificationManager::class.java).cancel(progressId(key))
+    }
+
+    private fun progressId(key: String) = PROGRESS_ID + (key.hashCode() and 0xffff)
+
+    private const val PROGRESS_CHANNEL_ID = "cursio_build_progress"
+    private const val PROGRESS_ID = 0x0c1000
+
     private val icons = HashMap<String, String>()
     private const val ICON_PX = 96
 

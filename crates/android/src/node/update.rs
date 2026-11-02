@@ -16,7 +16,7 @@ use cursio_core::config::Config;
 use cursio_core::update::agent::Agent;
 use cursio_core::update::layout::InstallLayout;
 use cursio_core::update::UpdateError;
-use jni::objects::JValue;
+use jni::objects::{JObject, JValue};
 
 /// The component of a phone build: the APK itself.
 pub const APK_COMPONENT: &str = "apk";
@@ -125,6 +125,93 @@ pub fn window_shown() {
         if let Err(error) = offered {
             tracing::warn!(app = ?waiting.app, version = %waiting.version, %error, "could not offer a waiting build again");
         }
+    }
+}
+
+/// Show every build coming in over the mesh as a notification with its
+/// progress, from the first byte to the last: a launcher sent from a
+/// computer was otherwise invisible on the phone until the installer opened.
+/// Polled once a second rather than pushed from the lane, which runs per
+/// link and per window of bytes; the first call starts it.
+pub fn watch_fetches() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("cursio-fetches".into())
+            .spawn(|| {
+                let mut shown: std::collections::HashMap<String, i32> = Default::default();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let now = cursio_core::update::agent::fetching();
+                    let mut seen = std::collections::HashSet::new();
+                    for fetch in now {
+                        let key =
+                            format!("{}@{}", fetch.app.as_deref().unwrap_or(""), fetch.version);
+                        let percent = match fetch.total {
+                            0 => 0,
+                            total => i32::try_from(fetch.received.saturating_mul(100) / total)
+                                .unwrap_or(100)
+                                .min(100),
+                        };
+                        seen.insert(key.clone());
+                        if shown.get(&key) == Some(&percent) {
+                            continue;
+                        }
+                        let name = fetch.app.as_deref().unwrap_or("Cursio");
+                        let title = format!("Receiving {name} {}", fetch.version);
+                        let text = format!("from {}", fetch.from);
+                        progress(&key, &title, &text, percent);
+                        shown.insert(key, percent);
+                    }
+                    shown.retain(|key, _| {
+                        let going = seen.contains(key);
+                        if !going {
+                            progress_done(key);
+                        }
+                        going
+                    });
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "cannot show builds coming in; no notification will say so");
+        }
+    });
+}
+
+fn progress(key: &str, title: &str, text: &str, percent: i32) {
+    if let Err(why) = crate::jvm::with_native(|env, class| {
+        let key = JObject::from(env.new_string(key)?);
+        let title = JObject::from(env.new_string(title)?);
+        let text = JObject::from(env.new_string(text)?);
+        env.call_static_method(
+            class,
+            "onBuildProgress",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V",
+            &[
+                JValue::Object(&key),
+                JValue::Object(&title),
+                JValue::Object(&text),
+                JValue::Int(percent),
+            ],
+        )?;
+        Ok(())
+    }) {
+        tracing::warn!(%why, "could not show a build coming in");
+    }
+}
+
+fn progress_done(key: &str) {
+    if let Err(why) = crate::jvm::with_native(|env, class| {
+        let key = JObject::from(env.new_string(key)?);
+        env.call_static_method(
+            class,
+            "onBuildProgressDone",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&key)],
+        )?;
+        Ok(())
+    }) {
+        tracing::warn!(%why, "could not take down a build's progress");
     }
 }
 

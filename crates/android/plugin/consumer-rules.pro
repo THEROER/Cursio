@@ -33,4 +33,6 @@
     public static boolean apkInstalled(...);
     public static java.lang.String apkLabel(...);
     public static java.lang.String apkIcon(...);
+    public static void onBuildProgress(...);
+    public static void onBuildProgressDone(...);
 }

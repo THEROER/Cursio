@@ -132,6 +132,40 @@ pub struct WaitingBuild {
     pub icon: Option<String>,
 }
 
+/// A build coming in over the mesh right now, for the app's progress bar and
+/// a phone's notification: what was sent there was otherwise invisible on
+/// it until the installer opened, minutes later for an APK.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchingBuild {
+    /// The application, or `None` for Cursio itself.
+    pub app: Option<String>,
+    pub version: String,
+    pub from: String,
+    pub received: u64,
+    pub total: u64,
+}
+
+/// Every build this machine is fetching now, Cursio's first.
+pub fn fetching() -> Vec<FetchingBuild> {
+    let apps = crate::apps::builds::builds()
+        .map(|b| b.known())
+        .unwrap_or_default();
+    global()
+        .into_iter()
+        .chain(apps)
+        .filter_map(|agent| {
+            let progress = agent.status().progress?;
+            Some(FetchingBuild {
+                app: agent.app().map(str::to_owned),
+                version: progress.version,
+                from: progress.from,
+                received: progress.received,
+                total: progress.total,
+            })
+        })
+        .collect()
+}
+
 /// How an application's build shows to the person.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Look {

@@ -603,6 +603,7 @@
   },
   "phoneUpdate": {
     "ready": "{name} {version} is ready to install",
+    "receiving": "Receiving {name} {version}",
     "from": "from {machine}",
     "install": "Install",
     "failed": "The installer did not open"

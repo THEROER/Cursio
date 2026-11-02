@@ -186,6 +186,8 @@ export interface NodeStatusReply {
   desk?: DeskView
   /** Builds a phone holds that only the person can install; absent from a node older than control v22. */
   waiting_builds?: WaitingBuild[]
+  /** Builds coming in over the mesh now; absent from a node older than control v23. */
+  fetching_builds?: FetchingBuild[]
 }
 
 /** Mirrors `cursio_core::update::agent::WaitingBuild`. */
@@ -200,6 +202,16 @@ export interface WaitingBuild {
   label?: string
   /** The application's icon, base64 PNG; absent as `label` is. */
   icon?: string
+}
+
+/** Mirrors `cursio_core::update::agent::FetchingBuild`. */
+export interface FetchingBuild {
+  /** The application, or `null` for Cursio itself. */
+  app: string | null
+  version: string
+  from: string
+  received: number
+  total: number
 }
 
 /** Mirrors `cursio_core::desk::DeskView`: millimetres on the desk. */
