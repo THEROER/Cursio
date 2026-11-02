@@ -275,6 +275,24 @@ merged by time with the app's own log.
   answered at once without launching: restarting an application nobody
   allowed inspecting would only cost its person its state. The waiting is
   `apps::tunnel::open_launching`, tested with fakes.
+- **Android's System WebView (SDK 0.7.0)**: the WebView opens its DevTools
+  on the abstract socket `@webview_devtools_remote_<pid>` once the app calls
+  `WebView.setWebContentsDebuggingEnabled(true)`, and accepts a connection
+  only from its own app's uid, `shell` or `root` — the node, another app, is
+  turned away. So `App::devtools(cursio_sdk::android_webview())` has the SDK
+  open a bridge inside the application, `@cursio-devtools-<pid>`, which lets
+  in only the node's uid (read with `SO_PEERCRED` off the SDK's connection to
+  the node) and joins each connection to the WebView's socket. The kind is
+  `Devtools::AbstractSocket { name }`, declared by `ClientMsg::Devtools` after
+  the welcome rather than in the hello: an older node would refuse a hello
+  with a kind it cannot read, where it answers an unknown message
+  `Unsupported` and keeps the application. `Devtools` also gained `Unknown`
+  (`#[serde(other)]`) so a hello naming a later kind is read. The owner check
+  is the connection itself (`apps::devtools::connect_abstract`): an abstract
+  socket has no file, and the kernel says who listens only to whoever
+  connects, so the node connects and keeps the stream only if the listener's
+  pid is one the application registered. The console as a log is read only
+  from a port, and says so for a socket.
 - **Not built**: discovery of rungs in `apps status`, a notification and tray
   entry beyond the problem, WebKitGTK through WebDriver, and a live run
   against a deployed WebView2 application.

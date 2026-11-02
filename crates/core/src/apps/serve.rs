@@ -616,6 +616,10 @@ async fn serve_connection<S: AsyncRead + AsyncWrite>(
                     let peers = super::mesh::peers(&app);
                     let _ = out.send(NodeMsg::Peers { id, peers });
                 }
+                Ok(ClientMsg::Devtools { devtools }) => {
+                    tracing::info!(%app, process = ?key.process, ?devtools, "application declared its DevTools");
+                    lock(registry).set_devtools(&key, Some(devtools));
+                }
                 Err(_) => {
                     let feature = message_kind(&line).unwrap_or_else(|| "not a message".into());
                     tracing::debug!(%app, %feature, "an application sent a message this node does not know");

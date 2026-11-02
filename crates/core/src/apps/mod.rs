@@ -233,7 +233,7 @@ impl Registry {
             .iter()
             .filter(|(key, r)| key.app == *app && r.running())
             .filter(|(key, _)| process.is_none_or(|p| key.process.as_ref() == Some(p)))
-            .find_map(|(key, r)| Some((key.clone(), r.pid?, r.devtools?)))
+            .find_map(|(key, r)| Some((key.clone(), r.pid?, r.devtools.clone()?)))
     }
 
     /// Every pid `app`'s running processes registered with.

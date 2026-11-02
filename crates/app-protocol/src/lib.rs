@@ -419,15 +419,26 @@ pub struct AppPeer {
     pub topics: Vec<TopicName>,
 }
 
-/// A DevTools endpoint a process opened on loopback (`docs/devtools-design.md`,
-/// rung 5). Only the port crosses: the node forwards nothing but a loopback
-/// port that this very process listens on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A DevTools endpoint a process opened on this machine
+/// (`docs/devtools-design.md`, rung 5). The node forwards nothing but an
+/// endpoint this very process listens on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Devtools {
-    /// The Chrome DevTools Protocol: WebView2 (Tauri on Windows), Electron,
-    /// CEF — `--remote-debugging-port=<port>`.
+    /// The Chrome DevTools Protocol on a loopback port: WebView2 (Tauri on
+    /// Windows), Electron, CEF — `--remote-debugging-port=<port>`.
     Cdp { port: u16 },
+    /// The Chrome DevTools Protocol on the abstract Unix socket `@<name>`
+    /// (Linux and Android): what Android's System WebView opens, as
+    /// `webview_devtools_remote_<pid>`, once the app calls
+    /// `WebView.setWebContentsDebuggingEnabled(true)`. Declared only through
+    /// [`ClientMsg::Devtools`], never in a hello, so a node that does not
+    /// know it answers [`NodeMsg::Unsupported`] instead of refusing the
+    /// application.
+    AbstractSocket { name: String },
+    /// A kind this build does not know, from a newer one.
+    #[serde(other)]
+    Unknown,
 }
 
 /// An action a process declares in its hello: what it is called, what it
@@ -615,6 +626,12 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "is_zero")]
         dropped: u64,
     },
+    /// This process's DevTools endpoint, declared after the welcome rather
+    /// than in the hello: a kind added since — [`Devtools::AbstractSocket`] —
+    /// would make an older node refuse the whole hello, where an unknown
+    /// message is only answered [`NodeMsg::Unsupported`]. Replaces what the
+    /// hello declared.
+    Devtools { devtools: Devtools },
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -1089,6 +1106,36 @@ mod tests {
             decode_line::<ClientMsg>(text.trim_end().as_bytes()).unwrap(),
             hello
         );
+    }
+
+    #[test]
+    fn an_abstract_socket_is_declared_after_the_welcome_with_pinned_bytes() {
+        let declared = ClientMsg::Devtools {
+            devtools: Devtools::AbstractSocket {
+                name: "cursio-devtools-3".into(),
+            },
+        };
+        let text = line(&declared);
+        assert_eq!(
+            text,
+            "{\"msg\":\"devtools\",\"devtools\":{\"kind\":\"abstract_socket\",\"name\":\"cursio-devtools-3\"}}\n"
+        );
+        assert_eq!(
+            decode_line::<ClientMsg>(text.trim_end().as_bytes()).unwrap(),
+            declared
+        );
+    }
+
+    #[test]
+    fn a_hello_naming_a_devtools_kind_from_a_newer_build_is_still_read() {
+        let hello = decode_line::<ClientMsg>(
+            b"{\"msg\":\"hello\",\"protocol\":1,\"app\":\"leavepulse\",\"version\":\"9\",\"pid\":3,\"devtools\":{\"kind\":\"webdriver\",\"port\":4444}}",
+        )
+        .unwrap();
+        let ClientMsg::Hello { devtools, .. } = hello else {
+            panic!("not a hello");
+        };
+        assert_eq!(devtools, Some(Devtools::Unknown));
     }
 
     #[test]

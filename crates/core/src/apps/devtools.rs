@@ -20,7 +20,8 @@
 //! table, that one of the application's registered processes is what listens
 //! on it, and on loopback. Without that any program of the user could declare
 //! any local service — a database, another program's debugger — and have the
-//! mesh carry it.
+//! mesh carry it. An abstract socket (Android's WebView) is checked the one
+//! way the kernel allows, by connecting and reading who listens.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -201,19 +202,39 @@ pub const NOT_DECLARED: &str = "declares a DevTools endpoint";
 /// an application just started answers until its web view is up.
 pub const NOT_LISTENING: &str = "nothing listens on";
 
-/// The loopback port of `app`'s DevTools (`process`'s when named), checked to
-/// be listened on by that very process.
-pub fn endpoint(app: &AppId, process: Option<&ProcessName>) -> Result<u16, String> {
-    let (key, pid, devtools) = super::registry()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .devtools(app, process)
-        .ok_or_else(|| {
+/// Where an application's DevTools are, once checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    /// A loopback port its process listens on.
+    Port(u16),
+    /// An abstract Unix socket; whose it is is learnt by connecting, so the
+    /// check is [`connect_abstract`]'s, against these pids.
+    Abstract { name: String, pids: Vec<u32> },
+}
+
+/// Where `app`'s DevTools (`process`'s when named) are. A port is checked
+/// here to be listened on by that very process; an abstract socket is
+/// checked when connected to.
+pub fn endpoint(app: &AppId, process: Option<&ProcessName>) -> Result<Endpoint, String> {
+    let (key, pid, devtools, pids) = {
+        let registry = super::registry().lock().unwrap_or_else(|p| p.into_inner());
+        let (key, pid, devtools) = registry.devtools(app, process).ok_or_else(|| {
             format!("no running process of {app} here {NOT_DECLARED} (App::devtools)")
         })?;
-    let Devtools::Cdp { port } = devtools;
+        let pids = registry.pids(app);
+        (key, pid, devtools, pids)
+    };
+    let port = match devtools {
+        Devtools::Cdp { port } => port,
+        Devtools::AbstractSocket { name } => return Ok(Endpoint::Abstract { name, pids }),
+        Devtools::Unknown => {
+            return Err(format!(
+                "{app} declares a kind of DevTools this build of Cursio does not know; update it"
+            ))
+        }
+    };
     match listener(port)? {
-        Listener::Loopback(owner) if owner == pid => Ok(port),
+        Listener::Loopback(owner) if owner == pid => Ok(Endpoint::Port(port)),
         Listener::Loopback(owner) => Err(format!(
             "port {port} that {} declared is listened on by another process ({owner}); \
              nothing is forwarded",
@@ -228,6 +249,54 @@ pub fn endpoint(app: &AppId, process: Option<&ProcessName>) -> Result<u16, Strin
         )),
     }
 }
+
+/// Connect to the abstract socket `@name`, and keep the connection only if
+/// one of `pids` is what listens on it.
+///
+/// An abstract socket has no file and no owner to look up; the kernel says
+/// who listens only to whoever connects (`SO_PEERCRED`, the listener's
+/// credentials from when it called `listen`). So the check is the connection.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn connect_abstract(name: &str, pids: &[u32]) -> Result<Box<dyn Socket>, String> {
+    #[cfg(target_os = "android")]
+    use std::os::android::net::SocketAddrExt;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+        .map_err(|e| format!("@{name} is not a socket name: {e}"))?;
+    let stream = std::os::unix::net::UnixStream::connect_addr(&addr)
+        .map_err(|e| format!("{NOT_LISTENING} the declared DevTools socket @{name}: {e}"))?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| format!("cannot use the DevTools socket @{name}: {e}"))?;
+    let stream = tokio::net::UnixStream::from_std(stream)
+        .map_err(|e| format!("cannot use the DevTools socket @{name}: {e}"))?;
+    let owner = stream
+        .peer_cred()
+        .map_err(|e| format!("cannot tell who listens on @{name}: {e}"))?
+        .pid()
+        .and_then(|pid| u32::try_from(pid).ok());
+    match owner {
+        Some(pid) if pids.contains(&pid) => Ok(Box::new(stream)),
+        Some(pid) => Err(format!(
+            "the DevTools socket @{name} is listened on by another process ({pid}); \
+             nothing is forwarded"
+        )),
+        None => Err(format!("the system would not say who listens on @{name}")),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn connect_abstract(name: &str, _pids: &[u32]) -> Result<Box<dyn Socket>, String> {
+    Err(format!(
+        "@{name} is an abstract socket, which only Linux and Android have"
+    ))
+}
+
+/// A connection to DevTools, whichever kind of endpoint it reached.
+pub trait Socket: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Socket for T {}
 
 /// Who listens on a TCP port of this machine.
 #[derive(Debug, PartialEq, Eq)]
@@ -363,6 +432,23 @@ mod tests {
    0: 0100007F:2406 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242 1 0000000000000000 100 0 0 10 0
    1: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 777 1 0000000000000000 100 0 0 10 0
    2: 0100007F:2406 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 999 1 0000000000000000 20 4 30 10 -1";
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_abstract_socket_is_reached_only_when_the_application_listens_on_it() {
+        use std::os::linux::net::SocketAddrExt;
+        let name = format!("cursio-test-devtools-{}", uuid::Uuid::new_v4());
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        let ours = std::process::id();
+        assert!(connect_abstract(&name, &[ours]).is_ok());
+        let theirs = connect_abstract(&name, &[ours + 1]).err().unwrap();
+        assert!(theirs.contains("another process"), "{theirs}");
+        let nobody = connect_abstract("cursio-test-nobody-listens", &[ours])
+            .err()
+            .unwrap();
+        assert!(nobody.contains(NOT_LISTENING), "{nobody}");
+    }
 
     #[test]
     fn only_listening_sockets_count_and_loopback_is_told_apart() {

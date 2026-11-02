@@ -44,7 +44,9 @@ pub use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
+mod bridge;
 mod log;
+use bridge::NodeUid;
 #[cfg(feature = "tracing")]
 pub use log::CursioLayer;
 pub use log::LogLevel;
@@ -272,9 +274,13 @@ impl App {
         self
     }
 
-    /// This process opened a DevTools endpoint on loopback — for a Chromium
-    /// web view, `--remote-debugging-port=<port>` — which another machine may
-    /// inspect through Cursio (`cursio devtools`, `cursio mcp`'s `web_*`).
+    /// This process opened a DevTools endpoint — for a Chromium web view on a
+    /// desktop, `--remote-debugging-port=<port>` as [`Devtools::Cdp`]; for
+    /// Android's System WebView, [`android_webview`] — which another machine
+    /// may inspect through Cursio (`cursio devtools`, `cursio mcp`'s `web_*`).
+    ///
+    /// An abstract socket is reached through a bridge this SDK opens, which
+    /// lets in only the Cursio node: the WebView accepts no other app.
     ///
     /// DevTools run any code inside the application and read what it
     /// stores, so declare it only in a build or a run meant for it (behind
@@ -405,6 +411,13 @@ impl App {
             messages: Arc::new(listeners),
             on_blob: self.on_blob.clone(),
         };
+        // A port goes in the hello, which every node since 0.5 reads; an
+        // abstract socket only after the welcome, so a node that does not
+        // know it says so instead of refusing the application.
+        let (in_hello, abstract_target) = match self.devtools {
+            Some(Devtools::AbstractSocket { name }) => (None, Some(name)),
+            other => (other, None),
+        };
         let hello = ClientMsg::Hello {
             protocol: PROTOCOL,
             app: id,
@@ -415,7 +428,7 @@ impl App {
             actions: specs,
             topics,
             blobs: self.on_blob.is_some(),
-            devtools: self.devtools,
+            devtools: in_hello,
         };
         let endpoint = self.endpoint.unwrap_or_else(cursio_app_protocol::endpoint);
         let shared = Arc::new(Mutex::new(Link::Connecting));
@@ -439,6 +452,7 @@ impl App {
                     requests_rx,
                     hooks,
                     queued,
+                    abstract_target,
                 ))
             })
             .map_err(|e| Error::Thread(e.to_string()))?;
@@ -449,6 +463,17 @@ impl App {
             rejected,
             logs,
         })
+    }
+}
+
+/// The DevTools of this process's Android System WebView, for
+/// [`App::devtools`]: `@webview_devtools_remote_<pid>`, which the WebView
+/// opens once the app calls `WebView.setWebContentsDebuggingEnabled(true)`
+/// (in Tauri, before the window is built). Only in a build or a run meant
+/// for it, as for any DevTools.
+pub fn android_webview() -> Devtools {
+    Devtools::AbstractSocket {
+        name: format!("webview_devtools_remote_{}", std::process::id()),
     }
 }
 
@@ -964,6 +989,7 @@ enum Ended {
     Stop,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     endpoint: PathBuf,
     hello: ClientMsg,
@@ -972,15 +998,24 @@ async fn run(
     mut requests: mpsc::UnboundedReceiver<Request>,
     hooks: Hooks,
     logs: Arc<LogShared>,
+    abstract_target: Option<String>,
 ) {
     let set = |link: Link| *shared.lock().unwrap_or_else(|p| p.into_inner()) = link;
+    let node = Arc::new(NodeUid::default());
+    let declare = abstract_target.map(|target| ClientMsg::Devtools {
+        devtools: Devtools::AbstractSocket {
+            name: bridge::open(target, node.clone()),
+        },
+    });
     let mut wait = RETRY_MIN;
     loop {
         let ended = match connect(&endpoint).await {
             Ok(stream) => {
+                node.learn(&stream);
                 session(
                     stream,
                     &hello,
+                    declare.as_ref(),
                     &set,
                     &mut health,
                     &mut requests,
@@ -1104,9 +1139,11 @@ impl Drop for AbortOnDrop {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
     stream: S,
     hello: &ClientMsg,
+    declare: Option<&ClientMsg>,
     set: &impl Fn(Link),
     health: &mut watch::Receiver<(HealthState, Option<String>)>,
     requests: &mut mpsc::UnboundedReceiver<Request>,
@@ -1126,6 +1163,11 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
         Ok(NodeMsg::Welcome { machine, .. }) => set(Link::Connected { machine }),
         Ok(NodeMsg::Refused { reason }) => return Ended::Refused(reason),
         _ => return Ended::Closed,
+    }
+    if let Some(declare) = declare {
+        if write.write_all(&encode_line(declare)).await.is_err() {
+            return Ended::Closed;
+        }
     }
     let send_health = |(state, detail): (HealthState, Option<String>)| {
         encode_line(&ClientMsg::Health { state, detail })
@@ -1438,6 +1480,36 @@ mod tests {
         assert_eq!(
             nowhere.set_health(HealthState::Degraded, None),
             Err(Error::NotRunning)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_abstract_devtools_socket_is_declared_after_the_welcome_as_its_bridge() {
+        let path = socket();
+        let heard = fake_node(
+            path.clone(),
+            NodeMsg::Welcome {
+                protocol: 1,
+                machine: "POCO".into(),
+            },
+        );
+        let _app = App::new("demo")
+            .devtools(android_webview())
+            .endpoint(&path)
+            .start()
+            .unwrap();
+        match heard.recv_timeout(Duration::from_secs(10)).unwrap() {
+            ClientMsg::Hello { devtools, .. } => assert_eq!(devtools, None),
+            other => panic!("expected hello, got {other:?}"),
+        }
+        assert_eq!(
+            heard.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ClientMsg::Devtools {
+                devtools: Devtools::AbstractSocket {
+                    name: format!("cursio-devtools-{}", std::process::id())
+                }
+            }
         );
     }
 

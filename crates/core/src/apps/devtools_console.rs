@@ -124,7 +124,10 @@ async fn run(app: &AppId, process: Option<&ProcessName>) {
     }
     while still_wanted(app) {
         let page = match super::devtools::endpoint(app, process) {
-            Ok(port) => Cdp::local(port).await,
+            Ok(super::devtools::Endpoint::Port(port)) => Cdp::local(port).await,
+            Ok(super::devtools::Endpoint::Abstract { name, .. }) => Err(format!(
+                "the console is read only from a DevTools port, and {app} declares the socket @{name}"
+            )),
             Err(why) => Err(why),
         };
         let mut page = match page {

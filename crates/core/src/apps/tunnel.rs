@@ -305,17 +305,21 @@ async fn open_here(
     peer: &str,
     app: &str,
     process: Option<&str>,
-) -> Result<tokio::net::TcpStream, String> {
+) -> Result<Box<dyn super::devtools::Socket>, String> {
+    use super::devtools::Endpoint;
     let id = AppId::parse(app).map_err(|e| e.to_string())?;
     let process = process
         .map(ProcessName::parse)
         .transpose()
         .map_err(|e| e.to_string())?;
     super::devtools::allowed(peer, &id)?;
-    let port = super::devtools::endpoint(&id, process.as_ref())?;
-    tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .map_err(|e| format!("cannot reach {app}'s DevTools on port {port}: {e}"))
+    match super::devtools::endpoint(&id, process.as_ref())? {
+        Endpoint::Port(port) => tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map(|s| Box::new(s) as Box<dyn super::devtools::Socket>)
+            .map_err(|e| format!("cannot reach {app}'s DevTools on port {port}: {e}")),
+        Endpoint::Abstract { name, pids } => super::devtools::connect_abstract(&name, &pids),
+    }
 }
 
 /// How long a listener with no connection stays.
