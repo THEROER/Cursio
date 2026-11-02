@@ -210,6 +210,14 @@ object CursioNative {
     @JvmStatic
     fun apkInstalled(path: String): Boolean = UpdateOffer.installed(java.io.File(path))
 
+    /** The application name the APK at [path] carries, or `""`. */
+    @JvmStatic
+    fun apkLabel(path: String): String = UpdateOffer.label(java.io.File(path)) ?: ""
+
+    /** The icon the APK at [path] carries, as base64 PNG, or `""`. */
+    @JvmStatic
+    fun apkIcon(path: String): String = UpdateOffer.icon(java.io.File(path)) ?: ""
+
     /** Paired computers, as `address\tname` lines; see [BtLink]. */
     @JvmStatic
     fun btComputers(): String = BtLink.computers()

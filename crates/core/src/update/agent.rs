@@ -122,6 +122,33 @@ pub struct WaitingBuild {
     pub version: String,
     pub from: String,
     pub published_at: u64,
+    /// What the person knows the application as — on a phone, its APK's
+    /// label rather than its id. Absent when nothing here can say, and from
+    /// an older node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The application's icon as base64 PNG, small; absent as `label` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+/// How an application's build shows to the person.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Look {
+    pub label: Option<String>,
+    /// Base64 PNG.
+    pub icon: Option<String>,
+}
+
+/// Says how an application's waiting build (its id and version) looks.
+type Looker = Box<dyn Fn(&str, &str) -> Look + Send + Sync>;
+
+static LOOKER: OnceLock<Looker> = OnceLock::new();
+
+/// How this machine shows an application's build; a phone reads its APK's
+/// label and icon. The first call wins.
+pub fn set_looker(looker: impl Fn(&str, &str) -> Look + Send + Sync + 'static) {
+    let _ = LOOKER.set(Box::new(looker));
 }
 
 /// What a lane should do with an offer.
@@ -239,11 +266,17 @@ impl Agent {
             return None;
         }
         let ready = self.ready()?;
+        let look = self
+            .app()
+            .and_then(|app| LOOKER.get().map(|look| look(app, &ready.version)))
+            .unwrap_or_default();
         Some(WaitingBuild {
             app: self.app().map(str::to_owned),
             version: ready.version,
             from: ready.from,
             published_at: ready.published_at,
+            label: look.label,
+            icon: look.icon,
         })
     }
 
@@ -964,6 +997,8 @@ mod tests {
                 version: "0.9.0+apk".into(),
                 from: "Nocturne".into(),
                 published_at: 9,
+                label: None,
+                icon: None,
             })
         );
         agent.now_running("0.9.0+apk");

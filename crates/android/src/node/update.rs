@@ -128,6 +128,40 @@ pub fn window_shown() {
     }
 }
 
+/// The name and icon the APK of `app`'s waiting `version` carries, for the
+/// window to show it by rather than by its id.
+pub fn look(app: &str, version: &str) -> cursio_core::update::agent::Look {
+    let Some(path) = agent_for(Some(app))
+        .ok()
+        .and_then(|agent| app_apk(agent.layout(), version).ok())
+    else {
+        return Default::default();
+    };
+    let path = path.to_string_lossy().into_owned();
+    let ask = |method: &str| -> Option<String> {
+        let answer = crate::jvm::with_native(|env, class| {
+            let path = env.new_string(&path)?;
+            let answer = env
+                .call_static_method(
+                    class,
+                    method,
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Object(&path)],
+                )?
+                .l()?;
+            let answer: String = env.get_string(&jni::objects::JString::from(answer))?.into();
+            Ok(answer)
+        })
+        .map_err(|why| tracing::warn!(%app, %why, "could not read how a build's application looks"))
+        .ok()?;
+        (!answer.is_empty()).then_some(answer)
+    };
+    cursio_core::update::agent::Look {
+        label: ask("apkLabel"),
+        icon: ask("apkIcon"),
+    }
+}
+
 /// Whether the package `apk` holds is installed at its version or later.
 fn apk_installed(apk: &std::path::Path) -> bool {
     let path = apk.to_string_lossy().into_owned();

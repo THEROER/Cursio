@@ -31,4 +31,6 @@
     public static java.lang.String btComputers(...);
     public static java.lang.String btConnect(...);
     public static boolean apkInstalled(...);
+    public static java.lang.String apkLabel(...);
+    public static java.lang.String apkIcon(...);
 }

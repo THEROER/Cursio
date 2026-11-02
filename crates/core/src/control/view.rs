@@ -595,6 +595,8 @@ mod tests {
             version: "0.6.0+x".into(),
             from: "Nocturne".into(),
             published_at: 9,
+            label: Some("LeavePulse Launcher".into()),
+            icon: Some("iVBORw0KGgo=".into()),
         }];
         let mut json = serde_json::to_value(&status).unwrap();
         let read: Status = serde_json::from_value(json.clone()).unwrap();

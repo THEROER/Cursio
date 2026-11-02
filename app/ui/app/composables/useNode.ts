@@ -196,6 +196,10 @@ export interface WaitingBuild {
   /** The machine it came from; empty when found on disk after a restart. */
   from: string
   published_at: number
+  /** The application's own name, from its APK; absent when the phone cannot say, and for Cursio. */
+  label?: string
+  /** The application's icon, base64 PNG; absent as `label` is. */
+  icon?: string
 }
 
 /** Mirrors `cursio_core::desk::DeskView`: millimetres on the desk. */

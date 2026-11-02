@@ -48,8 +48,54 @@ object UpdateOffer {
         val apk = File(path)
         refusal(apk)?.let { return it }
         // One notification per application: the newest of each replaces it.
-        notify(apk, "$app update ready", "Tap to install $version", NOTIFICATION_ID + 1 + (app.hashCode() and 0xffff))
+        val name = label(apk) ?: app
+        notify(apk, "$name update ready", "Tap to install $version", NOTIFICATION_ID + 1 + (app.hashCode() and 0xffff))
         return ""
+    }
+
+    /**
+     * The application name [apk] carries, or null. An archive's label is
+     * read only once its source paths point at the archive itself.
+     */
+    fun label(apk: File): String? {
+        val pm = context.packageManager
+        val info = archived(apk) ?: return null
+        return pm.getApplicationLabel(info).toString().takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * The icon [apk] carries, as base64 PNG of [ICON_PX] square, or null.
+     * Kept per file: the window asks with every status, and one build's APK
+     * never changes under its path.
+     */
+    fun icon(apk: File): String? {
+        synchronized(icons) { icons[apk.path] }?.let { return it }
+        val info = archived(apk) ?: return null
+        val drawable = context.packageManager.getApplicationIcon(info)
+        val bitmap = android.graphics.Bitmap.createBitmap(ICON_PX, ICON_PX, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bitmap)
+        drawable.setBounds(0, 0, ICON_PX, ICON_PX)
+        drawable.draw(canvas)
+        val png = java.io.ByteArrayOutputStream()
+        bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, png)
+        bitmap.recycle()
+        val encoded = android.util.Base64.encodeToString(png.toByteArray(), android.util.Base64.NO_WRAP)
+        synchronized(icons) { icons[apk.path] = encoded }
+        return encoded
+    }
+
+    private val icons = HashMap<String, String>()
+    private const val ICON_PX = 96
+
+    /**
+     * [apk]'s application info, readable for its label and icon: an
+     * archive's resources load only once its source paths name the archive.
+     */
+    private fun archived(apk: File): android.content.pm.ApplicationInfo? {
+        val info = context.packageManager.getPackageArchiveInfo(apk.path, 0)?.applicationInfo ?: return null
+        info.sourceDir = apk.path
+        info.publicSourceDir = apk.path
+        return info
     }
 
     /**

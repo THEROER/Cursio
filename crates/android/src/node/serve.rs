@@ -195,6 +195,7 @@ fn phone_modules(
     cursio_core::media_hub::hub().set_display(crate::media::AndroidDisplay::shared());
     cursio_core::phone_screen::set_backend(crate::screen::AndroidScreen::shared());
     cursio_core::phone_hands::install(std::sync::Arc::new(crate::screen::AndroidHands));
+    cursio_core::update::agent::set_looker(super::update::look);
     modules
 }
 

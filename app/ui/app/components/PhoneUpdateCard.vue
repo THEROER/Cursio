@@ -31,10 +31,16 @@ async function install(build: WaitingBuild) {
 <template>
   <LpCard v-if="waiting.length" padded class="flex flex-col gap-3">
     <div v-for="build in waiting" :key="keyOf(build)" class="flex items-center gap-3">
-      <LpIcon name="lucide:download" :size="18" class="shrink-0 text-brand" />
+      <img
+        v-if="build.icon"
+        :src="`data:image/png;base64,${build.icon}`"
+        alt=""
+        class="size-8 shrink-0 rounded-lg"
+      />
+      <LpIcon v-else name="lucide:download" :size="18" class="shrink-0 text-brand" />
       <div class="min-w-0 flex-1">
         <p class="truncate text-sm font-medium">
-          {{ t("phoneUpdate.ready", { name: build.app ?? "Cursio", version: build.version }) }}
+          {{ t("phoneUpdate.ready", { name: build.label ?? build.app ?? "Cursio", version: build.version }) }}
         </p>
         <p v-if="build.from" class="truncate text-xs text-muted">
           {{ t("phoneUpdate.from", { machine: build.from }) }}
