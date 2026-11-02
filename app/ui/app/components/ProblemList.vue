@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { Problem, ProblemAction } from "~/composables/useNode"
 
-defineProps<{ problems: Problem[] }>()
+const props = defineProps<{ problems: Problem[] }>()
 
 const { t } = useI18n()
 const { applyConfigEdit } = useNode()
@@ -11,13 +11,23 @@ const toast = useCursioToast()
 const busy = ref<string | null>(null)
 
 /**
- * A button is a config change the node offered; making it ends the problem,
- * which disappears with the next status the node pushes.
+ * Problems answered here, by id, with the `since` they had then. A button is
+ * a config change the node offered, and the node takes the problem down once
+ * it holds no longer — but a problem it forgot to take down stayed with its
+ * button live, to be pressed again and again. Hidden until the node raises it
+ * anew, with a later `since`.
  */
+const answered = ref(new Map<string, string>())
+
+const shown = computed(() =>
+  props.problems.filter((p) => answered.value.get(p.id) !== JSON.stringify(p.since)),
+)
+
 async function act(problem: Problem, action: ProblemAction) {
   busy.value = problem.id
   try {
     await applyConfigEdit(action.edit)
+    answered.value.set(problem.id, JSON.stringify(problem.since))
     toast.success(t("settings.saved"))
   } catch (e) {
     toast.failure(e, { title: t("problems.actionFailed"), retry: () => act(problem, action) })
@@ -51,14 +61,14 @@ const badge = { Info: "brand", Warning: "warning", Error: "danger" } as const
 
 <template>
   <LpEmptyState
-    v-if="problems.length === 0"
+    v-if="shown.length === 0"
     compact
     icon="lucide:circle-check"
     :title="t('problems.none')"
     :description="t('problems.noneHint')"
   />
   <ul v-else class="flex flex-col gap-2">
-    <li v-for="problem in problems" :key="problem.id">
+    <li v-for="problem in shown" :key="problem.id">
       <LpCard padded class="flex gap-3">
         <LpIcon :name="icon[problem.severity]" :size="18" class="mt-0.5 shrink-0" :class="tone[problem.severity]" />
         <div class="flex min-w-0 flex-1 flex-col gap-2">
