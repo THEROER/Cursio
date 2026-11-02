@@ -957,7 +957,7 @@ pub fn list() -> Vec<Value> {
             false, false,
             json!({
                 "app": { "type": "string", "description": "the application's id" },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "PLATFORM=PATH (windows-x86_64, linux-x86_64, android-aarch64) or a path for this machine's platform" },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "PLATFORM=PATH (windows-x86_64, linux-x86_64, android-aarch64) or a path: an .apk is android-aarch64, anything else this machine's platform" },
                 "version": { "type": "string" },
                 "admin": { "type": "array", "items": { "type": "string" }, "description": "file names that ask to run as administrator" },
             }),

@@ -452,12 +452,21 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// `[PLATFORM=]FILE` arguments, grouped by platform.
+/// The platform every phone build is for.
+const PHONE_PLATFORM: &str = "android-aarch64";
+
+/// `[PLATFORM=]FILE` arguments, grouped by platform. A file naming none is
+/// for this machine — except an APK, which only a phone installs: taken as
+/// this machine's, it was published for a computer and waited for at the
+/// phone until the wait ran out.
 fn by_platform(files: &[String]) -> anyhow::Result<BTreeMap<String, Vec<PathBuf>>> {
     let mut grouped: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for arg in files {
         let (platform, path) = match arg.split_once('=') {
             Some((platform, path)) => (platform.to_owned(), PathBuf::from(path)),
+            None if arg.to_ascii_lowercase().ends_with(".apk") => {
+                (PHONE_PLATFORM.to_owned(), PathBuf::from(arg))
+            }
             None => (cursio_protocol::update::this_platform(), PathBuf::from(arg)),
         };
         if !path.is_file() {
@@ -635,8 +644,14 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(grouped["windows-x86_64"], [exe]);
-        assert_eq!(grouped["android-aarch64"], [apk]);
+        assert_eq!(grouped["android-aarch64"], [apk.clone()]);
         assert!(by_platform(&[dir.join("missing").display().to_string()]).is_err());
+        let bare = by_platform(&[apk.display().to_string()]).unwrap();
+        assert_eq!(
+            bare[PHONE_PLATFORM],
+            [apk],
+            "an APK naming no platform is a phone's"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
