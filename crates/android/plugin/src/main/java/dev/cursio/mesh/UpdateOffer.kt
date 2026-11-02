@@ -49,9 +49,20 @@ object UpdateOffer {
         refusal(apk)?.let { return it }
         // One notification per application: the newest of each replaces it.
         val name = label(apk) ?: app
-        notify(apk, "$name update ready", "Tap to install $version", NOTIFICATION_ID + 1 + (app.hashCode() and 0xffff))
+        notify(apk, "$name update ready", "Tap to install $version", appNotification(app))
         return ""
     }
+
+    /**
+     * [app]'s build is on: take its offer out of the shade. Installed from
+     * the app's own Install button, the notification otherwise stayed,
+     * offering what was already there.
+     */
+    fun installedApp(app: String) {
+        context.getSystemService(NotificationManager::class.java).cancel(appNotification(app))
+    }
+
+    private fun appNotification(app: String) = NOTIFICATION_ID + 1 + (app.hashCode() and 0xffff)
 
     /**
      * The application name [apk] carries, or null. An archive's label is

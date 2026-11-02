@@ -263,12 +263,29 @@ fn note_installed() {
             Ok(apk) if apk_installed(&apk) => {
                 tracing::info!(app = agent.subject(), version = %ready.version, "an application's build was installed");
                 agent.now_running(&ready.version);
+                installed_notice(agent.subject());
             }
             Ok(_) => {}
             Err(error) => {
                 tracing::debug!(app = agent.subject(), %error, "a waiting build has no APK to check")
             }
         }
+    }
+}
+
+/// Take `app`'s install offer out of the notification shade.
+fn installed_notice(app: &str) {
+    if let Err(why) = crate::jvm::with_native(|env, class| {
+        let app = JObject::from(env.new_string(app)?);
+        env.call_static_method(
+            class,
+            "onAppInstalled",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&app)],
+        )?;
+        Ok(())
+    }) {
+        tracing::warn!(%app, %why, "could not take down an installed build's notification");
     }
 }
 

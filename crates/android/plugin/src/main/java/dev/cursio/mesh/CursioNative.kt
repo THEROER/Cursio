@@ -219,6 +219,10 @@ object CursioNative {
     fun onBuildProgress(key: String, title: String, text: String, percent: Int) =
         UpdateOffer.progress(key, title, text, percent)
 
+    /** [app]'s offered build is installed; its notification goes. */
+    @JvmStatic
+    fun onAppInstalled(app: String) = UpdateOffer.installedApp(app)
+
     /** The build [key] stopped coming in, received or not. */
     @JvmStatic
     fun onBuildProgressDone(key: String) = UpdateOffer.progressDone(key)
