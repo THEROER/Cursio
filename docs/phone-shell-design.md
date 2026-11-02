@@ -85,7 +85,11 @@ command from a computer — whether a phone of a given make accepts it.
    byte for byte — not `cmd`, which names a binder service.
 2. Pairing from the phone's own window, the key in its files, finding the
    port by mDNS, and the node's connection with its fallback when debugging
-   is off. **Built, not yet run on a phone**: Settings → "This phone's
+   is off. **Built, and run on a POCO X7 Pro (HyperOS 3)**: paired from the
+   phone's own window, the node ran `id -un` through its own debugging port
+   and got `shell`. The key could not be kept by `libadb`'s store at first:
+   it publishes with a hard link, which Android's SELinux refuses an app.
+   Settings → "This phone's
    shell" → Pair opens the developer settings at wireless debugging and
    starts looking for the pairing service (`ShellAccess.kt`, NsdManager,
    only addresses of this phone); when it appears a notification asks for
