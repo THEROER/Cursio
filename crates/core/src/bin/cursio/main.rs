@@ -152,7 +152,13 @@ async fn run() -> anyhow::Result<()> {
                 config_path.clone(),
             );
             let input = tokio::io::BufReader::new(tokio::io::stdin());
-            cursio_core::mcp::serve(input, tokio::io::stdout(), &tools).await?;
+            cursio_core::mcp::serve_following(
+                input,
+                tokio::io::stdout(),
+                &tools,
+                cursio_core::mcp::successor,
+            )
+            .await?;
             Ok(())
         }
         Command::Config => {

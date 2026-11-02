@@ -16,10 +16,25 @@
 //! stdout is the protocol and nothing else writes to it: the log goes to
 //! stderr and the log file, and the apps functions this calls report progress
 //! through a sink rather than printing.
+//!
+//! ## Following the installed version
+//!
+//! The client starts this once per session, through the stable `cursio`,
+//! which hands over to the version current then — and the session then runs
+//! for days while the machine updates under it. Talking to a newer node and
+//! reading a config a newer build wrote, the old server failed on things its
+//! own version never knew. So before each message it looks at what is current
+//! ([`successor`]) and, when that is another build, starts that build's
+//! `cursio mcp` and passes the line through to it. A pass-through rather than
+//! replacing the process: Windows has no exec, and the client must keep the
+//! one child it started. Nothing is lost by switching mid-session, because
+//! the server holds no state between messages.
 
 #[cfg(feature = "web-tools")]
 pub mod cdp;
 pub mod tools;
+
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -35,28 +50,140 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_LINE: usize = 1024 * 1024;
 
 /// Serve MCP on `input`/`output` until the client closes `input`.
-pub async fn serve<R, W>(
+pub async fn serve<R, W>(input: R, output: W, tools: &tools::Tools<impl Ask>) -> std::io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    serve_following(input, output, tools, || None).await
+}
+
+/// [`serve`], passing each message to the `cursio mcp` of the executable
+/// `successor` names whenever it names one, and answering itself otherwise.
+pub async fn serve_following<R, W>(
     input: R,
     mut output: W,
     tools: &tools::Tools<impl Ask>,
+    successor: impl Fn() -> Option<PathBuf>,
 ) -> std::io::Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut lines = input.lines();
+    let mut ahead: Option<Successor> = None;
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(answer) = handle(tools, &line).await {
-            let mut bytes = serde_json::to_vec(&answer).expect("a JSON value always serializes");
-            bytes.push(b'\n');
-            output.write_all(&bytes).await?;
+        match successor() {
+            Some(exe) if ahead.as_ref().is_none_or(|s| s.exe != exe) => {
+                ahead = match Successor::start(&exe) {
+                    Ok(next) => {
+                        tracing::info!(exe = %exe.display(), "a newer build is current; passing tool calls to its server");
+                        Some(next)
+                    }
+                    Err(e) => {
+                        tracing::warn!(exe = %exe.display(), error = %e, "could not start the current build's server; answering here");
+                        None
+                    }
+                };
+            }
+            Some(_) => {}
+            None => ahead = None,
+        }
+        let answer = match ahead.as_mut() {
+            Some(next) => match next.pass(&line).await {
+                Ok(answer) => answer,
+                Err(e) => {
+                    tracing::warn!(error = %e, "the current build's server went away; answering here");
+                    ahead = None;
+                    handle(tools, &line).await.map(|a| a.to_string())
+                }
+            },
+            None => handle(tools, &line).await.map(|a| a.to_string()),
+        };
+        if let Some(answer) = answer {
+            output.write_all(answer.as_bytes()).await?;
+            output.write_all(b"\n").await?;
             output.flush().await?;
         }
     }
     Ok(())
+}
+
+/// The installed build's `cursio` when it is not the one running: what a
+/// long-lived server should pass its messages to. `None` for a development
+/// build, or when this is current.
+pub fn successor() -> Option<PathBuf> {
+    let current = crate::update::layout::restart_target("cursio")?;
+    let own = std::env::current_exe().ok()?;
+    match (current.canonicalize(), own.canonicalize()) {
+        (Ok(current), Ok(own)) if current == own => None,
+        _ => Some(current),
+    }
+}
+
+/// A newer build's server, started with this one's arguments.
+struct Successor {
+    exe: PathBuf,
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+}
+
+impl Successor {
+    fn start(exe: &Path) -> std::io::Result<Self> {
+        let mut child = tokio::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let missing = || std::io::Error::other("the server's pipes were not opened");
+        let stdin = child.stdin.take().ok_or_else(missing)?;
+        let stdout = child.stdout.take().ok_or_else(missing)?;
+        Ok(Self {
+            exe: exe.to_owned(),
+            child,
+            stdin,
+            stdout: tokio::io::BufReader::new(stdout).lines(),
+        })
+    }
+
+    /// Hand `line` on, and bring back its answer when it gets one.
+    async fn pass(&mut self, line: &str) -> std::io::Result<Option<String>> {
+        self.stdin.write_all(line.as_bytes()).await?;
+        self.stdin.write_all(b"\n").await?;
+        self.stdin.flush().await?;
+        if !answered(line) {
+            return Ok(None);
+        }
+        loop {
+            match self.stdout.next_line().await? {
+                Some(answer) if answer.trim().is_empty() => continue,
+                Some(answer) => return Ok(Some(answer)),
+                None => {
+                    let status = self.child.try_wait().ok().flatten();
+                    return Err(std::io::Error::other(format!(
+                        "it closed its output ({status:?})"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Whether [`handle`] answers `line`, so a passed-on line is waited for
+/// exactly when the server it went to will reply.
+fn answered(line: &str) -> bool {
+    if line.len() > MAX_LINE {
+        return true;
+    }
+    match serde_json::from_str::<Value>(line) {
+        Ok(message) => message.get("id").is_some(),
+        Err(_) => true,
+    }
 }
 
 /// The answer to one line, or `None` for a notification.
@@ -331,6 +458,76 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("machine"));
+    }
+
+    /// An executable standing in for another build's server.
+    #[cfg(unix)]
+    fn fake_server(body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cursio-mcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("cursio");
+        std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, exe)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_newer_build_answers_once_it_is_current() {
+        let (dir, exe) = fake_server(
+            "while read line; do case \"$line\" in *'\"id\"'*) \
+             echo '{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":\"newer\"}';; esac; done",
+        );
+        let t = tools(Reply::Done);
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}\n";
+        let mut output = Vec::new();
+        serve_following(
+            tokio::io::BufReader::new(&input[..]),
+            &mut output,
+            &t,
+            || Some(exe.clone()),
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [r#"{"jsonrpc":"2.0","id":8,"result":"newer"}"#]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_newer_build_that_dies_leaves_the_answer_to_this_one() {
+        let (dir, exe) = fake_server("exit 0");
+        let t = tools(Reply::Done);
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n";
+        let mut output = Vec::new();
+        serve_following(
+            tokio::io::BufReader::new(&input[..]),
+            &mut output,
+            &t,
+            || Some(exe.clone()),
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("\"id\":9") && text.contains("\"result\":{}"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_requests_and_unreadable_lines_are_waited_for() {
+        assert!(answered(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#));
+        assert!(!answered(
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+        ));
+        assert!(answered("not json"));
     }
 
     #[tokio::test]

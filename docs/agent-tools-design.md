@@ -37,6 +37,16 @@ socket afresh (`NodeAsk`), because `apply_update` and `restart_machine`
 replace the node it would be holding, and an agent session outlives many of
 them. With no node running, every tool answers that, and nothing else breaks.
 
+The server itself follows the installed version the same way. Started once
+per agent session, it otherwise stayed the build that was current then, for
+days, and failed on what newer builds wrote — a config key it did not know,
+a node answering in a newer vocabulary. Before each message it checks what is
+current (`mcp::successor`); when that is another build, it starts that build's
+`cursio mcp` and passes the lines through to it. The client keeps the one
+child it started, which is why it passes lines through instead of exec'ing the
+new build: Windows has no exec. Switching mid-session loses nothing, since the
+server holds no state between messages.
+
 stdout carries the protocol alone; the log goes to stderr and its file.
 
 ## Tools
