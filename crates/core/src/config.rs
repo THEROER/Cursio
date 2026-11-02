@@ -78,7 +78,7 @@ pub const DEFAULT_PORT: u16 = 46073;
 
 /// Everything `cursio mesh` decides at startup.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// TCP port the node listens on.
     pub port: u16,
@@ -111,7 +111,6 @@ pub struct Config {
 /// takes it only once its person allowed that package — and only under the
 /// application id it was allowed as, so another app cannot claim it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PackageGrant {
     pub package: String,
     pub app: String,
@@ -120,7 +119,7 @@ pub struct PackageGrant {
 
 /// How this machine takes one application's builds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AppConfig {
     /// `auto` installs and hands the build to the application at once;
     /// `never` stops taking it. `ask` behaves as `auto`: an application's
@@ -161,7 +160,6 @@ pub enum DevtoolsConsent {
 /// seconds), and, when `pids` is not empty, only while one of those
 /// processes runs: "until the application restarts".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DevtoolsGrant {
     pub peer: String,
     pub until: u64,
@@ -221,7 +219,7 @@ impl AppConfig {
 /// on one desk"). Its screens are read from the desktop as it runs, never
 /// stored: a monitor unplugged is gone from the desk at once.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct LayoutConfig {
     /// Where its screens' top-left corner stands, in millimetres from the
     /// desk's origin. Absent until someone arranges this machine; the grid
@@ -240,7 +238,7 @@ pub struct LayoutConfig {
 /// The mesh's Bluetooth path: a phone's to its computers, and a computer's to
 /// the computers it is paired with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct BluetoothConfig {
     /// Whether this machine carries the mesh over Bluetooth at all. Read on
     /// every turn of the dialler, so a change needs no restart.
@@ -388,7 +386,7 @@ impl ConfigEdit {
 /// Where a phone's call voice goes once this computer carries it. Read at
 /// every call, so a change needs no restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct CallsConfig {
     /// Answering or dialling from this computer brings the voice here, as on
     /// Phone Link. Off, the voice stays wherever the phone puts it.
@@ -427,7 +425,7 @@ pub enum CallVoice {
 /// How this machine takes new builds that reach it over the mesh. Read again
 /// at every decision, so a change here needs no restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct UpdateConfig {
     pub policy: UpdatePolicy,
     pub channel: UpdateChannel,
@@ -457,7 +455,6 @@ pub enum UpdateChannel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TrustedBuilder {
     pub peer: cursio_protocol::PeerId,
     /// What the machine was called when it was trusted; for the reader only.
@@ -479,7 +476,7 @@ impl Default for UpdateConfig {
 /// Which modules this node offers. A module is still negotiated per link; off
 /// here means it is never advertised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Modules {
     /// Capture this machine's keyboard and mouse and share them.
     pub input: bool,
@@ -494,7 +491,7 @@ pub struct Modules {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AudioConfig {
     /// Windows: render peers' audio into the output whose name contains this.
     pub render_device: Option<String>,
@@ -505,7 +502,7 @@ pub struct AudioConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AirPlayConfig {
     /// `on`, `off`, or a quality profile such as `1080p60`; the CLI parses it.
     pub mode: String,
@@ -520,7 +517,7 @@ pub struct AirPlayConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct InputConfig {
     /// Where a peer's modifiers land on a Mac: `positional`, `swapped`, or
     /// `from=to` pairs. Ignored elsewhere.
@@ -543,7 +540,7 @@ pub struct InputConfig {
 /// the moment it meets the barrier, so the desktop never sees the press
 /// however long crossing waits.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct CrossingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub left: Option<EdgeSpan>,
@@ -604,7 +601,7 @@ impl From<EdgeSpan> for [u8; 2] {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct FilesConfig {
     /// What this machine shares, in the files module's `SharePolicy` shape.
     /// `None` keeps that module's own default.
@@ -695,14 +692,59 @@ impl Config {
     }
 
     fn parse(text: &str, path: &Path) -> Result<Self, ConfigError> {
-        toml::from_str(text).map_err(|source| ConfigError::Parse {
+        let (config, unknown) = Self::parse_lenient(text).map_err(|source| ConfigError::Parse {
             path: path.to_owned(),
             source: Box::new(source),
-        })
+        })?;
+        for key in &unknown {
+            tracing::warn!(
+                config = %path.display(),
+                key = %dotted(key),
+                "this build does not know a key in the config and leaves it unused but kept; a newer build wrote it, or it is misspelt"
+            );
+        }
+        Ok(config)
+    }
+
+    /// The config, and every key in `text` it does not know.
+    fn parse_lenient(text: &str) -> Result<(Self, Vec<Vec<Step>>), toml::de::Error> {
+        let mut unknown = Vec::new();
+        let config = serde_ignored::deserialize(toml::Deserializer::new(text), |at| {
+            let mut key = Vec::new();
+            steps(&at, &mut key);
+            unknown.push(key);
+        })?;
+        Ok((config, unknown))
     }
 
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         Ok(toml::to_string_pretty(self)?)
+    }
+
+    /// This config as TOML, carrying over every key of `old` this build does
+    /// not know.
+    ///
+    /// Machines update one at a time, and the app writes what the newest
+    /// build knows, so a build that is behind meets keys from the future. It
+    /// reads past them; writing the file back without them would undo what
+    /// the newer build was told the moment this one saved anything.
+    fn to_toml_keeping(&self, old: &str) -> Result<String, ConfigError> {
+        let (Ok((_, unknown)), Ok(old)) = (Self::parse_lenient(old), old.parse::<toml::Table>())
+        else {
+            return self.to_toml();
+        };
+        if unknown.is_empty() {
+            return self.to_toml();
+        }
+        let toml::Value::Table(mut new) = toml::Value::try_from(self)? else {
+            return self.to_toml();
+        };
+        for key in &unknown {
+            if let Some(value) = lookup(&old, key) {
+                keep(&mut new, key, value.clone());
+            }
+        }
+        Ok(toml::to_string_pretty(&new)?)
     }
 
     /// Write the config so a reader never sees half a file: the daemon polls
@@ -715,8 +757,12 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(write_err)?;
         }
+        let text = match std::fs::read_to_string(path) {
+            Ok(old) => self.to_toml_keeping(&old)?,
+            Err(_) => self.to_toml()?,
+        };
         let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, self.to_toml()?).map_err(write_err)?;
+        std::fs::write(&tmp, text).map_err(write_err)?;
         std::fs::rename(&tmp, path).map_err(write_err)
     }
 
@@ -844,6 +890,84 @@ pub async fn wait_for_change(path: &Path, overrides: &Overrides, running: &Confi
     }
 }
 
+/// One step into a TOML document: a table's key or an array's element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+fn steps(at: &serde_ignored::Path<'_>, out: &mut Vec<Step>) {
+    use serde_ignored::Path as At;
+    match at {
+        At::Root => {}
+        At::Seq { parent, index } => {
+            steps(parent, out);
+            out.push(Step::Index(*index));
+        }
+        At::Map { parent, key } => {
+            steps(parent, out);
+            out.push(Step::Key(key.to_string()));
+        }
+        At::Some { parent } | At::NewtypeStruct { parent } | At::NewtypeVariant { parent } => {
+            steps(parent, out)
+        }
+    }
+}
+
+fn dotted(key: &[Step]) -> String {
+    key.iter()
+        .map(|step| match step {
+            Step::Key(k) => k.clone(),
+            Step::Index(i) => format!("[{i}]"),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn lookup<'a>(table: &'a toml::Table, key: &[Step]) -> Option<&'a toml::Value> {
+    let (Step::Key(first), rest) = key.split_first()? else {
+        return None;
+    };
+    let mut value = table.get(first)?;
+    for step in rest {
+        value = match step {
+            Step::Key(k) => value.as_table()?.get(k)?,
+            Step::Index(i) => value.as_array()?.get(*i)?,
+        };
+    }
+    Some(value)
+}
+
+/// Put `value` at `key` in `table` unless something is there already. A key
+/// whose surroundings this build wrote differently — a table now an array,
+/// an element now missing — is dropped rather than forced in.
+fn keep(table: &mut toml::Table, key: &[Step], value: toml::Value) {
+    let Some((Step::Key(first), rest)) = key.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        table.entry(first.clone()).or_insert(value);
+        return;
+    }
+    let child = table
+        .entry(first.clone())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    keep_in(child, rest, value);
+}
+
+fn keep_in(at: &mut toml::Value, key: &[Step], value: toml::Value) {
+    match (at, key) {
+        (toml::Value::Table(table), [Step::Key(_), ..]) => keep(table, key, value),
+        (toml::Value::Array(items), [Step::Index(i), rest @ ..]) if !rest.is_empty() => {
+            if let Some(item) = items.get_mut(*i) {
+                keep_in(item, rest, value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -919,9 +1043,41 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_key_is_refused_rather_than_ignored() {
-        let err = Config::parse("[modules]\naudoi = true\n", Path::new("x.toml")).unwrap_err();
-        assert!(err.to_string().contains("audoi"), "{err}");
+    fn a_key_this_build_does_not_know_is_read_past_and_named() {
+        let (c, unknown) =
+            Config::parse_lenient("[modules]\naudoi = true\n[apps.lp]\nactions = \"allow\"\n")
+                .unwrap();
+        assert_eq!(c.modules, Config::default().modules);
+        let named: Vec<String> = unknown.iter().map(|k| dotted(k)).collect();
+        assert!(named.contains(&"modules.audoi".to_string()), "{named:?}");
+        assert!(
+            Config::parse("[modules]\naudio = \"loud\"\n", Path::new("x.toml")).is_err(),
+            "a known key with a value of the wrong kind is still an error"
+        );
+    }
+
+    #[test]
+    fn saving_keeps_the_keys_a_newer_build_wrote() {
+        let dir = std::env::temp_dir().join(format!("cursio-keep-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            "port = 1\n[future]\nwhat = 2\n[modules]\nlater = true\n\
+             [[layout.offsets]]\nscreen = \"A\"\ndx_mm = 1\ndy_mm = 2\ntilt = 3\n",
+        )
+        .unwrap();
+        let mut c = Config::load(&path).unwrap();
+        c.port = 7;
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (back, unknown) = Config::parse_lenient(&text).unwrap();
+        assert_eq!(back.port, 7, "what this build changed is written");
+        let named: Vec<String> = unknown.iter().map(|k| dotted(k)).collect();
+        for key in ["future", "modules.later", "layout.offsets.[0].tilt"] {
+            assert!(named.contains(&key.to_string()), "{key} lost: {text}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

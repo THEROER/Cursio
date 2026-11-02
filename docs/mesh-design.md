@@ -239,8 +239,14 @@ mac_modifiers = "positional"
 [files.share]        # opaque here: whatever the files module's SharePolicy reads
 ```
 
-Unknown keys are refused rather than ignored — a misspelt module is otherwise a
-module that silently stays off. A change is applied to the running node, not by
+A key this build does not know is read past and kept, with a warning naming it
+in the log. Refusing it, as it once was, made a whole file unreadable to any
+build that was behind: machines update one at a time, the app writes what the
+newest build knows, and a node, `cursio mcp` or any command on an older build
+then failed on the first key from the future. Saving carries such keys over
+untouched, so an older build changing one setting does not undo what a newer
+one was told. The cost is that a misspelt key is a warning rather than an
+error. A change is applied to the running node, not by
 restarting it (next section): the control socket applies it before replying,
 and the node polls the file every two seconds for changes made any other way.
 Fields a flag pinned stay pinned and are reported as such.
