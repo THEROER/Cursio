@@ -76,7 +76,12 @@ pub(super) fn publisher() -> u64 {
     NEXT_PUBLISHER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Record which of `peer`'s volumes are mounted here now.
+/// Record which of `peer`'s volumes are mounted here now. Called only where
+/// there is a mount backend.
+#[cfg_attr(
+    not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))),
+    allow(dead_code)
+)]
 pub(super) fn publish(peer: &str, by: u64, volumes: Vec<Volume>) {
     state().mounted.insert(peer.to_string(), (by, volumes));
 }
