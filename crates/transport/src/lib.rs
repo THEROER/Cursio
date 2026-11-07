@@ -180,11 +180,6 @@ pub trait TransportTx: Send {
     /// be gone.
     async fn flush(&mut self) {}
 
-    /// This sender is a session's bulk lane alone, which frees it from the
-    /// bound on its kernel backlog (see `send_backlog`). The default does
-    /// nothing: only a socket whose backlog was bounded has a bound to lift.
-    fn carries_bulk_alone(&mut self) {}
-
     /// Another handle onto this sender's queue, for a sender that has one.
     ///
     /// Session modules run on their own threads and send without going

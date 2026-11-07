@@ -195,9 +195,6 @@ impl Inner {
             noise,
             kind,
         } = path;
-        if kind.lane() == Some(Lane::Bulk) {
-            tx.carries_bulk_alone();
-        }
         let (writers, mut frames): (Vec<_>, Vec<_>) = Lane::ALL
             .into_iter()
             .map(|lane| mpsc::channel::<Vec<u8>>(writer_depth(lane)))

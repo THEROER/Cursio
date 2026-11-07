@@ -44,11 +44,7 @@ its drainer waits for acknowledgements; it never silently abandons resumability.
 There are 16 incoming frames per lane and two frames per socket writer, plus the
 frame currently being written. Reassembly has the existing bounded-message
 checks, independently per lane. Kernel unsent-backlog limits remain in force on
-every TCP socket (`send_backlog.rs`) but one: on Windows the bulk lane's own
-socket gets a fixed 1 MiB `SO_SNDBUF` instead of following the stack's ideal
-backlog. Windows counts unacknowledged bytes against it, so the estimate
-capped a link's files near 8 MB/s on Wi-Fi that carried 25, and a lane of its
-own has nothing waiting behind it; the shared radio queue is the pacer's.
+every TCP socket (`send_backlog.rs`).
 
 `queue_age` reports the oldest queued or currently sending frame. Completed
 queue-delay histograms and byte counters remain available. `flush` waits for

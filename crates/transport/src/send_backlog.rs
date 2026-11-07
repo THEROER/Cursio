@@ -29,9 +29,7 @@
 //!   `SIO_IDEAL_SEND_BACKLOG_QUERY`, its own bandwidth-delay estimate for this
 //!   connection — and Microsoft's guidance is to keep exactly that much
 //!   outstanding. [`IdealBacklog`] follows it, re-reading as the estimate
-//!   moves — except on a socket carrying one session's bulk lane alone,
-//!   which nothing else waits behind and which the estimate capped well below
-//!   the link ([`IdealBacklog::release`]).
+//!   moves.
 //! - **Elsewhere** a fixed `SO_SNDBUF`, which bounds in-flight and unsent
 //!   together; looser than the options above, but a bound.
 //!
@@ -183,9 +181,6 @@ fn apply(stream: &TcpStream) -> io::Result<&'static str> {
 pub(crate) struct IdealBacklog {
     last_query: Option<std::time::Instant>,
     applied: usize,
-    /// The socket carries a session's bulk lane alone and is bounded no more;
-    /// see [`IdealBacklog::release`].
-    released: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -199,35 +194,11 @@ impl IdealBacklog {
         Self {
             last_query: None,
             applied: 0,
-            released: false,
-        }
-    }
-
-    /// Stop bounding this socket: it carries one session's bulk lane and
-    /// nothing else.
-    ///
-    /// The bound exists so that nothing waits in the kernel behind file data,
-    /// which mattered while every lane shared one socket. A lane of its own
-    /// has nothing behind it but more of the same lane, and the shared radio
-    /// queue is the bulk pacer's to keep short. Windows counts every
-    /// unacknowledged byte against `SO_SNDBUF`, so following the ideal backlog
-    /// there capped one socket at its estimate per round trip: plain TCP
-    /// writing 64 KiB at a time measured 14 MB/s with a 128 KiB buffer against
-    /// 25 MB/s with 1 MiB, and Cursio's bulk stayed near 8 MB/s on a link that
-    /// carried 25.
-    pub(crate) fn release(&mut self, stream: &TcpStream) {
-        self.released = true;
-        match windows::set_send_buffer(stream, windows::BULK_SEND_BUFFER) {
-            Ok(()) => self.applied = windows::BULK_SEND_BUFFER,
-            Err(e) => tracing::debug!(error = %e, "could not widen a bulk lane's send buffer"),
         }
     }
 
     /// Re-read the ideal backlog if it is due, and apply it if it moved.
     pub(crate) fn retune(&mut self, stream: &TcpStream) {
-        if self.released {
-            return;
-        }
         let now = std::time::Instant::now();
         if self
             .last_query
@@ -274,10 +245,6 @@ mod windows {
     /// past this the path is not a LAN; a larger buffer would only rebuild the
     /// queue this module exists to remove.
     const MAX_SEND_BUFFER: usize = 4 * 1024 * 1024;
-
-    /// A bulk lane's send buffer once it is no longer bounded: the measured
-    /// knee, past which a Wi-Fi link gained nothing more.
-    pub(super) const BULK_SEND_BUFFER: usize = 1024 * 1024;
 
     pub(super) fn clamp_ideal(ideal: usize) -> usize {
         ideal.clamp(MIN_SEND_BUFFER, MAX_SEND_BUFFER)
