@@ -22,6 +22,7 @@ impl RemoteFs {
     /// thrown away.
     fn peer_listing(&self, volume: &str, path: &str) -> Result<Vec<(u64, FileMeta)>, FileError> {
         let entries = self.peer.read_dir(volume, path)?;
+        self.meta.put_listing(volume, path, entries.clone());
         let mut state = self.state.lock().expect("inode state");
         Ok(entries
             .into_iter()

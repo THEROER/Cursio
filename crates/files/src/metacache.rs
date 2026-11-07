@@ -69,7 +69,94 @@ struct Entry {
 /// A directory's contents, and when they were fetched.
 struct Listing {
     entries: Vec<FileMeta>,
+    /// Position in `entries` by exact name, so answering one name from a
+    /// listing of thousands is neither a scan nor a copy of the whole.
+    by_name: HashMap<String, usize>,
+    /// Every name lowercased: a name that matches only this way may still be
+    /// there on a Windows owner, which compares names without case.
+    folded: std::collections::HashSet<String>,
     at: Instant,
+}
+
+impl Listing {
+    fn new(entries: Vec<FileMeta>) -> Self {
+        let by_name = entries
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.name.clone(), i))
+            .collect();
+        let folded = entries.iter().map(|m| m.name.to_lowercase()).collect();
+        Self {
+            entries,
+            by_name,
+            folded,
+            at: Instant::now(),
+        }
+    }
+
+    /// What this listing says about `name`, or `None` when only the owner can
+    /// say: the name differs from a listed one by case alone.
+    fn answer(&self, name: &str) -> Option<Result<FileMeta, cursio_protocol::FileError>> {
+        if let Some(&i) = self.by_name.get(name) {
+            return Some(Ok(self.entries[i].clone()));
+        }
+        if self.folded.contains(&name.to_lowercase()) {
+            return None;
+        }
+        Some(Err(cursio_protocol::FileError::NotFound))
+    }
+}
+
+/// What a held listing says about one name.
+enum Listed {
+    /// No listing of the directory is fresh.
+    NotHeld,
+    /// One is, but the name matches a listed one only without case.
+    Undecided,
+    Answer(Result<FileMeta, cursio_protocol::FileError>),
+}
+
+/// Questions about names a directory's listing could have answered, counted to
+/// notice the directory being swept.
+struct Misses {
+    count: usize,
+    since: Instant,
+    /// How many entries the directory had when it was last listed, which
+    /// decides how many misses its next listing is worth.
+    last_listed: Option<usize>,
+    /// A listing is on its way: another thread's miss asks for its one path
+    /// rather than listing the same directory a second time.
+    listing: bool,
+    /// The owner refused the listing in this window — a directory that may be
+    /// entered but not read — so the window's misses are asked one by one.
+    refused: bool,
+}
+
+/// One listing is worth this many entries per miss in its directory.
+///
+/// A listing is one round trip whose reply grows with the directory, and a
+/// miss is one round trip of tens of bytes. A directory of a few hundred is
+/// worth listing for the second name asked; one of tens of thousands — a
+/// system directory, a package store — only once many of its names are being
+/// asked about, or two `stat`s a second there would pull megabytes.
+const ENTRIES_PER_MISS: usize = 256;
+
+/// The fewest misses in one window that make a sweep.
+///
+/// Two: one name is an application checking one path; a second distinct
+/// name in the same directory within [`META_TTL`] is a walk — `git status`,
+/// a build's dependency scan — which goes on to ask about the rest.
+const SWEEP_MISSES: usize = 2;
+
+/// How many directories' miss counts to hold at once.
+const MAX_MISS_DIRS: usize = MAX_LISTINGS * 4;
+
+/// The parent directory and last component of a wire path.
+fn split_path(path: &str) -> (&str, &str) {
+    match path.rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", path),
+    }
 }
 
 /// Answers about paths, remembered briefly.
@@ -89,6 +176,8 @@ pub struct MetaCache {
     /// carry; the file writes sharing it then missed the mount's 3 s deadline
     /// and Windows reported the drive as failing.
     listings: Mutex<HashMap<(String, String), Listing>>,
+    /// Per directory, the names asked about that no listing could answer.
+    misses: Mutex<HashMap<(String, String), Misses>>,
 }
 
 impl Default for MetaCache {
@@ -102,6 +191,7 @@ impl MetaCache {
         Self {
             entries: Mutex::new(HashMap::new()),
             listings: Mutex::new(HashMap::new()),
+            misses: Mutex::new(HashMap::new()),
         }
     }
 
@@ -124,11 +214,67 @@ impl MetaCache {
         }
         listings.insert(
             (volume.to_string(), path.to_string()),
-            Listing {
-                entries,
-                at: Instant::now(),
-            },
+            Listing::new(entries),
         );
+    }
+
+    /// What a fresh listing of `path`'s directory says about it.
+    fn listed(&self, volume: &str, path: &str) -> Listed {
+        let (parent, name) = split_path(path);
+        let key = (volume.to_string(), parent.to_string());
+        let listings = self.listings.lock().expect("listing cache");
+        match listings.get(&key) {
+            Some(held) if held.at.elapsed() < META_TTL => match held.answer(name) {
+                Some(answer) => Listed::Answer(answer),
+                None => Listed::Undecided,
+            },
+            _ => Listed::NotHeld,
+        }
+    }
+
+    /// Count a miss in `dir`, and say whether this one should list it.
+    fn note_miss(&self, volume: &str, dir: &str) -> bool {
+        let mut misses = self.misses.lock().expect("miss counts");
+        if misses.len() >= MAX_MISS_DIRS {
+            misses.clear();
+        }
+        let held = misses
+            .entry((volume.to_string(), dir.to_string()))
+            .or_insert(Misses {
+                count: 0,
+                since: Instant::now(),
+                last_listed: None,
+                listing: false,
+                refused: false,
+            });
+        if held.since.elapsed() >= META_TTL {
+            held.count = 0;
+            held.since = Instant::now();
+            held.refused = false;
+        }
+        held.count += 1;
+        let needed = (held.last_listed.unwrap_or(0) / ENTRIES_PER_MISS).max(SWEEP_MISSES);
+        if held.listing || held.refused || held.count < needed {
+            return false;
+        }
+        held.listing = true;
+        true
+    }
+
+    /// Record how the listing [`Self::note_miss`] asked for went.
+    fn listed_dir(&self, volume: &str, dir: &str, outcome: Option<usize>) {
+        let mut misses = self.misses.lock().expect("miss counts");
+        if let Some(held) = misses.get_mut(&(volume.to_string(), dir.to_string())) {
+            held.listing = false;
+            match outcome {
+                Some(len) => {
+                    held.last_listed = Some(len);
+                    held.count = 0;
+                    held.since = Instant::now();
+                }
+                None => held.refused = true,
+            }
+        }
     }
 
     /// Forget a directory's contents, because something in it changed.
@@ -236,6 +382,63 @@ impl MetaCache {
         let fresh = ask();
         self.put(volume, path, fresh.clone());
         fresh
+    }
+
+    /// As [`Self::get_or_ask`], answering from the directory's listing when
+    /// one is held — and fetching that listing once the directory is being
+    /// swept.
+    ///
+    /// A tree walked by name never lists anything: `git status` `lstat`s
+    /// every tracked file to compare it with the index, and a build checks
+    /// each dependency it knows of. Each name was its own round trip, so
+    /// `git diff --stat` over two thousand files on a peer's disk took 33 s
+    /// of almost pure waiting. The names such a walk asks about cluster by
+    /// directory, so the second distinct miss in one directory within
+    /// [`META_TTL`] lists it — one round trip — and the rest of that
+    /// directory is answered here, including the names that are not there.
+    ///
+    /// A listing answers for [`META_TTL`] from when it was fetched, and the
+    /// kernel may then hold the answer for its own `CACHE_TTL`: a change made
+    /// on the owner can take up to the sum of the two to appear, against one
+    /// of them for a path asked about directly.
+    pub fn get_or_ask_swept(
+        &self,
+        volume: &str,
+        path: &str,
+        ask: impl FnOnce() -> Result<FileMeta, cursio_protocol::FileError>,
+        list: impl FnOnce(&str) -> Result<Vec<FileMeta>, cursio_protocol::FileError>,
+    ) -> Result<FileMeta, cursio_protocol::FileError> {
+        if let Some(hit) = self.get(volume, path) {
+            return hit;
+        }
+        if path.is_empty() {
+            return self.get_or_ask(volume, path, ask);
+        }
+        match self.listed(volume, path) {
+            Listed::Answer(answer) => return answer,
+            Listed::Undecided => return self.get_or_ask(volume, path, ask),
+            Listed::NotHeld => {}
+        }
+        let (dir, _) = split_path(path);
+        if self.note_miss(volume, dir) {
+            match list(dir) {
+                Ok(entries) => {
+                    self.listed_dir(volume, dir, Some(entries.len()));
+                    self.put_listing(volume, dir, entries);
+                    if let Listed::Answer(answer) = self.listed(volume, path) {
+                        return answer;
+                    }
+                }
+                Err(e) => {
+                    // A directory that may be entered but not read is an
+                    // ordinary thing on Windows; the path is asked about on its
+                    // own, and that answer carries any error that matters.
+                    tracing::debug!(volume, dir, error = ?e, "listing a swept directory was refused");
+                    self.listed_dir(volume, dir, None);
+                }
+            }
+        }
+        self.get_or_ask(volume, path, ask)
     }
 }
 
@@ -366,6 +569,115 @@ mod tests {
             held <= MAX_ENTRIES,
             "cache grew to {held}, past its {MAX_ENTRIES} cap"
         );
+    }
+
+    /// Asks `cache` about `path` the way a mount does, counting what reached
+    /// the peer.
+    fn ask(
+        cache: &MetaCache,
+        path: &str,
+        listing: &[FileMeta],
+        stats: &std::cell::Cell<u32>,
+        lists: &std::cell::Cell<u32>,
+    ) -> Result<FileMeta, FileError> {
+        cache.get_or_ask_swept(
+            "C:",
+            path,
+            || {
+                stats.set(stats.get() + 1);
+                let (_, name) = split_path(path);
+                listing
+                    .iter()
+                    .find(|m| m.name.eq_ignore_ascii_case(name))
+                    .cloned()
+                    .ok_or(FileError::NotFound)
+            },
+            |_| {
+                lists.set(lists.get() + 1);
+                Ok(listing.to_vec())
+            },
+        )
+    }
+
+    /// `git status` over a peer's disk: the second name asked about in one
+    /// directory lists it, and every other name there — present or not — is
+    /// answered without another round trip.
+    #[test]
+    fn a_directory_swept_by_name_is_listed_once_and_answers_the_rest() {
+        let c = MetaCache::new();
+        let listing = [meta("a", 1), meta("b", 2), meta("c", 3), meta("d", 4)];
+        let (stats, lists) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+
+        assert_eq!(ask(&c, "src/a", &listing, &stats, &lists).unwrap().size, 1);
+        assert_eq!((stats.get(), lists.get()), (1, 0), "one name is one stat");
+
+        assert_eq!(ask(&c, "src/b", &listing, &stats, &lists).unwrap().size, 2);
+        assert_eq!(ask(&c, "src/c", &listing, &stats, &lists).unwrap().size, 3);
+        assert_eq!(ask(&c, "src/d", &listing, &stats, &lists).unwrap().size, 4);
+        assert!(matches!(
+            ask(&c, "src/absent", &listing, &stats, &lists),
+            Err(FileError::NotFound)
+        ));
+        assert_eq!(
+            (stats.get(), lists.get()),
+            (1, 1),
+            "the rest of the directory cost one listing"
+        );
+    }
+
+    /// A Windows owner finds `readme.md` when `README.md` is there; the listing
+    /// cannot say so, and must neither refuse the name nor list again.
+    #[test]
+    fn a_name_matching_a_listed_one_only_without_case_is_asked_about() {
+        let c = MetaCache::new();
+        let listing = [meta("README.md", 1), meta("x", 2)];
+        let (stats, lists) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        c.put_listing("C:", "doc", listing.to_vec());
+
+        let got = ask(&c, "doc/readme.md", &listing, &stats, &lists);
+        assert_eq!(got.unwrap().name, "README.md");
+        assert_eq!((stats.get(), lists.get()), (1, 0));
+    }
+
+    /// A directory the owner will not list is asked about name by name for the
+    /// rest of the window, rather than every other miss trying again.
+    #[test]
+    fn a_refused_listing_falls_back_to_asking_without_retrying() {
+        let c = MetaCache::new();
+        let (stats, lists) = (std::cell::Cell::new(0u32), std::cell::Cell::new(0u32));
+        for name in ["a", "b", "c", "d"] {
+            let _ = c.get_or_ask_swept(
+                "C:",
+                &format!("locked/{name}"),
+                || {
+                    stats.set(stats.get() + 1);
+                    Ok(meta(name, 0))
+                },
+                |_| {
+                    lists.set(lists.get() + 1);
+                    Err(FileError::Denied)
+                },
+            );
+        }
+        assert_eq!(stats.get(), 4, "every name still answered");
+        assert_eq!(lists.get(), 1, "the refusal is not asked for again");
+    }
+
+    /// A directory of thousands is listed again only once enough of its names
+    /// are being asked about: two `stat`s a second in a system directory must
+    /// not pull its whole listing each time.
+    #[test]
+    fn a_large_directory_needs_more_misses_before_it_is_listed_again() {
+        let c = MetaCache::new();
+        assert!(!c.note_miss("C:", "big"));
+        assert!(
+            c.note_miss("C:", "big"),
+            "unknown size: the second miss lists"
+        );
+        c.listed_dir("C:", "big", Some(10 * ENTRIES_PER_MISS));
+
+        let lists_at = (1..=10).find(|_| c.note_miss("C:", "big"));
+        assert_eq!(lists_at, Some(10));
     }
 
     /// A volume list still fresh is answered without asking the peer, and a

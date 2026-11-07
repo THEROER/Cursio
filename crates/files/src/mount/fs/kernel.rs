@@ -161,7 +161,10 @@ impl Filesystem for RemoteFs {
             Some(Entry::Path { path, .. }) if path.is_empty() => {
                 reply.attr(&CACHE_TTL, &dir_attr(ino.0, self.uid, self.gid))
             }
-            Some(Entry::Path { volume, path }) => match self.peer.stat(&volume, &path) {
+            // Through the cache: an `lstat` whose attributes have expired while
+            // the name is still known arrives here instead of at `lookup`, and
+            // is the same question.
+            Some(Entry::Path { volume, path }) => match self.stat_path(&volume, &path) {
                 Ok(meta) => reply.attr(&CACHE_TTL, &attr_from(ino.0, &meta, self.uid, self.gid)),
                 Err(e) => reply.error(to_errno(&e)),
             },

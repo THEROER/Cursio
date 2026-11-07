@@ -109,10 +109,15 @@ impl RemoteFs {
     /// A negative answer is remembered too: an application that checks whether
     /// a file exists before creating it asks about a name that is not there,
     /// and asking the peer again each time costs the same round trip as a real
-    /// one.
+    /// one. A directory being swept name by name is listed once instead — see
+    /// [`MetaCache::get_or_ask_swept`](crate::metacache::MetaCache::get_or_ask_swept).
     fn stat_path(&self, volume: &str, path: &str) -> Result<cursio_protocol::FileMeta, FileError> {
-        self.meta
-            .get_or_ask(volume, path, || self.peer.stat(volume, path))
+        self.meta.get_or_ask_swept(
+            volume,
+            path,
+            || self.peer.stat(volume, path),
+            |dir| self.peer.read_dir(volume, dir),
+        )
     }
 
     /// The peer's handle behind one of ours.
