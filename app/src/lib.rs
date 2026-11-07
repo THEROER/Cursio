@@ -45,7 +45,10 @@ mod tray;
 
 /// On Linux the node draws the notification-area icon (`node_tray`), whose
 /// menu starts this app; a running copy takes that over its single-instance
-/// hand-off. The app has no icon of its own, only its window to show.
+/// hand-off. The app has no icon of its own and is nothing but its windows:
+/// the main one is made when asked for and destroyed when closed, and the app
+/// ends with its last window. Made, not shown from hidden, also because the
+/// CEF runtime never maps a window that was created hidden and shown later.
 #[cfg(target_os = "linux")]
 mod tray {
     use tauri::{AppHandle, Emitter, Manager};
@@ -54,15 +57,30 @@ mod tray {
         false
     }
 
-    /// Show the main window on `route`.
+    /// Show the main window on `route`, making it when there is none.
     pub fn open(app: &AppHandle, route: &str) {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.show();
             let _ = window.unminimize();
             let _ = window.set_focus();
+            if let Err(e) = app.emit_to("main", "navigate", route) {
+                tracing::warn!(error = %e, route, "could not switch the window's page");
+            }
+            return;
         }
-        if let Err(e) = app.emit_to("main", "navigate", route) {
-            tracing::warn!(error = %e, route, "could not switch the window's page");
+        // A page still loading hears no `navigate`; it asks for this instead.
+        *app.state::<crate::StartPage>()
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(route.to_owned());
+        let Some(config) = app.config().app.windows.iter().find(|w| w.label == "main") else {
+            tracing::warn!("the app's configuration has no main window");
+            return;
+        };
+        let built = tauri::WebviewWindowBuilder::from_config(app, config)
+            .and_then(|builder| builder.visible(true).build());
+        if let Err(e) = built {
+            tracing::warn!(error = %e, "could not open the window");
         }
     }
 }
@@ -197,7 +215,14 @@ pub fn run() {
         relaunch::wait_for_predecessor(&std::env::args().collect::<Vec<_>>());
 
         // Started at login by autostart: come up as the tray alone.
-        (log, std::env::args().any(|a| a == "--hidden"))
+        let hidden = std::env::args().any(|a| a == "--hidden");
+        // Linux has no tray of the app's to come up as (see `tray`): a start
+        // asking for no window — an autostart entry an older app wrote, a
+        // restart of an app nobody was looking at — has nothing to do.
+        if cfg!(target_os = "linux") && hidden {
+            return;
+        }
+        (log, hidden)
     };
 
     let builder = tauri::Builder::default();
@@ -261,9 +286,13 @@ pub fn run() {
         })
         .manage(StartPage::default())
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            // Where the tray is the app, a closed window only hides. On
+            // Linux it goes, and the app with the last one (see `tray`).
+            if cfg!(not(target_os = "linux")) {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -382,16 +411,17 @@ pub fn run() {
     }
 }
 
-/// The app's context, with one change for Chromium: the CEF runtime never maps
-/// a window that was created hidden and shown later, so under it the main
-/// window is created visible. Without a tray there it is the app anyway.
+/// The app's context. On Linux the main window is not made at start but when
+/// it is asked for (see `tray`): a start for a call must not show it.
 fn context() -> tauri::Context {
     let context = tauri::generate_context!();
-    #[cfg(feature = "cef")]
+    #[cfg(target_os = "linux")]
     let context = {
         let mut context = context;
         for window in &mut context.config_mut().app.windows {
-            window.visible = true;
+            if window.label == "main" {
+                window.create = false;
+            }
         }
         context
     };

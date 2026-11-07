@@ -102,9 +102,13 @@ async function act(action: CallAction) {
   }
 }
 
+/**
+ * Closed, not hidden: where the tray is the app the close becomes a hide, and
+ * on Linux, where the app is only its windows, the app ends with its last.
+ */
 async function hide() {
   await getCurrentWindow()
-    .hide()
+    .close()
     .catch(() => {})
 }
 

@@ -306,6 +306,8 @@ function standbyFailed(e: unknown) {
 interface Autostart {
   node: boolean
   tray: boolean
+  /** False on Linux, where the node draws the icon and the app is only its windows. */
+  trayAvailable: boolean
 }
 
 const autostart = ref<Autostart | null>(null)
@@ -622,7 +624,7 @@ async function restartNode() {
           <LpSkeleton v-if="!autostart" rounded="card" class="h-32" />
           <LpCard v-else padded>
             <ul class="flex flex-col divide-y divide-line">
-              <li class="flex items-center gap-4 pb-3">
+              <li class="flex items-center gap-4" :class="{ 'pb-3': autostart.trayAvailable }">
                 <div class="min-w-0 flex-1">
                   <p class="text-sm font-medium">{{ t("settings.autostartNode") }}</p>
                   <p class="text-xs text-muted">{{ t("settings.autostartNodeHint") }}</p>
@@ -634,7 +636,7 @@ async function restartNode() {
                   @error="autostartFailed('node')"
                 />
               </li>
-              <li class="flex items-center gap-4 pt-3">
+              <li v-if="autostart.trayAvailable" class="flex items-center gap-4 pt-3">
                 <div class="min-w-0 flex-1">
                   <p class="text-sm font-medium">{{ t("settings.autostartTray") }}</p>
                   <p class="text-xs text-muted">{{ t("settings.autostartTrayHint") }}</p>

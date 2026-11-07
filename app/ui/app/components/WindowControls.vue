@@ -6,9 +6,10 @@ const toast = useCursioToast()
 
 /**
  * The window draws its own title bar (`decorations: false`, as the LeavePulse
- * launcher does), so it has to offer what the system bar did. Close hides: the
- * Rust side turns a close request into a hide, because the tray is the app
- * and the node keeps running either way.
+ * launcher does), so it has to offer what the system bar did. Where the tray
+ * is the app (Windows, macOS) the Rust side turns a close request into a
+ * hide; on Linux the node draws the icon and the window really closes. The
+ * node keeps running either way.
  */
 async function act(action: "minimize" | "toggleMaximize" | "close") {
   try {

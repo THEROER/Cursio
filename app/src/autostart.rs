@@ -7,8 +7,10 @@
 //! **Linux**: the node is a systemd user unit bound to
 //! `graphical-session.target`, so it starts with the desktop (it captures
 //! input and talks to the portal, which need the session's environment) and
-//! `Restart=on-failure` brings it back from a crash; the tray is an XDG
-//! autostart entry, which is what a desktop reads for applications.
+//! `Restart=on-failure` brings it back from a crash. There is no tray switch:
+//! the node draws the icon itself (`node_tray`), and the app, only ever its
+//! windows, has nothing to start at login. The XDG autostart entry an older
+//! app wrote for its tray is removed.
 //! Enabling does not start the unit now: a node started by hand may already
 //! hold the port, and a unit failing on it in a loop is worse than waiting for
 //! the next login.
@@ -26,6 +28,10 @@ use serde::{Deserialize, Serialize};
 pub struct Autostart {
     pub node: bool,
     pub tray: bool,
+    /// Whether this app has a tray to start at login; on Linux the node
+    /// draws the icon, and the switch is not offered.
+    #[serde(default)]
+    pub tray_available: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -113,33 +119,23 @@ mod platform {
         }
     }
 
+    /// The node draws the icon here (`node_tray`), and the app is only ever
+    /// its windows, so the app has nothing to start at login.
     pub fn tray_enabled() -> bool {
-        desktop_path().is_ok_and(|p| p.exists())
+        false
     }
 
+    /// Only ever removes: the entry an older app wrote, which started it
+    /// hidden at every login.
     pub fn set_tray(on: bool) -> Result<(), String> {
-        let path = desktop_path()?;
         if on {
-            let exe = crate::node::app_executable().map_err(|e| e.to_string())?;
-            let entry = format!(
-                "[Desktop Entry]\n\
-                 Type=Application\n\
-                 Name=Cursio\n\
-                 Comment=Status and settings for the Cursio mesh\n\
-                 Exec=\"{}\" --hidden\n\
-                 Terminal=false\n\
-                 X-GNOME-Autostart-enabled=true\n",
-                exe.display()
-            );
-            std::fs::create_dir_all(path.parent().expect("autostart path has a parent"))
-                .and_then(|()| std::fs::write(&path, entry))
-                .map_err(|e| format!("cannot write {}: {e}", path.display()))
-        } else {
-            match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
-            }
+            return Err("on Linux the node shows the icon; start the node at login".into());
+        }
+        let path = desktop_path()?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
         }
     }
 }
@@ -231,6 +227,7 @@ pub fn current() -> Autostart {
     Autostart {
         node: platform::node_enabled(),
         tray: platform::tray_enabled(),
+        tray_available: cfg!(not(target_os = "linux")),
     }
 }
 
@@ -254,6 +251,10 @@ pub fn refresh() {
         if let Err(error) = platform::set_tray(true) {
             tracing::warn!(%error, "could not update the app's start-at-login entry");
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = platform::set_tray(false) {
+        tracing::warn!(%error, "could not remove the app's old start-at-login entry");
     }
 }
 
