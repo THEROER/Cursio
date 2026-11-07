@@ -121,7 +121,16 @@ impl FrameSink for ResumableSink {
         }
         for (writer, id, frame) in writes {
             if self.lane == Lane::Bulk {
-                tokio::time::sleep(self.next_bulk.saturating_duration_since(Instant::now())).await;
+                // Only when the slot is still ahead: a zero-length sleep is
+                // not free. Tokio rounds a deadline up to its next millisecond
+                // and fires it on a turn of its timer, which Windows takes on
+                // its 15.6 ms tick, so sleeping before every frame "for no
+                // time" held a Windows machine's bulk near one 64 KiB frame
+                // per tick even with the pacer wide open (measured: 7.5 MB/s
+                // out of a link carrying 25).
+                if self.next_bulk > Instant::now() {
+                    tokio::time::sleep_until(self.next_bulk).await;
+                }
                 let rate = self.inner.congestion.lock().unwrap().bytes_per_second();
                 self.next_bulk = next_bulk_slot(self.next_bulk, Instant::now(), frame.len(), rate);
                 self.inner.lock().bulk_active = Some(Instant::now());
