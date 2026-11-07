@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import type { SidebarItem } from "@leavepulse/ui"
+
 /**
  * The phone's frame: a title bar, one scrolling column and a tab bar under it.
  *
@@ -35,13 +37,17 @@ function isActive(path: string) {
 
 const title = computed(() => items.value.find((i) => isActive(i.path))?.label ?? t("app.title"))
 
-// The tab bar is the kit's, so its marker slides between destinations; the
-// route stays the single source of which one is open.
-const tabs = computed(() => items.value.map((i) => ({ value: i.path, label: i.label, icon: i.icon, dot: i.dot })))
-const activeTab = computed({
-  get: () => items.value.find((i) => isActive(i.path))?.path ?? "/",
-  set: (path: string) => void navigateTo(path),
-})
+// The kit's bottom bar: links with `aria-current`, not a tablist, since each
+// destination is a page; the route stays the single source of which is open.
+const nav = computed(() => items.value.map((i) => ({ id: i.path, to: i.path, label: i.label, icon: i.icon, dot: i.dot })))
+
+const nodeState = computed(() =>
+  status.value
+    ? { state: "online" as const, label: t("node.runningShort") }
+    : notRunning.value
+      ? { state: "down" as const, label: t("node.stoppedShort") }
+      : { state: "starting" as const, label: t("node.connecting") },
+)
 
 // The phone's sound comes back to its computer from whatever page opens
 // first, as soon as that computer is linked: the node can start capture only
@@ -70,9 +76,7 @@ onMounted(() => void resumeSound())
           <h1 class="truncate text-base font-semibold leading-tight">{{ title }}</h1>
           <p class="truncate text-xs text-muted">{{ status?.node.name ?? t("app.title") }}</p>
         </div>
-        <LpBadge v-if="status" tone="success" dot size="sm" class="shrink-0">{{ t("node.runningShort") }}</LpBadge>
-        <LpBadge v-else-if="notRunning" tone="danger" dot size="sm" class="shrink-0">{{ t("node.stoppedShort") }}</LpBadge>
-        <LpBadge v-else tone="neutral" dot size="sm" class="shrink-0">{{ t("node.connecting") }}</LpBadge>
+        <LpStatus :state="nodeState.state" :label="nodeState.label" variant="pill" size="sm" announce class="shrink-0" />
         <ProblemsBell />
       </div>
     </header>
@@ -87,14 +91,7 @@ onMounted(() => void resumeSound())
       </LpScrollArea>
     </main>
 
-    <LpTabs
-      v-model="activeTab"
-      :items="tabs"
-      variant="bottom"
-      accent
-      :label="t('nav.label')"
-      class="shrink-0"
-    />
+    <LpBottomNav :items="nav" :is-active="(item: SidebarItem) => isActive(item.id)" :label="t('nav.label')" class="shrink-0" />
 
     <AppCommands />
     <PeerForgetDialog />
