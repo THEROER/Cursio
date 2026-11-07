@@ -157,6 +157,7 @@ where
     });
 
     let mut revisions = state.revisions();
+    let mut calls = crate::calls_hub::hub().revisions();
     let mut refresh = tokio::time::interval(PUSH_REFRESH);
     let mut subscribed = false;
     // Held while this connection is an app whose tray stands in for the
@@ -219,6 +220,11 @@ where
                 if changed.is_err() {
                     break Ok(());
                 }
+                if let Err(e) = push(&mut write, &state, &mut last_pushed).await {
+                    break Err(e);
+                }
+            }
+            Ok(()) = calls.changed(), if subscribed => {
                 if let Err(e) = push(&mut write, &state, &mut last_pushed).await {
                     break Err(e);
                 }
@@ -746,6 +752,58 @@ mod tests {
         };
         assert_eq!(status.peers.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A call answered on the phone stops ringing in the app's call window as
+    /// soon as the node hears of it, not at the next periodic refresh.
+    #[tokio::test]
+    async fn a_phones_call_changing_is_pushed_at_once() {
+        use cursio_protocol::calls::{Call, CallDirection, CallState, CallsMsg};
+
+        let dir = std::env::temp_dir().join(format!("cursio-ctl-calls-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(serve_connection(server_side, node(&dir)));
+        let (client, mut pushes) = Client::start(client_side);
+        client.request(Command::Subscribe).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), pushes.recv())
+            .await
+            .expect("no initial push");
+
+        let hub = crate::calls_hub::hub();
+        let phone = cursio_protocol::PeerId::new_v4();
+        let name = format!("phone {phone}");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = hub.register_mesh_phone(
+            phone,
+            name.clone(),
+            crate::calls_hub::Outbox::new(tx, Default::default()),
+        );
+        hub.from_mesh_phone(
+            &phone,
+            CallsMsg::Calls {
+                calls: vec![Call {
+                    id: 1,
+                    direction: CallDirection::Incoming,
+                    state: CallState::Active,
+                    number: None,
+                    name: None,
+                }],
+            },
+        );
+        let pushed = async {
+            loop {
+                if let Some(Reply::Status(status)) = pushes.recv().await {
+                    if status.calls.iter().any(|p| p.name == name) {
+                        return;
+                    }
+                }
+            }
+        };
+        let in_time = tokio::time::timeout(PUSH_REFRESH / 4, pushed).await.is_ok();
+        hub.unregister_mesh_phone(&phone, token);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(in_time, "the call waited for the periodic refresh");
     }
 
     #[tokio::test]

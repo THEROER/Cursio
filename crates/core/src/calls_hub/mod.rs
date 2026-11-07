@@ -149,6 +149,19 @@ pub struct CallsHub {
     /// `None` where this build carries no Bluetooth calls at all.
     setup: Mutex<Option<CallSetup>>,
     at_desk: DeskProbe,
+    revision: Revision,
+}
+
+/// Bumped on every change to the phones' calls, so what shows them over the
+/// control socket — the app's call window — is pushed the change at once. Its
+/// periodic refresh left a call answered on the phone ringing in the window
+/// for up to two seconds more.
+struct Revision(tokio::sync::watch::Sender<u64>);
+
+impl Default for Revision {
+    fn default() -> Self {
+        Revision(tokio::sync::watch::channel(0).0)
+    }
 }
 
 /// Whether the user's hand was on this desk just now; a fake in tests, where
@@ -539,6 +552,11 @@ impl CallsHub {
         }
     }
 
+    /// Resolves each time the phones' calls change.
+    pub fn revisions(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision.0.subscribe()
+    }
+
     fn changed(&self) {
         let (phones, f) = {
             let desk = lock(&self.desk);
@@ -547,6 +565,7 @@ impl CallsHub {
         if let Some(f) = f {
             f(&phones);
         }
+        self.revision.0.send_modify(|r| *r = r.wrapping_add(1));
     }
 }
 

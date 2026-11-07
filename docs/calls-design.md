@@ -279,6 +279,8 @@ another computer carries can still send its voice here.
   server as the phone's notifications: urgent while ringing, replaced in place
   as the call moves on, closed when it ends. Closing a call's notification is
   not declining it.
+- **The app's call window** reads `Status.calls`; a change to them is pushed
+  to the app at once, not at the control socket's two-second refresh.
 - **The control socket**: `Status.calls`, and `Command::Call { phone, action }`
   for the app and the GNOME menu.
 - **The CLI**: `cursio call list | answer | decline | hangup | dial | mute |
