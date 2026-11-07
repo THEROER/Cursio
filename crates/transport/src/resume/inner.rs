@@ -169,8 +169,9 @@ impl Inner {
             noise,
             kind,
         } = path;
-        let (writers, mut frames): (Vec<_>, Vec<_>) = (0..Lane::COUNT)
-            .map(|_| mpsc::channel::<Vec<u8>>(2))
+        let (writers, mut frames): (Vec<_>, Vec<_>) = Lane::ALL
+            .into_iter()
+            .map(|lane| mpsc::channel::<Vec<u8>>(writer_depth(lane)))
             .unzip();
         let writers: [mpsc::Sender<Vec<u8>>; Lane::COUNT] =
             writers.try_into().expect("one inbox per lane");
@@ -184,8 +185,23 @@ impl Inner {
         let write_noise = noise.clone();
         let write = tokio::spawn(async move {
             while let Some(frame) = next_by_lane(&mut frames).await {
-                let sent = match seal_frame(&write_noise, &frame) {
-                    Ok(sealed) => tx.send(&sealed).await,
+                // Whatever else is already waiting leaves in the same write;
+                // see `TransportTx::send_batch` for what that saves.
+                let mut batch = vec![frame];
+                let mut bytes = batch[0].len();
+                while bytes < BATCH_BYTES {
+                    let Some(more) = waiting_by_lane(&mut frames) else {
+                        break;
+                    };
+                    bytes += more.len();
+                    batch.push(more);
+                }
+                let sent = match batch
+                    .iter()
+                    .map(|frame| seal_frame(&write_noise, frame))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(sealed) => tx.send_batch(&sealed).await,
                     Err(e) => Err(e),
                 };
                 if let Err(e) = sent {
@@ -311,6 +327,34 @@ impl Inner {
 /// The next frame for a path's socket: the most urgent lane's first, so a
 /// path shared by every lane sends in lane order. `None` once every inbox has
 /// closed.
+/// How many bytes of already-waiting frames one write may carry.
+///
+/// Enough for a burst of pointer motion and its acknowledgements in a few
+/// RFCOMM frames; small enough that a frame arriving just after the batch is
+/// built waits behind at most this much, which over Bluetooth is a few
+/// milliseconds.
+const BATCH_BYTES: usize = 16 * 1024;
+
+/// How many frames of `lane` may wait for a path's writer.
+///
+/// Two for the lanes whose frames are large, so their order stays with the
+/// priority scheduler upstream rather than in a queue it cannot see. The
+/// interactive lane's are tens of bytes, and with room for two a batch could
+/// never hold more than two pointer moves; with room for 32 a burst leaves in
+/// one write, still ahead of every other lane.
+fn writer_depth(lane: Lane) -> usize {
+    match lane {
+        Lane::Interactive => 32,
+        _ => 2,
+    }
+}
+
+/// A frame already waiting, the most urgent lane first, without waiting for
+/// one.
+fn waiting_by_lane(frames: &mut [mpsc::Receiver<Vec<u8>>]) -> Option<Vec<u8>> {
+    frames.iter_mut().find_map(|inbox| inbox.try_recv().ok())
+}
+
 async fn next_by_lane(frames: &mut [mpsc::Receiver<Vec<u8>>]) -> Option<Vec<u8>> {
     std::future::poll_fn(|cx| {
         let mut open = false;
@@ -333,6 +377,38 @@ async fn next_by_lane(frames: &mut [mpsc::Receiver<Vec<u8>>]) -> Option<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a batch adds after its first frame comes most urgent lane first,
+    /// and the wait ends at an empty inbox rather than blocking.
+    #[tokio::test]
+    async fn a_batch_takes_waiting_frames_most_urgent_first_and_does_not_wait() {
+        let (senders, mut inboxes): (Vec<_>, Vec<_>) = Lane::ALL
+            .into_iter()
+            .map(|lane| mpsc::channel::<Vec<u8>>(writer_depth(lane)))
+            .unzip();
+        senders[Lane::Bulk as usize]
+            .send(b"bulk".to_vec())
+            .await
+            .unwrap();
+        for n in 0..20u8 {
+            senders[Lane::Interactive as usize]
+                .send(vec![n])
+                .await
+                .unwrap();
+        }
+
+        let mut taken = Vec::new();
+        while let Some(frame) = waiting_by_lane(&mut inboxes) {
+            taken.push(frame);
+        }
+        assert_eq!(taken.len(), 21, "twenty moves fit beside each other");
+        assert_eq!(
+            taken[..20],
+            (0..20u8).map(|n| vec![n]).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(taken[20], b"bulk");
+        assert!(waiting_by_lane(&mut inboxes).is_none());
+    }
 
     #[tokio::test]
     async fn a_shared_path_sends_input_ahead_of_frames_queued_before_it() {

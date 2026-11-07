@@ -109,6 +109,23 @@ impl<S: AsyncWrite + Send + 'static> TransportTx for StreamTx<S> {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
         write_message(&mut self.write, msg).await
     }
+
+    /// One write and one flush for the lot.
+    ///
+    /// A pointer sends hundreds of small messages a second. Over RFCOMM each
+    /// write and flush went out as a frame of its own, every one spending a
+    /// credit and an air slot, and the channel fell behind: in a measured
+    /// minute input waited up to 49 ms to reach the socket and the pointer
+    /// moved in jumps. Written together they leave as a few full frames.
+    async fn send_batch(&mut self, msgs: &[Message]) -> Result<(), TransportError> {
+        let mut bytes = Vec::new();
+        for msg in msgs {
+            bytes.extend_from_slice(&encode_frame(&msg.to_bytes()?)?);
+        }
+        self.write.write_all(&bytes).await?;
+        self.write.flush().await?;
+        Ok(())
+    }
 }
 
 struct StreamRx<S> {
@@ -129,6 +146,64 @@ mod tests {
 
     fn ping(n: u64) -> Message {
         Message::Heartbeat { nonce: n }
+    }
+
+    /// A batch is one write on the pipe and arrives as the messages it held,
+    /// in order.
+    #[tokio::test]
+    async fn a_batch_leaves_in_one_write_and_arrives_in_order() {
+        struct Counting<W> {
+            inner: W,
+            writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl<W: AsyncRead + Unpin> AsyncRead for Counting<W> {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+        impl<W: AsyncWrite + Unpin> AsyncWrite for Counting<W> {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Counting {
+            inner: a,
+            writes: writes.clone(),
+        };
+        let (mut tx, _) = Box::new(StreamTransport::new(counted, BLUETOOTH)).split();
+        let (_, mut rx) = Box::new(StreamTransport::new(b, BLUETOOTH)).split();
+
+        let batch: Vec<Message> = (0..20).map(ping).collect();
+        tx.send_batch(&batch).await.unwrap();
+        assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        for n in 0..20 {
+            assert_eq!(rx.recv().await.unwrap(), ping(n));
+        }
     }
 
     #[tokio::test]

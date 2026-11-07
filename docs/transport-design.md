@@ -177,7 +177,16 @@ mouse produces, so on any link that cannot keep up a pointer move that finds
 the previous move still waiting in the input queue is added into it (relative
 deltas sum exactly; a button or key between them stops the merge). This is
 what a Bluetooth mouse itself does per connection interval. A link that keeps
-up never has a move waiting, so nothing changes there. A fully idle Bluetooth standby keeps its sparse 15-second
+up never has a move waiting, so nothing changes there.
+
+What leaves a path's writer leaves in as few writes as it can: everything
+already waiting in its inboxes, most urgent lane first and up to 16 KiB, is
+sealed and written at once (`TransportTx::send_batch`). On RFCOMM a write is a
+frame of its own, and a frame of tens of bytes takes a radio packet nearly as
+long as a full one; written one by one, a pointer's moves waited up to 49 ms
+to reach the socket in a measured minute and arrived in jumps. The interactive
+inbox holds 32 frames rather than 2 so a burst can travel together; it is
+still emptied before any other lane. TCP keeps one write per frame. A fully idle Bluetooth standby keeps its sparse 15-second
 keepalive. Loss of the interactive path holds the session even if a data socket
 is still alive; a usable control path must return within 60 seconds. Modules,
 mounts and capture objects remain intact while individual paths reconnect.

@@ -133,6 +133,20 @@ pub struct QueueDelay {
 pub trait TransportTx: Send {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError>;
 
+    /// Send `msgs` in order, as few writes as the carrier allows.
+    ///
+    /// The default sends them one by one, which is what a socket that bounds
+    /// its own backlog (TCP here) wants. A byte stream overrides it to write
+    /// them as one, because there each write is a unit of the carrier's own:
+    /// on RFCOMM one write is one frame with its own credit and its own slot
+    /// on the air.
+    async fn send_batch(&mut self, msgs: &[Message]) -> Result<(), TransportError> {
+        for msg in msgs {
+            self.send(msg).await?;
+        }
+        Ok(())
+    }
+
     /// How long `priority`'s frames have recently waited to reach the socket.
     ///
     /// Zero for a sender that writes inside `send`, for the same reason as
