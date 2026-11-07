@@ -13,11 +13,17 @@
 //! - a peer's disk is in use through a mount, or ours through theirs — a
 //!   restart in the middle of a write is how Steam once wedged itself on a
 //!   WinFsp volume badly enough to need a reboot;
-//! - a USB device is carrying traffic across the link.
+//! - a USB device is carrying traffic across the link;
+//! - a phone call is up on any phone this machine sees. This machine may be
+//!   the phone's hands-free unit, and a restart drops it mid-sentence: the
+//!   phone falls back to whichever other headset it has connected — a Windows
+//!   laptop's own Bluetooth, once, so the call went on in another room.
+//!   Even with the voice elsewhere, the call's buttons are here.
 //!
 //! The sessions and modules that know these things only report them here, in
 //! atomics, because none of them should hold a lock the update path could
-//! wait on.
+//! wait on. Calls are the exception: they are read from the calls hub, whose
+//! lock is held only to copy its state and never across a wait.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -93,6 +99,16 @@ struct Activity {
     last_files: u64,
     last_usb: u64,
     last_input: u64,
+    calls: usize,
+}
+
+/// Calls up on every phone this machine sees, ringing ones included.
+pub fn calls_up() -> usize {
+    crate::calls_hub::hub()
+        .phones()
+        .iter()
+        .map(|p| p.calls.len())
+        .sum()
 }
 
 /// Why now is not a quiet moment, or `None` when it is.
@@ -103,6 +119,7 @@ pub fn busy() -> Option<String> {
             last_files: LAST_FILES.load(Ordering::Relaxed),
             last_usb: LAST_USB.load(Ordering::Relaxed),
             last_input: LAST_INPUT.load(Ordering::Relaxed),
+            calls: calls_up(),
         },
         now_ms(),
     )
@@ -111,6 +128,9 @@ pub fn busy() -> Option<String> {
 fn judge(activity: Activity, now: u64) -> Option<String> {
     let settle = SETTLE.as_millis() as u64;
     let recent = |at: u64| at != 0 && now.saturating_sub(at) < settle;
+    if activity.calls > 0 {
+        return Some("a phone call is up".into());
+    }
     if activity.driving > 0 {
         return Some("the cursor is on another machine".into());
     }
@@ -162,6 +182,15 @@ mod tests {
         };
         assert!(judge(usb, 1500).unwrap().contains("USB"));
         assert_eq!(judge(usb, 1000 + settle), None);
+    }
+
+    #[test]
+    fn a_call_holds_the_switch_for_as_long_as_it_is_up() {
+        let calling = Activity {
+            calls: 1,
+            ..Activity::default()
+        };
+        assert!(judge(calling, 5).unwrap().contains("call"));
     }
 
     #[test]

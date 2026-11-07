@@ -63,6 +63,13 @@ pub fn set_maintainer(act: Maintainer) {
 
 /// Do `what` to this node, shortly: the answer goes out first.
 pub fn maintain(what: Maintenance) -> Result<(), String> {
+    // Asked for "now" rather than at a quiet moment, but a call is the one
+    // thing a restart cannot be undone for: this machine may be the phone's
+    // headset, and the phone hands the call to whatever else it is connected
+    // to. The person asking is at another machine and cannot see it ringing.
+    if crate::update::quiet::calls_up() > 0 {
+        return Err("a phone call is up here; ask again once it has ended".into());
+    }
     let act = maintainer()
         .clone()
         .ok_or("this node takes no maintenance from its peers")?;

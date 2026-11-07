@@ -94,6 +94,9 @@ pub struct RunArgs {
     /// Switch without starting the node.
     #[arg(long)]
     no_relaunch: bool,
+    /// Stop the node even while a phone call is up on this machine.
+    #[arg(long)]
+    even_during_call: bool,
     /// Seconds the new node has to answer on its control socket.
     #[arg(long, default_value_t = 90)]
     health_timeout: u64,
@@ -109,6 +112,34 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    /// Refuse to stop a node that has a phone call up. It may be the phone's
+    /// headset, and the phone hands a call whose headset vanished to whatever
+    /// else it is connected to: once a Windows laptop's own Bluetooth, which
+    /// played the rest of the call in another room. A node that cannot be
+    /// asked has nothing to lose.
+    async fn refuse_during_call(&self) -> anyhow::Result<()> {
+        use crate::control::{transport, Command, Reply};
+        if !self.stop || self.even_during_call {
+            return Ok(());
+        }
+        let Ok(endpoint) = transport::endpoint() else {
+            return Ok(());
+        };
+        let Ok((client, _pushes)) = transport::connect(&endpoint).await else {
+            return Ok(());
+        };
+        let Ok(Reply::Status(status)) = client.request(Command::Status).await else {
+            return Ok(());
+        };
+        let calls: usize = status.calls.iter().map(|p| p.calls.len()).sum();
+        if calls > 0 {
+            anyhow::bail!(
+                "a phone call is up on this machine; switch once it has ended, or pass --even-during-call"
+            );
+        }
+        Ok(())
+    }
+
     fn plan(&self, version: String) -> Plan {
         Plan {
             version,
@@ -259,8 +290,12 @@ pub async fn run(action: UpdateAction, config_path: &std::path::Path) -> anyhow:
             }
             Ok(())
         }
-        UpdateAction::Apply { version, run } => switch(&layout, run.plan(version)).await,
+        UpdateAction::Apply { version, run } => {
+            run.refuse_during_call().await?;
+            switch(&layout, run.plan(version)).await
+        }
         UpdateAction::Rollback { run } => {
+            run.refuse_during_call().await?;
             let previous = layout
                 .previous()
                 .ok_or_else(|| anyhow::anyhow!("there is no previous version to go back to"))?;

@@ -221,7 +221,13 @@ without a restart.
 no peer's input has been injected here for 60 s (a peer driving *this* screen
 is the user working here, and a switch would throw the cursor back mid-word),
 and no file-sharing or USB message has crossed any link for 60 s — a restart
-mid-write is how Steam wedged itself on a WinFsp mount. Switching hands over to
+mid-write is how Steam wedged itself on a WinFsp mount — and no phone call is
+up. A machine that is a phone's headset dropped mid-call hands the call to
+whatever else the phone has connected; once that was a Windows laptop's own
+Bluetooth, in another room. The same holds for the ways that do not wait for a
+quiet moment: a peer's `cursio apply-update` and `cursio restart` are refused
+with that reason, and `cursio update apply --stop` refuses unless given
+`--even-during-call`. Switching hands over to
 phase 1's helper with the node's own arguments; the helper stops the node
 (SIGINT on Unix, which shuts down cleanly; termination on Windows), flips
 `current`, starts the new build with the old one's elevation, and rolls back
