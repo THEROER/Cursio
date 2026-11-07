@@ -34,6 +34,7 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
         let mut silent: Vec<(u64, Duration)> = Vec::new();
         let mut degraded = None;
         let mut end = None;
+        let mut overdue = None;
         let ack_due;
         {
             let mut state = inner.lock();
@@ -134,11 +135,7 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
             if let Some(path) = state.paths.iter_mut().find(|p| Some(p.id) == probe_path) {
                 if let Some((_, at)) = path.probe {
                     if interval < ACK_EVERY && now.duration_since(at) > interval {
-                        inner
-                            .congestion
-                            .lock()
-                            .unwrap()
-                            .observe(now.duration_since(at), now, true);
+                        overdue = Some((path.id, now.duration_since(at)));
                     }
                 }
                 if now.duration_since(path.last_probe) >= interval
@@ -146,6 +143,15 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
                         .probe
                         .is_none_or(|(_, at)| now.duration_since(at) > STALL)
                 {
+                    if let Some((unanswered, at)) = path.probe {
+                        tracing::debug!(
+                            session = %inner.label(),
+                            path = path.id,
+                            nonce = unanswered,
+                            waited_ms = now.duration_since(at).as_millis() as u64,
+                            "a probe went unanswered; sending another"
+                        );
+                    }
                     let mut ping = vec![link_tag::PING];
                     ping.extend_from_slice(&nonce.to_be_bytes());
                     if path.control().try_send(ping).is_ok() {
@@ -155,6 +161,9 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
                 }
             }
             ack_due = state.ack_due;
+        }
+        if let Some((path, waited)) = overdue {
+            inner.round_trip(path, waited, true, true);
         }
 
         for (id, quiet) in silent {

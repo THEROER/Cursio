@@ -137,15 +137,41 @@ impl Inner {
         if tagged[0] == link_tag::PING {
             let mut pong = vec![link_tag::PONG];
             pong.extend_from_slice(&nonce.to_be_bytes());
-            let _ = path.control().try_send(pong);
+            if let Err(e) = path.control().try_send(pong) {
+                tracing::debug!(session = %self.label(), path = id, error = %e, "a probe's answer was dropped: the path's writer is full");
+            }
         } else if let Some((expected, at)) = path.probe {
             if expected == nonce {
                 path.probe = None;
-                self.congestion
-                    .lock()
-                    .unwrap()
-                    .observe(at.elapsed(), Instant::now(), active);
+                drop(state);
+                self.round_trip(id, at.elapsed(), active, false);
+            } else {
+                tracing::debug!(session = %self.label(), path = id, nonce, expected, "an answer to an earlier probe arrived");
             }
+        } else {
+            tracing::debug!(session = %self.label(), path = id, nonce, "an answer arrived with no probe outstanding");
+        }
+    }
+
+    /// Hand one interactive round trip to the bulk pacer, saying why when it
+    /// backs off: `overdue` when the reading is a probe still unanswered.
+    pub(super) fn round_trip(&self, path: u64, rtt: Duration, active: bool, overdue: bool) {
+        let cut = self
+            .congestion
+            .lock()
+            .unwrap()
+            .observe(rtt, Instant::now(), active);
+        if let Some((standing, baseline)) = cut {
+            let rate = self.congestion.lock().unwrap().bytes_per_second();
+            tracing::debug!(
+                session = %self.label(),
+                path,
+                overdue,
+                standing_ms = standing.as_secs_f64() * 1000.0,
+                baseline_ms = baseline.as_secs_f64() * 1000.0,
+                rate_kb_s = (rate / 1024.0) as u64,
+                "bulk eased off: the interactive round trip is standing above its baseline"
+            );
         }
     }
 

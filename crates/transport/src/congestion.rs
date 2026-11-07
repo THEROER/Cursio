@@ -47,6 +47,16 @@ pub(crate) struct BackgroundRate {
     /// The latest readings, newest last.
     current: VecDeque<Duration>,
     updated: Option<Instant>,
+    /// No reading has stood above the baseline since bulk last started:
+    /// the rate doubles rather than creeping up.
+    ///
+    /// Each transfer starts at [`INITIAL_RATE`], and at 10% per reading it
+    /// took six seconds to reach the 18 MB/s a Wi-Fi link carried, so a
+    /// ten-second test measured a third of it and a game's bursty reads,
+    /// each starting over after a pause, ran at the bottom of the ramp. As in
+    /// TCP's slow start, doubling until the first sign of a queue reaches
+    /// that in under a second; from then on the cautious increase holds.
+    slow_start: bool,
 }
 
 impl Default for BackgroundRate {
@@ -56,6 +66,7 @@ impl Default for BackgroundRate {
             minima: VecDeque::new(),
             current: VecDeque::new(),
             updated: None,
+            slow_start: true,
         }
     }
 }
@@ -65,7 +76,14 @@ impl BackgroundRate {
         self.rate
     }
 
-    pub(crate) fn observe(&mut self, rtt: Duration, now: Instant, active: bool) {
+    /// Take one round-trip reading. Answers the reading that made it back
+    /// off, and the baseline it stood above, when it did.
+    pub(crate) fn observe(
+        &mut self,
+        rtt: Duration,
+        now: Instant,
+        active: bool,
+    ) -> Option<(Duration, Duration)> {
         let baseline = self.baseline(rtt, now);
         if self.current.len() == CURRENT_SAMPLES {
             self.current.pop_front();
@@ -74,26 +92,28 @@ impl BackgroundRate {
         if !active {
             self.rate = self.rate.min(INITIAL_RATE);
             self.updated = None;
-            return;
+            self.slow_start = true;
+            return None;
         }
         if self
             .updated
             .is_some_and(|at| now.duration_since(at) < UPDATE_INTERVAL)
         {
-            return;
+            return None;
         }
         self.updated = Some(now);
         let standing = self.current.iter().min().copied().unwrap_or(rtt);
         if standing.saturating_sub(baseline) > QUEUE_TARGET {
             self.rate = (self.rate * 0.7).max(MIN_RATE);
-            tracing::debug!(
-                standing_ms = standing.as_secs_f64() * 1000.0,
-                baseline_ms = baseline.as_secs_f64() * 1000.0,
-                rate_kb_s = (self.rate / 1024.0) as u64,
-                "bulk eased off: the interactive round trip is standing above its baseline"
-            );
+            self.slow_start = false;
+            Some((standing, baseline))
         } else {
-            self.rate = (self.rate * 1.1 + 16_384.0).min(MAX_RATE);
+            self.rate = match self.slow_start {
+                true => self.rate * 2.0,
+                false => self.rate * 1.1 + 16_384.0,
+            }
+            .min(MAX_RATE);
+            None
         }
     }
 }
@@ -127,18 +147,30 @@ mod tests {
         let mut controller = BackgroundRate::default();
         let mut now = Instant::now();
         controller.observe(Duration::from_millis(10), now, true);
-        let clear = controller.bytes_per_second();
-        for _ in 0..CURRENT_SAMPLES {
+        // A queue is believed once it has stood for every reading the filter
+        // holds, and not before.
+        let mut cut = None;
+        for _ in 0..=CURRENT_SAMPLES {
             now += UPDATE_INTERVAL;
-            controller.observe(Duration::from_millis(60), now, true);
+            let before = controller.bytes_per_second();
+            if controller
+                .observe(Duration::from_millis(60), now, true)
+                .is_some()
+            {
+                cut = Some((before, controller.bytes_per_second()));
+                break;
+            }
         }
-        let congested = controller.bytes_per_second();
-        assert!(congested < clear);
+        let (before, congested) = cut.expect("a standing queue cuts the rate");
+        assert!(congested < before);
         // Repeated readings within one interval must not compound the cut.
         controller.observe(Duration::from_millis(60), now, true);
         assert_eq!(controller.bytes_per_second(), congested);
         now += UPDATE_INTERVAL;
-        controller.observe(Duration::from_millis(10), now, true);
+        for _ in 0..CURRENT_SAMPLES {
+            controller.observe(Duration::from_millis(10), now, true);
+            now += UPDATE_INTERVAL;
+        }
         assert!(controller.bytes_per_second() > congested);
     }
 
@@ -160,12 +192,17 @@ mod tests {
         controller.observe(Duration::from_millis(2), now, true);
         // The quiet round trip is 30 ms from here on: a roam, another
         // channel. Within the window it reads as queue and is cut ...
-        for _ in 0..CURRENT_SAMPLES {
+        let mut cut = None;
+        for _ in 0..=CURRENT_SAMPLES {
             now += UPDATE_INTERVAL;
-            controller.observe(Duration::from_millis(30), now, true);
+            if controller
+                .observe(Duration::from_millis(30), now, true)
+                .is_some()
+            {
+                cut = Some(controller.bytes_per_second());
+            }
         }
-        let cut = controller.bytes_per_second();
-        assert!(cut < INITIAL_RATE);
+        let cut = cut.expect("read as queue while the old baseline holds");
         // ... and once the 2 ms reading has aged out it is the baseline, so
         // the rate grows again instead of staying pinned.
         let mut last = cut;
@@ -174,9 +211,34 @@ mod tests {
             controller.observe(Duration::from_millis(30), now, true);
             last = controller.bytes_per_second();
         }
-        assert!(
-            last > INITIAL_RATE,
-            "{last} after the old baseline aged out"
-        );
+        assert!(last > cut * 2.0, "{last} after the old baseline aged out");
+    }
+
+    #[test]
+    fn a_clear_link_is_filled_within_a_second_of_bulk_starting() {
+        let mut controller = BackgroundRate::default();
+        let mut now = Instant::now();
+        for _ in 0..5 {
+            controller.observe(Duration::from_millis(5), now, true);
+            now += UPDATE_INTERVAL;
+        }
+        assert!(controller.bytes_per_second() >= 16.0 * 1024.0 * 1024.0);
+    }
+
+    #[test]
+    fn after_the_first_queue_the_rate_creeps_rather_than_doubles() {
+        let mut controller = BackgroundRate::default();
+        let mut now = Instant::now();
+        controller.observe(Duration::from_millis(5), now, true);
+        for _ in 0..CURRENT_SAMPLES {
+            now += UPDATE_INTERVAL;
+            controller.observe(Duration::from_millis(60), now, true);
+        }
+        now += UPDATE_INTERVAL;
+        controller.observe(Duration::from_millis(5), now, true);
+        let before = controller.bytes_per_second();
+        now += UPDATE_INTERVAL;
+        controller.observe(Duration::from_millis(5), now, true);
+        assert!(controller.bytes_per_second() < before * 1.2);
     }
 }

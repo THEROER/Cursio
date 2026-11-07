@@ -121,7 +121,12 @@ roam and every reading looked like queue. The queue is the lowest of the last
 three readings above that baseline: a Wi-Fi link's quiet RTT spikes by tens of
 milliseconds on its own, and each lone spike used to cut bulk by 30%. Queueing above
 that baseline by more than 15 ms reduces the bulk rate by 30%; a clear path
-raises it by 10% plus 16 KiB/s, at most once per 200 ms. An overdue probe is also
+raises it by 10% plus 16 KiB/s, at most once per 200 ms — doubling instead
+until the first sign of a queue since bulk started, as TCP's slow start does:
+at 10% from 1 MiB/s a transfer took six seconds to reach the 18 MB/s a Wi-Fi
+link carried, and bursty reads that start over after each pause never left the
+bottom of the ramp. Each back-off is logged at debug with the session, the
+reading and the baseline it stood above. An overdue probe is also
 a congestion signal. Idle observations update the baseline without raising the
 next transfer's initial rate. A replacement control path resets the estimate.
 
