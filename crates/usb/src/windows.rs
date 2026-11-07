@@ -73,7 +73,17 @@ pub struct WindowsUsb {
     classes: std::cell::RefCell<Option<ClassCache>>,
     /// The last listing, and what it was read under. See [`Self::devices`].
     listing: std::cell::RefCell<Option<Listing>>,
+    /// A listing being read on a thread, and the notification counter it was
+    /// started under. Shared by clones, which are the same backend.
+    reading: std::sync::Arc<std::sync::Mutex<Option<Reading>>>,
 }
+
+/// A listing a thread is reading: the notification counter it started under,
+/// and where its answer arrives.
+type Reading = (
+    u64,
+    std::sync::mpsc::Receiver<Result<(Vec<LocalDevice>, ClassCache), UsbBackendError>>,
+);
 
 /// A USB vendor and product id, the key PnP classes are matched by.
 type VendorProduct = (u16, u16);
@@ -181,6 +191,7 @@ impl WindowsUsb {
             exe: PathBuf::from(DEFAULT_PATH),
             classes: std::cell::RefCell::new(None),
             listing: std::cell::RefCell::new(None),
+            reading: Default::default(),
         }
     }
 
@@ -190,6 +201,7 @@ impl WindowsUsb {
             exe: exe.into(),
             classes: std::cell::RefCell::new(None),
             listing: std::cell::RefCell::new(None),
+            reading: Default::default(),
         }
     }
 
@@ -207,14 +219,31 @@ impl WindowsUsb {
     /// Unprivileged, so this is safe to call on every listing. The answer is
     /// kept until Windows reports a device arriving or leaving, this backend
     /// binds one, or [`LISTING_TRUSTED_FOR`] passes.
+    ///
+    /// Only the first listing is read while the caller waits. After that an
+    /// expired one is answered as it stands while a fresh one is read on a
+    /// thread of its own, and taken up by the next call: `usbipd state` is a
+    /// process costing about 70 ms, and paid inline once a minute per link it
+    /// held up the module's device traffic 1971 times in four days on one
+    /// machine. The caller asks every few seconds, so a device that arrives is
+    /// still listed within one of them.
     pub fn devices(&self) -> Result<Vec<LocalDevice>, UsbBackendError> {
         let generation = device_changes();
+        self.take_reading();
         if let Some(listing) = self.listing.borrow().as_ref() {
             if listing_is_current(listing, generation) {
                 return Ok(listing.devices.clone());
             }
+            if let Some(generation) = generation {
+                self.start_reading(generation);
+                return Ok(listing.devices.clone());
+            }
         }
-        let devices = self.read_devices()?;
+        if !self.is_available() {
+            return Err(self.missing());
+        }
+        let (devices, classes) = read_listing(&self.exe, self.classes.borrow().clone())?;
+        *self.classes.borrow_mut() = Some(classes);
         *self.listing.borrow_mut() = generation.map(|generation| Listing {
             devices: devices.clone(),
             generation,
@@ -223,29 +252,60 @@ impl WindowsUsb {
         Ok(devices)
     }
 
-    fn read_devices(&self) -> Result<Vec<LocalDevice>, UsbBackendError> {
-        let json = self.run(&["state"])?;
-        let mut devices = parse_state(&json)?;
-        // `usbipd state` carries no class, and the class is what decides
-        // whether a device may be taken automatically — a Bluetooth radio
-        // taken from a laptop cuts out the user's headphones. Windows knows it
-        // through PnP, so it is asked separately and matched by vendor and
-        // product, and cached: see `classes`.
-        let present: Vec<(u16, u16)> = devices.iter().map(|d| (d.vendor, d.product)).collect();
-        let mut slot = self.classes.borrow_mut();
-        let classes = match slot.as_ref() {
-            Some((read_for, classes)) if !needs_reread(read_for, &present) => classes,
-            _ => {
-                let fresh = pnp_classes();
-                &slot.insert((present, fresh)).1
-            }
-        };
-        for device in &mut devices {
-            if let Some(class) = classes.get(&(device.vendor, device.product)) {
-                device.class = *class;
+    /// Start reading a fresh listing on a thread, unless one is under way.
+    fn start_reading(&self, generation: u64) {
+        let mut reading = self.reading.lock().unwrap_or_else(|e| e.into_inner());
+        if reading.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (exe, classes) = (self.exe.clone(), self.classes.borrow().clone());
+        let spawned = std::thread::Builder::new()
+            .name("usbipd-state".into())
+            .spawn(move || {
+                let _ = tx.send(read_listing(&exe, classes));
+            });
+        match spawned {
+            Ok(_) => *reading = Some((generation, rx)),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot start reading the usb listing; keeping the last one")
             }
         }
-        Ok(devices)
+    }
+
+    /// Take up a listing a thread has finished reading.
+    fn take_reading(&self) {
+        let mut reading = self.reading.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((generation, rx)) = reading.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Ok(Ok((devices, classes))) => {
+                *self.classes.borrow_mut() = Some(classes);
+                *self.listing.borrow_mut() = Some(Listing {
+                    devices,
+                    generation: *generation,
+                    read_at: std::time::Instant::now(),
+                });
+            }
+            // The last listing stays: answering with what was there a minute
+            // ago beats answering with nothing, and the next call reads again.
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "cannot enumerate usb devices; keeping the last listing")
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+        *reading = None;
+    }
+
+    /// Why nothing can be asked of `usbipd-win`.
+    fn missing(&self) -> UsbBackendError {
+        UsbBackendError::DriverMissing(format!(
+            "usbipd-win is not installed ({} is missing); \
+             install it with: winget install usbipd",
+            self.exe.display()
+        ))
     }
 
     /// Share a device so a peer can attach it.
@@ -378,42 +438,75 @@ impl WindowsUsb {
     /// Run `usbipd` and return its stdout.
     fn run(&self, args: &[&str]) -> Result<String, UsbBackendError> {
         if !self.is_available() {
-            return Err(UsbBackendError::DriverMissing(format!(
-                "usbipd-win is not installed ({} is missing); \
-                 install it with: winget install usbipd",
-                self.exe.display()
-            )));
+            return Err(self.missing());
         }
-        // Anything but `state` changes what `state` answers.
+        // Anything but `state` changes what `state` answers — including a
+        // listing a thread is reading right now, which would arrive describing
+        // the machine as it was before this command.
         if args.first() != Some(&"state") {
             self.listing.borrow_mut().take();
+            self.reading
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
         }
-        let mut command = Command::new(&self.exe);
-        command.args(args);
-        // `state` is polled for the life of the node. A node started from the
-        // app or at login has no console, so without this every poll opens a
-        // console window of its own and the screen flickers.
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-        let output = command.output().map_err(|e| {
-            UsbBackendError::Enumerate(format!("cannot run {}: {e}", self.exe.display()))
-        })?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-        }
-
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        // The privilege case is told apart because it is the one the user can
-        // act on, and because the wire vocabulary has a variant for it.
-        if message.to_lowercase().contains("administrator") {
-            return Err(UsbBackendError::NeedsPrivilege(message));
-        }
-        Err(UsbBackendError::Enumerate(message))
+        run_usbipd(&self.exe, args)
     }
+}
+
+/// `usbipd-win` and the PnP classes of what it lists, as one listing, given
+/// the classes known so far.
+fn read_listing(
+    exe: &Path,
+    classes: Option<ClassCache>,
+) -> Result<(Vec<LocalDevice>, ClassCache), UsbBackendError> {
+    let json = run_usbipd(exe, &["state"])?;
+    let mut devices = parse_state(&json)?;
+    // `usbipd state` carries no class, and the class is what decides whether a
+    // device may be taken automatically — a Bluetooth radio taken from a
+    // laptop cuts out the user's headphones. Windows knows it through PnP, so
+    // it is asked separately and matched by vendor and product, and cached:
+    // see `WindowsUsb::classes`.
+    let present: Vec<(u16, u16)> = devices.iter().map(|d| (d.vendor, d.product)).collect();
+    let classes = match classes {
+        Some((read_for, classes)) if !needs_reread(&read_for, &present) => (read_for, classes),
+        _ => (present, pnp_classes()),
+    };
+    for device in &mut devices {
+        if let Some(class) = classes.1.get(&(device.vendor, device.product)) {
+            device.class = *class;
+        }
+    }
+    Ok((devices, classes))
+}
+
+/// Run `usbipd-win` with `args` and return what it printed.
+fn run_usbipd(exe: &Path, args: &[&str]) -> Result<String, UsbBackendError> {
+    let mut command = Command::new(exe);
+    command.args(args);
+    // `state` is polled for the life of the node. A node started from the
+    // app or at login has no console, so without this every poll opens a
+    // console window of its own and the screen flickers.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command
+        .output()
+        .map_err(|e| UsbBackendError::Enumerate(format!("cannot run {}: {e}", exe.display())))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    // The privilege case is told apart because it is the one the user can
+    // act on, and because the wire vocabulary has a variant for it.
+    if message.to_lowercase().contains("administrator") {
+        return Err(UsbBackendError::NeedsPrivilege(message));
+    }
+    Err(UsbBackendError::Enumerate(message))
 }
 
 /// The firewall rule that keeps usbipd's port on this machine.
@@ -690,6 +783,62 @@ mod tests {
     fn a_listing_is_reread_after_a_minute_even_without_notifications() {
         let kept = listing(4, LISTING_TRUSTED_FOR + std::time::Duration::from_secs(1));
         assert!(!listing_is_current(&kept, Some(4)));
+    }
+
+    /// A listing read on a thread is taken up under the counter it was started
+    /// with, and a failed one leaves the last listing standing.
+    #[test]
+    fn a_listing_read_in_the_background_replaces_the_kept_one() {
+        let usb = WindowsUsb::at("/nonexistent/usbipd.exe");
+        *usb.listing.borrow_mut() = Some(listing(4, LISTING_TRUSTED_FOR * 2));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        *usb.reading.lock().unwrap() = Some((5, rx));
+        usb.take_reading();
+        assert_eq!(
+            usb.listing.borrow().as_ref().unwrap().generation,
+            4,
+            "not done yet"
+        );
+
+        tx.send(Err(UsbBackendError::Enumerate("busy".into())))
+            .unwrap();
+        usb.take_reading();
+        assert_eq!(
+            usb.listing.borrow().as_ref().unwrap().generation,
+            4,
+            "a failure keeps it"
+        );
+        assert!(
+            usb.reading.lock().unwrap().is_none(),
+            "and the next call reads again"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        *usb.reading.lock().unwrap() = Some((5, rx));
+        tx.send(Ok((Vec::new(), (Vec::new(), HashMap::new()))))
+            .unwrap();
+        usb.take_reading();
+        let kept = usb.listing.borrow().clone().unwrap();
+        assert!(listing_is_current(&kept, Some(5)));
+    }
+
+    /// A bind changes what `state` answers, so a listing read before it must
+    /// not arrive afterwards as the current one.
+    #[test]
+    fn a_command_that_changes_the_state_drops_a_listing_being_read() {
+        // Any program that exists stands in for usbipd; the command failing is
+        // beside the point, which is what happened before it ran.
+        let stand_in = if cfg!(windows) {
+            r"C:\Windows\System32\where.exe"
+        } else {
+            "/bin/false"
+        };
+        let usb = WindowsUsb::at(stand_in);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        *usb.reading.lock().unwrap() = Some((5, rx));
+        let _ = usb.run(&["bind", "--busid", "1-1"]);
+        assert!(usb.reading.lock().unwrap().is_none());
     }
 
     #[cfg(target_os = "windows")]
