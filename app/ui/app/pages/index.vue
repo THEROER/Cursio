@@ -115,6 +115,13 @@ function peerFacts(link: NonNullable<PeerView["link"]>) {
 
 <template>
   <div>
+    <div v-if="isMobile" class="mb-6 empty:hidden"><PhoneUpdateCard /></div>
+    <div v-if="isMobile" class="mb-6 empty:hidden"><PhoneSetupCard /></div>
+
+    <!-- The placeholders give way to the page by the kit's swap, keyed by the
+         state rather than by each new status, so it plays once, not on every
+         push. -->
+    <LpSwap :swap-key="status ? 'ready' : 'loading'">
     <!-- Loading: the first push has not arrived and nothing has failed yet. -->
     <div v-if="!status && !error" class="flex flex-col gap-6">
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -123,10 +130,7 @@ function peerFacts(link: NonNullable<PeerView["link"]>) {
       <LpSkeleton rounded="card" class="h-64" />
     </div>
 
-    <div v-if="isMobile" class="mb-6 empty:hidden"><PhoneUpdateCard /></div>
-    <div v-if="isMobile" class="mb-6 empty:hidden"><PhoneSetupCard /></div>
-
-    <div v-if="status" class="flex flex-col gap-6">
+    <div v-else-if="status" class="flex flex-col gap-6">
       <LpCard v-if="isMobile" padded class="flex flex-col gap-3">
         <div class="flex items-center gap-2">
           <LpIcon name="lucide:smartphone" :size="18" class="shrink-0 text-brand" />
@@ -222,12 +226,23 @@ function peerFacts(link: NonNullable<PeerView["link"]>) {
           :title="t('peers.none')"
           :description="t('peers.noneHint')"
         />
-        <div v-else class="grid grid-cols-1 gap-3 md:grid-cols-2">
-          <PeerMenu
-            v-for="peer in status.peers"
-            :key="peer.id"
-            :peer="peerRef(peer)"
-          >
+        <!-- A machine paired or forgotten comes and goes, the others moving
+             over to make room, rather than the grid jumping. -->
+        <TransitionGroup
+          v-else
+          tag="div"
+          class="grid grid-cols-1 gap-3 md:grid-cols-2"
+          move-class="transition-transform duration-[var(--duration-medium)] ease-[var(--ease-emphasized)] motion-reduce:transition-none"
+          enter-active-class="transition duration-[var(--duration-medium)] ease-[var(--ease-emphasized)] motion-reduce:transition-none"
+          enter-from-class="opacity-0 translate-y-1"
+          leave-active-class="transition-opacity duration-[var(--duration-fast)] motion-reduce:transition-none"
+          leave-to-class="opacity-0"
+        >
+          <div v-for="peer in status.peers" :key="peer.id">
+          <PeerMenu :peer="peerRef(peer)">
+            <!-- The card grows and shrinks with what its link brings —
+                 facts, modules — and those fade in and out as they come. -->
+            <LpShift axis="height" presence>
             <LpCard padded class="flex flex-col gap-3">
               <div class="flex items-center gap-2">
                 <LpIcon
@@ -270,10 +285,13 @@ function peerFacts(link: NonNullable<PeerView["link"]>) {
               </template>
               <p v-else class="text-xs text-muted">{{ t("peer.noLink") }}</p>
             </LpCard>
+            </LpShift>
           </PeerMenu>
-        </div>
+          </div>
+        </TransitionGroup>
       </section>
     </div>
+    </LpSwap>
 
     <LpConfirmDialog
       v-model:open="confirmRestart"

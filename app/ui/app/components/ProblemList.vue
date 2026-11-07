@@ -72,7 +72,18 @@ const badge = { Info: "brand", Warning: "warning", Error: "danger" } as const
     :title="t('problems.none')"
     :description="t('problems.noneHint')"
   />
-  <ul v-else class="flex flex-col gap-2">
+  <!-- A problem raised or cleared comes and goes, the rest closing up after
+       it, rather than the list jumping. -->
+  <TransitionGroup
+    v-else
+    tag="ul"
+    class="relative flex flex-col gap-2"
+    move-class="transition-transform duration-[var(--duration-medium)] ease-[var(--ease-emphasized)] motion-reduce:transition-none"
+    enter-active-class="transition duration-[var(--duration-medium)] ease-[var(--ease-emphasized)] motion-reduce:transition-none"
+    enter-from-class="opacity-0 translate-y-1"
+    leave-active-class="absolute inset-x-0 transition-opacity duration-[var(--duration-fast)] motion-reduce:transition-none"
+    leave-to-class="opacity-0"
+  >
     <li v-for="problem in shown" :key="problem.id">
       <LpCard padded class="flex gap-3">
         <LpIcon :name="icon[problem.severity]" :size="18" class="mt-0.5 shrink-0" :class="tone[problem.severity]" />
@@ -108,5 +119,5 @@ const badge = { Info: "brand", Warning: "warning", Error: "danger" } as const
         </LpTooltip>
       </LpCard>
     </li>
-  </ul>
+  </TransitionGroup>
 </template>
