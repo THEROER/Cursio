@@ -12,7 +12,9 @@
 //! more than a banner that slides away. The node asks for it by starting the
 //! app's stable copy with `--page call`; a running app takes that over its
 //! single-instance hand-off, so this works whether or not it is open. The
-//! notification stays the fallback for a machine with no installed app, and
+//! notification stays the fallback for a machine with no installed app, for
+//! a call that arrives while the app is not running (its window is then
+//! seconds away, and the notification rings meanwhile), and
 //! for every machine the user is not at, where a window would pop up over
 //! nobody.
 
@@ -169,8 +171,18 @@ pub fn start(display: Arc<dyn NotifyDisplay>) {
                 let notification = notification(&key, phone, call, &buttons);
                 let actions: Vec<CallAction> = buttons.into_iter().map(|(_, a)| a).collect();
                 let new_call = !state.shown.contains_key(&key);
-                if new_call && crate::presence::user_here() && open_call_window() {
+                // A window from an app that is already running is up at once.
+                // One that has to start first took a second and more on a
+                // call that was ringing, with nothing at all on screen
+                // meanwhile; so then the notification shows as well.
+                if new_call
+                    && crate::presence::user_here()
+                    && crate::proc_memory::running("cursio-app")
+                    && open_call_window()
+                {
                     state.windowed.insert(key.clone());
+                } else if new_call && crate::presence::user_here() {
+                    open_call_window();
                 }
                 let unchanged = state
                     .shown

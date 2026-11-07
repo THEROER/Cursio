@@ -282,7 +282,11 @@ another computer carries can still send its voice here.
   Windows that is the `incomingCall` toast, which loops its ringtone for as
   long as the toast is up, so an answered call is an ordinary notification.
 - **The app's call window** reads `Status.calls`; a change to them is pushed
-  to the app at once, not at the control socket's two-second refresh.
+  to the app at once, not at the control socket's two-second refresh. On the
+  machine the user is at it replaces the notification — unless the app was
+  not running when the call came: starting it took a second and more, with
+  nothing on screen while the phone rang, so then the notification shows
+  too.
 - **The control socket**: `Status.calls`, and `Command::Call { phone, action }`
   for the app and the GNOME menu.
 - **The CLI**: `cursio call list | answer | decline | hangup | dial | mute |

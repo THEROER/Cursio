@@ -38,6 +38,12 @@ pub fn top(n: usize) -> Vec<ProcessUse> {
     all
 }
 
+/// Whether a process whose name starts with `prefix` is running. `false`
+/// where the system cannot be asked, which callers take as "not running".
+pub fn running(prefix: &str) -> bool {
+    imp::all().iter().any(|p| p.name.starts_with(prefix))
+}
+
 /// Write this node's memory to the log.
 pub fn log_own() {
     let own = own();
