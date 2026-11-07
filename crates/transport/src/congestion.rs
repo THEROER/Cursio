@@ -86,6 +86,12 @@ impl BackgroundRate {
         let standing = self.current.iter().min().copied().unwrap_or(rtt);
         if standing.saturating_sub(baseline) > QUEUE_TARGET {
             self.rate = (self.rate * 0.7).max(MIN_RATE);
+            tracing::debug!(
+                standing_ms = standing.as_secs_f64() * 1000.0,
+                baseline_ms = baseline.as_secs_f64() * 1000.0,
+                rate_kb_s = (self.rate / 1024.0) as u64,
+                "bulk eased off: the interactive round trip is standing above its baseline"
+            );
         } else {
             self.rate = (self.rate * 1.1 + 16_384.0).min(MAX_RATE);
         }
