@@ -191,6 +191,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             node::follow(app.handle().clone());
+            relaunch::follow_install(app.handle().clone());
             // Started by the node for a call: the call window alone, the main
             // window left in the tray as if started at login.
             let for_call = first_page.as_deref() == Some(CALL_ROUTE);

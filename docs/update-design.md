@@ -78,6 +78,14 @@ the app was installed and up to date there and search found nothing. The node
 writes it at its own start, not in the apply helper, because the helper is the
 previous version's code.
 
+The app follows the node by itself. Switching versions relaunches the node
+only; a window keeps the build it started as, and a tray app may go days
+unopened. So the app compares its version with `current` once a minute and,
+while none of its windows is on screen, restarts through `<root>/cursio-app
+--hidden` (`app/src/relaunch.rs`). An open window is left alone and offers the
+restart instead (`WindowStaleAlert`), since its user may be in the middle of
+something.
+
 **Installing** (`cursio update install <dir>`) reads the build's
 `manifest.json`, verifies every component's sha256 in the source, copies into
 `versions/.<v>.partial`, verifies again, and renames into place — a half-copied
