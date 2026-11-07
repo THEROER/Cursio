@@ -1055,6 +1055,7 @@ mod tests {
                     modified_unix: 0,
                     writable: true,
                     allocated: None,
+                    stamp: None,
                 }))
                 .expect("reply sends");
         });

@@ -384,6 +384,7 @@ mod tests {
             modified_unix: 0,
             writable: true,
             allocated: None,
+            stamp: None,
         };
         assert!(
             cache.get("C:", "a.txt").is_none(),
@@ -419,6 +420,7 @@ mod tests {
                     modified_unix: 0,
                     writable: true,
                     allocated: None,
+                    stamp: None,
                 }),
             );
         }
@@ -444,6 +446,7 @@ mod tests {
                 modified_unix: 0,
                 writable: true,
                 allocated: None,
+                stamp: None,
             }),
         );
         cache.forget("C:", "a.txt");

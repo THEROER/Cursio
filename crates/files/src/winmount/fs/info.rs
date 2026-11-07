@@ -17,6 +17,7 @@ pub(super) fn synthetic_dir(name: &str) -> FileMeta {
         modified_unix: 0,
         writable: true,
         allocated: None,
+        stamp: None,
     }
 }
 

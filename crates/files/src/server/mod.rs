@@ -868,7 +868,53 @@ fn meta_from(name: String, md: &std::fs::Metadata, volume_writable: bool) -> Fil
         modified_unix,
         writable: volume_writable && !md.permissions().readonly(),
         allocated: allocated_bytes(md),
+        stamp: match kind {
+            FileKind::File => version_stamp(md),
+            FileKind::Dir | FileKind::Symlink => None,
+        },
     }
+}
+
+/// A value that changes whenever the file's bytes may have; see
+/// [`FileMeta::stamp`].
+///
+/// The change time is the part that cannot be faked from user space: a
+/// program can put the modification time back after rewriting a file (`cp -p`,
+/// `touch -r`, an archiver restoring times), but every such write and the
+/// `utimensat` that follows it moves `ctime`. The inode and device are there
+/// for a file replaced by a rename, which can carry over every time it had.
+#[cfg(unix)]
+fn version_stamp(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut h = crate::fnv::Fnv64::default();
+    h.write_u64(md.mtime() as u64)
+        .write_u64(md.mtime_nsec() as u64)
+        .write_u64(md.ctime() as u64)
+        .write_u64(md.ctime_nsec() as u64)
+        .write_u64(md.ino())
+        .write_u64(md.dev())
+        .write_u64(md.len());
+    Some(h.finish())
+}
+
+/// Windows keeps the last write in 100 ns units, which is fine enough that two
+/// writes landing on the same value is not a case worth designing for, and the
+/// creation time tells a file replaced by a rename from the one it replaced.
+/// There is no change time to read without opening the file, which a listing
+/// of thousands of entries cannot do one file at a time.
+#[cfg(windows)]
+fn version_stamp(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::MetadataExt;
+    let mut h = crate::fnv::Fnv64::default();
+    h.write_u64(md.last_write_time())
+        .write_u64(md.creation_time())
+        .write_u64(md.file_size());
+    Some(h.finish())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn version_stamp(_md: &std::fs::Metadata) -> Option<u64> {
+    None
 }
 
 /// What the file occupies on this machine's disk, when that is knowable.
@@ -946,6 +992,50 @@ mod tests {
         });
         drop(held);
         assert_eq!(listing, vec!["a.txt".to_string()]);
+    }
+
+    /// A rewrite of the same length that puts the modification time back, as
+    /// `cp -p` or an archiver does, still reads as a new version: the change
+    /// time moved, and a cache keyed on the stamp must not serve the old bytes.
+    #[test]
+    fn a_rewrite_that_restores_its_time_still_changes_the_stamp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("a.bin");
+        std::fs::write(&file, b"first").expect("write");
+        let srv = server_on(tmp.path());
+        let ns = srv.namespace();
+        let before = ns.stat("T:", "a.bin").expect("stats");
+        assert!(before.stamp.is_some(), "a regular file is vouched for");
+        assert_eq!(
+            ns.stat("T:", "a.bin").expect("stats").stamp,
+            before.stamp,
+            "an unchanged file keeps its stamp"
+        );
+
+        let mtime = std::fs::metadata(&file)
+            .expect("md")
+            .modified()
+            .expect("mtime");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&file, b"other").expect("rewrite");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open")
+            .set_modified(mtime)
+            .expect("restore mtime");
+        let after = ns.stat("T:", "a.bin").expect("stats");
+        assert_eq!(after.size, before.size);
+        assert_eq!(after.modified_unix, before.modified_unix);
+        assert_ne!(after.stamp, before.stamp);
+    }
+
+    #[test]
+    fn only_a_regular_file_carries_a_stamp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("d")).expect("mkdir");
+        let srv = server_on(tmp.path());
+        assert_eq!(srv.namespace().stat("T:", "d").expect("stats").stamp, None);
     }
 
     fn server_on(root: &Path) -> FileServer {

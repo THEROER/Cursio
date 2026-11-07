@@ -516,6 +516,7 @@ impl Filesystem for RemoteFs {
             modified_unix: crate::now_unix(),
             writable: true,
             allocated: None,
+            stamp: None,
         };
         reply.entry(
             &CACHE_TTL,
@@ -783,6 +784,7 @@ impl Filesystem for RemoteFs {
             modified_unix: crate::now_unix(),
             writable: true,
             allocated: None,
+            stamp: None,
         };
         reply.created(
             &CACHE_TTL,

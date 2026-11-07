@@ -195,6 +195,7 @@ mod tests {
             modified_unix: 0,
             writable: true,
             allocated: None,
+            stamp: None,
         };
         assert_ne!(attributes_of(&dir) & FILE_ATTRIBUTE_DIRECTORY, 0);
         assert_eq!(attributes_of(&dir) & FILE_ATTRIBUTE_READONLY, 0);
@@ -206,6 +207,7 @@ mod tests {
             modified_unix: 0,
             writable: false,
             allocated: None,
+            stamp: None,
         };
         assert_ne!(attributes_of(&ro_file) & FILE_ATTRIBUTE_READONLY, 0);
         assert_eq!(attributes_of(&ro_file) & FILE_ATTRIBUTE_DIRECTORY, 0);
@@ -217,6 +219,7 @@ mod tests {
             modified_unix: 0,
             writable: true,
             allocated: None,
+            stamp: None,
         };
         assert_eq!(
             attributes_of(&link) & FILE_ATTRIBUTE_REPARSE_POINT,

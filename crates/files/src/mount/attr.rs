@@ -162,6 +162,7 @@ mod tests {
             modified_unix: 0,
             writable: true,
             allocated: Some(4 * 1024 * 1024 * 1024),
+            stamp: None,
         };
         let attr = super::attr_from(1, &meta, 1000, 1000);
         assert_eq!(attr.size, meta.size, "the length is still the length");
@@ -183,6 +184,7 @@ mod tests {
             modified_unix: 0,
             writable: true,
             allocated: None,
+            stamp: None,
         };
         assert_eq!(
             super::attr_from(1, &meta, 1000, 1000).blocks,
@@ -198,6 +200,7 @@ mod tests {
             modified_unix: 1_700_000_000,
             writable,
             allocated: None,
+            stamp: None,
         }
     }
 

@@ -218,6 +218,7 @@ impl RemoteFs {
             modified_unix: crate::now_unix(),
             writable: true,
             allocated: None,
+            stamp: None,
         };
         self.meta
             .put(&context.volume, &context.path, Ok(meta.clone()));
@@ -820,6 +821,7 @@ impl FileSystemContext for RemoteFs {
             modified_unix: crate::now_unix(),
             writable: true,
             allocated: None,
+            stamp: None,
         };
         fill_info(file_info.as_mut(), &meta);
         set_normalized_name(file_info, file_name);

@@ -42,7 +42,7 @@ use crate::FilesError;
 /// its own executable, so the two normally agree; this catches the case where
 /// they do not (a helper left running across an update) before any request is
 /// misread.
-pub const RELAY_VERSION: u32 = 3;
+pub const RELAY_VERSION: u32 = 4;
 
 /// The largest frame either side accepts. A write carries at most one wire
 /// chunk, a directory listing at most a few thousand entries; this is far
@@ -630,6 +630,7 @@ mod tests {
             modified_unix: 0,
             writable: true,
             allocated: None,
+            stamp: None,
         }
     }
 

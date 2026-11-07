@@ -19,6 +19,7 @@ pub mod bridge;
 pub mod case;
 /// The length of a file open on a mount, as far as its handle can vouch for.
 pub mod filesize;
+mod fnv;
 /// Which mount callbacks entered and never returned, the one failure a stuck
 /// caller cannot report for itself.
 pub mod inflight;

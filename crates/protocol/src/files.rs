@@ -142,6 +142,18 @@ pub struct FileMeta {
     /// carry the figure. The mount then falls back to `size`, which is what it
     /// always did.
     pub allocated: Option<u64>,
+    /// A value the owner vouches changes whenever the file's bytes do; `None`
+    /// when it cannot say.
+    ///
+    /// `modified_unix` is whole seconds, which is enough for a listing and too
+    /// coarse for anything that keeps a file's contents across runs: a rewrite
+    /// of the same length within one second leaves size and time unchanged,
+    /// and a copy kept under them would be served stale for good. The owner
+    /// derives this from what its filesystem records at full precision — on
+    /// Unix the change time too, which moves even when a program restores the
+    /// modification time — so a mount can key what it keeps on it. Opaque: it
+    /// is compared for equality, never ordered or decoded.
+    pub stamp: Option<u64>,
 }
 
 /// The three kinds of entry a listing distinguishes.
