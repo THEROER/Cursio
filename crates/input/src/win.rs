@@ -232,6 +232,7 @@ impl InputInjector for WinInjector {
             InputEvent::PointerScroll { dx, dy } => {
                 // Neutral scroll is in WHEEL_DELTA units already, and Windows
                 // scrolls smoothly by a fraction of a notch.
+                tracing::debug!(dx, dy, "injecting wheel");
                 if dy != 0 {
                     self.send_mouse(MOUSEEVENTF_WHEEL, 0, 0, dy)?;
                 }

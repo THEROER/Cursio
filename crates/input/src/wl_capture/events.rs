@@ -168,6 +168,10 @@ pub(super) fn handle_ei_event(
             scroll.discrete = true;
             let dx = s.discrete_dx;
             let dy = -s.discrete_dy;
+            // The capture end of the scroll trace, as for buttons: a wheel
+            // that does nothing on a peer is either never captured here or
+            // lost on the way, and only both ends together say which.
+            tracing::debug!(dx, dy, "captured wheel");
             if dx == 0 && dy == 0 {
                 return;
             }
@@ -178,7 +182,10 @@ pub(super) fn handle_ei_event(
             return;
         }
         EiEvent::Frame(_) => match scroll.finish() {
-            Some(event) => event,
+            Some(event) => {
+                tracing::debug!(?event, "captured smooth scroll");
+                event
+            }
             None => return,
         },
         _ => return,
