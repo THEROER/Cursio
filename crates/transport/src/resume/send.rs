@@ -123,8 +123,7 @@ impl FrameSink for ResumableSink {
             if self.lane == Lane::Bulk {
                 tokio::time::sleep(self.next_bulk.saturating_duration_since(Instant::now())).await;
                 let rate = self.inner.congestion.lock().unwrap().bytes_per_second();
-                self.next_bulk =
-                    Instant::now() + Duration::from_secs_f64(frame.len() as f64 / rate);
+                self.next_bulk = next_bulk_slot(self.next_bulk, Instant::now(), frame.len(), rate);
                 self.inner.lock().bulk_active = Some(Instant::now());
             }
             if let Some(seq) = frame.get(2..).and_then(read_u64) {
@@ -142,5 +141,56 @@ impl FrameSink for ResumableSink {
             }
         }
         Ok(())
+    }
+}
+
+/// How far a bulk frame's slot may lag the clock and still be caught up on.
+///
+/// Slots used to be counted from the moment the pacer woke, so whatever a
+/// sleep overran was lost for good — and Windows wakes a sleeper on its
+/// 15.6 ms system tick, so every 64 KiB frame cost at least one tick: bulk
+/// from a Windows machine never passed 64 KiB / 15.6 ms ≈ 4 MB/s, whatever
+/// the rate allowed and the link carried (measured: 3.4–4.0 MB/s against
+/// 25 MB/s of plain TCP on the same Wi-Fi). Counting from the previous slot
+/// carries the overrun into the next frames instead. Bounded, so a link that
+/// sat idle does not bank an allowance and dump it at once: just over one
+/// Windows tick.
+const BULK_CATCH_UP: Duration = Duration::from_millis(20);
+
+/// When the bulk frame after one of `len` bytes may go, at `rate` bytes a
+/// second, the previous one having been due at `due` and sent at `now`.
+fn next_bulk_slot(due: Instant, now: Instant, len: usize, rate: f64) -> Instant {
+    let from = due.max(now.checked_sub(BULK_CATCH_UP).unwrap_or(now));
+    from + Duration::from_secs_f64(len as f64 / rate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sleep_that_overran_its_tick_does_not_cost_bulk_its_rate() {
+        // 64 KiB frames at 20 MB/s are due every 3.3 ms; a Windows sleep wakes
+        // 15.6 ms late each time. Over a second the frames sent must still
+        // carry about the rate, not one frame per tick.
+        let start = Instant::now();
+        let rate = 20_000_000.0;
+        let (mut due, mut now, mut sent) = (start, start, 0usize);
+        while now.duration_since(start) < Duration::from_secs(1) {
+            if due > now {
+                now += Duration::from_micros(15_600);
+            }
+            sent += 65_536;
+            due = next_bulk_slot(due, now, 65_536, rate);
+        }
+        assert!(sent as f64 > rate * 0.9, "{sent} bytes in a second");
+    }
+
+    #[test]
+    fn an_idle_link_banks_no_more_than_a_tick_of_bulk() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(5);
+        let due = next_bulk_slot(start, later, 65_536, 1_000_000.0);
+        assert!(due >= later - BULK_CATCH_UP);
     }
 }

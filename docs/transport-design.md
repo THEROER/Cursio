@@ -106,7 +106,10 @@ latency still needs a dedicated measurement. See `docs/live-test.md`.
 All producers in the bulk lane share a pacer, including retransmissions. It
 starts at 1 MiB/s, has a 64 KiB/s floor and a 128 MiB/s ceiling. At most one frame
 is released at a time; there is no accumulated idle token allowance to dump into
-the network when a transfer starts.
+the network when a transfer starts. Each frame's slot follows the previous
+slot rather than the moment the pacer woke, catching up at most 20 ms: Windows
+wakes a sleeper on its 15.6 ms tick, and counting from the wake capped every
+Windows machine's bulk at one 64 KiB frame per tick, about 4 MB/s.
 
 Authenticated ping/pong probes travel on the interactive connection and are
 answered by its reader, independently of application work. They run once per
