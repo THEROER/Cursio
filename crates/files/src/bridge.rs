@@ -485,6 +485,73 @@ impl PeerLink {
         })
     }
 
+    /// Read `len` bytes at `offset` in wire-chunk pieces, all in flight at
+    /// once.
+    ///
+    /// The owner answers at most one chunk per read, so a span reaching into
+    /// a second block — a read-ahead that starts mid-block, filled to block
+    /// boundaries for the read cache — would otherwise cost a round trip per
+    /// piece, one after another. Short only at end of file: a short piece
+    /// ends the answer there, and the pieces after it are still collected so
+    /// none is left pending.
+    pub fn read_span(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, FileError> {
+        let chunk = cursio_protocol::FilesMsg::MAX_CHUNK as u64;
+        if len <= chunk {
+            return self.read(handle, offset, len as u32);
+        }
+        let mut waiting = Vec::new();
+        let mut at = offset;
+        while at < offset + len {
+            let piece = chunk.min(offset + len - at);
+            let (tx, rx) = std_mpsc::channel();
+            if self
+                .ops
+                .send(Op::Read {
+                    handle,
+                    offset: at,
+                    len: piece as u32,
+                    reply: tx,
+                })
+                .is_err()
+            {
+                tracing::warn!("a read could not be queued: the session is gone");
+                return Err(FileError::Io("file sharing session is gone".into()));
+            }
+            waiting.push((rx, piece));
+            at += piece;
+        }
+        let mut out = Vec::with_capacity(len as usize);
+        let mut stopped = false;
+        let mut failure = None;
+        for (rx, piece) in waiting {
+            let got = self.await_reply(rx, BULK_OP_TIMEOUT);
+            if stopped {
+                continue;
+            }
+            match got {
+                Ok(bytes) => {
+                    stopped = (bytes.len() as u64) < piece;
+                    out.extend_from_slice(&bytes);
+                }
+                Err(e) => {
+                    stopped = true;
+                    failure = Some(e);
+                }
+            }
+        }
+        // A failed piece fails the whole read: answering what came before it
+        // would read to the application as the end of the file.
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
     /// Send one write without waiting for its answer, returning the channel the
     /// answer will arrive on.
     ///

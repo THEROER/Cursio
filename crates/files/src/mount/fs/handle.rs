@@ -205,6 +205,7 @@ pub fn mount(
     mountpoint: impl AsRef<std::path::Path>,
     peer_name: &str,
     volume: &str,
+    cache: Option<std::sync::Arc<crate::readcache::ReadCache>>,
 ) -> std::io::Result<MountHandle> {
     let mountpoint = mountpoint.as_ref().to_path_buf();
     // Clear a mount left behind by a previous run before creating anything.
@@ -231,7 +232,9 @@ pub fn mount(
 
     let config = mount_config(peer_name);
     let session = fuser::Session::new(
-        RemoteFs::new(peer, volume).of_peer(peer_name),
+        RemoteFs::new(peer, volume)
+            .of_peer(peer_name)
+            .with_cache(cache),
         &mountpoint,
         &config,
     )?

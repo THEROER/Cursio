@@ -177,6 +177,8 @@ fn phone_modules(
             enabled: true,
             share: cursio_core::live::Shared::new(cursio_files::SharePolicy::everything()),
             role: cursio_protocol::ModuleRole::Source,
+            // A phone serves its storage and mounts nothing.
+            read_cache: None,
         }))
         .with(Box::new(cursio_core::gallery_session::GalleryFactory {
             store: Some(crate::gallery::AndroidGallery::shared()),

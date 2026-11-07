@@ -55,6 +55,9 @@ pub struct MountRequest {
     pub peer_name: String,
     pub volume: String,
     pub label: String,
+    /// The node's disk cache for what the mount reads, opened in the process
+    /// presenting it, since that is where the reads happen; `None` when off.
+    pub cache: Option<crate::readcache::CacheSettings>,
 }
 
 /// Node → helper.
@@ -663,6 +666,7 @@ mod tests {
             peer_name: "Lightmoon".into(),
             volume: "C:".into(),
             label: "Windows".into(),
+            cache: None,
         }
     }
 

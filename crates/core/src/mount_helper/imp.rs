@@ -276,8 +276,21 @@ fn mount_volume(
     link: PeerLink,
     request: MountRequest,
 ) -> Result<(cursio_files::winmount::MountHandle, String), String> {
-    cursio_files::winmount::mount(link, &request.peer_name, &request.volume, &request.label)
-        .map(|handle| {
+    // Opened here rather than in the node: this process is the one reading.
+    // One cache for every drive the helper presents, so the cap holds across
+    // all of them.
+    let cache = request
+        .cache
+        .as_ref()
+        .and_then(cursio_files::readcache::shared);
+    cursio_files::winmount::mount(
+        link,
+        &request.peer_name,
+        &request.volume,
+        &request.label,
+        cache,
+    )
+    .map(|handle| {
             let at = handle.mountpoint().to_string();
             tracing::info!(peer = %request.peer_name, volume = %request.volume, at = %at, "mounted for the node");
             (handle, at)
@@ -317,6 +330,7 @@ pub fn mount(
     volume: &str,
     label: &str,
     publisher: u64,
+    cache: Option<cursio_files::readcache::CacheSettings>,
 ) -> anyhow::Result<RelayedMount> {
     let runtime = tokio::runtime::Handle::try_current()
         .context("a relayed mount needs the link's runtime")?;
@@ -325,6 +339,7 @@ pub fn mount(
         peer_name: peer_name.to_string(),
         volume: volume.to_string(),
         label: label.to_string(),
+        cache,
     };
     let task = runtime.spawn(async move {
         let peer = request.peer_name.clone();

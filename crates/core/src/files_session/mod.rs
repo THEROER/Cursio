@@ -217,10 +217,21 @@ pub struct FilesEngine {
     /// What this machine offers. Applied to every rescan too, so a stick
     /// plugged in later is offered only if the policy names it.
     share: cursio_files::SharePolicy,
+    /// Where this engine's mounts keep what they read; see
+    /// [`FilesFactory::read_cache`].
+    #[cfg_attr(
+        not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))),
+        allow(dead_code)
+    )]
+    read_cache: Option<cursio_files::readcache::CacheSettings>,
 }
 
 impl FilesEngine {
-    pub fn new(peer_name: String, share: cursio_files::SharePolicy) -> anyhow::Result<Self> {
+    pub fn new(
+        peer_name: String,
+        share: cursio_files::SharePolicy,
+        read_cache: Option<cursio_files::readcache::CacheSettings>,
+    ) -> anyhow::Result<Self> {
         let (ops_tx, ops_rx) = tokio::sync::mpsc::unbounded_channel();
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
         let (outbox_tx, outbox_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -284,6 +295,7 @@ impl FilesEngine {
             rescan_tx,
             rescan_rx,
             share,
+            read_cache,
         })
     }
 }
@@ -312,6 +324,23 @@ pub struct FilesFactory {
     /// present a mount, and two phones have nothing to exchange, so the module
     /// does not start between them.
     pub role: cursio_protocol::ModuleRole,
+    /// Where a mount here keeps what it reads from a peer's disk, and how
+    /// much; `None` reads everything over the link every time. See
+    /// [`cursio_files::readcache`].
+    pub read_cache: Option<cursio_files::readcache::CacheSettings>,
+}
+
+/// The read cache `[files] cache_gb` asks for, under the platform's cache
+/// directory; `None` when it is 0 or there is no such directory.
+pub fn read_cache_settings(cache_gb: u64) -> Option<cursio_files::readcache::CacheSettings> {
+    if cache_gb == 0 {
+        return None;
+    }
+    let dirs = directories::ProjectDirs::from("dev", "cursio", "cursio")?;
+    Some(cursio_files::readcache::CacheSettings {
+        root: dirs.cache_dir().join("mount-cache"),
+        cap_bytes: cache_gb.saturating_mul(1024 * 1024 * 1024),
+    })
 }
 
 impl crate::module::ModuleFactory for FilesFactory {
@@ -328,6 +357,7 @@ impl crate::module::ModuleFactory for FilesFactory {
         Ok(Box::new(FilesEngine::new(
             ctx.peer_name().to_string(),
             self.share.get(),
+            self.read_cache.clone(),
         )?))
     }
 }
@@ -346,6 +376,7 @@ mod tests {
             enabled: true,
             share: crate::live::Shared::new(cursio_files::SharePolicy::everything()),
             role,
+            read_cache: None,
         }
         .advert()
         .expect("an enabled factory advertises")

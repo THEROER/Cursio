@@ -472,6 +472,81 @@ Short enough to actually apply in review:
    and adaptive rate control (ack-driven) all exist. A new module that invents
    its own is a bug, not a design choice.
 
+## A peer's files, kept on this disk
+
+A game launched on one machine from another's disk reads gigabytes, and over
+Wi-Fi at 5–14 MB/s that is minutes on every launch. Neither page cache helps a
+second launch: the kernel's does not outlive the mount, WinFsp's does not
+outlive a handle. So a mount keeps what it reads on its own disk
+(`cursio_files::readcache`), and from the second launch the bytes come from
+there. `[files] cache_gb` sizes it (default 10, 0 turns it off); it lives under
+the platform cache directory as `mount-cache/`, and applies at the next start
+(`live::restart_needed`). On Windows the mount runs in `cursio-mount-helper`,
+so the node passes the root and cap in the relay's `MountRequest` and the
+helper opens it — one cache per process, shared by every drive it presents, so
+the cap holds across all of them.
+
+**Correct before fast: a version the owner vouches for.** `FileMeta` carried
+only `modified_unix`, whole seconds, and a cache keyed on that serves a
+same-length rewrite within one second as the old file forever. So the owner
+adds `stamp` (`files` module version 8, relay version 4): on Unix a hash of the
+modification and change times to the nanosecond, the inode, the device and
+the length; on Windows of the last write time (100 ns), the creation time and
+the length. The change time is the part a program cannot put back — `cp -p` or
+an archiver restoring the modification time still moves it — and the inode and
+creation time tell apart a file replaced by a rename that carried its times
+over. FNV with fixed constants, never `DefaultHasher`, because the value is
+compared by another process. Entries are keyed by peer, volume, path, stamp
+and length; a different stamp is a different file, and storing a new one
+deletes the old. Only regular files with a stamp are cached; an owner that
+cannot say sends `None` and its files are read as before.
+
+**A sparse file and a bitmap per version.** Blocks are one wire chunk
+(256 KiB), so a miss is fetched block-aligned and one block is one request; a
+read reaching into a second block sends both pieces at once
+(`PeerLink::read_span`) rather than one round trip after the other. A file per
+block would be a hundred thousand files for one game archive, and an
+appended log of blocks would need an index and compaction of its own; a data
+file of the file's length, written only where blocks were read, costs nothing
+for its holes on ext4, btrfs or NTFS (marked sparse with `FSCTL_SET_SPARSE`,
+or NTFS fills every gap with zeros). Its map is the set of blocks present.
+
+**Crash ordering.** A block is claimed only by the map on disk, and a bit
+reaches the map only after the data was synced: a flush snapshots the bits,
+`sync_data`s the data file, then writes the map to a temporary file and renames
+it over the old one. Flushes happen when a handle closes and every few seconds
+while a file is being filled. A crash leaves the previous map, which names
+only synced data; a map that is torn, fails its checksum, or names a data
+file of the wrong length is dropped as empty. Every failure degrades to "not
+cached" with a warning — a read never fails because the cache did.
+
+**Writes through this mount.** A write, truncate, overwrite, create, rename or
+delete through the mount voids the path (and, for a rename or delete, the tree
+under it) before it is sent: what is stored is deleted, and every key taken
+for that path earlier stops being served or stored, so a handle opened before
+a local write reads the owner for the rest of its life. Keys carry the clock
+they were taken at; only a newer key may replace a stored version with another,
+which keeps two handles of one path from deleting each other's copy in turn.
+
+**Fewer opens.** A file read whole from the cache is never opened on the
+owner: the FUSE half checks the cache before `open_for_read`, and the Windows
+half defers the open of a read-only handle whose file the cache already holds
+until a read misses. On Linux the head that arrives with an open is stored too,
+since a small file never reaches any other fetch.
+
+**Size.** Least recently used entries go first once the total passes the cap,
+down to 90 % of it; the order survives a restart through the map files'
+modification times, which a flush moves. A file larger than the cap is never
+kept.
+
+**What it does not cover.** A change made on the owner is seen through the
+metadata the mount already has — its short-lived cache, then a fresh stat. A
+handle opened within that window from metadata predating the change uses the
+old stamp, exactly as it reads the old size today; the next open after the
+metadata refreshes sees the new stamp and never the old bytes. An open whose
+answer disagrees with the length the key was taken at drops the key for that
+handle.
+
 ## What a peer may reach
 
 Pairing is trust, but not one amount of it. Every module that exposes this

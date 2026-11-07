@@ -35,7 +35,8 @@
 //! What cannot change live is named by [`restart_needed`]: the listen port
 //! (the listener owns it), the remote-screen portal backend (a D-Bus name
 //! claimed at startup), AirPlay (a receiver bound and announced at startup),
-//! and input turned on in a process that started without capture. The status
+//! the mount read cache's size (opened once per process), and input turned on
+//! in a process that started without capture. The status
 //! and every save reply carry that list, so the app can say "restart to
 //! apply" rather than let a toggle silently do nothing.
 
@@ -359,6 +360,12 @@ pub fn restart_needed(started: &Config, current: &Config) -> Vec<String> {
         started.airplay.share != current.airplay.share,
     );
     check("airplay.port", started.airplay.port != current.airplay.port);
+    // Opened once per process, and on Windows in the drive helper, which
+    // keeps the cache it was first handed.
+    check(
+        "files.cache_gb",
+        started.files.cache_gb != current.files.cache_gb,
+    );
     check(
         "airplay.interface",
         started.airplay.interface != current.airplay.interface,
@@ -390,6 +397,15 @@ mod tests {
         assert_eq!(plan.switches, vec![(ModuleId::FILES, false)]);
         assert!(plan.restart.is_empty());
         assert!(restart_needed(&running, &next).is_empty());
+    }
+
+    #[test]
+    fn a_new_read_cache_size_waits_for_a_restart() {
+        let running = Config::default();
+        let mut next = running.clone();
+        next.files.cache_gb = 0;
+        assert_eq!(restart_needed(&running, &next), vec!["files.cache_gb"]);
+        assert!(plan(&running, &next).restart.is_empty());
     }
 
     #[test]

@@ -22,6 +22,9 @@ impl RemoteFs {
         let _call = crate::inflight::shared().enter("write");
         let lease = self.remote(context).map_err(|e| to_ntstatus(&e))?;
         let remote = lease.handle;
+        // Before the bytes leave: a handle reading this file must not be
+        // answered from the copy kept of what they replace.
+        self.void_cached(&context.volume, &context.path);
         // Pipelined: this write is sent now and its answer collected later,
         // while the answer being waited on here belongs to a write already a
         // window behind. Nothing is acknowledged before the peer has stored it

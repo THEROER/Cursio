@@ -87,6 +87,10 @@ pub struct FileCtx {
     /// caller's PID rides the access token of a create request, and a
     /// directory listing is a request with no token at all.
     opener: u32,
+    /// The version this handle reads from the disk cache, taken at open from
+    /// the metadata the open already had; `None` for a handle that writes, or
+    /// once the file turned out to differ from that metadata.
+    key: Option<crate::readcache::FileKey>,
 }
 
 /// The peer's volumes, presented as a Windows drive.
@@ -120,6 +124,9 @@ pub struct RemoteFs {
     meta: crate::metacache::MetaCache,
     /// Whose disk this is, for naming it when something walks it.
     peer_name: String,
+    /// File contents kept on this disk across runs; see [`crate::readcache`].
+    /// What makes a game's second launch from a peer's disk read this one.
+    cache: Option<std::sync::Arc<crate::readcache::ReadCache>>,
 }
 
 impl RemoteFs {
@@ -132,6 +139,31 @@ impl RemoteFs {
             meta: crate::metacache::MetaCache::new(),
             write_budget: crate::writeback::InFlightBudget::new(),
             peer_name: String::new(),
+            cache: None,
+        }
+    }
+
+    /// Read through the on-disk cache.
+    pub fn with_cache(
+        mut self,
+        cache: Option<std::sync::Arc<crate::readcache::ReadCache>>,
+    ) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// This machine is about to change the file at `path` on the owner; see
+    /// [`crate::readcache::ReadCache::invalidate`].
+    fn void_cached(&self, volume: &str, path: &str) {
+        if let Some(cache) = &self.cache {
+            cache.invalidate(&self.peer_name, volume, path);
+        }
+    }
+
+    /// As [`Self::void_cached`], for a path that may be a directory.
+    fn void_cached_tree(&self, volume: &str, path: &str) {
+        if let Some(cache) = &self.cache {
+            cache.invalidate_tree(&self.peer_name, volume, path);
         }
     }
 
@@ -421,7 +453,23 @@ impl FileSystemContext for RemoteFs {
         // volume asked for writing) fails at `CreateFile`, where the
         // application looks for that answer.
         let mode = access_to_mode(granted_access);
-        let (remote, size) = match !is_dir && wants_data(granted_access) {
+        // A handle that only reads takes its cache key from the metadata in
+        // hand; one that may write reads without the cache, since its own
+        // writes are what would make it stale.
+        let key = match (&self.cache, mode.write) {
+            (Some(cache), false) => cache.key(&self.peer_name, &volume, &path, &meta),
+            _ => None,
+        };
+        // A file the cache already holds is not opened on the owner until a
+        // read misses: a game opening thousands of files it read last launch
+        // would otherwise still pay a round trip each. It was opened and read
+        // before under this very version, so an open the owner would refuse
+        // is not what this defers.
+        let cached = match (&self.cache, &key) {
+            (Some(cache), Some(key)) => cache.holds(key),
+            _ => false,
+        };
+        let (remote, size) = match !is_dir && wants_data(granted_access) && !cached {
             true => {
                 let (handle, size) = self
                     .peer
@@ -431,6 +479,9 @@ impl FileSystemContext for RemoteFs {
             }
             false => (None, meta.size),
         };
+        // The owner's answer disagreeing with the metadata means the file
+        // changed since; this handle then reads without the cache.
+        let key = key.filter(|k| k.size() == size);
 
         Ok(FileCtx {
             remote: Mutex::new(remote),
@@ -443,6 +494,7 @@ impl FileSystemContext for RemoteFs {
             writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
             opener: self.caller(),
             cleaned: std::sync::atomic::AtomicBool::new(false),
+            key,
         })
     }
 
@@ -463,6 +515,9 @@ impl FileSystemContext for RemoteFs {
             }
         }
         self.release_remote(&context);
+        if let (Some(cache), Some(key)) = (&self.cache, &context.key) {
+            cache.close(key);
+        }
     }
 
     fn read(
@@ -478,7 +533,19 @@ impl FileSystemContext for RemoteFs {
         let bytes = context
             .ahead
             .read(offset, buffer.len(), |at, len| {
-                self.with_remote(context, |remote| self.peer.read(remote, at, len))
+                // From this disk when a previous run kept it, and then without
+                // opening the owner's file at all; a miss fetches whole blocks,
+                // all in flight together, and keeps them.
+                match (&self.cache, &context.key) {
+                    (Some(cache), Some(key)) => {
+                        cache.read_through(key, at, len as usize, |from, span| {
+                            self.with_remote(context, |remote| {
+                                self.peer.read_span(remote, from, span)
+                            })
+                        })
+                    }
+                    _ => self.with_remote(context, |remote| self.peer.read(remote, at, len)),
+                }
             })
             .map_err(|e| to_ntstatus(&e))?;
         let n = bytes.len().min(buffer.len());
@@ -596,6 +663,7 @@ impl FileSystemContext for RemoteFs {
         let remote = lease.handle;
         self.settle_writes(context, "overwrite")
             .map_err(|e| to_ntstatus(&e))?;
+        self.void_cached(&context.volume, &context.path);
         self.peer.truncate(remote, 0).map_err(|e| to_ntstatus(&e))?;
         self.meta.forget(&context.volume, &context.path);
         context.ahead.invalidate();
@@ -743,6 +811,7 @@ impl FileSystemContext for RemoteFs {
         // extend the file again past the length just set.
         self.settle_writes(context, "set_file_size")
             .map_err(|e| to_ntstatus(&e))?;
+        self.void_cached(&context.volume, &context.path);
         self.peer
             .set_size(remote, new_size, set_allocation_size)
             .map_err(|e| to_ntstatus(&e))?;
@@ -798,6 +867,7 @@ impl FileSystemContext for RemoteFs {
                 writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
                 opener: self.caller(),
                 cleaned: std::sync::atomic::AtomicBool::new(false),
+                key: None,
             });
         }
 
@@ -808,6 +878,7 @@ impl FileSystemContext for RemoteFs {
             truncate: false,
             exclusive: false,
         };
+        self.void_cached(&volume, &path);
         let (remote, size) = self
             .peer
             .open(&volume, &path, mode)
@@ -839,6 +910,7 @@ impl FileSystemContext for RemoteFs {
             writes: Mutex::new(crate::writeback::WriteBack::new(self.write_budget.clone())),
             opener: self.caller(),
             cleaned: std::sync::atomic::AtomicBool::new(false),
+            key: None,
         })
     }
 
@@ -858,6 +930,8 @@ impl FileSystemContext for RemoteFs {
             const STATUS_NOT_SAME_DEVICE: i32 = 0xC00000D4u32 as i32;
             return Err(winfsp::FspError::NTSTATUS(STATUS_NOT_SAME_DEVICE));
         }
+        self.void_cached_tree(&volume, &from);
+        self.void_cached_tree(&volume, &to);
         let renamed = self
             .peer
             .rename(&volume, &from, &to)
@@ -880,6 +954,7 @@ impl FileSystemContext for RemoteFs {
         // WinFsp signals a delete through cleanup rather than a separate call.
         const FSP_CLEANUP_DELETE: u32 = 0x01;
         if flags & FSP_CLEANUP_DELETE != 0 {
+            self.void_cached_tree(&context.volume, &context.path);
             let r = self.peer.remove(&context.volume, &context.path);
             tracing::debug!(
                 path = %context.path,

@@ -69,6 +69,10 @@ pub struct RemoteFs {
     /// Writes travelling at once across every handle of this mount; see
     /// [`crate::writeback::InFlightBudget`] for why it is not per handle.
     write_budget: crate::writeback::InFlightBudget,
+    /// File contents kept on this disk across runs; see [`crate::readcache`].
+    /// The kernel's page cache already serves a file read twice in one run;
+    /// this is what serves it in the next.
+    cache: Option<std::sync::Arc<crate::readcache::ReadCache>>,
 }
 
 struct State {
@@ -85,6 +89,9 @@ struct State {
     /// Each writing handle's gathered and unconfirmed writes, by our handle;
     /// see [`write`].
     writes: std::collections::HashMap<u64, std::sync::Arc<Mutex<write::HandleWrites>>>,
+    /// The version each reading handle reads from the disk cache, taken at
+    /// open from the metadata the `lookup` before it settled.
+    keys: std::collections::HashMap<u64, crate::readcache::FileKey>,
 }
 
 /// A file opened here for reading, not yet opened on its owner.
@@ -149,6 +156,7 @@ impl RemoteFs {
             bound: bound.into(),
             peer_name: String::new(),
             write_budget: crate::writeback::InFlightBudget::new(),
+            cache: None,
             state: Mutex::new(State {
                 inodes: InodeTable::new(),
                 handles: std::collections::HashMap::new(),
@@ -156,6 +164,7 @@ impl RemoteFs {
                 heads: std::collections::HashMap::new(),
                 unopened: std::collections::HashMap::new(),
                 writes: std::collections::HashMap::new(),
+                keys: std::collections::HashMap::new(),
             }),
             // Safe: these are plain getuid/getgid calls with no preconditions.
             uid: unsafe { libc::getuid() },
@@ -167,6 +176,30 @@ impl RemoteFs {
     pub fn of_peer(mut self, peer_name: &str) -> Self {
         self.peer_name = peer_name.to_string();
         self
+    }
+
+    /// Read through the on-disk cache.
+    pub fn with_cache(
+        mut self,
+        cache: Option<std::sync::Arc<crate::readcache::ReadCache>>,
+    ) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// This machine is about to change the file at `path` on the owner; see
+    /// [`crate::readcache::ReadCache::invalidate`].
+    fn void_cached(&self, volume: &str, path: &str) {
+        if let Some(cache) = &self.cache {
+            cache.invalidate(&self.peer_name, volume, path);
+        }
+    }
+
+    /// As [`Self::void_cached`], for a path that may be a directory.
+    fn void_cached_tree(&self, volume: &str, path: &str) {
+        if let Some(cache) = &self.cache {
+            cache.invalidate_tree(&self.peer_name, volume, path);
+        }
     }
 
     /// The peer's volumes, refetched when the cached list has expired.
@@ -206,6 +239,20 @@ impl RemoteFs {
         let (remote, size, bytes) =
             self.peer
                 .open_head(&file.volume, &file.path, file.mode, HEAD_BYTES)?;
+        // A small file is read whole from its head and never reaches the
+        // cache's own fetch, so the head is what gets kept. An open that
+        // disagrees with the length the key was taken at means the metadata
+        // was out of date: the handle reads without the cache from here.
+        if let Some(cache) = &self.cache {
+            let key = self.state.lock().expect("inode state").keys.remove(&fh);
+            if let Some(key) = key.filter(|k| k.size() == size) {
+                cache.put(&key, 0, &bytes);
+                let mut state = self.state.lock().expect("inode state");
+                if state.unopened.contains_key(&fh) || state.handles.contains_key(&fh) {
+                    state.keys.insert(fh, key);
+                }
+            }
+        }
         let mut state = self.state.lock().expect("inode state");
         if let Some(&first) = state.handles.get(&fh) {
             drop(state);
@@ -328,6 +375,7 @@ impl RemoteFs {
         };
         // Gone, along with anything inside it if it was a directory.
         self.meta.forget_dir(&volume, &path);
+        self.void_cached_tree(&volume, &path);
         match self.peer.remove(&volume, &path) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_errno(&e)),

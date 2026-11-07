@@ -617,6 +617,19 @@ impl Filesystem for RemoteFs {
         // will not open — locked by a program there, refused by its ACL —
         // fails at its first read rather than at the open; its existence was
         // already settled by the `lookup` before.
+        if mode.truncate {
+            self.void_cached(&volume, &path);
+        }
+        // A reading handle takes its cache key now, from the metadata the
+        // `lookup` just settled; a writing one reads without the cache, since
+        // its own writes are what would make it stale.
+        let key = match (&self.cache, mode.is_mutating()) {
+            (Some(cache), false) => self
+                .stat_path(&volume, &path)
+                .ok()
+                .and_then(|meta| cache.key(&self.peer_name, &volume, &path, &meta)),
+            _ => None,
+        };
         let opened = if mode.is_mutating() {
             self.peer.open(&volume, &path, mode).map(Some)
         } else {
@@ -628,6 +641,9 @@ impl Filesystem for RemoteFs {
                 let mut state = self.state.lock().expect("inode state");
                 let fh = state.next_handle;
                 state.next_handle += 1;
+                if let Some(key) = key {
+                    state.keys.insert(fh, key);
+                }
                 match remote {
                     Some((remote, _)) => {
                         state.handles.insert(fh, remote);
@@ -681,6 +697,21 @@ impl Filesystem for RemoteFs {
         if let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) {
             self.settle_path(&volume, &path);
         }
+        // From this disk when a previous run kept it — before the owner is
+        // asked to open anything, so a file read whole from here is never
+        // opened there at all.
+        let key = self
+            .state
+            .lock()
+            .expect("inode state")
+            .keys
+            .get(&fh.0)
+            .cloned();
+        if let (Some(cache), Some(key)) = (&self.cache, &key) {
+            if let Some(bytes) = cache.get(key, offset, size as usize) {
+                return reply.data(&bytes);
+            }
+        }
         let (remote, unopened) = {
             let state = self.state.lock().expect("inode state");
             (
@@ -702,7 +733,23 @@ impl Filesystem for RemoteFs {
             },
             (None, None) => return reply.error(Errno::EBADF),
         };
-        match self.peer.read(remote, offset, size) {
+        // The open may have dropped the key, finding the file changed.
+        let key = key.filter(|_| {
+            self.state
+                .lock()
+                .expect("inode state")
+                .keys
+                .contains_key(&fh.0)
+        });
+        let read = match (&self.cache, &key) {
+            (Some(cache), Some(key)) => {
+                cache.read_through(key, offset, size as usize, |at, len| {
+                    self.peer.read_span(remote, at, len)
+                })
+            }
+            _ => self.peer.read(remote, offset, size),
+        };
+        match read {
             Ok(bytes) => reply.data(&bytes),
             Err(e) => reply.error(to_errno(&e)),
         }
@@ -730,6 +777,7 @@ impl Filesystem for RemoteFs {
         // cache holds, so it must not answer the next `getattr` with what it
         // knew before the write.
         self.meta.forget(&volume, &path);
+        self.void_cached(&volume, &path);
         self.forget_heads(ino.0);
         // Gathered and pipelined; see `write`. A failure of this write reaches
         // the application at its next write, `fsync` or `close`.
@@ -759,6 +807,8 @@ impl Filesystem for RemoteFs {
         // say about opening one that already exists.
         mode.create = true;
         mode.exclusive = flags & libc::O_EXCL != 0;
+        // A file already there may be truncated by this open.
+        self.void_cached(&volume, &path);
 
         let (remote, size) = match self.peer.open(&volume, &path, mode) {
             Ok(v) => v,
@@ -855,6 +905,8 @@ impl Filesystem for RemoteFs {
         // Both ends move, and a directory takes its contents with it.
         self.meta.forget_dir(&volume, &from);
         self.meta.forget_dir(&volume, &to);
+        self.void_cached_tree(&volume, &from);
+        self.void_cached_tree(&volume, &to);
         if let Err(e) = self.peer.rename(&volume, &from, &to) {
             return reply.error(to_errno(&e));
         }
@@ -896,6 +948,7 @@ impl Filesystem for RemoteFs {
             // Writes still on their way would land after the truncate and
             // undo it.
             if let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) {
+                self.void_cached(&volume, &path);
                 self.settle_path(&volume, &path);
             }
             let remote = fh
@@ -965,17 +1018,23 @@ impl Filesystem for RemoteFs {
         if let Err(e) = self.settle_fh(fh.0) {
             tracing::warn!(error = ?e, "writes to a file failed after its last close");
         }
-        let remote = {
+        let (remote, key) = {
             let mut state = self.state.lock().expect("inode state");
+            let key = state.keys.remove(&fh.0);
             state.heads.remove(&fh.0);
             state.unopened.remove(&fh.0);
             state.writes.remove(&fh.0);
-            state.handles.remove(&fh.0)
+            (state.handles.remove(&fh.0), key)
         };
         if let Some(remote) = remote {
             self.peer.close(remote);
         }
         reply.ok();
+        // After the reply: making what this handle stored durable is a sync,
+        // and nothing the application waits for depends on it.
+        if let (Some(cache), Some(key)) = (&self.cache, key) {
+            cache.close(&key);
+        }
     }
 }
 

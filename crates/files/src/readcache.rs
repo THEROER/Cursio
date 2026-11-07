@@ -506,6 +506,16 @@ impl ReadCache {
         })
     }
 
+    /// Whether anything is stored for exactly this key — for a mount deciding
+    /// whether opening the owner's file can wait until a read misses.
+    pub fn holds(&self, key: &FileKey) -> bool {
+        let state = self.lock();
+        Self::valid(&state, key)
+            && state.entries.get(&key.dir).is_some_and(|e| {
+                e.name == key.name && e.stamp == key.stamp && e.size == key.size && e.bytes > 0
+            })
+    }
+
     fn valid(state: &State, key: &FileKey) -> bool {
         key.taken >= state.floor
             && key
@@ -514,19 +524,37 @@ impl ReadCache {
                 .all(|h| state.invalidated.get(h).is_none_or(|at| *at <= key.taken))
     }
 
-    /// Something here is changing `path` (or the tree under it) on the owner:
-    /// void every key taken for it so far, and delete what is stored.
+    /// Something here is changing the file at `path` on the owner: void every
+    /// key taken for it so far, and delete what is stored. Cheap enough for
+    /// every write a copy makes.
     pub fn invalidate(&self, peer: &str, volume: &str, path: &str) {
         let mut state = self.lock();
+        Self::void(&mut state, path_hash(peer, volume, path));
+        let dir = path_hash(peer, volume, path);
+        if state
+            .entries
+            .get(&dir)
+            .is_some_and(|e| e.name == name_of(peer, volume, path))
+        {
+            self.remove(&mut state, dir);
+        }
+    }
+
+    fn void(state: &mut State, hash: u64) {
         state.clock += 1;
         let clock = state.clock;
         if state.invalidated.len() >= MAX_INVALIDATED {
             state.invalidated.clear();
             state.floor = clock;
         }
-        state
-            .invalidated
-            .insert(path_hash(peer, volume, path), clock);
+        state.invalidated.insert(hash, clock);
+    }
+
+    /// As [`invalidate`](Self::invalidate), for a path that may be a
+    /// directory being renamed or removed: everything under it goes too.
+    pub fn invalidate_tree(&self, peer: &str, volume: &str, path: &str) {
+        let mut state = self.lock();
+        Self::void(&mut state, path_hash(peer, volume, path));
         let name = name_of(peer, volume, path);
         let under = match path.is_empty() {
             true => name.clone(),
@@ -911,6 +939,39 @@ impl ReadCache {
             self.remove(state, dir);
         }
     }
+
+    /// Serve a read from the cache, or fetch the blocks covering it through
+    /// `fetch(offset, len)` — a wire read, short only at end of file — and
+    /// keep them.
+    ///
+    /// Fetched block-aligned so the bytes can be kept at all: a read of 4 KiB
+    /// in the middle of a block stores nothing, and the next launch would ask
+    /// the wire again for every such read. An answer shorter than the length
+    /// the stamp promised is not kept: the file changed under its metadata.
+    pub fn read_through<E>(
+        &self,
+        key: &FileKey,
+        offset: u64,
+        len: usize,
+        fetch: impl FnOnce(u64, u64) -> Result<Vec<u8>, E>,
+    ) -> Result<Vec<u8>, E> {
+        if let Some(hit) = self.get(key, offset, len) {
+            return Ok(hit);
+        }
+        let end = offset.saturating_add(len as u64).min(key.size);
+        if offset >= end {
+            return fetch(offset, len as u64);
+        }
+        let from = offset / BLOCK * BLOCK;
+        let to = end.div_ceil(BLOCK).saturating_mul(BLOCK).min(key.size);
+        let bytes = fetch(from, to - from)?;
+        if bytes.len() as u64 == to - from {
+            self.put(key, from, &bytes);
+        }
+        let start = ((offset - from) as usize).min(bytes.len());
+        let stop = ((end - from) as usize).min(bytes.len());
+        Ok(bytes[start..stop].to_vec())
+    }
 }
 
 impl Drop for ReadCache {
@@ -1179,11 +1240,17 @@ mod tests {
         assert!(cache.get(&after, 0, 1).is_some());
 
         // A directory renamed or removed takes everything under it.
-        cache.invalidate("p", "v", "dir");
+        cache.invalidate_tree("p", "v", "dir");
         assert_eq!(cache.get(&after, 0, 1), None);
+        let fresh = cache.key("p", "v", "dir/a", &meta(BLOCK, 1)).expect("key");
+        assert_eq!(
+            cache.get(&fresh, 0, 1),
+            None,
+            "and what was stored under it is gone"
+        );
         let sibling = cache.key("p", "v", "dirt", &meta(BLOCK, 1)).expect("key");
         cache.put(&sibling, 0, &block);
-        cache.invalidate("p", "v", "dir");
+        cache.invalidate_tree("p", "v", "dir");
         assert!(
             cache.get(&sibling, 0, 1).is_some(),
             "a name sharing the prefix is another path"
@@ -1200,5 +1267,71 @@ mod tests {
         m.stamp = Some(1);
         m.kind = FileKind::Dir;
         assert!(cache.key("p", "v", "a", &m).is_none());
+    }
+
+    /// A small read in the middle of a block fetches the whole block once;
+    /// every later read inside it, this run or the next, stays off the wire.
+    #[test]
+    fn a_miss_fetches_whole_blocks_and_the_next_read_stays_local() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let size = BLOCK * 3 + 77;
+        let file = contents(size);
+        let fetches = std::cell::RefCell::new(Vec::new());
+        let fetch = |at: u64, len: u64| -> Result<Vec<u8>, ()> {
+            fetches.borrow_mut().push((at, len));
+            let end = (at + len).min(size);
+            Ok(file[at as usize..end as usize].to_vec())
+        };
+        {
+            let cache = ReadCache::open(&settings(tmp.path(), BIG)).expect("opens");
+            let key = cache.key("p", "v", "a", &meta(size, 1)).expect("key");
+            let got = cache
+                .read_through(&key, BLOCK + 10, 4096, fetch)
+                .expect("reads");
+            assert_eq!(
+                got,
+                &file[(BLOCK + 10) as usize..(BLOCK + 10 + 4096) as usize]
+            );
+            let tail = cache
+                .read_through(&key, size - 5, 4096, fetch)
+                .expect("reads the end");
+            assert_eq!(tail, &file[(size - 5) as usize..]);
+            cache.close(&key);
+        }
+        assert_eq!(
+            *fetches.borrow(),
+            vec![(BLOCK, BLOCK), (BLOCK * 3, 77)],
+            "aligned to blocks, clamped to the file"
+        );
+        let cache = ReadCache::open(&settings(tmp.path(), BIG)).expect("reopens");
+        let key = cache.key("p", "v", "a", &meta(size, 1)).expect("key");
+        let again = cache
+            .read_through(&key, BLOCK + 100, 1000, fetch)
+            .expect("reads");
+        assert_eq!(
+            again,
+            &file[(BLOCK + 100) as usize..(BLOCK + 1100) as usize]
+        );
+        assert_eq!(
+            fetches.borrow().len(),
+            2,
+            "the second launch read nothing over the wire"
+        );
+    }
+
+    #[test]
+    fn a_fetch_shorter_than_the_stamp_promised_is_not_kept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = ReadCache::open(&settings(tmp.path(), BIG)).expect("opens");
+        let key = cache.key("p", "v", "a", &meta(BLOCK * 2, 1)).expect("key");
+        let got = cache
+            .read_through(&key, 0, 10, |_, _| Ok::<_, ()>(vec![5u8; 100]))
+            .expect("reads");
+        assert_eq!(got, vec![5u8; 10], "the caller gets what the owner has");
+        assert_eq!(
+            cache.get(&key, 0, 10),
+            None,
+            "but the file shrank, so none is kept"
+        );
     }
 }

@@ -50,6 +50,7 @@ use crate::mesh::run_mesh;
 use crate::mesh::start_control;
 use crate::modules::module_registry;
 use crate::modules::start_screen_portal;
+use crate::modules::FilesOpts;
 use crate::modules::ServiceSetup;
 use crate::modules::WindowOpts;
 use crate::pairing::list_peers;
@@ -357,7 +358,12 @@ async fn run() -> anyhow::Result<()> {
                 render_device,
                 mic_gate,
                 control.mixer(),
-                files_share,
+                FilesOpts {
+                    share: files_share,
+                    read_cache: cursio_core::files_session::read_cache_settings(
+                        config.files.cache_gb,
+                    ),
+                },
                 live.switches(),
                 WindowOpts {
                     airplay: airplay_tap.clone().map(|tap| {

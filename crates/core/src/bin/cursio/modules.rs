@@ -36,6 +36,15 @@ pub(crate) fn start_screen_portal(
     None
 }
 
+/// File-sharing options, grouped like [`WindowOpts`].
+pub(crate) struct FilesOpts {
+    /// What this machine offers, followed live.
+    pub share: Shared<cursio_files::SharePolicy>,
+    /// Where a mount here keeps what it reads; `None` when `[files] cache_gb`
+    /// is 0.
+    pub read_cache: Option<cursio_files::readcache::CacheSettings>,
+}
+
 /// Window-transfer options, grouped for the same reason [`AudioOpts`] is: the
 /// registry builder should gain a struct field per subsystem, not a positional
 /// argument.
@@ -103,7 +112,7 @@ pub(crate) fn module_registry(
     render_device: Shared<Option<String>>,
     mic_gate: Shared<cursio_core::audio_gate::MicGate>,
     mixer: cursio_core::mixer::LocalMixer,
-    files_share: Shared<cursio_files::SharePolicy>,
+    files: FilesOpts,
     switches: cursio_core::module::ModuleSwitches,
     window: WindowOpts,
     services: ServiceSetup,
@@ -201,8 +210,9 @@ pub(crate) fn module_registry(
         // nothing.
         .with(Box::new(cursio_core::files_session::FilesFactory {
             enabled: true,
-            share: files_share,
+            share: files.share,
             role: cursio_protocol::ModuleRole::Both,
+            read_cache: files.read_cache,
         }))
         // Like files, a machine both offers its own ports and attaches a
         // peer's. The factory carries the node-level state every link shares,

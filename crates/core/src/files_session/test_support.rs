@@ -58,6 +58,7 @@ pub(super) fn engine() -> (FilesEngine, tokio::sync::mpsc::UnboundedSender<Op>) 
         rescan_tx,
         rescan_rx,
         share: cursio_files::SharePolicy::everything(),
+        read_cache: None,
     };
     (engine, ops_tx)
 }

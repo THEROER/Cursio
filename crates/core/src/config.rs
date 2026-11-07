@@ -600,12 +600,25 @@ impl From<EdgeSpan> for [u8; 2] {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FilesConfig {
     /// What this machine shares, in the files module's `SharePolicy` shape.
     /// `None` keeps that module's own default.
     pub share: Option<toml::Table>,
+    /// How many GiB of a peer's file contents a mount here may keep on this
+    /// disk across runs (`cursio_files::readcache`); 0 turns the cache off.
+    /// Read when the node starts.
+    pub cache_gb: u64,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            share: None,
+            cache_gb: 10,
+        }
+    }
 }
 
 impl Default for Config {
@@ -1125,6 +1138,16 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains("percent along the edge"), "{err}");
         }
+    }
+
+    #[test]
+    fn the_read_cache_defaults_to_ten_gigabytes_and_zero_turns_it_off() {
+        assert_eq!(parse("").files.cache_gb, 10);
+        assert_eq!(
+            parse("[files.share]\nmode = \"allow\"\n").files.cache_gb,
+            10
+        );
+        assert_eq!(parse("[files]\ncache_gb = 0\n").files.cache_gb, 0);
     }
 
     #[test]

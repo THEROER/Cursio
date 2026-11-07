@@ -168,12 +168,14 @@ pub(super) fn mount_one_volume(
     peer_name: &str,
     volume: &Volume,
     _publisher: u64,
+    cache: Option<&cursio_files::readcache::CacheSettings>,
 ) -> anyhow::Result<Mount> {
     Ok(cursio_files::mount::mount(
         peer,
         volume_mount_point(peer_name, volume),
         peer_name,
         &volume.id,
+        cache.and_then(cursio_files::readcache::shared),
     )?)
 }
 
@@ -186,13 +188,20 @@ pub(super) fn mount_one_volume(
     peer_name: &str,
     volume: &Volume,
     publisher: u64,
+    cache: Option<&cursio_files::readcache::CacheSettings>,
 ) -> anyhow::Result<Mount> {
     let name = cursio_files::peer_volume_name(peer_name, &volume.id, volume.removable);
     #[cfg(feature = "files-mount")]
     {
         if crate::elevate::is_elevated() {
-            match crate::mount_helper::mount(peer.clone(), peer_name, &volume.id, &name, publisher)
-            {
+            match crate::mount_helper::mount(
+                peer.clone(),
+                peer_name,
+                &volume.id,
+                &name,
+                publisher,
+                cache.cloned(),
+            ) {
                 Ok(relayed) => return Ok(Mount::Helper(relayed)),
                 Err(e) => tracing::warn!(
                     peer = %peer_name,
@@ -203,7 +212,8 @@ pub(super) fn mount_one_volume(
                 ),
             }
         }
-        cursio_files::winmount::mount(peer, peer_name, &volume.id, &name).map(|drive| {
+        let cache = cache.and_then(cursio_files::readcache::shared);
+        cursio_files::winmount::mount(peer, peer_name, &volume.id, &name, cache).map(|drive| {
             super::peer_paths::note_drive(publisher, peer_name, &volume.id, drive.mountpoint());
             Mount::Here { _drive: drive }
         })
@@ -212,7 +222,15 @@ pub(super) fn mount_one_volume(
     // elevated or not.
     #[cfg(not(feature = "files-mount"))]
     {
-        crate::mount_helper::mount(peer, peer_name, &volume.id, &name, publisher).map(Mount::Helper)
+        crate::mount_helper::mount(
+            peer,
+            peer_name,
+            &volume.id,
+            &name,
+            publisher,
+            cache.cloned(),
+        )
+        .map(Mount::Helper)
     }
 }
 
@@ -358,6 +376,7 @@ impl FilesEngine {
                 &self.peer_name,
                 volume,
                 self.mounts_publisher,
+                self.read_cache.as_ref(),
             ) {
                 Ok(m) => {
                     self.volume_mounts.insert(volume.id.clone(), m);

@@ -173,6 +173,7 @@ pub fn mount(
     peer_name: &str,
     volume: &str,
     volume_label: &str,
+    cache: Option<std::sync::Arc<crate::readcache::ReadCache>>,
 ) -> anyhow::Result<MountHandle> {
     // Load WinFsp's DLL from where the installer actually put it, before
     // anything asks for a symbol from it.
@@ -260,7 +261,9 @@ pub fn mount(
     // these sit side by side in Explorer, so the name says whose disk it is.
     let mut host: FileSystemHost<RemoteFs> = FileSystemHost::new(
         params,
-        RemoteFs::new(peer, volume_label, volume).of_peer(peer_name),
+        RemoteFs::new(peer, volume_label, volume)
+            .of_peer(peer_name)
+            .with_cache(cache),
     )
     .map_err(|e| anyhow::anyhow!("cannot create the filesystem host: {e:?}"))?;
 
