@@ -56,6 +56,14 @@ pub(crate) struct BackgroundRate {
     /// each starting over after a pause, ran at the bottom of the ramp. As in
     /// TCP's slow start, doubling until the first sign of a queue reaches
     /// that in under a second; from then on the cautious increase holds.
+    ///
+    /// The first sign is read early and raw, as HyStart does: one reading
+    /// past half the target ends the doubling, without a cut. Waiting for the
+    /// filtered queue to pass the whole target let three more doublings
+    /// through — eight times the rate the link had just shown it could not
+    /// take — and a Windows laptop's Wi-Fi answered that burst by losing the
+    /// interactive lane's packets, each loss a 300 ms retransmission timer:
+    /// the pointer's round trip reached 1.1 s.
     slow_start: bool,
 }
 
@@ -103,6 +111,9 @@ impl BackgroundRate {
         }
         self.updated = Some(now);
         let standing = self.current.iter().min().copied().unwrap_or(rtt);
+        if self.slow_start && rtt.saturating_sub(baseline) > QUEUE_TARGET / 2 {
+            self.slow_start = false;
+        }
         if standing.saturating_sub(baseline) > QUEUE_TARGET {
             self.rate = (self.rate * 0.7).max(MIN_RATE);
             self.slow_start = false;
@@ -240,5 +251,22 @@ mod tests {
         now += UPDATE_INTERVAL;
         controller.observe(Duration::from_millis(5), now, true);
         assert!(controller.bytes_per_second() < before * 1.2);
+    }
+
+    #[test]
+    fn the_first_reading_past_half_the_target_ends_the_doubling_without_a_cut() {
+        let mut controller = BackgroundRate::default();
+        let mut now = Instant::now();
+        controller.observe(Duration::from_millis(5), now, true);
+        now += UPDATE_INTERVAL;
+        let before = controller.bytes_per_second();
+        assert!(controller
+            .observe(Duration::from_millis(14), now, true)
+            .is_none());
+        let after = controller.bytes_per_second();
+        assert!(
+            after > before && after < before * 1.2,
+            "{before} -> {after}"
+        );
     }
 }
