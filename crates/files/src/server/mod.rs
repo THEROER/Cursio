@@ -362,10 +362,17 @@ impl Namespace {
             if self.is_excluded(&entry.path()) {
                 continue;
             }
-            // `symlink_metadata`, not `metadata`: a listing must describe the
-            // link itself, or a link pointing outside the volume would be
-            // reported as whatever it targets.
-            let md = match entry.path().symlink_metadata() {
+            // The entry's own metadata, which describes a link as the link: a
+            // listing reporting a link as whatever it targets would let one
+            // pointing outside the volume pass for a file inside it.
+            //
+            // Taken from the entry rather than by stat'ing its path: on
+            // Windows the enumeration already carries it, while a stat per
+            // entry is a system call each, which the antivirus may scan.
+            // Listings of a Windows `C:` stat'ing every entry took 8.6 and
+            // 12.2 s, past the mount's deadline. On Linux the two are the same
+            // `lstat`.
+            let md = match entry.metadata() {
                 Ok(md) => md,
                 // A file can vanish between reading the directory and stat'ing
                 // it. Skipping it is right — it is genuinely no longer there.
