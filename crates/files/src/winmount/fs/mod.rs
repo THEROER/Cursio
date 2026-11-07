@@ -167,7 +167,24 @@ impl RemoteFs {
     fn resolve(&self, file_name: &U16CStr) -> (String, String) {
         let win_path = file_name.to_string_lossy();
         let path = win_path.trim_start_matches('\\').replace('\\', "/");
+        let path = self.true_case(&self.bound, path);
         (self.bound.clone(), path)
+    }
+
+    /// `path` as the owner spells it; see [`crate::case`]. The drive tells
+    /// Windows it compares names without case (`case_sensitive_search(false)`),
+    /// and a Linux owner does not: an Unreal Engine game opening its own
+    /// executable lowercased was told it does not exist, and did not start.
+    fn true_case(&self, volume: &str, path: String) -> String {
+        crate::case::true_case(
+            &path,
+            |p| self.stat_path(volume, p).is_ok(),
+            |dir| {
+                self.entries_at(volume, dir)
+                    .ok()
+                    .map(|entries| entries.into_iter().map(|m| m.name).collect())
+            },
+        )
     }
 
     /// Metadata for a path, answered from the cache when it was asked for
@@ -881,18 +898,22 @@ impl FileSystemContext for RemoteFs {
 impl RemoteFs {
     /// Entries of a directory, as the peer lists them.
     fn entries_of(&self, context: &FileCtx) -> Result<Vec<FileMeta>, FileError> {
+        self.entries_at(&context.volume, &context.path)
+    }
+
+    /// Entries of the directory `path` on `volume`.
+    fn entries_at(&self, volume: &str, path: &str) -> Result<Vec<FileMeta>, FileError> {
         // Windows enumerates a directory in batches and calls back for each
         // one, so one pass over a folder asks for the same listing several
         // times. Measured against Steam: 1980 listings in 30 seconds, of
         // directories holding up to 1815 entries — around 11 MB/s of metadata,
         // which is the whole link. The writes sharing it then missed the
         // mount's deadline and Windows reported the drive as failing.
-        if let Some(held) = self.meta.listing(&context.volume, &context.path) {
+        if let Some(held) = self.meta.listing(volume, path) {
             return Ok(held);
         }
-        let entries = self.peer.read_dir(&context.volume, &context.path)?;
-        self.meta
-            .put_listing(&context.volume, &context.path, entries.clone());
+        let entries = self.peer.read_dir(volume, path)?;
+        self.meta.put_listing(volume, path, entries.clone());
         // A listing already carries every entry's metadata, and what follows a
         // listing is almost always a query per entry — Explorer does it to fill
         // its columns, and a directory walk does it to decide where to descend.
@@ -902,11 +923,11 @@ impl RemoteFs {
         // This is what a batched `stat` would buy, without a message for it: the
         // owner's `read_dir` stats every entry anyway to build the reply.
         for meta in &entries {
-            let child = match context.path.is_empty() {
+            let child = match path.is_empty() {
                 true => meta.name.clone(),
-                false => format!("{}/{}", context.path, meta.name),
+                false => format!("{}/{}", path, meta.name),
             };
-            self.meta.put(&context.volume, &child, Ok(meta.clone()));
+            self.meta.put(volume, &child, Ok(meta.clone()));
         }
         Ok(entries)
     }

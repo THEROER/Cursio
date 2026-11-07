@@ -14,6 +14,9 @@ pub mod background;
 /// by both mount implementations — the platform differences are all in how the
 /// OS asks, not in how the answer is fetched.
 pub mod bridge;
+/// A path's real spelling on an owner that compares names with case, for the
+/// Windows mount, which promises Windows it does not.
+pub mod case;
 /// The length of a file open on a mount, as far as its handle can vouch for.
 pub mod filesize;
 /// Which mount callbacks entered and never returned, the one failure a stuck
