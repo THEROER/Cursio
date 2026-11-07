@@ -404,6 +404,7 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
 /// Answer a command that waits on a peer; anything else goes to `state`.
 /// How long a screenshot with `ask` waits for the phone's person to allow
 /// sharing and the first picture to arrive.
+#[cfg(all(feature = "phone-control", any(target_os = "linux", windows)))]
 const SCREEN_ALLOW_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// A phone's screen read or driven by a program here; `None` for any other
