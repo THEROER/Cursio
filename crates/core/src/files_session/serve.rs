@@ -328,6 +328,18 @@ pub(super) fn run_request(
                 |()| FilesMsg::Ok { req },
             )
         }
+        FilesMsg::SetTimes {
+            req,
+            volume,
+            path,
+            modified,
+            accessed,
+        } => {
+            let r = ns().set_times(&volume, &path, modified, accessed);
+            answer(req, &format!("set times of {volume}/{path}"), r, |()| {
+                FilesMsg::Ok { req }
+            })
+        }
         FilesMsg::ListVolumes { .. } => {
             // Answered with the announcement itself, which carries no request
             // id — the list is idempotent, so the asker takes the next one.

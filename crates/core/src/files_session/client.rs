@@ -357,6 +357,22 @@ impl FilesEngine {
                         to,
                     },
                 ),
+                Op::SetTimes {
+                    volume,
+                    path,
+                    modified,
+                    accessed,
+                    reply,
+                } => (
+                    Pending::Unit(reply),
+                    FilesMsg::SetTimes {
+                        req,
+                        volume,
+                        path,
+                        modified,
+                        accessed,
+                    },
+                ),
                 Op::Symlink {
                     volume,
                     path,

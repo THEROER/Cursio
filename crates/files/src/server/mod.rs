@@ -260,6 +260,16 @@ impl FileServer {
     pub fn symlink(&self, volume: &str, path: &str, target: &str) -> Result<(), FileError> {
         self.ns.symlink(volume, path, target)
     }
+
+    pub fn set_times(
+        &self,
+        volume: &str,
+        path: &str,
+        modified: Option<(i64, u32)>,
+        accessed: Option<(i64, u32)>,
+    ) -> Result<(), FileError> {
+        self.ns.set_times(volume, path, modified, accessed)
+    }
 }
 
 impl Namespace {
@@ -576,6 +586,34 @@ impl Namespace {
         create_symlink(&at, &native).map_err(symlink_error)
     }
 
+    /// Set a path's modification and access times; `None` leaves one alone.
+    ///
+    /// Through a final link, as `utimensat` without `AT_SYMLINK_NOFOLLOW`
+    /// does, so it is confined like an open. A directory takes times too:
+    /// `tar` and `rsync` restore a folder's after filling it.
+    pub fn set_times(
+        &self,
+        volume: &str,
+        path: &str,
+        modified: Option<(i64, u32)>,
+        accessed: Option<(i64, u32)>,
+    ) -> Result<(), FileError> {
+        if !self.writable(volume) {
+            return Err(FileError::ReadOnly);
+        }
+        let target = self.resolve_through(volume, path)?;
+        let mut times = std::fs::FileTimes::new();
+        if let Some(at) = modified.map(system_time) {
+            times = times.set_modified(at);
+        }
+        if let Some(at) = accessed.map(system_time) {
+            times = times.set_accessed(at);
+        }
+        open_for_times(&target)
+            .and_then(|file| file.set_times(times))
+            .map_err(to_file_error)
+    }
+
     /// Rename within one volume. Cross-volume moves are the caller's problem to
     /// decompose into copy+delete, exactly as they are locally.
     pub fn rename(&self, volume: &str, from: &str, to: &str) -> Result<(), FileError> {
@@ -612,6 +650,46 @@ fn stays_under(root: &Path, path: &Path) -> bool {
             },
         }
     }
+}
+
+/// Seconds and nanoseconds since the epoch, negative seconds before it.
+fn system_time((secs, nanos): (i64, u32)) -> std::time::SystemTime {
+    let epoch = std::time::UNIX_EPOCH;
+    let nanos = std::time::Duration::from_nanos(u64::from(nanos.min(999_999_999)));
+    if secs >= 0 {
+        epoch + std::time::Duration::from_secs(secs as u64) + nanos
+    } else {
+        epoch - std::time::Duration::from_secs(secs.unsigned_abs()) + nanos
+    }
+}
+
+/// A handle that may set `path`'s times, file or directory.
+///
+/// On Unix, opening for reading is enough for the owner to set times, and a
+/// directory opens that way. Windows needs the attribute-writing right asked
+/// for, and opens a directory only with backup semantics.
+#[cfg(unix)]
+fn open_for_times(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(windows)]
+fn open_for_times(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_for_times(_path: &Path) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "setting file times is not supported on this platform",
+    ))
 }
 
 /// A link's stored target in the wire's spelling — see [`Namespace::read_link`].
@@ -1599,6 +1677,51 @@ mod tests {
         assert_eq!(
             native_link_target(".", 0).expect("here"),
             PathBuf::from(".")
+        );
+    }
+
+    /// A time set through the mount lands on the owner's file and folder —
+    /// what `touch`, `cp -p` and `tar` need, and what `make` reads.
+    #[test]
+    fn times_set_through_the_mount_land_on_the_owners_file_and_folder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("dir")).expect("mkdir");
+        std::fs::write(tmp.path().join("dir/a.txt"), b"x").expect("write");
+        let srv = server_on(tmp.path());
+
+        srv.set_times("T:", "dir/a.txt", Some((1_600_000_000, 500)), None)
+            .expect("file");
+        srv.set_times(
+            "T:",
+            "dir",
+            Some((1_500_000_000, 0)),
+            Some((1_500_000_001, 0)),
+        )
+        .expect("folder");
+
+        let file = std::fs::metadata(tmp.path().join("dir/a.txt")).unwrap();
+        assert_eq!(
+            file.modified().unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::new(1_600_000_000, 500)
+        );
+        let dir = std::fs::metadata(tmp.path().join("dir")).unwrap();
+        assert_eq!(
+            dir.modified().unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000)
+        );
+        assert!(matches!(
+            srv.set_times("T:", "missing", Some((0, 0)), None),
+            Err(FileError::NotFound)
+        ));
+    }
+
+    /// Seconds before the epoch with a fraction count back from it, as the
+    /// mount spells them.
+    #[test]
+    fn a_time_before_the_epoch_is_read_back_whole() {
+        assert_eq!(
+            system_time((-2, 500_000_000)),
+            std::time::UNIX_EPOCH - std::time::Duration::from_millis(1500)
         );
     }
 

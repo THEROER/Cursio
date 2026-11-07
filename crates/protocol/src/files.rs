@@ -477,6 +477,23 @@ pub enum FilesMsg {
         size: u64,
         head: Chunk,
     },
+
+    /// Mount -> owner: set a path's modification and access times, each as
+    /// seconds and nanoseconds since the epoch; `None` leaves that one as it
+    /// is. Answered with [`FilesMsg::Ok`].
+    ///
+    /// What `touch`, `cp -p`, `rsync` and an unpacking `tar` do after writing,
+    /// and what `make` decides by. Without it a time set through the mount
+    /// never reached the owner: while the kernel kept a file's times as its
+    /// own it only looked set, and once the owner's times were honoured
+    /// (which a disk the owner also changes needs) it was visibly lost.
+    SetTimes {
+        req: FileReqId,
+        volume: String,
+        path: String,
+        modified: Option<(i64, u32)>,
+        accessed: Option<(i64, u32)>,
+    },
 }
 
 impl FilesMsg {

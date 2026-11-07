@@ -183,6 +183,13 @@ pub enum Op {
         target: String,
         reply: std_mpsc::Sender<Result<(), FileError>>,
     },
+    SetTimes {
+        volume: String,
+        path: String,
+        modified: Option<(i64, u32)>,
+        accessed: Option<(i64, u32)>,
+        reply: std_mpsc::Sender<Result<(), FileError>>,
+    },
 }
 
 /// The mount's handle on the session.
@@ -643,6 +650,23 @@ impl PeerLink {
             volume: volume.to_string(),
             from: from.to_string(),
             to: to.to_string(),
+            reply,
+        })
+    }
+
+    /// Set `path`'s times on the owner; `None` leaves that one as it is.
+    pub fn set_times(
+        &self,
+        volume: &str,
+        path: &str,
+        modified: Option<(i64, u32)>,
+        accessed: Option<(i64, u32)>,
+    ) -> Result<(), FileError> {
+        self.call(|reply| Op::SetTimes {
+            volume: volume.to_string(),
+            path: path.to_string(),
+            modified,
+            accessed,
             reply,
         })
     }

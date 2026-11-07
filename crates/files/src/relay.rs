@@ -42,7 +42,7 @@ use crate::FilesError;
 /// its own executable, so the two normally agree; this catches the case where
 /// they do not (a helper left running across an update) before any request is
 /// misread.
-pub const RELAY_VERSION: u32 = 2;
+pub const RELAY_VERSION: u32 = 3;
 
 /// The largest frame either side accepts. A write carries at most one wire
 /// chunk, a directory listing at most a few thousand entries; this is far
@@ -134,6 +134,12 @@ enum Request {
         volume: String,
         path: String,
         target: String,
+    },
+    SetTimes {
+        volume: String,
+        path: String,
+        modified: Option<(i64, u32)>,
+        accessed: Option<(i64, u32)>,
     },
 }
 
@@ -304,6 +310,12 @@ fn execute(link: &PeerLink, request: Request) -> Option<Answer> {
             path,
             target,
         } => Answer::Unit(link.symlink(&volume, &path, &target)),
+        Request::SetTimes {
+            volume,
+            path,
+            modified,
+            accessed,
+        } => Answer::Unit(link.set_times(&volume, &path, modified, accessed)),
     })
 }
 
@@ -475,6 +487,21 @@ fn split(op: Op) -> (Request, Option<Waiting>) {
                 volume,
                 path,
                 target,
+            },
+            Some(Waiting::Unit(reply)),
+        ),
+        Op::SetTimes {
+            volume,
+            path,
+            modified,
+            accessed,
+            reply,
+        } => (
+            Request::SetTimes {
+                volume,
+                path,
+                modified,
+                accessed,
             },
             Some(Waiting::Unit(reply)),
         ),

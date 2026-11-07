@@ -875,8 +875,8 @@ impl Filesystem for RemoteFs {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         fh: Option<fuser::FileHandle>,
         _crtime: Option<std::time::SystemTime>,
@@ -885,11 +885,10 @@ impl Filesystem for RemoteFs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // Only truncation is honoured. Modes, owners and timestamps have no
-        // faithful meaning across Linux and Windows, and silently accepting
-        // them would report success for something that never happened — so
-        // they are ignored, which is what `chmod` on a foreign filesystem does
-        // anyway.
+        // Truncation and times are honoured. Modes and owners have no faithful
+        // meaning across Linux and Windows — a Windows ACL has no
+        // translation — so they are ignored, which is what `chmod` on a
+        // foreign filesystem does anyway.
         if let Some(size) = size {
             self.forget_heads(ino.0);
             // Writes still on their way would land after the truncate and
@@ -904,6 +903,38 @@ impl Filesystem for RemoteFs {
                 return reply.error(Errno::EBADF);
             };
             if let Err(e) = self.peer.truncate(remote, size) {
+                return reply.error(to_errno(&e));
+            }
+        }
+        if atime.is_some() || mtime.is_some() {
+            let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) else {
+                return reply.error(Errno::EPERM);
+            };
+            // After the writes, or the last of them lands later and moves the
+            // modification time `cp -p` just restored.
+            self.settle_path(&volume, &path);
+            let at = |time: fuser::TimeOrNow| {
+                let time = match time {
+                    fuser::TimeOrNow::SpecificTime(time) => time,
+                    fuser::TimeOrNow::Now => std::time::SystemTime::now(),
+                };
+                match time.duration_since(std::time::UNIX_EPOCH) {
+                    Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+                    Err(e) => {
+                        let back = e.duration();
+                        let nanos = back.subsec_nanos();
+                        if nanos == 0 {
+                            (-(back.as_secs() as i64), 0)
+                        } else {
+                            (-(back.as_secs() as i64) - 1, 1_000_000_000 - nanos)
+                        }
+                    }
+                }
+            };
+            if let Err(e) = self
+                .peer
+                .set_times(&volume, &path, mtime.map(at), atime.map(at))
+            {
                 return reply.error(to_errno(&e));
             }
         }

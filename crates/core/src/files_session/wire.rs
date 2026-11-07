@@ -68,6 +68,7 @@ pub(super) fn is_request(msg: &FilesMsg) -> bool {
             | FilesMsg::Remove { .. }
             | FilesMsg::Rename { .. }
             | FilesMsg::Symlink { .. }
+            | FilesMsg::SetTimes { .. }
             | FilesMsg::Close { .. }
             | FilesMsg::ListVolumes { .. }
     )
@@ -88,6 +89,7 @@ pub(super) fn request_kind(msg: &FilesMsg) -> &'static str {
         FilesMsg::Remove { .. } => "remove",
         FilesMsg::Rename { .. } => "rename",
         FilesMsg::Symlink { .. } => "symlink",
+        FilesMsg::SetTimes { .. } => "set_times",
         FilesMsg::Close { .. } => "close",
         FilesMsg::ListVolumes { .. } => "volumes",
         _ => "other",
@@ -111,7 +113,8 @@ pub(super) fn request_req(msg: &FilesMsg) -> Option<FileReqId> {
         | FilesMsg::MkDir { req, .. }
         | FilesMsg::Remove { req, .. }
         | FilesMsg::Rename { req, .. }
-        | FilesMsg::Symlink { req, .. } => Some(*req),
+        | FilesMsg::Symlink { req, .. }
+        | FilesMsg::SetTimes { req, .. } => Some(*req),
         _ => None,
     }
 }
