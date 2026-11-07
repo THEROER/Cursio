@@ -15,7 +15,10 @@
 //!   than being modprobed by whoever happens to need them first.
 //! - `/etc/udev/rules.d/70-cursio-usbip.rules` — the bind and attach files
 //!   become writable by a group the user is in, so Cursio itself never needs
-//!   root again.
+//!   root again. That includes the generic `usb` driver's `bind`/`unbind`:
+//!   an export takes the device from it first and a return gives it back, so
+//!   the group can detach any USB device here — which is what lending one to
+//!   a peer is.
 //! - A `modprobe` and a `udevadm trigger` now, so the machine is usable
 //!   without a reboot.
 //!
@@ -97,13 +100,22 @@ impl Readiness {
 pub fn readiness() -> Readiness {
     let export = std::path::Path::new("/sys/bus/usb/drivers/usbip-host/bind");
     let attach = std::path::Path::new("/sys/devices/platform/vhci_hcd.0/attach");
+    // An export first takes the device from the generic `usb` driver, and
+    // giving it back re-binds it there. Leaving these out reported a machine
+    // as set up while every export failed on `usb/unbind` — 896 refusals in a
+    // week on two machines, each a peer's claim answered "needs root".
+    let release = std::path::Path::new("/sys/bus/usb/drivers/usb/unbind");
+    let reclaim = std::path::Path::new("/sys/bus/usb/drivers/usb/bind");
     Readiness {
         can_export: export.exists(),
         can_attach: attach.exists(),
         // Writability rather than mode bits: a rule may grant access through a
         // group, an ACL, or something a future distribution invents, and the
         // only question that matters is whether this process can write.
-        unprivileged: is_writable(export) && is_writable(attach),
+        unprivileged: is_writable(export)
+            && is_writable(attach)
+            && is_writable(release)
+            && is_writable(reclaim),
     }
 }
 
@@ -197,6 +209,13 @@ fn script_body() -> String {
          chmod g+w /sys/bus/usb/drivers/usbip-host/bind \
          /sys/bus/usb/drivers/usbip-host/unbind \
          /sys/bus/usb/drivers/usbip-host/match_busid 2>/dev/null'\"\n\
+         # An export takes the device from the generic usb driver first, and\n\
+         # giving it back binds it there again. Each device's arrival re-applies\n\
+         # this, since sysfs modes do not survive a reboot.\n\
+         ACTION==\"add\", SUBSYSTEM==\"usb\", ENV{{DEVTYPE}}==\"usb_device\", \
+         RUN+=\"/bin/sh -c 'chgrp {GROUP} /sys/bus/usb/drivers/usb/bind \
+         /sys/bus/usb/drivers/usb/unbind 2>/dev/null; \
+         chmod g+w /sys/bus/usb/drivers/usb/bind /sys/bus/usb/drivers/usb/unbind 2>/dev/null'\"\n\
          EOF\n\
          # The vhci files belong to a platform device that exists only once the\n\
          # module is loaded, so they are chmodded directly rather than by rule.\n\
@@ -208,6 +227,10 @@ fn script_body() -> String {
          # device event.\n\
          for f in bind unbind match_busid; do\n\
          \x20 p=/sys/bus/usb/drivers/usbip-host/$f\n\
+         \x20 [ -e \"$p\" ] && chgrp {GROUP} \"$p\" && chmod g+w \"$p\"\n\
+         done\n\
+         for f in bind unbind; do\n\
+         \x20 p=/sys/bus/usb/drivers/usb/$f\n\
          \x20 [ -e \"$p\" ] && chgrp {GROUP} \"$p\" && chmod g+w \"$p\"\n\
          done\n\
          udevadm control --reload-rules\n"
@@ -293,6 +316,21 @@ mod tests {
         // And works right now, without one.
         assert!(body.contains("modprobe usbip-host"));
         assert!(body.contains("modprobe vhci-hcd"));
+    }
+
+    /// An export unbinds the device from the generic `usb` driver before
+    /// `usbip-host` can take it, and a return binds it back; the group must be
+    /// able to write both now and after every reboot, or each export fails on
+    /// a machine that reports itself set up.
+    #[test]
+    fn the_script_opens_the_generic_drivers_bind_and_unbind() {
+        let body = script_body();
+        let rule_end = body.find("\nEOF\n").expect("the rule ends");
+        let (rule, now) = body.split_at(rule_end);
+        assert!(rule.contains("/sys/bus/usb/drivers/usb/unbind"), "{rule}");
+        assert!(rule.contains("/sys/bus/usb/drivers/usb/bind"), "{rule}");
+        assert!(rule.contains("ENV{DEVTYPE}==\"usb_device\""), "{rule}");
+        assert!(now.contains("p=/sys/bus/usb/drivers/usb/$f"), "{now}");
     }
 
     /// Reading the machine must never panic, whatever this host is.
