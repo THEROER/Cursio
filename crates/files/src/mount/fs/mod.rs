@@ -116,7 +116,10 @@ impl RemoteFs {
             volume,
             path,
             || self.peer.stat(volume, path),
-            |dir| self.peer.read_dir(volume, dir),
+            |dir| {
+                self.peer
+                    .read_dir_within(volume, dir, crate::metacache::SWEEP_LISTING_WAIT)
+            },
         )
     }
 

@@ -130,7 +130,25 @@ struct Misses {
     /// The owner refused the listing in this window — a directory that may be
     /// entered but not read — so the window's misses are asked one by one.
     refused: bool,
+    /// Listings of this directory that came to nothing. At
+    /// [`SWEEP_GIVE_UP`] it is not listed for a sweep again.
+    failed: u8,
 }
+
+/// How long a sweep waits for the listing it asked for.
+///
+/// The listing stands in for questions a walk is about to ask, each a few
+/// milliseconds on a LAN; waiting longer than this for it costs more than
+/// asking them. A directory that cannot be listed this fast — a system
+/// directory of tens of thousands of entries — is answered name by name.
+pub const SWEEP_LISTING_WAIT: Duration = Duration::from_secs(1);
+
+/// Failed listings after which a directory is no longer listed for a sweep.
+///
+/// Two, so a single unlucky moment does not cost the directory its shortcut,
+/// while a directory too big to list in time stops costing a
+/// [`SWEEP_LISTING_WAIT`] every window a walk passes through it.
+const SWEEP_GIVE_UP: u8 = 2;
 
 /// One listing is worth this many entries per miss in its directory.
 ///
@@ -246,6 +264,7 @@ impl MetaCache {
                 last_listed: None,
                 listing: false,
                 refused: false,
+                failed: 0,
             });
         if held.since.elapsed() >= META_TTL {
             held.count = 0;
@@ -254,7 +273,7 @@ impl MetaCache {
         }
         held.count += 1;
         let needed = (held.last_listed.unwrap_or(0) / ENTRIES_PER_MISS).max(SWEEP_MISSES);
-        if held.listing || held.refused || held.count < needed {
+        if held.listing || held.refused || held.failed >= SWEEP_GIVE_UP || held.count < needed {
             return false;
         }
         held.listing = true;
@@ -271,8 +290,12 @@ impl MetaCache {
                     held.last_listed = Some(len);
                     held.count = 0;
                     held.since = Instant::now();
+                    held.failed = 0;
                 }
-                None => held.refused = true,
+                None => {
+                    held.refused = true;
+                    held.failed = held.failed.saturating_add(1);
+                }
             }
         }
     }
@@ -661,6 +684,26 @@ mod tests {
         }
         assert_eq!(stats.get(), 4, "every name still answered");
         assert_eq!(lists.get(), 1, "the refusal is not asked for again");
+    }
+
+    /// A directory too big to list in time stops being listed for sweeps, so a
+    /// walk through it does not pay a listing's wait every window.
+    #[test]
+    fn a_directory_whose_listing_keeps_failing_is_no_longer_listed() {
+        let c = MetaCache::new();
+        for _ in 0..SWEEP_GIVE_UP {
+            assert!(!c.note_miss("C:", "Windows/WinSxS"));
+            assert!(c.note_miss("C:", "Windows/WinSxS"));
+            c.listed_dir("C:", "Windows/WinSxS", None);
+            // The next window.
+            c.misses
+                .lock()
+                .unwrap()
+                .get_mut(&("C:".to_string(), "Windows/WinSxS".to_string()))
+                .unwrap()
+                .since -= META_TTL;
+        }
+        assert!(!(0..10).any(|_| c.note_miss("C:", "Windows/WinSxS")));
     }
 
     /// A directory of thousands is listed again only once enough of its names

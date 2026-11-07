@@ -356,8 +356,46 @@ impl PeerLink {
         self.call(|reply| Op::Volumes { reply })
     }
 
+    /// List a directory, waiting as long as a large one needs.
+    ///
+    /// A listing's time grows with the directory, so a late one says the
+    /// directory is big, not that the peer is gone: judged by
+    /// [`OP_TIMEOUT`], one slow listing started a cool-off that refused every
+    /// `stat` of a `git status` for five seconds, again and again. It waits
+    /// [`BULK_OP_TIMEOUT`] and leaves the peer's health to the questions that
+    /// are small — though it still fails at once during a cool-off, which a
+    /// small question started.
     pub fn read_dir(&self, volume: &str, path: &str) -> Result<Vec<FileMeta>, FileError> {
-        self.call(|reply| Op::ReadDir {
+        self.list_within(volume, path, BULK_OP_TIMEOUT)
+    }
+
+    /// List a directory only if the answer comes within `limit`, never
+    /// counting a late one against the peer.
+    ///
+    /// For listings asked for as a shortcut — the metadata cache reading a
+    /// whole directory to answer names a walk is about to ask about — where
+    /// waiting longer than the questions it replaces would cost more than it
+    /// saves.
+    pub fn read_dir_within(
+        &self,
+        volume: &str,
+        path: &str,
+        limit: Duration,
+    ) -> Result<Vec<FileMeta>, FileError> {
+        self.list_within(volume, path, limit)
+    }
+
+    fn list_within(
+        &self,
+        volume: &str,
+        path: &str,
+        limit: Duration,
+    ) -> Result<Vec<FileMeta>, FileError> {
+        if self.in_cooloff() {
+            tracing::debug!("refusing a listing: still in the cool-off from a timeout");
+            return Err(FileError::Io("peer is not responding".into()));
+        }
+        self.call_within(limit, |reply| Op::ReadDir {
             volume: volume.to_string(),
             path: path.to_string(),
             reply,
@@ -811,6 +849,35 @@ mod tests {
             link.in_cooloff(),
             "an unanswered stat means the peer is not answering"
         );
+    }
+
+    /// A listing that runs late says the directory is big, not that the peer
+    /// is gone: it must not refuse the `stat`s that follow it.
+    #[test]
+    fn a_late_listing_does_not_start_a_cool_off() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let link = PeerLink::new(tx);
+        let _held = rx;
+
+        assert!(link
+            .read_dir_within("C:", "Windows", Duration::from_millis(20))
+            .is_err());
+        assert!(!link.in_cooloff());
+    }
+
+    /// During a cool-off a listing fails at once, like every other question:
+    /// waiting its long deadline against a peer that stopped answering would
+    /// hang the caller far longer than a `stat` does.
+    #[test]
+    fn a_listing_fails_at_once_during_a_cool_off() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let link = PeerLink::new(tx);
+        let _held = rx;
+        link.mark_unresponsive();
+
+        let started = std::time::Instant::now();
+        assert!(link.read_dir("C:", "Windows").is_err());
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     /// Bulk work gets the longer deadline; metadata keeps the short one.
