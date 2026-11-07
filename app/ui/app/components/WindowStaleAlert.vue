@@ -41,7 +41,7 @@ async function restart() {
       {{ t("window.staleBody", { window: install?.app, node: status?.node.installed_version }) }}
     </p>
     <div class="mt-3">
-      <LpButton variant="solid" size="sm" :disabled="restarting" @click="restart">
+      <LpButton variant="solid" size="sm" :loading="restarting" @click="restart">
         <LpIcon name="lucide:refresh-cw" :size="14" />
         {{ t("window.relaunch") }}
       </LpButton>

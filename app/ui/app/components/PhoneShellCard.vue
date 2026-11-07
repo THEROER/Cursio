@@ -36,7 +36,7 @@ async function pair() {
       <LpBadge v-if="setup.shell && setup.shellOn" tone="success" dot size="sm" class="shrink-0">
         {{ t("phoneShell.on") }}
       </LpBadge>
-      <LpButton v-else variant="solid" class="shrink-0" :disabled="busy" @click="pair">
+      <LpButton v-else variant="solid" class="shrink-0" :loading="busy" @click="pair">
         {{ setup.shell ? t("phoneShell.turnOn") : t("phoneShell.pair") }}
       </LpButton>
     </div>

@@ -70,7 +70,8 @@ async function ask(what: PhoneGrant) {
           v-else
           variant="solid"
           class="shrink-0"
-          :disabled="busy !== null"
+          :loading="busy === row.what"
+          :disabled="busy !== null && busy !== row.what"
           @click="ask(row.what)"
         >
           {{ t("phone.allow") }}
@@ -86,7 +87,12 @@ async function ask(what: PhoneGrant) {
         </div>
         <div class="flex flex-wrap justify-end gap-2">
           <LpButton variant="ghost" @click="markAutostartDone(true)">{{ t("phone.autostartDone") }}</LpButton>
-          <LpButton variant="soft" :disabled="busy !== null" @click="ask('autostart')">
+          <LpButton
+            variant="soft"
+            :loading="busy === 'autostart'"
+            :disabled="busy !== null && busy !== 'autostart'"
+            @click="ask('autostart')"
+          >
             <LpIcon name="lucide:external-link" :size="14" />
             {{ t("phone.openSettings") }}
           </LpButton>

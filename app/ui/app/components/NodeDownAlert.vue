@@ -33,9 +33,15 @@ async function startNode() {
   >
     <p class="text-sm"><CodeText :text="isMobile ? t('node.notRunningBodyPhone') : t('node.notRunningBody')" /></p>
     <div class="mt-3">
-      <LpButton variant="solid" :size="isMobile ? 'md' : 'sm'" :disabled="starting" @click="startNode">
+      <LpButton
+        variant="solid"
+        :size="isMobile ? 'md' : 'sm'"
+        :loading="starting"
+        :loading-label="t('node.starting')"
+        @click="startNode"
+      >
         <LpIcon name="lucide:play" :size="14" />
-        {{ starting ? t("node.starting") : t("node.start") }}
+        {{ t("node.start") }}
       </LpButton>
     </div>
   </LpAlert>

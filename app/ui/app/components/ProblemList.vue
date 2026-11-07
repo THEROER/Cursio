@@ -9,6 +9,9 @@ const toast = useCursioToast()
 
 /** The problem whose button is being answered, so it is pressed once. */
 const busy = ref<string | null>(null)
+// Which of the problem's buttons was pressed: that one spins, its neighbours
+// only wait.
+const pressed = ref<string | null>(null)
 
 /**
  * Problems answered here, by id, with the `since` they had then. A button is
@@ -25,6 +28,7 @@ const shown = computed(() =>
 
 async function act(problem: Problem, action: ProblemAction) {
   busy.value = problem.id
+  pressed.value = action.label
   try {
     await applyConfigEdit(action.edit)
     answered.value.set(problem.id, JSON.stringify(problem.since))
@@ -33,6 +37,7 @@ async function act(problem: Problem, action: ProblemAction) {
     toast.failure(e, { title: t("problems.actionFailed"), retry: () => act(problem, action) })
   } finally {
     busy.value = null
+    pressed.value = null
   }
 }
 
@@ -88,7 +93,8 @@ const badge = { Info: "brand", Warning: "warning", Error: "danger" } as const
               :key="action.label"
               size="sm"
               :variant="i === 0 ? 'solid' : 'soft'"
-              :disabled="busy === problem.id"
+              :loading="busy === problem.id && pressed === action.label"
+              :disabled="busy === problem.id && pressed !== action.label"
               @click="act(problem, action)"
             >
               {{ action.label }}

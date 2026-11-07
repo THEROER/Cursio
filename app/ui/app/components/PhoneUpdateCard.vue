@@ -58,7 +58,12 @@ async function install(build: WaitingBuild) {
           {{ t("phoneUpdate.from", { machine: build.from }) }}
         </p>
       </div>
-      <LpButton class="shrink-0" :disabled="busy !== null" @click="install(build)">
+      <LpButton
+        class="shrink-0"
+        :loading="busy === keyOf(build)"
+        :disabled="busy !== null && busy !== keyOf(build)"
+        @click="install(build)"
+      >
         {{ t("phoneUpdate.install") }}
       </LpButton>
     </div>
