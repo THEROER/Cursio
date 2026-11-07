@@ -491,7 +491,12 @@ mode is read off the end of the argument because a Windows path has a colon of
 its own (`C:\:ro`).
 
 Enforcement is in `Namespace`, the one boundary every request already crosses:
-read-only refuses every mutating open, `mkdir`, `remove` and `rename`, and a
+read-only refuses every mutating open, `mkdir`, `remove`, `rename` and
+`symlink`. A link the peer creates must be relative and may not climb above the
+volume root from where it sits — checked on the target's spelling, so it keeps
+a copied tree's links pointing into that tree; what a link leads to when
+followed is still the confinement below. A
+folder root is *confined* — `..` was already refused, but a
 folder root is *confined* — `..` was already refused, but a symlink inside the
 folder pointing at `/etc` would still carry a request out, since the OS follows
 links while opening. So the parent of every path must resolve (symlinks

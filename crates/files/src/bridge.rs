@@ -166,6 +166,12 @@ pub enum Op {
         to: String,
         reply: std_mpsc::Sender<Result<(), FileError>>,
     },
+    Symlink {
+        volume: String,
+        path: String,
+        target: String,
+        reply: std_mpsc::Sender<Result<(), FileError>>,
+    },
 }
 
 /// The mount's handle on the session.
@@ -562,6 +568,15 @@ impl PeerLink {
             volume: volume.to_string(),
             from: from.to_string(),
             to: to.to_string(),
+            reply,
+        })
+    }
+
+    pub fn symlink(&self, volume: &str, path: &str, target: &str) -> Result<(), FileError> {
+        self.call(|reply| Op::Symlink {
+            volume: volume.to_string(),
+            path: path.to_string(),
+            target: target.to_string(),
             reply,
         })
     }

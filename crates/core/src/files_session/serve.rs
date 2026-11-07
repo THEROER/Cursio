@@ -271,6 +271,20 @@ pub(super) fn run_request(
                 FilesMsg::Ok { req }
             })
         }
+        FilesMsg::Symlink {
+            req,
+            volume,
+            path,
+            target,
+        } => {
+            let r = ns().symlink(&volume, &path, &target);
+            answer(
+                req,
+                &format!("symlink {volume}/{path} -> {target}"),
+                r,
+                |()| FilesMsg::Ok { req },
+            )
+        }
         FilesMsg::ListVolumes { .. } => {
             // Answered with the announcement itself, which carries no request
             // id — the list is idempotent, so the asker takes the next one.

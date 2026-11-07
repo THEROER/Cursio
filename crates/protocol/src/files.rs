@@ -435,6 +435,24 @@ pub enum FilesMsg {
     /// Owner -> mount: this request failed. Sent for every failure, so a caller
     /// never waits forever.
     Failed { req: FileReqId, error: FileError },
+
+    /// Mount -> owner: create a symlink at `path` pointing at `target`.
+    ///
+    /// `target` is `/`-separated and relative to the link's own directory, the
+    /// form a link inside a copied tree takes (`node_modules/.bin`, a git
+    /// checkout). The owner refuses one that is absolute or climbs out of the
+    /// volume: such a link would point into the owner's disk rather than into
+    /// the tree it was copied with. Without this request `cp -r` of any tree
+    /// holding a link reported a failure for the whole copy.
+    ///
+    /// Answered with [`FilesMsg::Ok`]. Appended last so every variant before it
+    /// keeps its encoding.
+    Symlink {
+        req: FileReqId,
+        volume: String,
+        path: String,
+        target: String,
+    },
 }
 
 impl FilesMsg {

@@ -430,22 +430,57 @@ impl Filesystem for RemoteFs {
         reply.error(Errno::EPERM);
     }
 
-    /// Links are read but never created.
+    /// A symlink is made on the peer, in the wire's `/` spelling.
     ///
-    /// `ReadLink` is the whole of the protocol's link support: a target can be
-    /// reported, but nothing asks the peer to make one. Creating a symlink here
-    /// would also mean writing a path that this machine interprets and the peer
-    /// stores — the two do not agree on what a path looks like when one of them
-    /// is Windows.
+    /// `cp -r` copies a link as a link, so while this was refused a copy of any
+    /// tree holding one — every `node_modules/.bin` — ended in an error. The
+    /// owner translates the target to its own separators and refuses one that
+    /// is absolute or leaves the volume (see `Namespace::symlink`), which is
+    /// what keeps a path this machine interprets from naming something else on
+    /// the peer's disk.
+    ///
+    /// The entry is answered from what was asked rather than with a `stat`
+    /// round trip, as `create` does; the size is the target's length, which is
+    /// what a link's `lstat` reports here.
     fn symlink(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _link_name: &OsStr,
-        _target: &std::path::Path,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        reply.error(Errno::EPERM);
+        let (volume, path) = match self.child_path(parent, link_name) {
+            Ok(v) => v,
+            Err(e) => return reply.error(e),
+        };
+        let Some(target) = target.to_str() else {
+            // Wire paths are UTF-8.
+            return reply.error(Errno::EINVAL);
+        };
+        self.meta.forget(&volume, &path);
+        if let Err(e) = self.peer.symlink(&volume, &path, target) {
+            return reply.error(to_errno(&e));
+        }
+        let ino = self
+            .state
+            .lock()
+            .expect("inode state")
+            .inodes
+            .lookup(&volume, &path);
+        let meta = cursio_protocol::FileMeta {
+            name: path.rsplit('/').next().unwrap_or(&path).to_string(),
+            kind: FileKind::Symlink,
+            size: target.len() as u64,
+            modified_unix: crate::now_unix(),
+            writable: true,
+            allocated: None,
+        };
+        reply.entry(
+            &CACHE_TTL,
+            &attr_from(ino, &meta, self.uid, self.gid),
+            GENERATION,
+        );
     }
 
     /// Hard links have no representation on the wire.

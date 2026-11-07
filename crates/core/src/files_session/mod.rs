@@ -328,7 +328,7 @@ impl crate::module::ModuleFactory for FilesFactory {
 
 /// Version of this module's wire vocabulary ([`FilesMsg`]). Bump when those
 /// types change shape; peers run the module only on an exact match.
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 #[cfg(test)]
 mod tests {

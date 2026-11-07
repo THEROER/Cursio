@@ -124,6 +124,11 @@ enum Request {
         from: String,
         to: String,
     },
+    Symlink {
+        volume: String,
+        path: String,
+        target: String,
+    },
 }
 
 /// What a [`Request`] answered, one variant per reply type.
@@ -281,6 +286,11 @@ fn execute(link: &PeerLink, request: Request) -> Option<Answer> {
         Request::MkDir { volume, path } => Answer::Unit(link.mkdir(&volume, &path)),
         Request::Remove { volume, path } => Answer::Unit(link.remove(&volume, &path)),
         Request::Rename { volume, from, to } => Answer::Unit(link.rename(&volume, &from, &to)),
+        Request::Symlink {
+            volume,
+            path,
+            target,
+        } => Answer::Unit(link.symlink(&volume, &path, &target)),
     })
 }
 
@@ -422,6 +432,19 @@ fn split(op: Op) -> (Request, Option<Waiting>) {
             reply,
         } => (
             Request::Rename { volume, from, to },
+            Some(Waiting::Unit(reply)),
+        ),
+        Op::Symlink {
+            volume,
+            path,
+            target,
+            reply,
+        } => (
+            Request::Symlink {
+                volume,
+                path,
+                target,
+            },
             Some(Waiting::Unit(reply)),
         ),
     }

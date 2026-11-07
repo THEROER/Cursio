@@ -339,6 +339,20 @@ impl FilesEngine {
                         to,
                     },
                 ),
+                Op::Symlink {
+                    volume,
+                    path,
+                    target,
+                    reply,
+                } => (
+                    Pending::Unit(reply),
+                    FilesMsg::Symlink {
+                        req,
+                        volume,
+                        path,
+                        target,
+                    },
+                ),
                 // Nothing to wait for, so nothing to track — but it must not
                 // overtake this handle's writes.
                 //

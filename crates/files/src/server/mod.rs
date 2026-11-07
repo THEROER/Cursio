@@ -247,6 +247,10 @@ impl FileServer {
     pub fn rename(&self, volume: &str, from: &str, to: &str) -> Result<(), FileError> {
         self.ns.rename(volume, from, to)
     }
+
+    pub fn symlink(&self, volume: &str, path: &str, target: &str) -> Result<(), FileError> {
+        self.ns.symlink(volume, path, target)
+    }
 }
 
 impl Namespace {
@@ -382,10 +386,13 @@ impl Namespace {
     /// as written and the mount side interprets it against the mounted tree,
     /// where a link leading out of the volume simply dangles.
     ///
-    /// Windows targets keep their backslashes. Rewriting them would be a guess
-    /// about a path this side never resolves, and a dangling link that reads
-    /// back what the owner stored is easier to explain than one silently
-    /// rewritten into a different dangling path.
+    /// A relative Windows target is spelled with `/`, the wire's separator:
+    /// `\` cannot occur inside a Windows name, so the rewrite is exact, and
+    /// without it a link [`Namespace::symlink`] created would read back as a
+    /// single name that dangles. An absolute one keeps its backslashes —
+    /// it names a place on this disk the mount side cannot reach either way,
+    /// and reads back as stored rather than rewritten into a different
+    /// dangling path.
     pub fn read_link(&self, volume: &str, path: &str) -> Result<String, FileError> {
         let target = self.resolve(volume, path)?;
         // `symlink_metadata` first: `read_link` on a regular file reports
@@ -397,11 +404,7 @@ impl Namespace {
             return Err(FileError::WrongKind);
         }
         let dest = std::fs::read_link(&target).map_err(to_file_error)?;
-        dest.to_str()
-            .map(str::to_owned)
-            // Wire paths are UTF-8. A target that is not says so plainly rather
-            // than arriving mangled by a lossy conversion.
-            .ok_or(FileError::Io("link target is not valid utf-8".into()))
+        wire_link_target(&dest)
     }
 
     /// Open a file, returning it and its current size. It has no handle until
@@ -529,8 +532,32 @@ impl Namespace {
         if md.is_dir() {
             std::fs::remove_dir(&target).map_err(to_file_error)
         } else {
-            std::fs::remove_file(&target).map_err(to_file_error)
+            remove_non_dir(&target, &md).map_err(to_file_error)
         }
+    }
+
+    /// Create a symlink at `path` pointing at `target`.
+    ///
+    /// The target is checked lexically against the link's own depth: it may
+    /// not be absolute and may not climb above the volume root. This keeps a
+    /// copied tree's links meaning what they meant in the tree, rather than
+    /// letting one name a place on this disk the copy never came from. It is
+    /// not the security boundary — a component of the target may itself be a
+    /// link — which stays [`Namespace::resolve_through`], checked whenever
+    /// anything goes through the link.
+    pub fn symlink(&self, volume: &str, path: &str, target: &str) -> Result<(), FileError> {
+        if !self.writable(volume) {
+            return Err(FileError::ReadOnly);
+        }
+        let at = self.resolve(volume, path)?;
+        // `resolve` refused every `..`, so the remaining names are exactly the
+        // directories between the root and the link, plus the link itself.
+        let depth = path
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != ".")
+            .count();
+        let native = native_link_target(target, depth.saturating_sub(1))?;
+        create_symlink(&at, &native).map_err(symlink_error)
     }
 
     /// Rename within one volume. Cross-volume moves are the caller's problem to
@@ -569,6 +596,127 @@ fn stays_under(root: &Path, path: &Path) -> bool {
             },
         }
     }
+}
+
+/// A link's stored target in the wire's spelling — see [`Namespace::read_link`].
+fn wire_link_target(dest: &Path) -> Result<String, FileError> {
+    // Wire paths are UTF-8. A target that is not says so plainly rather than
+    // arriving mangled by a lossy conversion.
+    let not_utf8 = || FileError::Io("link target is not valid utf-8".into());
+    let as_stored = || dest.to_str().map(str::to_owned).ok_or_else(not_utf8);
+    if !cfg!(windows) {
+        return as_stored();
+    }
+    let mut parts = Vec::new();
+    for part in dest.components() {
+        match part {
+            Component::Normal(name) => parts.push(name.to_str().ok_or_else(not_utf8)?),
+            Component::ParentDir => parts.push(".."),
+            Component::CurDir => parts.push("."),
+            Component::Prefix(_) | Component::RootDir => return as_stored(),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+/// A wire link target in this OS's spelling, for a link `parent_depth`
+/// directories below the volume root — refused when it is absolute or climbs
+/// above that root. See [`Namespace::symlink`].
+fn native_link_target(target: &str, parent_depth: usize) -> Result<PathBuf, FileError> {
+    // What `symlink(2)` answers for an empty target.
+    if target.is_empty() {
+        return Err(FileError::NotFound);
+    }
+    if target.starts_with('/') {
+        return Err(FileError::Denied);
+    }
+    let mut level = parent_depth;
+    let mut out = PathBuf::new();
+    for part in target.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => {
+                level = level.checked_sub(1).ok_or(FileError::Denied)?;
+                out.push("..");
+            }
+            // One plain name, as in `Namespace::resolve`: on Windows `C:` or
+            // a backslash inside a component would re-root or split it.
+            _ => {
+                let mut comps = Path::new(part).components();
+                match (comps.next(), comps.next()) {
+                    (Some(Component::Normal(name)), None) => {
+                        level += 1;
+                        out.push(name);
+                    }
+                    _ => return Err(FileError::Denied),
+                }
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn create_symlink(at: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, at)
+}
+
+/// Windows records whether a link names a directory or a file, and a link of
+/// the wrong kind cannot be traversed. The kind is taken from what the target
+/// is now; one that does not exist yet becomes a file link.
+#[cfg(windows)]
+fn create_symlink(at: &Path, target: &Path) -> std::io::Result<()> {
+    let names_dir = at.parent().is_some_and(|dir| dir.join(target).is_dir());
+    if names_dir {
+        std::os::windows::fs::symlink_dir(target, at)
+    } else {
+        std::os::windows::fs::symlink_file(target, at)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink(_at: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks are not supported on this platform",
+    ))
+}
+
+fn symlink_error(e: std::io::Error) -> FileError {
+    // ERROR_PRIVILEGE_NOT_HELD: Windows lets a process create a symlink only
+    // when it is elevated or Developer Mode is on. The peer sees a refusal;
+    // the reason belongs in this machine's log, where it can be acted on.
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(1314) {
+        tracing::warn!(
+            "a peer's symlink was refused: creating one here needs Windows Developer Mode \
+             (Settings > System > For developers) or cursio running elevated"
+        );
+        return FileError::Denied;
+    }
+    to_file_error(e)
+}
+
+/// Remove anything that is not a directory, including a link to one.
+///
+/// Windows keeps a directory link as a directory entry: `DeleteFile` refuses it
+/// and only `RemoveDirectory` takes it away, so every directory link
+/// [`Namespace::symlink`] made would otherwise be impossible to delete.
+#[cfg(windows)]
+fn remove_non_dir(path: &Path, md: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+    if md.file_type().is_symlink_dir() {
+        return std::fs::remove_dir(path);
+    }
+    std::fs::remove_file(path)
+}
+
+#[cfg(not(windows))]
+fn remove_non_dir(path: &Path, _md: &std::fs::Metadata) -> std::io::Result<()> {
+    std::fs::remove_file(path)
 }
 
 /// An open file taken out of the server, so its I/O needs no lock.
@@ -1356,6 +1504,106 @@ mod tests {
         assert!(matches!(srv.remove(&id, "a.txt"), Err(FileError::ReadOnly)));
         assert!(matches!(
             srv.rename(&id, "a.txt", "b.txt"),
+            Err(FileError::ReadOnly)
+        ));
+    }
+
+    /// A copied tree's relative link is made on the owner's disk and reads
+    /// back exactly as it was written — `cp -r` of `node_modules/.bin`.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_link_is_created_and_reads_back_as_written() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("pkg/bin")).expect("mkdir");
+        std::fs::write(tmp.path().join("pkg/tool.js"), b"x").expect("write");
+        let srv = server_on(tmp.path());
+
+        srv.symlink("T:", "pkg/bin/tool", "../tool.js")
+            .expect("creates");
+
+        let md = tmp
+            .path()
+            .join("pkg/bin/tool")
+            .symlink_metadata()
+            .expect("exists");
+        assert!(md.file_type().is_symlink());
+        assert_eq!(
+            srv.read_link("T:", "pkg/bin/tool").expect("reads"),
+            "../tool.js"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("pkg/bin/tool")).expect("follows"),
+            b"x"
+        );
+        srv.remove("T:", "pkg/bin/tool").expect("removes the link");
+        assert!(tmp.path().join("pkg/tool.js").exists(), "not its target");
+    }
+
+    /// A link whose target is absolute or climbs above the volume root would
+    /// point into the owner's disk rather than the tree it was copied with.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_leading_out_of_the_volume_is_not_created() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("dir")).expect("mkdir");
+        let srv = server_on(tmp.path());
+
+        for target in ["/etc/passwd", "../../outside", "a/../../../outside"] {
+            assert!(
+                matches!(
+                    srv.symlink("T:", "dir/link", target),
+                    Err(FileError::Denied)
+                ),
+                "{target} must be refused"
+            );
+            assert!(tmp.path().join("dir/link").symlink_metadata().is_err());
+        }
+        srv.symlink("T:", "dir/link", "../dir/./sub/..")
+            .expect("stays inside");
+    }
+
+    /// The depth check counts from where the link sits, so `..` is allowed
+    /// exactly as many times as there are directories above it.
+    #[test]
+    fn a_link_target_may_climb_only_as_far_as_the_volume_root() {
+        assert!(native_link_target("..", 1).is_ok());
+        assert!(matches!(
+            native_link_target("..", 0),
+            Err(FileError::Denied)
+        ));
+        assert!(native_link_target("a/../..", 1).is_ok());
+        assert!(matches!(
+            native_link_target("a/../../..", 1),
+            Err(FileError::Denied)
+        ));
+        assert!(matches!(
+            native_link_target("", 3),
+            Err(FileError::NotFound)
+        ));
+        assert_eq!(
+            native_link_target(".", 0).expect("here"),
+            PathBuf::from(".")
+        );
+    }
+
+    /// A read-only volume refuses a link like any other change.
+    #[test]
+    fn a_read_only_volume_refuses_a_link() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let srv = FileServer::new(vec![SharedVolume {
+            info: Volume {
+                id: "R:".to_string(),
+                label: "Read-only".to_string(),
+                writable: false,
+                total_bytes: FALLBACK_TOTAL,
+                free_bytes: FALLBACK_FREE,
+                removable: false,
+            },
+            root: tmp.path().to_path_buf(),
+            confined: false,
+        }]);
+        assert!(matches!(
+            srv.symlink("R:", "link", "target"),
             Err(FileError::ReadOnly)
         ));
     }
