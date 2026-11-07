@@ -138,6 +138,8 @@ rpassword = "7"
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
 gio.workspace = true
+# The node's notification-area icon, over that same zbus; see node_tray.rs.
+ksni.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Self-elevation at startup: without admin rights, Windows' UIPI silently drops

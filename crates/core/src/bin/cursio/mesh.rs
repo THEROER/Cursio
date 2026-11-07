@@ -451,6 +451,8 @@ pub(crate) fn start_control(state: cursio_core::control::NodeState) {
             tracing::warn!(%error, "control socket stopped; the app and `cursio status` cannot reach this node");
         }
     });
+    #[cfg(target_os = "linux")]
+    cursio_core::node_tray::start();
 }
 
 /// Call paired computers over Bluetooth when the network stops reaching them,

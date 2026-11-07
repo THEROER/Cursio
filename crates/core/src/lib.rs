@@ -123,6 +123,8 @@ pub mod mount_helper;
 /// The system telling the sessions their network went away.
 pub mod network_watch;
 pub mod node_status;
+#[cfg(target_os = "linux")]
+pub mod node_tray;
 /// A phone's notifications shown through this desktop's notification server.
 /// Not showing a phone's copy of what a desktop client already showed.
 pub mod notify_dedup;

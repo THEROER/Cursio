@@ -202,7 +202,16 @@ pub fn run() {
             }
             // `reg.exe` / `systemctl`: off the thread that draws the window.
             tauri::async_runtime::spawn_blocking(autostart::refresh);
-            if let Err(e) = tray::install(app.handle()) {
+            // On Linux the node draws the icon itself (`node_tray`): an
+            // appindicator here is GTK 3, which an app drawing with Chromium
+            // cannot load, and a second icon beside the node's would be one
+            // too many. Its menu starts this app, which a running copy takes
+            // over its single-instance hand-off.
+            if cfg!(target_os = "linux") {
+                if !hidden {
+                    tray::open(app.handle(), "/");
+                }
+            } else if let Err(e) = tray::install(app.handle()) {
                 // No tray (GNOME without the AppIndicator extension) must not
                 // leave an app nobody can reach: show the window instead.
                 tracing::warn!(
