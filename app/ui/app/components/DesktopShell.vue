@@ -40,10 +40,10 @@ const items = computed<SidebarItem[]>(() => [
 
 const nodeState = computed(() =>
   status.value
-    ? { tone: "success" as const, dot: "bg-action", label: t("node.running") }
+    ? { state: "online" as const, label: t("node.running") }
     : notRunning.value
-      ? { tone: "danger" as const, dot: "bg-danger", label: t("node.stopped") }
-      : { tone: "neutral" as const, dot: "bg-muted", label: t("node.connecting") },
+      ? { state: "down" as const, label: t("node.stopped") }
+      : { state: "starting" as const, label: t("node.connecting") },
 )
 
 const title = computed(() => {
@@ -81,12 +81,12 @@ const title = computed(() => {
 
     <template #sidebar-footer="{ compact }">
       <LpTooltip v-if="compact" :content="nodeState.label" side="right">
-        <span class="grid size-10 place-items-center" role="status" :aria-label="nodeState.label">
-          <span class="size-2.5 rounded-full" :class="nodeState.dot" />
+        <span class="grid size-10 place-items-center">
+          <LpStatus :state="nodeState.state" :label="nodeState.label" hide-label announce />
         </span>
       </LpTooltip>
       <div v-else class="flex flex-col gap-2 px-1">
-        <LpBadge :tone="nodeState.tone" dot>{{ nodeState.label }}</LpBadge>
+        <LpStatus :state="nodeState.state" :label="nodeState.label" variant="pill" announce />
       </div>
     </template>
 
