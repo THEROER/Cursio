@@ -31,7 +31,10 @@ const SWITCHES: [(ModuleSwitch, &str); 6] = [
     (ModuleSwitch::Audio, "Share audio"),
     (ModuleSwitch::Files, "Share disks"),
     (ModuleSwitch::Usb, "Share USB devices"),
-    (ModuleSwitch::RemoteScreen, "Peers' screens for screen sharing"),
+    (
+        ModuleSwitch::RemoteScreen,
+        "Peers' screens for screen sharing",
+    ),
 ];
 
 /// Longest a problem's text runs in the menu, in characters. A menu item is
@@ -225,7 +228,10 @@ pub fn start() {
                 tokio::time::sleep(RECONNECT).await;
                 continue;
             };
-            if !matches!(client.request(Command::Subscribe).await, Ok(Reply::Subscribed)) {
+            if !matches!(
+                client.request(Command::Subscribe).await,
+                Ok(Reply::Subscribed)
+            ) {
                 tokio::time::sleep(RECONNECT).await;
                 continue;
             }

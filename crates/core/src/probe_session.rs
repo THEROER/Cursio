@@ -554,9 +554,16 @@ mod tests {
         }
         let (peer, result) = test.await.unwrap().unwrap();
         assert_eq!(peer, "Probed");
-        assert!(fills > WINDOW && pushes > WINDOW, "{fills} fills, {pushes} pushes, {result:?}");
+        assert!(
+            fills > WINDOW && pushes > WINDOW,
+            "{fills} fills, {pushes} pushes, {result:?}"
+        );
         assert!(result.download.bytes_per_sec > 0 && result.upload.bytes_per_sec > 0);
-        assert!(result.idle.sent >= 10 && result.idle.lost <= 1, "{:?}", result.idle);
+        assert!(
+            result.idle.sent >= 10 && result.idle.lost <= 1,
+            "{:?}",
+            result.idle
+        );
         assert!(result.download.loaded.sent > 0 && result.upload.loaded.sent > 0);
         assert!(!result.automatic);
     }
