@@ -10,6 +10,14 @@
 //! congested, holding bulk near its floor for the rest of the session. The
 //! baseline is the lowest of the last [`BASE_WINDOW`], kept as per-bucket
 //! minima the way LEDBAT keeps its base delay.
+//!
+//! Nor is one reading the queue. A Wi-Fi link's quiet round trip spikes by
+//! tens of milliseconds on its own — measured to one Windows laptop: 7 to
+//! 35 ms with nothing else crossing — and every spike cut bulk by 30%, so a
+//! file crossed that link at a third of what TCP alone carried while the
+//! pointer gained nothing. A queue bulk built persists and a spike does not,
+//! so the queue is read from the lowest of the last [`CURRENT_SAMPLES`]
+//! readings, as LEDBAT filters its current delay.
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -27,12 +35,17 @@ const QUEUE_TARGET: Duration = Duration::from_millis(15);
 const BASE_WINDOW: Duration = Duration::from_secs(180);
 /// One bucket of [`BASE_WINDOW`]: its lowest round trip is all that is kept.
 const BASE_BUCKET: Duration = Duration::from_secs(10);
+/// Readings the queue is judged from: at a probe every 200 ms under load, a
+/// queue standing for 600 ms is believed, a one-reading spike is not.
+const CURRENT_SAMPLES: usize = 3;
 
 pub(crate) struct BackgroundRate {
     rate: f64,
     /// Lowest round trip of each recent bucket, oldest first, with when the
     /// bucket began.
     minima: VecDeque<(Instant, Duration)>,
+    /// The latest readings, newest last.
+    current: VecDeque<Duration>,
     updated: Option<Instant>,
 }
 
@@ -41,6 +54,7 @@ impl Default for BackgroundRate {
         Self {
             rate: INITIAL_RATE,
             minima: VecDeque::new(),
+            current: VecDeque::new(),
             updated: None,
         }
     }
@@ -53,6 +67,10 @@ impl BackgroundRate {
 
     pub(crate) fn observe(&mut self, rtt: Duration, now: Instant, active: bool) {
         let baseline = self.baseline(rtt, now);
+        if self.current.len() == CURRENT_SAMPLES {
+            self.current.pop_front();
+        }
+        self.current.push_back(rtt);
         if !active {
             self.rate = self.rate.min(INITIAL_RATE);
             self.updated = None;
@@ -65,7 +83,8 @@ impl BackgroundRate {
             return;
         }
         self.updated = Some(now);
-        if rtt.saturating_sub(baseline) > QUEUE_TARGET {
+        let standing = self.current.iter().min().copied().unwrap_or(rtt);
+        if standing.saturating_sub(baseline) > QUEUE_TARGET {
             self.rate = (self.rate * 0.7).max(MIN_RATE);
         } else {
             self.rate = (self.rate * 1.1 + 16_384.0).min(MAX_RATE);
@@ -98,13 +117,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn background_yields_to_queue_growth_and_recovers_gradually() {
+    fn background_yields_to_a_standing_queue_and_recovers_gradually() {
         let mut controller = BackgroundRate::default();
         let mut now = Instant::now();
         controller.observe(Duration::from_millis(10), now, true);
         let clear = controller.bytes_per_second();
-        now += UPDATE_INTERVAL;
-        controller.observe(Duration::from_millis(60), now, true);
+        for _ in 0..CURRENT_SAMPLES {
+            now += UPDATE_INTERVAL;
+            controller.observe(Duration::from_millis(60), now, true);
+        }
         let congested = controller.bytes_per_second();
         assert!(congested < clear);
         // Repeated readings within one interval must not compound the cut.
@@ -113,7 +134,17 @@ mod tests {
         now += UPDATE_INTERVAL;
         controller.observe(Duration::from_millis(10), now, true);
         assert!(controller.bytes_per_second() > congested);
-        assert!(controller.bytes_per_second() < clear);
+    }
+
+    #[test]
+    fn a_lone_spike_of_a_wifi_link_is_not_taken_for_queue() {
+        let mut controller = BackgroundRate::default();
+        let mut now = Instant::now();
+        controller.observe(Duration::from_millis(7), now, true);
+        let before = controller.bytes_per_second();
+        now += UPDATE_INTERVAL;
+        controller.observe(Duration::from_millis(35), now, true);
+        assert!(controller.bytes_per_second() > before);
     }
 
     #[test]
@@ -123,8 +154,10 @@ mod tests {
         controller.observe(Duration::from_millis(2), now, true);
         // The quiet round trip is 30 ms from here on: a roam, another
         // channel. Within the window it reads as queue and is cut ...
-        now += UPDATE_INTERVAL;
-        controller.observe(Duration::from_millis(30), now, true);
+        for _ in 0..CURRENT_SAMPLES {
+            now += UPDATE_INTERVAL;
+            controller.observe(Duration::from_millis(30), now, true);
+        }
         let cut = controller.bytes_per_second();
         assert!(cut < INITIAL_RATE);
         // ... and once the 2 ms reading has aged out it is the baseline, so

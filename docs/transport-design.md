@@ -114,7 +114,9 @@ second when idle and every 200 ms while bulk traffic is active. The controller
 tracks the minimum RTT observed on the current control path over the last
 three minutes, kept as 10-second bucket minima — not over the whole session,
 which pinned bulk near its floor once a Wi-Fi link's quiet RTT rose after a
-roam and every reading looked like queue. Queueing above
+roam and every reading looked like queue. The queue is the lowest of the last
+three readings above that baseline: a Wi-Fi link's quiet RTT spikes by tens of
+milliseconds on its own, and each lone spike used to cut bulk by 30%. Queueing above
 that baseline by more than 15 ms reduces the bulk rate by 30%; a clear path
 raises it by 10% plus 16 KiB/s, at most once per 200 ms. An overdue probe is also
 a congestion signal. Idle observations update the baseline without raising the
