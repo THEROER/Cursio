@@ -84,6 +84,15 @@ impl Filesystem for RemoteFs {
             InitFlags::FUSE_READDIRPLUS_AUTO,
             "adaptive readdirplus",
         );
+        // A file's cached pages are dropped when its size or modification time
+        // changes as seen by a later `getattr` or `lookup`, rather than on
+        // every open. This is what lets `open` keep the cache (see `open`)
+        // without serving a file the owner has since changed.
+        request(
+            config,
+            InitFlags::FUSE_AUTO_INVAL_DATA,
+            "invalidate cached data on change",
+        );
         // `FUSE_ASYNC_READ` and `FUSE_BIG_WRITES` are not named here: the
         // crate requests both for every filesystem it mounts.
         Ok(())
@@ -593,9 +602,16 @@ impl Filesystem for RemoteFs {
                 let fh = state.next_handle;
                 state.next_handle += 1;
                 state.handles.insert(fh, remote);
-                // No FopenFlags: the kernel may cache this file's pages, which
-                // is what makes sequential reads fast over a slow link.
-                reply.opened(fuser::FileHandle(fh), fuser::FopenFlags::empty());
+                // Keep the pages already cached. Without it the kernel drops a
+                // file's cache on every open, so reading a tree a second time —
+                // a warm `git diff --stat` over 160 files — fetched every byte
+                // again, 0.12 s a file. A change made on the owner still
+                // reaches here: `FUSE_AUTO_INVAL_DATA` drops the pages when the
+                // refreshed attributes show a new size or modification time.
+                // The wire carries that time in whole seconds, so a rewrite
+                // keeping the size within the same second can read stale until
+                // the next change.
+                reply.opened(fuser::FileHandle(fh), fuser::FopenFlags::FOPEN_KEEP_CACHE);
             }
             Err(e) => reply.error(to_errno(&e)),
         }
