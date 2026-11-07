@@ -179,11 +179,30 @@ function serviceLabel(state: ServiceState) {
   return t("settings.callsStarting")
 }
 
-function serviceTone(state: ServiceState) {
-  if (state.state === "running") return "success"
-  if (state.state === "failed") return "danger"
-  return "neutral"
+function serviceStatus(state: ServiceState) {
+  if (state.state === "running") return "online"
+  if (state.state === "failed") return "down"
+  return "starting"
 }
+
+const nodeFacts = computed(() =>
+  status.value
+    ? [
+        { key: "build", label: t("settings.build"), value: status.value.node.build, mono: true, copyable: true },
+        ...(isMobile.value
+          ? []
+          : [
+              {
+                key: "installed",
+                label: t("settings.installedVersion"),
+                value: status.value.node.installed_version ?? t("settings.notInstalled"),
+                mono: true,
+              },
+              { key: "pid", label: t("settings.pid"), value: status.value.node.pid || null, mono: true },
+            ]),
+      ]
+    : [],
+)
 
 async function loadCalls() {
   try {
@@ -367,8 +386,14 @@ async function restartNode() {
                 :disabled="nameBusy"
                 class="min-w-0 flex-1 basis-56"
               />
-              <LpButton type="submit" variant="solid" :disabled="!nameChanged || !!nameError || nameBusy">
-                {{ nameBusy ? t("common.working") : t("settings.rename") }}
+              <LpButton
+                type="submit"
+                variant="solid"
+                :loading="nameBusy"
+                :loading-label="t('common.working')"
+                :disabled="!nameChanged || !!nameError"
+              >
+                {{ t("settings.rename") }}
               </LpButton>
             </form>
             <p v-if="isMobile" class="text-xs text-muted">{{ t("settings.namePhoneHint") }}</p>
@@ -452,7 +477,7 @@ async function restartNode() {
               >
                 <div class="flex items-center gap-4">
                   <p class="min-w-0 flex-1 text-sm font-medium">{{ row.label }}</p>
-                  <LpBadge :tone="serviceTone(row.state)" dot size="sm">{{ serviceLabel(row.state) }}</LpBadge>
+                  <LpStatus :state="serviceStatus(row.state)" :label="serviceLabel(row.state)" variant="pill" size="sm" />
                 </div>
                 <p v-if="row.state.state === 'failed'" class="text-xs text-muted">{{ row.state.reason }}</p>
               </li>
@@ -463,7 +488,13 @@ async function restartNode() {
                   <LpIcon name="lucide:smartphone" :size="16" class="shrink-0 text-muted" />
                   <span class="min-w-0 flex-1 truncate text-sm">{{ phone.name }}</span>
                   <span class="font-mono text-xs text-muted">{{ phone.address }}</span>
-                  <LpBadge v-if="phone.connected" tone="success" dot size="sm">{{ t("settings.callsConnected") }}</LpBadge>
+                  <LpStatus
+                    v-if="phone.connected"
+                    state="online"
+                    :label="t('settings.callsConnected')"
+                    variant="pill"
+                    size="sm"
+                  />
                 </div>
                 <p v-if="unpairedPhones.length" class="text-xs text-muted">
                   {{ t("settings.callsUnpaired", { phones: unpairedPhones.join(", ") }) }}
@@ -627,16 +658,7 @@ async function restartNode() {
               <p v-if="status.pinned.length" class="text-xs text-muted">
                 {{ t("settings.pinned", { fields: status.pinned.join(", ") }) }}
               </p>
-              <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                <dt class="text-muted">{{ t("settings.build") }}</dt>
-                <dd class="font-mono">{{ status.node.build || "—" }}</dd>
-                <template v-if="!isMobile">
-                  <dt class="text-muted">{{ t("settings.installedVersion") }}</dt>
-                  <dd class="font-mono">{{ status.node.installed_version ?? t("settings.notInstalled") }}</dd>
-                  <dt class="text-muted">{{ t("settings.pid") }}</dt>
-                  <dd class="font-mono">{{ status.node.pid || "—" }}</dd>
-                </template>
-              </dl>
+              <LpDataList :items="nodeFacts" layout="horizontal" size="sm" :labels="{ empty: '—' }" />
             </template>
             <div v-if="!isMobile">
               <LpButton variant="soft" size="sm" :disabled="!status" @click="confirmRestart = true">

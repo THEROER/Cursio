@@ -87,8 +87,29 @@ const MODULE_META = Object.fromEntries(MODULES.map((m) => [m.key, m]))
 
 const peerRef = peerRefOf
 
-function presenceTone(p: PeerView) {
-  return p.presence === "online" ? "success" : p.presence === "connecting" ? "brand" : "neutral"
+const PRESENCE_STATE = { online: "online", connecting: "starting", offline: "offline" } as const
+
+// Facts with nothing to say are left empty: the list shows its own
+// placeholder for them, worded as "cannot say" rather than as nothing.
+const factLabels = computed(() => ({ empty: t("peer.cannotSay") }))
+
+const phoneFacts = computed(() =>
+  status.value
+    ? [
+        { key: "battery", label: t("peer.battery"), value: battery(status.value.node.status) },
+        { key: "network", label: t("peer.network"), value: network(status.value.node.status) },
+        { key: "peers", label: t("stats.peers"), value: `${online.value} / ${status.value.peers.length}` },
+      ]
+    : [],
+)
+
+function peerFacts(link: NonNullable<PeerView["link"]>) {
+  return [
+    ...(takesCursor(link.device_kind) ? [{ key: "position", label: t("peer.position"), value: place(link.position) }] : []),
+    { key: "kind", label: t("peer.kind"), value: t(`kind.${link.device_kind}`) },
+    { key: "battery", label: t("peer.battery"), value: battery(link.status) },
+    { key: "network", label: t("peer.network"), value: network(link.status) },
+  ]
 }
 </script>
 
@@ -112,14 +133,7 @@ function presenceTone(p: PeerView) {
           <p class="min-w-0 flex-1 truncate font-medium">{{ status.node.name }}</p>
           <LpBadge tone="brand" size="sm">{{ t("phone.thisPhone") }}</LpBadge>
         </div>
-        <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-          <dt class="text-muted">{{ t("peer.battery") }}</dt>
-          <dd>{{ battery(status.node.status) ?? t("peer.cannotSay") }}</dd>
-          <dt class="text-muted">{{ t("peer.network") }}</dt>
-          <dd>{{ network(status.node.status) ?? t("peer.cannotSay") }}</dd>
-          <dt class="text-muted">{{ t("stats.peers") }}</dt>
-          <dd>{{ online }} / {{ status.peers.length }}</dd>
-        </dl>
+        <LpDataList :items="phoneFacts" layout="horizontal" size="sm" :labels="factLabels" />
       </LpCard>
 
       <div v-else class="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -222,7 +236,12 @@ function presenceTone(p: PeerView) {
                   class="shrink-0 text-muted"
                 />
                 <p class="min-w-0 flex-1 truncate font-medium">{{ peer.name }}</p>
-                <LpBadge :tone="presenceTone(peer)" dot size="sm">{{ t(`presence.${peer.presence}`) }}</LpBadge>
+                <LpStatus
+                  :state="PRESENCE_STATE[peer.presence]"
+                  :label="t(`presence.${peer.presence}`)"
+                  variant="pill"
+                  size="sm"
+                />
                 <LpTooltip v-if="peer.link?.path === 'bluetooth'" :content="t('peer.overBluetoothHint')">
                   <LpBadge size="sm" tone="outline">{{ overBluetooth(peer) }}</LpBadge>
                 </LpTooltip>
@@ -235,18 +254,7 @@ function presenceTone(p: PeerView) {
                 :end-label="t('peer.uptimeEnd')"
               />
               <template v-if="peer.link">
-                <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                  <template v-if="takesCursor(peer.link.device_kind)">
-                    <dt class="text-muted">{{ t("peer.position") }}</dt>
-                    <dd>{{ place(peer.link.position) }}</dd>
-                  </template>
-                  <dt class="text-muted">{{ t("peer.kind") }}</dt>
-                  <dd>{{ t(`kind.${peer.link.device_kind}`) }}</dd>
-                  <dt class="text-muted">{{ t("peer.battery") }}</dt>
-                  <dd>{{ battery(peer.link.status) ?? t("peer.cannotSay") }}</dd>
-                  <dt class="text-muted">{{ t("peer.network") }}</dt>
-                  <dd>{{ network(peer.link.status) ?? t("peer.cannotSay") }}</dd>
-                </dl>
+                <LpDataList :items="peerFacts(peer.link)" layout="horizontal" size="sm" :labels="factLabels" />
                 <div class="flex flex-wrap gap-1">
                   <LpBadge v-for="m in peer.link.modules" :key="m" size="sm" tone="brand">
                     <LpIcon v-if="MODULE_META[m]" :name="MODULE_META[m]!.icon" :size="12" />
