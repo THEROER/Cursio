@@ -206,6 +206,8 @@ pub struct Agent {
     /// phone's app installed by hand holds no statement of itself.
     built_at: Option<u64>,
     subject: Subject,
+    /// The store's builds and when they were read; see [`Agent::held_builds`].
+    held: Mutex<Option<(std::time::Instant, Vec<super::store::Held>)>>,
 }
 
 #[derive(Default)]
@@ -247,6 +249,7 @@ impl Agent {
             switcher: None,
             built_at: None,
             subject: Subject::cursio(),
+            held: Mutex::new(None),
         }
     }
 
@@ -370,6 +373,31 @@ impl Agent {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// The builds the store holds, as last read.
+    ///
+    /// Reading the store is a directory walk with a file read and a parse per
+    /// build, and every link's update module asks for it every
+    /// [`REOFFER`](super::lane::REOFFER). Done in each module's pump that cost
+    /// 50–250 ms a time on a Windows machine, once 14 s, three links at once.
+    /// So the node's watcher thread reads it ([`Self::look_at_store`]) and the
+    /// links take the answer; a listing older than `REOFFER` — no watcher,
+    /// as on a phone — is read where it is asked for, as before.
+    pub fn held_builds(&self) -> Vec<super::store::Held> {
+        let cached = self.held.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        match cached {
+            Some((at, held)) if at.elapsed() < super::lane::REOFFER => held,
+            _ => self.look_at_store(),
+        }
+    }
+
+    /// Read the store now, for [`Self::held_builds`] to answer from.
+    pub fn look_at_store(&self) -> Vec<super::store::Held> {
+        let held = self.store.held();
+        *self.held.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((std::time::Instant::now(), held.clone()));
+        held
     }
 
     pub fn layout(&self) -> &InstallLayout {
@@ -782,6 +810,9 @@ pub fn watch(agent: Arc<Agent>) {
         .name("update-switch".into())
         .spawn(move || loop {
             std::thread::sleep(EVERY);
+            // Every link's module offers from this; reading it here keeps the
+            // walk off their pumps (see `Agent::held_builds`).
+            agent.look_at_store();
             if let Some(what) = agent.tick() {
                 tracing::info!(%what, "update");
             }

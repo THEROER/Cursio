@@ -82,7 +82,7 @@ impl Lane {
     pub fn offers(&mut self) -> Vec<UpdateMsg> {
         self.last_look = Some(Instant::now());
         let mut out = Vec::new();
-        for held in self.agent.store().held() {
+        for held in self.agent.held_builds() {
             let key = (held.statement.version.clone(), held.offer.have.clone());
             if !self.offered.contains(&key) {
                 self.offered.push(key);
@@ -305,6 +305,10 @@ impl Lane {
             .and_then(|dir| self.agent.layout().install(&dir));
         match installed {
             Ok(_) => {
+                // A build this machine now holds is one to hand on; the other
+                // links offer it at their next look rather than up to a
+                // watcher's period later.
+                self.agent.look_at_store();
                 self.agent.installed(&statement, &self.peer);
                 vec![UpdateMsg::Done(Done {
                     version: statement.version,
@@ -587,6 +591,28 @@ mod tests {
             to_b = next_b;
         }
         panic!("the lanes never went quiet");
+    }
+
+    /// A link offers from the store as the watcher last read it, without
+    /// walking the store itself; the walk is off every module's pump.
+    #[test]
+    fn a_link_offers_from_the_last_look_at_the_store() {
+        let root = scratch("cached");
+        let key = BuilderKey::from_seed([9; 32]);
+        let holder = publisher(&root, &key, 64);
+        assert_eq!(holder.look_at_store().len(), 1);
+
+        std::fs::remove_dir_all(root.join("install")).unwrap();
+        let mut lane = Lane::new(Arc::clone(&holder), "peer");
+        assert_eq!(
+            lane.offers().len(),
+            1,
+            "answered from the look, not the disk"
+        );
+        assert!(
+            holder.look_at_store().is_empty(),
+            "a fresh look sees the store as it is"
+        );
     }
 
     #[test]
