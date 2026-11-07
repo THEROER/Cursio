@@ -19,7 +19,7 @@
 //! per-`exec` and per-`close` ones were.
 
 use crate::mount::attr::{attr_from, dir_attr, root_attr, to_errno, CACHE_TTL};
-use crate::mount::fs::{note_headed, Head, GENERATION, HEAD_BYTES, MAX_HEADS};
+use crate::mount::fs::{Unopened, GENERATION};
 use crate::mount::inode::{join, Entry};
 use crate::mount::RemoteFs;
 use crate::server::{FALLBACK_FREE, FALLBACK_TOTAL};
@@ -596,43 +596,40 @@ impl Filesystem for RemoteFs {
 
         let mode = open_mode_from(flags);
 
-        // A file opened to read comes with its start, so its first read — for
-        // a small file, its only one — costs no second round trip. One opened
-        // to write does not: its contents are about to change. Nor does one
-        // whose start the kernel already holds; see `State::headed`.
-        let known = self
-            .meta
-            .get(&volume, &path)
-            .and_then(Result::ok)
-            .map(|meta| (meta.size, meta.modified_unix));
-        let cached = self.start_cached(ino.0, known);
-        let opened = if mode.is_mutating() || cached {
-            self.peer
-                .open(&volume, &path, mode)
-                .map(|(remote, _)| (remote, None))
+        // A file opened to read is answered here and opened on the owner only
+        // at the first read the kernel cannot serve from its own cache — with
+        // its head, so that read is the open's one round trip. A file the
+        // kernel holds is then never asked about at all: a warm `git diff
+        // --stat` cost exactly what opening and closing its 160 files did,
+        // 70 ms each, without a byte read. The price is that a file the owner
+        // will not open — locked by a program there, refused by its ACL —
+        // fails at its first read rather than at the open; its existence was
+        // already settled by the `lookup` before.
+        let opened = if mode.is_mutating() {
+            self.peer.open(&volume, &path, mode).map(Some)
         } else {
-            self.peer
-                .open_head(&volume, &path, mode, HEAD_BYTES)
-                .map(|(remote, size, bytes)| {
-                    let head = Head {
-                        ino: ino.0,
-                        size,
-                        bytes,
-                    };
-                    (remote, Some(head))
-                })
+            Ok(None)
         };
 
         match opened {
-            Ok((remote, head)) => {
+            Ok(remote) => {
                 let mut state = self.state.lock().expect("inode state");
                 let fh = state.next_handle;
                 state.next_handle += 1;
-                state.handles.insert(fh, remote);
-                if let Some(head) = head {
-                    note_headed(&mut state, ino.0, known, head.size);
-                    if state.heads.len() < MAX_HEADS {
-                        state.heads.insert(fh, head);
+                match remote {
+                    Some((remote, _)) => {
+                        state.handles.insert(fh, remote);
+                    }
+                    None => {
+                        state.unopened.insert(
+                            fh,
+                            Unopened {
+                                ino: ino.0,
+                                volume,
+                                path,
+                                mode,
+                            },
+                        );
                     }
                 }
                 // Keep the pages already cached. Without it the kernel drops a
@@ -661,15 +658,29 @@ impl Filesystem for RemoteFs {
         _lock: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let remote = {
+        let (remote, unopened) = {
             let state = self.state.lock().expect("inode state");
             if let Some(bytes) = state.heads.get(&fh.0).and_then(|h| h.read(offset, size)) {
                 return reply.data(bytes);
             }
-            state.handles.get(&fh.0).copied()
+            (
+                state.handles.get(&fh.0).copied(),
+                state.unopened.get(&fh.0).cloned(),
+            )
         };
-        let Some(remote) = remote else {
-            return reply.error(Errno::EBADF);
+        let remote = match (remote, unopened) {
+            (Some(remote), _) => remote,
+            (None, Some(unopened)) => match self.open_for_read(fh.0, unopened) {
+                Ok(remote) => {
+                    let state = self.state.lock().expect("inode state");
+                    if let Some(bytes) = state.heads.get(&fh.0).and_then(|h| h.read(offset, size)) {
+                        return reply.data(bytes);
+                    }
+                    remote
+                }
+                Err(e) => return reply.error(to_errno(&e)),
+            },
+            (None, None) => return reply.error(Errno::EBADF),
         };
         match self.peer.read(remote, offset, size) {
             Ok(bytes) => reply.data(&bytes),
@@ -894,6 +905,7 @@ impl Filesystem for RemoteFs {
         let remote = {
             let mut state = self.state.lock().expect("inode state");
             state.heads.remove(&fh.0);
+            state.unopened.remove(&fh.0);
             state.handles.remove(&fh.0)
         };
         if let Some(remote) = remote {

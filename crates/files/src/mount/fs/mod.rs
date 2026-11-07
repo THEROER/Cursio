@@ -75,34 +75,18 @@ struct State {
     /// The start of each file opened for reading, by our handle, as the owner
     /// sent it with the open; see [`Head`].
     heads: std::collections::HashMap<u64, Head>,
-    /// By inode, the size and modification time a file had when its head was
-    /// last handed to the kernel.
-    ///
-    /// The kernel keeps those pages across opens (`FOPEN_KEEP_CACHE`) and
-    /// drops them itself when either value changes (`FUSE_AUTO_INVAL_DATA`),
-    /// so a file whose attributes still match has its start in the page cache
-    /// already. Fetching it again with every open made a warm `git diff
-    /// --stat` slower than without heads at all — 11.5 s against 7.7 — for
-    /// bytes the kernel never asked for.
-    headed: std::collections::HashMap<u64, (u64, i64)>,
+    /// Files opened for reading that the owner has not been asked to open
+    /// yet, by our handle; see [`RemoteFs::open_for_read`].
+    unopened: std::collections::HashMap<u64, Unopened>,
 }
 
-/// How many inodes [`State::headed`] remembers before starting over.
-const MAX_HEADED: usize = 8192;
-
-/// Remember that `ino`'s head went to the kernel at `attrs`.
-///
-/// Only with attributes to compare against, and only when they describe the
-/// file the head came from: a file opened without them, or changed between
-/// the `stat` and the open, is fetched with its head again next time.
-fn note_headed(state: &mut State, ino: u64, attrs: Option<(u64, i64)>, head_size: u64) {
-    let Some(attrs) = attrs.filter(|(size, _)| *size == head_size) else {
-        return;
-    };
-    if state.headed.len() >= MAX_HEADED {
-        state.headed.clear();
-    }
-    state.headed.insert(ino, attrs);
+/// A file opened here for reading, not yet opened on its owner.
+#[derive(Clone)]
+struct Unopened {
+    ino: u64,
+    volume: String,
+    path: String,
+    mode: cursio_protocol::OpenMode,
 }
 
 /// How much of a file to ask for with its open.
@@ -162,7 +146,7 @@ impl RemoteFs {
                 handles: std::collections::HashMap::new(),
                 next_handle: 1,
                 heads: std::collections::HashMap::new(),
-                headed: std::collections::HashMap::new(),
+                unopened: std::collections::HashMap::new(),
             }),
             // Safe: these are plain getuid/getgid calls with no preconditions.
             uid: unsafe { libc::getuid() },
@@ -200,12 +184,43 @@ impl RemoteFs {
         )
     }
 
-    /// Whether the kernel holds `ino`'s start already: its head was handed
-    /// over at these same attributes, so the cached pages are still current.
-    fn start_cached(&self, ino: u64, attrs: Option<(u64, i64)>) -> bool {
-        attrs.is_some_and(|attrs| {
-            self.state.lock().expect("inode state").headed.get(&ino) == Some(&attrs)
-        })
+    /// Open `fh`'s file on its owner, with its head, at the first read that
+    /// needs it, and answer the owner's handle.
+    ///
+    /// Two reads of one handle may race to here; the second to come back
+    /// finds the first's handle in place and closes its own.
+    fn open_for_read(
+        &self,
+        fh: u64,
+        file: Unopened,
+    ) -> Result<cursio_protocol::FileHandle, FileError> {
+        let (remote, size, bytes) =
+            self.peer
+                .open_head(&file.volume, &file.path, file.mode, HEAD_BYTES)?;
+        let mut state = self.state.lock().expect("inode state");
+        if let Some(&first) = state.handles.get(&fh) {
+            drop(state);
+            self.peer.close(remote);
+            return Ok(first);
+        }
+        // Released while the open was away: nothing will close this handle.
+        if state.unopened.remove(&fh).is_none() {
+            drop(state);
+            self.peer.close(remote);
+            return Err(FileError::BadHandle);
+        }
+        state.handles.insert(fh, remote);
+        if state.heads.len() < MAX_HEADS {
+            state.heads.insert(
+                fh,
+                Head {
+                    ino: file.ino,
+                    size,
+                    bytes,
+                },
+            );
+        }
+        Ok(remote)
     }
 
     /// Drop every head held for `ino`: this machine is changing the file.
@@ -420,24 +435,92 @@ mod tests {
         assert!(head.read(5000, 1).is_none());
     }
 
-    /// A file whose head the kernel took is opened plainly again while its
-    /// size and modification time stay the same, and with its head once
-    /// either changes.
+    /// A peer that opens every file as handle `next`, `next + 1`, … with the
+    /// head `hello`, and reports each handle it is asked to close.
+    fn opening_peer() -> (
+        PeerLink,
+        std::sync::mpsc::Receiver<cursio_protocol::FileHandle>,
+    ) {
+        let (ops, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (closed_tx, closed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut next = 40;
+            while let Some(op) = rx.blocking_recv() {
+                match op {
+                    crate::bridge::Op::OpenHead { reply, .. } => {
+                        next += 1;
+                        let _ = reply.send(Ok((next, 5, b"hello".to_vec())));
+                    }
+                    crate::bridge::Op::Close { handle } => {
+                        let _ = closed_tx.send(handle);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (PeerLink::new(ops), closed)
+    }
+
+    fn unopened() -> Unopened {
+        Unopened {
+            ino: 9,
+            volume: "C:".into(),
+            path: "a.rs".into(),
+            mode: cursio_protocol::OpenMode::read_only(),
+        }
+    }
+
+    /// The owner is asked at the first read, once, and the head it sends
+    /// answers that read and the ones after it.
     #[test]
-    fn a_file_is_opened_without_its_head_while_the_kernel_holds_it() {
-        let (ops, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let fs = RemoteFs::new(PeerLink::new(ops), "C:");
-        assert!(!fs.start_cached(9, Some((120, 1000))), "never handed over");
+    fn a_file_opened_to_read_is_opened_on_the_owner_at_its_first_read() {
+        let (peer, _closed) = opening_peer();
+        let fs = RemoteFs::new(peer, "C:");
+        fs.state.lock().unwrap().unopened.insert(1, unopened());
 
-        note_headed(&mut fs.state.lock().unwrap(), 9, Some((120, 1000)), 120);
-        assert!(fs.start_cached(9, Some((120, 1000))));
-        assert!(!fs.start_cached(9, Some((121, 1000))), "grew");
-        assert!(!fs.start_cached(9, Some((120, 1001))), "rewritten");
-        assert!(!fs.start_cached(9, None), "nothing to compare with");
+        assert_eq!(fs.open_for_read(1, unopened()).unwrap(), 41);
+        let state = fs.state.lock().unwrap();
+        assert!(state.unopened.is_empty());
+        assert_eq!(state.handles.get(&1), Some(&41));
+        assert_eq!(state.heads[&1].read(0, 4096), Some(&b"hello"[..]));
+    }
 
-        // Attributes describing another version of the file than the head.
-        note_headed(&mut fs.state.lock().unwrap(), 10, Some((50, 1)), 60);
-        assert!(!fs.start_cached(10, Some((50, 1))));
+    /// Two reads racing to open one handle leave one owner handle open; the
+    /// loser's is closed rather than leaked.
+    #[test]
+    fn a_second_open_for_the_same_handle_is_closed_again() {
+        let (peer, closed) = opening_peer();
+        let fs = RemoteFs::new(peer, "C:");
+        fs.state.lock().unwrap().unopened.insert(1, unopened());
+
+        assert_eq!(fs.open_for_read(1, unopened()).unwrap(), 41);
+        assert_eq!(
+            fs.open_for_read(1, unopened()).unwrap(),
+            41,
+            "the first one stays"
+        );
+        assert_eq!(
+            closed.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(42)
+        );
+    }
+
+    /// A handle released while its open was away keeps nothing open on the
+    /// owner.
+    #[test]
+    fn an_open_finishing_after_its_release_is_closed() {
+        let (peer, closed) = opening_peer();
+        let fs = RemoteFs::new(peer, "C:");
+
+        assert!(matches!(
+            fs.open_for_read(1, unopened()),
+            Err(FileError::BadHandle)
+        ));
+        assert_eq!(
+            closed.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(41)
+        );
+        assert!(fs.state.lock().unwrap().handles.is_empty());
     }
 
     /// A write here makes every head of that file stale, whichever handle
