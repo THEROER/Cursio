@@ -25,6 +25,7 @@ pub mod messages;
 pub mod node;
 pub mod notify;
 pub mod paths;
+pub mod probe;
 pub mod service;
 pub mod share;
 pub mod update;

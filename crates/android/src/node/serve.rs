@@ -183,6 +183,7 @@ fn phone_modules(
             view: true,
         }))
         .with(Box::new(cursio_core::diag_session::DiagFactory))
+        .with(Box::new(cursio_core::probe_session::ProbeFactory))
         // Builds for this phone, and for any machine it relays them to.
         .with(Box::new(cursio_core::update::lane::UpdateFactory))
         // Other applications' builds, taken and handed on like this app's.

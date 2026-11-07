@@ -205,3 +205,15 @@ chunking, reconnect, Bluetooth fallback and loopback tests remain applicable.
 Video tests exercise aggregate backoff, idle behaviour and encoder caps.
 Hardware validation is still required on Windows, Android and congested Wi-Fi;
 unit tests do not establish end-to-end latency or throughput on those systems.
+
+## Measuring a link
+
+`cursio link test <machine>` (module `probe`, id 17, `core/src/probe_session.rs`)
+loads the bulk lane each way for a few seconds with requested 256 KiB pieces —
+a mount's shape, with no disk on either end — and pings at the input class
+throughout: at rest, then under each direction's load. The answer is speed
+each way and the pointer's round trip under load, which is what decides
+whether a file copy is felt in the mouse. One end of each pair of computers
+also tests by itself every 12 h at a quiet moment, never over Bluetooth and
+never with a phone; results are kept in the data directory
+(`link-tests.jsonl`, `cursio link history`).

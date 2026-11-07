@@ -233,6 +233,13 @@ pub(crate) enum Command {
         /// fails, `auto` is the usual: the network, Bluetooth when it is gone.
         choice: Option<PathArg>,
     },
+    /// Measure the link to a machine, or show the tests kept: speed each way
+    /// and how far the round trip stretches under that load. Goes through the
+    /// running node.
+    Link {
+        #[command(subcommand)]
+        action: LinkAction,
+    },
     /// Read and send a connected phone's text messages, through the running
     /// node.
     Sms {
@@ -640,6 +647,27 @@ pub(crate) enum PortalAction {
     /// Forward every screen-cast request to GNOME; what D-Bus starts when no
     /// `cursio mesh` holds the backend's name.
     Relay,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum LinkAction {
+    /// Load the link each way for a few seconds and measure it. Spends the
+    /// link while it runs: a file copy over it slows down meanwhile.
+    Test {
+        /// The machine, by name or id.
+        machine: String,
+        /// Seconds each direction is loaded, at most 30.
+        #[arg(long, default_value_t = 5)]
+        seconds: u32,
+    },
+    /// The tests this machine kept, by hand and by itself, oldest first.
+    History {
+        /// Only the link to this machine.
+        machine: Option<String>,
+        /// The newest this many.
+        #[arg(long, short = 'n', default_value_t = 20)]
+        lines: usize,
+    },
 }
 
 #[derive(Subcommand)]

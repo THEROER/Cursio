@@ -89,6 +89,9 @@ impl ModuleId {
     /// Other applications' builds, carried as Cursio's own are; see
     /// [`apps`](crate::apps).
     pub const APPS: ModuleId = ModuleId(16);
+    /// The link's speed each way and its round trips under load, measured;
+    /// see [`probe`](crate::probe).
+    pub const PROBE: ModuleId = ModuleId(17);
 
     /// Human-readable name, for logs and diagnostics. Unknown ids are rendered
     /// numerically rather than hidden — that is exactly the case worth seeing in
@@ -111,6 +114,7 @@ impl ModuleId {
             ModuleId::GALLERY => "gallery",
             ModuleId::DIAG => "diag",
             ModuleId::APPS => "apps",
+            ModuleId::PROBE => "probe",
             _ => "unknown",
         }
     }

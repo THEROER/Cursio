@@ -523,6 +523,13 @@ pub async fn handle_waiting(state: &NodeState, command: Command) -> Reply {
     if let Some(reply) = phone_remote(&command).await {
         return reply;
     }
+    if let Command::LinkTest { peer, seconds } = &command {
+        let seconds = seconds.unwrap_or(crate::probe_session::DEFAULT_SECONDS);
+        return match crate::probe_session::run(peer, seconds).await {
+            Ok((peer, result)) => Reply::LinkTest { peer, result },
+            Err(message) => Reply::Error { message },
+        };
+    }
     if let Command::Ring { peer } = &command {
         return match crate::notify_hub::hub().ring_confirmed(peer, true).await {
             Ok(name) => {
@@ -766,9 +773,13 @@ impl NodeState {
             | Command::WindowAct { .. }
             | Command::WindowTree { .. }
             | Command::WindowElement { .. }
-            | Command::Devtools { .. } => {
+            | Command::Devtools { .. }
+            | Command::LinkTest { .. } => {
                 error("logs and paths are asked through a desktop's control socket")
             }
+            Command::LinkTests { peer } => Reply::LinkTests {
+                tests: crate::probe_history::read(peer.as_deref()),
+            },
         }
     }
 

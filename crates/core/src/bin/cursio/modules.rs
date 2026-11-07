@@ -179,6 +179,7 @@ pub(crate) fn module_registry(
             view: true,
         }))
         .with(Box::new(cursio_core::diag_session::DiagFactory))
+        .with(Box::new(cursio_core::probe_session::ProbeFactory))
         .with(Box::new(cursio_core::service_session::ServiceFactory {
             state: services.state,
             reasons: services.reasons,

@@ -299,6 +299,123 @@ fn describe(report: &PathReport) -> String {
     format!("has {have}, input over {carrying}, choice {choice}")
 }
 
+pub(crate) async fn link(action: crate::cli::LinkAction) -> anyhow::Result<()> {
+    use crate::cli::LinkAction;
+    let client = control_client()
+        .await
+        .map_err(|e| anyhow::anyhow!("no running node to ask ({e}); start `cursio mesh` first"))?;
+    match action {
+        LinkAction::Test { machine, seconds } => {
+            println!("testing the link to {machine}: {seconds} s each way…");
+            match client
+                .request(Command::LinkTest {
+                    peer: machine,
+                    seconds: Some(seconds),
+                })
+                .await?
+            {
+                Reply::LinkTest { peer, result } => {
+                    print_link_test(&peer, &result);
+                    Ok(())
+                }
+                Reply::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!(
+                    "the running node does not know how to test a link ({other:?}); restart it with this version of Cursio"
+                ),
+            }
+        }
+        LinkAction::History { machine, lines } => {
+            match client.request(Command::LinkTests { peer: machine }).await? {
+                Reply::LinkTests { tests } => {
+                    if tests.is_empty() {
+                        println!("no link tests kept yet; run `cursio link test <machine>`");
+                    }
+                    let skip = tests.len().saturating_sub(lines);
+                    for kept in &tests[skip..] {
+                        println!("{}", link_line(&kept.peer, &kept.result));
+                    }
+                    Ok(())
+                }
+                Reply::Error { message } => anyhow::bail!("{message}"),
+                other => anyhow::bail!(
+                    "the running node does not keep link tests ({other:?}); restart it with this version of Cursio"
+                ),
+            }
+        }
+    }
+}
+
+fn ms(us: u64) -> String {
+    format!("{:.1} ms", us as f64 / 1000.0)
+}
+
+fn speed(bytes_per_sec: u64) -> String {
+    format!(
+        "{:.1} MB/s ({:.0} Mbit/s)",
+        bytes_per_sec as f64 / 1e6,
+        bytes_per_sec as f64 * 8.0 / 1e6
+    )
+}
+
+fn trips(t: &cursio_protocol::probe::RoundTrips) -> String {
+    let lost = if t.lost > 0 {
+        format!(", {} of {} lost", t.lost, t.sent)
+    } else {
+        String::new()
+    };
+    format!(
+        "p50 {}, p95 {}, max {}{lost}",
+        ms(t.p50_us),
+        ms(t.p95_us),
+        ms(t.max_us)
+    )
+}
+
+/// How a pointer would feel the link under load: what Orb-style tools call
+/// responsiveness, from the round trip's tail while a file crosses.
+fn feel(r: &cursio_protocol::probe::ProbeResult) -> &'static str {
+    let worst = r.download.loaded.p95_us.max(r.upload.loaded.p95_us);
+    let lost = r.download.loaded.lost + r.upload.loaded.lost + r.idle.lost;
+    match (worst, lost) {
+        (_, l) if l > 2 => "poor: pings went unanswered under load",
+        (w, _) if w < 20_000 => "good: a file crossing does not hold the pointer up",
+        (w, _) if w < 60_000 => "fair: a pointer stutters a little while a file crosses",
+        _ => "poor: a file crossing holds the pointer up visibly",
+    }
+}
+
+fn print_link_test(peer: &str, r: &cursio_protocol::probe::ProbeResult) {
+    let path = r.path.as_deref().unwrap_or("an unknown path");
+    println!("{peer}, over {path}");
+    println!("  at rest     {}", trips(&r.idle));
+    println!(
+        "  download    {}   round trip under load: {}",
+        speed(r.download.bytes_per_sec),
+        trips(&r.download.loaded)
+    );
+    println!(
+        "  upload      {}   round trip under load: {}",
+        speed(r.upload.bytes_per_sec),
+        trips(&r.upload.loaded)
+    );
+    println!("  {}", feel(r));
+}
+
+fn link_line(peer: &str, r: &cursio_protocol::probe::ProbeResult) -> String {
+    // UTC, as every log line is, so a test reads against the logs around it.
+    let at =
+        cursio_core::log_tail::timestamp(std::time::UNIX_EPOCH + Duration::from_secs(r.at_unix));
+    format!(
+        "{at}  {peer:<16} {:<9} ↓ {:>7.1} MB/s  ↑ {:>7.1} MB/s  rest {:>8}  loaded p95 {:>8}{}",
+        r.path.as_deref().unwrap_or("?"),
+        r.download.bytes_per_sec as f64 / 1e6,
+        r.upload.bytes_per_sec as f64 / 1e6,
+        ms(r.idle.p50_us),
+        ms(r.download.loaded.p95_us.max(r.upload.loaded.p95_us)),
+        if r.automatic { "  (by itself)" } else { "" }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

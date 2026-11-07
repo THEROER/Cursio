@@ -198,3 +198,4 @@ windows = { version = "0.61", features = [
 tokio = { version = "1", features = ["full", "test-util"] }
 # The real client against the real apps socket (`apps::serve`'s tests).
 cursio-sdk.workspace = true
+tempfile.workspace = true

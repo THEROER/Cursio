@@ -37,7 +37,8 @@ use std::path::PathBuf;
 /// Pictures/Cursio. v20: `desk` in the status, `arrange` and `barrier`.
 /// v21: `arrange_screen`, and each desk screen's `dx_mm`/`dy_mm`.
 /// v22: `waiting_builds` in the status. v23: `fetching_builds`.
-pub const CONTROL_VERSION: u32 = 23;
+/// v24: `link_test` and `link_tests`, a link measured and its tests kept.
+pub const CONTROL_VERSION: u32 = 24;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -350,6 +351,19 @@ pub enum Command {
         #[serde(default)]
         choice: Option<cursio_protocol::diag::PathChoice>,
     },
+    /// Measure the link to `peer`: its speed each way, each loaded for
+    /// `seconds`, and the round trips under that load; see
+    /// [`cursio_protocol::probe`].
+    LinkTest {
+        peer: String,
+        #[serde(default)]
+        seconds: Option<u32>,
+    },
+    /// The link tests this machine kept, of `peer` or of every peer.
+    LinkTests {
+        #[serde(default)]
+        peer: Option<String>,
+    },
     /// Copy one item to this machine's `Pictures/Cursio/<peer>`, or into `dir`
     /// when given: a folder the user picked, or the app's cache for a file it
     /// is about to open, copy or send on.
@@ -592,6 +606,7 @@ impl Command {
                 Command::Ring { .. }
                     | Command::Logs { .. }
                     | Command::Paths { .. }
+                    | Command::LinkTest { .. }
                     | Command::Report { .. }
                     | Command::Maintain { .. }
                     | Command::Launch { .. }
@@ -687,6 +702,15 @@ pub enum Reply {
     },
     /// The session with a peer as each end sees it. `there` is absent when
     /// the peer could not be asked, and `there_error` says why.
+    /// What [`Command::LinkTest`] found.
+    LinkTest {
+        peer: String,
+        result: cursio_protocol::probe::ProbeResult,
+    },
+    /// The tests [`Command::LinkTests`] asked for, oldest first.
+    LinkTests {
+        tests: Vec<crate::probe_history::Kept>,
+    },
     Paths {
         here: cursio_protocol::diag::PathReport,
         #[serde(default)]

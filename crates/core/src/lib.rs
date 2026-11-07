@@ -152,6 +152,8 @@ pub mod portal_setup;
 /// Whether the user is at this machine: where a phone's notification goes.
 pub mod presence;
 pub mod pressure;
+pub mod probe_history;
+pub mod probe_session;
 pub mod proc_memory;
 pub mod queue;
 /// Renegotiating a running link when either side's settings change.
