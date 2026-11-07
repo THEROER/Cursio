@@ -95,6 +95,14 @@ impl SessionModule for AudioEngine {
                     "device-state monitor up — device volumes replicate across machines"
                 );
             }
+            // A phone has one output and one input an app can address, and no
+            // endpoint volume of its own to replicate: the absence is what a
+            // phone is, not a fault, and was repeated on every link.
+            #[cfg(target_os = "android")]
+            Err(e) => {
+                tracing::debug!(error = %e, "no device-state monitor on a phone");
+            }
+            #[cfg(not(target_os = "android"))]
             Err(e) => {
                 tracing::warn!(error = %e, "no device-state monitor; device volumes won't replicate");
             }

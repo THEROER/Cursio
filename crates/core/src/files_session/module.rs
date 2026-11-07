@@ -75,7 +75,14 @@ impl SessionModule for FilesEngine {
             // there is nothing to report here yet — see `sync_peer_mounts`.
             "file sharing up"
         );
-        #[cfg(not(any(target_os = "linux", all(target_os = "windows", target_env = "msvc"))))]
+        // A phone only serves its storage (`ModuleRole::Source`), so it never
+        // mounts and has nothing to say about it; said on every link, this was
+        // most of a phone's warnings.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "windows", target_env = "msvc")
+        )))]
         tracing::warn!(
             peer = %self.peer_name,
             "no mount backend on this platform, so the peer's volumes will not appear here; \
