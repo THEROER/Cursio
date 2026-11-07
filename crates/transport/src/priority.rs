@@ -463,6 +463,9 @@ pub struct PrioritizedTx {
     /// The largest frame to cut a message into, for a sink whose connection
     /// may be slow; the full Noise budget without it.
     frame_limit: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    /// Told of each input frame sent and each one the session says it
+    /// received; see [`TransportTx::note_input`].
+    input_seen: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Closes the queues when dropped, which happens once, with the last clone.
@@ -607,6 +610,7 @@ impl PrioritizedTx {
             shared,
             holding: None,
             carrying_path: None,
+            input_seen: None,
             frame_limit: None,
         }
     }
@@ -614,6 +618,12 @@ impl PrioritizedTx {
     /// Answer [`TransportTx::holding`] with `holding`.
     pub(crate) fn with_holding(mut self, holding: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.holding = Some(holding);
+        self
+    }
+
+    /// Tell `seen` of every input frame that crosses this link.
+    pub(crate) fn with_input_seen(mut self, seen: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.input_seen = Some(seen);
         self
     }
 
@@ -675,6 +685,12 @@ fn log_window(window: &[QueueDelay; CLASS_COUNT]) {
 #[async_trait]
 impl TransportTx for PrioritizedTx {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
+        // A person's input, not everything riding its class: the link test's
+        // pings ride with input to measure what a pointer feels, and must not
+        // themselves make bulk yield.
+        if matches!(msg, Message::Input(_)) {
+            self.note_input();
+        }
         let idx = class_index(msg.priority());
         let lossy = msg.is_lossy();
         // A move that finds the previous one still unsent joins it. A link
@@ -767,6 +783,12 @@ impl TransportTx for PrioritizedTx {
 
     fn carrying_path(&self) -> Option<&'static str> {
         self.carrying_path.as_ref().and_then(|carrying| carrying())
+    }
+
+    fn note_input(&self) {
+        if let Some(seen) = &self.input_seen {
+            seen();
+        }
     }
 
     async fn flush(&mut self) {

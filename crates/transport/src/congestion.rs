@@ -18,6 +18,19 @@
 //! pointer gained nothing. A queue bulk built persists and a spike does not,
 //! so the queue is read from the lowest of the last [`CURRENT_SAMPLES`]
 //! readings, as LEDBAT filters its current delay.
+//!
+//! ## Strict while a person is at the input, generous while not
+//!
+//! How much queue bulk may build is a trade between a file's speed and the
+//! pointer's, and the right answer depends on whether anyone is moving it.
+//! Measured to a Windows laptop on Wi-Fi: holding the queue to 15 ms carried
+//! files at a third of the link; letting it grow carried them at 12–14 MB/s,
+//! but the laptop's radio then lost the interactive lane's packets, each a
+//! 300 ms retransmission timer, and the pointer's round trip reached 50–130 ms
+//! at the 95th percentile. So the queue may grow to [`IDLE_QUEUE_TARGET`]
+//! while no input has crossed the link for [`INPUT_HOLD`], and the moment
+//! input crosses, either way, bulk halves at once and is held to
+//! [`QUEUE_TARGET`] again.
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -27,6 +40,11 @@ const MIN_RATE: f64 = 64.0 * 1024.0;
 const MAX_RATE: f64 = 128.0 * 1024.0 * 1024.0;
 const UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 const QUEUE_TARGET: Duration = Duration::from_millis(15);
+/// The queue bulk may build while no person's input is crossing the link.
+const IDLE_QUEUE_TARGET: Duration = Duration::from_millis(60);
+/// How long after the last input event the link is held to [`QUEUE_TARGET`]:
+/// a pause between strokes, or reading what was just typed, is still use.
+const INPUT_HOLD: Duration = Duration::from_secs(2);
 /// How far back the baseline round trip reaches. Long enough that a transfer
 /// running throughout still had moments of an empty queue in it — each cut
 /// drains what bulk built — so its own queue does not become the baseline;
@@ -65,6 +83,8 @@ pub(crate) struct BackgroundRate {
     /// interactive lane's packets, each loss a 300 ms retransmission timer:
     /// the pointer's round trip reached 1.1 s.
     slow_start: bool,
+    /// When a person's input last crossed the link.
+    last_input: Option<Instant>,
 }
 
 impl Default for BackgroundRate {
@@ -75,6 +95,7 @@ impl Default for BackgroundRate {
             current: VecDeque::new(),
             updated: None,
             slow_start: true,
+            last_input: None,
         }
     }
 }
@@ -111,10 +132,11 @@ impl BackgroundRate {
         }
         self.updated = Some(now);
         let standing = self.current.iter().min().copied().unwrap_or(rtt);
-        if self.slow_start && rtt.saturating_sub(baseline) > QUEUE_TARGET / 2 {
+        let target = self.target(now);
+        if self.slow_start && rtt.saturating_sub(baseline) > target / 2 {
             self.slow_start = false;
         }
-        if standing.saturating_sub(baseline) > QUEUE_TARGET {
+        if standing.saturating_sub(baseline) > target {
             self.rate = (self.rate * 0.7).max(MIN_RATE);
             self.slow_start = false;
             Some((standing, baseline))
@@ -130,6 +152,32 @@ impl BackgroundRate {
 }
 
 impl BackgroundRate {
+    /// A person's input crossed the link at `now`. The first after a quiet
+    /// spell halves bulk at once: the queue it built under the generous
+    /// target has to drain before the pointer stops feeling it, and waiting
+    /// for readings to show it would take most of a second.
+    pub(crate) fn note_input(&mut self, now: Instant) {
+        let was_quiet = self
+            .last_input
+            .is_none_or(|at| now.duration_since(at) > INPUT_HOLD);
+        self.last_input = Some(now);
+        if was_quiet {
+            self.rate = (self.rate * 0.5).max(MIN_RATE);
+            self.slow_start = false;
+        }
+    }
+
+    /// The queue bulk may build now.
+    fn target(&self, now: Instant) -> Duration {
+        match self
+            .last_input
+            .is_some_and(|at| now.duration_since(at) <= INPUT_HOLD)
+        {
+            true => QUEUE_TARGET,
+            false => IDLE_QUEUE_TARGET,
+        }
+    }
+
     /// Fold `rtt` into the recent minima and answer the lowest of them.
     fn baseline(&mut self, rtt: Duration, now: Instant) -> Duration {
         match self.minima.back_mut() {
@@ -157,6 +205,8 @@ mod tests {
     fn background_yields_to_a_standing_queue_and_recovers_gradually() {
         let mut controller = BackgroundRate::default();
         let mut now = Instant::now();
+        // Someone is at the input: the strict target holds.
+        controller.note_input(now);
         controller.observe(Duration::from_millis(10), now, true);
         // A queue is believed once it has stood for every reading the filter
         // holds, and not before.
@@ -200,6 +250,8 @@ mod tests {
     fn a_round_trip_that_rose_for_good_stops_reading_as_congestion() {
         let mut controller = BackgroundRate::default();
         let mut now = Instant::now();
+        // Someone is at the input: the strict target holds.
+        controller.note_input(now);
         controller.observe(Duration::from_millis(2), now, true);
         // The quiet round trip is 30 ms from here on: a roam, another
         // channel. Within the window it reads as queue and is cut ...
@@ -257,6 +309,8 @@ mod tests {
     fn the_first_reading_past_half_the_target_ends_the_doubling_without_a_cut() {
         let mut controller = BackgroundRate::default();
         let mut now = Instant::now();
+        // Someone is at the input: the strict target holds.
+        controller.note_input(now);
         controller.observe(Duration::from_millis(5), now, true);
         now += UPDATE_INTERVAL;
         let before = controller.bytes_per_second();
@@ -268,5 +322,45 @@ mod tests {
             after > before && after < before * 1.2,
             "{before} -> {after}"
         );
+    }
+
+    #[test]
+    fn with_nobody_at_the_input_bulk_may_queue_more() {
+        let mut controller = BackgroundRate::default();
+        let mut now = Instant::now();
+        controller.observe(Duration::from_millis(5), now, true);
+        // 30 ms of standing queue: past the strict target, within the idle one.
+        for _ in 0..=CURRENT_SAMPLES {
+            now += UPDATE_INTERVAL;
+            assert!(controller
+                .observe(Duration::from_millis(35), now, true)
+                .is_none());
+        }
+        // The same queue once input crosses is cut.
+        controller.note_input(now);
+        let mut cut = false;
+        for _ in 0..=CURRENT_SAMPLES {
+            now += UPDATE_INTERVAL;
+            cut |= controller
+                .observe(Duration::from_millis(35), now, true)
+                .is_some();
+        }
+        assert!(cut);
+    }
+
+    #[test]
+    fn input_after_a_quiet_spell_halves_bulk_at_once_and_only_once() {
+        let mut controller = BackgroundRate::default();
+        let mut now = Instant::now();
+        for _ in 0..4 {
+            controller.observe(Duration::from_millis(5), now, true);
+            now += UPDATE_INTERVAL;
+        }
+        let before = controller.bytes_per_second();
+        controller.note_input(now);
+        assert_eq!(controller.bytes_per_second(), before * 0.5);
+        now += Duration::from_millis(8);
+        controller.note_input(now);
+        assert_eq!(controller.bytes_per_second(), before * 0.5);
     }
 }

@@ -130,6 +130,18 @@ reading and the baseline it stood above. An overdue probe is also
 a congestion signal. Idle observations update the baseline without raising the
 next transfer's initial rate. A replacement control path resets the estimate.
 
+The 15 ms target holds only while a person's input crosses the link, either
+way, and for two seconds after; with nobody at the input bulk may queue 60 ms.
+Measured to a Windows laptop on Wi-Fi, 15 ms all the time carried files at a
+third of the link, while a generous target all the time carried them at
+12–14 MB/s but let the laptop's radio lose the interactive lane's packets, each
+loss a 300 ms retransmission timer, putting the pointer's 95th-percentile
+round trip at 50–130 ms. So the first input event after a quiet spell halves
+bulk at once, before any reading could show the queue, and the strict target
+returns with it. Each end judges from what it sees: input it sends, and input
+it receives and injects (`TransportTx::note_input`). The link test's pings
+ride the input class but are not input, and do not count.
+
 These are application-level heuristics on top of TCP congestion control. They
 protect latency but cannot guarantee a latency bound through arbitrary router
 queues, radio interference or a saturated external sender. They need real LAN

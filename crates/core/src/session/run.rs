@@ -790,6 +790,9 @@ where
     fn inject(&mut self, event: cursio_protocol::InputEvent, read_at: std::time::Instant) {
         let batch = drain_received_input(event, read_at, &mut self.inbound_rx, &mut self.held_back);
         crate::update::quiet::note_input_activity();
+        // The peer's files yield to this pointer on their own side; this
+        // side's must too, or a copy the other way still crowds it out.
+        self.tx.note_input();
         for (event, read_at) in batch {
             tracing::trace!(?event, "peer input");
             let started = std::time::Instant::now();

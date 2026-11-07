@@ -204,6 +204,12 @@ pub trait TransportTx: Send {
     fn carrying_path(&self) -> Option<&'static str> {
         None
     }
+
+    /// A person's input crossed this link just now, either way: a pointer
+    /// move or a key sent, or one received and injected. Background traffic
+    /// yields while input flows; see `congestion.rs`. The default does
+    /// nothing, for a link with no background traffic to hold back.
+    fn note_input(&self) {}
 }
 
 /// The receive half of a split [`Transport`].

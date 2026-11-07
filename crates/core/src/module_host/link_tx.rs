@@ -160,6 +160,14 @@ impl TransportTx for LinkTx {
             .ok()
             .and_then(|slot| slot.as_ref().and_then(|tx| tx.carrying_path()))
     }
+
+    fn note_input(&self) {
+        if let Ok(slot) = self.slot.try_lock() {
+            if let Some(tx) = slot.as_ref() {
+                tx.note_input();
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -486,9 +486,16 @@ impl ResumableLink {
                 _ => "network",
             })
         });
+        let weak = Arc::downgrade(&self.inner);
+        let input_seen = Arc::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.congestion.lock().unwrap().note_input(Instant::now());
+            }
+        });
         let tx = PrioritizedTx::spawn_lanes(sinks)
             .with_holding(holding)
             .with_carrying_path(carrying)
+            .with_input_seen(input_seen)
             .with_frame_limit(frame_limit);
         self.inner.lock().kick = Some(tx.kick_handle());
         Box::new(tx)
