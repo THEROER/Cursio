@@ -75,6 +75,34 @@ struct State {
     /// The start of each file opened for reading, by our handle, as the owner
     /// sent it with the open; see [`Head`].
     heads: std::collections::HashMap<u64, Head>,
+    /// By inode, the size and modification time a file had when its head was
+    /// last handed to the kernel.
+    ///
+    /// The kernel keeps those pages across opens (`FOPEN_KEEP_CACHE`) and
+    /// drops them itself when either value changes (`FUSE_AUTO_INVAL_DATA`),
+    /// so a file whose attributes still match has its start in the page cache
+    /// already. Fetching it again with every open made a warm `git diff
+    /// --stat` slower than without heads at all — 11.5 s against 7.7 — for
+    /// bytes the kernel never asked for.
+    headed: std::collections::HashMap<u64, (u64, i64)>,
+}
+
+/// How many inodes [`State::headed`] remembers before starting over.
+const MAX_HEADED: usize = 8192;
+
+/// Remember that `ino`'s head went to the kernel at `attrs`.
+///
+/// Only with attributes to compare against, and only when they describe the
+/// file the head came from: a file opened without them, or changed between
+/// the `stat` and the open, is fetched with its head again next time.
+fn note_headed(state: &mut State, ino: u64, attrs: Option<(u64, i64)>, head_size: u64) {
+    let Some(attrs) = attrs.filter(|(size, _)| *size == head_size) else {
+        return;
+    };
+    if state.headed.len() >= MAX_HEADED {
+        state.headed.clear();
+    }
+    state.headed.insert(ino, attrs);
 }
 
 /// How much of a file to ask for with its open.
@@ -134,6 +162,7 @@ impl RemoteFs {
                 handles: std::collections::HashMap::new(),
                 next_handle: 1,
                 heads: std::collections::HashMap::new(),
+                headed: std::collections::HashMap::new(),
             }),
             // Safe: these are plain getuid/getgid calls with no preconditions.
             uid: unsafe { libc::getuid() },
@@ -169,6 +198,14 @@ impl RemoteFs {
                     .read_dir_within(volume, dir, crate::metacache::SWEEP_LISTING_WAIT)
             },
         )
+    }
+
+    /// Whether the kernel holds `ino`'s start already: its head was handed
+    /// over at these same attributes, so the cached pages are still current.
+    fn start_cached(&self, ino: u64, attrs: Option<(u64, i64)>) -> bool {
+        attrs.is_some_and(|attrs| {
+            self.state.lock().expect("inode state").headed.get(&ino) == Some(&attrs)
+        })
     }
 
     /// Drop every head held for `ino`: this machine is changing the file.
@@ -381,6 +418,26 @@ mod tests {
         assert!(head.read(90, 20).is_none(), "straddles the end of the head");
         assert!(head.read(100, 1).is_none(), "wholly past it");
         assert!(head.read(5000, 1).is_none());
+    }
+
+    /// A file whose head the kernel took is opened plainly again while its
+    /// size and modification time stay the same, and with its head once
+    /// either changes.
+    #[test]
+    fn a_file_is_opened_without_its_head_while_the_kernel_holds_it() {
+        let (ops, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let fs = RemoteFs::new(PeerLink::new(ops), "C:");
+        assert!(!fs.start_cached(9, Some((120, 1000))), "never handed over");
+
+        note_headed(&mut fs.state.lock().unwrap(), 9, Some((120, 1000)), 120);
+        assert!(fs.start_cached(9, Some((120, 1000))));
+        assert!(!fs.start_cached(9, Some((121, 1000))), "grew");
+        assert!(!fs.start_cached(9, Some((120, 1001))), "rewritten");
+        assert!(!fs.start_cached(9, None), "nothing to compare with");
+
+        // Attributes describing another version of the file than the head.
+        note_headed(&mut fs.state.lock().unwrap(), 10, Some((50, 1)), 60);
+        assert!(!fs.start_cached(10, Some((50, 1))));
     }
 
     /// A write here makes every head of that file stale, whichever handle

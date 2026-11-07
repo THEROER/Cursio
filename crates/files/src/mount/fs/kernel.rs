@@ -19,7 +19,7 @@
 //! per-`exec` and per-`close` ones were.
 
 use crate::mount::attr::{attr_from, dir_attr, root_attr, to_errno, CACHE_TTL};
-use crate::mount::fs::{Head, GENERATION, HEAD_BYTES, MAX_HEADS};
+use crate::mount::fs::{note_headed, Head, GENERATION, HEAD_BYTES, MAX_HEADS};
 use crate::mount::inode::{join, Entry};
 use crate::mount::RemoteFs;
 use crate::server::{FALLBACK_FREE, FALLBACK_TOTAL};
@@ -598,8 +598,15 @@ impl Filesystem for RemoteFs {
 
         // A file opened to read comes with its start, so its first read — for
         // a small file, its only one — costs no second round trip. One opened
-        // to write does not: its contents are about to change.
-        let opened = if mode.is_mutating() {
+        // to write does not: its contents are about to change. Nor does one
+        // whose start the kernel already holds; see `State::headed`.
+        let known = self
+            .meta
+            .get(&volume, &path)
+            .and_then(Result::ok)
+            .map(|meta| (meta.size, meta.modified_unix));
+        let cached = self.start_cached(ino.0, known);
+        let opened = if mode.is_mutating() || cached {
             self.peer
                 .open(&volume, &path, mode)
                 .map(|(remote, _)| (remote, None))
@@ -622,8 +629,11 @@ impl Filesystem for RemoteFs {
                 let fh = state.next_handle;
                 state.next_handle += 1;
                 state.handles.insert(fh, remote);
-                if let Some(head) = head.filter(|_| state.heads.len() < MAX_HEADS) {
-                    state.heads.insert(fh, head);
+                if let Some(head) = head {
+                    note_headed(&mut state, ino.0, known, head.size);
+                    if state.heads.len() < MAX_HEADS {
+                        state.heads.insert(fh, head);
+                    }
                 }
                 // Keep the pages already cached. Without it the kernel drops a
                 // file's cache on every open, so reading a tree a second time —
