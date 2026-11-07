@@ -447,7 +447,7 @@ function describe(item: MediaItem): string {
         </LpContextMenu>
         <LpEmptyState v-if="!items.length && !loading" compact icon="lucide:image" :title="t('gallery.none')" />
         <div ref="sentinel" class="flex justify-center py-2">
-          <LpSkeleton v-if="loading" class="h-4 w-24" />
+          <LpLoader v-if="loading" variant="dots" size="sm" :labels="{ loading: t('common.loading') }" />
         </div>
       </template>
     </section>

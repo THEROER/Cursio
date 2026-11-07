@@ -124,7 +124,8 @@
   },
   "common": {
     "cancel": "Cancel",
-    "working": "Working…"
+    "working": "Working…",
+    "loading": "Loading…"
   },
   "toast": {
     "failed": "Something went wrong",

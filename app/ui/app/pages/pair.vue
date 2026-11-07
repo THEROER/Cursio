@@ -125,7 +125,7 @@ function copySelection(event: ClipboardEvent) {
             </button>
           </LpTooltip>
         </template>
-        <p v-else class="text-sm">{{ t("pair.waiting") }}</p>
+        <LpLoader v-else variant="dots" size="sm" :delay="0" :label="t('pair.waiting')" class="text-sm" />
         <LpBadge tone="brand">
           <i18n-t keypath="pair.expiresIn" scope="global">
             <template #time><LpNumberFlow :value="left" :format="clock" /></template>
