@@ -333,11 +333,28 @@ always run whatever the file says), and `PhoneClipboard` reads it on every
 offer and tap, so turning it off stops both directions on links already up,
 not only on the next one.
 
-### Open question: files
+### Files: pasted through the files module's mounts
 
-`text/uri-list` names paths on the *owner's* filesystem, which generally do not
-exist on the receiver. Copying a file between machines therefore needs the file
-*contents* transferred and materialised somewhere — a separate feature with its
-own questions (where do they land, when are they cleaned up). For now the URI
-list is carried as-is, which is correct locally and visibly incomplete across
-machines.
+`text/uri-list` names paths on the *owner's* filesystem, which do not exist on
+the receiver: a picture copied in Nautilus arrived in Explorer as the text
+`/home/…/a.png`. Transferring the contents ahead of the paste would break the
+offer-then-request rule and could not cover a folder of any size. The files
+module already mounts every volume the peer shares, so a copied path is a path
+inside one of those mounts.
+
+Both backends read a copied file list (`text/uri-list` on Linux, `CF_HDROP` on
+Windows) and offer it beside the paths-as-text a file manager also puts there.
+A computer pulls the list and rewrites each path to the same file in the
+peer's volume mounted here — `~/Cursio/<peer>/<volume>/…` on Linux,
+`\\cursio\<peer>-<volume>\…` on Windows, the share that reaches the drive from
+any logon session — and writes only that list, as Explorer does
+(`clipboard_session::files_here`, `files_session::peer_paths`). Pasting copies
+the file or folder through the mount, fetched as it is read; a chat window
+attaches it. The volume is found by the longest id the path sits under (a
+mount path, a drive, or a shared folder's path), so a path on no mounted
+volume is left out, and a list with nothing left is written as the paths in
+text, which is what a paste gave before.
+
+A copy made from a peer's mount of *this* machine's disk names the file through
+the peer's `~/Cursio`, which the peer refuses to serve back; that paste fails
+rather than being mapped home.

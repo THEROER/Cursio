@@ -329,6 +329,7 @@ impl FilesEngine {
             self.mount_failures += 1;
             self.mount_retry_at = Some(Instant::now() + retry_after(self.mount_failures));
         }
+        self.publish_mounts();
 
         // Arrived: one mount each. Anything still missing is retried, since a
         // failure here is often temporary — see [`FilesEngine::mount_retry_at`].
@@ -361,6 +362,7 @@ impl FilesEngine {
         // Spaced out rather than attempted every pump: a mount that cannot be
         // made usually cannot be made a millisecond later either, and each
         // attempt touches the filesystem.
+        self.publish_mounts();
         if failed {
             self.mount_failures += 1;
             self.mount_retry_at = Some(Instant::now() + retry_after(self.mount_failures));
@@ -376,6 +378,19 @@ impl FilesEngine {
             self.mount_failures = 0;
             self.mount_failed_at = None;
         }
+    }
+
+    /// Tell [`peer_paths`](super::peer_paths) which of the peer's volumes are
+    /// mounted now, for a file list pasted from that peer to be found in.
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
+    fn publish_mounts(&self) {
+        let mounted = self
+            .peer_volumes
+            .iter()
+            .filter(|v| self.volume_mounts.contains_key(&v.id))
+            .cloned()
+            .collect();
+        super::peer_paths::publish(&self.peer_name, self.mounts_publisher, mounted);
     }
 
     /// No-op where this platform has no mount backend at all.

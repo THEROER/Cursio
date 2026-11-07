@@ -71,12 +71,54 @@ async fn send(tx: &mut dyn TransportTx, msg: ClipboardMsg) -> Result<(), Transpo
 /// so those are pullable, and RTF and app-specific `Other` types are not, since
 /// there is no write path for them yet. When a backend gains one, adding the
 /// format here is the whole change.
+///
+/// A file list is pulled too, and written as files inside the peer's mounts
+/// here — see [`files_here`].
 const PULLABLE: &[ClipboardFormat] = &[
     ClipboardFormat::ImagePng,
     ClipboardFormat::ImageJpeg,
     ClipboardFormat::Html,
+    ClipboardFormat::UriList,
     ClipboardFormat::Text,
 ];
+
+/// What to put on this clipboard for a file list copied on `peer`.
+///
+/// The paths name files on the peer's disk, so each is rewritten to the same
+/// file inside the peer's volume mounted here (see
+/// [`files_session::peer_paths`](crate::files_session::peer_paths)): pasted
+/// in Explorer or Nautilus that copies the file or folder through the mount,
+/// and a chat window attaches it. Only the list is written, as Explorer writes
+/// it — and in the encoding the clipboard reads it back in, which is how the
+/// write is later told apart from a copy made here.
+///
+/// A path on no volume mounted here — the files module is off, or the peer
+/// shares only a folder elsewhere — is left out, since it names nothing here.
+/// When none is left, the paths go on as text, which is what a paste of them
+/// produced before and still says what was copied.
+fn files_here(peer: &str, copied: &ClipboardContent) -> ClipboardContent {
+    let paths = copied.copied_file_paths().unwrap_or_default();
+    #[cfg(feature = "files")]
+    let here: Vec<std::path::PathBuf> = paths
+        .iter()
+        .filter_map(|p| crate::files_session::peer_paths::path_here(peer, p))
+        .collect();
+    #[cfg(not(feature = "files"))]
+    let here: Vec<std::path::PathBuf> = Vec::new();
+
+    if here.len() < paths.len() {
+        tracing::warn!(
+            peer,
+            copied = paths.len(),
+            reachable = here.len(),
+            "some copied files are on none of the peer's disks mounted here; leaving them out"
+        );
+    }
+    if here.is_empty() {
+        return ClipboardContent::single(ClipboardFormat::Text, paths.join("\n").into_bytes());
+    }
+    ClipboardContent::files(&here)
+}
 
 /// Bytes per [`ClipboardData`] chunk.
 ///
@@ -720,9 +762,12 @@ impl ClipboardEngine {
                 bytes = buf.len(),
                 "received peer copy; writing to local clipboard"
             );
-            let content = ClipboardContent {
+            let mut content = ClipboardContent {
                 entries: vec![ClipboardEntry::loaded(format, buf)],
             };
+            if content.has(&ClipboardFormat::UriList) {
+                content = files_here(&self.peer_name, &content);
+            }
             self.last_remote_copy = Some(content.clone());
             self.worker.write(content);
             self.pulled += 1;

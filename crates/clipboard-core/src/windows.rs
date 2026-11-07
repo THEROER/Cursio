@@ -7,9 +7,11 @@
 //!
 //! ## Formats
 //!
-//! Two representations are carried, covering what actually gets copied between
-//! machines:
+//! Three representations are carried, covering what actually gets copied
+//! between machines:
 //!
+//! - **Files** ↔ `CF_HDROP`, the list Explorer copies, carried as
+//!   [`ClipboardFormat::UriList`] (see `dropfiles.rs`).
 //! - **Text** ↔ `CF_UNICODETEXT`. Windows stores UTF-16; we convert to/from the
 //!   crate's UTF-8 [`ClipboardFormat::Text`].
 //! - **PNG** ↔ a registered `"PNG"` clipboard format (what browsers and modern
@@ -53,6 +55,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE, WNDCLASSW,
 };
 
+use crate::dropfiles::{drop_files, dropped_paths};
 use crate::format::{ClipboardContent, ClipboardEntry, ClipboardFormat};
 use crate::{Clipboard, ClipboardChanged, ClipboardError, Selection, WatchHandle};
 
@@ -127,6 +130,17 @@ impl Clipboard for WinClipboard {
 
         let mut content = ClipboardContent::default();
 
+        // Files copied in Explorer. Read whole rather than left lazy: the list
+        // is a few hundred bytes, and its size is only known once read.
+        if unsafe { IsClipboardFormatAvailable(CF_HDROP) }.is_ok() {
+            match read_file_list() {
+                Ok(list) => content.insert(ClipboardEntry::loaded(ClipboardFormat::UriList, list)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the copied file list could not be read; offering the rest")
+                }
+            }
+        }
+
         // Text.
         if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32) }.is_ok() {
             content.insert(ClipboardEntry::lazy(ClipboardFormat::Text, 0));
@@ -153,6 +167,7 @@ impl Clipboard for WinClipboard {
         match format {
             ClipboardFormat::Text => read_text(),
             ClipboardFormat::ImagePng => self.read_png(),
+            ClipboardFormat::UriList => read_file_list(),
             other => Err(ClipboardError::FormatUnavailable(other.mime().to_string())),
         }
     }
@@ -285,24 +300,16 @@ fn write_bytes(format: u32, bytes: &[u8]) -> Result<(), ClipboardError> {
 /// The standard format id of a file list, `CF_HDROP`.
 const CF_HDROP: u32 = 15;
 
-/// A `DROPFILES` block: the 20-byte header (`pFiles`, a zero point, `fNC`,
-/// `fWide`) then each path as NUL-terminated UTF-16, and one more NUL to end
-/// the list. Explorer and every file dialog read pasted files from this.
-fn drop_files(paths: &[std::path::PathBuf]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&20u32.to_le_bytes()); // pFiles: offset of the list
-    bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.x
-    bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.y
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // fNC
-    bytes.extend_from_slice(&1u32.to_le_bytes()); // fWide: UTF-16 paths
-    for path in paths {
-        for unit in path.as_os_str().to_string_lossy().encode_utf16() {
-            bytes.extend_from_slice(&unit.to_le_bytes());
-        }
-        bytes.extend_from_slice(&[0, 0]);
-    }
-    bytes.extend_from_slice(&[0, 0]);
-    bytes
+/// The files copied in Explorer, as the `text/uri-list` the rest of the crate
+/// carries — encoded by [`ClipboardContent::files`], the same encoder a write
+/// is compared against when deciding whether a change was our own.
+fn read_file_list() -> Result<Vec<u8>, ClipboardError> {
+    let paths = dropped_paths(&read_bytes(CF_HDROP)?);
+    ClipboardContent::files(&paths)
+        .bytes(&ClipboardFormat::UriList)
+        .filter(|_| !paths.is_empty())
+        .map(<[u8]>::to_vec)
+        .ok_or(ClipboardError::FormatUnavailable("text/uri-list".into()))
 }
 
 /// Write text as `CF_UNICODETEXT` (UTF-16, NUL-terminated).

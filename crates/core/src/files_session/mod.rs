@@ -64,6 +64,7 @@ mod health;
 mod module;
 mod mounts;
 mod pacer;
+pub mod peer_paths;
 mod serve;
 #[cfg(test)]
 mod test_support;
@@ -174,6 +175,9 @@ pub struct FilesEngine {
     /// dropping that one and no other.
     #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
     volume_mounts: HashMap<String, Mount>,
+    /// This engine's identity in [`peer_paths`], where the mounted volumes are
+    /// published for a pasted file list to be found in.
+    mounts_publisher: u64,
     /// Kept so a volume that appears mid-session can be mounted then, rather
     /// than only at startup.
     mount_link: PeerLink,
@@ -264,6 +268,7 @@ impl FilesEngine {
             in_progress: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
             volume_mounts: HashMap::new(),
+            mounts_publisher: peer_paths::publisher(),
             mount_link: link,
             #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
             mount_retry_at: None,

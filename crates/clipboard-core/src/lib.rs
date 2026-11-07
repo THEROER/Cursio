@@ -36,6 +36,8 @@
 
 pub mod format;
 
+#[cfg(any(target_os = "windows", test))]
+mod dropfiles;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]

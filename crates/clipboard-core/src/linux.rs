@@ -120,13 +120,13 @@ impl ArboardClipboard {
                 let image = self.inner.get_image()?;
                 return encode_png(&image);
             }
-            ClipboardFormat::UriList => self.inner.get().file_list().map(|paths| {
-                paths
-                    .iter()
-                    .map(|p| format!("file://{}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\r\n")
-                    .into_bytes()
+            // Encoded exactly as `read` encodes it: a received list is
+            // recognised as our own write by comparing these bytes.
+            ClipboardFormat::UriList => self.inner.get().file_list().and_then(|paths| {
+                ClipboardContent::files(&paths)
+                    .bytes(&ClipboardFormat::UriList)
+                    .map(<[u8]>::to_vec)
+                    .ok_or(arboard::Error::ContentNotAvailable)
             }),
             // JPEG and app-specific types aren't reachable through arboard's
             // typed API; an image always comes back as PNG (see module docs).
@@ -186,6 +186,21 @@ impl Clipboard for ArboardClipboard {
         // return. Probing text first is deliberate: it is by far the common
         // case and the cheapest, so the usual copy costs one call.
         let mut content = ClipboardContent::default();
+
+        // A file manager's copy is a list of files that also offers their paths
+        // as text. Read as text alone it reached a peer as a path naming
+        // nothing there, so the list is read first and offered alongside.
+        match self.inner.get().clipboard(selection.into()).file_list() {
+            Ok(paths) if !paths.is_empty() => {
+                for entry in ClipboardContent::files(&paths).entries {
+                    content.insert(entry);
+                }
+            }
+            Ok(_) | Err(arboard::Error::ContentNotAvailable) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "the copied file list could not be read; offering the rest")
+            }
+        }
 
         match self.inner.get().clipboard(selection.into()).text() {
             Ok(text) => content.insert(ClipboardEntry::loaded(

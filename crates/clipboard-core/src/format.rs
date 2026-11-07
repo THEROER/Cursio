@@ -327,6 +327,24 @@ impl ClipboardContent {
             .collect();
         (!paths.is_empty()).then_some(paths)
     }
+
+    /// The files a `text/uri-list` names, spelled as the machine that copied
+    /// them writes them, with `/` separators — `/home/me/a.png`,
+    /// `C:/Users/me/a.png`.
+    ///
+    /// For a list that came from another machine, where none of them is a path
+    /// here: [`Self::file_paths`] would turn a drive path into a relative one
+    /// on Linux, and a Linux path into a path on the current drive on Windows.
+    pub fn copied_file_paths(&self) -> Option<Vec<String>> {
+        let list = std::str::from_utf8(self.bytes(&ClipboardFormat::UriList)?).ok()?;
+        let paths: Vec<_> = list
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(spelled_path_of_uri)
+            .collect();
+        (!paths.is_empty()).then_some(paths)
+    }
 }
 
 /// A `file://` URI for an absolute path, percent-encoding all but the
@@ -351,7 +369,9 @@ fn file_uri(path: &std::path::Path) -> String {
     uri
 }
 
-fn path_of_uri(uri: &str) -> Option<std::path::PathBuf> {
+/// A local `file://` URI's path as the machine that wrote it spells it, with
+/// `/` separators: `/home/me/a.png`, or `C:/Users/me/a.png` for a drive.
+fn spelled_path_of_uri(uri: &str) -> Option<String> {
     // `file:` URIs from other machines name their host; only a local one is a
     // path here.
     let rest = uri.strip_prefix("file://")?;
@@ -374,11 +394,19 @@ fn path_of_uri(uri: &str) -> Option<std::path::PathBuf> {
     }
     let text = String::from_utf8(bytes).ok()?;
     // `/C:/…` is a Windows drive path.
-    let text = match text.as_bytes() {
-        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => text[1..].replace('/', "\\"),
+    Some(match text.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => text[1..].to_string(),
         _ => text,
-    };
-    Some(std::path::PathBuf::from(text))
+    })
+}
+
+fn path_of_uri(uri: &str) -> Option<std::path::PathBuf> {
+    let spelled = spelled_path_of_uri(uri)?;
+    Some(std::path::PathBuf::from(if spelled.starts_with('/') {
+        spelled
+    } else {
+        spelled.replace('/', "\\")
+    }))
 }
 #[cfg(test)]
 mod tests {
@@ -404,6 +432,21 @@ mod tests {
         assert_eq!(
             content.file_paths().unwrap(),
             [std::path::PathBuf::from("C:\\Users\\me\\a b.jpg")]
+        );
+    }
+
+    /// Read on the other OS, a copied path keeps the spelling its owner gave
+    /// it rather than being reinterpreted as a path there.
+    #[test]
+    fn copied_paths_keep_their_owners_spelling() {
+        let content = ClipboardContent::single(
+            ClipboardFormat::UriList,
+            b"file:///C:/Users/me/a%20b.jpg\r\nfile:///home/me/%D1%84%D0%BE%D1%82%D0%BE.png\r\n"
+                .to_vec(),
+        );
+        assert_eq!(
+            content.copied_file_paths().unwrap(),
+            ["C:/Users/me/a b.jpg", "/home/me/фото.png"]
         );
     }
 

@@ -207,6 +207,7 @@ impl SessionModule for FilesEngine {
         // those threads, so the process hung in `unmount` with this function's
         // own log line as its last.
         self.mount_link.shut_down();
+        crate::files_session::peer_paths::withdraw(&self.peer_name, self.mounts_publisher);
         // Dropping the handles unmounts.
         #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
         if !self.volume_mounts.is_empty() {

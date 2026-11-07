@@ -43,6 +43,7 @@ pub(super) fn engine() -> (FilesEngine, tokio::sync::mpsc::UnboundedSender<Op>) 
         in_progress: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
         volume_mounts: HashMap::new(),
+        mounts_publisher: crate::files_session::peer_paths::publisher(),
         mount_link: PeerLink::new(tokio::sync::mpsc::unbounded_channel().0),
         #[cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))]
         mount_retry_at: None,
