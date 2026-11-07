@@ -476,8 +476,19 @@ impl ResumableLink {
                 usize::MAX
             }
         });
+        let weak = Arc::downgrade(&self.inner);
+        let carrying = Arc::new(move || {
+            let inner = weak.upgrade()?;
+            let state = inner.lock();
+            let path = state.carrying(Lane::Interactive, Instant::now())?;
+            Some(match path.kind {
+                PathKind::Bluetooth => crate::stream::BLUETOOTH,
+                _ => "network",
+            })
+        });
         let tx = PrioritizedTx::spawn_lanes(sinks)
             .with_holding(holding)
+            .with_carrying_path(carrying)
             .with_frame_limit(frame_limit);
         self.inner.lock().kick = Some(tx.kick_handle());
         Box::new(tx)

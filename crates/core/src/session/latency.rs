@@ -11,6 +11,17 @@ pub(super) const INPUT_LATENCY_WINDOW: Duration = Duration::from_secs(30);
 /// much in one frame out of a hundred is visibly trailing the hand.
 pub(super) const INPUT_LATENCY_WARN: Duration = Duration::from_millis(20);
 
+/// A round-trip p99 at or above this is logged at `warn`, naming the path.
+///
+/// The input-latency warning above measures only this machine's own stretch
+/// of the way, so a link that held a pointer up — Bluetooth sharing its radio
+/// with a phone's audio, a congested Wi-Fi — left nothing in the warnings at
+/// all; the round trips that showed it were logged as `info`. Measured here,
+/// a healthy network link's p99 is under 10 ms and a healthy Bluetooth one's
+/// under 90 ms, while the stalls a person feels run to hundreds of
+/// milliseconds and past a second.
+pub(super) const ROUND_TRIP_WARN: Duration = Duration::from_millis(150);
+
 /// Samples kept per window. Beyond this the oldest are overwritten, which
 /// keeps a gaming mouse's thousand events a second from growing memory while
 /// still leaving thousands of samples behind each percentile.
@@ -132,11 +143,22 @@ impl InteractiveProbe {
         }
     }
 
-    pub(super) fn report(&mut self) {
+    /// Log the window's round trips; `path` is what carried input meanwhile.
+    pub(super) fn report(&mut self, path: Option<&'static str>) {
         if self.latency.started.elapsed() < INPUT_LATENCY_WINDOW {
             return;
         }
         if let Some((p50, p99, maximum)) = self.latency.percentiles() {
+            if p99 >= ROUND_TRIP_WARN {
+                tracing::warn!(
+                    peer = ?self.peer,
+                    path = path.unwrap_or("the link"),
+                    p50_ms = p50.as_secs_f64() * 1000.0,
+                    p99_ms = p99.as_secs_f64() * 1000.0,
+                    max_ms = maximum.as_secs_f64() * 1000.0,
+                    "the link to the peer is slow enough to feel: input arrives late and in jumps"
+                );
+            }
             tracing::info!(
                 peer = ?self.peer,
                 samples = self.latency.total,

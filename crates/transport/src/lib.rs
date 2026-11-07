@@ -197,6 +197,13 @@ pub trait TransportTx: Send {
     fn holding(&self) -> bool {
         false
     }
+
+    /// Which kind of path carries input now — [`stream::BLUETOOTH`] or
+    /// `"network"` — for a link with more than one. `None` for a link over a
+    /// single connection, whose kind never changes and is the transport's own.
+    fn carrying_path(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// The receive half of a split [`Transport`].

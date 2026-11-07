@@ -458,6 +458,8 @@ pub struct PrioritizedTx {
     /// Answers [`TransportTx::holding`] for a sink that can lose its
     /// connection and wait for another.
     holding: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Answers [`TransportTx::carrying_path`] for a sink with several paths.
+    carrying_path: Option<Arc<dyn Fn() -> Option<&'static str> + Send + Sync>>,
     /// The largest frame to cut a message into, for a sink whose connection
     /// may be slow; the full Noise budget without it.
     frame_limit: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
@@ -604,6 +606,7 @@ impl PrioritizedTx {
             _open: Arc::new(OpenHandle(shared.clone())),
             shared,
             holding: None,
+            carrying_path: None,
             frame_limit: None,
         }
     }
@@ -611,6 +614,15 @@ impl PrioritizedTx {
     /// Answer [`TransportTx::holding`] with `holding`.
     pub(crate) fn with_holding(mut self, holding: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.holding = Some(holding);
+        self
+    }
+
+    /// Answer [`TransportTx::carrying_path`] with `carrying`.
+    pub(crate) fn with_carrying_path(
+        mut self,
+        carrying: Arc<dyn Fn() -> Option<&'static str> + Send + Sync>,
+    ) -> Self {
+        self.carrying_path = Some(carrying);
         self
     }
 
@@ -751,6 +763,10 @@ impl TransportTx for PrioritizedTx {
 
     fn holding(&self) -> bool {
         self.holding.as_ref().is_some_and(|holding| holding())
+    }
+
+    fn carrying_path(&self) -> Option<&'static str> {
+        self.carrying_path.as_ref().and_then(|carrying| carrying())
     }
 
     async fn flush(&mut self) {

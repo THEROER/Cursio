@@ -153,6 +153,13 @@ impl TransportTx for LinkTx {
             .ok()
             .is_some_and(|slot| slot.as_ref().is_some_and(|tx| tx.holding()))
     }
+
+    fn carrying_path(&self) -> Option<&'static str> {
+        self.slot
+            .try_lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(|tx| tx.carrying_path()))
+    }
 }
 
 #[cfg(test)]

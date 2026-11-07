@@ -402,7 +402,7 @@ where
         self.inject_latency.report_if_due();
         self.inject_call.report_if_due();
         self.forward_latency.report_if_due();
-        self.probe.report();
+        self.probe.report(self.tx.carrying_path());
         // Has the peer gone quiet? Checked on the heartbeat tick, so detection
         // costs nothing extra and lands within one interval of the deadline.
         let heard_at = Duration::from_millis(self.last_heard.load(Ordering::Relaxed));
