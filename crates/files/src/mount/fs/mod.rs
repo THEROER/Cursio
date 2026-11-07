@@ -19,6 +19,7 @@ mod kernel;
 
 mod handle;
 mod listing;
+mod write;
 
 pub use handle::{mount, release_stale_peer_mounts, MountHandle};
 
@@ -65,6 +66,9 @@ pub struct RemoteFs {
     bound: String,
     /// Whose disk this is, for naming it when something walks it.
     peer_name: String,
+    /// Writes travelling at once across every handle of this mount; see
+    /// [`crate::writeback::InFlightBudget`] for why it is not per handle.
+    write_budget: crate::writeback::InFlightBudget,
 }
 
 struct State {
@@ -78,6 +82,9 @@ struct State {
     /// Files opened for reading that the owner has not been asked to open
     /// yet, by our handle; see [`RemoteFs::open_for_read`].
     unopened: std::collections::HashMap<u64, Unopened>,
+    /// Each writing handle's gathered and unconfirmed writes, by our handle;
+    /// see [`write`].
+    writes: std::collections::HashMap<u64, std::sync::Arc<Mutex<write::HandleWrites>>>,
 }
 
 /// A file opened here for reading, not yet opened on its owner.
@@ -141,12 +148,14 @@ impl RemoteFs {
             volumes: crate::metacache::VolumeList::default(),
             bound: bound.into(),
             peer_name: String::new(),
+            write_budget: crate::writeback::InFlightBudget::new(),
             state: Mutex::new(State {
                 inodes: InodeTable::new(),
                 handles: std::collections::HashMap::new(),
                 next_handle: 1,
                 heads: std::collections::HashMap::new(),
                 unopened: std::collections::HashMap::new(),
+                writes: std::collections::HashMap::new(),
             }),
             // Safe: these are plain getuid/getgid calls with no preconditions.
             uid: unsafe { libc::getuid() },
@@ -221,6 +230,44 @@ impl RemoteFs {
             );
         }
         Ok(remote)
+    }
+
+    /// The writes of handle `fh`, begun at its first write; `None` for a
+    /// handle with no owner handle to write through.
+    fn writes_of(
+        &self,
+        fh: u64,
+        volume: &str,
+        path: &str,
+    ) -> Option<std::sync::Arc<Mutex<write::HandleWrites>>> {
+        let mut state = self.state.lock().expect("inode state");
+        if let Some(writes) = state.writes.get(&fh) {
+            return Some(writes.clone());
+        }
+        let remote = *state.handles.get(&fh)?;
+        let writes = std::sync::Arc::new(Mutex::new(write::HandleWrites::new(
+            volume.to_string(),
+            path.to_string(),
+            remote,
+            self.write_budget.clone(),
+        )));
+        state.writes.insert(fh, writes.clone());
+        Some(writes)
+    }
+
+    /// Settle `fh`'s writes, if it has written; see [`write`].
+    fn settle_fh(&self, fh: u64) -> Result<(), FileError> {
+        let writes = self
+            .state
+            .lock()
+            .expect("inode state")
+            .writes
+            .get(&fh)
+            .cloned();
+        match writes {
+            Some(writes) => self.settle(&writes),
+            None => Ok(()),
+        }
     }
 
     /// Drop every head held for `ino`: this machine is changing the file.

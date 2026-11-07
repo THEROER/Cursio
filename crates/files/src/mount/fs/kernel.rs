@@ -132,6 +132,9 @@ impl Filesystem for RemoteFs {
             }
             Entry::Path { volume, path } => {
                 let child = join(&path, name);
+                // As in `getattr`: a file being written answers its size only
+                // once the owner has caught up.
+                self.settle_path(&volume, &child);
                 let meta = match self.stat_path(&volume, &child) {
                     Ok(m) => m,
                     Err(e) => return reply.error(to_errno(&e)),
@@ -176,10 +179,19 @@ impl Filesystem for RemoteFs {
             // Through the cache: an `lstat` whose attributes have expired while
             // the name is still known arrives here instead of at `lookup`, and
             // is the same question.
-            Some(Entry::Path { volume, path }) => match self.stat_path(&volume, &path) {
-                Ok(meta) => reply.attr(&CACHE_TTL, &attr_from(ino.0, &meta, self.uid, self.gid)),
-                Err(e) => reply.error(to_errno(&e)),
-            },
+            //
+            // A file being written is settled first: the owner's size lags
+            // the writes still on their way, and the kernel would cut its
+            // pages to it (see `write`).
+            Some(Entry::Path { volume, path }) => {
+                self.settle_path(&volume, &path);
+                match self.stat_path(&volume, &path) {
+                    Ok(meta) => {
+                        reply.attr(&CACHE_TTL, &attr_from(ino.0, &meta, self.uid, self.gid))
+                    }
+                    Err(e) => reply.error(to_errno(&e)),
+                }
+            }
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -243,27 +255,25 @@ impl Filesystem for RemoteFs {
         }
     }
 
-    /// Nothing to flush.
+    /// Send what this handle gathered and wait for the owner to confirm all of
+    /// it.
     ///
-    /// Every write that reaches [`RemoteFs::write`] is a `Write` the peer
-    /// answers before the caller returns, so anything written has already been
-    /// stored by the time a `close()` arrives, and there is nothing here that
-    /// could still fail. A scheme that acknowledged a write before the peer
-    /// stored it would need this call to report the failure instead — and
-    /// would then depend on the caller checking a `close()` return that most
-    /// programs ignore.
-    ///
-    /// Left unimplemented it answers `ENOSYS` — which the kernel tolerates, but
-    /// which logs a warning on every single file close.
+    /// Called at every `close(2)` of the descriptor, and its error is what that
+    /// `close` returns: writes are answered before the owner stored them (see
+    /// `write`), so this is where a failure among the last of them reaches the
+    /// application.
     fn flush(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        match self.settle_fh(fh.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_errno(&e)),
+        }
     }
 
     fn readdir(
@@ -340,14 +350,13 @@ impl Filesystem for RemoteFs {
         );
     }
 
-    /// Nothing is buffered, so there is nothing to force to disk.
+    /// Wait until the owner has confirmed every write of this handle.
     ///
-    /// Every `Write` is a request the peer answers before the caller returns,
-    /// so by the time an `fsync` arrives the bytes are as durable as this
-    /// filesystem can make them. Answering `ENOSYS` would be read by callers as
+    /// Writes are gathered and answered before the owner stored them (see
+    /// `write`), so an `fsync` sends what is gathered and waits for each
+    /// answer, returning the first failure. Answering `ENOSYS` would be read as
     /// "the write may not have landed" — SQLite and any editor that fsyncs
-    /// before replacing a file treat that as data loss and refuse to proceed,
-    /// which is a good deal worse than the warning it also logs.
+    /// before replacing a file treat that as data loss and refuse to proceed.
     ///
     /// What this cannot promise is the peer's own disk cache: `fsync` there is
     /// not part of the protocol. The honest reading is "delivered and
@@ -356,11 +365,14 @@ impl Filesystem for RemoteFs {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        match self.settle_fh(fh.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_errno(&e)),
+        }
     }
 
     /// Directories are never buffered either; see [`RemoteFs::fsync`].
@@ -649,7 +661,7 @@ impl Filesystem for RemoteFs {
     fn read(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: fuser::FileHandle,
         offset: u64,
         size: u32,
@@ -657,11 +669,19 @@ impl Filesystem for RemoteFs {
         _lock: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let (remote, unopened) = {
+        {
             let state = self.state.lock().expect("inode state");
             if let Some(bytes) = state.heads.get(&fh.0).and_then(|h| h.read(offset, size)) {
                 return reply.data(bytes);
             }
+        }
+        // Going to the owner: whatever this machine wrote to the file must be
+        // there first, or the read returns what it replaced (see `write`).
+        if let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) {
+            self.settle_path(&volume, &path);
+        }
+        let (remote, unopened) = {
+            let state = self.state.lock().expect("inode state");
             (
                 state.handles.get(&fh.0).copied(),
                 state.unopened.get(&fh.0).cloned(),
@@ -699,20 +719,21 @@ impl Filesystem for RemoteFs {
         _lock: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
-        let Some(remote) = self.remote_handle(fh) else {
+        let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) else {
+            return reply.error(Errno::EBADF);
+        };
+        let Some(writes) = self.writes_of(fh.0, &volume, &path) else {
             return reply.error(Errno::EBADF);
         };
         // The size and modification time this changes are exactly what the
         // cache holds, so it must not answer the next `getattr` with what it
         // knew before the write.
-        if let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) {
-            self.meta.forget(&volume, &path);
-        }
+        self.meta.forget(&volume, &path);
         self.forget_heads(ino.0);
-        match self.peer.write(remote, offset, data.to_vec()) {
-            // A short write would make the caller retry the remainder; the peer
-            // writes all or fails, so this is always the full length.
-            Ok(written) => reply.written(written as u32),
+        // Gathered and pipelined; see `write`. A failure of this write reaches
+        // the application at its next write, `fsync` or `close`.
+        match self.gather_write(&writes, offset, data) {
+            Ok(written) => reply.written(written),
             Err(e) => reply.error(to_errno(&e)),
         }
     }
@@ -871,6 +892,11 @@ impl Filesystem for RemoteFs {
         // anyway.
         if let Some(size) = size {
             self.forget_heads(ino.0);
+            // Writes still on their way would land after the truncate and
+            // undo it.
+            if let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) {
+                self.settle_path(&volume, &path);
+            }
             let remote = fh
                 .and_then(|fh| self.remote_handle(fh))
                 .or_else(|| self.open_for_truncate(ino));
@@ -901,10 +927,16 @@ impl Filesystem for RemoteFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        // The last `flush` settled this already unless something wrote after
+        // it; a failure here has no caller left to tell, so it is only logged.
+        if let Err(e) = self.settle_fh(fh.0) {
+            tracing::warn!(error = ?e, "writes to a file failed after its last close");
+        }
         let remote = {
             let mut state = self.state.lock().expect("inode state");
             state.heads.remove(&fh.0);
             state.unopened.remove(&fh.0);
+            state.writes.remove(&fh.0);
             state.handles.remove(&fh.0)
         };
         if let Some(remote) = remote {

@@ -147,6 +147,13 @@ impl WriteBack {
         self.failed.take()
     }
 
+    /// Record a failure that happened outside an answer — a write that could
+    /// not even be sent — for the handle's writer to be told, keeping an
+    /// earlier one if there is.
+    pub fn fail(&mut self, error: FileError) {
+        self.failed.get_or_insert(error);
+    }
+
     /// Collect the answer to the oldest outstanding write.
     ///
     /// `wait` is how each answer is awaited, so the caller keeps its own
