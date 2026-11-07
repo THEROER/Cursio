@@ -51,6 +51,40 @@ impl UsbFactory {
     }
 }
 
+/// Why this process's one request to set the machine up came to nothing.
+#[cfg(target_os = "linux")]
+static SETUP_REFUSED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Whether this machine is set up to share USB, asking for privilege at most
+/// once per process.
+///
+/// One prompt for the machine, not one per device: loading the modules and
+/// making the control files group-writable is a property of this host, and
+/// everything after it runs unprivileged. Does nothing when the machine is
+/// already set up, so this is free on every start but the first.
+///
+/// Remembered because adverts are built for every link: a machine where the
+/// prompt was declined, or where pkexec has no agent to show one, asked again
+/// for each — three times within a second on one laptop, and on a desktop that
+/// would have been a dialog per link. A machine set up by hand after the
+/// refusal is noticed without asking.
+#[cfg(target_os = "linux")]
+fn set_up_once() -> bool {
+    if SETUP_REFUSED.get().is_some() {
+        return cursio_usb::setup::readiness().is_complete();
+    }
+    let refused = match cursio_usb::setup::ensure_ready() {
+        Ok(true) => return true,
+        Ok(false) => "setting this machine up needs privilege and the prompt was declined \
+                      (or no polkit agent could show it); restart cursio to be asked again"
+            .to_string(),
+        Err(e) => e.to_string(),
+    };
+    tracing::warn!(reason = %refused, "usb sharing is off");
+    let _ = SETUP_REFUSED.set(refused);
+    false
+}
+
 impl crate::module::ModuleFactory for UsbFactory {
     fn id(&self) -> ModuleId {
         ModuleId::USB
@@ -66,24 +100,8 @@ impl crate::module::ModuleFactory for UsbFactory {
         // `modprobe` the user can run.
         #[cfg(target_os = "linux")]
         {
-            // One prompt for the machine, not one per device: loading the
-            // modules and making the control files group-writable is a
-            // property of this host, and everything after it runs
-            // unprivileged. Does nothing when the machine is already set up,
-            // so this is free on every start but the first.
-            match cursio_usb::setup::ensure_ready() {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!(
-                        "usb sharing is off: setting this machine up needs privilege \
-                         and the prompt was declined"
-                    );
-                    return None;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "usb sharing is off");
-                    return None;
-                }
+            if !set_up_once() {
+                return None;
             }
             if !LinuxUsbBackend::new().is_available() {
                 tracing::warn!("usb sharing is off: the usbip-host module did not load");
