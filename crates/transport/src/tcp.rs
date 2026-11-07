@@ -156,6 +156,11 @@ impl TransportTx for TcpTx {
         self.write.flush().await?;
         Ok(())
     }
+
+    fn carries_bulk_alone(&mut self) {
+        #[cfg(target_os = "windows")]
+        self.backlog.release(self.write.as_ref());
+    }
 }
 
 /// Receive half of a split [`TcpTransport`].
