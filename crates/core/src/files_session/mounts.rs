@@ -167,6 +167,7 @@ pub(super) fn mount_one_volume(
     peer: PeerLink,
     peer_name: &str,
     volume: &Volume,
+    _publisher: u64,
 ) -> anyhow::Result<Mount> {
     Ok(cursio_files::mount::mount(
         peer,
@@ -176,17 +177,22 @@ pub(super) fn mount_one_volume(
     )?)
 }
 
+/// `publisher` is the engine's identity in `peer_paths`, where the drive
+/// letter is recorded once known — at once here, when the helper reports it
+/// for a relayed mount.
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 pub(super) fn mount_one_volume(
     peer: PeerLink,
     peer_name: &str,
     volume: &Volume,
+    publisher: u64,
 ) -> anyhow::Result<Mount> {
     let name = cursio_files::peer_volume_name(peer_name, &volume.id, volume.removable);
     #[cfg(feature = "files-mount")]
     {
         if crate::elevate::is_elevated() {
-            match crate::mount_helper::mount(peer.clone(), peer_name, &volume.id, &name) {
+            match crate::mount_helper::mount(peer.clone(), peer_name, &volume.id, &name, publisher)
+            {
                 Ok(relayed) => return Ok(Mount::Helper(relayed)),
                 Err(e) => tracing::warn!(
                     peer = %peer_name,
@@ -197,14 +203,16 @@ pub(super) fn mount_one_volume(
                 ),
             }
         }
-        cursio_files::winmount::mount(peer, peer_name, &volume.id, &name)
-            .map(|drive| Mount::Here { _drive: drive })
+        cursio_files::winmount::mount(peer, peer_name, &volume.id, &name).map(|drive| {
+            super::peer_paths::note_drive(publisher, peer_name, &volume.id, drive.mountpoint());
+            Mount::Here { _drive: drive }
+        })
     }
     // Without WinFsp in this binary the helper is the only way to mount,
     // elevated or not.
     #[cfg(not(feature = "files-mount"))]
     {
-        crate::mount_helper::mount(peer, peer_name, &volume.id, &name).map(Mount::Helper)
+        crate::mount_helper::mount(peer, peer_name, &volume.id, &name, publisher).map(Mount::Helper)
     }
 }
 
@@ -289,6 +297,7 @@ impl FilesEngine {
                     // server did to a peer that had files open when a disk was
                     // unplugged.
                     server.adopt_volumes(after);
+                    super::peer_paths::publish_own(server.volume_roots());
                     Some(now)
                 }
             };
@@ -323,6 +332,9 @@ impl FilesEngine {
             }
             let alive = mount_is_alive(mount);
             fell |= keep && !alive;
+            if !(keep && alive) {
+                super::peer_paths::forget_drive(self.mounts_publisher, id);
+            }
             keep && alive
         });
         if fell {
@@ -341,7 +353,12 @@ impl FilesEngine {
             if self.volume_mounts.contains_key(&volume.id) {
                 continue;
             }
-            match mount_one_volume(self.mount_link.clone(), &self.peer_name, volume) {
+            match mount_one_volume(
+                self.mount_link.clone(),
+                &self.peer_name,
+                volume,
+                self.mounts_publisher,
+            ) {
                 Ok(m) => {
                     self.volume_mounts.insert(volume.id.clone(), m);
                 }

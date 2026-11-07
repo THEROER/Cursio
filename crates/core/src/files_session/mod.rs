@@ -244,6 +244,7 @@ impl FilesEngine {
         let mut server = FileServer::detect_shared(&share);
         server.exclude(excluded_paths(&peer_name));
         let local_volumes = server.volumes();
+        peer_paths::publish_own(server.volume_roots());
         cursio_files::walk::set_reporter(report_walk);
 
         Ok(Self {

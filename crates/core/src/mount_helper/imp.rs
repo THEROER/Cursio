@@ -307,11 +307,16 @@ impl Drop for RelayedMount {
 
 /// Have the helper present one of the peer's volumes, answering its calls
 /// from `link`. Must be called inside the link's runtime.
+///
+/// The letter the helper picks is recorded under `publisher` in
+/// `files_session::peer_paths`, where a file copied from that drive is told
+/// apart as the peer's.
 pub fn mount(
     link: PeerLink,
     peer_name: &str,
     volume: &str,
     label: &str,
+    publisher: u64,
 ) -> anyhow::Result<RelayedMount> {
     let runtime = tokio::runtime::Handle::try_current()
         .context("a relayed mount needs the link's runtime")?;
@@ -331,12 +336,15 @@ pub fn mount(
                 return;
             }
         };
-        let (mounted_tx, mounted_rx) = tokio::sync::oneshot::channel();
+        let (mounted_tx, mounted_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
         let report = {
             let (peer, volume) = (peer.clone(), volume.clone());
             async move {
                 match mounted_rx.await {
-                    Ok(Ok(at)) => tracing::info!(peer = %peer, volume = %volume, at = %at, "peer volume mounted where Explorer sees it"),
+                    Ok(Ok(at)) => {
+                        crate::files_session::peer_paths::note_drive(publisher, &peer, &volume, &at);
+                        tracing::info!(peer = %peer, volume = %volume, at = %at, "peer volume mounted where Explorer sees it")
+                    }
                     Ok(Err(reason)) => tracing::warn!(peer = %peer, volume = %volume, reason = %reason, "the drive helper could not mount this volume; will retry"),
                     Err(_) => {}
                 }

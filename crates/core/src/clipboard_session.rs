@@ -82,6 +82,36 @@ const PULLABLE: &[ClipboardFormat] = &[
     ClipboardFormat::Text,
 ];
 
+/// A file list about to leave, with this machine's Cursio drive letters named
+/// by the shares they mount, so the machine pasting it can tell whose disk a
+/// file is on (`files_session::peer_paths::shared_spelling`). A list naming no
+/// such drive leaves byte for byte as read.
+fn shared_list(bytes: Vec<u8>) -> Vec<u8> {
+    #[cfg(feature = "files")]
+    {
+        let list = ClipboardContent::single(ClipboardFormat::UriList, bytes);
+        let paths = list.copied_file_paths().unwrap_or_default();
+        let shared: Vec<String> = paths
+            .iter()
+            .map(|p| crate::files_session::peer_paths::shared_spelling(p))
+            .collect();
+        let bytes = list
+            .bytes(&ClipboardFormat::UriList)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        if shared == paths {
+            return bytes;
+        }
+        let shared: Vec<std::path::PathBuf> = shared.into_iter().map(Into::into).collect();
+        ClipboardContent::files(&shared)
+            .bytes(&ClipboardFormat::UriList)
+            .map(<[u8]>::to_vec)
+            .unwrap_or(bytes)
+    }
+    #[cfg(not(feature = "files"))]
+    bytes
+}
+
 /// What to put on this clipboard for a file list copied on `peer`.
 ///
 /// The paths name files on the peer's disk, so each is rewritten to the same
@@ -92,17 +122,24 @@ const PULLABLE: &[ClipboardFormat] = &[
 /// it — and in the encoding the clipboard reads it back in, which is how the
 /// write is later told apart from a copy made here.
 ///
-/// A path on no volume mounted here — the files module is off, or the peer
+/// A file the peer copied through its mount of this machine's disk is this
+/// machine's own, and is pasted from where it lives here; one through its
+/// mount of a third machine is pasted through this machine's mount of that
+/// one. `me` is this machine's name as peers know it.
+///
+/// A path on no volume reachable here — the files module is off, or the peer
 /// shares only a folder elsewhere — is left out, since it names nothing here.
 /// When none is left, the paths go on as text, which is what a paste of them
 /// produced before and still says what was copied.
-fn files_here(peer: &str, copied: &ClipboardContent) -> ClipboardContent {
+fn files_here(me: &str, peer: &str, copied: &ClipboardContent) -> ClipboardContent {
     let paths = copied.copied_file_paths().unwrap_or_default();
     #[cfg(feature = "files")]
     let here: Vec<std::path::PathBuf> = paths
         .iter()
-        .filter_map(|p| crate::files_session::peer_paths::path_here(peer, p))
+        .filter_map(|p| crate::files_session::peer_paths::path_here(me, peer, p))
         .collect();
+    #[cfg(not(feature = "files"))]
+    let _ = me;
     #[cfg(not(feature = "files"))]
     let here: Vec<std::path::PathBuf> = Vec::new();
 
@@ -194,8 +231,11 @@ pub struct ClipboardEngine {
     /// more than one notification for a single write.
     last_remote_copy: Option<ClipboardContent>,
 
-    /// The peer's display name, for logs.
+    /// The peer's display name, for logs and for finding its files here.
     peer_name: String,
+    /// This machine's name as peers know it, which is how a file copied
+    /// through a peer's mount of this machine's disk is recognised as ours.
+    local_name: String,
 
     /// Set on a phone, whose clipboard is written but never watched; see
     /// [`phone`].
@@ -236,6 +276,12 @@ impl ClipboardEngine {
         Self::with_worker(peer_name, ClipboardWorker::spawn(), None)
     }
 
+    /// Name this machine as its peers know it.
+    fn on_machine(mut self, local_name: &str) -> Self {
+        self.local_name = local_name.to_string();
+        self
+    }
+
     /// The module on a phone: received copies go to the system through
     /// `clipboard`, and only copies handed to `link` are offered.
     fn on_phone(peer_name: String, clipboard: &PhoneClipboard, link: phone::PhoneLink) -> Self {
@@ -268,6 +314,7 @@ impl ClipboardEngine {
             pending_failures: Vec::new(),
             last_remote_copy: None,
             peer_name,
+            local_name: String::new(),
             phone,
             offered: 0,
             pulled: 0,
@@ -477,6 +524,11 @@ impl ClipboardEngine {
                         .await?;
                         continue;
                     }
+                    let bytes = if format == ClipboardFormat::UriList {
+                        shared_list(bytes)
+                    } else {
+                        bytes
+                    };
                     // Queue for chunked streaming from `pump_outbound`.
                     self.outbound.insert(
                         (generation, format.clone()),
@@ -766,7 +818,7 @@ impl ClipboardEngine {
                 entries: vec![ClipboardEntry::loaded(format, buf)],
             };
             if content.has(&ClipboardFormat::UriList) {
-                content = files_here(&self.peer_name, &content);
+                content = files_here(&self.local_name, &self.peer_name, &content);
             }
             self.last_remote_copy = Some(content.clone());
             self.worker.write(content);
@@ -815,17 +867,20 @@ impl crate::module::ModuleFactory for ClipboardFactory {
 
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         let name = ctx.peer_name().to_string();
-        Ok(Box::new(match &self.phone {
-            None => ClipboardEngine::new(name),
-            Some(phone) => {
-                let link = phone.attach(
-                    ctx.peer.peer_id,
-                    name.clone(),
-                    ctx.peer.device_kind.takes_cursor(),
-                );
-                ClipboardEngine::on_phone(name, phone, link)
+        Ok(Box::new(
+            match &self.phone {
+                None => ClipboardEngine::new(name),
+                Some(phone) => {
+                    let link = phone.attach(
+                        ctx.peer.peer_id,
+                        name.clone(),
+                        ctx.peer.device_kind.takes_cursor(),
+                    );
+                    ClipboardEngine::on_phone(name, phone, link)
+                }
             }
-        }))
+            .on_machine(&ctx.local.display_name),
+        ))
     }
 }
 

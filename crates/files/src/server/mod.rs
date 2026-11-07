@@ -164,6 +164,15 @@ impl FileServer {
         self.ns.volumes.iter().map(|v| v.info.clone()).collect()
     }
 
+    /// The volumes offered, each with the directory it serves.
+    pub fn volume_roots(&self) -> Vec<(Volume, PathBuf)> {
+        self.ns
+            .volumes
+            .iter()
+            .map(|v| (v.info.clone(), v.root.clone()))
+            .collect()
+    }
+
     /// Take the volume set from a fresh scan, keeping the handles this one has
     /// open.
     ///

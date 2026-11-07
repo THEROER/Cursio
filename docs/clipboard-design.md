@@ -355,6 +355,13 @@ mount path, a drive, or a shared folder's path), so a path on no mounted
 volume is left out, and a list with nothing left is written as the paths in
 text, which is what a paste gave before.
 
-A copy made from a peer's mount of *this* machine's disk names the file through
-the peer's `~/Cursio`, which the peer refuses to serve back; that paste fails
-rather than being mapped home.
+A file copied *inside a mount* is named by the mount, and the copying machine
+refuses to serve its mounts back. Such a path is recognised by the mount's own
+spelling — `…/Cursio/<machine>/<volume>/…` on Linux, `//cursio/<machine>-<share>/…`
+on Windows — and taken to the machine whose disk it is: this machine's own
+folder when it is ours (each files engine publishes its served volumes and
+their roots), the local mount of a third machine when that one is mounted here
+too. Explorer names such a file by drive letter, which says nothing about the
+machine, so a Windows node records the letter each of its Cursio mounts got and
+rewrites it into the share before a copied list leaves
+(`peer_paths::shared_spelling`).
