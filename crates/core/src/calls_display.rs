@@ -76,6 +76,40 @@ fn describe(phone: &PhoneCalls, call: &Call) -> String {
     format!("{what} on {}{route}", phone.name)
 }
 
+/// What a call shows as. Only a call still waiting for an answer is a
+/// [`NotifyKind::Call`]: that kind is what rings — urgent and kept on screen
+/// on Linux, Windows' `incomingCall` toast, which loops its ringtone until the
+/// toast goes. Kept as one after it was answered, the replaced toast rang on
+/// through the whole conversation on a machine the user was not at.
+fn notification(
+    key: &str,
+    phone: &PhoneCalls,
+    call: &Call,
+    buttons: &[(&'static str, CallAction)],
+) -> Notification {
+    Notification {
+        key: key.to_string(),
+        app_id: "dev.cursio.calls".into(),
+        app_name: "Phone".into(),
+        title: call.who().to_string(),
+        text: describe(phone, call),
+        icon: None,
+        when_ms: 0,
+        kind: if call.state.is_incoming_offer() {
+            NotifyKind::Call
+        } else {
+            NotifyKind::Other
+        },
+        actions: buttons
+            .iter()
+            .map(|(title, _)| NotifyAction {
+                title: (*title).into(),
+                reply: false,
+            })
+            .collect(),
+    }
+}
+
 struct State {
     /// Shown keys, with the phone and buttons behind each.
     shown: HashMap<String, (String, Vec<CallAction>)>,
@@ -132,23 +166,7 @@ pub fn start(display: Arc<dyn NotifyDisplay>) {
             for call in &phone.calls {
                 let key = format!("call:{}:{}", phone.name, call.id);
                 let buttons = buttons(phone, call, muted);
-                let notification = Notification {
-                    key: key.clone(),
-                    app_id: "dev.cursio.calls".into(),
-                    app_name: "Phone".into(),
-                    title: call.who().to_string(),
-                    text: describe(phone, call),
-                    icon: None,
-                    when_ms: 0,
-                    kind: NotifyKind::Call,
-                    actions: buttons
-                        .iter()
-                        .map(|(title, _)| NotifyAction {
-                            title: (*title).into(),
-                            reply: false,
-                        })
-                        .collect(),
-                };
+                let notification = notification(&key, phone, call, &buttons);
                 let actions: Vec<CallAction> = buttons.into_iter().map(|(_, a)| a).collect();
                 let new_call = !state.shown.contains_key(&key);
                 if new_call && crate::presence::user_here() && open_call_window() {
@@ -252,6 +270,26 @@ mod tests {
             b.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
             ["Answer", "Decline"]
         );
+    }
+
+    #[test]
+    fn a_call_rings_only_until_it_is_answered() {
+        let phone = phone(false, false);
+        let shown = |state| {
+            let call = call(state);
+            notification(
+                "call:POCO X7 Pro:1",
+                &phone,
+                &call,
+                &buttons(&phone, &call, false),
+            )
+            .kind
+        };
+        assert_eq!(shown(CallState::Ringing), NotifyKind::Call);
+        assert_eq!(shown(CallState::Waiting), NotifyKind::Call);
+        assert_eq!(shown(CallState::Active), NotifyKind::Other);
+        assert_eq!(shown(CallState::Held), NotifyKind::Other);
+        assert_eq!(shown(CallState::Dialing), NotifyKind::Other);
     }
 
     #[test]

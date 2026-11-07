@@ -278,7 +278,9 @@ another computer carries can still send its voice here.
 - **Notifications** (`calls_display.rs`), through the same notification
   server as the phone's notifications: urgent while ringing, replaced in place
   as the call moves on, closed when it ends. Closing a call's notification is
-  not declining it.
+  not declining it. Only a call waiting for an answer is shown as a call: on
+  Windows that is the `incomingCall` toast, which loops its ringtone for as
+  long as the toast is up, so an answered call is an ordinary notification.
 - **The app's call window** reads `Status.calls`; a change to them is pushed
   to the app at once, not at the control socket's two-second refresh.
 - **The control socket**: `Status.calls`, and `Command::Call { phone, action }`
