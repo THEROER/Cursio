@@ -34,6 +34,12 @@ impl Fnv64 {
         self.write(&v.to_le_bytes())
     }
 
+    /// A string followed by a byte no UTF-8 string contains, so that
+    /// `("ab", "c")` and `("a", "bc")` hash apart.
+    pub(crate) fn write_str(&mut self, s: &str) -> &mut Self {
+        self.write(s.as_bytes()).write(&[0xff])
+    }
+
     pub(crate) fn finish(&self) -> u64 {
         self.0
     }
@@ -53,5 +59,12 @@ mod tests {
             Fnv64::default().write(b"foobar").finish(),
             0x8594_4171_f739_67e8
         );
+    }
+
+    #[test]
+    fn strings_hash_apart_however_they_are_split() {
+        let a = Fnv64::default().write_str("ab").write_str("c").finish();
+        let b = Fnv64::default().write_str("a").write_str("bc").finish();
+        assert_ne!(a, b);
     }
 }

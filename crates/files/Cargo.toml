@@ -79,6 +79,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_WNet",
     # `DRIVE_REMOVABLE`, for telling a stick from a fixed disk.
     "Win32_System_WindowsProgramming",
+    # `FSCTL_SET_SPARSE`, so the read cache's data files keep their holes;
+    # see readcache.rs.
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
 ] }
 
 [dev-dependencies]

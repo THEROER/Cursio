@@ -31,6 +31,9 @@ pub mod mount;
 /// A per-file read buffer that fetches ahead while access stays sequential, so
 /// many small reads share one round trip.
 pub mod readahead;
+/// A peer's file contents kept on this machine's disk across runs, keyed by
+/// the owner's version stamp.
+pub mod readcache;
 /// A mount presented by another process, answered from this one's session.
 pub mod relay;
 pub mod server;
