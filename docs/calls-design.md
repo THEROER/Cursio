@@ -159,7 +159,10 @@ hands-free unit acts on them through it — with the voice staying on the phone
 
 - **State, not events.** `CallsMsg::Calls` carries every call the phone has
   now and is resent whole on change; a call that ended is absent. A link that
-  comes up mid-call is right at once.
+  comes up mid-call is right at once. A change goes out the moment the hub
+  hears it: the hub wakes the link's module (`SessionModule::wake`) instead of
+  leaving it to the one-second pace of a quiet module, which computers heard
+  as ringing on after the call was answered.
 - **The phone side** (`CallMonitor.kt`) is not the default dialer, so it sees
   calls only through the `PHONE_STATE` broadcast: idle, ringing (with the
   number, given `READ_CALL_LOG`), off-hook. That is aggregate, so at most the

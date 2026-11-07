@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use cursio_protocol::calls::CallsMsg;
 use cursio_protocol::{Message, ModuleId, ModuleRole, PeerId};
 use cursio_transport::{TransportError, TransportTx};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
-use crate::calls_hub::{hub, CallActor};
+use crate::calls_hub::{hub, CallActor, Outbox};
 use crate::module::SessionModule;
 
 /// Version of [`CallsMsg`]; peers run the module only on an exact match.
@@ -26,6 +26,8 @@ pub struct CallsEngine {
     actor: Option<Arc<dyn CallActor>>,
     /// Phone: what the monitor reports. Computer: requests for the phone.
     outbox: mpsc::UnboundedReceiver<CallsMsg>,
+    /// Notified by the hub as it queues into `outbox`.
+    wake: Arc<Notify>,
     token: u64,
     computer: bool,
     queued: Vec<CallsMsg>,
@@ -38,12 +40,14 @@ impl CallsEngine {
         actor: Option<Arc<dyn CallActor>>,
         computer: bool,
     ) -> Self {
+        let wake = Arc::new(Notify::new());
         if let Some(actor) = actor {
-            let (now, outbox, token) = hub().register_phone_link();
+            let (now, outbox, token) = hub().register_phone_link(wake.clone());
             CallsEngine {
                 peer,
                 actor: Some(actor),
                 outbox,
+                wake,
                 token,
                 computer,
                 queued: now,
@@ -51,7 +55,7 @@ impl CallsEngine {
         } else {
             let (tx, outbox) = mpsc::unbounded_channel();
             let token = if computer {
-                hub().register_mesh_phone(peer, peer_name, tx)
+                hub().register_mesh_phone(peer, peer_name, Outbox::new(tx, wake.clone()))
             } else {
                 0
             };
@@ -59,6 +63,7 @@ impl CallsEngine {
                 peer,
                 actor: None,
                 outbox,
+                wake,
                 token,
                 computer,
                 queued: Vec::new(),
@@ -122,6 +127,10 @@ impl SessionModule for CallsEngine {
             send(tx, &msg).await?;
         }
         Ok(())
+    }
+
+    fn wake(&self) -> Option<Arc<Notify>> {
+        Some(self.wake.clone())
     }
 
     fn handle_message(&mut self, msg: &Message) -> bool {

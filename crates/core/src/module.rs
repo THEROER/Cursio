@@ -70,6 +70,18 @@ pub trait SessionModule: Send {
         false
     }
 
+    /// Notified when something on this machine gives the module work to send,
+    /// so it is pumped at once rather than at its idle pace.
+    ///
+    /// What the peer sends wakes a module through its inbox; something this
+    /// machine produces does not, and a module quiet for two seconds is
+    /// pumped once a second. For a stream that is the fair price the idle
+    /// pace documents; for a phone's call going from ringing to answered it
+    /// is a second the computers keep ringing.
+    fn wake(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
+
     /// Handle one message from the peer. Only messages whose
     /// [`Message::module_id`] is this module's arrive here; return `false` for
     /// one of those this build does not recognise, which is logged.

@@ -49,7 +49,7 @@ use cursio_protocol::calls::{Call, CallId, CallsMsg};
 use cursio_protocol::PeerId;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::calls_hub::desk::Desk;
 use crate::calls_hub::desk::HandsFreePhone;
@@ -99,6 +99,30 @@ pub trait HandsFreeControl: Send + Sync {
 
 /// Told every phone's calls whenever any of them change.
 pub type OnChange = Arc<dyn Fn(&[PhoneCalls]) + Send + Sync>;
+
+/// One link's calls module as the hub reaches it: what to send, and a nudge
+/// so the module sends it now rather than at its idle pace — a call that
+/// started ringing or was answered is news the moment it happens.
+#[derive(Clone)]
+pub struct Outbox {
+    tx: mpsc::UnboundedSender<CallsMsg>,
+    wake: Arc<Notify>,
+}
+
+impl Outbox {
+    pub fn new(tx: mpsc::UnboundedSender<CallsMsg>, wake: Arc<Notify>) -> Self {
+        Outbox { tx, wake }
+    }
+
+    /// `false` once the link's module has gone.
+    fn send(&self, msg: CallsMsg) -> bool {
+        let sent = self.tx.send(msg).is_ok();
+        if sent {
+            self.wake.notify_one();
+        }
+        sent
+    }
+}
 
 /// One phone as a computer sees it, for the control socket and the menu.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,13 +178,11 @@ impl CallsHub {
         phone.status = Some(status.clone());
         phone.calls = calls.clone();
         phone.links.retain(|(_, tx)| {
-            (!status_changed || tx.send(status.clone()).is_ok())
+            (!status_changed || tx.send(status.clone()))
                 && (!calls_changed
-                    || tx
-                        .send(CallsMsg::Calls {
-                            calls: calls.clone(),
-                        })
-                        .is_ok())
+                    || tx.send(CallsMsg::Calls {
+                        calls: calls.clone(),
+                    }))
         });
     }
 
@@ -178,9 +200,13 @@ impl CallsHub {
     }
 
     /// A link to a computer is up: what to tell it now, and a channel for
-    /// what changes later.
-    pub fn register_phone_link(&self) -> (Vec<CallsMsg>, mpsc::UnboundedReceiver<CallsMsg>, u64) {
+    /// what changes later, with `wake` notified as each change is queued.
+    pub fn register_phone_link(
+        &self,
+        wake: Arc<Notify>,
+    ) -> (Vec<CallsMsg>, mpsc::UnboundedReceiver<CallsMsg>, u64) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let tx = Outbox::new(tx, wake);
         let token: u64 = rand::random();
         let mut phone = lock(&self.phone);
         let mut now = Vec::new();
@@ -211,7 +237,6 @@ impl CallsHub {
             tx.send(CallsMsg::Sound {
                 captured_to: captured_to.clone(),
             })
-            .is_ok()
         });
     }
 
@@ -298,12 +323,7 @@ impl CallsHub {
         lock(&self.desk).control = Some(control);
     }
 
-    pub fn register_mesh_phone(
-        &self,
-        peer: PeerId,
-        name: String,
-        tx: mpsc::UnboundedSender<CallsMsg>,
-    ) -> u64 {
+    pub fn register_mesh_phone(&self, peer: PeerId, name: String, tx: Outbox) -> u64 {
         let token: u64 = rand::random();
         lock(&self.desk).mesh.insert(
             peer,
@@ -512,10 +532,11 @@ impl CallsHub {
             return Err(format!("{} cannot do calls: {reason}", phone.name));
         }
         let msg = mesh_request(&phone.calls, action)?;
-        phone
-            .tx
-            .send(msg)
-            .map_err(|_| format!("the link to {} just closed", phone.name))
+        if phone.tx.send(msg) {
+            Ok(())
+        } else {
+            Err(format!("the link to {} just closed", phone.name))
+        }
     }
 
     fn changed(&self) {
@@ -612,7 +633,7 @@ mod tests {
     fn a_phone_whose_sound_goes_by_capture_is_known_by_its_bluetooth_name() {
         let phone = CallsHub::default();
         phone.set_phone_sound(Some("Cursio(Lightmoon): Speakers".into()));
-        let (told, _rx, _) = phone.register_phone_link();
+        let (told, _rx, _) = phone.register_phone_link(Arc::default());
         let sound = told
             .into_iter()
             .find(|m| matches!(m, CallsMsg::Sound { .. }))
@@ -621,7 +642,7 @@ mod tests {
         let computer = CallsHub::default();
         let (tx, _rx) = mpsc::unbounded_channel();
         let peer = PeerId::from_u128(1);
-        computer.register_mesh_phone(peer, "POCO X7 Pro".into(), tx);
+        computer.register_mesh_phone(peer, "POCO X7 Pro".into(), outbox(tx));
         computer.from_mesh_phone(
             &peer,
             CallsMsg::Status {
@@ -645,7 +666,7 @@ mod tests {
         let hub = CallsHub::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let peer = PeerId::from_u128(1);
-        hub.register_mesh_phone(peer, "POCO X7 Pro".into(), tx);
+        hub.register_mesh_phone(peer, "POCO X7 Pro".into(), outbox(tx));
         hub.from_mesh_phone(
             &peer,
             CallsMsg::Calls {
@@ -665,7 +686,7 @@ mod tests {
         hub.set_hands_free_control(recorder.clone());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let peer = PeerId::from_u128(1);
-        hub.register_mesh_phone(peer, "POCO X7 Pro".into(), tx);
+        hub.register_mesh_phone(peer, "POCO X7 Pro".into(), outbox(tx));
         hub.from_mesh_phone(
             &peer,
             CallsMsg::Status {
@@ -821,7 +842,7 @@ mod tests {
         let hub = CallsHub::default();
         let (tx, _rx) = mpsc::unbounded_channel();
         let peer = PeerId::from_u128(1);
-        hub.register_mesh_phone(peer, "POCO X7 Pro".into(), tx);
+        hub.register_mesh_phone(peer, "POCO X7 Pro".into(), outbox(tx));
         hub.from_mesh_phone(
             &peer,
             CallsMsg::Calls {
@@ -860,7 +881,7 @@ mod tests {
             bluetooth_name: None,
         };
         hub.set_phone(status.clone(), vec![call(1, CallState::Active)]);
-        let (now, mut rx, _) = hub.register_phone_link();
+        let (now, mut rx, _) = hub.register_phone_link(Arc::default());
         assert_eq!(
             now,
             vec![
@@ -876,6 +897,52 @@ mod tests {
             CallsMsg::Calls { calls: Vec::new() }
         );
         assert!(hub.reports_calls());
+    }
+
+    #[tokio::test]
+    async fn a_call_changing_wakes_every_computers_link_to_send_it() {
+        let hub = CallsHub::default();
+        let status = CallsMsg::Status {
+            available: true,
+            reason: None,
+            bluetooth_name: None,
+        };
+        hub.set_phone(status.clone(), Vec::new());
+        let wakes = [Arc::new(Notify::new()), Arc::new(Notify::new())];
+        let _links: Vec<_> = wakes
+            .iter()
+            .map(|w| hub.register_phone_link(w.clone()))
+            .collect();
+        hub.set_phone(status, vec![call(1, CallState::Ringing)]);
+        for wake in &wakes {
+            tokio::time::timeout(std::time::Duration::from_millis(10), wake.notified())
+                .await
+                .expect("the link was left to its idle pace");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_computers_request_wakes_the_link_to_the_phone() {
+        let hub = CallsHub::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let wake = Arc::new(Notify::new());
+        let peer = PeerId::from_u128(1);
+        hub.register_mesh_phone(peer, "POCO X7 Pro".into(), Outbox::new(tx, wake.clone()));
+        hub.from_mesh_phone(
+            &peer,
+            CallsMsg::Calls {
+                calls: vec![call(1, CallState::Ringing)],
+            },
+        );
+        hub.act("POCO X7 Pro", CallAction::Answer).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(10), wake.notified())
+            .await
+            .expect("the answer was left to the idle pace");
+        assert_eq!(rx.try_recv().unwrap(), CallsMsg::Answer { id: 1 });
+    }
+
+    fn outbox(tx: mpsc::UnboundedSender<CallsMsg>) -> Outbox {
+        Outbox::new(tx, Arc::default())
     }
 
     fn telegram_call(key: &str) -> Notification {

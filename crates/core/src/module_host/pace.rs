@@ -36,7 +36,8 @@ pub(crate) const IDLE_PUMP_AFTER: u32 = 20;
 /// wakes a module through its inbox at once, whatever its pace; only a module
 /// that has to notice something local — a capture that started producing, a
 /// copy — waits, and a second is a fair price for that once it has been
-/// quiet this long.
+/// quiet this long. One for which it is not (a phone's call changing) is
+/// woken by its own machine instead (`SessionModule::wake`).
 pub(crate) const DEEP_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Pumps at [`IDLE_PUMP_INTERVAL`] before dropping to [`DEEP_IDLE_INTERVAL`]:

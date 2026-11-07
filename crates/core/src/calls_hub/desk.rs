@@ -5,12 +5,12 @@ use crate::calls_hub::messenger::MessengerCall;
 use crate::calls_hub::voice::VoicePolicy;
 use crate::calls_hub::HandsFreeControl;
 use crate::calls_hub::OnChange;
+use crate::calls_hub::Outbox;
 use crate::calls_hub::PhoneCalls;
 use cursio_protocol::calls::{Call, CallsMsg};
 use cursio_protocol::PeerId;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 #[derive(Default)]
 pub(super) struct PhoneSide {
@@ -18,7 +18,7 @@ pub(super) struct PhoneSide {
     pub(super) calls: Vec<Call>,
     /// Where this phone's sound goes by playback capture.
     pub(super) sound: Option<String>,
-    pub(super) links: Vec<(u64, mpsc::UnboundedSender<CallsMsg>)>,
+    pub(super) links: Vec<(u64, Outbox)>,
 }
 
 pub(super) struct MeshPhone {
@@ -29,7 +29,7 @@ pub(super) struct MeshPhone {
     pub(super) calls: Vec<Call>,
     /// Where the phone said its sound goes by playback capture.
     pub(super) sound: Option<String>,
-    pub(super) tx: mpsc::UnboundedSender<CallsMsg>,
+    pub(super) tx: Outbox,
 }
 
 #[derive(Default)]

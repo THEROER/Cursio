@@ -289,6 +289,7 @@ async fn drive(
         }
     };
 
+    let wake = module.wake();
     let mut pace = Pace::new();
     let mut pump_due = true;
     let mut saw_inbound = false;
@@ -363,6 +364,7 @@ async fn drive(
                 saw_inbound = true;
             }
             _ = pace.interval.tick() => pump_due = true,
+            _ = woken(wake.as_deref()) => pump_due = true,
         }
     }
 
@@ -375,6 +377,15 @@ async fn drive(
     module.shutdown(&mut tx).await;
     tracing::info!(module = name, "module shutdown done");
     drop(module);
+}
+
+/// Resolves when the module's own machine gave it work; never for a module
+/// that only answers its peer.
+async fn woken(wake: Option<&tokio::sync::Notify>) {
+    match wake {
+        Some(wake) => wake.notified().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +442,80 @@ mod tests {
             .expect("the module's thread ended within a second")
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Sends one heartbeat per time it was given work from this machine.
+    struct Woken {
+        wake: std::sync::Arc<tokio::sync::Notify>,
+        owed: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+    #[async_trait::async_trait]
+    impl SessionModule for Woken {
+        fn name(&self) -> &'static str {
+            "woken"
+        }
+        fn id(&self) -> ModuleId {
+            ModuleId::CALLS
+        }
+        async fn start(&mut self, _: &mut dyn TransportTx) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn pump(&mut self, tx: &mut dyn TransportTx) -> Result<(), TransportError> {
+            while self.owed.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                self.owed.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tx.send(&Message::Heartbeat { nonce: 1 }).await?;
+            }
+            Ok(())
+        }
+        fn handle_message(&mut self, _: &Message) -> bool {
+            false
+        }
+        fn wake(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+            Some(self.wake.clone())
+        }
+    }
+
+    /// Counts what reached the link.
+    #[derive(Clone, Default)]
+    struct Counted(std::sync::Arc<std::sync::atomic::AtomicU32>);
+    #[async_trait::async_trait]
+    impl TransportTx for Counted {
+        async fn send(&mut self, _: &Message) -> Result<(), TransportError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_module_given_work_on_this_machine_sends_it_at_once() {
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let owed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let sent = Counted::default();
+        let (_inbox, rx) = inbox("woken");
+        let (stop_tx, stop) = oneshot::channel();
+        let (failures, _) = mpsc::unbounded_channel();
+        let driver = tokio::spawn(drive(
+            Box::new(Woken {
+                wake: wake.clone(),
+                owed: owed.clone(),
+            }),
+            LinkTx::new(Box::new(sent.clone())),
+            rx,
+            stop,
+            failures,
+        ));
+        // Long enough to settle at the deepest idle pace.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        owed.store(1, std::sync::atomic::Ordering::Relaxed);
+        wake.notify_one();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            sent.0.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the work waited for the idle pace"
+        );
+        let _ = stop_tx.send(());
+        driver.await.unwrap();
     }
 
     fn inbox(name: &'static str) -> (Inbox, crate::queue::Receiver<Message>) {
