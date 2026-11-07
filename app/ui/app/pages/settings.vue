@@ -669,7 +669,7 @@ async function restartNode() {
           </LpCard>
         </section>
       </div>
-      <aside v-if="!isMobile" class="sticky top-0 hidden xl:block">
+      <aside v-if="!isMobile" class="sticky top-[var(--lp-shell-top)] hidden self-start xl:block">
         <LpTableOfContents :links="toc" :hover-follow="false" :title="t('settings.onThisPage')" />
       </aside>
     </div>
