@@ -22,6 +22,7 @@ mod cross;
 mod install;
 mod run;
 
+mod cef_runtime;
 mod container;
 mod deploy;
 mod dotenv;
@@ -166,6 +167,9 @@ enum Command_ {
     /// List the GPL/AGPL code one build of a package links, and fail if there
     /// is any: whether a product embedding Cursio stays free of it.
     LicenseCheck(license::LicenseArgs),
+    /// Install the CEF that `cursio-app-cef` loads under this machine's
+    /// install root, once per CEF build (Linux).
+    CefRuntime(cef_runtime::CefRuntimeArgs),
     /// Put the node and the app in a versioned directory with a manifest,
     /// ready for `cursio update install`.
     Stage(stage::StageArgs),
@@ -261,6 +265,7 @@ fn main() -> Result<()> {
         Command_::Deploy(args) => deploy::deploy(args),
         Command_::LiveTest(args) => livetest::live_test(args),
         Command_::LicenseCheck(args) => license::license_check(args),
+        Command_::CefRuntime(args) => cef_runtime::cef_runtime(args),
         Command_::Stage(args) => stage::stage(args),
         Command_::Publish(args) => stage::publish(args),
         Command_::SdkMirror { push, tag } => sdk_mirror::run(

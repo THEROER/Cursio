@@ -41,13 +41,18 @@ pub struct StageArgs {
     /// only). The running node is left alone; switch with `cursio update apply`.
     #[arg(long)]
     install: bool,
+    /// Add `cursio-app-cef`, the app drawn by Chromium, to this machine's
+    /// build (Linux). The CEF it loads is installed apart, once per CEF build,
+    /// by `cargo xtask cef-runtime`.
+    #[arg(long)]
+    cef: bool,
 }
 
 pub fn stage(args: StageArgs) -> Result<()> {
     if args.install && !matches!(args.target, StageTarget::Host) {
         bail!("--install stages for this machine; install another platform's build there");
     }
-    let (_, dir) = stage_build(args.target, args.no_build, None)?;
+    let (_, dir) = stage_build(args.target, args.no_build, args.cef, None)?;
     if args.install {
         install_here(&dir)?;
     }
@@ -107,6 +112,7 @@ pub fn abi_from_version(version: &str) -> Result<String> {
 pub fn stage_build(
     target_kind: StageTarget,
     no_build: bool,
+    cef: bool,
     version: Option<&str>,
 ) -> Result<(String, PathBuf)> {
     if matches!(target_kind, StageTarget::Android) {
@@ -120,6 +126,9 @@ pub fn stage_build(
             if !no_build {
                 crate::build(true, Some(crate::BinArg::Cursio), None)?;
                 crate::build(true, Some(crate::BinArg::CursioApp), None)?;
+                if cef {
+                    crate::build_cef(true)?;
+                }
             }
             (None, crate::out_dir(true, None))
         }
@@ -144,10 +153,16 @@ pub fn stage_build(
     // Windows carries the drive helper as its own executable: the one that
     // links WinFsp's GPL bindings, kept apart so a node built without them
     // still mounts (see `mount_helper.rs` and THIRD-PARTY.md).
-    let bins: &[&str] = match target_kind {
-        StageTarget::Windows => &["cursio", "cursio-app", "cursio-mount-helper"],
-        _ => &["cursio", "cursio-app"],
+    let mut bins: Vec<&str> = match target_kind {
+        StageTarget::Windows => vec!["cursio", "cursio-app", "cursio-mount-helper"],
+        _ => vec!["cursio", "cursio-app"],
     };
+    if cef {
+        if !matches!(target_kind, StageTarget::Host) {
+            bail!("--cef adds the Chromium app to this machine's build only");
+        }
+        bins.push("cursio-app-cef");
+    }
     let files: Vec<String> = bins
         .iter()
         .map(|bin| crate::exe_name(bin, target))
@@ -244,6 +259,9 @@ pub struct PublishArgs {
     /// Leave the phone's APK out, even where this machine can build it.
     #[arg(long)]
     no_android: bool,
+    /// Add `cursio-app-cef` to this machine's build, as `stage --cef` does.
+    #[arg(long)]
+    cef: bool,
 }
 
 /// Stage this machine's build, the Windows one and — from a Linux host whose
@@ -255,11 +273,11 @@ pub struct PublishArgs {
 /// Signing is done by the staged node itself (`cursio update publish`), so the
 /// key and the store are handled by the same code that later verifies them.
 pub fn publish(args: PublishArgs) -> Result<()> {
-    let (version, host_dir) = stage_build(StageTarget::Host, args.no_build, None)?;
+    let (version, host_dir) = stage_build(StageTarget::Host, args.no_build, args.cef, None)?;
     let host_platform = platform_name(StageTarget::Host)?;
     let mut builds = vec![(host_platform.clone(), host_dir.clone())];
     if !args.host_only && !cfg!(windows) {
-        let (_, dir) = stage_build(StageTarget::Windows, args.no_build, Some(&version))?;
+        let (_, dir) = stage_build(StageTarget::Windows, args.no_build, false, Some(&version))?;
         builds.push((platform_name(StageTarget::Windows)?, dir));
     }
     if !args.host_only && cfg!(target_os = "linux") {
@@ -271,13 +289,14 @@ pub fn publish(args: PublishArgs) -> Result<()> {
         } else if platform_name(StageTarget::Ubuntu24)? == host_platform {
             // This machine links the same FFmpeg: its build already is theirs.
         } else {
-            let (_, dir) = stage_build(StageTarget::Ubuntu24, args.no_build, Some(&version))?;
+            let (_, dir) =
+                stage_build(StageTarget::Ubuntu24, args.no_build, false, Some(&version))?;
             builds.push((platform_name(StageTarget::Ubuntu24)?, dir));
         }
     }
     if !args.host_only && !args.no_android {
         if crate::cross::android_available() {
-            let (_, dir) = stage_build(StageTarget::Android, args.no_build, Some(&version))?;
+            let (_, dir) = stage_build(StageTarget::Android, args.no_build, false, Some(&version))?;
             builds.push((platform_name(StageTarget::Android)?, dir));
         } else {
             println!(

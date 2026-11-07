@@ -2,10 +2,10 @@
 //!
 //! They are two binaries, `cursio-app` on the platform webview and
 //! `cursio-app-cef` on Chromium (CEF). A binary linked against CEF needs
-//! `libcef` beside it to start at all, and CEF brings GTK 4 while WebKitGTK
-//! links GTK 3, which refuse to share a process. So the plain binary decides
-//! before any window exists and replaces itself with the Chromium one when
-//! that is chosen and can start.
+//! `libcef` where its loader looks to start at all, and CEF brings GTK 4
+//! while WebKitGTK links GTK 3, which refuse to share a process. So the plain
+//! binary decides before any window exists and replaces itself with the
+//! Chromium one when that is chosen and can start.
 //!
 //! The platform webview is the default: it ships with the system and costs
 //! nothing. Chromium is the way out on Linux machines where WebKitGTK cannot
@@ -61,17 +61,37 @@ fn sibling(name: &str) -> Option<PathBuf> {
     exe.is_file().then_some(exe)
 }
 
+/// The Chromium binary beside this one, and the directory of the CEF it will
+/// load.
 #[cfg(feature = "wry")]
-/// The Chromium binary beside this one, with the library it links
-/// (`$ORIGIN` rpath, so both sit side by side).
-fn chromium_exe() -> Option<PathBuf> {
+struct Chromium {
+    exe: PathBuf,
+    cef: PathBuf,
+}
+
+/// The library the Chromium binary links, looked for where its loader will
+/// and in the same order: the install's shared CEF of exactly the build it
+/// was linked against, `../../cef/<build>` from `versions/<v>/` (see
+/// `app/build.rs`), then beside it, for a build run from the target directory. Without
+/// it the binary would not even reach `main`, and this process, replaced by
+/// then, could not fall back.
+#[cfg(feature = "wry")]
+fn chromium() -> Option<Chromium> {
     let exe = sibling(CEF_BINARY)?;
+    let here = exe.parent()?.to_path_buf();
+    if cfg!(target_os = "macos") {
+        return Some(Chromium { exe, cef: here });
+    }
     let lib = if cfg!(windows) {
         "libcef.dll"
     } else {
         "libcef.so"
     };
-    (cfg!(target_os = "macos") || exe.with_file_name(lib).is_file()).then_some(exe)
+    let shared = here.join("../../cef").join(env!("CURSIO_CEF_RUNTIME"));
+    let cef = [shared, here]
+        .into_iter()
+        .find(|dir| dir.join(lib).is_file())?;
+    Some(Chromium { exe, cef })
 }
 
 #[cfg(feature = "cef")]
@@ -88,25 +108,34 @@ fn webkit_lacks_gpu() -> bool {
     cfg!(target_os = "linux") && Path::new("/proc/driver/nvidia/version").exists()
 }
 
-/// Whether Chromium will find a sandbox here.
+/// Whether Chromium will find a sandbox here, pointing it at the helper when
+/// that is the one.
 ///
 /// Without one it does not fail politely: it aborts with "No usable sandbox!"
 /// before any window, and since this process has already been replaced by
 /// then, nothing is left to fall back to the platform webview. So the
-/// question is asked before handing over. A sandbox is the setuid-root
-/// `chrome-sandbox` beside the binary, a helper named by
-/// `CHROME_DEVEL_SANDBOX`, or unprivileged user namespaces — which Ubuntu
-/// 24.04 and later hold back behind AppArmor, so there the helper is the only
-/// way. A debug build runs Chromium without the sandbox (see `cef_runtime`).
+/// question is asked before handing over. Ubuntu 24.04 and later hold the
+/// unprivileged user namespaces Chromium would sandbox with behind AppArmor,
+/// so there it needs either a profile that grants them to `cursio-app-cef`
+/// (`/etc/apparmor.d/cursio-app-cef`, put there once by root) or the
+/// setuid-root `chrome-sandbox` helper in its CEF directory. A debug build
+/// runs Chromium without the sandbox (see `cef_runtime`).
 #[cfg(all(target_os = "linux", feature = "wry"))]
-fn chromium_sandbox_usable(exe: &Path) -> bool {
+fn chromium_sandbox_usable(cef: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     if cfg!(debug_assertions) || std::env::var_os("CHROME_DEVEL_SANDBOX").is_some() {
         return true;
     }
-    let helper = exe.with_file_name("chrome-sandbox");
+    let helper = cef.join("chrome-sandbox");
     if std::fs::metadata(&helper).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o4000 != 0) {
+        // Named outright, so this is the helper Chromium uses whichever
+        // directory it would search by itself.
+        // SAFETY: `run` calls this before any thread exists.
+        unsafe { std::env::set_var("CHROME_DEVEL_SANDBOX", &helper) };
+        return true;
+    }
+    if Path::new("/etc/apparmor.d/cursio-app-cef").is_file() {
         return true;
     }
     let sysctl = |name: &str| {
@@ -119,38 +148,43 @@ fn chromium_sandbox_usable(exe: &Path) -> bool {
 }
 
 #[cfg(all(not(target_os = "linux"), feature = "wry"))]
-fn chromium_sandbox_usable(_exe: &Path) -> bool {
+fn chromium_sandbox_usable(_cef: &Path) -> bool {
     true
 }
 
-#[cfg(feature = "wry")]
 /// The Chromium binary to run instead of this one, if it is chosen and can
 /// start.
+#[cfg(feature = "wry")]
 fn chromium_for_this_run() -> Option<PathBuf> {
     let choice = requested();
     if choice == Choice::Webkit || (choice == Choice::Auto && !webkit_lacks_gpu()) {
         return None;
     }
-    let Some(exe) = chromium_exe() else {
+    let Some(Chromium { exe, cef }) = chromium() else {
         if choice == Choice::Chromium {
-            eprintln!("Chromium was asked for but is not installed beside cursio-app");
+            eprintln!(
+                "Chromium was asked for, but cursio-app-cef or CEF {} is not installed \
+                 (cargo xtask cef-runtime)",
+                env!("CURSIO_CEF_RUNTIME")
+            );
         }
         return None;
     };
-    if !chromium_sandbox_usable(&exe) {
+    if !chromium_sandbox_usable(&cef) {
         eprintln!(
             "Chromium would find no sandbox here, so the platform webview draws the window: \
-             make {} owned by root with mode 4755, or point CHROME_DEVEL_SANDBOX at such a helper",
-            exe.with_file_name("chrome-sandbox").display()
+             install the AppArmor profile /etc/apparmor.d/cursio-app-cef, or make {} owned by \
+             root with mode 4755",
+            cef.join("chrome-sandbox").display()
         );
         return None;
     }
     Some(exe)
 }
 
-#[cfg(feature = "wry")]
 /// Replace this process with the Chromium binary when that is the engine for
 /// this run. Returns when the platform webview stays.
+#[cfg(feature = "wry")]
 pub fn hand_over_to_chromium() {
     if let Some(exe) = chromium_for_this_run() {
         let error = hand_over(&exe);
