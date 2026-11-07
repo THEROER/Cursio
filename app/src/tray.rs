@@ -23,7 +23,7 @@ use cursio_core::control::{Command, ModuleSwitch, Presence, Status};
 use cursio_core::screen_views::ScreenView;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, Wry};
+use tauri::{AppHandle, DynRuntime, Emitter, Manager};
 
 use crate::node::NodeLink;
 
@@ -50,14 +50,14 @@ const SWITCHES: [(ModuleSwitch, &str, &str); 6] = [
 
 struct Items {
     app: AppHandle,
-    menu: Menu<Wry>,
-    summary: MenuItem<Wry>,
-    problems: MenuItem<Wry>,
-    switches: Vec<(ModuleSwitch, CheckMenuItem<Wry>)>,
-    start: MenuItem<Wry>,
+    menu: Menu<DynRuntime>,
+    summary: MenuItem<DynRuntime>,
+    problems: MenuItem<DynRuntime>,
+    switches: Vec<(ModuleSwitch, CheckMenuItem<DynRuntime>)>,
+    start: MenuItem<DynRuntime>,
     /// The remote-screen submenu, in the menu only while some view is open,
     /// and the views it was last built from.
-    screens: Mutex<(Option<Submenu<Wry>>, Vec<ScreenView>)>,
+    screens: Mutex<(Option<Submenu<DynRuntime>>, Vec<ScreenView>)>,
 }
 
 /// Whether this app's tray is up, so the node can hide the views' own icons;
@@ -104,7 +104,7 @@ pub fn open(app: &AppHandle, route: &str) {
 pub fn install(app: &AppHandle) -> tauri::Result<()> {
     let summary = MenuItem::with_id(app, "summary", "Cursio — connecting…", false, None::<&str>)?;
     let problems = MenuItem::with_id(app, "problems", "", false, None::<&str>)?;
-    let switches: Vec<(ModuleSwitch, CheckMenuItem<Wry>)> = SWITCHES
+    let switches: Vec<(ModuleSwitch, CheckMenuItem<DynRuntime>)> = SWITCHES
         .iter()
         .map(|(switch, id, label)| {
             CheckMenuItem::with_id(app, *id, *label, false, false, None::<&str>)
@@ -348,7 +348,7 @@ fn refresh_screens(items: &Items, views: &[ScreenView]) {
     }
 }
 
-fn screens_menu(app: &AppHandle, views: &[ScreenView]) -> tauri::Result<Submenu<Wry>> {
+fn screens_menu(app: &AppHandle, views: &[ScreenView]) -> tauri::Result<Submenu<DynRuntime>> {
     let top = Submenu::new(app, "Show in Discord/OBS", true)?;
     for view in views {
         let peer = Submenu::new(app, &view.peer, true)?;

@@ -128,7 +128,7 @@ impl NodeLink {
 
     /// Follows every change the node pushes. For the tray, which has no
     /// window to receive events.
-    #[cfg(desktop)]
+    #[cfg(all(desktop, not(target_os = "linux")))]
     pub fn watch(&self) -> tokio::sync::watch::Receiver<Latest> {
         self.latest.subscribe()
     }

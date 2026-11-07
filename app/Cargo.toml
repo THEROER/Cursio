@@ -20,11 +20,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # xtask builds with plain cargo: without it Tauri builds in dev mode and the
 # window loads whatever answers on `devUrl` — another project's dev server, if
 # one is running. `tauri dev` switches it off itself.
-default = ["custom-protocol"]
+default = ["custom-protocol", "wry"]
 custom-protocol = ["tauri/custom-protocol"]
+# The engine that draws the window: the platform webview (WebKitGTK, WebView2,
+# WKWebView).
+wry = ["dep:tauri-runtime-wry", "tauri/gtk3"]
 
 [build-dependencies]
-tauri-build = { version = "2.0.0-beta.18", features = [] }
+tauri-build.workspace = true
 
 [dependencies]
 # The mesh core and the control client, none of the platform modules: the app
@@ -34,8 +37,8 @@ tauri-build = { version = "2.0.0-beta.18", features = [] }
 cursio-core = { path = "../crates/core", default-features = false }
 cursio-protocol.workspace = true
 cursio-transport.workspace = true
-# `tray-icon`: the notification-area icon is the app on a desktop.
-tauri = { version = "2.0.0-beta.20", features = ["tray-icon"] }
+tauri.workspace = true
+tauri-runtime-wry = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -50,5 +53,12 @@ clipboard-core.workspace = true
 
 # On a phone the app is the node: no separate `cursio` process can live there,
 # so the mesh runs in this process, owned by the foreground service.
+# The notification-area icon is the app on Windows and macOS. On Linux the
+# node draws it (`node_tray`), and Tauri's would be one too many; it would not
+# even build here, being `ksni` on `async-io` where the node's is on tokio,
+# two features of one crate that refuse each other.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tauri = { workspace = true, features = ["tray-icon"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 cursio-android = { path = "../crates/android" }

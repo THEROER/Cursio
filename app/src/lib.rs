@@ -37,8 +37,32 @@ mod relaunch;
 /// Driving a peer's cursor from a phone's touch surface.
 #[cfg(mobile)]
 mod touchpad;
-#[cfg(desktop)]
+#[cfg(all(desktop, not(target_os = "linux")))]
 mod tray;
+
+/// On Linux the node draws the notification-area icon (`node_tray`), whose
+/// menu starts this app; a running copy takes that over its single-instance
+/// hand-off. The app has no icon of its own, only its window to show.
+#[cfg(target_os = "linux")]
+mod tray {
+    use tauri::{AppHandle, Emitter, Manager};
+
+    pub fn shown() -> bool {
+        false
+    }
+
+    /// Show the main window on `route`.
+    pub fn open(app: &AppHandle, route: &str) {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+        if let Err(e) = app.emit_to("main", "navigate", route) {
+            tracing::warn!(error = %e, route, "could not switch the window's page");
+        }
+    }
+}
 
 /// Which face of the app this build shows, so the UI picks its first page.
 #[tauri::command]
@@ -170,7 +194,9 @@ pub fn run() {
         (log, std::env::args().any(|a| a == "--hidden"))
     };
 
-    let builder = tauri::Builder::default().manage(node::NodeLink::default());
+    let builder = tauri::Builder::default()
+        .runtime(tauri_runtime_wry::Wry::default())
+        .manage(node::NodeLink::default());
 
     #[cfg(desktop)]
     let first_page = page_route(std::env::args());
@@ -202,16 +228,13 @@ pub fn run() {
             }
             // `reg.exe` / `systemctl`: off the thread that draws the window.
             tauri::async_runtime::spawn_blocking(autostart::refresh);
-            // On Linux the node draws the icon itself (`node_tray`): an
-            // appindicator here is GTK 3, which an app drawing with Chromium
-            // cannot load, and a second icon beside the node's would be one
-            // too many. Its menu starts this app, which a running copy takes
-            // over its single-instance hand-off.
-            if cfg!(target_os = "linux") {
-                if !hidden {
-                    tray::open(app.handle(), "/");
-                }
-            } else if let Err(e) = tray::install(app.handle()) {
+            // On Linux the node draws the icon itself (see `tray`).
+            #[cfg(target_os = "linux")]
+            if !hidden {
+                tray::open(app.handle(), "/");
+            }
+            #[cfg(not(target_os = "linux"))]
+            if let Err(e) = tray::install(app.handle()) {
                 // No tray (GNOME without the AppIndicator extension) must not
                 // leave an app nobody can reach: show the window instead.
                 tracing::warn!(

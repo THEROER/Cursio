@@ -61,14 +61,18 @@ quick-xml = "0.41"
 # desktop fetches one: GIO is already linked through GTK, and its HTTP backend
 # is the desktop's own, so the node gains no TLS stack of its own.
 gio = "0.22"
+# The app's Tauri: the 3 alpha, which takes the engine that draws the window
+# as a runtime the app picks instead of compiling WebKitGTK in. Pinned
+# exactly: an alpha moves its API between releases. The same set as the
+# LeavePulse launcher, which runs it.
+tauri = "=3.0.0-alpha.4"
+tauri-build = "=3.0.0-alpha.3"
+tauri-runtime-wry = "=3.0.0-alpha.4"
 # A second `cursio-app` (the Shell menu opening a page, a launcher click)
 # hands its arguments to the running one instead of starting another tray.
-# Held below 2.5, which requires Tauri 2.12 and would move the whole app's
-# Tauri with it.
-tauri-plugin-single-instance = "~2.4"
-# The native "Save as" a gallery item asks for. 2.7 is the last line on Tauri
-# 2.10/2.11; a later one would move the app's Tauri too.
-tauri-plugin-dialog = "~2.7"
+tauri-plugin-single-instance = "=3.0.0-alpha.3"
+# The native "Save as" a gallery item asks for.
+tauri-plugin-dialog = "=3.0.0-alpha.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

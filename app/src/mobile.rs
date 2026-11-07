@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder, PluginHandle, TauriPlugin};
-use tauri::{AppHandle, Manager, Runtime, Wry};
+use tauri::{AppHandle, DynRuntime, Manager, Runtime};
 
 /// The plugin's Kotlin class, as `register_android_plugin` names it.
 const PLUGIN_PACKAGE: &str = "dev.cursio.mesh";
@@ -122,8 +122,8 @@ struct GrantArgs {
     what: Grant,
 }
 
-fn plugin(app: &AppHandle) -> Result<PluginHandle<Wry>, String> {
-    app.try_state::<MeshPlugin<Wry>>()
+fn plugin(app: &AppHandle) -> Result<PluginHandle<DynRuntime>, String> {
+    app.try_state::<MeshPlugin<DynRuntime>>()
         .map(|p| p.0.clone())
         .ok_or_else(|| "the Cursio Android plugin is not loaded".to_string())
 }
