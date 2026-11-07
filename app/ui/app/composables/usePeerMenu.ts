@@ -1,4 +1,4 @@
-import type { ContextMenuItemDef } from "@leavepulse/ui"
+import { useClipboard, type ContextMenuItemDef } from "@leavepulse/ui"
 import { invoke } from "@tauri-apps/api/core"
 
 /** What a peer's menu needs to know about the machine it is for. */
@@ -42,6 +42,7 @@ export function usePeerMenu() {
   const { showInLogs } = useChrome()
   const { forget } = useNode()
   const { isMobile } = usePlatform()
+  const { copy } = useClipboard()
 
   function items(peer: PeerRef): ContextMenuItemDef[] {
     const list: ContextMenuItemDef[] = []
@@ -86,9 +87,15 @@ export function usePeerMenu() {
       {
         label: t("peerMenu.copyId"),
         icon: "lucide:copy",
+        // The kit's copy falls back where the clipboard API is refused and
+        // never throws; a menu item has no tick of its own, so both outcomes
+        // are said.
         onSelect: async () => {
-          await navigator.clipboard.writeText(peer.id)
-          toast.success(t("peerMenu.idCopied", { name: peer.name }))
+          if (await copy(peer.id)) {
+            toast.success(t("peerMenu.idCopied", { name: peer.name }))
+          } else {
+            toast.error(t("peerMenu.idCopyFailed"))
+          }
         },
       },
     )

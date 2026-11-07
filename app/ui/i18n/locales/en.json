@@ -408,6 +408,7 @@
     "showInLogs": "Show in logs",
     "copyId": "Copy id",
     "idCopied": "{name}'s id copied",
+    "idCopyFailed": "Could not copy the id",
     "wake": "Wake up",
     "wakeSent": "Sent {name} a wake-up; it joins once it is up",
     "wakeFailed": "{name} cannot be woken",
