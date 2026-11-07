@@ -167,6 +167,49 @@ pub(super) fn run_request(
                 |(handle, size)| FilesMsg::Opened { req, handle, size },
             )
         }
+        FilesMsg::OpenHead {
+            req,
+            volume,
+            path,
+            mode,
+            head,
+        } => {
+            // As `Open`, then the head read the same way `Read` reads: the
+            // handle detached, the disk touched outside the lock.
+            let lock = || server.lock().unwrap_or_else(PoisonError::into_inner);
+            let r = ns()
+                .open(&volume, &path, mode)
+                .and_then(|(file, size)| Ok((lock().adopt(file, mode.write)?, size)))
+                .and_then(|(handle, size)| {
+                    let want = head
+                        .min(FilesMsg::MAX_CHUNK as u32)
+                        .min(u32::try_from(size).unwrap_or(u32::MAX));
+                    if want == 0 {
+                        return Ok((handle, size, Vec::new()));
+                    }
+                    let file = lock().detach(handle);
+                    match file.and_then(|file| file.read(0, want)) {
+                        Ok(bytes) => Ok((handle, size, bytes)),
+                        // Answered as a failure, so the mount holds no handle
+                        // for it; nothing else would ever close this one.
+                        Err(e) => {
+                            drop(lock().close(handle));
+                            Err(e)
+                        }
+                    }
+                });
+            answer(
+                req,
+                &format!("open {volume}/{path} with its head"),
+                r,
+                |(handle, size, bytes)| FilesMsg::OpenedHead {
+                    req,
+                    handle,
+                    size,
+                    head: pack(bytes),
+                },
+            )
+        }
         FilesMsg::Read {
             req,
             handle,
@@ -343,7 +386,7 @@ impl FilesEngine {
             FilesMsg::Write { bytes, .. } => {
                 self.health.served_written_bytes += bytes.wire_len() as u64;
             }
-            FilesMsg::Read { len, .. } => {
+            FilesMsg::Read { len, .. } | FilesMsg::OpenHead { head: len, .. } => {
                 self.health.served_read_bytes += *len as u64;
             }
             _ => {}

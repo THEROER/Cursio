@@ -97,6 +97,10 @@ pub fn mount_threads() -> usize {
     (cores * 4).clamp(16, 64)
 }
 
+/// A file opened with its head: the peer's handle, the file's size, and its
+/// first bytes.
+pub type OpenedHead = (FileHandle, u64, Vec<u8>);
+
 /// One thing the mount wants the peer to do.
 ///
 /// Each carries the channel its answer comes back on, so replies cannot be
@@ -126,6 +130,13 @@ pub enum Op {
         path: String,
         mode: OpenMode,
         reply: std_mpsc::Sender<Result<(FileHandle, u64), FileError>>,
+    },
+    OpenHead {
+        volume: String,
+        path: String,
+        mode: OpenMode,
+        head: u32,
+        reply: std_mpsc::Sender<Result<OpenedHead, FileError>>,
     },
     Read {
         handle: FileHandle,
@@ -428,6 +439,32 @@ impl PeerLink {
             volume: volume.to_string(),
             path: path.to_string(),
             mode,
+            reply,
+        })
+    }
+
+    /// Open a file and receive up to `head` bytes from its start with the
+    /// answer — see [`FilesMsg::OpenHead`](cursio_protocol::FilesMsg::OpenHead).
+    ///
+    /// Waits as a read does, since the answer carries a read's bytes: judged
+    /// by the metadata deadline, a large head arriving behind a copy's chunks
+    /// would start a cool-off that refuses everything else. It still fails at
+    /// once during a cool-off, like every question.
+    pub fn open_head(
+        &self,
+        volume: &str,
+        path: &str,
+        mode: OpenMode,
+        head: u32,
+    ) -> Result<OpenedHead, FileError> {
+        if self.in_cooloff() {
+            return Err(FileError::Io("peer is not responding".into()));
+        }
+        self.call_within(BULK_OP_TIMEOUT, |reply| Op::OpenHead {
+            volume: volume.to_string(),
+            path: path.to_string(),
+            mode,
+            head,
             reply,
         })
     }

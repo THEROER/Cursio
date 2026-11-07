@@ -26,6 +26,7 @@ pub(super) enum Pending {
     Stat(std::sync::mpsc::Sender<Result<cursio_protocol::FileMeta, FileError>>),
     Link(std::sync::mpsc::Sender<Result<String, FileError>>),
     Open(std::sync::mpsc::Sender<Result<(cursio_protocol::FileHandle, u64), FileError>>),
+    OpenHead(std::sync::mpsc::Sender<Result<cursio_files::bridge::OpenedHead, FileError>>),
     Read {
         reply: std::sync::mpsc::Sender<Result<Vec<u8>, FileError>>,
         acc: Vec<u8>,
@@ -43,6 +44,7 @@ impl Pending {
             Pending::Stat(tx) => drop(tx.send(Err(e))),
             Pending::Link(tx) => drop(tx.send(Err(e))),
             Pending::Open(tx) => drop(tx.send(Err(e))),
+            Pending::OpenHead(tx) => drop(tx.send(Err(e))),
             Pending::Read { reply, .. } => drop(reply.send(Err(e))),
             Pending::Wrote(tx) => drop(tx.send(Err(e))),
             Pending::Unit(tx) => drop(tx.send(Err(e))),
@@ -233,6 +235,22 @@ impl FilesEngine {
                         mode,
                     },
                 ),
+                Op::OpenHead {
+                    volume,
+                    path,
+                    mode,
+                    head,
+                    reply,
+                } => (
+                    Pending::OpenHead(reply),
+                    FilesMsg::OpenHead {
+                        req,
+                        volume,
+                        path,
+                        mode,
+                        head,
+                    },
+                ),
                 Op::Read {
                     handle,
                     offset,
@@ -401,6 +419,9 @@ impl FilesEngine {
             // window grew on evidence from a direction it does not control.
             self.health.read_bytes += bytes.plain_len() as u64;
         }
+        if let FilesMsg::OpenedHead { head, .. } = &msg {
+            self.health.read_bytes += head.plain_len() as u64;
+        }
         if let FilesMsg::Failed { error, .. } = &msg {
             if super::health::is_fault(error) {
                 self.health.failed += 1;
@@ -473,6 +494,19 @@ impl FilesEngine {
             FilesMsg::Opened { req, handle, size } => {
                 if let Some(Pending::Open(tx)) = self.pending.remove(&req) {
                     let _ = tx.send(Ok((handle, size)));
+                }
+            }
+            // Unpacked on a worker for the reason `Data` is, below.
+            FilesMsg::OpenedHead {
+                req,
+                handle,
+                size,
+                head,
+            } => {
+                if let Some(Pending::OpenHead(tx)) = self.pending.remove(&req) {
+                    self.codec.spawn(move || {
+                        let _ = tx.send(unpack(head).map(|bytes| (handle, size, bytes)));
+                    });
                 }
             }
             FilesMsg::Data {

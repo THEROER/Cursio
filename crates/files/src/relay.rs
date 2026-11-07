@@ -42,7 +42,7 @@ use crate::FilesError;
 /// its own executable, so the two normally agree; this catches the case where
 /// they do not (a helper left running across an update) before any request is
 /// misread.
-pub const RELAY_VERSION: u32 = 1;
+pub const RELAY_VERSION: u32 = 2;
 
 /// The largest frame either side accepts. A write carries at most one wire
 /// chunk, a directory listing at most a few thousand entries; this is far
@@ -93,6 +93,12 @@ enum Request {
         path: String,
         mode: OpenMode,
     },
+    OpenHead {
+        volume: String,
+        path: String,
+        mode: OpenMode,
+        head: u32,
+    },
     Read {
         handle: FileHandle,
         offset: u64,
@@ -139,6 +145,7 @@ enum Answer {
     Meta(Result<FileMeta, FileError>),
     Link(Result<String, FileError>),
     Opened(Result<(FileHandle, u64), FileError>),
+    OpenedHead(Result<(FileHandle, u64, Vec<u8>), FileError>),
     Bytes(Result<Vec<u8>, FileError>),
     Wrote(Result<u64, FileError>),
     Unit(Result<(), FileError>),
@@ -264,6 +271,12 @@ fn execute(link: &PeerLink, request: Request) -> Option<Answer> {
         Request::Stat { volume, path } => Answer::Meta(link.stat(&volume, &path)),
         Request::ReadLink { volume, path } => Answer::Link(link.read_link(&volume, &path)),
         Request::Open { volume, path, mode } => Answer::Opened(link.open(&volume, &path, mode)),
+        Request::OpenHead {
+            volume,
+            path,
+            mode,
+            head,
+        } => Answer::OpenedHead(link.open_head(&volume, &path, mode, head)),
         Request::Read {
             handle,
             offset,
@@ -301,6 +314,7 @@ enum Waiting {
     Meta(std_mpsc::Sender<Result<FileMeta, FileError>>),
     Link(std_mpsc::Sender<Result<String, FileError>>),
     Opened(std_mpsc::Sender<Result<(FileHandle, u64), FileError>>),
+    OpenedHead(std_mpsc::Sender<Result<crate::bridge::OpenedHead, FileError>>),
     Bytes(std_mpsc::Sender<Result<Vec<u8>, FileError>>),
     Wrote(std_mpsc::Sender<Result<u64, FileError>>),
     Unit(std_mpsc::Sender<Result<(), FileError>>),
@@ -314,6 +328,7 @@ impl Waiting {
             (Waiting::Meta(tx), Answer::Meta(r)) => drop(tx.send(r)),
             (Waiting::Link(tx), Answer::Link(r)) => drop(tx.send(r)),
             (Waiting::Opened(tx), Answer::Opened(r)) => drop(tx.send(r)),
+            (Waiting::OpenedHead(tx), Answer::OpenedHead(r)) => drop(tx.send(r)),
             (Waiting::Bytes(tx), Answer::Bytes(r)) => drop(tx.send(r)),
             (Waiting::Wrote(tx), Answer::Wrote(r)) => drop(tx.send(r)),
             (Waiting::Unit(tx), Answer::Unit(r)) => drop(tx.send(r)),
@@ -334,6 +349,7 @@ impl Waiting {
             Waiting::Meta(tx) => drop(tx.send(Err(e))),
             Waiting::Link(tx) => drop(tx.send(Err(e))),
             Waiting::Opened(tx) => drop(tx.send(Err(e))),
+            Waiting::OpenedHead(tx) => drop(tx.send(Err(e))),
             Waiting::Bytes(tx) => drop(tx.send(Err(e))),
             Waiting::Wrote(tx) => drop(tx.send(Err(e))),
             Waiting::Unit(tx) => drop(tx.send(Err(e))),
@@ -374,6 +390,21 @@ fn split(op: Op) -> (Request, Option<Waiting>) {
         } => (
             Request::Open { volume, path, mode },
             Some(Waiting::Opened(reply)),
+        ),
+        Op::OpenHead {
+            volume,
+            path,
+            mode,
+            head,
+            reply,
+        } => (
+            Request::OpenHead {
+                volume,
+                path,
+                mode,
+                head,
+            },
+            Some(Waiting::OpenedHead(reply)),
         ),
         Op::Read {
             handle,

@@ -453,6 +453,30 @@ pub enum FilesMsg {
         path: String,
         target: String,
     },
+
+    /// Mount -> owner: open a file to read it, and send up to `head` bytes from
+    /// its start with the answer.
+    ///
+    /// Reading a small file was two round trips in a row — the open, then the
+    /// first read — each waiting on the owner's disk and its antivirus as well
+    /// as the link. A cold `git diff --stat` over 160 sources spent 0.28 s a
+    /// file that way. Most such files fit in one answer, so this costs one.
+    /// Answered with [`FilesMsg::OpenedHead`], or [`FilesMsg::Failed`].
+    OpenHead {
+        req: FileReqId,
+        volume: String,
+        path: String,
+        mode: OpenMode,
+        head: u32,
+    },
+    /// Owner -> mount: the file is open, and here is its start — the whole
+    /// file when it is no longer than what was asked for.
+    OpenedHead {
+        req: FileReqId,
+        handle: FileHandle,
+        size: u64,
+        head: Chunk,
+    },
 }
 
 impl FilesMsg {
@@ -481,9 +505,14 @@ impl FilesMsg {
     pub fn priority(&self) -> crate::Priority {
         match self {
             // The bytes themselves, and the requests that ask for them.
+            //
+            // An opened file's head is bytes too, up to a whole small file: as
+            // metadata it would ride the interactive lane, in front of the
+            // pointer.
             FilesMsg::Read { .. }
             | FilesMsg::Write { .. }
             | FilesMsg::Data { .. }
+            | FilesMsg::OpenedHead { .. }
             | FilesMsg::Wrote { .. } => crate::Priority::Bulk,
             // Everything else is metadata: a question about the shape of the
             // filesystem, with a caller blocked on the answer.
@@ -500,6 +529,7 @@ impl FilesMsg {
     pub fn wire_cost(&self) -> usize {
         match self {
             FilesMsg::Write { bytes, .. } | FilesMsg::Data { bytes, .. } => bytes.wire_len(),
+            FilesMsg::OpenedHead { head, .. } => head.wire_len(),
             _ => 0,
         }
     }
@@ -599,6 +629,28 @@ mod tests {
         };
         assert_eq!(read.priority(), crate::Priority::Bulk);
         assert_eq!(write.priority(), crate::Priority::Bulk);
+    }
+
+    /// A file's head rides with the bytes, not the interactive lane, while the
+    /// request for it stays a question about the filesystem.
+    #[test]
+    fn an_opened_head_is_bulk_and_its_request_is_metadata() {
+        let ask = FilesMsg::OpenHead {
+            req: 1,
+            volume: "C:".into(),
+            path: "a.rs".into(),
+            mode: OpenMode::read_only(),
+            head: 128 * 1024,
+        };
+        let answer = FilesMsg::OpenedHead {
+            req: 1,
+            handle: 1,
+            size: 3,
+            head: Chunk::Raw(vec![1, 2, 3]),
+        };
+        assert_eq!(ask.priority(), crate::Priority::Metadata);
+        assert_eq!(answer.priority(), crate::Priority::Bulk);
+        assert_eq!(answer.wire_cost(), 3);
     }
 
     /// File traffic must never outrank the cursor.

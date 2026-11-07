@@ -72,6 +72,53 @@ struct State {
     /// Our inode-scoped file handles mapped to the peer's.
     handles: std::collections::HashMap<u64, cursio_protocol::FileHandle>,
     next_handle: u64,
+    /// The start of each file opened for reading, by our handle, as the owner
+    /// sent it with the open; see [`Head`].
+    heads: std::collections::HashMap<u64, Head>,
+}
+
+/// How much of a file to ask for with its open.
+///
+/// The kernel's first read of a file asks for up to 128 KiB, so a head this
+/// long answers it whole, and nearly every source file fits.
+const HEAD_BYTES: u32 = 128 * 1024;
+
+/// How many open files keep a head at once. Each is up to [`HEAD_BYTES`]; a
+/// program holding thousands of files open keeps the rest without, and they
+/// read as before.
+const MAX_HEADS: usize = 256;
+
+/// A file's first bytes, received with its open.
+///
+/// Answers the reads that fall inside it without a round trip. Dropped when the
+/// handle is released, and whenever this machine writes to or truncates the
+/// file — through any handle — since it then no longer says what the file
+/// holds.
+struct Head {
+    ino: u64,
+    /// The file's size when it was opened.
+    size: u64,
+    bytes: Vec<u8>,
+}
+
+impl Head {
+    /// The bytes a read of `len` at `offset` returns, if this head holds them:
+    /// all of the range, or the rest of a file the head holds whole.
+    fn read(&self, offset: u64, len: u32) -> Option<&[u8]> {
+        let start = usize::try_from(offset).ok()?;
+        if start > self.bytes.len() {
+            return None;
+        }
+        let end = start.saturating_add(len as usize);
+        let whole = self.bytes.len() as u64 == self.size;
+        if end <= self.bytes.len() {
+            Some(&self.bytes[start..end])
+        } else if whole {
+            Some(&self.bytes[start..])
+        } else {
+            None
+        }
+    }
 }
 
 impl RemoteFs {
@@ -86,6 +133,7 @@ impl RemoteFs {
                 inodes: InodeTable::new(),
                 handles: std::collections::HashMap::new(),
                 next_handle: 1,
+                heads: std::collections::HashMap::new(),
             }),
             // Safe: these are plain getuid/getgid calls with no preconditions.
             uid: unsafe { libc::getuid() },
@@ -121,6 +169,15 @@ impl RemoteFs {
                     .read_dir_within(volume, dir, crate::metacache::SWEEP_LISTING_WAIT)
             },
         )
+    }
+
+    /// Drop every head held for `ino`: this machine is changing the file.
+    fn forget_heads(&self, ino: u64) {
+        self.state
+            .lock()
+            .expect("inode state")
+            .heads
+            .retain(|_, head| head.ino != ino);
     }
 
     /// The peer's handle behind one of ours.
@@ -295,6 +352,59 @@ mod tests {
             cache.get("C:", "a.txt").is_none(),
             "a write, truncate or rename leaves nothing stale behind it"
         );
+    }
+
+    /// A file the head holds whole is read from it entirely, end of file
+    /// included, with no round trip.
+    #[test]
+    fn a_small_file_is_read_whole_from_its_head() {
+        let head = Head {
+            ino: 2,
+            size: 5,
+            bytes: b"hello".to_vec(),
+        };
+        assert_eq!(head.read(0, 128 * 1024), Some(&b"hello"[..]));
+        assert_eq!(head.read(3, 10), Some(&b"lo"[..]));
+        assert_eq!(head.read(5, 10), Some(&b""[..]), "end of file");
+    }
+
+    /// Of a larger file the head answers only what it holds; a read reaching
+    /// past it goes to the owner.
+    #[test]
+    fn a_read_past_a_partial_head_goes_to_the_owner() {
+        let head = Head {
+            ino: 2,
+            size: 1000,
+            bytes: vec![7; 100],
+        };
+        assert_eq!(head.read(10, 20).map(<[u8]>::len), Some(20));
+        assert!(head.read(90, 20).is_none(), "straddles the end of the head");
+        assert!(head.read(100, 1).is_none(), "wholly past it");
+        assert!(head.read(5000, 1).is_none());
+    }
+
+    /// A write here makes every head of that file stale, whichever handle
+    /// wrote; heads of other files stay.
+    #[test]
+    fn writing_a_file_drops_its_heads_and_no_others() {
+        let (ops, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let fs = RemoteFs::new(PeerLink::new(ops), "C:");
+        {
+            let mut state = fs.state.lock().unwrap();
+            for (fh, ino) in [(1, 7), (2, 7), (3, 8)] {
+                state.heads.insert(
+                    fh,
+                    Head {
+                        ino,
+                        size: 1,
+                        bytes: vec![0],
+                    },
+                );
+            }
+        }
+        fs.forget_heads(7);
+        let state = fs.state.lock().unwrap();
+        assert_eq!(state.heads.keys().copied().collect::<Vec<_>>(), [3]);
     }
 
     /// The mount root is the bound volume's own root, not a list of volumes.

@@ -60,6 +60,7 @@ pub(super) fn is_request(msg: &FilesMsg) -> bool {
             | FilesMsg::Stat { .. }
             | FilesMsg::ReadLink { .. }
             | FilesMsg::Open { .. }
+            | FilesMsg::OpenHead { .. }
             | FilesMsg::Read { .. }
             | FilesMsg::Write { .. }
             | FilesMsg::Truncate { .. }
@@ -79,6 +80,7 @@ pub(super) fn request_kind(msg: &FilesMsg) -> &'static str {
         FilesMsg::Stat { .. } => "stat",
         FilesMsg::ReadLink { .. } => "readlink",
         FilesMsg::Open { .. } => "open",
+        FilesMsg::OpenHead { .. } => "open_head",
         FilesMsg::Read { .. } => "read",
         FilesMsg::Write { .. } => "write",
         FilesMsg::Truncate { .. } => "set_size",
@@ -102,6 +104,7 @@ pub(super) fn request_req(msg: &FilesMsg) -> Option<FileReqId> {
         | FilesMsg::Stat { req, .. }
         | FilesMsg::ReadLink { req, .. }
         | FilesMsg::Open { req, .. }
+        | FilesMsg::OpenHead { req, .. }
         | FilesMsg::Read { req, .. }
         | FilesMsg::Write { req, .. }
         | FilesMsg::Truncate { req, .. }
@@ -125,6 +128,7 @@ pub(super) fn reply_req(msg: &FilesMsg) -> Option<FileReqId> {
         | FilesMsg::StatResult { req, .. }
         | FilesMsg::LinkTarget { req, .. }
         | FilesMsg::Opened { req, .. }
+        | FilesMsg::OpenedHead { req, .. }
         | FilesMsg::Data { req, .. }
         | FilesMsg::Wrote { req, .. }
         | FilesMsg::Ok { req }

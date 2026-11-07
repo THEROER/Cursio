@@ -19,7 +19,7 @@
 //! per-`exec` and per-`close` ones were.
 
 use crate::mount::attr::{attr_from, dir_attr, root_attr, to_errno, CACHE_TTL};
-use crate::mount::fs::GENERATION;
+use crate::mount::fs::{Head, GENERATION, HEAD_BYTES, MAX_HEADS};
 use crate::mount::inode::{join, Entry};
 use crate::mount::RemoteFs;
 use crate::server::{FALLBACK_FREE, FALLBACK_TOTAL};
@@ -596,12 +596,35 @@ impl Filesystem for RemoteFs {
 
         let mode = open_mode_from(flags);
 
-        match self.peer.open(&volume, &path, mode) {
-            Ok((remote, _size)) => {
+        // A file opened to read comes with its start, so its first read — for
+        // a small file, its only one — costs no second round trip. One opened
+        // to write does not: its contents are about to change.
+        let opened = if mode.is_mutating() {
+            self.peer
+                .open(&volume, &path, mode)
+                .map(|(remote, _)| (remote, None))
+        } else {
+            self.peer
+                .open_head(&volume, &path, mode, HEAD_BYTES)
+                .map(|(remote, size, bytes)| {
+                    let head = Head {
+                        ino: ino.0,
+                        size,
+                        bytes,
+                    };
+                    (remote, Some(head))
+                })
+        };
+
+        match opened {
+            Ok((remote, head)) => {
                 let mut state = self.state.lock().expect("inode state");
                 let fh = state.next_handle;
                 state.next_handle += 1;
                 state.handles.insert(fh, remote);
+                if let Some(head) = head.filter(|_| state.heads.len() < MAX_HEADS) {
+                    state.heads.insert(fh, head);
+                }
                 // Keep the pages already cached. Without it the kernel drops a
                 // file's cache on every open, so reading a tree a second time —
                 // a warm `git diff --stat` over 160 files — fetched every byte
@@ -630,6 +653,9 @@ impl Filesystem for RemoteFs {
     ) {
         let remote = {
             let state = self.state.lock().expect("inode state");
+            if let Some(bytes) = state.heads.get(&fh.0).and_then(|h| h.read(offset, size)) {
+                return reply.data(bytes);
+            }
             state.handles.get(&fh.0).copied()
         };
         let Some(remote) = remote else {
@@ -662,6 +688,7 @@ impl Filesystem for RemoteFs {
         if let Some(Entry::Path { volume, path }) = self.entry_of(ino.0) {
             self.meta.forget(&volume, &path);
         }
+        self.forget_heads(ino.0);
         match self.peer.write(remote, offset, data.to_vec()) {
             // A short write would make the caller retry the remainder; the peer
             // writes all or fails, so this is always the full length.
@@ -823,6 +850,7 @@ impl Filesystem for RemoteFs {
         // they are ignored, which is what `chmod` on a foreign filesystem does
         // anyway.
         if let Some(size) = size {
+            self.forget_heads(ino.0);
             let remote = fh
                 .and_then(|fh| self.remote_handle(fh))
                 .or_else(|| self.open_for_truncate(ino));
@@ -853,12 +881,11 @@ impl Filesystem for RemoteFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let remote = self
-            .state
-            .lock()
-            .expect("inode state")
-            .handles
-            .remove(&fh.0);
+        let remote = {
+            let mut state = self.state.lock().expect("inode state");
+            state.heads.remove(&fh.0);
+            state.handles.remove(&fh.0)
+        };
         if let Some(remote) = remote {
             self.peer.close(remote);
         }
