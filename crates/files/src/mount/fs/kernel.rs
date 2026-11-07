@@ -411,6 +411,27 @@ impl Filesystem for RemoteFs {
         reply.error(Errno::NO_XATTR);
     }
 
+    /// No file here answers a device control, and `ENOTTY` is what a regular
+    /// file says to one.
+    ///
+    /// Programs probe for them as a matter of course — `cp` asks for a reflink
+    /// clone, file managers ask for the attribute flags — and fall back on
+    /// `ENOTTY`. Left unimplemented the answer was `ENOSYS`, read the same way
+    /// but logged as a warning by fuser on every probe: 88 in a few days.
+    fn ioctl(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _flags: fuser::IoctlFlags,
+        _cmd: u32,
+        _in_data: &[u8],
+        _out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        reply.error(Errno::ENOTTY);
+    }
+
     /// Device nodes, FIFOs and sockets do not cross the link.
     ///
     /// The protocol has no vocabulary for them, and a mount that could create
