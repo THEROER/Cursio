@@ -66,12 +66,15 @@ impl Filesystem for RemoteFs {
     /// refuse the mount — and the set differs across the kernels Cursio runs
     /// on.
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
-        // Buffered writes are collected by the kernel and handed over in large
-        // pieces, instead of arriving one application-sized write at a time.
-        // This is what the Windows half already gets from the WinFsp cache
-        // manager; without it the Linux mount carries every 4 KiB write across
-        // the link on its own and waits out the round trip.
-        request(config, InitFlags::FUSE_WRITEBACK_CACHE, "writeback cache");
+        // `FUSE_WRITEBACK_CACHE` is deliberately not asked for. It collects an
+        // application's small writes into large ones, but in exchange the
+        // kernel keeps a regular file's size and modification time as its
+        // own and ignores what the filesystem reports for them — sound only
+        // where nothing but this kernel changes the files. Here their owner
+        // does: a file rewritten on the peer kept its old size and time on
+        // this side indefinitely, and once cached pages outlived an open (see
+        // `open`) its old contents too, read back as current.
+        //
         // Lookups and directory reads may overlap. A tree walk is otherwise
         // strictly serial, which is exactly the shape of a file manager's copy.
         request(config, InitFlags::FUSE_PARALLEL_DIROPS, "parallel dirops");
@@ -242,17 +245,13 @@ impl Filesystem for RemoteFs {
 
     /// Nothing to flush.
     ///
-    /// Buffering happens in the kernel, not here: with `FUSE_WRITEBACK_CACHE`
-    /// the page cache collects an application's small writes and hands them
-    /// over in large pieces, but each piece that reaches [`RemoteFs::write`] is
-    /// still a `Write` the peer answers before the caller returns. So anything
-    /// the kernel had has already been pushed by the time a `close()` arrives,
-    /// and there is nothing here that could still fail.
-    ///
-    /// That is what makes the writeback cache safe to ask for. A scheme that
-    /// acknowledged a write before the peer stored it would need this call to
-    /// report the failure instead — and would then depend on the caller
-    /// checking a `close()` return that most programs ignore.
+    /// Every write that reaches [`RemoteFs::write`] is a `Write` the peer
+    /// answers before the caller returns, so anything written has already been
+    /// stored by the time a `close()` arrives, and there is nothing here that
+    /// could still fail. A scheme that acknowledged a write before the peer
+    /// stored it would need this call to report the failure instead — and
+    /// would then depend on the caller checking a `close()` return that most
+    /// programs ignore.
     ///
     /// Left unimplemented it answers `ENOSYS` — which the kernel tolerates, but
     /// which logs a warning on every single file close.
@@ -922,11 +921,11 @@ impl Filesystem for RemoteFs {
 pub(super) fn open_mode_from(flags: fuser::OpenFlags) -> OpenMode {
     let acc = flags.acc_mode();
     OpenMode {
-        // Readable even when opened write-only. With `FUSE_WRITEBACK_CACHE` the
-        // kernel fills a partially written page by reading it first, through
-        // the very handle the application opened `O_WRONLY` — and a peer
-        // handle without read access answers that with `EBADF`, which reaches
-        // the application as a failed write to the middle of a file.
+        // Readable even when opened write-only. The kernel reads through
+        // whatever handle it holds for a file — under a write-back cache it
+        // filled partial pages through the very handle opened `O_WRONLY` — and
+        // a peer handle without read access answers with `EBADF`, which
+        // reaches the application as a failed write.
         read: true,
         write: !matches!(acc, fuser::OpenAccMode::O_RDONLY),
         // The kernel resolves creation itself and calls `create`, so an `open`
@@ -953,7 +952,7 @@ mod tests {
         assert!(wo.write, "O_WRONLY writes");
         assert!(
             wo.read,
-            "and reads too: the writeback cache fills partial pages through it"
+            "and reads too: the kernel may read through any handle it holds"
         );
 
         let rw = open_mode_from(fuser::OpenFlags(libc::O_RDWR));
