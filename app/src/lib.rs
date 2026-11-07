@@ -34,6 +34,9 @@ mod node;
 /// Restarting this window as the version the install now names.
 #[cfg(desktop)]
 mod relaunch;
+/// The platform webview or Chromium, picked before the first window.
+#[cfg(desktop)]
+mod renderer;
 /// Driving a peer's cursor from a phone's touch surface.
 #[cfg(mobile)]
 mod touchpad;
@@ -132,7 +135,7 @@ fn page_route(args: impl IntoIterator<Item = String>) -> Option<String> {
 /// Wayland the DMABUF renderer takes the web process down, so it is off there
 /// and X11 keeps the GPU path. Anything the user exported is honoured, so
 /// `WEBKIT_DISABLE_DMABUF_RENDERER=0` brings it back.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "wry"))]
 fn tune_webkitgtk_renderer() {
     fn set_if_unset(key: &str, value: &str) {
         if std::env::var_os(key).is_none() {
@@ -152,9 +155,6 @@ fn tune_webkitgtk_renderer() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(target_os = "linux")]
-    tune_webkitgtk_renderer();
-
     #[cfg(desktop)]
     let (_log, hidden) = {
         // Started as the install's stable copy: run the current version instead.
@@ -167,6 +167,12 @@ pub fn run() {
                 ),
             }
         }
+        // After the install's handover, so the version that runs is the one
+        // whose Chromium binary takes over.
+        #[cfg(feature = "wry")]
+        renderer::hand_over_to_chromium();
+        #[cfg(all(target_os = "linux", feature = "wry"))]
+        tune_webkitgtk_renderer();
 
         // Console (info) + rotating file (debug) logging, shared with the CLI.
         // `_log` must outlive the UI — dropping it flushes the log file.
@@ -194,9 +200,12 @@ pub fn run() {
         (log, std::env::args().any(|a| a == "--hidden"))
     };
 
-    let builder = tauri::Builder::default()
-        .runtime(tauri_runtime_wry::Wry::default())
-        .manage(node::NodeLink::default());
+    let builder = tauri::Builder::default();
+    #[cfg(feature = "cef")]
+    let builder = builder.runtime(cef_runtime());
+    #[cfg(not(feature = "cef"))]
+    let builder = builder.runtime(tauri_runtime_wry::Wry::default());
+    let builder = builder.manage(node::NodeLink::default());
 
     #[cfg(desktop)]
     let first_page = page_route(std::env::args());
@@ -214,7 +223,6 @@ pub fn run() {
                 route => tray::open(app, &route.unwrap_or_else(|| "/".into())),
             }
         }))
-        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             node::follow(app.handle().clone());
             relaunch::follow_install(app.handle().clone());
@@ -357,9 +365,51 @@ pub fn run() {
             mobile::commands::phone_screen_answer,
         ]);
 
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    let result = builder.run(context());
+    if let Err(error) = result {
+        // Chromium that cannot start must not leave the machine without a
+        // window: back to the platform webview, told to stay on it.
+        #[cfg(all(desktop, feature = "cef"))]
+        if let Some(exe) = renderer::webkit_exe() {
+            tracing::warn!(%error, "Chromium did not start; using the platform webview");
+            // SAFETY: the runtime has shut down; no other thread reads the
+            // environment any more.
+            unsafe { std::env::set_var(renderer::ENV, "webkit") };
+            let error = renderer::hand_over(&exe);
+            panic!("could not start the platform webview either: {error}");
+        }
+        panic!("error while running tauri application: {error}");
+    }
+}
+
+/// The app's context, with one change for Chromium: the CEF runtime never maps
+/// a window that was created hidden and shown later, so under it the main
+/// window is created visible. Without a tray there it is the app anyway.
+fn context() -> tauri::Context {
+    let context = tauri::generate_context!();
+    #[cfg(feature = "cef")]
+    let context = {
+        let mut context = context;
+        for window in &mut context.config_mut().app.windows {
+            window.visible = true;
+        }
+        context
+    };
+    context
+}
+
+#[cfg(feature = "cef")]
+fn cef_runtime() -> tauri_runtime_cef::Cef {
+    // A debug build runs from the target directory, where no setuid
+    // `chrome-sandbox` can be, and Ubuntu holds back the user namespaces
+    // Chromium would use instead, so there it runs unsandboxed rather than
+    // aborting. A release build is only handed over to when a sandbox is
+    // there (`renderer::chromium_sandbox_usable`).
+    tauri_runtime_cef::Cef::default().sandbox(if cfg!(debug_assertions) {
+        tauri_runtime_cef::SandboxPolicy::Disabled
+    } else {
+        tauri_runtime_cef::SandboxPolicy::Auto
+    })
 }
 
 #[cfg(all(test, desktop))]

@@ -61,18 +61,23 @@ quick-xml = "0.41"
 # desktop fetches one: GIO is already linked through GTK, and its HTTP backend
 # is the desktop's own, so the node gains no TLS stack of its own.
 gio = "0.22"
-# The app's Tauri: the 3 alpha, which takes the engine that draws the window
-# as a runtime the app picks instead of compiling WebKitGTK in. Pinned
-# exactly: an alpha moves its API between releases. The same set as the
-# LeavePulse launcher, which runs it.
+# The app's Tauri: the 3 alpha, which takes the engine as a runtime chosen at
+# startup instead of compiling WebKitGTK in, so the same app can also be drawn
+# by Chromium (`app/src/renderer.rs`). Pinned exactly: an alpha moves its API
+# between releases. The same set as the LeavePulse launcher, which runs it.
 tauri = "=3.0.0-alpha.4"
 tauri-build = "=3.0.0-alpha.3"
 tauri-runtime-wry = "=3.0.0-alpha.4"
+tauri-runtime-cef = "=3.0.0-alpha.5"
 # A second `cursio-app` (the Shell menu opening a page, a launcher click)
 # hands its arguments to the running one instead of starting another tray.
+# On Linux it meets the first over D-Bus, with no GTK, so the Chromium binary
+# keeps it too.
 tauri-plugin-single-instance = "=3.0.0-alpha.3"
-# The native "Save as" a gallery item asks for.
-tauri-plugin-dialog = "=3.0.0-alpha.3"
+# The native "Save as" a gallery item asks for, through the desktop portal on
+# Linux: `tauri-plugin-dialog` links GTK 3 there, which cannot load beside the
+# GTK 4 that Chromium brings.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

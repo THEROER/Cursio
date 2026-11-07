@@ -23,6 +23,8 @@ useHead({
  * would only mislead.
  */
 const { t } = useI18n()
+/** Set where the window cannot be transparent (Chromium), so the card stays square. */
+const squareWindow = document.documentElement.dataset.squareWindow !== undefined
 const { status, callAction } = useNode()
 const toast = useCursioToast()
 
@@ -123,7 +125,10 @@ watch(
 </script>
 
 <template>
-  <div class="flex h-screen flex-col overflow-hidden rounded-card border border-line bg-surface text-ink select-none">
+  <div
+    class="flex h-screen flex-col overflow-hidden border border-line bg-surface text-ink select-none"
+    :class="{ 'rounded-card': !squareWindow }"
+  >
     <header data-tauri-drag-region class="flex items-center gap-2 px-3 pt-2.5 pb-1">
       <CursioLogo :size="16" class="pointer-events-none shrink-0 text-brand" />
       <span data-tauri-drag-region class="min-w-0 flex-1 truncate text-xs text-ink-muted">

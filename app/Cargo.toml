@@ -4,10 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# `tauri dev` runs `cargo run`, which must know which binary is the app; the
+# Chromium one is only ever started by it.
+default-run = "cursio-app"
 
 [[bin]]
 name = "cursio-app"
 path = "src/main.rs"
+
+# The same app drawn by Chromium, for machines whose WebKitGTK has no GPU
+# (`src/renderer.rs`). A binary of its own: it needs `libcef` beside it to
+# start at all, and CEF's GTK 4 cannot load beside the GTK 3 of the other.
+# `cargo xtask build --cef` builds it.
+[[bin]]
+name = "cursio-app-cef"
+path = "src/main_cef.rs"
+required-features = ["cef"]
 
 # What Android loads: Tauri's mobile entry point is a library the Activity
 # opens, and the phone's node and its JNI natives ship inside it.
@@ -23,8 +35,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 default = ["custom-protocol", "wry"]
 custom-protocol = ["tauri/custom-protocol"]
 # The engine that draws the window: the platform webview (WebKitGTK, WebView2,
-# WKWebView).
+# WKWebView). The runtime is linked, not chosen at run time, because a binary
+# linked against Chromium needs `libcef` beside it to start at all.
 wry = ["dep:tauri-runtime-wry", "tauri/gtk3"]
+cef = ["dep:tauri-runtime-cef", "tauri/gtk4"]
 
 [build-dependencies]
 tauri-build.workspace = true
@@ -47,7 +61,8 @@ tokio.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 tauri-plugin-single-instance.workspace = true
-tauri-plugin-dialog.workspace = true
+rfd.workspace = true
+tauri-runtime-cef = { workspace = true, optional = true }
 # A gallery item copied as a file, for a file manager or a chat to paste.
 clipboard-core.workspace = true
 

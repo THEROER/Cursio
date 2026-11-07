@@ -106,6 +106,10 @@ enum Command_ {
         /// Only build this binary (default: all).
         #[arg(long, value_enum)]
         bin: Option<BinArg>,
+        /// Also build `cursio-app-cef`, the app drawn by Chromium, beside
+        /// `cursio-app` (Linux). The first build downloads CEF.
+        #[arg(long)]
+        cef: bool,
     },
     /// Build release, then install binaries into ~/.local/bin (+ .desktop files).
     Install {
@@ -231,7 +235,18 @@ fn main() -> Result<()> {
     dotenv::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env"));
     let cli = Cli::parse();
     match cli.command {
-        Command_::Build { target, debug, bin } => build_target(target, !debug, bin),
+        Command_::Build {
+            target,
+            debug,
+            bin,
+            cef,
+        } => {
+            build_target(target, !debug, bin)?;
+            if cef {
+                build_cef(!debug)?;
+            }
+            Ok(())
+        }
         Command_::Install { bin, no_build } => install(bin, no_build),
         Command_::Run {
             debug,
@@ -313,6 +328,42 @@ fn build(release: bool, only: Option<BinArg>, target: Option<&str>) -> Result<()
 
     run(cmd).context("cargo build failed")?;
     println!("✓ built into {}", out_dir(release, target).display());
+    Ok(())
+}
+
+/// Build `cursio-app-cef` for this machine.
+///
+/// Not one more entry in `BINARIES`: it is the `cursio-app` package again with
+/// another runtime feature, and cargo builds one feature set per invocation.
+/// CEF's files (`libcef.so`, its paks, `locales/`, `chrome-sandbox`) land
+/// beside it in the output directory, where it looks for them. A release one
+/// runs only once `chrome-sandbox` there is root's with mode 4755 (or
+/// `CHROME_DEVEL_SANDBOX` names such a helper); until then `cursio-app` stays
+/// on WebKitGTK.
+fn build_cef(release: bool) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("cursio-app-cef is built for Linux only");
+    }
+    generate_app_ui()?;
+    let profile = if release { "release" } else { "debug" };
+    println!("→ building cursio-app-cef ({profile}, host)");
+    let mut cmd = cargo();
+    cmd.arg("build");
+    if release {
+        cmd.arg("--release");
+    }
+    cmd.args([
+        "-p",
+        "cursio-app",
+        "--no-default-features",
+        "--features",
+        "custom-protocol,cef",
+        "--bin",
+        "cursio-app-cef",
+    ])
+    .env("OPUS_TARGET", OPUS_TARGET_LINUX);
+    run(cmd).context("cargo build of cursio-app-cef failed")?;
+    println!("✓ built into {}", out_dir(release, None).display());
     Ok(())
 }
 

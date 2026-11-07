@@ -23,13 +23,26 @@ const MARGIN: f64 = 24.0;
 
 /// Show the call window, building it the first time.
 pub fn open(app: &AppHandle) {
+    // The CEF runtime answers a monitor query by posting to the main thread
+    // and waiting for it; asked from that thread (the app's setup), it waited
+    // on itself and the whole UI hung after its first frame.
+    #[cfg(feature = "cef")]
+    {
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || show(&app));
+    }
+    #[cfg(not(feature = "cef"))]
+    show(app);
+}
+
+fn show(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(LABEL) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
         return;
     }
-    let mut builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("Cursio — Call")
         .inner_size(WIDTH, HEIGHT)
         .resizable(false)
@@ -41,18 +54,25 @@ pub fn open(app: &AppHandle) {
         .always_on_top(true)
         .skip_taskbar(false)
         .focused(true);
+    // CEF cannot paint a transparent window on Linux, so under Chromium the
+    // window is opaque and the card square; the page reads the mark.
+    #[cfg(feature = "cef")]
+    let builder = builder
+        .transparent(false)
+        .initialization_script("document.documentElement.dataset.squareWindow = ''");
     // Bottom right, where a desktop's own notifications appear on Windows and
     // where Phone Link puts its call; centred when the monitor is unknown.
-    if let Ok(Some(monitor)) = app.primary_monitor() {
-        let size = monitor.size().to_logical::<f64>(monitor.scale_factor());
-        let origin = monitor.position().to_logical::<f64>(monitor.scale_factor());
-        builder = builder.position(
-            origin.x + size.width - WIDTH - MARGIN,
-            origin.y + size.height - HEIGHT - MARGIN * 3.0,
-        );
-    } else {
-        builder = builder.center();
-    }
+    let builder = match app.primary_monitor() {
+        Ok(Some(monitor)) => {
+            let size = monitor.size().to_logical::<f64>(monitor.scale_factor());
+            let origin = monitor.position().to_logical::<f64>(monitor.scale_factor());
+            builder.position(
+                origin.x + size.width - WIDTH - MARGIN,
+                origin.y + size.height - HEIGHT - MARGIN * 3.0,
+            )
+        }
+        _ => builder.center(),
+    };
     if let Err(e) = builder.build() {
         tracing::warn!(error = %e, "could not open the call window");
     }

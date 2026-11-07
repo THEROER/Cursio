@@ -102,28 +102,19 @@ pub async fn gallery_save(
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn gallery_save_as(
-    app: tauri::AppHandle,
     link: State<'_, NodeLink>,
     peer: String,
     item: String,
     name: String,
 ) -> Result<Option<String>, NodeError> {
-    use tauri_plugin_dialog::DialogExt;
-    // The dialog blocks until answered, so it waits off the runtime.
-    let picked = tauri::async_runtime::spawn_blocking(move || {
-        app.dialog()
-            .file()
-            .set_file_name(&name)
-            .blocking_save_file()
-    })
-    .await
-    .map_err(NodeError::failed)?;
+    let picked = rfd::AsyncFileDialog::new()
+        .set_file_name(&name)
+        .save_file()
+        .await;
     let Some(picked) = picked else {
         return Ok(None);
     };
-    let picked = picked
-        .into_path()
-        .map_err(|e| NodeError::failed(format!("not a place on this computer: {e}")))?;
+    let picked = picked.path().to_path_buf();
     let (Some(dir), Some(name)) = (picked.parent(), picked.file_name()) else {
         return Err(NodeError::failed(format!(
             "{} names no file",
