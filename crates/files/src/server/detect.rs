@@ -78,8 +78,13 @@ pub(super) fn detect_disks() -> Vec<SharedVolume> {
             continue;
         };
         // The root is already offered above, and a bind mount of it would
-        // otherwise arrive a second time under another name.
+        // otherwise arrive a second time under another name. Its device is
+        // marked seen for the same reason: docker's builds bind-mount the
+        // root's filesystem under /var/lib/docker/tmp for each step, and each
+        // reached the peer as a disk of its own, mounted and unmounted on
+        // Windows as a fresh drive letter every few seconds.
         if target == "/" {
+            seen.insert(source.to_string());
             continue;
         }
         let Some(disk) = backing_disk(source) else {
