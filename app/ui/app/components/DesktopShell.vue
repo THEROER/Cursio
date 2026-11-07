@@ -66,6 +66,7 @@ const title = computed(() => {
     content-class="mx-auto w-full max-w-5xl"
     resizable
     pinnable
+    page-transition
     persist="cursio"
     @select="(item: SidebarItem) => navigateTo(item.id)"
   >

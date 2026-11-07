@@ -372,7 +372,7 @@ async function restartNode() {
 </script>
 
 <template>
-  <DesktopShell>
+  <div>
     <div class="xl:grid xl:grid-cols-[minmax(0,1fr)_11rem] xl:items-start xl:gap-8">
       <div ref="sectionsBox" class="flex flex-col gap-6">
         <section v-if="status" id="name" class="flex scroll-mt-4 flex-col gap-3">
@@ -685,5 +685,5 @@ async function restartNode() {
       :loading-label="t('common.working')"
       @confirm="restartNode"
     />
-  </DesktopShell>
+  </div>
 </template>

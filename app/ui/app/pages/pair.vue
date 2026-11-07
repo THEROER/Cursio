@@ -107,7 +107,7 @@ function copySelection(event: ClipboardEvent) {
 </script>
 
 <template>
-  <DesktopShell>
+  <div>
     <section class="flex flex-col gap-4">
       <LpSection :title="t('pair.title')" :description="t('pair.description')" icon="lucide:link" />
 
@@ -200,5 +200,5 @@ function copySelection(event: ClipboardEvent) {
       :cancel-label="t('pair.keepOpen')"
       @confirm="cancel"
     />
-  </DesktopShell>
+  </div>
 </template>

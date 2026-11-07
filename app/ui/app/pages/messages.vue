@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import type { SegmentedOption } from "@leavepulse/ui"
+
+definePageMeta({ fullBleed: true })
 import type { Conversation, TextMessage } from "~/composables/useMessages"
 import { PAGE } from "~/composables/useMessages"
 
@@ -360,7 +362,7 @@ const showList = computed(() => !(open.value || composingNew.value))
 </script>
 
 <template>
-  <DesktopShell full-bleed>
+  <div class="h-full min-h-0">
     <div v-if="!phones.length" class="flex h-full items-center justify-center p-6">
       <LpEmptyState icon="lucide:smartphone" :title="t('messages.noPhone')" :description="t('messages.noPhoneHint')" />
     </div>
@@ -515,5 +517,5 @@ const showList = computed(() => !(open.value || composingNew.value))
         </div>
       </section>
     </div>
-  </DesktopShell>
+  </div>
 </template>

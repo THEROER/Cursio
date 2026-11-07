@@ -114,7 +114,7 @@ function peerFacts(link: NonNullable<PeerView["link"]>) {
 </script>
 
 <template>
-  <DesktopShell>
+  <div>
     <!-- Loading: the first push has not arrived and nothing has failed yet. -->
     <div v-if="!status && !error" class="flex flex-col gap-6">
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -286,5 +286,5 @@ function peerFacts(link: NonNullable<PeerView["link"]>) {
       :loading-label="t('common.working')"
       @confirm="restartNode"
     />
-  </DesktopShell>
+  </div>
 </template>

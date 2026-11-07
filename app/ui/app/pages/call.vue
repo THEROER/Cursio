@@ -2,6 +2,9 @@
 import { getCurrentWindow } from "@tauri-apps/api/window"
 import type { CallAction, PhoneCall, PhoneCalls } from "~/composables/useNode"
 
+// Its own small window, with no shell around it.
+definePageMeta({ layout: false })
+
 // The window is transparent so the card's rounded corners show; the page
 // behind the card must be too, or the theme's background fills them in.
 useHead({

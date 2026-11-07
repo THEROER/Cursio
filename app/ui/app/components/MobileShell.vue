@@ -87,7 +87,11 @@ onMounted(() => void resumeSound())
     <main v-else class="cursio-mobile__sides min-h-0 flex-1">
       <LpScrollArea class="h-full" content-class="px-4 py-4">
         <NodeDownAlert />
-        <slot />
+        <!-- The kit's swap: a new page rises in as the old one fades, as the
+             desktop shell's `page-transition` does. -->
+        <LpSwap :swap-key="route.path">
+          <slot />
+        </LpSwap>
       </LpScrollArea>
     </main>
 

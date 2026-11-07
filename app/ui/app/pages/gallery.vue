@@ -377,7 +377,7 @@ function describe(item: MediaItem): string {
 </script>
 
 <template>
-  <DesktopShell>
+  <div>
     <section class="flex flex-col gap-4">
       <div class="flex flex-wrap items-center justify-between gap-3">
         <LpSection :title="t('gallery.title')" :description="t('gallery.description')" icon="lucide:images" />
@@ -495,5 +495,5 @@ function describe(item: MediaItem): string {
         </div>
       </div>
     </LpModal>
-  </DesktopShell>
+  </div>
 </template>

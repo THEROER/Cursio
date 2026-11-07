@@ -155,7 +155,7 @@ const labels = computed(() => ({
 </script>
 
 <template>
-  <DesktopShell>
+  <div>
     <section class="flex flex-col gap-4">
       <LpSection :title="t('placement.title')" :description="t('placement.description')" icon="lucide:monitor" />
 
@@ -238,5 +238,5 @@ const labels = computed(() => ({
         </div>
       </div>
     </section>
-  </DesktopShell>
+  </div>
 </template>

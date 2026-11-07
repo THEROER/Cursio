@@ -1,4 +1,6 @@
 <script setup lang="ts">
+definePageMeta({ fullBleed: true })
+
 const { t } = useI18n()
 const { status, linkLost, isConnected, targets, driven, connecting, connectError, connect, click, zone, speed, surface } =
   useTouchpad()
@@ -40,7 +42,7 @@ const buttons: { name: "left" | "middle" | "right"; label: string }[] = [
 </script>
 
 <template>
-  <DesktopShell full-bleed>
+  <div class="flex h-full min-h-0 flex-1 flex-col">
     <!-- The pad owns every stroke that lands on it, so the page around it
          cannot scroll; what does not fit has to scroll on its own. The pad
          takes whatever room is left and every control sits in one scrolling
@@ -152,5 +154,5 @@ const buttons: { name: "left" | "middle" | "right"; label: string }[] = [
         </div>
       </div>
     </Teleport>
-  </DesktopShell>
+  </div>
 </template>
