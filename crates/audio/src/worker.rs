@@ -9,8 +9,18 @@
 //! between them is what dropping does, which [`OnDrop`] names.
 
 use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::AudioError;
+
+/// How long a stream's thread may take to say its loop is up. Opening a
+/// device takes milliseconds; one that never returns (seen on Windows: a
+/// Voicemeeter capture endpoint whose `Initialize` did not come back) held
+/// the audio module in its constructor for good, its inbox overflowed within
+/// half a minute, and the session ended — then again on every session after.
+/// Past this the stream is given up as unopenable and its thread left to
+/// stop by itself, if it ever returns.
+const READY_WITHIN: Duration = Duration::from_secs(3);
 
 /// What dropping a [`Worker`] waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,14 +57,33 @@ impl Worker {
         on_drop: OnDrop,
         run: impl FnOnce(mpsc::Receiver<()>, mpsc::Sender<Result<(), String>>) + Send + 'static,
     ) -> Result<Self, AudioError> {
+        Self::start_within(name, what, on_drop, READY_WITHIN, run)
+    }
+
+    fn start_within(
+        name: String,
+        what: &str,
+        on_drop: OnDrop,
+        within: Duration,
+        run: impl FnOnce(mpsc::Receiver<()>, mpsc::Sender<Result<(), String>>) + Send + 'static,
+    ) -> Result<Self, AudioError> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-        let worker = Self::spawn(name, what, on_drop, move |stop| run(stop, ready_tx))?;
-        match ready_rx.recv() {
+        let mut worker = Self::spawn(name, what, on_drop, move |stop| run(stop, ready_tx))?;
+        match ready_rx.recv_timeout(within) {
             Ok(Ok(())) => Ok(worker),
             Ok(Err(e)) => Err(AudioError::Backend(e)),
-            Err(_) => Err(AudioError::Backend(format!(
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::Backend(format!(
                 "{what} exited before signalling readiness"
             ))),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Never joined: the thread is stuck in the call that did not
+                // return, and joining it would hang this caller instead.
+                worker.on_drop = OnDrop::Detach;
+                Err(AudioError::Backend(format!(
+                    "{what} did not open its device within {} s; the device is not answering",
+                    within.as_secs()
+                )))
+            }
         }
     }
 
@@ -113,6 +142,24 @@ mod tests {
         assert!(
             matches!(result, Err(AudioError::Backend(e)) if e == "test thread exited before signalling readiness")
         );
+    }
+
+    #[test]
+    fn a_device_that_never_opens_fails_its_constructor_instead_of_holding_it() {
+        let started = std::time::Instant::now();
+        let result = Worker::start_within(
+            "t".into(),
+            "test thread",
+            OnDrop::Join,
+            Duration::from_millis(50),
+            |_, _ready| std::thread::sleep(Duration::from_secs(2)),
+        );
+        assert!(
+            matches!(&result, Err(AudioError::Backend(e)) if e.contains("did not open its device")),
+            "{:?}",
+            result.err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "not joined");
     }
 
     #[test]
