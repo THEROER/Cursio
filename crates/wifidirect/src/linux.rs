@@ -163,7 +163,7 @@ impl Drop for Station {
     }
 }
 
-pub fn join(ssid: &str, passphrase: &str) -> Result<(Station, Ipv4Addr, Ipv4Addr)> {
+pub fn join(ssid: &str, passphrase: &str) -> Result<(Station, Ipv4Addr, Ipv4Addr, Option<u32>)> {
     let bus = Connection::system().map_err(nm_err)?;
     let device = wifi_devices(&bus)?
         .into_iter()
@@ -249,7 +249,8 @@ pub fn join(ssid: &str, passphrase: &str) -> Result<(Station, Ipv4Addr, Ipv4Addr
     }
 
     let (local, host) = addresses(&station.bus, &device.path)?;
-    Ok((station, local, host))
+    let freq = frequency(&station.bus, &device.path);
+    Ok((station, local, host, freq))
 }
 
 /// This machine's address on the group, and the host's: the DHCP server that

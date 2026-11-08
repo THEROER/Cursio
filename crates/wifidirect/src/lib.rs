@@ -139,6 +139,11 @@ pub struct Joined {
     pub local: Ipv4Addr,
     /// The host's address on the group: where its mesh listener answers.
     pub host: Ipv4Addr,
+    /// The frequency the group turned out to be on, in MHz. The host
+    /// reports where its own Wi-Fi is, which says nothing when it has none:
+    /// Windows then picks the group's channel itself, and only the joined
+    /// end can see which.
+    pub freq_mhz: Option<u32>,
     #[cfg(target_os = "linux")]
     inner: linux::Station,
 }
@@ -157,8 +162,13 @@ impl Joined {
 pub fn join(ssid: &str, passphrase: &str) -> Result<Joined> {
     #[cfg(target_os = "linux")]
     {
-        let (inner, local, host) = linux::join(ssid, passphrase)?;
-        Ok(Joined { local, host, inner })
+        let (inner, local, host, freq_mhz) = linux::join(ssid, passphrase)?;
+        Ok(Joined {
+            local,
+            host,
+            freq_mhz,
+            inner,
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -388,6 +388,21 @@ impl DirectEngine {
                     unreachable!()
                 };
                 match futures_ready(task) {
+                    Ok(Ok(link))
+                        if !cursio_wifidirect::same_channel(
+                            self.mine.and_then(|m| m.freq_mhz),
+                            link.freq_mhz,
+                        ) =>
+                    {
+                        let why = format!(
+                            "the group came up on {} MHz and this machine's Wi-Fi is on {} MHz; one card on two channels is slower than the router",
+                            link.freq_mhz.unwrap_or(0),
+                            self.mine.and_then(|m| m.freq_mhz).unwrap_or(0)
+                        );
+                        tracing::info!(peer = %self.peer_name, %why, "leaving the peer's direct Wi-Fi group");
+                        drop_off_runtime(link);
+                        self.outbox.push(DirectMsg::Left { why });
+                    }
                     Ok(Ok(link)) => {
                         tracing::info!(
                             peer = %self.peer_name,
