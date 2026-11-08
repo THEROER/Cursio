@@ -137,13 +137,18 @@ playback clock causes crackle or growing lag.
   waveforms (or very low energy) are eligible; unmatched material is retained
   rather than forced through an audible discontinuity. This is conservative
   catch-up, not a complete speech concealment or general music time-stretcher.
-  Hard overflow still drops the oldest whole frames with a crossfade.
+  Hard overflow still drops the oldest whole frames with a crossfade, but only
+  past the reserve plus 100 ms (`Delay::limit`; never below 200 ms). Recovery
+  works only above the reserve, so a hard limit equal to the reserve's own
+  200 ms bound left it no room: once a pause or a stall had grown the reserve
+  there, every few packets arriving together were cut — heard as a gap every
+  second or two.
 
   Pull-model backends include one complete device cycle in the prefill and
   ceiling, including unusually large cycles. A PipeWire playback cycle is
-  `pw_buffer.requested` frames, not the mapped buffer. WASAPI keeps its jitter
-  queue within 200 ms at the device format independently of its 40 ms device
-  lead. Health logs distinguish target reserve, buffered duration, graceful
+  `pw_buffer.requested` frames, not the mapped buffer. WASAPI bounds its
+  jitter queue the same way at the device format, independently of its 40 ms
+  device lead. Health logs distinguish target reserve, buffered duration, graceful
   acceleration, hard drops, and silence produced.
 
 - **Clock:** packet timestamps use the source sample clock, advanced by the

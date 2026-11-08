@@ -17,7 +17,9 @@
 //!
 //! Prefill and the ceiling include one complete device cycle. The remaining
 //! reserve adapts to local packet arrival gaps and decays after a stable period.
-//! Correlation-gated overlap removal reduces excess delay gradually.
+//! Correlation-gated overlap removal reduces excess delay gradually; the
+//! ceiling sits above the reserve ([`crate::jitter::Delay::limit`]) so that it
+//! cuts only a runaway backlog.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -93,11 +95,11 @@ impl Playout {
         self.channels * 4
     }
 
-    /// The ceiling: never below one cycle and its margin, or the buffer could
-    /// not hold what a single cycle takes.
+    /// The ceiling: never below one cycle and the reserve's limit, or the
+    /// buffer could not hold what a single cycle takes.
     fn ceiling(&self) -> usize {
         self.max_bytes
-            .max(self.cycle_bytes + self.delay.frames() * self.frame_bytes())
+            .max(self.cycle_bytes + self.delay.limit() * self.frame_bytes())
     }
 
     /// Queue newly arrived audio. Returns the bytes of old audio dropped to
@@ -364,6 +366,28 @@ mod tests {
         assert_eq!(fill.accelerated, 0);
         assert_eq!(playout.buf.len(), before - out.len());
         assert!(playout.buf.len() > 100 * MS);
+    }
+
+    #[test]
+    fn a_reserve_grown_to_its_ceiling_still_absorbs_packets_arriving_together() {
+        use std::time::Duration;
+        let start = Instant::now();
+        let mut playout = Playout::new(RATE, 2, MAX, MARGIN);
+        playout.push_at(&tone(240), start, Some(0));
+        // One chunk 300 ms late: the reserve grows to its 200 ms ceiling.
+        playout.push_at(&tone(240), start + Duration::from_millis(300), Some(240));
+        assert_eq!(playout.delay.frames(), MAX / FRAME);
+
+        // The reserve's worth queued, then a few packets more at once.
+        let trimmed = playout.push(&tone(48 * 200 - 480 + 48 * 30));
+        assert_eq!(
+            trimmed, 0,
+            "a 30 ms burst above the reserve must not be cut"
+        );
+
+        let trimmed = playout.push(&tone(48 * 200));
+        assert!(trimmed > 0, "a runaway backlog is still bounded");
+        assert_eq!(playout.buf.len(), 300 * MS);
     }
 
     #[test]

@@ -456,11 +456,12 @@ pub(super) fn run_render_loop(
                 ));
             }
             // Bound the backlog by discarding the oldest audio — see
-            // RENDER_MAX_BYTES. Trim whole frames so the stream stays aligned
-            // and channels don't swap.
-            if jitter.len() > max_jitter_bytes {
+            // RENDER_MAX_BYTES and `Delay::limit`. Trim whole frames so the
+            // stream stays aligned and channels don't swap.
+            let limit_bytes = max_jitter_bytes.max(delay.limit() * frame_bytes);
+            if jitter.len() > limit_bytes {
                 let frame = (mix.nChannels as usize) * (mix.wBitsPerSample as usize / 8);
-                let mut excess = jitter.len() - max_jitter_bytes;
+                let mut excess = jitter.len() - limit_bytes;
                 if frame > 0 {
                     excess -= excess % frame;
                 }

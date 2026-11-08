@@ -63,6 +63,19 @@ impl Delay {
         self.target.ceil() as usize
     }
 
+    /// Most audio a playout may hold before the oldest is cut: the reserve plus
+    /// 100 ms above it.
+    ///
+    /// A cut is heard as a gap, so it is reserved for a backlog that runs away;
+    /// ordinary excess is removed by [`Recovery`], which only acts above the
+    /// reserve and so needs room there. A limit equal to the reserve's own
+    /// ceiling left none once the reserve had grown to it: a queue held at
+    /// 200 ms against a 200 ms limit cut 5–10 ms of audio every time a few
+    /// packets arrived together, every second or two.
+    pub fn limit(&self) -> usize {
+        self.frames() + self.rate / 10
+    }
+
     pub fn stable(&self, now: Instant) -> bool {
         self.disturbed
             .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(30))
