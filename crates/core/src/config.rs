@@ -488,6 +488,9 @@ pub struct Modules {
     pub remote_screen: bool,
     /// Let peers view this machine's screen.
     pub screen_host: bool,
+    /// Reach a nearby machine over a direct Wi-Fi link beside the router;
+    /// see `direct_session`.
+    pub direct: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -652,6 +655,7 @@ impl Default for Modules {
             usb: false,
             remote_screen: false,
             screen_host: true,
+            direct: true,
         }
     }
 }

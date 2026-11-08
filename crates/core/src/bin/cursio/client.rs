@@ -5,6 +5,7 @@ use crate::cli::BluetoothAction;
 use crate::cli::CallCommand;
 use crate::cli::PortalAction;
 use crate::cli::SmsAction;
+use crate::cli::WifiAction;
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn portal(action: PortalAction) -> anyhow::Result<()> {
@@ -27,6 +28,21 @@ pub(crate) fn bluetooth(action: BluetoothAction) -> anyhow::Result<()> {
 pub(crate) fn bluetooth(_action: BluetoothAction) -> anyhow::Result<()> {
     anyhow::bail!(
         "a phone's calls reach this computer's audio over bluetooth only on Linux so far; calls are still answered and placed from here over the mesh"
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn wifi(action: WifiAction) -> anyhow::Result<()> {
+    match action {
+        WifiAction::Install => cursio_core::wifi_setup::install(),
+        WifiAction::Uninstall => cursio_core::wifi_setup::uninstall(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn wifi(_action: WifiAction) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "nothing to install here: Windows runs the group a nearby Linux machine joins, and needs no second interface for it"
     )
 }
 

@@ -247,13 +247,14 @@ impl LiveConfig {
 }
 
 /// The modules a config switch turns on and off, by id.
-fn switchable(config: &Config) -> [(ModuleId, bool); 4] {
+fn switchable(config: &Config) -> [(ModuleId, bool); 5] {
     let m = &config.modules;
     [
         (ModuleId::CLIPBOARD, m.clipboard),
         (ModuleId::AUDIO, m.audio),
         (ModuleId::FILES, m.files),
         (ModuleId::USB, m.usb),
+        (ModuleId::DIRECT, m.direct),
     ]
 }
 

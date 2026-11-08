@@ -117,6 +117,7 @@ pub mod module;
 pub(crate) mod module_host;
 pub use module_host::modules_busy;
 pub mod desktop_window;
+pub mod direct_session;
 /// The unelevated process that keeps a peer's drives where Explorer sees them.
 #[cfg(feature = "files")]
 pub mod mount_helper;
@@ -191,6 +192,8 @@ pub mod usb_session;
 mod video_budget;
 /// Waking a paired machine that is asleep, by the address learned while awake.
 pub mod wake;
+#[cfg(target_os = "linux")]
+pub mod wifi_setup;
 #[cfg(feature = "window")]
 pub mod window_session;
 

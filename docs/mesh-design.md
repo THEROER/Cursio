@@ -710,6 +710,53 @@ unprompted copy of its sound only to those profiles. They are not this path.)
 On macOS the computer's half is not built yet and says so in the log; peers
 reach a Mac over the network only.
 
+## A direct Wi-Fi path beside the router
+
+Two machines on one access point reach each other in two hops through it,
+and a far router makes each a slow one. Measured between Nocturne and
+Lightmoon with both still on their own network: the group between them gave
+a 1.6 ms median round trip and lost nothing, where the hotspot beside it gave
+5.5 ms and lost one ping in five. So a machine near another runs a second,
+private network with it on the same card, and the session gains paths over it.
+
+- **A path, not a link.** The group is an IP network, so connections over it
+  are ordinary TCP connections that join the running session (`link::join`)
+  like any other network path. A path is *direct* when this end's address
+  belongs to a group (`cursio_transport::direct`); both ends see their own
+  group address on the same connection, so both mark it alike with nothing on
+  the wire. Each lane may hold one direct path and one through the router
+  (`resume::state::PathSlot::direct`); a healthy direct one carries, the
+  router's stays beside it on its keepalive, and a joining connection fills a
+  lane missing from its own class. When the group goes,
+  `resume::direct_lost` lets the direct paths go at once and the router's
+  carry on — the session never notices the machines moving apart.
+- **A legacy group, not Wi-Fi Direct proper.** NetworkManager's `wifi-p2p`
+  device finds a Windows machine, but Windows refuses its group negotiation
+  (`P2P-GO-NEG-FAILURE status=4`) from either side, since NetworkManager
+  sends no provision discovery and accepts no request, and wpa_supplicant
+  beneath it is root's. So Windows runs its Wi-Fi Direct group in legacy mode
+  (a plain WPA2 network, no internet sharing) and Linux joins it as a station
+  on a **second station interface** of the same card (`wlcursio0`). Creating
+  that interface is root's, once: `cursio wifi install`. NetworkManager then
+  drives it for the user with a volatile connection bound to the node's D-Bus
+  connection, so a crashed node leaves no link up, with `never-default` so the
+  internet stays on each machine's own network, and with power saving off
+  (on, the mean round trip was 50 ms).
+- **One channel.** A card on two channels splits its time between them and
+  did worse than the router alone; the host's group takes the channel of the
+  host's own Wi-Fi. Each end reports the frequency of its own Wi-Fi, and the
+  link is put up only when they match (or one end is wired).
+- **Who does what** is the `direct` module (18, `core/src/direct_session.rs`,
+  vocabulary `protocol/src/direct.rs`): both ends send `Able`, derive alike
+  who hosts, the host puts the group up and sends its fresh name and
+  passphrase inside the session, the joiner joins and answers `Joined` with
+  both addresses, and only the joiner dials over the group
+  (`direct_session::dial_ips`, `PeerRegistry::needs_direct_path`), so the two
+  never race. The host keeps the clock: a group nobody joined in 75 s, or one
+  the joiner left, comes down and is offered again after 30 s, doubling to
+  30 min. A group's address is never remembered as a peer's, announced over
+  mDNS or used to wake a machine. `[modules] direct = false` turns it off.
+
 ## Where it lives
 
 All five parts shipped, and the code is laid out along the same seams:

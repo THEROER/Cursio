@@ -176,6 +176,13 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: BluetoothAction,
     },
+    /// Give the Wi-Fi card a second station interface, so this machine can
+    /// reach a nearby one over a direct link while staying on its own
+    /// network (Linux; asks for root once).
+    Wifi {
+        #[command(subcommand)]
+        action: WifiAction,
+    },
     /// Show the newest lines of this machine's log, of other machines' in the
     /// mesh, or of all of them merged by time. Goes through the running node.
     Logs {
@@ -635,6 +642,14 @@ pub(crate) enum BluetoothAction {
     /// WirePlumber; Bluetooth audio drops for a second).
     Install,
     /// Give those roles back to PipeWire.
+    Uninstall,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WifiAction {
+    /// Add the interface now and whenever the card appears.
+    Install,
+    /// Remove it and its rule.
     Uninstall,
 }
 

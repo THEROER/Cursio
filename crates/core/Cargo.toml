@@ -75,6 +75,7 @@ cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true
 cursio-transport.workspace = true
+cursio-wifidirect.workspace = true
 cursio-airplay = { workspace = true, optional = true }
 cursio-input = { workspace = true, optional = true }
 cursio-audio = { workspace = true, optional = true }

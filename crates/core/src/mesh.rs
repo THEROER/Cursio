@@ -54,6 +54,9 @@ pub struct DialTarget {
     pub peer_id: PeerId,
     pub display_name: String,
     pub addr: SocketAddr,
+    /// A call over a direct Wi-Fi link, adding a path to a running session:
+    /// its address is the group's, never remembered as the peer's.
+    pub direct: bool,
 }
 
 /// Decide who to dial on this sweep.
@@ -138,6 +141,29 @@ fn next_dial_targets_at(
             peer_id: peer.peer_id,
             display_name: peer.display_name,
             addr,
+            direct: false,
+        });
+    }
+    // Only the machine that joined a group has an address to call over it,
+    // so only it calls: one side, no race to settle.
+    for (peer_id, ip) in crate::direct_session::dial_ips() {
+        if !reg.needs_direct_path(&peer_id) {
+            continue;
+        }
+        let Some(peer) = reg.get(&peer_id).cloned() else {
+            continue;
+        };
+        let Some(port) = peer.addr.map(|a| a.port()) else {
+            continue;
+        };
+        if !reg.begin_direct_dial(peer_id, now) {
+            continue;
+        }
+        targets.push(DialTarget {
+            peer_id,
+            display_name: peer.display_name,
+            addr: SocketAddr::new(ip, port),
+            direct: true,
         });
     }
     targets

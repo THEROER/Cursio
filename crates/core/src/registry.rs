@@ -137,10 +137,20 @@ pub struct PeerRegistry {
     /// 17 000 calls a day to one phone, each two log lines, and a connect
     /// timeout's worth of a socket every four seconds.
     dial_backoff: HashMap<PeerId, (u32, Instant)>,
+    /// Calls over a direct Wi-Fi link in flight, or failed and resting until
+    /// the instant given. Apart from [`Self::dial_backoff`]: the peer is
+    /// online through the router meanwhile, and a missed direct call must not
+    /// mark it offline or slow the router's own redials.
+    direct_dials: HashMap<PeerId, Instant>,
 }
 
 /// The wait after one failed call; it doubles with each in a row.
 pub const DIAL_RETRY: Duration = Duration::from_secs(4);
+
+/// How long after a failed call over a direct Wi-Fi link the next one goes.
+/// The group was just joined, so the host is near; a refusal is the host's
+/// listener not answering on the group yet, not the machine being gone.
+const DIRECT_RETRY: Duration = Duration::from_secs(5);
 /// The most a peer that keeps not answering waits between calls. Short
 /// enough that a machine woken up is found within it even when its own
 /// announcement never reaches this one.
@@ -400,6 +410,41 @@ impl PeerRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    /// A session to `peer` runs, but not every lane has a path over the
+    /// direct link yet.
+    pub fn needs_direct_path(&self, peer: &PeerId) -> bool {
+        self.sessions
+            .get(peer)
+            .is_some_and(|s| !s.0.is_ended() && !s.0.direct_complete())
+    }
+
+    /// Take the next call to `peer` over the direct link, unless one is in
+    /// flight or resting after a failure.
+    pub fn begin_direct_dial(&mut self, peer: PeerId, now: Instant) -> bool {
+        if self
+            .direct_dials
+            .get(&peer)
+            .is_some_and(|until| now < *until)
+        {
+            return false;
+        }
+        // In flight: no deadline but the connect timeout, after which the
+        // outcome is reported.
+        self.direct_dials
+            .insert(peer, now + Duration::from_secs(3600));
+        true
+    }
+
+    /// A call over the direct link ended: free to call again at once after a
+    /// success (the next lane), after a pause after a failure.
+    pub fn direct_dial_done(&mut self, peer: PeerId, ok: bool, now: Instant) {
+        if ok {
+            self.direct_dials.remove(&peer);
+        } else {
+            self.direct_dials.insert(peer, now + DIRECT_RETRY);
+        }
     }
 
     /// A session to `peer` is missing a healthy network lane. Dial through

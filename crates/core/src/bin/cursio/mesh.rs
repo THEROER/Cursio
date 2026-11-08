@@ -200,7 +200,11 @@ pub(crate) async fn run_mesh(
                             }
                         };
                         tracing::info!(peer = %transport.peer_addr(), "peer dialled in");
-                        let network = Some(transport.peer_addr().ip());
+                        // The group's hardware addresses wake nothing: only a
+                        // connection through the router teaches one.
+                        let network = (!cursio_transport::Transport::local_ip(&transport)
+                            .is_some_and(cursio_transport::direct::is_local))
+                        .then(|| transport.peer_addr().ip());
                         spawn_peer_session(
                             transport,
                             identity.clone(),
@@ -391,6 +395,14 @@ pub(crate) async fn run_mesh(
                                         error = %e,
                                         "dial failed; will retry"
                                     );
+                                    if target.direct {
+                                        registry.borrow_mut().direct_dial_done(
+                                            target.peer_id,
+                                            false,
+                                            std::time::Instant::now(),
+                                        );
+                                        continue;
+                                    }
                                     // Back to Offline, retried after a backoff.
                                     registry
                                         .borrow_mut()
@@ -398,12 +410,20 @@ pub(crate) async fn run_mesh(
                                     continue;
                                 }
                             };
-                            tracing::info!(peer = %target.display_name, addr = %target.addr, "dialled peer");
+                            tracing::info!(peer = %target.display_name, addr = %target.addr, direct = target.direct, "dialled peer");
+                            if target.direct {
+                                registry.borrow_mut().direct_dial_done(
+                                    target.peer_id,
+                                    true,
+                                    std::time::Instant::now(),
+                                );
+                            }
                             // Cache the address that just worked so we can redial
                             // this peer after a restart even if mDNS never
                             // announces it. Best-effort: a failed write must not
-                            // stop the session.
-                            if let Ok(mut store) = TrustStore::load() {
+                            // stop the session. Never a group's address, which
+                            // lasts only while the two machines are near.
+                            if let Some(Ok(mut store)) = (!target.direct).then(TrustStore::load) {
                                 if let Err(e) = store.remember_addr(&target.peer_id, target.addr) {
                                     tracing::debug!(error = %e, "could not cache peer address");
                                 }
@@ -422,7 +442,7 @@ pub(crate) async fn run_mesh(
                                 modules.clone(),
                                 offer,
                                 None,
-                                Some(target.addr.ip()),
+                                (!target.direct).then(|| target.addr.ip()),
                             );
                         }
                         });

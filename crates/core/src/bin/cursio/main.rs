@@ -43,6 +43,7 @@ use crate::client::print_status;
 use crate::client::ring_phone;
 use crate::client::send_share;
 use crate::client::sms;
+use crate::client::wifi;
 use crate::input::apply_crossing;
 use crate::input::apply_modifier_map;
 use crate::input::watch_screens;
@@ -506,6 +507,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Peers { timeout_secs } => list_peers(identity, timeout_secs).await,
         Command::Call { action } => call(action).await,
         Command::Bluetooth { action } => bluetooth(action),
+        Command::Wifi { action } => wifi(action),
         Command::Sms { action } => sms(action).await,
         Command::Logs {
             machines,
