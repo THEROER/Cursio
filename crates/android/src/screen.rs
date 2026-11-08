@@ -4,14 +4,17 @@
 //! `ScreenShare` (Kotlin) owns the projection and the hardware encoder, and
 //! hands each encoded unit down through `nativeScreenUnit` as a slice of the
 //! codec's own direct buffer — read in place, copied once into the mesh.
-//! `ScreenTouch`, the accessibility service, carries out what
-//! [`phone_gesture`](cursio_core::phone_gesture) decided. Everything in
-//! between is [`phone_screen`](cursio_core::phone_screen), which is the same
-//! on every machine.
+//! What [`phone_gesture`](cursio_core::phone_gesture) decided is carried out
+//! by the phone's own shell when it is paired — its `input` reaches screens an
+//! app closed to accessibility services — and otherwise, or for pinching and
+//! text, by `ScreenTouch`, the accessibility service. Everything in between is
+//! [`phone_screen`](cursio_core::phone_screen), which is the same on every
+//! machine.
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use cursio_core::phone_gesture::Gesture;
+use cursio_core::phone_gesture::{Gesture, ShellStroke, ShellStrokes};
 use cursio_core::phone_screen::ScreenBackend;
 use jni::objects::{JObject, JValue};
 
@@ -129,9 +132,92 @@ fn answer(method: &str, text: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// How long touch stays with the accessibility service after the shell
+/// refused one: debugging turned off, or HyperOS' "USB debugging (Security
+/// settings)" not on, which `input` needs there.
+const SHELL_TOUCH_RETRY: Duration = Duration::from_secs(30);
+
+static STROKES: Mutex<ShellStrokes> = Mutex::new(ShellStrokes::new());
+static SHELL_REFUSED: Mutex<Option<Instant>> = Mutex::new(None);
+static SHELL_QUEUE: OnceLock<Mutex<mpsc::Sender<String>>> = OnceLock::new();
+
+fn lock_strokes() -> std::sync::MutexGuard<'static, ShellStrokes> {
+    STROKES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a computer's touch goes through the shell now.
+fn shell_touch_usable() -> bool {
+    if !crate::shell::paired() {
+        return false;
+    }
+    let refused = SHELL_REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    refused.is_none_or(|at| at.elapsed() >= SHELL_TOUCH_RETRY)
+}
+
+/// The screen in pixels as it is turned now; what the stream's fractions
+/// are of.
+fn screen_size() -> (u32, u32) {
+    let packed = crate::jvm::with_native(|env, class| {
+        Ok(env
+            .call_static_method(class, "onScreenSize", "()J", &[])?
+            .j()?)
+    });
+    match packed {
+        Ok(packed) => ((packed >> 32) as u32, packed as u32),
+        Err(e) => {
+            tracing::warn!(error = %e, "the phone did not say its screen's size");
+            (0, 0)
+        }
+    }
+}
+
+/// Hand `command` to the thread that runs the shell's `input`, in order.
+///
+/// Off the caller's thread: each command is a connection through the
+/// debugging port and a process on the phone, a few hundred milliseconds,
+/// which the module carrying the computer's input must not wait out.
+fn shell_queue(command: String) {
+    let queue = SHELL_QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<String>();
+        let spawned = std::thread::Builder::new()
+            .name("cursio-shell-touch".into())
+            .spawn(move || {
+                for command in rx {
+                    // `input` prints nothing when it injected, and the
+                    // exception when the system refused it.
+                    let why = match crate::shell::run(&command) {
+                        Ok(out) if out.trim().is_empty() => continue,
+                        Ok(out) => out.trim().to_owned(),
+                        Err(why) => why,
+                    };
+                    tracing::warn!(%command, %why, "the phone's shell refused a touch; the accessibility service carries touch for now");
+                    *SHELL_REFUSED.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(Instant::now());
+                    *lock_strokes() = ShellStrokes::new();
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "could not start the shell's touch thread");
+        }
+        Mutex::new(tx)
+    });
+    if queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .send(command)
+        .is_err()
+    {
+        tracing::warn!("the shell's touch thread is gone; the accessibility service carries touch");
+        *SHELL_REFUSED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+}
+
 impl cursio_core::phone_hands::PhoneHands for AndroidHands {
     fn touch(&self) -> Result<(), String> {
-        answer("onTouchState", None)
+        match answer("onTouchState", None) {
+            Err(_) if shell_touch_usable() => Ok(()),
+            other => other,
+        }
     }
 
     fn type_text(&self, text: &str) -> Result<(), String> {
@@ -173,6 +259,18 @@ impl ScreenBackend for AndroidScreen {
     }
 
     fn gesture(&self, gesture: Gesture) {
+        let (width, height) = match shell_touch_usable() {
+            true => screen_size(),
+            false => (0, 0),
+        };
+        if width > 0 && height > 0 {
+            let stroke = lock_strokes().take(gesture, Instant::now(), width, height);
+            match stroke {
+                ShellStroke::Run(command) => return shell_queue(command),
+                ShellStroke::Held => return,
+                ShellStroke::Pass => {}
+            }
+        }
         let f = flat(gesture);
         if let Err(e) = crate::jvm::with_native(|env, class| {
             let text = match f.text {

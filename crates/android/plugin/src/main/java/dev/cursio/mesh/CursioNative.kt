@@ -314,6 +314,24 @@ object CursioNative {
     fun onScreenGesture(kind: Int, x1: Float, y1: Float, x2: Float, y2: Float, dx: Int, dy: Int, text: String?) =
         ScreenTouch.gesture(kind, x1, y1, x2, y2, dx, dy, text)
 
+    /**
+     * The screen's size in pixels as it is turned now, packed as
+     * `width shl 32 or height`, for the shell's `input`, which takes pixels.
+     */
+    @JvmStatic
+    fun onScreenSize(): Long {
+        val context = UpdateOffer.context
+        val (width, height) = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            val bounds = context.getSystemService(android.view.WindowManager::class.java)
+                .maximumWindowMetrics.bounds
+            bounds.width() to bounds.height()
+        } else {
+            val metrics = context.resources.displayMetrics
+            metrics.widthPixels to metrics.heightPixels
+        }
+        return (width.toLong() shl 32) or height.toLong()
+    }
+
     /** Whether a computer's touch can work now: `""`, or what to turn on. */
     @JvmStatic
     fun onTouchState(): String = ScreenTouch.state()

@@ -118,5 +118,17 @@ command from a computer — whether a phone of a given make accepts it.
    show the screen as it is, not as a stream seconds behind. A phone that
    cannot says why; an older one does not answer, and the computer takes the
    picture from the stream as before. 1220×2712 in 0.7 s, measured.
-5. The `shell` helper: sound by `REMOTE_SUBMIX`/playback capture, then the
+5. Touch through the shell's `input` (**built**, `ShellStrokes` in
+   `core/src/phone_gesture.rs`, carried out by `android/src/screen.rs`). An
+   app may close its screens to accessibility services, which Android 14+
+   honours by dropping their injected touch — a bank's documents opened to
+   `input tap` and not to the same tap from `ScreenTouch`. Each `input` is a
+   process of its own, a few hundred milliseconds, so a stroke is held and
+   played whole when the finger lifts: a tap, a long press, or a swipe as
+   long as the drag was. Pinching and text stay with the accessibility
+   service. `input` prints nothing when it injected; anything it prints is a
+   refusal (debugging off, or HyperOS' "USB debugging (Security settings)"
+   off), after which the service carries touch for 30 s before the shell is
+   tried again.
+6. The `shell` helper: sound by `REMOTE_SUBMIX`/playback capture, then the
    screen as a stream, both without the projection's consent.

@@ -247,9 +247,161 @@ fn us_char(key: u16, shift: bool) -> Option<char> {
     })
 }
 
+/// What a gesture becomes on a phone whose own shell carries touch
+/// (`docs/phone-shell-design.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellStroke {
+    /// Run this `input` command.
+    Run(String),
+    /// Taken; the command comes when the finger lifts.
+    Held,
+    /// Not one the shell carries: the accessibility service does it.
+    Pass,
+}
+
+/// Turns gestures into the phone shell's `input` commands.
+///
+/// Why the shell at all: an app may mark its screens as closed to
+/// accessibility services, which Android 14+ honours by dropping their
+/// injected touch — a bank's documents opened to `input tap` and not to the
+/// same tap from Cursio's service. `input` is the shell's, and the app cannot
+/// tell it from a finger.
+///
+/// Each `input` starts a process of its own, a few hundred milliseconds, so a
+/// stroke is not followed as it moves: the press is held and the whole of it
+/// is played when the finger lifts — a tap, a long press, or a swipe taking as
+/// long as the drag did. Pinching and typing stay with the accessibility
+/// service, which carries both.
+#[derive(Debug, Default)]
+pub struct ShellStrokes {
+    press: Option<(Point, Point, std::time::Instant)>,
+}
+
+/// Movement under this many pixels is a tap, not a swipe.
+const SHELL_TAP_SLOP: f32 = 16.0;
+/// A press held this long without moving is a long press.
+const SHELL_LONG_PRESS_MS: u128 = 450;
+/// How long a wheel notch's swipe takes, as the accessibility service's does.
+const SHELL_SCROLL_MS: u32 = 120;
+/// One wheel notch swipes this share of the screen.
+const SHELL_SCROLL_STEP: f32 = 0.12;
+
+impl ShellStrokes {
+    pub const fn new() -> Self {
+        Self { press: None }
+    }
+
+    /// The command for `gesture` at `now`, on a screen `width` x `height`
+    /// pixels as it is turned now.
+    pub fn take(
+        &mut self,
+        gesture: Gesture,
+        now: std::time::Instant,
+        width: u32,
+        height: u32,
+    ) -> ShellStroke {
+        let px = |p: Point| {
+            (
+                (p.x.clamp(0.0, 1.0) * (width.max(1) - 1) as f32).round(),
+                (p.y.clamp(0.0, 1.0) * (height.max(1) - 1) as f32).round(),
+            )
+        };
+        match gesture {
+            Gesture::Down(at) => {
+                self.press = Some((at, at, now));
+                ShellStroke::Held
+            }
+            Gesture::Move(at) => match self.press.as_mut() {
+                Some(press) => {
+                    press.1 = at;
+                    ShellStroke::Held
+                }
+                None => ShellStroke::Held,
+            },
+            Gesture::Up(at) => {
+                let Some((from, _, since)) = self.press.take() else {
+                    return ShellStroke::Held;
+                };
+                let ((x1, y1), (x2, y2)) = (px(from), px(at));
+                let held = now.saturating_duration_since(since).as_millis();
+                let moved = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
+                ShellStroke::Run(if moved < SHELL_TAP_SLOP {
+                    if held < SHELL_LONG_PRESS_MS {
+                        format!("input tap {x1} {y1}")
+                    } else {
+                        format!("input swipe {x1} {y1} {x1} {y1} {held}")
+                    }
+                } else {
+                    format!("input swipe {x1} {y1} {x2} {y2} {}", held.max(80))
+                })
+            }
+            Gesture::Scroll { at, dx, dy } => {
+                // Wheel away from the person (dy > 0) shows what is above:
+                // the finger moves down.
+                let to = Point {
+                    x: at.x - dx as f32 * SHELL_SCROLL_STEP,
+                    y: at.y + dy as f32 * SHELL_SCROLL_STEP,
+                };
+                let ((x1, y1), (x2, y2)) = (px(at), px(to));
+                ShellStroke::Run(format!("input swipe {x1} {y1} {x2} {y2} {SHELL_SCROLL_MS}"))
+            }
+            Gesture::Back => ShellStroke::Run("input keyevent 4".into()),
+            Gesture::Home => ShellStroke::Run("input keyevent 3".into()),
+            Gesture::Recents => ShellStroke::Run("input keyevent 187".into()),
+            Gesture::Enter => ShellStroke::Run("input keyevent 66".into()),
+            Gesture::Backspace => ShellStroke::Run("input keyevent 67".into()),
+            Gesture::PinchDown(..)
+            | Gesture::PinchMove(..)
+            | Gesture::PinchUp(..)
+            | Gesture::Text(_) => ShellStroke::Pass,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shell_plays_a_stroke_when_the_finger_lifts() {
+        let t0 = std::time::Instant::now();
+        let ms = |n| t0 + std::time::Duration::from_millis(n);
+        let p = |x, y| Point { x, y };
+        let mut strokes = ShellStrokes::default();
+        assert_eq!(
+            strokes.take(Gesture::Down(p(0.5, 0.5)), t0, 1001, 2001),
+            ShellStroke::Held
+        );
+        assert_eq!(
+            strokes.take(Gesture::Up(p(0.5, 0.5)), ms(80), 1001, 2001),
+            ShellStroke::Run("input tap 500 1000".into())
+        );
+        strokes.take(Gesture::Down(p(0.5, 0.5)), t0, 1001, 2001);
+        assert_eq!(
+            strokes.take(Gesture::Up(p(0.5, 0.5)), ms(900), 1001, 2001),
+            ShellStroke::Run("input swipe 500 1000 500 1000 900".into()),
+            "held still: a long press"
+        );
+        strokes.take(Gesture::Down(p(0.5, 0.8)), t0, 1001, 2001);
+        strokes.take(Gesture::Move(p(0.5, 0.5)), ms(100), 1001, 2001);
+        assert_eq!(
+            strokes.take(Gesture::Up(p(0.5, 0.2)), ms(300), 1001, 2001),
+            ShellStroke::Run("input swipe 500 1600 500 400 300".into())
+        );
+        assert_eq!(
+            strokes.take(Gesture::Back, t0, 1001, 2001),
+            ShellStroke::Run("input keyevent 4".into())
+        );
+        assert_eq!(
+            strokes.take(Gesture::Text('a'), t0, 1001, 2001),
+            ShellStroke::Pass
+        );
+        assert_eq!(
+            strokes.take(Gesture::Up(p(0.1, 0.1)), t0, 1001, 2001),
+            ShellStroke::Held,
+            "a lift with no press does nothing"
+        );
+    }
 
     fn button(x: u32, y: u32, button: MouseButton, pressed: bool) -> WindowInput {
         WindowInput::PointerButton {
