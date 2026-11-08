@@ -126,10 +126,17 @@ impl State {
     }
 
     /// Whether input has stopped getting through on `id`, a network path
-    /// carrying the interactive lane, while a Bluetooth path could take it:
-    /// a key or click unacknowledged, or a probe unanswered, for
-    /// [`INPUT_STALL`]. Pointer motion is never kept for an acknowledgement,
-    /// so the probe is what notices a stall while only the pointer moves.
+    /// carrying the interactive lane, while another path could take it — a
+    /// Bluetooth one, or the router's beside a direct one: a key or click
+    /// unacknowledged, or a probe unanswered, for [`INPUT_STALL`]. Pointer
+    /// motion is never kept for an acknowledgement, so the probe is what
+    /// notices a stall while only the pointer moves.
+    ///
+    /// A direct path stalled for three seconds once while a game loaded
+    /// through it, with the router's standing by; at the general [`STALL`]
+    /// that was three seconds of a pointer going nowhere. Its loaded round
+    /// trip stays near a tenth of a second, so a second unanswered is not
+    /// load but a stall.
     ///
     /// Never true of a Bluetooth path, whose round trip itself spikes past a
     /// second: moving input off it on that evidence would send it back to a
@@ -138,9 +145,13 @@ impl State {
         let Some(path) = self.paths.iter().find(|p| p.id == id) else {
             return false;
         };
-        if path.kind != PathKind::Network
-            || !self.paths.iter().any(|p| p.kind == PathKind::Bluetooth)
-        {
+        let bluetooth = self.paths.iter().any(|p| p.kind == PathKind::Bluetooth);
+        let routed = path.direct
+            && self
+                .paths
+                .iter()
+                .any(|p| p.kind == PathKind::Network && !p.direct);
+        if path.kind != PathKind::Network || !(bluetooth || routed) {
             return false;
         }
         let late = |at: Instant| now.duration_since(at) > INPUT_STALL;
@@ -231,6 +242,27 @@ mod tests {
         state.paths.push(path(2, PathKind::Bluetooth, now));
         assert!(!state.input_stalled_on(1, now + INPUT_STALL / 2));
         assert!(state.input_stalled_on(1, now + INPUT_STALL * 2));
+    }
+
+    #[test]
+    fn an_unanswered_probe_moves_input_off_a_direct_path_to_the_routers_within_a_second() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.paths.push(path(1, PathKind::Network, now));
+        state.paths[0].direct = true;
+        state.paths[0].probe = Some((7, now));
+        assert!(
+            !state.input_stalled_on(1, now + INPUT_STALL * 2),
+            "nowhere to move it"
+        );
+
+        state.paths.push(path(2, PathKind::Network, now));
+        assert!(!state.input_stalled_on(1, now + INPUT_STALL / 2));
+        assert!(state.input_stalled_on(1, now + INPUT_STALL * 2));
+        assert!(
+            !state.input_stalled_on(2, now + INPUT_STALL * 2),
+            "the router's own stall waits for the general rule"
+        );
     }
 
     #[test]
