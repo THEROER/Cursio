@@ -733,6 +733,7 @@ const labels = computed(() => ({
   back: t("palette.back"),
   searching: t("palette.searching"),
   searchFailed: t("palette.searchFailed"),
+  searchIncomplete: t("palette.searchIncomplete"),
   retry: t("palette.retry"),
   showMore: t("palette.showMore", { count: "{count}" }),
   actions: t("palette.actions"),

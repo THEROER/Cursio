@@ -225,6 +225,7 @@
     "title": "Command palette",
     "description": "Search pages, settings, machines and their actions, modules, a phone's conversations and the node's log; call or text a number.",
     "searchFailed": "The log could not be read.",
+    "searchIncomplete": "Some results could not be loaded.",
     "retry": "Retry",
     "showMore": "Show {count} more",
     "actions": "actions",
