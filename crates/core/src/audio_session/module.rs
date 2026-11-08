@@ -124,6 +124,14 @@ impl SessionModule for AudioEngine {
             // capture has to exist for chunks to flow once it opens the mirror.
             let cap = match cursio_audio::Capture::mic_tap(id, Some(dev.id.clone())) {
                 Ok(c) => c,
+                // Every input of the machine timed out alike when it happened
+                // (Windows, ten inputs, three seconds each): thirty seconds in
+                // this constructor overflowed the module's inbox and ended the
+                // session. One unanswered open says the capture side is stuck.
+                Err(e @ cursio_audio::AudioError::NotAnswering(_)) => {
+                    tracing::warn!(error = %e, device = %dev.description, "not recording any input on this link: the system does not answer opening one");
+                    break;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, device = %dev.description, "cannot record this input");
                     continue;

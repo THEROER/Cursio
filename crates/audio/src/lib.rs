@@ -69,6 +69,10 @@ pub enum AudioError {
     /// A feature isn't implemented for this platform/backend yet.
     #[error("audio sharing not supported on this platform yet")]
     Unsupported,
+    /// The system did not return from opening a device: its audio stack is
+    /// stuck, not this one device missing.
+    #[error("{0}")]
+    NotAnswering(String),
 }
 
 /// Produces local audio streams to share with the peer (the **source** side).

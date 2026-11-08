@@ -79,8 +79,8 @@ impl Worker {
                 // Never joined: the thread is stuck in the call that did not
                 // return, and joining it would hang this caller instead.
                 worker.on_drop = OnDrop::Detach;
-                Err(AudioError::Backend(format!(
-                    "{what} did not open its device within {} s; the device is not answering",
+                Err(AudioError::NotAnswering(format!(
+                    "{what} did not open its device within {} s; the system's audio is not answering",
                     within.as_secs()
                 )))
             }
@@ -155,7 +155,7 @@ mod tests {
             |_, _ready| std::thread::sleep(Duration::from_secs(2)),
         );
         assert!(
-            matches!(&result, Err(AudioError::Backend(e)) if e.contains("did not open its device")),
+            matches!(&result, Err(AudioError::NotAnswering(e)) if e.contains("did not open its device")),
             "{:?}",
             result.err()
         );
