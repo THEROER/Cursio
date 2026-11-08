@@ -21,6 +21,7 @@ members = [
     "app",
     "apps/clipd",
     "crates/xtask",
+    "crates/wifidirect",
     "tools/wgc-probe",
 ]
 
@@ -38,6 +39,7 @@ cursio-app-protocol = { path = "crates/app-protocol", version = "0.7.1" }
 cursio-sdk = { path = "crates/sdk" }
 cursio-transport = { path = "crates/transport" }
 cursio-bluetooth = { path = "crates/bluetooth" }
+cursio-wifidirect = { path = "crates/wifidirect" }
 cursio-airplay = { path = "crates/airplay" }
 cursio-input = { path = "crates/input" }
 cursio-audio = { path = "crates/audio" }

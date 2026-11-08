@@ -1,0 +1,32 @@
+[package]
+name = "cursio-wifidirect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+# NetworkManager drives the second station interface for the user, over the
+# system bus; the same zbus the rest of the tree already links.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+
+# Windows runs a group only through WinRT's Wi-Fi Direct publisher; the
+# channel its own Wi-Fi is on comes from the WLAN API.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Devices_Enumeration",
+    "Devices_WiFiDirect",
+    "Foundation",
+    "Foundation_Collections",
+    "Networking",
+    "Security_Credentials",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_System_WinRT",
+] }
