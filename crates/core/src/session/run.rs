@@ -144,8 +144,12 @@ where
     // re-announce the reading the greeting just carried.
     status_ticker.tick().await;
 
+    // The id comparison may start this side dormant, which with input off
+    // here would grab this machine's own mouse and keyboard and forward them
+    // nowhere — the state a `Grab` from the peer is refused for below.
+    let start_active = cursor.start_active || reconf.as_ref().is_some_and(|r| !r.input_on());
     let mut session = SessionLoop {
-        role: CursorRole::new(cursor.start_active),
+        role: CursorRole::new(start_active),
         cursor,
         outbox,
         tx,

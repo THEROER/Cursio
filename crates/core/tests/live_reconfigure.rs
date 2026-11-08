@@ -505,6 +505,33 @@ async fn a_machine_with_input_off_reports_ownership_when_the_peer_takes_the_curs
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_machine_with_input_off_starts_holding_its_own_cursor() {
+    let (a_t, b_t) = encrypted_pair().await;
+    let (a_id, b_id) = pair_ids();
+    let (a_pos, b_pos) = (Position::new(0, 0), Position::new(1, 0));
+    let (a, a_task) = run_side(
+        a_t,
+        a_id.clone(),
+        greeting(&b_id, b_pos),
+        a_pos,
+        false,
+        false,
+    );
+    let (b, b_task) = run_side(b_t, b_id, greeting(&a_id, a_pos), b_pos, true, true);
+    eventually("both sessions up", || {
+        a.census.heard.load(Ordering::SeqCst) == 1 && b.census.heard.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        a.active.lock().unwrap().first(),
+        Some(&true),
+        "A started dormant with nothing to forward"
+    );
+    a_task.abort();
+    b_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_the_peer_ends_the_link_cleanly_and_the_peer_hears_goodbye() {
     let (a_t, b_t) = encrypted_pair().await;
     let (a_id, b_id) = pair_ids();
