@@ -405,7 +405,9 @@ impl PeerRegistry {
                     // all night was called every 4 s until morning.
                     || (p.addr.is_some()
                         && self.needs_network_path(&p.peer_id)
-                        && !(resting && self.bluetooth_reaches(&p.peer_id))
+                        && !(resting
+                            && (self.bluetooth_reaches(&p.peer_id)
+                                || self.direct_reaches(&p.peer_id)))
                         && !matches!(p.state, PeerState::Connecting))
             })
             .cloned()
@@ -468,6 +470,15 @@ impl PeerRegistry {
         self.sessions
             .get(peer)
             .is_some_and(|s| !s.0.is_ended() && s.0.paths().network)
+    }
+
+    /// Whether `peer`'s session has a path over a direct Wi-Fi link now: a
+    /// router that does not answer is then called back with the ordinary
+    /// backoff, not at every sweep, as when Bluetooth carries the session.
+    pub fn direct_reaches(&self, peer: &PeerId) -> bool {
+        self.sessions
+            .get(peer)
+            .is_some_and(|s| !s.0.is_ended() && s.0.paths().direct)
     }
 
     /// Whether `peer`'s session has a Bluetooth path now.

@@ -264,8 +264,13 @@ impl ResumeHandle {
         self.0.lock().summary()
     }
 
+    /// Whether every lane has a healthy path through the router. Direct
+    /// paths do not count: they last only while the two machines are near,
+    /// and a session whose lanes were all direct had nothing to fall back
+    /// on but Bluetooth when the group went (seen: the router's paths were
+    /// never placed again after a restart, since every lane looked filled).
     pub fn network_complete(&self) -> bool {
-        self.0.lock().missing_lane(None).is_none()
+        self.0.lock().missing_lane(Some(false)).is_none()
     }
 
     /// Whether every lane has a healthy path over the direct Wi-Fi link, so
@@ -945,6 +950,28 @@ mod tests {
         assert_eq!(a.handle.report().carrying.as_deref(), Some("network"));
         a.tx.send(&key(4)).await.unwrap();
         assert_eq!(next(&mut b).await, key(4));
+    }
+
+    #[tokio::test]
+    async fn a_session_on_direct_paths_alone_still_wants_the_routers() {
+        let (mut first_a, mut first_b, tag) = path_pair(PathKind::Network).await;
+        first_a.direct = true;
+        first_b.direct = true;
+        let (_link_a, a) = ResumableLink::new(first_a, tag);
+        let (_link_b, b) = ResumableLink::new(first_b, tag);
+        for _ in 1..Lane::COUNT {
+            let (mut pa, mut pb, _) = path_pair(PathKind::Network).await;
+            pa.direct = true;
+            pb.direct = true;
+            let (ra, rb) = tokio::join!(a.attach(pa), b.attach(pb));
+            ra.unwrap();
+            rb.unwrap();
+        }
+        assert!(a.direct_complete());
+        assert!(
+            !a.network_complete(),
+            "the router's paths are the standby and must still be placed"
+        );
     }
 
     #[tokio::test]
