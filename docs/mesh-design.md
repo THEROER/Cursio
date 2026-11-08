@@ -730,6 +730,18 @@ private network with it on the same card, and the session gains paths over it.
   lane missing from its own class. When the group goes,
   `resume::direct_lost` lets the direct paths go at once and the router's
   carry on — the session never notices the machines moving apart.
+- **Input rides both.** While a direct path carries the interactive lane,
+  every frame of it is also written on the router's path
+  (`State::mirror`), and the receiver delivers whichever copy arrives first,
+  dropping the other by its number. Both paths share one radio, so files are
+  never doubled; input is tens of bytes a frame. A copy must never run ahead
+  of a frame its path has not carried — the receiver takes a gap for lost
+  motion, and would lose a key press that way — so a mirror starts by
+  resending everything unacknowledged, and a copy that does not fit ends it
+  until the next frame starts it over. A stall on the direct path (one froze
+  for three seconds while a game loaded through it) then costs nothing; if
+  the direct path stops answering probes for a second, input moves to the
+  router's outright.
 - **A legacy group, not Wi-Fi Direct proper.** NetworkManager's `wifi-p2p`
   device finds a Windows machine, but Windows refuses its group negotiation
   (`P2P-GO-NEG-FAILURE status=4`) from either side, since NetworkManager

@@ -125,6 +125,30 @@ impl State {
             })
     }
 
+    /// The path input is written on as well as `carrying`: the router's,
+    /// healthy, beside a direct path that carries the interactive lane.
+    ///
+    /// Both ride one radio, so doubling a file would halve it; input is tens
+    /// of bytes a frame, and with a copy on each path the pointer moves by
+    /// whichever arrives first — a stall on one, like the three seconds the
+    /// direct path once froze for while a game loaded, is not felt at all.
+    pub(super) fn mirror(&self, lane: Lane, carrying: u64, now: Instant) -> Option<&PathSlot> {
+        if lane != Lane::Interactive
+            || !self
+                .paths
+                .iter()
+                .any(|p| p.id == carrying && p.direct && p.kind == PathKind::Network)
+        {
+            return None;
+        }
+        self.paths.iter().find(|p| {
+            p.kind == PathKind::Network
+                && !p.direct
+                && p.suspect_since.is_none()
+                && p.degraded_until.is_none_or(|until| until <= now)
+        })
+    }
+
     /// Whether input has stopped getting through on `id`, a network path
     /// carrying the interactive lane, while another path could take it — a
     /// Bluetooth one, or the router's beside a direct one: a key or click
@@ -263,6 +287,33 @@ mod tests {
             !state.input_stalled_on(2, now + INPUT_STALL * 2),
             "the router's own stall waits for the general rule"
         );
+    }
+
+    #[test]
+    fn only_input_on_a_direct_path_is_copied_and_only_onto_a_healthy_routers_path() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.paths.push(path(1, PathKind::Network, now));
+        state.paths[0].direct = true;
+        assert!(
+            state.mirror(Lane::Interactive, 1, now).is_none(),
+            "no router path"
+        );
+        state.paths.push(path(2, PathKind::Network, now));
+        assert_eq!(
+            state.mirror(Lane::Interactive, 1, now).map(|p| p.id),
+            Some(2)
+        );
+        assert!(
+            state.mirror(Lane::Bulk, 1, now).is_none(),
+            "files are never doubled"
+        );
+        assert!(
+            state.mirror(Lane::Interactive, 2, now).is_none(),
+            "the router carrying needs no copy"
+        );
+        state.paths[1].degraded_until = Some(now + Duration::from_secs(10));
+        assert!(state.mirror(Lane::Interactive, 1, now).is_none());
     }
 
     #[test]

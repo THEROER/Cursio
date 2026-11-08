@@ -492,6 +492,7 @@ impl ResumableLink {
                     inner: self.inner.clone(),
                     lane,
                     last_path: None,
+                    mirror: None,
                     next_bulk: Instant::now(),
                 }) as Box<dyn FrameSink>
             })
@@ -944,6 +945,27 @@ mod tests {
         assert_eq!(a.handle.report().carrying.as_deref(), Some("network"));
         a.tx.send(&key(4)).await.unwrap();
         assert_eq!(next(&mut b).await, key(4));
+    }
+
+    #[tokio::test]
+    async fn input_copied_onto_the_routers_path_arrives_once_and_in_order() {
+        let (mut a, mut b) = session().await;
+        for _ in 0..Lane::COUNT {
+            let (mut pa, mut pb, _) = path_pair(PathKind::Network).await;
+            pa.direct = true;
+            pb.direct = true;
+            let (ra, rb) = tokio::join!(a.handle.attach(pa), b.handle.attach(pb));
+            ra.unwrap();
+            rb.unwrap();
+        }
+        for n in 0..200u16 {
+            a.tx.send(&key(n)).await.unwrap();
+        }
+        for n in 0..200u16 {
+            assert_eq!(next(&mut b).await, key(n));
+        }
+        a.tx.send(&key(999)).await.unwrap();
+        assert_eq!(next(&mut b).await, key(999), "no copy left over");
     }
 
     #[tokio::test]

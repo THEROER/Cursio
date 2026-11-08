@@ -24,6 +24,10 @@ pub(super) struct ResumableSink {
     pub(super) inner: Arc<Inner>,
     pub(super) lane: Lane,
     pub(super) last_path: Option<u64>,
+    /// The router's path input is also written on while a direct path
+    /// carries it, once that path holds every frame since the oldest
+    /// unacknowledged one; see [`State::mirror`](super::state::State::mirror).
+    pub(super) mirror: Option<u64>,
     pub(super) next_bulk: Instant,
 }
 
@@ -112,6 +116,30 @@ impl FrameSink for ResumableSink {
                         sent_on: None,
                     });
                 }
+                // The receiver delivers whatever number comes first and takes
+                // a gap for lost motion, so a copy may never run ahead of a
+                // frame the mirror has not carried: a mirror starts with
+                // everything unacknowledged, and one copy that does not fit
+                // ends it until the next frame starts it over.
+                let mirror = carrying
+                    .as_ref()
+                    .and_then(|(id, _, _)| state.mirror(self.lane, *id, now))
+                    .map(|p| (p.id, p.writer(self.lane).clone()));
+                match &mirror {
+                    Some((id, writer)) => {
+                        let mut whole = true;
+                        if self.mirror != Some(*id) {
+                            for kept in &state.lanes[self.lane as usize].unacked {
+                                if kept.seq < delivery_seq(&frame) {
+                                    whole &= writer.try_send(kept.frame.clone()).is_ok();
+                                }
+                            }
+                        }
+                        whole &= writer.try_send(frame.clone()).is_ok();
+                        self.mirror = whole.then_some(*id);
+                    }
+                    None => self.mirror = None,
+                }
                 match carrying {
                     Some((_, PathKind::Bluetooth, _)) if out.lossy && self.lane == Lane::Video => {}
                     Some((id, _, writer)) => writes.push((writer, id, frame)),
@@ -151,6 +179,11 @@ impl FrameSink for ResumableSink {
         }
         Ok(())
     }
+}
+
+/// The number a `SEQ` frame carries.
+fn delivery_seq(frame: &[u8]) -> u64 {
+    frame.get(2..).and_then(read_u64).unwrap_or(0)
 }
 
 /// How far a bulk frame's slot may lag the clock and still be caught up on.
