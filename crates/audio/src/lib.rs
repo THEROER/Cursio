@@ -42,7 +42,7 @@ pub mod pipewire_backend;
 mod playback_feed;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod playout;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 mod sample_clock;
 /// Drives the Cursio virtual audio driver, which is what gives Windows the
 /// same per-device parity Linux gets from PipeWire.

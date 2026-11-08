@@ -273,7 +273,7 @@ pub(super) fn run_capture_loop(
         let _ = ready_tx.send(Ok(()));
 
         let mut seq = 0u32;
-        let mut ts = 0u64;
+        let mut clock = crate::sample_clock::SourceClock::default();
         let mut capture_phase = 0u64;
         // Set when the device fails; ends the outer loop too.
         let mut return_err: Option<String> = None;
@@ -343,14 +343,14 @@ pub(super) fn run_capture_loop(
                         )
                     };
                     let wire_frames = data.len() / (CHANNELS as usize * 4);
+                    let timestamp = clock.stamp(std::time::Instant::now(), wire_frames as u64);
                     let _ = chunks_tx.send(AudioChunk {
                         id,
                         seq,
-                        timestamp: ts,
+                        timestamp,
                         data,
                     });
                     seq = seq.wrapping_add(1);
-                    ts = ts.wrapping_add(wire_frames as u64);
                 }
 
                 let _ = capture.ReleaseBuffer(num_frames);

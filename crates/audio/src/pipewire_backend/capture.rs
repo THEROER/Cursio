@@ -272,7 +272,7 @@ pub(super) fn run_capture_loop(
 
     // Per-stream monotonic seq + sample-clock timestamp for the wire chunks.
     let seq = std::cell::Cell::new(0u32);
-    let ts = std::cell::Cell::new(0u64);
+    let clock = std::cell::RefCell::new(crate::sample_clock::SourceClock::default());
 
     let _listener = stream
         .add_local_listener_with_user_data(())
@@ -299,8 +299,7 @@ pub(super) fn run_capture_loop(
                 let n = seq.get();
                 seq.set(n.wrapping_add(1));
                 let frames = (payload.len() / BYTES_PER_FRAME) as u64;
-                let t = ts.get();
-                ts.set(t.wrapping_add(frames));
+                let t = clock.borrow_mut().stamp(std::time::Instant::now(), frames);
                 let _ = chunks_tx.send(AudioChunk {
                     id,
                     seq: n,

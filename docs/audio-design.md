@@ -146,7 +146,11 @@ playback clock causes crackle or growing lag.
   lead. Health logs distinguish target reserve, buffered duration, graceful
   acceleration, hard drops, and silence produced.
 
-- **Clock:** packet timestamps use the source sample clock. Drift that builds
+- **Clock:** packet timestamps use the source sample clock, advanced by the
+  wall-clock time the source did not run (`sample_clock::SourceClock`): a
+  paused or seeking application stops delivering, and a bare sample count
+  made its first chunk afterwards look late by the whole pause, which raised
+  the receiver's reserve to its ceiling for minutes. Drift that builds
   surplus audio can be reduced by conservative overlap recovery. Continuous
   asynchronous sample-rate conversion is not implemented. Windows fixed-rate
   conversion carries fractional positions across packets so 44.1 kHz does not
