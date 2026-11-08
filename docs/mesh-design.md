@@ -745,7 +745,10 @@ private network with it on the same card, and the session gains paths over it.
 - **One channel.** A card on two channels splits its time between them and
   did worse than the router alone; the host's group takes the channel of the
   host's own Wi-Fi. Each end reports the frequency of its own Wi-Fi, and the
-  link is put up only when they match (or one end is wired).
+  link is put up only when they match (or one end is wired). A host with no
+  Wi-Fi of its own says nothing about where Windows will put the group, so
+  the joiner checks the frequency it actually joined on and leaves at once,
+  saying why, when it differs from its own Wi-Fi's.
 - **Who does what** is the `direct` module (18, `core/src/direct_session.rs`,
   vocabulary `protocol/src/direct.rs`): both ends send `Able`, derive alike
   who hosts, the host puts the group up and sends its fresh name and
