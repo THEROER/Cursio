@@ -141,9 +141,26 @@ enum State {
     },
     Joining(JoinHandle<cursio_wifidirect::Result<Joined>>),
     Joined {
-        link: Joined,
+        /// Shared with the check in flight: asking NetworkManager blocks, and
+        /// so does leaving the group, which must not happen on this thread —
+        /// the module runs inside the link's runtime, where a blocking D-Bus
+        /// call panics.
+        link: std::sync::Arc<Joined>,
+        check: Option<JoinHandle<bool>>,
         next_check: Instant,
     },
+}
+
+/// Drop `value` on a thread of its own: leaving a group or stopping one is a
+/// blocking call into the system, and this end may be inside a runtime, or
+/// tearing down while the runtime itself goes.
+fn drop_off_runtime<T: Send + 'static>(value: T) {
+    let spawned = std::thread::Builder::new()
+        .name("cursio-direct-drop".into())
+        .spawn(move || drop(value));
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "could not leave the direct Wi-Fi link on a thread of its own; NetworkManager ends it with this process");
+    }
 }
 
 pub struct DirectEngine {
@@ -212,15 +229,17 @@ impl DirectEngine {
             State::Idle => return,
             State::Starting(task) => task.abort(),
             State::Joining(task) => task.abort(),
-            State::Hosting { held, .. } => {
+            State::Hosting { group, held, .. } => {
                 if let Some(addr) = held {
                     hold_local(addr, false);
                 }
+                drop_off_runtime(group);
             }
-            State::Joined { link, .. } => {
+            State::Joined { link, check, .. } => {
                 dial_table().remove(&self.peer);
                 hold_local(link.local, false);
-                drop(link);
+                drop(check);
+                drop_off_runtime(link);
             }
         }
         tracing::info!(peer = %self.peer_name, %why, "direct Wi-Fi link down");
@@ -383,7 +402,8 @@ impl DirectEngine {
                             joiner: link.local.octets(),
                         });
                         self.state = State::Joined {
-                            link,
+                            link: std::sync::Arc::new(link),
+                            check: None,
                             next_check: now + CHECK_EVERY,
                         };
                     }
@@ -398,14 +418,22 @@ impl DirectEngine {
                     }
                 }
             }
-            State::Joined { link, next_check } => {
+            State::Joined {
+                link,
+                check,
+                next_check,
+            } => {
                 if plan != Some(Plan::Join) {
                     self.tear_down("this machine no longer joins the link", true);
-                } else if now >= *next_check {
-                    *next_check = now + CHECK_EVERY;
-                    if !link.is_up() {
+                } else if check.as_ref().is_some_and(|c| c.is_finished()) {
+                    let up = check.take().map(futures_ready);
+                    if matches!(up, Some(Ok(false))) {
                         self.tear_down("the group went away", true);
                     }
+                } else if check.is_none() && now >= *next_check {
+                    *next_check = now + CHECK_EVERY;
+                    let link = link.clone();
+                    *check = Some(tokio::task::spawn_blocking(move || link.is_up()));
                 }
             }
             State::Starting(_) | State::Joining(_) => {}
