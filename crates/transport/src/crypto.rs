@@ -481,12 +481,14 @@ impl<T: Transport> EncryptedTransport<T> {
     /// Take the connection apart into a path a resumable link can carry a
     /// session over: the raw halves, and the Noise state that seals for them.
     pub fn into_path(self, kind: crate::resume::PathKind) -> crate::resume::Path {
+        let direct = self.inner.local_ip().is_some_and(crate::direct::is_local);
         let (tx, rx) = Box::new(self.inner).split();
         crate::resume::Path {
             tx,
             rx,
             noise: self.noise,
             kind,
+            direct,
         }
     }
 
@@ -614,6 +616,10 @@ impl<T: Transport> Transport for EncryptedTransport<T> {
 
     fn kind(&self) -> &'static str {
         "noise"
+    }
+
+    fn local_ip(&self) -> Option<std::net::IpAddr> {
+        self.inner.local_ip()
     }
 
     fn split(self: Box<Self>) -> (Box<dyn TransportTx>, Box<dyn TransportRx>) {

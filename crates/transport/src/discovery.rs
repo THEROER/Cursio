@@ -204,7 +204,7 @@ pub fn lan_interface_addrs() -> Vec<IpAddr> {
             .into_iter()
             .filter(|i| !i.is_loopback() && !is_off_lan_interface(&i.name))
             .map(|i| i.ip())
-            .filter(|a| a.is_ipv4() && !is_virtual_addr(a))
+            .filter(|a| a.is_ipv4() && !is_virtual_addr(a) && !crate::direct::is_local(*a))
             .collect(),
         Err(e) => {
             tracing::warn!(error = %e, "could not enumerate interfaces; discovery sees no LAN");
@@ -251,6 +251,9 @@ pub fn is_off_lan_interface(name: &str) -> bool {
         "lxd",
         "cni",
         "flannel",
+        // The second Wi-Fi interface a direct link to one peer rides; see
+        // `crate::direct`.
+        "wlcursio",
     ];
     const FRAGMENTS: &[&str] = &[
         "vethernet",

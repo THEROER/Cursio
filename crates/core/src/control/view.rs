@@ -536,6 +536,7 @@ mod tests {
             Paths {
                 network: false,
                 bluetooth: true,
+                direct: false,
             },
         );
         assert_eq!(shown(&node), LinkPath::Bluetooth);
@@ -559,6 +560,7 @@ mod tests {
             Paths {
                 network: true,
                 bluetooth: true,
+                direct: false,
             },
         );
         assert_eq!(

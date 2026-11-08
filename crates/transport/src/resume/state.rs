@@ -24,6 +24,8 @@ pub(super) struct Kept {
 pub(super) struct PathSlot {
     pub(super) id: u64,
     pub(super) kind: PathKind,
+    /// Over a direct Wi-Fi link rather than through the router.
+    pub(super) direct: bool,
     /// One inbox per lane, drained in lane order by the path's writer. A
     /// network path only ever carries its own lane; a Bluetooth path carries
     /// all of them, and without this they reached its socket in arrival order,
@@ -93,17 +95,30 @@ impl State {
             .min_by_key(|p| {
                 let bluetooth = p.kind == PathKind::Bluetooth;
                 let degraded = p.degraded_until.is_some_and(|until| until > now);
+                // A direct path is a step shorter than the router's, so it
+                // carries whenever it is healthy; the router's stays beside
+                // it as the standby that takes over when the machines part.
+                let routed = !p.direct;
                 match self.choice {
-                    PathChoice::Auto => {
-                        (false, degraded, bluetooth, std::cmp::Reverse(p.attached_at))
-                    }
-                    PathChoice::Network => {
-                        (bluetooth, degraded, false, std::cmp::Reverse(p.attached_at))
-                    }
+                    PathChoice::Auto => (
+                        false,
+                        degraded,
+                        bluetooth,
+                        routed,
+                        std::cmp::Reverse(p.attached_at),
+                    ),
+                    PathChoice::Network => (
+                        bluetooth,
+                        degraded,
+                        false,
+                        routed,
+                        std::cmp::Reverse(p.attached_at),
+                    ),
                     PathChoice::Bluetooth => (
                         !bluetooth,
                         degraded,
                         false,
+                        routed,
                         std::cmp::Reverse(p.attached_at),
                     ),
                 }
@@ -140,6 +155,10 @@ impl State {
         Paths {
             network: self.paths.iter().any(|p| p.kind == PathKind::Network),
             bluetooth: self.paths.iter().any(|p| p.kind == PathKind::Bluetooth),
+            direct: self
+                .paths
+                .iter()
+                .any(|p| p.kind == PathKind::Network && p.direct),
         }
     }
 
@@ -166,10 +185,13 @@ impl State {
         std::array::from_fn(|i| self.lanes[i].delivered)
     }
 
-    pub(super) fn missing_lane(&self) -> Option<Lane> {
+    /// The first lane with no healthy network path: of any kind with `None`,
+    /// over the direct link or through the router with `Some(direct)`.
+    pub(super) fn missing_lane(&self, direct: Option<bool>) -> Option<Lane> {
         Lane::ALL.into_iter().find(|lane| {
             !self.paths.iter().any(|path| {
                 path.kind.lane() == Some(*lane)
+                    && direct.is_none_or(|d| path.direct == d)
                     && path
                         .degraded_until
                         .is_none_or(|until| until <= Instant::now())
@@ -186,6 +208,7 @@ mod tests {
         PathSlot {
             id,
             kind,
+            direct: false,
             writers: std::array::from_fn(|_| mpsc::channel(1).0),
             last_heard: now,
             degraded_until: None,

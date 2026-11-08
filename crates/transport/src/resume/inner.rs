@@ -194,6 +194,7 @@ impl Inner {
             mut rx,
             noise,
             kind,
+            direct,
         } = path;
         let (writers, mut frames): (Vec<_>, Vec<_>) = Lane::ALL
             .into_iter()
@@ -312,11 +313,12 @@ impl Inner {
             let mut state = self.lock();
             let (old, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut state.paths)
                 .into_iter()
-                .partition(|p| p.kind == kind);
+                .partition(|p| p.kind == kind && p.direct == direct);
             state.paths = keep;
             state.paths.push(PathSlot {
                 id,
                 kind,
+                direct,
                 writers,
                 last_heard: now,
                 degraded_until: None,
@@ -343,7 +345,7 @@ impl Inner {
         if matches!(kind, PathKind::Network | PathKind::Bluetooth) {
             *self.congestion.lock().unwrap() = crate::congestion::BackgroundRate::default();
         }
-        tracing::info!(session = %self.label(), path = id, ?kind, "a path joined the session");
+        tracing::info!(session = %self.label(), path = id, ?kind, direct, "a path joined the session");
         self.changed.notify_waiters();
         self.kick(0);
         self.report();

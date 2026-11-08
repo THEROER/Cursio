@@ -117,6 +117,10 @@ impl Transport for TcpTransport {
         "tcp"
     }
 
+    fn local_ip(&self) -> Option<std::net::IpAddr> {
+        self.stream.local_addr().ok().map(|a| a.ip())
+    }
+
     fn split(self: Box<Self>) -> (Box<dyn TransportTx>, Box<dyn TransportRx>) {
         // Owned split gives independent read/write halves that can live in
         // separate tasks. The read half carries our leftover buffer so no

@@ -19,6 +19,7 @@ use cursio_protocol::Message;
 mod congestion;
 pub mod crypto;
 pub mod dead_peer;
+pub mod direct;
 pub mod discovery;
 pub mod lane;
 pub mod pairing;
@@ -67,6 +68,13 @@ pub trait Transport: Send {
 
     /// A short, human-readable label for logs/UI, e.g. `"tcp"`.
     fn kind(&self) -> &'static str;
+
+    /// This end's address, for a transport that has one: what tells a
+    /// connection over a direct Wi-Fi link from one through the router
+    /// ([`crate::direct`]).
+    fn local_ip(&self) -> Option<std::net::IpAddr> {
+        None
+    }
 
     /// Split into independent send and receive halves.
     ///

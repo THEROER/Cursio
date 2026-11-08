@@ -183,11 +183,17 @@ pub struct Path {
     pub(crate) rx: Box<dyn TransportRx>,
     pub(crate) noise: SharedNoise,
     pub(crate) kind: PathKind,
+    /// Over a direct Wi-Fi link rather than through the router.
+    pub(crate) direct: bool,
 }
 
 impl Path {
     pub fn kind(&self) -> PathKind {
         self.kind
+    }
+
+    pub fn is_direct(&self) -> bool {
+        self.direct
     }
 }
 
@@ -197,6 +203,8 @@ impl Path {
 pub struct Paths {
     pub network: bool,
     pub bluetooth: bool,
+    /// A network path over a direct Wi-Fi link is among them.
+    pub direct: bool,
 }
 
 /// Every resumable link in the process, for [`network_lost`].
@@ -218,6 +226,20 @@ pub fn network_lost() {
     };
     for link in links {
         ResumeHandle(link).network_lost();
+    }
+}
+
+/// A direct Wi-Fi link went away: every session lets the paths over it go at
+/// once, so the paths through the router carry on instead of waiting out
+/// the direct ones' silence.
+pub fn direct_lost(why: &str) {
+    let links: Vec<Arc<Inner>> = {
+        let mut all = live_links().lock().unwrap_or_else(|p| p.into_inner());
+        all.retain(|link| link.strong_count() > 0);
+        all.iter().filter_map(Weak::upgrade).collect()
+    };
+    for link in links {
+        ResumeHandle(link).release_direct(why);
     }
 }
 
@@ -243,15 +265,13 @@ impl ResumeHandle {
     }
 
     pub fn network_complete(&self) -> bool {
-        let state = self.0.lock();
-        Lane::ALL.into_iter().all(|lane| {
-            state.paths.iter().any(|path| {
-                path.kind.lane() == Some(lane)
-                    && path
-                        .degraded_until
-                        .is_none_or(|until| until <= Instant::now())
-            })
-        })
+        self.0.lock().missing_lane(None).is_none()
+    }
+
+    /// Whether every lane has a healthy path over the direct Wi-Fi link, so
+    /// the side that dials over it has nothing left to place.
+    pub fn direct_complete(&self) -> bool {
+        self.0.lock().missing_lane(Some(true)).is_none()
     }
 
     pub fn is_ended(&self) -> bool {
@@ -290,6 +310,7 @@ impl ResumeHandle {
                 .carrying(Lane::Interactive, Instant::now())
                 .map(|path| match path.kind {
                     PathKind::Bluetooth => "bluetooth".to_string(),
+                    _ if path.direct => "direct".to_string(),
                     _ => "network".to_string(),
                 }),
             choice: state.choice,
@@ -309,6 +330,21 @@ impl ResumeHandle {
                 PathKind::for_lane(lane),
                 "the system reported the network gone",
             );
+        }
+    }
+
+    /// Let every path over a direct Wi-Fi link go.
+    pub fn release_direct(&self, why: &str) {
+        let ids: Vec<u64> = self
+            .0
+            .lock()
+            .paths
+            .iter()
+            .filter(|p| p.direct)
+            .map(|p| p.id)
+            .collect();
+        for id in ids {
+            self.0.path_failed(id, why);
         }
     }
 
@@ -336,13 +372,17 @@ impl ResumeHandle {
             mut rx,
             noise,
             kind,
+            direct,
         } = path;
+        // Both ends mark the connection alike (each sees its own address on
+        // the group), so both propose a lane missing from the same set.
         let (delivered, proposed) = {
             let state = self.0.lock();
             if let Some(why) = &state.ended {
                 return Err(TransportError::Other(format!("the session is over: {why}")));
             }
-            (state.delivered(), state.missing_lane())
+            let class = (kind != PathKind::Bluetooth).then_some(direct);
+            (state.delivered(), state.missing_lane(class))
         };
         let mut resume = resume_frame(delivered, proposed);
         resume.extend_from_slice(&self.tag());
@@ -391,6 +431,7 @@ impl ResumeHandle {
             rx,
             noise,
             kind,
+            direct,
         });
         Ok(())
     }
@@ -871,9 +912,38 @@ mod tests {
             a.handle.paths(),
             Paths {
                 network: true,
-                bluetooth: false
+                bluetooth: false,
+                direct: false,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_direct_path_carries_beside_the_router_and_hands_back_when_lost() {
+        let (mut a, mut b) = session().await;
+        for _ in 0..Lane::COUNT {
+            assert!(!a.handle.direct_complete());
+            let (mut pa, mut pb, _) = path_pair(PathKind::Network).await;
+            pa.direct = true;
+            pb.direct = true;
+            let (ra, rb) = tokio::join!(a.handle.attach(pa), b.handle.attach(pb));
+            ra.unwrap();
+            rb.unwrap();
+        }
+        assert!(a.handle.direct_complete());
+        assert!(a.handle.network_complete());
+        assert_eq!(a.handle.0.lock().paths.len(), 2 * Lane::COUNT);
+        assert_eq!(a.handle.report().carrying.as_deref(), Some("direct"));
+        a.tx.send(&key(3)).await.unwrap();
+        assert_eq!(next(&mut b).await, key(3));
+
+        a.handle.release_direct("the group went away");
+        b.handle.release_direct("the group went away");
+        assert!(!a.handle.paths().direct);
+        assert!(a.handle.network_complete());
+        assert_eq!(a.handle.report().carrying.as_deref(), Some("network"));
+        a.tx.send(&key(4)).await.unwrap();
+        assert_eq!(next(&mut b).await, key(4));
     }
 
     #[tokio::test]
@@ -887,7 +957,8 @@ mod tests {
             a.handle.paths(),
             Paths {
                 network: true,
-                bluetooth: true
+                bluetooth: true,
+                direct: false,
             }
         );
         a.handle.network_lost();
