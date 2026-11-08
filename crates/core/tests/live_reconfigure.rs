@@ -469,6 +469,42 @@ async fn a_machine_with_input_off_keeps_its_own_cursor_when_the_peer_takes_it() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_machine_with_input_off_reports_ownership_when_the_peer_takes_the_cursor() {
+    let (a_t, b_t) = encrypted_pair().await;
+    let (a_id, b_id) = pair_ids();
+    let (a_pos, b_pos) = (Position::new(0, 0), Position::new(1, 0));
+    // A drives B, which shares nothing. A taking the cursor back must still
+    // reach B's ownership report, which is what releases the keys A left held
+    // there.
+    let (a, a_task) = run_side(
+        a_t,
+        a_id.clone(),
+        greeting(&b_id, b_pos),
+        a_pos,
+        false,
+        true,
+    );
+    let (b, b_task) = run_side(b_t, b_id, greeting(&a_id, a_pos), b_pos, true, false);
+    eventually("both sessions up", || {
+        a.census.heard.load(Ordering::SeqCst) == 1 && b.census.heard.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let before = b.active.lock().unwrap().len();
+
+    a.live.apply(&Plan {
+        input: Some(false),
+        ..Plan::default()
+    });
+    eventually("B to report ownership again", || {
+        b.active.lock().unwrap().len() > before
+    })
+    .await;
+    assert_eq!(b.active.lock().unwrap().last(), Some(&true));
+    a_task.abort();
+    b_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_the_peer_ends_the_link_cleanly_and_the_peer_hears_goodbye() {
     let (a_t, b_t) = encrypted_pair().await;
     let (a_id, b_id) = pair_ids();

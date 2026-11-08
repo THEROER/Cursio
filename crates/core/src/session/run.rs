@@ -702,6 +702,13 @@ where
                 tracing::info!(
                     "peer took the cursor, but input sharing is off here; this machine keeps its own"
                 );
+                // The role stays, but the peer has stopped driving here, so
+                // what it holds down is still reported: the report is what
+                // releases it. Its hotkey arrives as Ctrl and Alt pressed here
+                // with the releases going to the peer, and left held they turned
+                // every click on this machine into Ctrl+Alt+click — the pointer
+                // moved, clicks reached nothing, a game ignored them all.
+                self.tell(false, None);
             }
             Message::Grab { active } => {
                 // The peer is handing the cursor to us (active=true) or taking
