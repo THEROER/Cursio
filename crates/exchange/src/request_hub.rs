@@ -81,11 +81,11 @@ impl<Req, Resp> RequestHub<Req, Resp> {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn generation(&self) -> u64 {
+    pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn register(
+    pub fn register(
         &self,
         peer: PeerId,
         name: String,
@@ -104,14 +104,14 @@ impl<Req, Resp> RequestHub<Req, Resp> {
         (rx, token)
     }
 
-    pub(crate) fn unregister(&self, peer: &PeerId, token: u64) {
+    pub fn unregister(&self, peer: &PeerId, token: u64) {
         let mut links = self.lock();
         if links.get(peer).is_some_and(|l| l.token == token) {
             links.remove(peer);
         }
     }
 
-    pub(crate) fn bump(&self, peer: &PeerId) {
+    pub fn bump(&self, peer: &PeerId) {
         if let Some(link) = self.lock().get_mut(peer) {
             link.revision = link.revision.wrapping_add(1);
         }

@@ -52,7 +52,7 @@ pub fn hub() -> &'static MessagesHub {
 /// The store a node without one uses in tests, and nothing else: it answers
 /// from memory.
 #[cfg(test)]
-pub(crate) struct MemoryStore(pub Mutex<Vec<cursio_protocol::messages::Conversation>>);
+pub struct MemoryStore(pub Mutex<Vec<cursio_protocol::messages::Conversation>>);
 
 #[cfg(test)]
 impl MessageStore for MemoryStore {

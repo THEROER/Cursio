@@ -7,7 +7,8 @@
 //!
 //! The paths of a session belong to the transport, which the module does not
 //! hold — it runs on its own thread and sees only messages. So the registry
-//! records each session's [`ResumeHandle`] here as it holds it
+//! records each session's
+//! [`ResumeHandle`](cursio_transport::resume::ResumeHandle) here as it holds it
 //! ([`hold`]/[`release`]), and both the control socket and the answering
 //! half find it by peer.
 //!
@@ -16,20 +17,15 @@
 //! machine on a hotspot, with no shell anyone can reach, was otherwise left
 //! running an old build until a quiet moment came or a person walked over.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use cursio_protocol::diag::{
-    DiagMsg, DiagRequest, DiagResponse, Maintenance, NodeReport, PathChoice, PathReport,
-};
+use cursio_protocol::diag::{DiagMsg, DiagRequest, DiagResponse, Maintenance, NodeReport};
 use cursio_protocol::{ModuleAdvert, ModuleId, ModuleRole, PeerId, Priority};
-use cursio_transport::resume::ResumeHandle;
 
 use crate::exchange_session::{Exchange, ExchangeEngine};
 use crate::log_tail::Tail;
 use crate::module::SessionModule;
-use crate::request_hub::{HubKind, RequestHub};
 
 /// Version of [`DiagMsg`]; peers run the module only on an exact match.
 pub const VERSION: u16 = 3;
@@ -104,67 +100,9 @@ pub fn own_report(since: Duration) -> Result<NodeReport, String> {
     Ok(report)
 }
 
-/// Longest a caller waits for a peer's answer. A log answer is up to half a
-/// megabyte, which over Bluetooth is seconds.
-pub const ANSWER_WAIT: Duration = Duration::from_secs(30);
-
-pub type DiagHub = RequestHub<DiagRequest, DiagResponse>;
-
-pub fn hub() -> &'static DiagHub {
-    static HUB: OnceLock<DiagHub> = OnceLock::new();
-    HUB.get_or_init(|| {
-        RequestHub::new(HubKind {
-            wait: ANSWER_WAIT,
-            peer: "machine",
-            shares: "diagnostics",
-        })
-    })
-}
-
-fn sessions() -> std::sync::MutexGuard<'static, HashMap<PeerId, ResumeHandle>> {
-    static SESSIONS: OnceLock<Mutex<HashMap<PeerId, ResumeHandle>>> = OnceLock::new();
-    SESSIONS
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-}
-
-/// `peer`'s session is now `handle`.
-pub fn hold(peer: PeerId, handle: ResumeHandle) {
-    sessions().insert(peer, handle);
-}
-
-/// `peer`'s session tagged `tag` ended, unless a newer one replaced it.
-pub fn release(peer: PeerId, tag: cursio_protocol::SessionTag) {
-    let mut sessions = sessions();
-    if sessions.get(&peer).is_some_and(|h| h.tag() == tag) {
-        sessions.remove(&peer);
-    }
-}
-
-/// Choose `choice` for this end of the session with `peer`, when given, and
-/// report its paths.
-pub fn paths(peer: &PeerId, choice: Option<PathChoice>) -> Result<PathReport, String> {
-    let handle = sessions()
-        .get(peer)
-        .filter(|h| !h.is_ended())
-        .cloned()
-        .ok_or_else(|| "no session to this machine is running".to_string())?;
-    if let Some(choice) = choice {
-        handle.choose(choice);
-    }
-    Ok(handle.report())
-}
-
-/// Whether Bluetooth carries the session with `peer` now: the one path a
-/// module's traffic shares with every pointer move, at a fraction of the
-/// network's speed.
-pub fn carried_by_bluetooth(peer: &PeerId) -> bool {
-    sessions()
-        .get(peer)
-        .filter(|h| !h.is_ended())
-        .is_some_and(|h| h.report().carrying.as_deref() == Some("bluetooth"))
-}
+pub use cursio_exchange::diag_hub::{
+    carried_by_bluetooth, hold, hub, paths, release, DiagHub, ANSWER_WAIT,
+};
 
 /// This node's own log, as a peer or the control socket asks for it.
 /// A window target names an application by the rules every name off the

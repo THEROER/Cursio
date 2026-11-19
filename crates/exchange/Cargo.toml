@@ -1,0 +1,30 @@
+[package]
+name = "cursio-exchange"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# This computer's Pictures and Videos for peers to browse: a folder walk and a
+# thumbnail decoder. A phone answers from its MediaStore instead.
+gallery = ["dep:image", "dep:sha2"]
+
+[dependencies]
+cursio-core-base.workspace = true
+cursio-protocol.workspace = true
+cursio-transport.workspace = true
+image = { workspace = true, optional = true }
+
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+directories.workspace = true
+# Thumbnails are cached under the hash of what they were made from.
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+cursio-core-base = { workspace = true, features = ["test-support"] }
+tokio = { version = "1", features = ["full", "test-util"] }

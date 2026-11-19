@@ -114,7 +114,7 @@ impl<E: Exchange> ExchangeEngine<E> {
         }
     }
 
-    pub(crate) fn on_message(&mut self, msg: ExchangeMsg<E::Request, E::Response>) {
+    pub fn on_message(&mut self, msg: ExchangeMsg<E::Request, E::Response>) {
         match msg {
             ExchangeMsg::Request { id, request } => match &mut self.answering {
                 Some(answering) => answering.incoming.push_back((id, request)),

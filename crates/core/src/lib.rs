@@ -50,7 +50,6 @@ pub mod desk;
 pub mod desktop_window;
 pub mod diag_session;
 pub mod direct_session;
-pub mod exchange_session;
 /// File sharing. Serving this machine's volumes is portable and always built;
 /// *mounting* the peer's needs FUSE on Linux or WinFsp on Windows (and the
 /// latter only under MSVC, because `winfsp-sys` rejects every other target
@@ -62,13 +61,6 @@ pub mod firewall;
 /// Removing a machine from the mesh: the trust store, builder trust, and what
 /// the running node holds about it.
 pub mod forget;
-/// This computer's Pictures and Videos, answered to peers browsing them.
-#[cfg(feature = "gallery")]
-pub mod gallery_folder;
-/// Where this machine's gallery is answered and a window's requests leave.
-pub mod gallery_hub;
-/// The gallery module on one link.
-pub mod gallery_session;
 /// Which peer this machine's one mouse and keyboard reach, across all links.
 pub mod input_hub;
 /// Bringing a link up to the point a session can start: handshake, pairing,
@@ -81,10 +73,6 @@ pub mod logging;
 /// `cursio mcp`: the mesh as tools for an AI agent.
 pub mod mcp;
 pub mod mesh;
-/// Where a phone's messages are answered and a desktop's requests leave.
-pub mod messages_hub;
-/// The messages module on one link.
-pub mod messages_session;
 pub mod metrics;
 pub mod mixer;
 /// The unelevated process that keeps a peer's drives where Explorer sees them.
@@ -120,8 +108,6 @@ pub mod registry;
 /// screen-sharing software here without being drawn on this desktop.
 #[cfg(feature = "window")]
 pub mod remote_screen;
-/// Where a request-and-answer module meets the rest of the node.
-pub mod request_hub;
 /// Where a capture app's request for a peer's screen meets that peer's link.
 #[cfg(feature = "window")]
 pub mod screen_hub;
@@ -148,17 +134,22 @@ pub mod window_session;
 
 #[cfg(target_os = "linux")]
 pub use cursio_core_base::session_bus;
-pub use cursio_hubs::{
-    calls_hub, calls_session, media_hub, media_session, notify_dedup, notify_hub, notify_session,
-    notify_toast, presence,
-};
-#[cfg(target_os = "linux")]
-pub use cursio_hubs::{media_mpris, notify_display};
-#[cfg(target_os = "windows")]
-pub use cursio_hubs::media_smtc;
 #[cfg(test)]
 use cursio_core_base::test_support;
 pub use cursio_core_base::{
     at_phone, config, data_dir, diagnostics, elevate, health, identity, live, module, module_host,
     modules_busy, node_status, queue, NodeIdentity,
 };
+#[cfg(feature = "gallery")]
+pub use cursio_exchange::gallery_folder;
+pub use cursio_exchange::{
+    exchange_session, gallery_hub, gallery_session, messages_hub, messages_session, request_hub,
+};
+#[cfg(target_os = "windows")]
+pub use cursio_hubs::media_smtc;
+pub use cursio_hubs::{
+    calls_hub, calls_session, media_hub, media_session, notify_dedup, notify_hub, notify_session,
+    notify_toast, presence,
+};
+#[cfg(target_os = "linux")]
+pub use cursio_hubs::{media_mpris, notify_display};

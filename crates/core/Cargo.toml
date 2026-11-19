@@ -62,7 +62,7 @@ bluetooth = ["dep:cursio-bluetooth"]
 # This computer's Pictures and Videos for peers to browse: a folder walk and a
 # thumbnail decoder. A phone answers from its MediaStore instead, and browses
 # a peer's gallery without this.
-gallery = ["dep:image"]
+gallery = ["dep:image", "cursio-exchange/gallery"]
 # A phone's screen read as a picture by a program here (`cursio phone`, the
 # MCP tools): the screen's H.264 decoded once and written as PNG.
 phone-control = ["window", "dep:image"]
@@ -76,6 +76,8 @@ airplay = ["dep:cursio-airplay", "window"]
 cursio-core-base.workspace = true
 # Where a phone's calls, notifications and players meet this machine.
 cursio-hubs.workspace = true
+# The request-and-answer modules: messages, the gallery, diagnostics' hub.
+cursio-exchange.workspace = true
 cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true
