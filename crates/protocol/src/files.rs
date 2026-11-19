@@ -2,8 +2,8 @@
 //!
 //! Each machine offers its volumes — `/` on Linux, `C:`, `D:`, … on Windows —
 //! and the other mounts them as ordinary folders, so any application opens a
-//! file across the link with no awareness that it is remote. See
-//! `docs/files-design.md`.
+//! file across the link with no awareness that it is remote. See "Files" in
+//! `CLAUDE.md` and the mounting notes in `README.md`.
 //!
 //! ## Request/response, not push
 //!

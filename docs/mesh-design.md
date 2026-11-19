@@ -45,7 +45,7 @@ next link. These stay.
 
 Only two places leak actual "server-ness", and only these need to change:
 
-- `start_active = matches!(role, Role::Responder)` (then in `cursio.rs`; now `bin/cursio/peer_session.rs`) — decides who
+- `start_active = matches!(role, Role::Responder)` (then in `cursio.rs`; the cursor's start is now decided in `bin/cursio/peer_session.rs`) — decides who
   holds the cursor. With N nodes "the responder" is meaningless.
 - Audio stream-id namespacing `Initiator => 1000 / Responder => 2000`
   (`audio_session/ids.rs`) — with three nodes, two of them would both pick 1000 and
