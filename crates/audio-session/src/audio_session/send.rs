@@ -306,7 +306,7 @@ impl AudioEngine {
     pub(super) fn bitrate_ceiling(&self) -> u32 {
         match self
             .peer
-            .is_some_and(|p| crate::diag_session::carried_by_bluetooth(&p))
+            .is_some_and(|p| cursio_exchange::diag_hub::carried_by_bluetooth(&p))
         {
             true => BLUETOOTH_BITRATE,
             false => cursio_audio::codec::DEFAULT_BITRATE,

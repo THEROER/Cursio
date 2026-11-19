@@ -23,6 +23,8 @@ pub mod health;
 pub mod identity;
 /// Applying a changed config to running links instead of restarting.
 pub mod live;
+/// The listener's own volume for each peer stream playing on this machine.
+pub mod mixer;
 pub mod module;
 /// Running each session module on a thread of its own, off the loop the
 /// shared cursor rides.

@@ -1199,6 +1199,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cursio-audio-session"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cursio-audio",
+ "cursio-bluetooth",
+ "cursio-core-base",
+ "cursio-exchange",
+ "cursio-hubs",
+ "cursio-protocol",
+ "cursio-transport",
+ "rand 0.8.7",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cursio-bluetooth"
 version = "0.9.0"
 dependencies = [
@@ -1240,6 +1258,7 @@ dependencies = [
  "cursio-airplay",
  "cursio-app-protocol",
  "cursio-audio",
+ "cursio-audio-session",
  "cursio-bluetooth",
  "cursio-clipboard-session",
  "cursio-core-base",

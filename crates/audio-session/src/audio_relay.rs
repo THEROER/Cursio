@@ -55,12 +55,12 @@ pub fn phone_sound_of(label: &str) -> Option<&str> {
 }
 
 /// One relay's shared state, as the audio module of the peer's link sees it.
-pub(crate) struct Relay {
-    pub(crate) peer: PeerId,
-    pub(crate) label: String,
-    pub(crate) wants_mic: bool,
+pub struct Relay {
+    pub peer: PeerId,
+    pub label: String,
+    pub wants_mic: bool,
     pcm: Mutex<Option<mpsc::UnboundedReceiver<AudioChunk>>>,
-    pub(crate) mic: mpsc::UnboundedSender<AudioChunk>,
+    pub mic: mpsc::UnboundedSender<AudioChunk>,
     closed: AtomicBool,
 }
 
@@ -69,7 +69,7 @@ impl Relay {
         lock(&self.pcm).take()
     }
 
-    pub(crate) fn closed(&self) -> bool {
+    pub fn closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 }
@@ -128,10 +128,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// A link's audio module, registered while it runs.
-pub(crate) struct LinkMark(u64);
+pub struct LinkMark(u64);
 
 impl LinkMark {
-    pub(crate) fn new(peer: PeerId, name: &str) -> Self {
+    pub fn new(peer: PeerId, name: &str) -> Self {
         let token: u64 = rand::random();
         lock(&state().links).push(LinkEntry {
             token,
@@ -179,7 +179,7 @@ pub fn open(peer: PeerId, label: &str, wants_mic: bool) -> RelayHandle {
 /// Relays for `peer` that no link has taken yet. Taking one claims its PCM,
 /// so a second link to the same peer (a reconnect overlapping the old one)
 /// does not split the stream.
-pub(crate) fn unclaimed(peer: PeerId) -> Vec<(Arc<Relay>, mpsc::UnboundedReceiver<AudioChunk>)> {
+pub fn unclaimed(peer: PeerId) -> Vec<(Arc<Relay>, mpsc::UnboundedReceiver<AudioChunk>)> {
     lock(&state().relays)
         .iter()
         .filter(|r| r.peer == peer)

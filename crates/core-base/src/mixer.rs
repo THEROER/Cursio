@@ -9,7 +9,7 @@
 //! Plain data with no platform dependency, so the control socket can carry it
 //! on a build without the audio module: every link's audio engine fills it,
 //! and whatever draws the UI reads and sets it through
-//! [`Command::SetStreamVolume`](crate::control::Command::SetStreamVolume).
+//! `cursio_core::control::Command::SetStreamVolume`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};

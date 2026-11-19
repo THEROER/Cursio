@@ -1,0 +1,30 @@
+[package]
+name = "cursio-audio-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# A phone's calls with their voice on this computer: the Bluetooth hands-free
+# unit, whose audio rides the audio module's playback and microphone.
+calls = ["dep:cursio-bluetooth"]
+
+[dependencies]
+cursio-core-base.workspace = true
+cursio-hubs = { workspace = true, features = ["audio"] }
+cursio-exchange.workspace = true
+cursio-protocol.workspace = true
+cursio-transport.workspace = true
+cursio-audio.workspace = true
+cursio-bluetooth = { workspace = true, optional = true }
+
+async-trait.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+cursio-core-base = { workspace = true, features = ["test-support"] }
+tokio = { version = "1", features = ["full", "test-util"] }

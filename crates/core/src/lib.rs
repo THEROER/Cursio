@@ -21,23 +21,10 @@
 #[cfg(feature = "airplay")]
 pub mod airplay_window;
 pub mod apps;
-#[cfg(feature = "audio")]
-pub mod audio_gate;
-/// Sound made on this machine — a call's voice, a phone's music — sent to a
-/// peer as one of its application streams.
-#[cfg(feature = "audio")]
-pub mod audio_relay;
-#[cfg(feature = "audio")]
-pub mod audio_session;
 /// Handing a paired phone's headset and speaker roles from PipeWire to Cursio.
 /// The mesh's channel over Bluetooth, for a peer the network does not reach.
 #[cfg(feature = "bluetooth")]
 pub mod bluetooth_link;
-#[cfg(all(target_os = "linux", feature = "calls"))]
-pub mod bluetooth_setup;
-/// A phone's call voice, played and recorded on this computer's audio.
-#[cfg(feature = "calls")]
-pub mod call_audio;
 /// A phone's calls as notifications here, with buttons that act on them.
 pub mod calls_display;
 /// The local socket the app, the tray and `cursio status` talk to.
@@ -66,7 +53,6 @@ pub mod logging;
 pub mod mcp;
 pub mod mesh;
 pub mod metrics;
-pub mod mixer;
 /// The system telling the sessions their network went away.
 pub mod network_watch;
 #[cfg(target_os = "linux")]
@@ -116,14 +102,20 @@ pub mod wifi_setup;
 #[cfg(feature = "window")]
 pub mod window_session;
 
+#[cfg(all(target_os = "linux", feature = "calls"))]
+pub use cursio_audio_session::bluetooth_setup;
+#[cfg(feature = "calls")]
+pub use cursio_audio_session::call_audio;
+#[cfg(feature = "audio")]
+pub use cursio_audio_session::{audio_gate, audio_relay, audio_session};
 pub use cursio_clipboard_session::clipboard_session;
 #[cfg(target_os = "linux")]
 pub use cursio_core_base::session_bus;
 #[cfg(test)]
 use cursio_core_base::test_support;
 pub use cursio_core_base::{
-    at_phone, config, data_dir, diagnostics, elevate, health, identity, live, module, module_host,
-    modules_busy, node_status, queue, NodeIdentity,
+    at_phone, config, data_dir, diagnostics, elevate, health, identity, live, mixer, module,
+    module_host, modules_busy, node_status, queue, NodeIdentity,
 };
 #[cfg(feature = "gallery")]
 pub use cursio_exchange::gallery_folder;

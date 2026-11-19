@@ -41,7 +41,7 @@ desktop = ["audio", "input", "window", "files", "files-mount", "airplay", "usb",
 # `cursio mcp`'s `web_*` tools: a DevTools-protocol client for an
 # application's web view on another machine (docs/devtools-design.md).
 web-tools = ["dep:tokio-tungstenite", "dep:futures"]
-audio = ["dep:cursio-audio", "cursio-hubs/audio"]
+audio = ["dep:cursio-audio", "dep:cursio-audio-session", "cursio-hubs/audio"]
 input = ["dep:cursio-input"]
 window = ["dep:cursio-window"]
 files = ["dep:cursio-files", "dep:cursio-files-session", "cursio-clipboard-session/files"]
@@ -54,7 +54,7 @@ files-mount = ["files", "cursio-files/mount", "cursio-files-session/files-mount"
 usb = ["dep:cursio-usb-session"]
 # A phone's calls with their voice on this computer: the Bluetooth hands-free
 # unit, whose audio rides the audio module's playback and microphone.
-calls = ["dep:cursio-bluetooth", "audio"]
+calls = ["dep:cursio-bluetooth", "audio", "cursio-audio-session/calls"]
 # The mesh over Bluetooth: an RFCOMM channel paired phones open when the
 # network is not there. Only the socket comes from BlueZ; what crosses it is
 # the mesh itself.
@@ -83,6 +83,7 @@ cursio-service-session.workspace = true
 cursio-usb-session = { workspace = true, optional = true }
 cursio-files-session = { workspace = true, optional = true }
 cursio-clipboard-session.workspace = true
+cursio-audio-session = { workspace = true, optional = true }
 cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true
