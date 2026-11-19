@@ -14,6 +14,11 @@
 //! A handle every instance writes and the receiver reads is the only shape
 //! where "somebody asked me to host this" survives the session that carried
 //! the request going away.
+//!
+//! A crate of its own, below `cursio-core` (which re-exports it as
+//! `cursio_core::service_session`), because the modules that place a duty —
+//! window transfer for AirPlay, USB for a shared device — live in crates of
+//! their own too.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -24,7 +29,8 @@ use cursio_protocol::{
 };
 use cursio_transport::{TransportError, TransportTx};
 
-use crate::module::SessionModule;
+use cursio_core_base::module;
+use module::SessionModule;
 
 /// Every duty this build knows how to ask about or carry.
 ///

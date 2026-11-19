@@ -19,6 +19,8 @@ members = [
     "crates/core-base",
     "crates/hubs",
     "crates/exchange",
+    "crates/service-session",
+    "crates/usb-session",
     "crates/core",
     "crates/android",
     "app",
@@ -52,6 +54,8 @@ cursio-usb = { path = "crates/usb" }
 cursio-core-base = { path = "crates/core-base" }
 cursio-hubs = { path = "crates/hubs" }
 cursio-exchange = { path = "crates/exchange" }
+cursio-service-session = { path = "crates/service-session" }
+cursio-usb-session = { path = "crates/usb-session" }
 cursio-core = { path = "crates/core" }
 cursio-android = { path = "crates/android" }
 cursio-log = { path = "crates/logging" }

@@ -702,7 +702,7 @@ impl SessionModule for UsbEngine {
                 // minute a switch waits for quiet — so counting them held an
                 // update back for good on a machine lending nothing at all.
                 if matches!(decoded, Some(UsbMsg::Data { .. })) {
-                    crate::update::quiet::note_usb_activity();
+                    crate::quiet::note_usb_activity();
                 }
                 decoded
             }

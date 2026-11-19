@@ -1,0 +1,19 @@
+[package]
+name = "cursio-service-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cursio-core-base.workspace = true
+cursio-protocol.workspace = true
+cursio-transport.workspace = true
+
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+cursio-core-base = { workspace = true, features = ["test-support"] }
+tokio = { version = "1", features = ["full", "test-util"] }

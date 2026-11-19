@@ -51,7 +51,7 @@ files = ["dep:cursio-files"]
 # GPL code for files — what a closed product embedding Cursio needs. See
 # THIRD-PARTY.md.
 files-mount = ["files", "cursio-files/mount"]
-usb = ["dep:cursio-usb"]
+usb = ["dep:cursio-usb", "dep:cursio-usb-session"]
 # A phone's calls with their voice on this computer: the Bluetooth hands-free
 # unit, whose audio rides the audio module's playback and microphone.
 calls = ["dep:cursio-bluetooth", "audio"]
@@ -78,6 +78,9 @@ cursio-core-base.workspace = true
 cursio-hubs.workspace = true
 # The request-and-answer modules: messages, the gallery, diagnostics' hub.
 cursio-exchange.workspace = true
+# Placing a duty that must live on one machine, such as the AirPlay receiver.
+cursio-service-session.workspace = true
+cursio-usb-session = { workspace = true, optional = true }
 cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true

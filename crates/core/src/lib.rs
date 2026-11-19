@@ -112,17 +112,12 @@ pub mod remote_screen;
 #[cfg(feature = "window")]
 pub mod screen_hub;
 pub mod screen_views;
-pub mod service_session;
 pub mod session;
 mod session_outbox;
 pub mod share_session;
 pub mod share_sink;
 /// Versions side by side, a `current` pointer, and the helper that switches it.
 pub mod update;
-#[cfg(feature = "usb")]
-pub mod usb_node;
-#[cfg(feature = "usb")]
-pub mod usb_session;
 #[cfg(feature = "window")]
 mod video_budget;
 /// Waking a paired machine that is asleep, by the address learned while awake.
@@ -153,3 +148,6 @@ pub use cursio_hubs::{
 };
 #[cfg(target_os = "linux")]
 pub use cursio_hubs::{media_mpris, notify_display};
+pub use cursio_service_session as service_session;
+#[cfg(feature = "usb")]
+pub use cursio_usb_session::{usb_node, usb_session};

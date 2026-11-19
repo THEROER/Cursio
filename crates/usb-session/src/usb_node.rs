@@ -25,11 +25,11 @@
 //! arbiter and the host's own attachment. Rule 4 in `docs/platform-design.md`
 //! — one owner per piece of state — where the state is the device and the owner
 //! is the machine with the port. The same shape as
-//! [`node_status`](crate::node_status): one monitor per machine, one cursor per
+//! [`node_status`](cursio_core_base::node_status): one monitor per machine, one cursor per
 //! link.
 //!
 //! Shared as an `Arc<Mutex<_>>`, the same shape
-//! [`service_session`](crate::service_session) uses for the state its links
+//! `cursio_core::service_session` uses for the state its links
 //! share: every link's module runs on a thread of its own, so the node-level
 //! half is genuinely contended and cannot be an `Rc`.
 //!
@@ -57,7 +57,6 @@ struct Exported {
     /// cache and a configuration lease describe the device rather than a link:
     /// one per link would be one cache per link, which is the desynchronisation
     /// it exists to prevent.
-    #[cfg(feature = "usb")]
     arbiter: cursio_usb::arbiter::Arbiter,
     /// The request each in-flight transfer carried, keyed by the submitter and
     /// its sequence number.
@@ -65,7 +64,6 @@ struct Exported {
     /// A reply header carries no setup bytes of its own, so the association has
     /// to be held across the round trip — that is what lets a descriptor be
     /// cached when it comes back.
-    #[cfg(feature = "usb")]
     in_flight: HashMap<(PeerId, u32), cursio_usb::urb::Setup>,
     /// Whether the host has attached the device to itself as well.
     ///
@@ -244,9 +242,7 @@ impl UsbNode {
                 device,
                 Exported {
                     holders: HashMap::new(),
-                    #[cfg(feature = "usb")]
                     arbiter: cursio_usb::arbiter::Arbiter::new(),
-                    #[cfg(feature = "usb")]
                     in_flight: HashMap::new(),
                     local: false,
                     local_stream: None,
@@ -425,7 +421,6 @@ impl UsbNode {
     /// A stream carries payloads as well as headers, and a partial read is the
     /// ordinary case rather than an error — refusing what cannot be parsed
     /// would break every transfer larger than one read.
-    #[cfg(feature = "usb")]
     pub fn feed_from(
         &mut self,
         device: UsbDeviceId,
@@ -488,7 +483,6 @@ impl UsbNode {
     ///
     /// The host's own loop is fed straight into its controller; a peer's has to
     /// travel its link, so it is queued for that session to send.
-    #[cfg(feature = "usb")]
     fn answer(
         &mut self,
         peer: PeerId,
@@ -540,10 +534,7 @@ impl UsbNode {
         };
         // Through the arbiter like anyone else's: the host is one more holder,
         // and its transfers must not race a peer's either.
-        #[cfg(feature = "usb")]
         let fed = self.feed_from(device, self.host, stream, bytes);
-        #[cfg(not(feature = "usb"))]
-        let fed = self.backend.feed(stream, bytes);
         if let Err(error) = fed {
             tracing::warn!(%device, %error, "the host's own urbs did not reach the device");
         }
