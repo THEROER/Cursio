@@ -1,0 +1,29 @@
+[package]
+name = "cursio-clipboard-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# A file list copied on a peer pasted as the same files through its mounted
+# volume, and this machine's drive letters named by the shares they mount.
+files = ["dep:cursio-files-session"]
+
+[dependencies]
+cursio-core-base.workspace = true
+cursio-files-session = { workspace = true, optional = true }
+cursio-protocol.workspace = true
+cursio-transport.workspace = true
+# The platform layer (read/write/watch) the module drives on a worker thread.
+clipboard-core.workspace = true
+
+async-trait.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+cursio-core-base = { workspace = true, features = ["test-support"] }
+tokio = { version = "1", features = ["full", "test-util"] }

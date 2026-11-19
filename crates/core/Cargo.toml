@@ -44,7 +44,7 @@ web-tools = ["dep:tokio-tungstenite", "dep:futures"]
 audio = ["dep:cursio-audio", "cursio-hubs/audio"]
 input = ["dep:cursio-input"]
 window = ["dep:cursio-window"]
-files = ["dep:cursio-files", "dep:cursio-files-session"]
+files = ["dep:cursio-files", "dep:cursio-files-session", "cursio-clipboard-session/files"]
 # Mounting a peer's volumes on Windows in this binary: links WinFsp's GPL-3.0
 # bindings. Without it a Windows node still mounts, through the separate
 # `cursio-mount-helper` executable beside it, and the node itself carries no
@@ -82,6 +82,7 @@ cursio-exchange.workspace = true
 cursio-service-session.workspace = true
 cursio-usb-session = { workspace = true, optional = true }
 cursio-files-session = { workspace = true, optional = true }
+cursio-clipboard-session.workspace = true
 cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true

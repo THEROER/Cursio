@@ -27,7 +27,7 @@
 //! connection that must live on one thread; `write` detaches its own serving
 //! thread). A [`SessionModule`] is `Send` and must not block the session loop.
 //! So the blocking clipboard lives on a dedicated worker thread, and this module
-//! holds only channels to it — exactly how [`AudioEngine`](crate::audio_session)
+//! holds only channels to it — exactly how [`AudioEngine`](cursio_core::audio_session)
 //! keeps its captures behind channels.
 //!
 //! ## How it composes with `clipd`

@@ -40,7 +40,6 @@ pub mod bluetooth_setup;
 pub mod call_audio;
 /// A phone's calls as notifications here, with buttons that act on them.
 pub mod calls_display;
-pub mod clipboard_session;
 /// The local socket the app, the tray and `cursio status` talk to.
 pub mod control;
 /// The engine a request-and-answer module (messages, the gallery) runs on a link.
@@ -117,6 +116,7 @@ pub mod wifi_setup;
 #[cfg(feature = "window")]
 pub mod window_session;
 
+pub use cursio_clipboard_session::clipboard_session;
 #[cfg(target_os = "linux")]
 pub use cursio_core_base::session_bus;
 #[cfg(test)]

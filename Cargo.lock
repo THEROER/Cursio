@@ -1213,6 +1213,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cursio-clipboard-session"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clipboard-core",
+ "cursio-core-base",
+ "cursio-files-session",
+ "cursio-protocol",
+ "cursio-transport",
+ "rand 0.8.7",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cursio-core"
 version = "0.9.0"
 dependencies = [
@@ -1225,6 +1241,7 @@ dependencies = [
  "cursio-app-protocol",
  "cursio-audio",
  "cursio-bluetooth",
+ "cursio-clipboard-session",
  "cursio-core-base",
  "cursio-exchange",
  "cursio-files",
