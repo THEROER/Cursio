@@ -391,10 +391,10 @@ crates/usb/                mechanism
   ├── setup.rs             one privileged run per machine     (built)
   └── lib.rs               traits, LocalDevice
 
-crates/core/src/usb_node.rs
+crates/usb-session/src/usb_node.rs
                            one per machine: the backend, the exports,
                            the arbiter                        (built)
-crates/core/src/usb_session/
+crates/usb-session/src/usb_session/
                            policy: who attaches, who leases   (built)
                            LinuxUsbBackend, UsbFactory        (built)
 ```

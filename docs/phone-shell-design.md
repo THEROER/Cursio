@@ -119,7 +119,7 @@ command from a computer — whether a phone of a given make accepts it.
    cannot says why; an older one does not answer, and the computer takes the
    picture from the stream as before. 1220×2712 in 0.7 s, measured.
 5. Touch through the shell's `input` (**built**, `ShellStrokes` in
-   `core/src/phone_gesture.rs`, carried out by `android/src/screen.rs`). An
+   `window-session/src/phone_gesture.rs`, carried out by `android/src/screen.rs`). An
    app may close its screens to accessibility services, which Android 14+
    honours by dropping their injected touch — a bank's documents opened to
    `input tap` and not to the same tap from `ScreenTouch`. Each `input` is a

@@ -95,7 +95,7 @@ window; the viewer's pointer comes back as `WindowInput` and
 accessibility service the person turns on once) dispatches.
 
 What is built on top — **nothing new crosses the link**
-(`core/src/phone_screen/remote.rs`):
+(`window-session/src/phone_screen/remote.rs`):
 
 - **`phone_screenshot { phone, ask?, max_side? }` → MCP `image` content.**
   The computer's window engine for a link to a phone hands the registry the
@@ -112,14 +112,14 @@ What is built on top — **nothing new crosses the link**
   session was not needed.
 - **`phone_tap { phone, x, y, hold_ms? }`, `phone_swipe { phone, x1, y1, x2,
   y2, ms? }`, `phone_key { phone, key: back | home | recents }`,
-  `phone_text { phone, text }`.** `core/src/phone_action.rs` turns each into
+  `phone_text { phone, text }`.** `window-session/src/phone_action.rs` turns each into
   the `WindowInput` a surrogate would send — points are fractions of the
   picture, so the caller never needs the resolution — and
   `Command::PhoneAct` sends them into the link's window engine, paced (a
   swipe is a move every ~16 ms). Recents is the forward side button, newly
   `Gesture::Recents` → `GLOBAL_ACTION_RECENTS`. All destructive-marked: they
   act in the person's phone UI.
-- **Touch says when it cannot land** (`core/src/phone_hands.rs`). Touch
+- **Touch says when it cannot land** (`window-session/src/phone_hands.rs`). Touch
   needs Cursio's accessibility service on the phone, which its person turns
   on by hand; with it off Android drops the gesture silently. So before a
   tap, swipe or key the computer asks `DiagRequest::PhoneTouch`, and a phone

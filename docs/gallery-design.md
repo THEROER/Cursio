@@ -12,9 +12,9 @@ wherever a machine has a gallery and a window to show one — unlike messages,
 where only a phone has the messages and only a desktop the window. A machine
 whose platform names no Pictures folder still browses: it advertises `Sink`.
 
-Code: `protocol/src/gallery.rs` (wire), `core/src/gallery_session.rs` (the
-module on a link), `core/src/gallery_hub.rs` (where a window's requests leave
-and this machine's changes are counted), `core/src/gallery_folder.rs` (a
+Code: `protocol/src/gallery.rs` (wire), `exchange/src/gallery_session.rs` (the
+module on a link), `exchange/src/gallery_hub.rs` (where a window's requests leave
+and this machine's changes are counted), `exchange/src/gallery_folder.rs` (a
 computer's gallery), `crates/android/src/gallery.rs` + `GalleryStore.kt` (a
 phone's).
 

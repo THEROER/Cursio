@@ -513,7 +513,7 @@ of the capture backend work.
      framebuffer painted via `gdk::MemoryTexture` in `B8g8r8a8` — the wire
      format verbatim, so no colour conversion. Pointer/scroll/keys come back as
      `WindowInput`, rescaled into the **host's** pixel space.
-   - Session wiring (`crates/core/src/window_session/`): `WindowEngine` as a
+   - Session wiring (`crates/window-session/src/window_session/`): `WindowEngine` as a
      `SessionModule` beside audio/clipboard, holding **both roles at once**.
      Offer strictly precedes the first frame; pumping is bounded per call so a
      busy window can't starve the session's inbound branch.
@@ -786,8 +786,8 @@ Cursio machines, and every viewer's surrogate already decodes it. So the
 access units go out exactly as the encoder made them — no pixel passes through
 the app — and the computer opens the surrogate it opens for any window. Its
 pointer comes back as the `WindowInput` every surrogate sends. The policy is
-`core/src/phone_screen/` (who watches, when the window opens and closes) and
-`core/src/phone_gesture.rs` (what a mouse means on a touch screen); the phone's
+`window-session/src/phone_screen/` (who watches, when the window opens and closes) and
+`window-session/src/phone_gesture.rs` (what a mouse means on a touch screen); the phone's
 half is `ScreenShare.kt` (projection, encoder) and `ScreenTouch.kt` (touch).
 
 The phone advertises the window module as `ModuleRole::Source`: it hosts its

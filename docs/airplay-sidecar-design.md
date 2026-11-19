@@ -38,8 +38,8 @@ structures; that is what keeps them two programs and not one split in two.
 |---|---|---|
 | `crates/airplay` (receiver, RTSP, crypto, playfair, mirror framing, video) | the iPhone side | **moves** into the `cursio-airplay` executable, unchanged |
 | `core/src/bin/cursio/airplay.rs` (`Receiver` setup, `Announcer`, bind probe, quality) | starts and announces the receiver | **splits**: starting and announcing move to the executable; the node keeps deciding *whether* this machine hosts (placement) and asks the executable to start, stop, withdraw or re-announce |
-| `core/src/service_session.rs`, `protocol/src/service.rs` | placement across the mesh, refusal and fallback | **stays** in the node: it is mesh policy, and it never touched playfair |
-| `core/src/airplay_window.rs` (`MirrorTap` → window frames) | the iPhone screen as a transferable window | **stays** in the node, reading access units from the socket instead of an in-process `MirrorTap` |
+| `service-session/src/lib.rs`, `protocol/src/service.rs` | placement across the mesh, refusal and fallback | **stays** in the node: it is mesh policy, and it never touched playfair |
+| `window-session/src/airplay_window.rs` (`MirrorTap` → window frames) | the iPhone screen as a transferable window | **stays** in the node, reading access units from the socket instead of an in-process `MirrorTap` |
 | `window_session/factory.rs` (`WindowFactory`'s AirPlay field) | gives the window module the tap | **stays**, holding the socket-backed tap |
 
 ## The boundary

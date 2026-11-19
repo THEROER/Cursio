@@ -35,14 +35,14 @@ nothing here may wait in front of the cursor.
 
 ## Where the halves live
 
-- `core/src/media_hub.rs` — one per process. Holds this machine's backend
+- `hubs/src/media_hub.rs` — one per process. Holds this machine's backend
   (`MediaBackend`), where peers' players are shown (`MediaDisplay`), every
   peer's last list and fetched covers, and "Disconnect".
-- `core/src/media_session.rs` — the module on one link: sends this machine's
+- `hubs/src/media_session.rs` — the module on one link: sends this machine's
   list when the hub's generation moves, carries button presses and covers.
   Backend calls run on `spawn_blocking`: an MPRIS call or a MediaController is
   another process's answer.
-- `core/src/media_mpris/` (Linux) — reads players with a 1 s `GetAll` poll
+- `hubs/src/media_mpris/` (Linux) — reads players with a 1 s `GetAll` poll
   (cheaper than one `PropertiesChanged` subscription per player plus one for
   players appearing, and the position is compared only for jumps), and offers
   each peer player as `org.mpris.MediaPlayer2.cursio_<peer>_<n>` on a

@@ -257,7 +257,7 @@ This used to restart the process: capture, the listener and every link's
 negotiated modules are settled at startup, and a fresh start is the one reload
 guaranteed correct. For a toggle in the app that price was wrong — every link
 dropped, the peer's disks unmounted, and on Windows the new process asked for
-elevation again. Now a change lands where it belongs (`core/src/live.rs`,
+elevation again. Now a change lands where it belongs (`core-base/src/live.rs`,
 `core/src/reconfigure.rs`):
 
 | Setting | Applied |
@@ -398,7 +398,7 @@ on cellular `is_metered`. Those are the questions the mesh will ask.
 
 The log says everything once, among thousands of lines. A user who opens it an
 hour after the USB claim failed finds `no such device` and has to work out that
-`adb` was holding the phone. `core/src/diagnostics.rs` is the other half: the
+`adb` was holding the phone. `core-base/src/diagnostics.rs` is the other half: the
 set of problems that hold **right now**, each a `Problem` with a stable `id`, a
 `Severity`, a one-line `summary` naming the concrete cause, an optional `hint`
 (the command that fixes it) and the `since` of the first time it was seen.
@@ -458,7 +458,7 @@ level and clears at a lower one (memory full-stall 10%/5%, some-stall 20%/10%,
 I/O full-stall 20%/10%, swap or commit 90%/80%), because a single line would
 make a panel blink while pressure hovers at it.
 
-**Links, modules and missing pieces** (`core/src/health.rs`) are one function
+**Links, modules and missing pieces** (`core-base/src/health.rs`) are one function
 per condition, so the sentence, severity and id live in one place and a raise
 cannot drift from its clear:
 
@@ -535,7 +535,7 @@ those that are, and to all of them when none is.
 Five minutes is right for a desk — reading a long page is not leaving — and
 wrong the moment the user gets up and takes the phone: every message for the
 next five minutes lit up an empty desk. So the phone answers one more question
-itself, in `core/src/at_phone.rs`: **is the user holding me?**
+itself, in `core-base/src/at_phone.rs`: **is the user holding me?**
 
 - **The strong signal is order.** The phone's screen on and unlocked is
   someone using it — the screen times out without a touch, so this is also
@@ -783,7 +783,7 @@ All five parts shipped, and the code is laid out along the same seams:
 | Identity-derived roles | `CursorSetup::negotiate` — `session.rs` |
 | Peer registry | `PeerState`, `should_dial` — `registry.rs` |
 | N sessions | one task per peer, supervised by the registry |
-| Node state | `NodeStatus` — `protocol/src/node.rs`; reading it — `core/src/node_status.rs` |
+| Node state | `NodeStatus` — `protocol/src/node.rs`; reading it — `core-base/src/node_status.rs` |
 | Priority to the wire | drainer, queue delay — `transport/src/priority.rs`; kernel backlog — `transport/src/send_backlog.rs` |
 
 `PeerState` gained a third state the original design did not name: `Connecting`,

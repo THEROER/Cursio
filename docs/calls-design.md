@@ -41,7 +41,7 @@ Cursio takes the role itself instead (`crates/bluetooth`):
   voice — CVSD (8 kHz linear PCM) or mSBC (16 kHz, below) — through an
   ordinary Cursio playback node and
   the same microphone tap that shares a microphone with peers
-  (`core/src/call_audio.rs`). The computer keeps its devices; nothing appears
+  (`audio-session/src/call_audio.rs`). The computer keeps its devices; nothing appears
   or disappears on the desktop.
 
 "Use phone" closes Cursio's end of SCO, which is how any headset hands the
@@ -177,7 +177,7 @@ hands-free unit acts on them through it — with the voice staying on the phone
 
 ### One phone, two routes
 
-A computer may hear a phone both ways. `core/src/calls_hub/` shows it once:
+A computer may hear a phone both ways. `hubs/src/calls_hub/` shows it once:
 by its hands-free link while one is up (that is where the voice goes, and its
 state is the phone's own call list), by the mesh otherwise. They are matched
 by name — the phone reports its device name, which is what it is called over
@@ -221,7 +221,7 @@ through.
 The phone pairs with one computer, which carries the call; the user may sit
 at another. With `[calls] voice = "follow"` (the default) the computer
 carrying the call plays the voice where the user is and records that
-machine's microphone (`core/src/call_audio.rs`); `"here"` keeps it on this
+machine's microphone (`audio-session/src/call_audio.rs`); `"here"` keeps it on this
 computer.
 
 - **Where the user is** (`presence::whereabouts`): the peer this machine's
@@ -230,7 +230,7 @@ computer.
   looked at twice a second, and a new answer must hold for two seconds
   before the sound moves, so a cursor crossing to a peer and straight back
   does not tear the call's audio down twice.
-- **Getting there** (`core/src/audio_relay.rs`). The voice leaves as one of
+- **Getting there** (`audio-session/src/audio_relay.rs`). The voice leaves as one of
   this machine's application streams on the audio module — advertised with
   no device, Opus at the module's low-latency settings, in the `Audio`
   priority class — so the peer plays it on its default output like any other

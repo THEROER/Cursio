@@ -43,7 +43,7 @@ works at all — it can only rank traffic it can see.
 
 ## What a module is today
 
-`SessionModule` (`crates/core/src/module.rs`) is four calls: `start`, `pump`,
+`SessionModule` (`crates/core-base/src/module.rs`) is four calls: `start`, `pump`,
 `handle_message`, `shutdown`. `run_session` owns the transport and lends a `tx`
 at each. Multiplexing is by message *type*: modules are asked in turn whether an
 inbound message is theirs, first claim wins.
@@ -149,7 +149,7 @@ into the ownership loop.
 ### 3. Module construction is hard-coded in `main` — **done**
 
 *Implemented as `ModuleFactory` / `ModuleRegistry` / `SessionCtx` in
-`crates/core/src/module.rs`, with a factory beside each engine.*
+`crates/core-base/src/module.rs`, with a factory beside each engine.*
 
 
 The binary used to build the module vector inline: an `if` per module,
@@ -266,7 +266,7 @@ aside — appeared in the last 10 s. A copy that arrives first is shown and
 taken down if the twin follows within 2 s; an app that has matched twice is
 remembered (`notify-native-apps.json` in the config directory, forgotten after
 14 days without a match) and its copies wait those 2 s instead, then show if
-no twin came. Calls are never held. `crates/core/src/notify_dedup.rs` holds
+no twin came. Calls are never held. `crates/hubs/src/notify_dedup.rs` holds
 the rest.
 
 **On Windows a phone's notifications are toasts.** An unpackaged program has
@@ -279,7 +279,7 @@ same test as Linux. Twins are read from `UserNotificationListener`, polled
 once a second (its change event needs a packaged background task); it asks
 the user's consent and may refuse a program without package identity, and
 then copies show at once, as before deduplication existed
-(`crates/core/src/notify_toast.rs`).
+(`crates/hubs/src/notify_toast.rs`).
 
 The reason this decomposes cleanly is that all four are *state replication or
 bulk transfer* — the two patterns the audio and clipboard modules already
@@ -580,7 +580,7 @@ final link, must land inside too. A link may still be listed and stat'ed as the
 link it is. A whole volume has nothing outside it to escape to and pays none of
 this.
 
-**The gallery** (`core/src/gallery_folder.rs`, `GalleryStore.kt`). Read-only
+**The gallery** (`exchange/src/gallery_folder.rs`, `GalleryStore.kt`). Read-only
 and narrower than files: a computer offers its Pictures and Videos folders and
 nothing else, a phone the rows of its MediaStore. An id is resolved on the
 machine that issued it, confined the same way as a folder root — no `..`, and

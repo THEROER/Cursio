@@ -161,7 +161,7 @@ playback clock causes crackle or growing lag.
   conversion carries fractional positions across packets so 44.1 kHz does not
   lose half an output sample on every 5 ms packet.
 - **Silence gate:** the sender drops chunks nobody would hear
-  (`core/src/audio_gate.rs`), because an idle mirror pumping full-rate silence
+  (`audio-session/src/audio_gate.rs`), because an idle mirror pumping full-rate silence
   is link capacity the cursor shares. Two questions, two answers:
   - *application/device streams* ask "is the source idle?" — a fixed -60 dBFS
     peak, just above the dither floor; an adaptive threshold would chop the
@@ -574,7 +574,7 @@ backend, it never advertises the audio module and so is not a node here at all.
 
 A phone's call voice and its Bluetooth music reach Cursio as PCM off a
 socket, not as an application in the graph, and the computer that carries
-them is not always the one the user sits at. `core/src/audio_relay.rs` lets
+them is not always the one the user sits at. `audio-session/src/audio_relay.rs` lets
 such a producer hand PCM to the audio module of one link; the module sends it
 as an ordinary **Remote Stream** — app name set, no target device — so the
 peer plays it on its default output exactly like a routed application, and no

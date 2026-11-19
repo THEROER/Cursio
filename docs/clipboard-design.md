@@ -3,7 +3,7 @@
 Status: **implemented on all three platforms.** `clipboard-core` has Linux
 (`data-control`/X11 via arboard), Windows (Win32 clipboard on a message-only
 window) and macOS (`NSPasteboard`) backends; cross-machine sharing is a session
-module in `crates/core/src/clipboard_session.rs`, and `clipd` ships its own GTK4
+module in `crates/clipboard-session/src/clipboard_session.rs`, and `clipd` ships its own GTK4
 popup. Companion to `input-design.md`, `window-transfer-design.md`, and
 `audio-design.md`.
 
@@ -229,7 +229,7 @@ claim first, as an explicit and reversible choice.
 ## Cross-machine sharing (built)
 
 Implemented as a [`SessionModule`] — `ClipboardEngine` in
-`crates/core/src/clipboard_session.rs` — multiplexed onto the same encrypted
+`crates/clipboard-session/src/clipboard_session.rs` — multiplexed onto the same encrypted
 channel as input and audio, exactly like window transfer and audio. Enabled with
 `mesh --clipboard`. The blocking `clipboard-core`
 backend runs on a dedicated worker thread (`clipboard_session/worker.rs`) so the
