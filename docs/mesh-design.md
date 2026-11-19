@@ -45,10 +45,10 @@ next link. These stay.
 
 Only two places leak actual "server-ness", and only these need to change:
 
-- `start_active = matches!(role, Role::Responder)` (`cursio.rs`) — decides who
+- `start_active = matches!(role, Role::Responder)` (then in `cursio.rs`; now `bin/cursio/peer_session.rs`) — decides who
   holds the cursor. With N nodes "the responder" is meaningless.
 - Audio stream-id namespacing `Initiator => 1000 / Responder => 2000`
-  (`audio_session.rs`) — with three nodes, two of them would both pick 1000 and
+  (`audio_session/ids.rs`) — with three nodes, two of them would both pick 1000 and
   collide.
 
 Fixing both by deriving from the stable `PeerId` instead of the link role is
@@ -471,7 +471,7 @@ cannot drift from its clear:
 | A portal dialog was cancelled | `cursio-window::notice` (screen sharing); input capture failing to start | the next grant |
 
 `module_stalled`/`module_recovered` are for the loop that already times every
-module turn (`module_host.rs`); it is the one place that can tell a module that
+module turn (`module_host/`); it is the one place that can tell a module that
 fell behind from one that has caught up.
 
 ## One session, independent delivery lanes
@@ -570,7 +570,7 @@ down — disks unmounted, streams closed, the cursor sent home — and rebuilt o
 the mesh dialled again. dark, on a b43 radio that loses its access point about
 once an hour for a median of eight seconds, paid that every time.
 
-Now the session rides a `ResumableLink` (`transport/src/resume.rs`) and
+Now the session rides a `ResumableLink` (`transport/src/resume/`) and
 connections are *paths* under it:
 
 - **Sequenced, acknowledged, resent.** XMPP's stream management (XEP-0198) is
@@ -827,7 +827,7 @@ ordering-sensitive: forwarding captured input, injecting the peer's,
 heartbeat and liveness, and `NodeStatus`. The ownership logic itself is
 unchanged — its ordering is what several past races were about.
 
-**Each module** runs on a dedicated OS thread (`module_host.rs`), driven with
+**Each module** runs on a dedicated OS thread (`module_host/`), driven with
 `Handle::block_on` on the runtime that owns the link. A thread rather than a
 task, because blocking is exactly the failure being contained: a task that
 blocks holds a runtime worker and whatever is queued behind it. The link's
