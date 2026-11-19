@@ -35,7 +35,7 @@ pub(super) struct Routes {
 /// for one lookup and one channel send; the session takes it only when a
 /// module starts or stops.
 #[derive(Clone, Default)]
-pub(crate) struct Router {
+pub struct Router {
     routes: Arc<std::sync::Mutex<Routes>>,
 }
 
@@ -51,7 +51,7 @@ impl Router {
     /// and the reader routes its first message before the session loop has
     /// read the announcement and started the module on this side; dropping it
     /// lost that module's opening exchange.
-    pub(crate) fn route(&self, msg: Message) -> Option<Message> {
+    pub fn route(&self, msg: Message) -> Option<Message> {
         let Some(id) = msg.module_id() else {
             return Some(msg);
         };
@@ -86,7 +86,7 @@ impl Router {
         None
     }
 
-    pub(crate) fn error(&self) -> Option<String> {
+    pub fn error(&self) -> Option<String> {
         self.routes().error.clone()
     }
 

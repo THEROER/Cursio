@@ -1,6 +1,6 @@
 //! Queue policies shared by the session and module hosts.
 pub use cursio_queue::{channel, Receiver, SendError, Sender, Stats};
-pub(crate) fn message_bytes(message: &cursio_protocol::Message) -> usize {
+pub fn message_bytes(message: &cursio_protocol::Message) -> usize {
     use cursio_protocol::Message;
     let payload = match message {
         Message::Module { payload, .. } | Message::Opaque(payload) => payload.len(),
@@ -11,7 +11,7 @@ pub(crate) fn message_bytes(message: &cursio_protocol::Message) -> usize {
     payload.saturating_add(256)
 }
 
-pub(crate) fn merge_motion(
+pub fn merge_motion(
     previous: &mut cursio_protocol::InputEvent,
     next: &cursio_protocol::InputEvent,
 ) -> bool {
@@ -26,7 +26,7 @@ pub(crate) fn merge_motion(
     false
 }
 
-pub(crate) fn merge_messages(
+pub fn merge_messages(
     previous: &mut cursio_protocol::Message,
     next: &cursio_protocol::Message,
 ) -> bool {

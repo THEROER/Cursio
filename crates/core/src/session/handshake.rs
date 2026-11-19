@@ -2,44 +2,10 @@
 //! identity, modules, position and state, and what kind of device this is.
 
 use crate::session::SessionError;
-use cursio_protocol::{
-    DeviceKind, Hello, Message, ModuleAdvert, Negotiated, PeerId, PROTOCOL_VERSION,
-};
+use cursio_protocol::{DeviceKind, Hello, Message, ModuleAdvert, PROTOCOL_VERSION};
 use cursio_transport::Transport;
 
-/// Identity and capabilities learned from the peer's [`Hello`].
-#[derive(Debug, Clone)]
-pub struct PeerHello {
-    pub peer_id: PeerId,
-    pub display_name: String,
-    /// What sort of machine the peer is. Consulted before handing it the shared
-    /// cursor — a phone has no screen edge to enter.
-    pub device_kind: DeviceKind,
-    /// Modules the peer advertised. Raw; use [`PeerHello::negotiate`] to decide
-    /// what actually runs.
-    pub modules: Vec<ModuleAdvert>,
-    /// Where the peer stands in the layout, which is what decides the edge the
-    /// cursor crosses to reach it.
-    pub position: cursio_protocol::Position,
-    /// The peer's screens on the shared desk; see [`crate::desk`].
-    pub layout: cursio_protocol::Layout,
-    /// What the peer can carry for the mesh, and what quality it wants from a
-    /// duty the mesh places. See [`cursio_protocol::ServiceOffer`].
-    pub service: cursio_protocol::ServiceOffer,
-    /// The peer's power and network state as of the greeting. Superseded by
-    /// every [`Message::NodeStatus`] the session then reports.
-    pub status: cursio_protocol::NodeStatus,
-    /// The sessions the peer is holding open, with anyone; see
-    /// [`cursio_protocol::Hello::resumable`].
-    pub resumable: Vec<cursio_protocol::SessionTag>,
-}
-
-impl PeerHello {
-    /// Which of *our* modules run on this link, and why the rest don't.
-    pub fn negotiate(&self, local: &[ModuleAdvert]) -> Negotiated {
-        cursio_protocol::negotiate(local, &self.modules)
-    }
-}
+pub use cursio_core_base::PeerHello;
 
 /// Perform the opening [`Hello`] exchange and return the peer's identity.
 ///

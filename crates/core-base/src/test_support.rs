@@ -6,16 +6,16 @@ use cursio_transport::{QueueDepth, TransportError, TransportTx};
 /// Stands in for the link, so a test asserts on what a module or the session
 /// put on the wire rather than on its internals.
 #[derive(Default)]
-pub(crate) struct RecordingTx {
-    pub(crate) sent: Vec<Message>,
+pub struct RecordingTx {
+    pub sent: Vec<Message>,
     /// The backlog every queue reports; a module asks only of its own.
-    pub(crate) depth: QueueDepth,
+    pub depth: QueueDepth,
 }
 
 impl RecordingTx {
     /// What was sent for `module`, out of its envelopes — the way the peer's
     /// module sees it.
-    pub(crate) fn decoded<T: for<'de> serde::Deserialize<'de>>(&self, module: ModuleId) -> Vec<T> {
+    pub fn decoded<T: for<'de> serde::Deserialize<'de>>(&self, module: ModuleId) -> Vec<T> {
         self.sent
             .iter()
             .filter_map(|m| m.decode_module::<T>(module).unwrap())

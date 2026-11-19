@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use cursio_protocol::PeerId;
 use serde::{Deserialize, Serialize};
 
+use crate::IdentityError;
+
 /// This node's persistent identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeIdentity {
@@ -22,7 +24,7 @@ pub struct NodeIdentity {
 impl NodeIdentity {
     /// Load the identity from disk, generating and persisting a new one on
     /// first run.
-    pub fn load_or_create() -> anyhow::Result<Self> {
+    pub fn load_or_create() -> Result<Self, IdentityError> {
         let path = Self::path()?;
         match std::fs::read(&path) {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -42,19 +44,23 @@ impl NodeIdentity {
     ///
     /// Peers learn a name from the greeting, so links already up keep the old
     /// one until they are brought up again.
-    pub fn rename(&mut self, name: &str) -> anyhow::Result<()> {
+    pub fn rename(&mut self, name: &str) -> Result<(), IdentityError> {
         let name = name.trim();
         if name.is_empty() {
-            anyhow::bail!("a machine's name cannot be empty");
+            return Err(IdentityError::Name(
+                "a machine's name cannot be empty".into(),
+            ));
         }
         if name.chars().count() > MAX_NAME_CHARS {
-            anyhow::bail!("a machine's name is at most {MAX_NAME_CHARS} characters");
+            return Err(IdentityError::Name(format!(
+                "a machine's name is at most {MAX_NAME_CHARS} characters"
+            )));
         }
         self.display_name = name.to_owned();
         self.save()
     }
 
-    fn save(&self) -> anyhow::Result<()> {
+    fn save(&self) -> Result<(), IdentityError> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -63,7 +69,7 @@ impl NodeIdentity {
         Ok(())
     }
 
-    fn path() -> anyhow::Result<PathBuf> {
+    fn path() -> Result<PathBuf, IdentityError> {
         // An explicitly configured root wins: on Android it is the only answer,
         // since the writable directory is chosen by the system per install and
         // handed to the app at runtime. See `cursio_protocol::paths`.
@@ -71,7 +77,7 @@ impl NodeIdentity {
             return Ok(dir.join("identity.json"));
         }
         let dirs = directories::ProjectDirs::from("dev", "cursio", "cursio")
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve config directory"))?;
+            .ok_or(IdentityError::NoConfigDir)?;
         Ok(dirs.config_dir().join("identity.json"))
     }
 }

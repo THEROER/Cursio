@@ -1219,13 +1219,13 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "bincode",
  "clap",
  "clipboard-core",
  "cursio-airplay",
  "cursio-app-protocol",
  "cursio-audio",
  "cursio-bluetooth",
+ "cursio-core-base",
  "cursio-files",
  "cursio-input",
  "cursio-log",
@@ -1240,14 +1240,12 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "gio 0.22.8",
- "hostname",
  "image",
  "ksni",
  "libc",
  "rand 0.8.7",
  "rpassword",
  "serde",
- "serde_ignored",
  "serde_json",
  "sha1",
  "sha2",
@@ -1263,6 +1261,31 @@ dependencies = [
  "zbus",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "cursio-core-base"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "cursio-protocol",
+ "cursio-queue",
+ "cursio-transport",
+ "directories",
+ "hostname",
+ "serde",
+ "serde_ignored",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml 0.8.2",
+ "tracing",
+ "uuid",
+ "windows",
+ "zbus",
 ]
 
 [[package]]

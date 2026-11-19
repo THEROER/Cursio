@@ -9,7 +9,7 @@ use std::time::Duration;
 /// pumped smoothly rather than in bursts. Without a pace a module was pumped
 /// only when something else woke the loop, which turned continuous audio into
 /// one clump every heartbeat.
-pub(crate) const MODULE_PUMP_INTERVAL: Duration = Duration::from_millis(5);
+pub const MODULE_PUMP_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The pace a module falls back to once it has been quiet for
 /// [`IDLE_PUMP_AFTER`] consecutive pumps.
@@ -18,14 +18,14 @@ pub(crate) const MODULE_PUMP_INTERVAL: Duration = Duration::from_millis(5);
 /// core out of its deeper idle states — a steady draw on an always-on node, per
 /// module now rather than per link. 50 ms still bounds how long a module that
 /// starts producing between ticks waits for its first pump.
-pub(crate) const IDLE_PUMP_INTERVAL: Duration = Duration::from_millis(50);
+pub const IDLE_PUMP_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Consecutive silent pumps before dropping to [`IDLE_PUMP_INTERVAL`].
 ///
 /// Several rather than one: audio chunks do not arrive on a perfect grid, so
 /// one empty tick is normal mid-stream. At the fast pace this is 100 ms of
 /// silence before the pace changes at all.
-pub(crate) const IDLE_PUMP_AFTER: u32 = 20;
+pub const IDLE_PUMP_AFTER: u32 = 20;
 
 /// The pace of a module that has been quiet for long, after
 /// [`DEEP_IDLE_AFTER`] pumps at [`IDLE_PUMP_INTERVAL`].
@@ -38,11 +38,11 @@ pub(crate) const IDLE_PUMP_AFTER: u32 = 20;
 /// copy — waits, and a second is a fair price for that once it has been
 /// quiet this long. One for which it is not (a phone's call changing) is
 /// woken by its own machine instead (`SessionModule::wake`).
-pub(crate) const DEEP_IDLE_INTERVAL: Duration = Duration::from_secs(1);
+pub const DEEP_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Pumps at [`IDLE_PUMP_INTERVAL`] before dropping to [`DEEP_IDLE_INTERVAL`]:
 /// two seconds of nothing.
-pub(crate) const DEEP_IDLE_AFTER: u32 = 40;
+pub const DEEP_IDLE_AFTER: u32 = 40;
 
 /// How many modules, across every link of this process, are at the fast pace
 /// now — that is, have traffic. Zero means the node is idle, which a phone

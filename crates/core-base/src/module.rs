@@ -104,7 +104,7 @@ pub struct SessionCtx<'a> {
     /// This node's stable identity.
     pub local: &'a crate::NodeIdentity,
     /// Who we're talking to, and what they said they can do.
-    pub peer: &'a crate::session::PeerHello,
+    pub peer: &'a crate::PeerHello,
     /// Which of this machine's screen edges borders the peer, if configured.
     ///
     /// The window module's drag trigger needs it — it compares the pointer

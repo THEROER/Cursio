@@ -21,7 +21,6 @@
 #[cfg(feature = "airplay")]
 pub mod airplay_window;
 pub mod apps;
-pub mod at_phone;
 #[cfg(feature = "audio")]
 pub mod audio_gate;
 /// Sound made on this machine — a call's voice, a phone's music — sent to a
@@ -46,19 +45,15 @@ pub mod calls_hub;
 /// The calls module on one link.
 pub mod calls_session;
 pub mod clipboard_session;
-/// What `cursio mesh` runs, read from `config.toml` and overridden by flags.
-pub mod config;
 /// The local socket the app, the tray and `cursio status` talk to.
 pub mod control;
 /// The engine a request-and-answer module (messages, the gallery) runs on a link.
 pub mod crash;
-pub mod data_dir;
 /// This machine's current problems, each with the fix where there is one.
 pub mod desk;
+pub mod desktop_window;
 pub mod diag_session;
-pub mod diagnostics;
-/// Windows self-elevation, so injected input isn't blocked by UIPI.
-pub mod elevate;
+pub mod direct_session;
 pub mod exchange_session;
 /// File sharing. Serving this machine's volumes is portable and always built;
 /// *mounting* the peer's needs FUSE on Linux or WinFsp on Windows (and the
@@ -78,17 +73,12 @@ pub mod gallery_folder;
 pub mod gallery_hub;
 /// The gallery module on one link.
 pub mod gallery_session;
-/// Link, module and platform problems, each raised and cleared by name.
-pub mod health;
-pub mod identity;
 /// Which peer this machine's one mouse and keyboard reach, across all links.
 pub mod input_hub;
 /// Bringing a link up to the point a session can start: handshake, pairing,
 /// encryption, module negotiation. Shared by the CLI and the app, desktop and
 /// mobile alike.
 pub mod link;
-/// Applying a changed config to running links instead of restarting.
-pub mod live;
 pub mod log_report;
 pub mod log_tail;
 pub mod logging;
@@ -111,19 +101,11 @@ pub mod messages_hub;
 pub mod messages_session;
 pub mod metrics;
 pub mod mixer;
-pub mod module;
-/// Running each session module on a thread of its own, off the loop the
-/// shared cursor rides.
-pub(crate) mod module_host;
-pub use module_host::modules_busy;
-pub mod desktop_window;
-pub mod direct_session;
 /// The unelevated process that keeps a peer's drives where Explorer sees them.
 #[cfg(feature = "files")]
 pub mod mount_helper;
 /// The system telling the sessions their network went away.
 pub mod network_watch;
-pub mod node_status;
 #[cfg(target_os = "linux")]
 pub mod node_tray;
 /// A phone's notifications shown through this desktop's notification server.
@@ -158,7 +140,6 @@ pub mod pressure;
 pub mod probe_history;
 pub mod probe_session;
 pub mod proc_memory;
-pub mod queue;
 /// Renegotiating a running link when either side's settings change.
 pub mod reconfigure;
 pub mod registry;
@@ -174,14 +155,9 @@ pub mod screen_hub;
 pub mod screen_views;
 pub mod service_session;
 pub mod session;
-/// The session bus, from a thread outside the runtime.
-#[cfg(target_os = "linux")]
-pub mod session_bus;
 mod session_outbox;
 pub mod share_session;
 pub mod share_sink;
-#[cfg(test)]
-mod test_support;
 /// Versions side by side, a `current` pointer, and the helper that switches it.
 pub mod update;
 #[cfg(feature = "usb")]
@@ -197,4 +173,11 @@ pub mod wifi_setup;
 #[cfg(feature = "window")]
 pub mod window_session;
 
-pub use identity::NodeIdentity;
+#[cfg(target_os = "linux")]
+pub use cursio_core_base::session_bus;
+#[cfg(test)]
+use cursio_core_base::test_support;
+pub use cursio_core_base::{
+    at_phone, config, data_dir, diagnostics, elevate, health, identity, live, module, module_host,
+    modules_busy, node_status, queue, NodeIdentity,
+};

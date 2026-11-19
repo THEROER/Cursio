@@ -17,7 +17,7 @@ pub(super) type Slot = Arc<tokio::sync::Mutex<Option<Box<dyn TransportTx>>>>;
 /// the session is done with it rather than when the module lets go, and
 /// anything the module sends afterwards fails instead of reaching a peer that
 /// has moved on.
-pub(crate) struct LinkTx {
+pub struct LinkTx {
     slot: Slot,
     open: Arc<AtomicBool>,
     closed: Arc<tokio::sync::Notify>,
@@ -30,7 +30,7 @@ pub(crate) struct LinkTx {
 }
 
 impl LinkTx {
-    pub(crate) fn new(tx: Box<dyn TransportTx>) -> Self {
+    pub fn new(tx: Box<dyn TransportTx>) -> Self {
         Self {
             slot: Arc::new(tokio::sync::Mutex::new(Some(tx))),
             open: Arc::new(AtomicBool::new(true)),
@@ -42,7 +42,7 @@ impl LinkTx {
 
     /// A handle for a module: a clone of the queue where the sender has one,
     /// or this very sender, shared, where it does not.
-    pub(crate) fn fork(&self) -> Self {
+    pub fn fork(&self) -> Self {
         let cloned = self
             .slot
             .try_lock()
@@ -61,7 +61,7 @@ impl LinkTx {
     }
 
     /// Another reference to the same handle, for closing it from outside.
-    pub(crate) fn closer(&self) -> Self {
+    pub fn closer(&self) -> Self {
         Self {
             slot: self.slot.clone(),
             open: self.open.clone(),
@@ -75,7 +75,7 @@ impl LinkTx {
     ///
     /// Closing cancels a send awaiting queue capacity before taking its slot.
     /// Atomic scheduler admission makes that cancellation safe.
-    pub(crate) async fn close(&self) {
+    pub async fn close(&self) {
         self.open.store(false, Ordering::Release);
         self.closed.notify_waiters();
         if !self.own {
@@ -87,7 +87,7 @@ impl LinkTx {
         }
     }
 
-    pub(crate) fn sent(&self) -> u64 {
+    pub fn sent(&self) -> u64 {
         self.sent
     }
 }

@@ -52,19 +52,18 @@ use cursio_transport::TransportError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::module::SessionModule;
-pub(super) use crate::module_host::link_tx::LinkTx;
+pub use crate::module_host::link_tx::LinkTx;
 use crate::module_host::pace::Pace;
 use crate::module_host::router::module_inbox;
 use crate::module_host::router::Inbox;
-pub(super) use crate::module_host::router::Router;
+pub use crate::module_host::router::Router;
 
 mod link_tx;
 mod pace;
 mod router;
 
 pub use pace::modules_busy;
-#[cfg(feature = "files")]
-pub(crate) use pace::MODULE_PUMP_INTERVAL;
+pub use pace::MODULE_PUMP_INTERVAL;
 
 /// Warn when a single pump takes at least this long.
 ///
@@ -92,14 +91,14 @@ const INBOX_BATCH: usize = 64;
 /// it held the session — and with it the reconnect — hostage. Past this the
 /// thread is detached with a warning naming it; it finishes, and drops the
 /// module, whenever its call returns.
-pub(crate) const MODULE_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+pub const MODULE_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// The message's variant name, for a log line that has to name what stalled.
 ///
 /// `Debug` on the message would carry the payload — an audio chunk's samples,
 /// a window's pixels — into a warning that fires exactly when the log is the
 /// only evidence available.
-pub(crate) fn message_kind(msg: &Message) -> &'static str {
+pub fn message_kind(msg: &Message) -> &'static str {
     match msg {
         Message::Hello(_) => "Hello",
         Message::PairRequest { .. } => "PairRequest",
@@ -140,13 +139,13 @@ pub(crate) fn message_kind(msg: &Message) -> &'static str {
 /// link is dead, which is the session's to act on, and a failed `start` has
 /// always ended the session.
 #[derive(Debug)]
-pub(crate) struct ModuleFailure {
+pub struct ModuleFailure {
     pub module: &'static str,
     pub error: TransportError,
 }
 
 /// One module running on its own thread.
-pub(crate) struct ModuleHost {
+pub struct ModuleHost {
     name: &'static str,
     id: ModuleId,
     inbox: Inbox,
@@ -162,7 +161,7 @@ impl ModuleHost {
     /// Must be called from inside the runtime the link runs on, which the
     /// thread then borrows (see the module docs for why not a runtime of its
     /// own).
-    pub(crate) fn spawn(
+    pub fn spawn(
         module: Box<dyn SessionModule>,
         tx: LinkTx,
         failures: mpsc::UnboundedSender<ModuleFailure>,
@@ -207,7 +206,7 @@ impl ModuleHost {
 }
 
 /// Build the reader's routing table for these hosts.
-pub(crate) fn router_for(hosts: &[ModuleHost]) -> Router {
+pub fn router_for(hosts: &[ModuleHost]) -> Router {
     let router = Router::default();
     for host in hosts {
         router.insert(host.id, host.inbox.clone(), false);
@@ -216,19 +215,19 @@ pub(crate) fn router_for(hosts: &[ModuleHost]) -> Router {
 }
 
 impl ModuleHost {
-    pub(crate) fn id(&self) -> ModuleId {
+    pub fn id(&self) -> ModuleId {
         self.id
     }
 
     /// Route `id`'s messages to this host. See [`Router::insert`] for
     /// `keep_parked`.
-    pub(crate) fn attach(&self, router: &Router, keep_parked: bool) {
+    pub fn attach(&self, router: &Router, keep_parked: bool) {
         router.insert(self.id, self.inbox.clone(), keep_parked);
     }
 }
 
 /// Stop routing to `id`, and drop whatever was held for it.
-pub(crate) fn detach(router: &Router, id: ModuleId) {
+pub fn detach(router: &Router, id: ModuleId) {
     router.remove(id);
 }
 
@@ -239,7 +238,7 @@ pub(crate) fn detach(router: &Router, id: ModuleId) {
 /// warning naming it — its thread keeps the module until its blocking call
 /// returns, and then drops it — and its sender is closed either way, so the
 /// link can close behind the session.
-pub(crate) async fn shut_down(hosts: Vec<ModuleHost>, grace: Duration) {
+pub async fn shut_down(hosts: Vec<ModuleHost>, grace: Duration) {
     let mut hosts = hosts;
     for host in &mut hosts {
         host.request_stop();

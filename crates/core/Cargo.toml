@@ -71,6 +71,9 @@ phone-control = ["window", "dep:image"]
 airplay = ["dep:cursio-airplay", "window"]
 
 [dependencies]
+# Identity, the module API and host, config and health: what the module
+# crates share with the core. Re-exported under the old paths.
+cursio-core-base.workspace = true
 cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true
@@ -107,8 +110,6 @@ tokio.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
-serde_ignored.workspace = true
-bincode.workspace = true
 
 thiserror.workspace = true
 anyhow.workspace = true
@@ -119,7 +120,6 @@ tracing-subscriber.workspace = true
 cursio-log.workspace = true
 uuid.workspace = true
 clap.workspace = true
-hostname.workspace = true
 directories.workspace = true
 toml.workspace = true
 zeroize = "1"
@@ -196,6 +196,7 @@ windows = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+cursio-core-base = { workspace = true, features = ["test-support"] }
 # `start_paused` for time-dependent tests (liveness timeouts) — lets a 15s
 # timeout elapse in virtual time instead of really waiting.
 tokio = { version = "1", features = ["full", "test-util"] }
