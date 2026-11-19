@@ -14,7 +14,6 @@ audio = ["dep:cursio-audio"]
 cursio-core-base.workspace = true
 cursio-protocol.workspace = true
 cursio-transport.workspace = true
-cursio-audio = { workspace = true, optional = true }
 
 async-trait.workspace = true
 tokio.workspace = true
@@ -30,6 +29,7 @@ zbus.workspace = true
 gio.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+cursio-audio = { workspace = true, optional = true }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     # COM for the apartment the toast thread joins.
