@@ -41,7 +41,7 @@ desktop = ["audio", "input", "window", "files", "files-mount", "airplay", "usb",
 # `cursio mcp`'s `web_*` tools: a DevTools-protocol client for an
 # application's web view on another machine (docs/devtools-design.md).
 web-tools = ["dep:tokio-tungstenite", "dep:futures"]
-audio = ["dep:cursio-audio"]
+audio = ["dep:cursio-audio", "cursio-hubs/audio"]
 input = ["dep:cursio-input"]
 window = ["dep:cursio-window"]
 files = ["dep:cursio-files"]
@@ -74,6 +74,8 @@ airplay = ["dep:cursio-airplay", "window"]
 # Identity, the module API and host, config and health: what the module
 # crates share with the core. Re-exported under the old paths.
 cursio-core-base.workspace = true
+# Where a phone's calls, notifications and players meet this machine.
+cursio-hubs.workspace = true
 cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true
@@ -138,7 +140,6 @@ rpassword = "7"
 # and the user's idle time from Mutter; see notify_display.rs and presence.rs.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
-gio.workspace = true
 # The node's notification-area icon, over that same zbus; see node_tray.rs.
 ksni.workspace = true
 

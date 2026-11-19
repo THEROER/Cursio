@@ -17,6 +17,7 @@ members = [
     "crates/bluetooth",
     "crates/phone-shell",
     "crates/core-base",
+    "crates/hubs",
     "crates/core",
     "crates/android",
     "app",
@@ -48,6 +49,7 @@ cursio-window = { path = "crates/window" }
 cursio-files = { path = "crates/files" }
 cursio-usb = { path = "crates/usb" }
 cursio-core-base = { path = "crates/core-base" }
+cursio-hubs = { path = "crates/hubs" }
 cursio-core = { path = "crates/core" }
 cursio-android = { path = "crates/android" }
 cursio-log = { path = "crates/logging" }

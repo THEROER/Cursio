@@ -1227,6 +1227,7 @@ dependencies = [
  "cursio-bluetooth",
  "cursio-core-base",
  "cursio-files",
+ "cursio-hubs",
  "cursio-input",
  "cursio-log",
  "cursio-protocol",
@@ -1239,7 +1240,6 @@ dependencies = [
  "directories",
  "ed25519-dalek",
  "futures",
- "gio 0.22.8",
  "image",
  "ksni",
  "libc",
@@ -1308,6 +1308,27 @@ dependencies = [
  "windows-sys 0.61.2",
  "winfsp",
  "zstd",
+]
+
+[[package]]
+name = "cursio-hubs"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cursio-audio",
+ "cursio-core-base",
+ "cursio-protocol",
+ "cursio-transport",
+ "directories",
+ "gio 0.22.8",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "windows",
+ "zbus",
 ]
 
 [[package]]

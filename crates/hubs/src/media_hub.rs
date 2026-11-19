@@ -140,7 +140,7 @@ impl MediaHub {
         self.backend().map(|b| b.players()).unwrap_or_default()
     }
 
-    pub(crate) fn register(
+    pub fn register(
         &self,
         peer: PeerId,
         name: String,
@@ -162,7 +162,7 @@ impl MediaHub {
         (rx, token)
     }
 
-    pub(crate) fn unregister(&self, peer: &PeerId, token: u64) {
+    pub fn unregister(&self, peer: &PeerId, token: u64) {
         let mut inner = lock(&self.inner);
         if inner.links.get(peer).is_some_and(|(t, _)| *t == token) {
             inner.links.remove(peer);
@@ -178,7 +178,7 @@ impl MediaHub {
     }
 
     /// A peer sent its list.
-    pub(crate) fn set_remote(&self, peer: PeerId, players: Vec<Player>) {
+    pub fn set_remote(&self, peer: PeerId, players: Vec<Player>) {
         let now = Instant::now();
         let mut inner = lock(&self.inner);
         let mut wanted = Vec::new();
@@ -230,7 +230,7 @@ impl MediaHub {
     }
 
     /// A cover arrived.
-    pub(crate) fn store_art(&self, peer: &PeerId, art: u64, mime: String, bytes: Vec<u8>) {
+    pub fn store_art(&self, peer: &PeerId, art: u64, mime: String, bytes: Vec<u8>) {
         let mut inner = lock(&self.inner);
         let art_ref = Arc::new((mime, bytes));
         inner.art.insert(art, art_ref.clone());
@@ -359,7 +359,7 @@ impl CallPause {
 /// Whether two lists differ in anything a remote control shows. A position
 /// counts only when it jumped: a second's drift is a track playing.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) fn players_changed(old: &[Player], new: &[Player]) -> bool {
+pub fn players_changed(old: &[Player], new: &[Player]) -> bool {
     if old.len() != new.len() {
         return true;
     }
@@ -387,7 +387,7 @@ pub(crate) fn players_changed(old: &[Player], new: &[Player]) -> bool {
 
 /// The id a cover is asked for by: a hash of whatever names it on this machine.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) fn art_hash(s: &str) -> u64 {
+pub fn art_hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
@@ -399,7 +399,7 @@ mod tests {
     use super::*;
     use cursio_protocol::media::PlaybackState;
 
-    pub(crate) fn player(id: &str, title: &str, state: PlaybackState) -> Player {
+    pub fn player(id: &str, title: &str, state: PlaybackState) -> Player {
         Player {
             id: id.into(),
             app: "App".into(),

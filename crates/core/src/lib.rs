@@ -40,10 +40,6 @@ pub mod bluetooth_setup;
 pub mod call_audio;
 /// A phone's calls as notifications here, with buttons that act on them.
 pub mod calls_display;
-/// Where a phone's calls meet this machine, over the mesh or Bluetooth.
-pub mod calls_hub;
-/// The calls module on one link.
-pub mod calls_session;
 pub mod clipboard_session;
 /// The local socket the app, the tray and `cursio status` talk to.
 pub mod control;
@@ -84,16 +80,6 @@ pub mod log_tail;
 pub mod logging;
 /// `cursio mcp`: the mesh as tools for an AI agent.
 pub mod mcp;
-/// Where this machine's players meet the mesh and peers' are shown.
-pub mod media_hub;
-/// This desktop's MPRIS players, and peers' players offered as MPRIS ones.
-#[cfg(target_os = "linux")]
-pub mod media_mpris;
-/// The media module on one link.
-pub mod media_session;
-/// This Windows machine's players, from the system media controls.
-#[cfg(target_os = "windows")]
-pub mod media_smtc;
 pub mod mesh;
 /// Where a phone's messages are answered and a desktop's requests leave.
 pub mod messages_hub;
@@ -108,17 +94,6 @@ pub mod mount_helper;
 pub mod network_watch;
 #[cfg(target_os = "linux")]
 pub mod node_tray;
-/// A phone's notifications shown through this desktop's notification server.
-/// Not showing a phone's copy of what a desktop client already showed.
-pub mod notify_dedup;
-#[cfg(target_os = "linux")]
-pub mod notify_display;
-/// Where a phone's notifications enter the mesh and a desktop's answers leave.
-pub mod notify_hub;
-/// The notification module on one link.
-pub mod notify_session;
-/// A phone's notifications shown as Windows toasts.
-pub mod notify_toast;
 pub mod opener;
 /// Who may pair right now, with what secret, and for how long.
 pub mod pairing_window;
@@ -134,8 +109,6 @@ pub mod phone_screen;
 /// Installing Cursio as this user's ScreenCast portal backend.
 #[cfg(all(target_os = "linux", feature = "window"))]
 pub mod portal_setup;
-/// Whether the user is at this machine: where a phone's notification goes.
-pub mod presence;
 pub mod pressure;
 pub mod probe_history;
 pub mod probe_session;
@@ -175,6 +148,14 @@ pub mod window_session;
 
 #[cfg(target_os = "linux")]
 pub use cursio_core_base::session_bus;
+pub use cursio_hubs::{
+    calls_hub, calls_session, media_hub, media_session, notify_dedup, notify_hub, notify_session,
+    notify_toast, presence,
+};
+#[cfg(target_os = "linux")]
+pub use cursio_hubs::{media_mpris, notify_display};
+#[cfg(target_os = "windows")]
+pub use cursio_hubs::media_smtc;
 #[cfg(test)]
 use cursio_core_base::test_support;
 pub use cursio_core_base::{

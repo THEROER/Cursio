@@ -33,7 +33,7 @@ pub const AWAY_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// Whether the user is at this machine now.
 pub fn user_here() -> bool {
-    if crate::update::quiet::driving() {
+    if crate::quiet::driving() {
         return false;
     }
     idle().is_none_or(|idle| idle < AWAY_AFTER)
@@ -49,7 +49,7 @@ pub const ACTIVE_WITHIN: Duration = Duration::from_secs(15);
 /// was; `None` when the system cannot say. A machine whose mouse drives a peer
 /// is not in use itself: the input lands on the other screen.
 pub fn activity() -> Option<(bool, Duration)> {
-    if crate::update::quiet::driving() {
+    if crate::quiet::driving() {
         return Some((false, ACTIVE_WITHIN));
     }
     let idle = idle()?;
