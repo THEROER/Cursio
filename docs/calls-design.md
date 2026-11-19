@@ -177,7 +177,7 @@ hands-free unit acts on them through it — with the voice staying on the phone
 
 ### One phone, two routes
 
-A computer may hear a phone both ways. `core/src/calls_hub.rs` shows it once:
+A computer may hear a phone both ways. `core/src/calls_hub/` shows it once:
 by its hands-free link while one is up (that is where the voice goes, and its
 state is the phone's own call list), by the mesh otherwise. They are matched
 by name — the phone reports its device name, which is what it is called over

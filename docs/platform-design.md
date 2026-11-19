@@ -179,7 +179,7 @@ since added `offer`, taking it back to 10), ~75 lines of
 per-module `if` plus three `#[cfg]` blocks collapsed to one `build_agreed` call,
 and `spawn_drag_trigger` moved out of the binary into `window_session` — it was
 platform-specific window-transfer wiring living in `main` for no reason. The
-`#[cfg]` blocks still in `cursio.rs` are all about the *input injector*, which is
+`#[cfg]` blocks still in the binary (`core/src/bin/cursio/`) are all about the *input injector*, which is
 correct: input is not a `SessionModule`.
 
 Two consequences worth taking deliberately:

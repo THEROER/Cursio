@@ -330,13 +330,19 @@ platform crates → binaries:
 - `crates/airplay` — the AirPlay receiver, deliberately outside the mesh, with
   the vendored FairPlay C in `native/playfair`
 - `crates/logging` — console + rotating-file logging shared by every binary
+- `crates/queue` — the bounded, nonblocking process queues
+- `crates/phone-shell` — a phone's own `adb`, reached over its wireless debugging
+- `crates/wifidirect` — a direct Wi-Fi link between two machines on one router
+- `crates/sdk`, `crates/app-protocol` — what another application links to talk
+  to the node on its machine (MIT OR Apache-2.0)
 - `crates/xtask` — build/install/cross-compile automation
 - `app` — the Tauri UI: the desktop window and tray, and the whole phone app
 - `apps/clipd` — standalone Linux clipboard history popup (GTK4/libadwaita)
 - `native/` — the Windows audio driver and the GNOME extension (drag
   detection and the quick-settings tile)
+- `tools/wgc-probe` — a probe for Windows Graphics Capture on hidden windows
 
-Platform crates are **mechanism**; the matching `*_session.rs` in `core` is
+Platform crates are **mechanism**; the matching `*_session` module in `core` is
 **policy**. A feature is added as a module, never by branching in the CLI.
 
 `docs/*.md` are the source of truth for their subsystems: [mesh](docs/mesh-design.md),
@@ -345,7 +351,11 @@ Platform crates are **mechanism**; the matching `*_session.rs` in `core` is
 [window transfer](docs/window-transfer-design.md), [USB](docs/usb-design.md),
 [messages](docs/messages-design.md), [calls](docs/calls-design.md),
 [media](docs/media-design.md), [gallery](docs/gallery-design.md),
-[updates](docs/update-design.md), [live testing](docs/live-test.md).
+[updates](docs/update-design.md), [transport](docs/transport-design.md),
+[app SDK](docs/app-sdk-design.md), [agent tools](docs/agent-tools-design.md),
+[devtools](docs/devtools-design.md), [phone shell](docs/phone-shell-design.md),
+[AirPlay as a process](docs/airplay-sidecar-design.md) (design only),
+[live testing](docs/live-test.md).
 
 ## Limitations (v0.x)
 

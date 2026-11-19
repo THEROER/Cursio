@@ -42,7 +42,7 @@ nothing here may wait in front of the cursor.
   list when the hub's generation moves, carries button presses and covers.
   Backend calls run on `spawn_blocking`: an MPRIS call or a MediaController is
   another process's answer.
-- `core/src/media_mpris.rs` (Linux) — reads players with a 1 s `GetAll` poll
+- `core/src/media_mpris/` (Linux) — reads players with a 1 s `GetAll` poll
   (cheaper than one `PropertiesChanged` subscription per player plus one for
   players appearing, and the position is compared only for jumps), and offers
   each peer player as `org.mpris.MediaPlayer2.cursio_<peer>_<n>` on a

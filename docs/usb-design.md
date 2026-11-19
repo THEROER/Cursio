@@ -1,7 +1,7 @@
 # USB Design (one device, every machine in the mesh)
 
 Status: **designed; vocabulary and ownership built, arbitration not.** Companion
-to `files-design.md`, whose FUSE layer is the model this follows, and
+to the files module (`crates/files`), whose FUSE layer is the model this follows, and
 `platform-design.md`'s rules for new modules.
 
 ## What this is for
@@ -394,7 +394,7 @@ crates/usb/                mechanism
 crates/core/src/usb_node.rs
                            one per machine: the backend, the exports,
                            the arbiter                        (built)
-crates/core/src/usb_session.rs
+crates/core/src/usb_session/
                            policy: who attaches, who leases   (built)
                            LinuxUsbBackend, UsbFactory        (built)
 ```
@@ -410,7 +410,7 @@ namespace, and the module's vocabulary is versioned by its `ModuleAdvert`.
 ## Milestones
 
 1. ~~**Vocabulary**~~ — `protocol/src/usb.rs`, `ModuleId::USB`.
-2. ~~**Ownership policy**~~ — `usb_session.rs`, tested against a fake backend.
+2. ~~**Ownership policy**~~ — `usb_session/`, tested against a fake backend.
    Brought in line with "Ownership, restated" after shipping under the older
    one-holder rule: a second peer asking for a device now gets its own stream
    instead of `InUse`, and a release ends one holder's use rather than the

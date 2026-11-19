@@ -45,7 +45,8 @@ it), Windows cross-builds need `GSTREAMER_WINDOWS_SYSROOT`. The README's
   GPU or a peer is tested through the in-memory fakes
   (`transport::test_util::MemTransport`, `window::window_test_support`); the
   crates' `examples/` probe real hardware and stay examples.
-- **Errors**: one `thiserror` enum per library crate, `anyhow` in binaries.
+- **Errors**: one `thiserror` enum per library crate, `anyhow` in binaries
+  (`cursio-core`'s node code also uses `anyhow` today; see CLAUDE.md).
   Messages are lowercase, name the cause, and say what to install when that is
   the fix. Never swallow one; degrade with `tracing::warn!` and a reason.
 - **Platform code** is gated with `#[cfg(target_os = ...)]` and always has a

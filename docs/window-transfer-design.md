@@ -502,18 +502,18 @@ of the capture backend work.
 2. **Vertical slice Linux→Linux — CODE COMPLETE, NOT YET RUN (2026-07-20)** —
    the whole path exists and is unit-tested, but no frame has crossed a real
    link yet; live bring-up is the immediate next step (see *Status* above).
-   - Host capture (`crates/window/src/linux_capture.rs`): portal session →
+   - Host capture (`crates/window/src/linux_capture/`): portal session →
      PipeWire BGRA stream → `WindowFrame`s. Frames are **diffed** against the
      previous one (`FrameDiffer`) so only the changed bounding box is sent —
      PipeWire always hands over a full frame, so without this every tick would
      cost the full 8.3 MiB. Tiles over ~1 KiB are zstd'd
      (`LosslessBgra8888`), smaller ones ride raw.
-   - Viewer surrogate (`crates/window/src/linux_surrogate.rs`): a GTK4 window
+   - Viewer surrogate (`crates/window/src/linux_surrogate/`): a GTK4 window
      (the toolkit clipd already uses) blitting tiles into a full-window
      framebuffer painted via `gdk::MemoryTexture` in `B8g8r8a8` — the wire
      format verbatim, so no colour conversion. Pointer/scroll/keys come back as
      `WindowInput`, rescaled into the **host's** pixel space.
-   - Session wiring (`crates/core/src/window_session.rs`): `WindowEngine` as a
+   - Session wiring (`crates/core/src/window_session/`): `WindowEngine` as a
      `SessionModule` beside audio/clipboard, holding **both roles at once**.
      Offer strictly precedes the first frame; pumping is bounded per call so a
      busy window can't starve the session's inbound branch.
@@ -786,7 +786,7 @@ Cursio machines, and every viewer's surrogate already decodes it. So the
 access units go out exactly as the encoder made them — no pixel passes through
 the app — and the computer opens the surrogate it opens for any window. Its
 pointer comes back as the `WindowInput` every surrogate sends. The policy is
-`core/src/phone_screen.rs` (who watches, when the window opens and closes) and
+`core/src/phone_screen/` (who watches, when the window opens and closes) and
 `core/src/phone_gesture.rs` (what a mouse means on a touch screen); the phone's
 half is `ScreenShare.kt` (projection, encoder) and `ScreenTouch.kt` (touch).
 
