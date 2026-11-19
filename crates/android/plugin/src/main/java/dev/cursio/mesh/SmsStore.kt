@@ -22,7 +22,7 @@ import org.json.JSONObject
 
 /**
  * This phone's text messages, read and sent for a desktop
- * (`crates/core/src/messages_session.rs` is the other half).
+ * (`crates/exchange/src/messages_session.rs` is the other half).
  *
  * Read straight from the telephony provider rather than kept in a copy:
  * Android already stores every SMS and the text of every MMS, and a copy would

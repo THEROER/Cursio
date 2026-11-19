@@ -51,7 +51,7 @@ it), Windows cross-builds need `GSTREAMER_WINDOWS_SYSROOT`. The README's
   the fix. Never swallow one; degrade with `tracing::warn!` and a reason.
 - **Platform code** is gated with `#[cfg(target_os = ...)]` and always has a
   fallback arm returning an explicit error.
-- **A feature is a module** (`core/src/module.rs`), not a branch in the CLI.
+- **A feature is a module** (`core-base/src/module.rs`), not a branch in the CLI.
 - **Wire changes** bump `PROTOCOL_VERSION`; the update lane
   (`protocol/src/update.rs`) is never changed.
 - Dependencies are declared once in the root `[workspace.dependencies]`.

@@ -20,7 +20,7 @@ import java.io.FileInputStream
 
 /**
  * This phone's photos and videos, browsed from a peer
- * (`crates/core/src/gallery_session.rs` is the other half).
+ * (`crates/exchange/src/gallery_session.rs` is the other half).
  *
  * Read from MediaStore rather than by walking storage: it already indexes the
  * camera roll, screenshots and every app's saved pictures, with dates and
