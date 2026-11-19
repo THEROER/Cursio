@@ -45,9 +45,9 @@ use tokio::sync::mpsc;
 
 use crate::wl_capture::barriers::crossing_from;
 use crate::wl_capture::barriers::entry_position;
-use crate::wl_capture::barriers::EDGE_NUDGE_PX;
 use crate::wl_capture::barriers::inside_edge;
 use crate::wl_capture::barriers::nudge_off_edge;
+use crate::wl_capture::barriers::EDGE_NUDGE_PX;
 use crate::wl_capture::events::handle_ei_event;
 use crate::wl_capture::events::MotionRemainder;
 use crate::wl_capture::events::ScrollFrame;

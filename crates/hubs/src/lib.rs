@@ -38,8 +38,8 @@ pub mod notify_toast;
 /// Whether the user is at this machine: where a phone's notification goes.
 pub mod presence;
 
-use cursio_core_base::{at_phone, config, module, quiet};
 #[cfg(target_os = "linux")]
 use cursio_core_base::session_bus;
 #[cfg(test)]
 use cursio_core_base::test_support;
+use cursio_core_base::{at_phone, config, module, quiet};

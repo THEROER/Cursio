@@ -36,10 +36,10 @@ mod video_budget;
 #[cfg(feature = "window")]
 pub mod window_session;
 
-#[cfg(all(test, feature = "window"))]
-use cursio_core_base::test_support;
 #[cfg(feature = "phone-control")]
 use cursio_core_base::data_dir;
+#[cfg(all(test, feature = "window"))]
+use cursio_core_base::test_support;
 #[cfg(feature = "window")]
 use cursio_core_base::{health, live, module};
 #[cfg(feature = "window")]
