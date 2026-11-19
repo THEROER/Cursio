@@ -1276,6 +1276,7 @@ dependencies = [
  "cursio-usb-session",
  "cursio-wifidirect",
  "cursio-window",
+ "cursio-window-session",
  "directories",
  "ed25519-dalek",
  "futures",
@@ -1571,6 +1572,27 @@ dependencies = [
  "windows",
  "zbus",
  "zstd",
+]
+
+[[package]]
+name = "cursio-window-session"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cursio-airplay",
+ "cursio-core-base",
+ "cursio-exchange",
+ "cursio-hubs",
+ "cursio-protocol",
+ "cursio-service-session",
+ "cursio-transport",
+ "cursio-window",
+ "image",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

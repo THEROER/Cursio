@@ -18,8 +18,6 @@
 //! plus the modules it can implement and never compiles PipeWire, a FUSE mount
 //! or an AirPlay receiver, none of which exist there.
 
-#[cfg(feature = "airplay")]
-pub mod airplay_window;
 pub mod apps;
 /// Handing a paired phone's headset and speaker roles from PipeWire to Cursio.
 /// The mesh's channel over Bluetooth, for a peer the network does not reach.
@@ -60,18 +58,7 @@ pub mod node_tray;
 pub mod opener;
 /// Who may pair right now, with what secret, and for how long.
 pub mod pairing_window;
-/// A tap, a swipe, a key or text for a phone's screen, as its window input.
-pub mod phone_action;
 /// Raising memory, swap and i/o pressure as a problem while it lasts.
-/// A mouse on a computer turned into a finger on a phone's screen.
-pub mod phone_gesture;
-pub mod phone_hands;
-/// A phone's screen shown on a computer as a window it can be driven from.
-#[cfg(feature = "window")]
-pub mod phone_screen;
-/// Installing Cursio as this user's ScreenCast portal backend.
-#[cfg(all(target_os = "linux", feature = "window"))]
-pub mod portal_setup;
 pub mod pressure;
 pub mod probe_history;
 pub mod probe_session;
@@ -79,28 +66,16 @@ pub mod proc_memory;
 /// Renegotiating a running link when either side's settings change.
 pub mod reconfigure;
 pub mod registry;
-/// Remote-screen views: an app or monitor of a peer, offered to
-/// screen-sharing software here without being drawn on this desktop.
-#[cfg(feature = "window")]
-pub mod remote_screen;
-/// Where a capture app's request for a peer's screen meets that peer's link.
-#[cfg(feature = "window")]
-pub mod screen_hub;
-pub mod screen_views;
 pub mod session;
 mod session_outbox;
 pub mod share_session;
 pub mod share_sink;
 /// Versions side by side, a `current` pointer, and the helper that switches it.
 pub mod update;
-#[cfg(feature = "window")]
-mod video_budget;
 /// Waking a paired machine that is asleep, by the address learned while awake.
 pub mod wake;
 #[cfg(target_os = "linux")]
 pub mod wifi_setup;
-#[cfg(feature = "window")]
-pub mod window_session;
 
 #[cfg(all(target_os = "linux", feature = "calls"))]
 pub use cursio_audio_session::bluetooth_setup;
@@ -135,3 +110,10 @@ pub use cursio_hubs::{media_mpris, notify_display};
 pub use cursio_service_session as service_session;
 #[cfg(feature = "usb")]
 pub use cursio_usb_session::{usb_node, usb_session};
+#[cfg(feature = "airplay")]
+pub use cursio_window_session::airplay_window;
+#[cfg(all(target_os = "linux", feature = "window"))]
+pub use cursio_window_session::portal_setup;
+pub use cursio_window_session::{phone_action, phone_gesture, phone_hands, screen_views};
+#[cfg(feature = "window")]
+pub use cursio_window_session::{phone_screen, remote_screen, screen_hub, window_session};

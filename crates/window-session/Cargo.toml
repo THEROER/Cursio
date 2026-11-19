@@ -1,0 +1,43 @@
+[package]
+name = "cursio-window-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The core's features of the same names, which turn these on.
+[features]
+window = [
+    "dep:cursio-window",
+    "dep:cursio-core-base",
+    "dep:cursio-hubs",
+    "dep:cursio-exchange",
+]
+# AirPlay carries a window back to the mesh, so it cannot be built without the
+# window module to carry it through.
+airplay = ["window", "dep:cursio-airplay", "dep:cursio-service-session"]
+# A phone's screen read as a picture by a program here (`cursio phone`, the
+# MCP tools): the screen's H.264 decoded once and written as PNG.
+phone-control = ["window", "dep:image"]
+
+[dependencies]
+cursio-core-base = { workspace = true, optional = true }
+cursio-hubs = { workspace = true, optional = true }
+cursio-exchange = { workspace = true, optional = true }
+cursio-service-session = { workspace = true, optional = true }
+cursio-protocol.workspace = true
+cursio-transport.workspace = true
+cursio-window = { workspace = true, optional = true }
+cursio-airplay = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+cursio-core-base = { workspace = true, features = ["test-support"] }
+tokio = { version = "1", features = ["full", "test-util"] }

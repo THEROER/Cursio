@@ -1,7 +1,7 @@
 //! Window transfer as a [`SessionModule`], sharing the session's one channel.
 //!
 //! Rides alongside input, audio, and clipboard rather than owning a session of
-//! its own — the same arrangement as [`crate::audio_session`]. The transport
+//! its own — the same arrangement as `cursio_core::audio_session`. The transport
 //! already schedules our messages sensibly: [`Message::WindowFrame`] is
 //! `Priority::Video` (the bulkiest, most droppable traffic) while
 //! [`Message::WindowInput`] is `Priority::Input`, so a burst of pixels can never
@@ -40,7 +40,7 @@ use cursio_protocol::SCREEN_STREAM_ID;
 mod factory;
 mod pump;
 
-pub(crate) use pump::{MAX_FRAMES_PER_PUMP, VIDEO_QUEUE_HIGH_WATER_BYTES};
+pub use pump::{MAX_FRAMES_PER_PUMP, VIDEO_QUEUE_HIGH_WATER_BYTES};
 
 #[cfg(feature = "airplay")]
 pub use factory::AirPlayShare;
@@ -51,10 +51,7 @@ pub use factory::WindowFactory;
 /// Only control traffic goes through here. Frames and surrogate input stay
 /// first-class `Message` variants and are sent directly — see
 /// [`WindowMsg`](cursio_protocol::WindowMsg) for why that split exists.
-pub(crate) async fn send_control(
-    tx: &mut dyn TransportTx,
-    msg: WindowMsg,
-) -> Result<(), TransportError> {
+pub async fn send_control(tx: &mut dyn TransportTx, msg: WindowMsg) -> Result<(), TransportError> {
     let framed = Message::module(ModuleId::WINDOW, msg.priority(), &msg)?;
     tx.send(&framed).await
 }

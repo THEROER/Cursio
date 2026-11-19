@@ -15,14 +15,14 @@ use cursio_window::{CaptureSession, Surrogate, WindowCapture, WindowRenderer};
 /// the trait documents. A capture at 60 fps produces roughly one frame per
 /// 16 ms while `pump` runs far more often than that, so a small bound keeps
 /// latency low and still never monopolises the loop.
-pub(crate) const MAX_FRAMES_PER_PUMP: usize = 4;
+pub const MAX_FRAMES_PER_PUMP: usize = 4;
 
 /// Stop pulling capture packets once this much video is waiting for the socket.
 ///
 /// `PriorityTransport::send` only enqueues, so without this gate the session
 /// drains one queue into another and can still accumulate seconds of stale
 /// video. Backpressure now reaches the bounded capture channel instead.
-pub(crate) const VIDEO_QUEUE_HIGH_WATER_BYTES: usize = 2 * 1024 * 1024;
+pub const VIDEO_QUEUE_HIGH_WATER_BYTES: usize = 2 * 1024 * 1024;
 
 /// Most input events to forward per pump, viewer→host.
 ///
@@ -40,7 +40,7 @@ pub(super) const KEYFRAME_REQUEST_INTERVAL: std::time::Duration = std::time::Dur
 
 /// Rate-limits one stream's keyframe requests to [`KEYFRAME_REQUEST_INTERVAL`].
 #[derive(Debug, Default)]
-pub(crate) struct KeyframeRequests {
+pub struct KeyframeRequests {
     last: Option<std::time::Instant>,
 }
 
@@ -48,7 +48,7 @@ impl KeyframeRequests {
     /// Whether to send a request now, taking the surrogate's want only when
     /// one may go — so a want raised during the quiet interval is kept, not
     /// lost.
-    pub(crate) fn poll(&mut self, now: std::time::Instant, wants: impl FnOnce() -> bool) -> bool {
+    pub fn poll(&mut self, now: std::time::Instant, wants: impl FnOnce() -> bool) -> bool {
         let ready = self
             .last
             .is_none_or(|last| now.saturating_duration_since(last) >= KEYFRAME_REQUEST_INTERVAL);
@@ -61,7 +61,7 @@ impl KeyframeRequests {
 
     /// A request went out for another reason (a new stream); the next one
     /// waits its turn from here.
-    pub(crate) fn note_sent(&mut self, now: std::time::Instant) {
+    pub fn note_sent(&mut self, now: std::time::Instant) {
         self.last = Some(now);
     }
 }

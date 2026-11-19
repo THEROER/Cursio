@@ -5,9 +5,9 @@ const INITIAL: u32 = 12_000_000;
 const MIN: u32 = 256_000;
 const MAX: u32 = 200_000_000;
 const SAMPLE: Duration = Duration::from_millis(500);
-pub(crate) const TARGET_QUEUE: Duration = Duration::from_millis(75);
+pub const TARGET_QUEUE: Duration = Duration::from_millis(75);
 
-pub(crate) struct VideoBudget {
+pub struct VideoBudget {
     bits_per_second: u32,
     sample: Option<(Instant, u64)>,
     congested_until: Option<Instant>,
@@ -24,11 +24,11 @@ impl Default for VideoBudget {
 }
 
 impl VideoBudget {
-    pub(crate) fn congested(&self, now: Instant) -> bool {
+    pub fn congested(&self, now: Instant) -> bool {
         self.congested_until.is_some_and(|until| now < until)
     }
 
-    pub(crate) fn observe(&mut self, sent: u64, age: Duration, active: bool, now: Instant) -> u32 {
+    pub fn observe(&mut self, sent: u64, age: Duration, active: bool, now: Instant) -> u32 {
         if age > TARGET_QUEUE {
             self.congested_until = Some(now + Duration::from_secs(4));
         }

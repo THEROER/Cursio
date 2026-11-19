@@ -43,7 +43,7 @@ desktop = ["audio", "input", "window", "files", "files-mount", "airplay", "usb",
 web-tools = ["dep:tokio-tungstenite", "dep:futures"]
 audio = ["dep:cursio-audio", "dep:cursio-audio-session", "cursio-hubs/audio"]
 input = ["dep:cursio-input"]
-window = ["dep:cursio-window"]
+window = ["dep:cursio-window", "cursio-window-session/window"]
 files = ["dep:cursio-files", "dep:cursio-files-session", "cursio-clipboard-session/files"]
 # Mounting a peer's volumes on Windows in this binary: links WinFsp's GPL-3.0
 # bindings. Without it a Windows node still mounts, through the separate
@@ -65,10 +65,10 @@ bluetooth = ["dep:cursio-bluetooth"]
 gallery = ["dep:image", "cursio-exchange/gallery"]
 # A phone's screen read as a picture by a program here (`cursio phone`, the
 # MCP tools): the screen's H.264 decoded once and written as PNG.
-phone-control = ["window", "dep:image"]
+phone-control = ["window", "dep:image", "cursio-window-session/phone-control"]
 # AirPlay carries a window back to the mesh, so it cannot be built without the
 # window module to carry it through.
-airplay = ["dep:cursio-airplay", "window"]
+airplay = ["dep:cursio-airplay", "window", "cursio-window-session/airplay"]
 
 [dependencies]
 # Identity, the module API and host, config and health: what the module
@@ -84,6 +84,9 @@ cursio-usb-session = { workspace = true, optional = true }
 cursio-files-session = { workspace = true, optional = true }
 cursio-clipboard-session.workspace = true
 cursio-audio-session = { workspace = true, optional = true }
+# Screens across the mesh; built without `window` it is only what the control
+# socket names on every build.
+cursio-window-session.workspace = true
 cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true

@@ -4,15 +4,14 @@
 //! picked from a notification-area icon of its own — one per peer, beside the
 //! app's tray icon, which read as the same program twice. So the app's tray
 //! now carries the choice for every view, and the node's icons stand aside
-//! while an app is attached to say so ([`Command::TrayAttached`]). A node with
-//! no app keeps them: headless, they are the only selector there is.
+//! while an app is attached to say so (the control socket's
+//! `Command::TrayAttached`). A node with no app keeps them: headless, they
+//! are the only selector there is.
 //!
 //! This module is the meeting point: each viewer publishes its view's sources
 //! and what it shows, the control socket lists them and hands a choice back.
 //! It knows nothing of windows, so the status that carries it builds on a
 //! phone too, where there are no views.
-//!
-//! [`Command::TrayAttached`]: crate::control::Command::TrayAttached
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};

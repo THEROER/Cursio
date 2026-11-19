@@ -232,11 +232,11 @@ impl ScreenHost {
     }
 
     /// Send what is owed: list updates, a finished switch, then frames.
-    pub(crate) fn has_capture(&self) -> bool {
+    pub fn has_capture(&self) -> bool {
         self.current.is_some()
     }
 
-    pub(crate) fn set_network_budget(&mut self, bits_per_second: u32, congested: bool) {
+    pub fn set_network_budget(&mut self, bits_per_second: u32, congested: bool) {
         if let Some((_, session)) = &mut self.current {
             session.set_network_budget(bits_per_second, congested);
         }

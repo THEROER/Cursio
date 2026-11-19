@@ -210,7 +210,7 @@ const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Ask `phone` over diag; `None` when its link carries no diag or it did not
 /// answer in [`ASK_WAIT`].
 async fn ask(phone: &str, request: DiagRequest) -> Option<Result<DiagResponse, String>> {
-    let hub = crate::diag_session::hub();
+    let hub = cursio_exchange::diag_hub::hub();
     if !hub
         .peers()
         .iter()
@@ -228,7 +228,7 @@ async fn ask(phone: &str, request: DiagRequest) -> Option<Result<DiagResponse, S
 /// caller takes the picture from the stream instead.
 pub async fn screencap(phone: &str) -> Option<Result<Vec<u8>, String>> {
     let name = known(&phones(), phone).ok()?;
-    let hub = crate::diag_session::hub();
+    let hub = cursio_exchange::diag_hub::hub();
     let answer = tokio::time::timeout(SCREENCAP_WAIT, hub.ask(&name, DiagRequest::PhoneShot))
         .await
         .ok()?;
