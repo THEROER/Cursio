@@ -106,7 +106,7 @@ pub(super) fn publish_own(volumes: Vec<(Volume, PathBuf)>) {
 
 /// Record that engine `by` mounted `peer`'s `volume` on `mountpoint` (`Z:`).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub(crate) fn note_drive(by: u64, peer: &str, volume: &str, mountpoint: &str) {
+pub fn note_drive(by: u64, peer: &str, volume: &str, mountpoint: &str) {
     if let Some(letter) = drive_letter(mountpoint) {
         state()
             .drives

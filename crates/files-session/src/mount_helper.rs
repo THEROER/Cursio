@@ -60,8 +60,8 @@ pub async fn run_helper(_parent: u32) -> anyhow::Result<()> {
     )
 }
 
-#[cfg(all(target_os = "windows", target_env = "msvc", feature = "files"))]
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
 pub use imp::{mount, RelayedMount};
 
-#[cfg(all(target_os = "windows", target_env = "msvc", feature = "files"))]
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
 mod imp;

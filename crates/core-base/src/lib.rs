@@ -28,6 +28,9 @@ pub mod module;
 /// shared cursor rides.
 pub mod module_host;
 pub mod node_status;
+/// A named pipe only this user can open.
+#[cfg(windows)]
+pub mod owner_pipe;
 mod peer_hello;
 pub mod queue;
 /// Whether now is a moment the node can be restarted without anyone noticing.

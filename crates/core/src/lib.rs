@@ -50,13 +50,6 @@ pub mod desk;
 pub mod desktop_window;
 pub mod diag_session;
 pub mod direct_session;
-/// File sharing. Serving this machine's volumes is portable and always built;
-/// *mounting* the peer's needs FUSE on Linux or WinFsp on Windows (and the
-/// latter only under MSVC, because `winfsp-sys` rejects every other target
-/// outright), so on a platform with neither the module runs one-way and logs
-/// why.
-#[cfg(feature = "files")]
-pub mod files_session;
 pub mod firewall;
 /// Removing a machine from the mesh: the trust store, builder trust, and what
 /// the running node holds about it.
@@ -75,9 +68,6 @@ pub mod mcp;
 pub mod mesh;
 pub mod metrics;
 pub mod mixer;
-/// The unelevated process that keeps a peer's drives where Explorer sees them.
-#[cfg(feature = "files")]
-pub mod mount_helper;
 /// The system telling the sessions their network went away.
 pub mod network_watch;
 #[cfg(target_os = "linux")]
@@ -140,6 +130,8 @@ pub use cursio_exchange::gallery_folder;
 pub use cursio_exchange::{
     exchange_session, gallery_hub, gallery_session, messages_hub, messages_session, request_hub,
 };
+#[cfg(feature = "files")]
+pub use cursio_files_session::{files_session, mount_helper};
 #[cfg(target_os = "windows")]
 pub use cursio_hubs::media_smtc;
 pub use cursio_hubs::{

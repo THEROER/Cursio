@@ -1228,6 +1228,7 @@ dependencies = [
  "cursio-core-base",
  "cursio-exchange",
  "cursio-files",
+ "cursio-files-session",
  "cursio-hubs",
  "cursio-input",
  "cursio-log",
@@ -1236,7 +1237,6 @@ dependencies = [
  "cursio-sdk",
  "cursio-service-session",
  "cursio-transport",
- "cursio-usb",
  "cursio-usb-session",
  "cursio-wifidirect",
  "cursio-window",
@@ -1327,6 +1327,23 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "winfsp",
+ "zstd",
+]
+
+[[package]]
+name = "cursio-files-session"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cursio-core-base",
+ "cursio-files",
+ "cursio-protocol",
+ "cursio-transport",
+ "directories",
+ "tokio",
+ "tracing",
+ "windows",
  "zstd",
 ]
 

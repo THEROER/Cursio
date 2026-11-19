@@ -39,6 +39,9 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     # OpenProcessToken/GetTokenInformation — are we already elevated?
     "Win32_Security",
+    # SDDL → security descriptor and SID → string, for the owner-only pipes;
+    # see owner_pipe.rs.
+    "Win32_Security_Authorization",
     "Win32_System_Threading",
     # GetConsoleWindow — whether a relaunched copy should have a window.
     "Win32_System_Console",

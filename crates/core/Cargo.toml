@@ -44,14 +44,14 @@ web-tools = ["dep:tokio-tungstenite", "dep:futures"]
 audio = ["dep:cursio-audio", "cursio-hubs/audio"]
 input = ["dep:cursio-input"]
 window = ["dep:cursio-window"]
-files = ["dep:cursio-files"]
+files = ["dep:cursio-files", "dep:cursio-files-session"]
 # Mounting a peer's volumes on Windows in this binary: links WinFsp's GPL-3.0
 # bindings. Without it a Windows node still mounts, through the separate
 # `cursio-mount-helper` executable beside it, and the node itself carries no
 # GPL code for files — what a closed product embedding Cursio needs. See
 # THIRD-PARTY.md.
-files-mount = ["files", "cursio-files/mount"]
-usb = ["dep:cursio-usb", "dep:cursio-usb-session"]
+files-mount = ["files", "cursio-files/mount", "cursio-files-session/files-mount"]
+usb = ["dep:cursio-usb-session"]
 # A phone's calls with their voice on this computer: the Bluetooth hands-free
 # unit, whose audio rides the audio module's playback and microphone.
 calls = ["dep:cursio-bluetooth", "audio"]
@@ -81,6 +81,7 @@ cursio-exchange.workspace = true
 # Placing a duty that must live on one machine, such as the AirPlay receiver.
 cursio-service-session.workspace = true
 cursio-usb-session = { workspace = true, optional = true }
+cursio-files-session = { workspace = true, optional = true }
 cursio-queue.workspace = true
 cursio-protocol.workspace = true
 cursio-app-protocol.workspace = true
@@ -91,7 +92,6 @@ cursio-input = { workspace = true, optional = true }
 cursio-audio = { workspace = true, optional = true }
 cursio-window = { workspace = true, optional = true }
 cursio-files = { workspace = true, optional = true }
-cursio-usb = { workspace = true, optional = true }
 cursio-bluetooth = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 # Thumbnails cross the control socket's JSON as text.

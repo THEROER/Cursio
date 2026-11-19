@@ -252,7 +252,7 @@ pub(super) async fn run_helper(parent: u32) -> anyhow::Result<()> {
 #[cfg(feature = "files-mount")]
 async fn serve(path: PathBuf) -> anyhow::Result<()> {
     let create = |first| {
-        crate::control::transport::windows::create(&path, first)
+        cursio_core_base::owner_pipe::create(&path, first)
             .with_context(|| format!("cannot open the drive helper's pipe {}", path.display()))
     };
     let mut server = create(true)?;
