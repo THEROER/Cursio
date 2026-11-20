@@ -211,7 +211,13 @@ impl NotifyEngine {
         }
         self.held.retain(|(n, _, _)| n.key != notification.key);
         let now = Instant::now();
-        match dedup().decide(&notification, now) {
+        // Decided apart from the match: a guard in the scrutinee lives to the
+        // end of it, and every display takes the record again in `show` to
+        // note its own copy. The module's thread then waited on itself
+        // forever, holding the record, so every later link's first copy
+        // waited too and its session's teardown left the thread behind.
+        let decision = dedup().decide(&notification, now);
+        match decision {
             Decision::Duplicate => {
                 tracing::debug!(peer = %self.peer_name, app = %notification.app_name, "a client here already showed this; not showing the phone's copy");
             }
@@ -354,7 +360,10 @@ impl SessionModule for NotifyEngine {
 impl Drop for NotifyEngine {
     fn drop(&mut self) {
         hub().unregister(&self.peer, self.posts.1);
-        // Its buttons answer through this link, which is gone.
+        // Its buttons answer through this link, which is gone. A session
+        // that resumes on a new connection keeps this module, so only a link
+        // that really ended withdraws them. Every display queues the close
+        // rather than waiting on it, so this never holds up the teardown.
         if let Some(display) = &self.display {
             for key in self.shown.drain() {
                 display.close(self.peer, &key);
@@ -444,6 +453,64 @@ mod tests {
                 refused: None
             }]
         );
+    }
+
+    /// Notes its own copy in the record before showing it, as the desktop's
+    /// notification server and Windows' toasts both do.
+    #[derive(Default)]
+    struct RecordingDisplay {
+        shown: Mutex<Vec<String>>,
+    }
+
+    impl NotifyDisplay for RecordingDisplay {
+        fn show(
+            &self,
+            _peer: PeerId,
+            _peer_name: &str,
+            n: &Notification,
+            _events: mpsc::UnboundedSender<DisplayEvent>,
+        ) {
+            dedup().own(&n.title, &n.text, Instant::now());
+            self.shown.lock().unwrap().push(n.key.clone());
+        }
+
+        fn close(&self, _peer: PeerId, _key: &str) {}
+    }
+
+    #[test]
+    fn showing_a_new_copy_does_not_wait_on_the_record_it_was_decided_by() {
+        let display = Arc::new(RecordingDisplay::default());
+        let mut desk = NotifyEngine::new(
+            PeerId::from_u128(rand::random()),
+            "POCO X7 Pro".into(),
+            true,
+            Some(display.clone()),
+            None,
+        );
+        // An app no test has taught the record, so the copy is shown at once
+        // whether or not a watcher is running.
+        let app = format!("dev.cursio.test.{:x}", rand::random::<u64>());
+        let notification = Notification {
+            key: "0|github|1".into(),
+            app_id: app.clone(),
+            app_name: app,
+            title: "a review was requested".into(),
+            text: "cursio#1".into(),
+            icon: None,
+            when_ms: 0,
+            kind: NotifyKind::Other,
+            actions: Vec::new(),
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            desk.posted(notification);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the module's thread waited on itself"
+        );
+        assert_eq!(*display.shown.lock().unwrap(), vec!["0|github|1"]);
     }
 
     #[test]
