@@ -412,27 +412,38 @@ impl Message {
         bincode::deserialize(bytes).map_err(|e| ProtocolError::Decode(e.to_string()))
     }
 
-    /// Whether this message only describes the present, so a copy that missed
-    /// its moment is worth less than nothing: pointer motion, sound, pixels.
+    /// What the link must do to deliver this message; see [`Delivery`].
     ///
-    /// A resumable link does not keep these for resending after a dropped
-    /// connection. Replayed, five seconds of buffered motion jump the cursor
-    /// by all of it at once and old sound plays over new — Mosh's lesson, that
-    /// a mobile link should deliver the latest state rather than the history.
-    /// A press or release is never lossy: one that is lost leaves a key held.
-    pub fn is_lossy(&self) -> bool {
+    /// Chosen by the kind of message, beside its [`Self::priority`]: the module
+    /// that owns a message knows whether a late copy is still worth anything,
+    /// and the transport does not.
+    pub fn delivery(&self) -> Delivery {
         use crate::window::WindowInput;
-        matches!(
-            self,
-            Message::AudioChunk(_)
-                | Message::WindowFrame(_)
-                | Message::Input(
-                    InputEvent::PointerMotion { .. } | InputEvent::PointerScroll { .. }
-                )
-                | Message::WindowInput(
-                    WindowInput::PointerMove { .. } | WindowInput::PointerScroll { .. }
-                )
-        )
+        match self {
+            Message::AudioChunk(_) => Delivery::Fresh {
+                within: Some(audio::FRESH_FOR),
+            },
+            Message::WindowFrame(_) => Delivery::Fresh {
+                within: Some(window::FRAME_FRESH_FOR),
+            },
+            // Never dropped for age on a live connection: a move or scroll
+            // waiting behind a stalled one is folded into it, and the sum is
+            // what the hand did. Dropping it instead would lose real motion on
+            // a Bluetooth path, where a phone's own audio on the same radio
+            // pauses the link for about a second at a time.
+            Message::Input(InputEvent::PointerMotion { .. } | InputEvent::PointerScroll { .. })
+            | Message::WindowInput(
+                WindowInput::PointerMove { .. } | WindowInput::PointerScroll { .. },
+            ) => Delivery::Fresh { within: None },
+            _ => Delivery::Reliable,
+        }
+    }
+
+    /// Whether this message only describes the present ([`Delivery::Fresh`]),
+    /// so a resumable link does not keep it for resending after a dropped
+    /// connection.
+    pub fn is_lossy(&self) -> bool {
+        matches!(self.delivery(), Delivery::Fresh { .. })
     }
 
     /// Scheduling priority for this message on the shared channel.
@@ -574,6 +585,39 @@ impl Message {
             _ => Ok(None),
         }
     }
+}
+
+/// How much a link must do to deliver a message: the other half of what a
+/// message's kind declares, beside its [`Priority`].
+///
+/// Priority says what goes *first*; this says what a late copy is *worth*.
+/// The two are independent: sound is urgent and worthless once late, a
+/// directory listing is urgent and must arrive however late, a file chunk is
+/// neither urgent nor ever worthless.
+///
+/// Not on the wire. Each end decides for what it sends, which is why a peer
+/// of any version can be sent to, and why a message's choice can change
+/// without a protocol bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Arrives exactly once and in order within its lane, resent after a
+    /// dropped connection. A key press, a release, a file request: lost, it
+    /// leaves a key held or a process asleep in a filesystem call forever.
+    Reliable,
+    /// Describes the present, so a copy that missed its moment is worth less
+    /// than nothing: pointer motion, sound, pixels.
+    ///
+    /// Never kept for resending after a dropped connection. Replayed, five
+    /// seconds of buffered motion jump the cursor by all of it at once and old
+    /// sound plays over new — Mosh's lesson, that a mobile link should deliver
+    /// the latest state rather than the history.
+    ///
+    /// With `within`, a sender that has not started the message that long
+    /// after it was queued drops it whole instead, so a link coming back from
+    /// a stall spends itself on what is current rather than on a backlog the
+    /// receiver would throw away on arrival. The receiver sees a gap, as it
+    /// would after a dropped connection, and must already cope with one.
+    Fresh { within: Option<std::time::Duration> },
 }
 
 /// Scheduling classes for the shared channel, highest first.
@@ -725,6 +769,48 @@ mod tests {
         .is_lossy());
         assert!(!Message::Heartbeat { nonce: 1 }.is_lossy());
         assert!(!Message::Bye.is_lossy());
+    }
+
+    #[test]
+    fn sound_and_pixels_expire_while_motion_waits_to_be_folded() {
+        let chunk = Message::AudioChunk(AudioChunk {
+            id: 1,
+            seq: 0,
+            timestamp: 0,
+            data: Vec::new(),
+        });
+        assert_eq!(
+            chunk.delivery(),
+            Delivery::Fresh {
+                within: Some(audio::FRESH_FOR)
+            }
+        );
+        let frame = Message::WindowFrame(WindowFrame {
+            id: 1,
+            seq: 0,
+            dirty: Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            codec: TileCodec::LossyVideo,
+            data: Vec::new(),
+        });
+        assert_eq!(
+            frame.delivery(),
+            Delivery::Fresh {
+                within: Some(window::FRAME_FRESH_FOR)
+            }
+        );
+        assert_eq!(
+            Message::Input(InputEvent::PointerMotion { dx: 1, dy: 0 }).delivery(),
+            Delivery::Fresh { within: None }
+        );
+        assert_eq!(
+            Message::Heartbeat { nonce: 1 }.delivery(),
+            Delivery::Reliable
+        );
     }
 
     #[test]

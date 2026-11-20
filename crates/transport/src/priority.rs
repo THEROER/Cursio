@@ -45,6 +45,17 @@
 //! lower classes: at gigabit one is half a millisecond, and smaller parts
 //! would push a 64 MiB message past the part count every receiver accepts.
 //!
+//! ## Dropping what is too old
+//!
+//! A message whose kind says it is only worth sending fresh
+//! ([`Delivery::Fresh`] with a time) is dropped here, whole, when the drainer
+//! reaches it too late — the only place a sender can still choose to, since
+//! once a frame is handed to the socket TCP will deliver it however late.
+//! A stall otherwise left a queue of sound and pictures that the link spent
+//! its recovery sending and the receiver then threw away for age. Only a
+//! message's first frame is judged: a message part-way out is finished, or
+//! the receiver would reassemble its tail onto the next one.
+//!
 //! ## Measuring it
 //!
 //! Every frame carries the instant it was queued, and the drainer records how
@@ -58,7 +69,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use cursio_protocol::{InputEvent, Message, Priority};
+use cursio_protocol::{Delivery, InputEvent, Message, Priority};
 use tokio::sync::Notify;
 use tracing::Instrument;
 
@@ -203,12 +214,25 @@ impl DelayHistogram {
     }
 }
 
+/// A finished measurement window: what each class waited, and how many of its
+/// messages were dropped unsent for age.
+struct Window {
+    delay: [QueueDelay; CLASS_COUNT],
+    expired: [u32; CLASS_COUNT],
+}
+
 /// One tagged-plaintext frame awaiting sealing, and when `send` queued it.
 struct Queued {
     frame: Vec<u8>,
     queued_at: Instant,
     /// From a message that only matters fresh ([`Message::is_lossy`]).
     lossy: bool,
+    /// The first frame of its message. Only here may a message be dropped:
+    /// once a part has gone out, the receiver is reassembling it, and the
+    /// rest must follow.
+    starts_message: bool,
+    /// When its message stops being worth sending ([`Delivery::Fresh`]).
+    expires: Option<Instant>,
     /// The deltas of a pointer move still waiting here, which a later move
     /// may fold into rather than queue behind; see [`PrioritizedTx::send`].
     motion: Option<(i32, i32)>,
@@ -289,22 +313,57 @@ struct Queues {
     /// every reader sees the same finished figures rather than a window that
     /// is still filling.
     last_window: [QueueDelay; CLASS_COUNT],
+    /// Messages dropped unsent in the running window because they outlived
+    /// their [`Delivery::Fresh`] time, per class.
+    expired: [u32; CLASS_COUNT],
 }
 
 impl Queues {
     /// Queue one frame in `class`, keeping the byte count with it.
     fn push(&mut self, class: usize, frame: Vec<u8>) {
-        self.push_frame(class, frame, false);
+        self.push_message(class, vec![frame], Delivery::Reliable);
     }
 
-    fn push_frame(&mut self, class: usize, frame: Vec<u8>, lossy: bool) {
-        self.queued_bytes[class] += frame.len();
-        self.classes[class].push_back(Queued {
-            frame,
-            queued_at: Instant::now(),
-            lossy,
-            motion: None,
-        });
+    /// Queue every frame of one message, contiguously.
+    fn push_message(&mut self, class: usize, frames: Vec<Vec<u8>>, delivery: Delivery) {
+        let queued_at = Instant::now();
+        let (lossy, expires) = match delivery {
+            Delivery::Reliable => (false, None),
+            Delivery::Fresh { within } => (true, within.and_then(|w| queued_at.checked_add(w))),
+        };
+        for (n, frame) in frames.into_iter().enumerate() {
+            self.queued_bytes[class] += frame.len();
+            self.classes[class].push_back(Queued {
+                frame,
+                queued_at,
+                lossy,
+                starts_message: n == 0,
+                expires,
+                motion: None,
+            });
+        }
+    }
+
+    /// Take the front of `class`, first dropping whole every message at the
+    /// front whose time ran out before it could start.
+    fn pop_class(&mut self, class: usize, now: Instant) -> Option<Queued> {
+        loop {
+            let front = self.classes[class].pop_front()?;
+            self.queued_bytes[class] -= front.frame.len();
+            let expired = front.starts_message && front.expires.is_some_and(|at| now >= at);
+            if !expired {
+                return Some(front);
+            }
+            self.expired[class] += 1;
+            let mut more = has_more_parts(&front.frame);
+            while more {
+                let Some(part) = self.classes[class].pop_front() else {
+                    break;
+                };
+                self.queued_bytes[class] -= part.frame.len();
+                more = has_more_parts(&part.frame);
+            }
+        }
     }
 
     /// Fold a pointer move into the move waiting last in `class`, if that is
@@ -333,12 +392,7 @@ impl Queues {
 
     /// Record that a frame of `class` queued at `queued_at` reached the socket
     /// at `now`. Returns the window just completed, when this closes one.
-    fn record_sent(
-        &mut self,
-        class: usize,
-        queued_at: Instant,
-        now: Instant,
-    ) -> Option<[QueueDelay; CLASS_COUNT]> {
+    fn record_sent(&mut self, class: usize, queued_at: Instant, now: Instant) -> Option<Window> {
         self.delay[class].record(now.saturating_duration_since(queued_at));
         let start = *self.window_start.get_or_insert(now);
         if now.duration_since(start) < DELAY_WINDOW {
@@ -348,7 +402,10 @@ impl Queues {
         self.last_window = finished;
         self.delay = Default::default();
         self.window_start = Some(now);
-        Some(finished)
+        Some(Window {
+            delay: finished,
+            expired: std::mem::take(&mut self.expired),
+        })
     }
 
     /// Pop the next frame to send: the front of the highest-priority non-empty
@@ -360,14 +417,10 @@ impl Queues {
         let Some(lane) = lane else {
             return self.pop_highest();
         };
-        let (idx, frame) = self
-            .classes
-            .iter_mut()
-            .enumerate()
-            .filter(|(idx, _)| Lane::for_priority(CLASS_ORDER[*idx]) == lane)
-            .find_map(|(idx, queue)| queue.pop_front().map(|frame| (idx, frame)))?;
-        self.queued_bytes[idx] -= frame.frame.len();
-        Some((idx, frame))
+        let now = Instant::now();
+        (0..CLASS_COUNT)
+            .filter(|&idx| Lane::for_priority(CLASS_ORDER[idx]) == lane)
+            .find_map(|idx| self.pop_class(idx, now).map(|frame| (idx, frame)))
     }
 
     fn pop_highest(&mut self) -> Option<(usize, Queued)> {
@@ -394,13 +447,11 @@ impl Queues {
         let forced = !urgent_waiting
             && !self.classes[bulk].is_empty()
             && (self.releasing_bulk || self.starved_bulk >= BULK_STARVATION_LIMIT);
+        let now = Instant::now();
         let (idx, frame) = if forced {
-            self.classes[bulk].pop_front().map(|f| (bulk, f))?
+            self.pop_class(bulk, now).map(|f| (bulk, f))?
         } else {
-            self.classes
-                .iter_mut()
-                .enumerate()
-                .find_map(|(idx, q)| q.pop_front().map(|f| (idx, f)))?
+            (0..CLASS_COUNT).find_map(|idx| self.pop_class(idx, now).map(|f| (idx, f)))?
         };
         if idx == bulk {
             self.starved_bulk = 0;
@@ -414,9 +465,6 @@ impl Queues {
             // and must not bank credit for a transfer that starts later.
             self.starved_bulk += 1;
         }
-        // Leaving the queue is what "no longer waiting" means; the bytes are
-        // credited as sent only after the socket takes them.
-        self.queued_bytes[idx] -= frame.frame.len();
         Some((idx, frame))
     }
 
@@ -645,14 +693,25 @@ impl PrioritizedTx {
     }
 }
 
-/// Report a finished delay window, if input moved during it.
+/// Report a finished delay window, if input moved during it, and what was
+/// dropped for age, if anything was.
 ///
 /// A window with no input frames says nothing about the pointer and is not
 /// logged: an idle link would otherwise write a line every ten seconds
 /// forever. Video and bulk ride along because they are what input waits
 /// behind, and seeing them deep while input stays shallow is the evidence
 /// that priority is holding.
-fn log_window(window: &[QueueDelay; CLASS_COUNT]) {
+fn log_window(window: &Window) {
+    let expired: u32 = window.expired.iter().sum();
+    if expired > 0 {
+        tracing::info!(
+            expired,
+            audio = window.expired[class_index(Priority::Audio)],
+            video = window.expired[class_index(Priority::Video)],
+            "dropped messages too old to be worth sending; the link stalled"
+        );
+    }
+    let window = &window.delay;
     let input = window[class_index(Priority::Input)];
     if input.frames == 0 {
         return;
@@ -692,7 +751,7 @@ impl TransportTx for PrioritizedTx {
             self.note_input();
         }
         let idx = class_index(msg.priority());
-        let lossy = msg.is_lossy();
+        let delivery = msg.delivery();
         // A move that finds the previous one still unsent joins it. A link
         // that keeps up never sees this; one that cannot send a frame per
         // move — Bluetooth carries well under a thousand packets a second,
@@ -729,9 +788,7 @@ impl TransportTx for PrioritizedTx {
                 }
                 if q.queued_bytes[idx] + size <= QUEUE_BYTES[idx].max(size) {
                     let single = frames.len() == 1;
-                    for frame in frames {
-                        q.push_frame(idx, frame, lossy);
-                    }
+                    q.push_message(idx, frames, delivery);
                     if single {
                         if let Some(last) = q.classes[idx].back_mut() {
                             last.motion = motion;
@@ -994,6 +1051,66 @@ mod tests {
         chunk_plaintext(&Message::Opaque(vec![0u8; 256 * 1024])).unwrap()
     }
 
+    const STALE: Delivery = Delivery::Fresh {
+        within: Some(Duration::ZERO),
+    };
+
+    #[test]
+    fn a_fresh_message_past_its_time_is_dropped_whole_and_counted() {
+        let mut q = Queues::default();
+        let video = class_index(Priority::Video);
+        let parts = chunked_message();
+        assert!(parts.len() > 1);
+        q.push_message(video, parts, STALE);
+        q.push_message(video, vec![vec![1]], Delivery::Reliable);
+        let (class, next) = q.pop_highest().expect("the reliable message");
+        assert_eq!((class, next.frame), (video, vec![1]));
+        assert!(q.pop_highest().is_none());
+        assert_eq!(q.queued_bytes[video], 0);
+        assert_eq!(q.expired[video], 1);
+    }
+
+    #[test]
+    fn a_fresh_message_already_started_is_finished() {
+        let mut q = Queues::default();
+        let video = class_index(Priority::Video);
+        let parts = chunked_message();
+        let count = parts.len();
+        q.push_message(
+            video,
+            parts,
+            Delivery::Fresh {
+                within: Some(Duration::from_secs(60)),
+            },
+        );
+        q.pop_highest().expect("the first part");
+        for part in &mut q.classes[video] {
+            part.expires = Some(Instant::now());
+        }
+        let rest = std::iter::from_fn(|| q.pop_highest()).count();
+        assert_eq!(rest, count - 1);
+        assert_eq!(q.expired[video], 0);
+    }
+
+    #[test]
+    fn reliable_and_untimed_fresh_messages_never_expire() {
+        let mut q = Queues::default();
+        let input = class_index(Priority::Input);
+        q.push_message(input, vec![vec![1]], Delivery::Reliable);
+        q.push_message(input, vec![vec![2]], Delivery::Fresh { within: None });
+        let order: Vec<_> = std::iter::from_fn(|| q.pop_highest().map(|(_, f)| f.frame)).collect();
+        assert_eq!(order, vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn a_lane_skips_past_an_expired_class_to_the_next() {
+        let mut q = Queues::default();
+        let audio = class_index(Priority::Audio);
+        q.push_message(audio, vec![vec![1]], STALE);
+        assert!(q.pop_lane(Some(Lane::Audio)).is_none());
+        assert_eq!(q.expired[audio], 1);
+    }
+
     /// Credit is not banked while nothing bulk is waiting.
     ///
     /// Otherwise a quiet period of metadata would buy a later transfer the
@@ -1093,8 +1210,8 @@ mod tests {
         let window = q
             .record_sent(input, queued, closing)
             .expect("the window has run its length");
-        assert_eq!(window[input].frames, 2);
-        assert_eq!(q.last_window[input], window[input]);
+        assert_eq!(window.delay[input].frames, 2);
+        assert_eq!(q.last_window[input], window.delay[input]);
         assert_eq!(q.delay[input].frames, 0, "the next window starts empty");
     }
 

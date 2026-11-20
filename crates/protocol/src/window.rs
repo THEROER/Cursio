@@ -233,6 +233,17 @@ pub enum WindowCloseReason {
 /// Drag transfers allocate upwards from 1 and never reach it.
 pub const SCREEN_STREAM_ID: WindowId = u32::MAX;
 
+/// How old a [`WindowFrame`] may be and still be sent; older, it is dropped
+/// whole ([`crate::Delivery::Fresh`]).
+///
+/// Four times the video budget's target queue, so rate control has backed the
+/// encoder off long before a frame gets this old and dropping happens only
+/// after a stall. A picture this late trails the hand by some twenty frames,
+/// and the video queue holds over a second of them: sent anyway, a backlog
+/// replays the past while the present waits behind it. The viewer asks for
+/// the whole picture on the gap a dropped frame leaves.
+pub const FRAME_FRESH_FOR: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Identifies one shareable source in a host's [`ScreenSource`] list.
 ///
 /// Chosen by the host and stable only for as long as the source exists; the

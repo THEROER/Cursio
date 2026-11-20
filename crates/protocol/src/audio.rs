@@ -114,6 +114,15 @@ pub struct AudioStreamMeta {
     pub codec: AudioCodec,
 }
 
+/// How old sound may be and still be played: past this, a chunk is dropped
+/// rather than sent ([`crate::Delivery::Fresh`]) or played (the listener's
+/// playback feed).
+///
+/// A quarter of a second is where sound stops reading as the same moment as
+/// the picture and the hand, and above the deepest jitter buffer a listener
+/// keeps on its own, so a chunk this late would be thrown away there anyway.
+pub const FRESH_FOR: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// One small frame of audio for a stream.
 ///
 /// Chunks are short and fixed (e.g. ~10 ms) so the receiver can run a **jitter

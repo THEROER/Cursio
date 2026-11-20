@@ -57,7 +57,7 @@ pub(crate) fn channel(limit: usize) -> (Sender, Receiver) {
             reported: std::cell::Cell::new(Instant::now()),
             limit,
             base,
-            stale_after: std::cell::Cell::new(Duration::from_millis(250)),
+            stale_after: std::cell::Cell::new(cursio_protocol::audio::FRESH_FOR),
         },
     )
 }
@@ -112,7 +112,7 @@ impl Receiver {
             .store(self.base.saturating_add(wire_bytes), Ordering::Relaxed);
         let cycle = Duration::from_secs_f64(wire_bytes as f64 / (48000.0 * 8.0));
         self.stale_after
-            .set(Duration::from_millis(250).max(cycle + Duration::from_millis(50)));
+            .set(cursio_protocol::audio::FRESH_FOR.max(cycle + Duration::from_millis(50)));
     }
 
     pub fn report(&self, stream: impl std::fmt::Display) {
