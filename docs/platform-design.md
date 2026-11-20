@@ -547,6 +547,45 @@ metadata refreshes sees the new stamp and never the old bytes. An open whose
 answer disagrees with the length the key was taken at drops the key for that
 handle.
 
+## A peer's drive keeps its letter
+
+On Windows each peer volume is a drive letter, and a letter is what programs
+store: a Steam library, a recent-files list, a shortcut. The letter used to be
+the first free one counting down from `Z:`, so it followed the order volumes
+happened to mount in — Nocturne's `/mnt/LocalDrive500` was `U:` one day and
+`X:` the next — and a Steam library on Lightmoon pointing into one of them
+found itself on another volume, asking it for `//SteamLibrary` some 180 000
+times a day.
+
+So the letter is remembered (`cursio_files::drive_letters`) by **peer id and
+volume id** — not the display name, which can be changed, and not the order
+the peer lists its volumes in. The record is `drive-letters.json` in the
+node's data directory; the node names that path in the relay's `MountRequest`
+(relay version 5, which also carries the peer id), because on Windows the
+mount usually runs in `cursio-mount-helper`, and the helper and a node mounting
+for itself must share one memory. It is reread for every mount and written
+through a rename; a missing or damaged one costs the memory, never the mount.
+
+- **Remembered and free**: that letter.
+- **Remembered but held by something else** (a stick, a `subst`, another
+  volume): not taken. The volume mounts on another letter for now, a warning
+  names both, and the record is *not* moved, so the next mount returns to its
+  own letter once it is free. Moving it would let one stray mount order
+  reshuffle every drive for good.
+- **Held by this volume's own previous mount**, still letting go after a
+  rebuilt link: refused, and the engine's retry mounts it once the old mount
+  has unmounted. Falling back there would have looked like the case above.
+- **Never mounted**: the first free letter from `Z:` down that no other
+  volume remembers, so a peer that went offline finds its letter waiting.
+  Only when every unremembered letter is taken does it share one with a
+  record; whichever of the two mounts first then holds it, and the other
+  falls back as above.
+
+At most 128 records are kept, the least recently mounted dropped first.
+Choosing, mounting and recording happen under one lock per process, so two
+volumes mounting at once cannot pick the same free letter or overwrite each
+other's record.
+
 ## What a peer may reach
 
 Pairing is trust, but not one amount of it. Every module that exposes this

@@ -1,32 +1,55 @@
 //! Mounting a peer's volume as a drive letter: finding WinFsp's DLL, choosing
 //! the letter, and the handle that unmounts it.
 
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
 use crate::bridge::PeerLink;
+use crate::drive_letters::{LetterBook, Pick, VolumeKey};
 use crate::winmount::convert::dir_name_of;
 use crate::winmount::fs::RemoteFs;
 use crate::winmount::fs::SECTORS_PER_CLUSTER;
 use crate::winmount::fs::SECTOR_SIZE;
 use winfsp::host::{FileSystemHost, VolumeParams};
 
-/// A drive letter nothing is using, counting down from `Z:`.
+/// The letters in use now, as a bitmask with bit 0 for `A:`.
 ///
-/// Downwards because the low letters belong to real hardware and to whatever the
-/// user maps by habit; a share from another machine belongs at the far end,
-/// which is also where Windows puts mapped network drives.
-///
-/// `GetLogicalDrives` returns a bitmask of the letters in use — one call, no
-/// filesystem access, so a wedged mount elsewhere cannot make this hang.
-pub(super) fn free_drive_letter() -> Option<char> {
+/// `GetLogicalDrives` is one call with no filesystem access, so a wedged mount
+/// elsewhere cannot make this hang.
+fn letters_in_use() -> u32 {
     // Safe: no arguments, no out-params; returns a bitmask.
     let used = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
     if used == 0 {
-        // The call failed. `Z:` is the conventional choice and mounting fails
-        // loudly if it is taken, which beats giving up here.
-        return Some('Z');
+        // The call failed. Treating every letter as free means the chosen one
+        // is tried and mounting fails loudly if it is taken, which beats
+        // giving up here.
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "cannot list the drive letters in use; trying the volume's letter as if free"
+        );
     }
-    ('D'..='Z')
-        .rev()
-        .find(|c| used & (1 << (*c as u8 - b'A')) == 0)
+    used
+}
+
+/// The peer volumes this process has mounted.
+///
+/// Held across choosing a letter, mounting on it and recording it, so two
+/// volumes mounting at once cannot both pick the same free letter or overwrite
+/// each other's record. A volume found here is still mounted — usually its
+/// previous mount being torn down after the link was rebuilt — and is refused
+/// for now rather than mounted on a second letter, which would also have
+/// looked like its remembered letter being taken.
+fn live_mounts() -> MutexGuard<'static, Vec<VolumeKey>> {
+    static LIVE: OnceLock<Mutex<Vec<VolumeKey>>> = OnceLock::new();
+    LIVE.get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Load `winfsp-x64.dll` from the directory the installer recorded.
@@ -146,6 +169,7 @@ pub(super) fn read_registry_string(subkey: &str, value: &str) -> Option<String> 
 pub struct MountHandle {
     host: FileSystemHost<RemoteFs>,
     mountpoint: String,
+    key: VolumeKey,
 }
 
 impl MountHandle {
@@ -160,19 +184,26 @@ impl Drop for MountHandle {
         // nothing to release separately.
         self.host.stop();
         self.host.unmount();
+        // Only once the letter is free again, so a remount waiting on this
+        // volume finds its remembered letter available.
+        live_mounts().retain(|k| *k != self.key);
     }
 }
 
-/// Mount ONE of the peer's volumes on the next free drive letter.
+/// Mount ONE of the peer's volumes on its drive letter.
 ///
 /// Called once per volume the peer offers: `volume` is the wire id (`"C:"`,
 /// `"/"`, a removable medium's mount path) and `volume_label` is what the drive
-/// calls itself in Explorer.
+/// calls itself in Explorer. `peer_id` and `volume` are what the letter is
+/// remembered by in the record at `letters`; without one, every mount picks
+/// afresh (see [`crate::drive_letters`]).
 pub fn mount(
     peer: PeerLink,
+    peer_id: &str,
     peer_name: &str,
     volume: &str,
     volume_label: &str,
+    letters: Option<&Path>,
     cache: Option<std::sync::Arc<crate::readcache::ReadCache>>,
 ) -> anyhow::Result<MountHandle> {
     // Load WinFsp's DLL from where the installer actually put it, before
@@ -289,9 +320,32 @@ pub fn mount(
     // Refused rather than folded in with another volume: there are 26 letters
     // for every disk on the machine and every peer's, and a volume quietly
     // sharing a letter with another is the ambiguity this change removes.
-    let letter = free_drive_letter().ok_or_else(|| {
+    let key = VolumeKey {
+        peer: peer_id.to_string(),
+        volume: volume.to_string(),
+    };
+    let mut live = live_mounts();
+    if live.contains(&key) {
+        anyhow::bail!(
+            "{peer_name}'s volume {volume} is still mounted from before; \
+             mounting it again once that mount has let go of its letter"
+        );
+    }
+    let mut book = letters.map(LetterBook::load).unwrap_or_default();
+    let pick = book.choose(&key, letters_in_use()).ok_or_else(|| {
         anyhow::anyhow!("no free drive letter left for {peer_name}'s volume {volume}")
     })?;
+    if let Pick::Elsewhere { letter, remembered } = pick {
+        tracing::warn!(
+            peer = peer_name,
+            volume,
+            remembered = %format!("{remembered}:"),
+            now = %format!("{letter}:"),
+            "this volume's own drive letter is taken by something else; mounting it \
+             elsewhere for now, and on its own letter again once that is free"
+        );
+    }
+    let letter = pick.letter();
     let mountpoint = format!("{letter}:");
     match host.mount(mountpoint.as_str()) {
         Ok(()) => tracing::debug!(drive = %mountpoint, "mounted"),
@@ -315,6 +369,19 @@ pub fn mount(
         Err(e) => return Err(anyhow::anyhow!("cannot start the filesystem: {e:?}")),
     }
 
+    live.push(key.clone());
+    if let Some(path) = letters {
+        book.record(&key, pick, unix_now());
+        if let Err(e) = book.save(path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "cannot remember this volume's drive letter; it may move at the next mount"
+            );
+        }
+    }
+    drop(live);
+
     tracing::info!(
         drive = %mountpoint,
         // Also reachable by path, which is worth recording: if the letter ever
@@ -324,5 +391,9 @@ pub fn mount(
         volume,
         "peer volume mounted"
     );
-    Ok(MountHandle { host, mountpoint })
+    Ok(MountHandle {
+        host,
+        mountpoint,
+        key,
+    })
 }

@@ -22,6 +22,7 @@ pub(super) fn engine() -> (FilesEngine, tokio::sync::mpsc::UnboundedSender<Op>) 
     let (rescan_tx, rescan_rx) = tokio::sync::mpsc::unbounded_channel();
     let server = FileServer::detect();
     let engine = FilesEngine {
+        peer_id: "00000000-0000-0000-0000-000000000001".into(),
         peer_name: "peer".into(),
         local_volumes: server.volumes(),
         server: std::sync::Arc::new(std::sync::Mutex::new(server)),

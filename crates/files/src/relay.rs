@@ -42,7 +42,7 @@ use crate::FilesError;
 /// its own executable, so the two normally agree; this catches the case where
 /// they do not (a helper left running across an update) before any request is
 /// misread.
-pub const RELAY_VERSION: u32 = 4;
+pub const RELAY_VERSION: u32 = 5;
 
 /// The largest frame either side accepts. A write carries at most one wire
 /// chunk, a directory listing at most a few thousand entries; this is far
@@ -52,9 +52,16 @@ const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Which of the peer's volumes to present, and how to name it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountRequest {
+    /// What the drive letter is remembered by, with `volume`; the name can
+    /// change, the id cannot.
+    pub peer_id: String,
     pub peer_name: String,
     pub volume: String,
     pub label: String,
+    /// The node's record of which letter each peer volume had, so the helper
+    /// and a node mounting for itself keep one memory between them; `None`
+    /// when the node has no data directory. See [`crate::drive_letters`].
+    pub drive_letters: Option<std::path::PathBuf>,
     /// The node's disk cache for what the mount reads, opened in the process
     /// presenting it, since that is where the reads happen; `None` when off.
     pub cache: Option<crate::readcache::CacheSettings>,
@@ -663,9 +670,11 @@ mod tests {
 
     fn request() -> MountRequest {
         MountRequest {
+            peer_id: "00000000-0000-0000-0000-000000000001".into(),
             peer_name: "Lightmoon".into(),
             volume: "C:".into(),
             label: "Windows".into(),
+            drive_letters: None,
             cache: None,
         }
     }
