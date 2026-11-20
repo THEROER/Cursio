@@ -322,6 +322,7 @@ impl SessionModule for AudioEngine {
                     let seq = packet.seq;
                     tx.send(&Message::AudioChunk(packet)).await?;
                     record_sent(&mut self.unacked, &mut self.sent_since_adapt, *id, seq);
+                    self.last_sent_at.insert(*id, std::time::Instant::now());
                     self.sent += 1;
                     continue;
                 }
@@ -413,6 +414,10 @@ impl SessionModule for AudioEngine {
             }
         }
 
+        // After the sends above, so a backlog that a late pump has just flushed
+        // counts as sound rather than as the quiet before it.
+        self.announce_idle(tx, std::time::Instant::now()).await?;
+
         // Feed the sender's rate control: sparse acks for what we've received,
         // and a bitrate re-evaluation for what we send.
         self.send_acks(tx).await?;
@@ -482,6 +487,10 @@ impl SessionModule for AudioEngine {
                 self.on_ack(&ack);
                 true
             }
+            AudioMsg::StreamIdle { id } => {
+                self.on_stream_idle(id);
+                true
+            }
             AudioMsg::DeviceStateSet { device, field } => {
                 self.on_device_state_set(&device, field);
                 true
@@ -534,6 +543,8 @@ impl SessionModule for AudioEngine {
                 self.mixer.remove(id);
                 self.recv_seq.remove(&id);
                 self.recv_timing.remove(&id);
+                self.peer_idle.remove(&id);
+                self.stalled.remove(&id);
                 self.demand_sent.remove(&id);
                 self.unwanted_streams.remove(&id);
                 self.last_ack_sent.remove(&id);

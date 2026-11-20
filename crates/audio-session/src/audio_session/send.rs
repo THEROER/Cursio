@@ -39,6 +39,15 @@ pub(super) const BACKLOG_LOW: u32 = 20;
 /// the logs showed many times a day, seconds apart.
 pub(super) const BITRATE_RAISE_AFTER: u32 = 3;
 
+/// How long an outbound stream may send nothing before the peer is told it
+/// went quiet ([`AudioMsg::StreamIdle`]).
+///
+/// Far above the ~10 ms between chunks of a playing stream, and far enough
+/// below the peer's [`AUDIO_STALL_AFTER`](super::health::AUDIO_STALL_AFTER)
+/// that the announcement lands before the peer would call the quiet a stall,
+/// even from a pump that ran late.
+pub(super) const IDLE_ANNOUNCE_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Most unacknowledged chunks remembered per stream.
 ///
 /// Only a bound on memory for a peer that stopped acking altogether: the
@@ -198,6 +207,32 @@ impl AudioEngine {
                 unacked.pop_front();
             }
         }
+    }
+
+    /// Tell the peer which outbound streams have stopped sending, once each
+    /// time one stops.
+    ///
+    /// Silence is gated out before it is sent and a paused application gives
+    /// the capture nothing at all, so the peer cannot tell a pause from a
+    /// broken link on its own. Judged by what was *sent*, whatever the reason
+    /// nothing was — the gate, a pause, or the peer no longer listening — since
+    /// that is exactly what the peer sees.
+    pub(super) async fn announce_idle(
+        &mut self,
+        tx: &mut dyn TransportTx,
+        now: std::time::Instant,
+    ) -> Result<(), TransportError> {
+        let quiet: Vec<u32> = self
+            .last_sent_at
+            .iter()
+            .filter(|(_, at)| now.saturating_duration_since(**at) >= IDLE_ANNOUNCE_AFTER)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in quiet {
+            self.last_sent_at.remove(&id);
+            send_control(tx, AudioMsg::StreamIdle { id }).await?;
+        }
+        Ok(())
     }
 
     /// Return a sparse [`AudioFrameAck`] for each inbound stream that has moved
@@ -541,5 +576,51 @@ mod tests {
                 "tick {tick}: one calm sample must not raise the rate"
             );
         }
+    }
+
+    fn idles(tx: &crate::audio_session::test_support::RecordingTx) -> Vec<u32> {
+        tx.decoded::<AudioMsg>(cursio_protocol::ModuleId::AUDIO)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                AudioMsg::StreamIdle { id } => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The announcement must land before the peer's stall check could fire,
+    /// with room for a pump that runs late; otherwise every pause is still
+    /// reported as a stall, only less often.
+    #[test]
+    fn idle_is_announced_well_before_the_peer_would_call_it_a_stall() {
+        const {
+            assert!(
+                IDLE_ANNOUNCE_AFTER.as_millis() * 2
+                    < super::super::health::AUDIO_STALL_AFTER.as_millis(),
+            );
+        }
+    }
+
+    /// Announced once per quiet spell: the peer keeps the mark until the next
+    /// chunk, so repeating it would only cost the link.
+    #[tokio::test]
+    async fn a_stream_that_stopped_sending_is_announced_idle_once() {
+        let mut e = engine();
+        let start = std::time::Instant::now();
+        e.last_sent_at.insert(5, start);
+
+        let mut tx = crate::audio_session::test_support::RecordingTx::default();
+        e.announce_idle(&mut tx, start + IDLE_ANNOUNCE_AFTER / 2)
+            .await
+            .unwrap();
+        assert!(idles(&tx).is_empty(), "a gap between chunks is not a pause");
+
+        e.announce_idle(&mut tx, start + IDLE_ANNOUNCE_AFTER)
+            .await
+            .unwrap();
+        e.announce_idle(&mut tx, start + IDLE_ANNOUNCE_AFTER * 4)
+            .await
+            .unwrap();
+        assert_eq!(idles(&tx), vec![5]);
     }
 }

@@ -327,6 +327,16 @@ pub enum AudioMsg {
     /// The stream stays open and the node stays published either way; this only
     /// says whether samples are worth sending right now.
     StreamDemand { id: AudioStreamId, listening: bool },
+    /// Owner -> consumer: this stream has stopped sending, and nothing more of
+    /// it is coming until its next chunk.
+    ///
+    /// The owner drops silence before it is sent and a paused application
+    /// produces nothing at all, so to the consumer a paused song and a broken
+    /// link looked the same: chunks stopped. Every pause was reported as a
+    /// stall. Said by the one side that knows, it leaves "chunks stopped with
+    /// no word" meaning what the warning claims. Rides the same class as the
+    /// chunks, so it can never overtake the last of them.
+    StreamIdle { id: AudioStreamId },
 }
 
 impl AudioMsg {

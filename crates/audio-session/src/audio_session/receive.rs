@@ -333,6 +333,22 @@ impl AudioEngine {
         }
     }
 
+    /// The peer stopped sending stream `id` because its source went quiet.
+    ///
+    /// Only for a stream that has sent something: the mark is cleared by the
+    /// stream's next chunk, and one for a stream already closed would never be.
+    pub(super) fn on_stream_idle(&mut self, id: u32) {
+        if !self.recv_timing.contains_key(&id) {
+            return;
+        }
+        self.peer_idle.insert(id);
+        // The announcement came after the stall was already reported (the
+        // peer's pump ran late); close that warning rather than leave it open.
+        if self.stalled.remove(&id) {
+            tracing::info!(id, "audio from the peer went quiet — the stall was a pause");
+        }
+    }
+
     pub(super) fn on_chunk(&mut self, chunk: &cursio_protocol::AudioChunk) {
         let id = chunk.id;
 
@@ -340,17 +356,18 @@ impl AudioEngine {
         // stall, say that it recovered — a warning with no matching "resumed" is
         // impossible to interpret later.
         let now = std::time::Instant::now();
-        if self.stall_reported {
-            let gap = self.last_chunk_at.map(|t| now.duration_since(t));
+        self.peer_idle.remove(&id);
+        let previous_arrival = self.recv_timing.insert(id, (now, chunk.timestamp));
+        if self.stalled.remove(&id) {
             tracing::info!(
-                stalled_for_ms = gap.map(|g| g.as_millis() as u64),
+                id,
+                stalled_for_ms =
+                    previous_arrival.map(|(t, _)| now.duration_since(t).as_millis() as u64),
                 "audio from the peer resumed"
             );
-            self.stall_reported = false;
         }
-        self.last_chunk_at = Some(now);
 
-        if let Some((previous, timestamp)) = self.recv_timing.insert(id, (now, chunk.timestamp)) {
+        if let Some((previous, timestamp)) = previous_arrival {
             let gap = now.saturating_duration_since(previous);
             let media_gap = std::time::Duration::from_secs_f64(
                 chunk.timestamp.saturating_sub(timestamp) as f64 / 48000.0,
@@ -636,5 +653,63 @@ mod tests {
             1,
             "one stream must have exactly one open in flight"
         );
+    }
+
+    fn chunk(id: u32, seq: u32) -> cursio_protocol::AudioChunk {
+        cursio_protocol::AudioChunk {
+            id,
+            seq,
+            timestamp: 0,
+            data: vec![0; 16],
+        }
+    }
+
+    /// A paused source is quiet until its next chunk, and only until then: a
+    /// mark that outlived the pause would hide a real stall later in the song.
+    #[test]
+    fn a_stream_announced_idle_counts_again_from_its_next_chunk() {
+        let mut e = engine();
+        e.opening_playbacks.insert(7);
+        e.on_chunk(&chunk(7, 0));
+
+        assert!(e.handle_message(
+            &Message::module(
+                ModuleId::AUDIO,
+                AudioMsg::PRIORITY,
+                &AudioMsg::StreamIdle { id: 7 }
+            )
+            .unwrap()
+        ));
+        assert!(e.peer_idle.contains(&7));
+
+        e.on_chunk(&chunk(7, 1));
+        assert!(!e.peer_idle.contains(&7));
+    }
+
+    /// An idle mark is cleared only by a chunk, so one for a stream that never
+    /// sent here (or was already closed) would sit in the set for good.
+    #[test]
+    fn idle_for_a_stream_that_never_sent_here_is_ignored() {
+        let mut e = engine();
+        e.on_stream_idle(42);
+        assert!(e.peer_idle.is_empty());
+    }
+
+    /// A late announcement closes the stall it would have prevented, and a
+    /// returning stream closes its own; either way the next quiet spell can be
+    /// reported again.
+    #[test]
+    fn a_reported_stall_is_closed_by_idle_or_by_the_next_chunk() {
+        let mut e = engine();
+        e.opening_playbacks.insert(7);
+        e.on_chunk(&chunk(7, 0));
+
+        e.stalled.insert(7);
+        e.on_stream_idle(7);
+        assert!(e.stalled.is_empty());
+
+        e.stalled.insert(7);
+        e.on_chunk(&chunk(7, 1));
+        assert!(e.stalled.is_empty());
     }
 }
