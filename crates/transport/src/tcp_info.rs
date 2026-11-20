@@ -81,6 +81,14 @@ impl RetransmitLog {
         }
         let reading = match tx.tcp_counters() {
             Some(Ok(reading)) => reading,
+            // A platform with no reader says so on every path of every
+            // connection, four at a time; that is a fact about the build, not
+            // a problem with this link.
+            Some(Err(error)) if error.kind() == io::ErrorKind::Unsupported => {
+                self.unreadable = true;
+                tracing::debug!(?lane, %error, "this lane's TCP retransmissions go unmeasured");
+                return;
+            }
             Some(Err(error)) => {
                 self.unreadable = true;
                 tracing::warn!(?lane, %error, "cannot read this lane's TCP retransmissions; it goes unmeasured");
