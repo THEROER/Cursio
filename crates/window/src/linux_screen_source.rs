@@ -42,17 +42,28 @@ use tokio::sync::mpsc;
 
 use crate::codec::decode_tile;
 use crate::frame_gap::FrameGap;
-use crate::framebuffer::{geometry_of, scale_into, Framebuffer, Geometry};
+use crate::framebuffer::{geometry_of, scale_into, Admitted, Framebuffer, Geometry, VideoSize};
 use crate::presentation_ack::PresentationAcks;
 use crate::video_decoder::VideoDecoder;
 use crate::{Surrogate, WindowError};
 
 /// What the session hands the PipeWire thread.
 enum Command {
-    Frame { seq: u32, dirty: Rect, raw: Vec<u8> },
-    VideoPacket { seq: u32, packet: Vec<u8> },
-    Grow { width: u32, height: u32 },
-    Resize { width: u32, height: u32 },
+    Frame {
+        seq: u32,
+        dirty: Rect,
+        raw: Vec<u8>,
+    },
+    /// `restart`: see [`VideoSize`].
+    VideoPacket {
+        seq: u32,
+        packet: Vec<u8>,
+        restart: bool,
+    },
+    Geometry {
+        seq: u32,
+        change: Geometry,
+    },
     Restart,
     Stop,
 }
@@ -76,6 +87,7 @@ pub struct PipeWireScreenSource {
     /// and here when frames went missing on the way.
     wants_keyframe: Arc<AtomicBool>,
     gap: FrameGap,
+    video_size: VideoSize,
 }
 
 impl PipeWireScreenSource {
@@ -137,6 +149,7 @@ impl PipeWireScreenSource {
             ended,
             wants_keyframe,
             gap: FrameGap::default(),
+            video_size: VideoSize::default(),
         })
     }
 
@@ -166,21 +179,20 @@ impl Surrogate for PipeWireScreenSource {
             );
             self.wants_keyframe.store(true, Ordering::Relaxed);
         }
-        match geometry_of(frame.dirty, frame.codec, self.width, self.height) {
-            Geometry::Unchanged => {}
-            Geometry::Resize { width, height } => {
-                (self.width, self.height) = (width, height);
-                self.send(Command::Resize { width, height })?;
-            }
-            Geometry::Grow { width, height } => {
-                (self.width, self.height) = (width, height);
-                self.send(Command::Grow { width, height })?;
-            }
+        let change = geometry_of(frame.dirty, frame.codec, self.width, self.height);
+        if let Geometry::Resize { width, height } | Geometry::Grow { width, height } = change {
+            (self.width, self.height) = (width, height);
+            self.send(Command::Geometry {
+                seq: frame.seq,
+                change,
+            })?;
         }
         if frame.codec == TileCodec::LossyVideo {
+            let restart = self.video_size.starts_over(frame.dirty);
             return self.send(Command::VideoPacket {
                 seq: frame.seq,
                 packet: frame.data.clone(),
+                restart,
             });
         }
         let expected = (frame.dirty.width as usize) * (frame.dirty.height as usize) * 4;
@@ -214,6 +226,7 @@ impl Surrogate for PipeWireScreenSource {
     fn restart_stream(&mut self, _title: &str) {
         self.acks = PresentationAcks::new(self.id);
         self.gap.reset();
+        self.video_size.forget();
         let _ = self.send(Command::Restart);
     }
 
@@ -428,9 +441,11 @@ fn run(
             };
             match command {
                 Command::Stop => return Ok(()),
-                Command::Restart => decoder = None,
-                Command::Resize { width, height } => fb.resize(width, height),
-                Command::Grow { width, height } => fb.grow_to(width, height),
+                Command::Restart => {
+                    decoder = None;
+                    fb.restart();
+                }
+                Command::Geometry { seq, change } => fb.follow(seq, change),
                 Command::Frame { seq, dirty, raw } => match fb.blit(dirty, &raw) {
                     Ok(()) => {
                         changed = true;
@@ -438,7 +453,14 @@ fn run(
                     }
                     Err(e) => tracing::warn!(error = %e, "dropping malformed tile"),
                 },
-                Command::VideoPacket { seq, packet } => {
+                Command::VideoPacket {
+                    seq,
+                    packet,
+                    restart,
+                } => {
+                    if restart {
+                        decoder = None;
+                    }
                     if decoder.is_none() {
                         match VideoDecoder::open() {
                             Ok(d) => decoder = Some(d),
@@ -454,8 +476,8 @@ fn run(
                     match dec.decode(&packet) {
                         Ok(pictures) => {
                             for pic in pictures {
-                                if (fb.width, fb.height) != (pic.width, pic.height) {
-                                    fb.resize(pic.width, pic.height);
+                                if fb.admit(seq, pic.width, pic.height) == Admitted::Stale {
+                                    continue;
                                 }
                                 let full = Rect {
                                     x: 0,

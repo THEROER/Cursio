@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::codec::decode_tile;
 use crate::frame_gap::FrameGap;
-use crate::framebuffer::{geometry_of, Geometry};
+use crate::framebuffer::{geometry_of, Geometry, VideoSize};
 use crate::presentation_ack::PresentationAcks;
 use crate::WindowError;
 
@@ -37,14 +37,19 @@ pub(crate) enum SurrogateCommand<X> {
     /// answering its own close button. Sending the packet rather than the
     /// pixels also saves a copy, since the decoded frame is wanted where the
     /// framebuffer lives.
-    VideoPacket { seq: u32, packet: Vec<u8> },
-    /// Window geometry changed; reallocate before the next blit.
-    Resize { width: u32, height: u32 },
-    /// The window grew, learnt from a tile rather than a full frame. Keeps the
-    /// pixels already drawn — see [`Framebuffer::grow_to`].
     ///
-    /// [`Framebuffer::grow_to`]: crate::framebuffer::Framebuffer::grow_to
-    Grow { width: u32, height: u32 },
+    /// `restart` says the stream starts over at another size and needs a
+    /// fresh decoder; see [`VideoSize`].
+    VideoPacket {
+        seq: u32,
+        packet: Vec<u8>,
+        restart: bool,
+    },
+    /// The frame numbered `seq` changed the window's size; the window takes it
+    /// on with [`Framebuffer::follow`] before the frame arrives.
+    ///
+    /// [`Framebuffer::follow`]: crate::framebuffer::Framebuffer::follow
+    Geometry { seq: u32, change: Geometry },
     /// Tear the window down.
     Close(WindowCloseReason),
     /// Something only this platform's window does. A GTK window has nothing
@@ -66,6 +71,7 @@ pub(crate) struct SurrogateFront<X> {
     /// Whether a `LossyVideo` packet has been seen, so the log says once that
     /// the stream switched to video.
     video_started: bool,
+    video_size: VideoSize,
     /// Raised by the window thread while its decoder waits for a keyframe,
     /// and here when frames went missing on the way.
     wants_keyframe: Arc<AtomicBool>,
@@ -88,6 +94,7 @@ impl<X> SurrogateFront<X> {
             presented,
             acks: PresentationAcks::new(id),
             video_started: false,
+            video_size: VideoSize::default(),
             wants_keyframe,
             gap: FrameGap::default(),
         }
@@ -113,16 +120,13 @@ impl<X> SurrogateFront<X> {
         }
         // A frame the picture cannot hold means the host resized the window;
         // adopt the new geometry before blitting into it.
-        match geometry_of(frame.dirty, frame.codec, self.width, self.height) {
-            Geometry::Unchanged => {}
-            Geometry::Resize { width, height } => {
-                (self.width, self.height) = (width, height);
-                self.send(SurrogateCommand::Resize { width, height });
-            }
-            Geometry::Grow { width, height } => {
-                (self.width, self.height) = (width, height);
-                self.send(SurrogateCommand::Grow { width, height });
-            }
+        let change = geometry_of(frame.dirty, frame.codec, self.width, self.height);
+        if let Geometry::Resize { width, height } | Geometry::Grow { width, height } = change {
+            (self.width, self.height) = (width, height);
+            self.send(SurrogateCommand::Geometry {
+                seq: frame.seq,
+                change,
+            });
         }
 
         // `LossyVideo` is the one codec whose packets are *not* self-contained:
@@ -135,9 +139,11 @@ impl<X> SurrogateFront<X> {
                 self.video_started = true;
                 tracing::info!(id = self.id, "host switched this window to a video stream");
             }
+            let restart = self.video_size.starts_over(frame.dirty);
             return self.deliver(SurrogateCommand::VideoPacket {
                 seq: frame.seq,
                 packet: frame.data.clone(),
+                restart,
             });
         }
 
@@ -168,6 +174,7 @@ impl<X> SurrogateFront<X> {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn restart(&mut self) {
         self.video_started = false;
+        self.video_size.forget();
         self.acks = PresentationAcks::new(self.id);
         self.gap.reset();
     }
@@ -212,45 +219,155 @@ impl<X> Drop for SurrogateFront<X> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framebuffer::{Admitted, Framebuffer};
 
-    fn front() -> (
+    type Command = SurrogateCommand<std::convert::Infallible>;
+
+    fn front(
+        width: u32,
+        height: u32,
+    ) -> (
         SurrogateFront<std::convert::Infallible>,
-        mpsc::UnboundedReceiver<SurrogateCommand<std::convert::Infallible>>,
+        mpsc::UnboundedReceiver<Command>,
     ) {
-        let (commands, window) = mpsc::unbounded_channel();
+        let (commands, commands_rx) = mpsc::unbounded_channel();
         let (_presented_tx, presented) = mpsc::unbounded_channel();
         let front = SurrogateFront::new(
-            7,
-            (4, 4),
+            1,
+            (width, height),
             commands,
             presented,
             Arc::new(AtomicBool::new(false)),
         );
-        (front, window)
+        (front, commands_rx)
     }
 
-    fn video(seq: u32) -> WindowFrame {
+    fn tile(seq: u32, x: u32, y: u32, width: u32, height: u32) -> WindowFrame {
         WindowFrame {
-            id: 7,
+            id: 1,
+            seq,
+            dirty: Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            codec: TileCodec::RawBgra8888,
+            data: vec![0x55; (width * height * 4) as usize],
+        }
+    }
+
+    fn video(seq: u32, width: u32, height: u32) -> WindowFrame {
+        WindowFrame {
+            id: 1,
             seq,
             dirty: Rect {
                 x: 0,
                 y: 0,
-                width: 4,
-                height: 4,
+                width,
+                height,
             },
             codec: TileCodec::LossyVideo,
-            data: vec![0, 0, 0, 1],
+            data: vec![0, 0, 0, 1, 0x65],
+        }
+    }
+
+    /// The window thread's part, as both surrogates do it: geometry and tiles
+    /// in order, video packets left for a decoder that answers later.
+    fn window_applies(fb: &mut Framebuffer, commands: &mut mpsc::UnboundedReceiver<Command>) {
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                SurrogateCommand::Geometry { seq, change } => fb.follow(seq, change),
+                SurrogateCommand::Frame { dirty, raw, .. } => {
+                    fb.blit(dirty, &raw).expect("no tile is refused");
+                }
+                _ => {}
+            }
         }
     }
 
     #[test]
     fn a_skipped_frame_asks_for_the_whole_picture() {
-        let (mut front, _window) = front();
-        front.apply_frame(&video(1)).unwrap();
-        front.apply_frame(&video(2)).unwrap();
+        let (mut front, _window) = front(4, 4);
+        front.apply_frame(&video(1, 4, 4)).unwrap();
+        front.apply_frame(&video(2, 4, 4)).unwrap();
         assert!(!front.take_keyframe_request());
-        front.apply_frame(&video(4)).unwrap();
+        front.apply_frame(&video(4, 4, 4)).unwrap();
         assert!(front.take_keyframe_request());
+    }
+
+    #[test]
+    fn a_window_maximised_on_the_host_keeps_its_new_size_against_a_late_picture() {
+        let (mut front, mut commands) = front(960, 1032);
+        let mut fb = Framebuffer::new(960, 1032);
+        front.apply_frame(&video(1, 960, 1032)).unwrap();
+        window_applies(&mut fb, &mut commands);
+
+        front.apply_frame(&video(2, 1920, 1032)).unwrap();
+        window_applies(&mut fb, &mut commands);
+        // The decoder, behind the frames, now hands over the first stream's
+        // picture.
+        assert_eq!(fb.admit(1, 960, 1032), Admitted::Stale);
+
+        // The host settles the picture with bands across the new width.
+        for y in [0, 259, 518] {
+            front.apply_frame(&tile(3, 0, y, 1920, 259)).unwrap();
+        }
+        front.apply_frame(&tile(3, 0, 777, 1920, 256)).unwrap();
+        window_applies(&mut fb, &mut commands);
+        assert_eq!((fb.width, fb.height), (1920, 1033));
+    }
+
+    #[test]
+    fn a_tile_that_grows_the_window_announces_it_with_its_own_number() {
+        let (mut front, mut commands) = front(4, 2);
+        front.apply_frame(&tile(7, 2, 1, 4, 3)).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(SurrogateCommand::Geometry {
+                seq: 7,
+                change: Geometry::Grow {
+                    width: 6,
+                    height: 4
+                }
+            })
+        ));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(SurrogateCommand::Frame { seq: 7, .. })
+        ));
+    }
+
+    fn restart_of(commands: &mut mpsc::UnboundedReceiver<Command>) -> Option<bool> {
+        while let Ok(command) = commands.try_recv() {
+            if let SurrogateCommand::VideoPacket { restart, .. } = command {
+                return Some(restart);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_video_stream_at_a_new_size_gets_a_fresh_decoder() {
+        let (mut front, mut commands) = front(960, 1032);
+        front.apply_frame(&video(1, 960, 1032)).unwrap();
+        assert_eq!(restart_of(&mut commands), Some(false));
+        front.apply_frame(&video(2, 960, 1032)).unwrap();
+        assert_eq!(restart_of(&mut commands), Some(false));
+        front.apply_frame(&video(3, 1920, 1032)).unwrap();
+        assert_eq!(restart_of(&mut commands), Some(true));
+    }
+
+    /// An odd-sized window: video crops it to even, the settled picture comes
+    /// as tiles at full size. The stream itself never changed, so its decoder
+    /// must not be thrown away and wait for a keyframe.
+    #[test]
+    fn tiles_of_another_size_between_video_frames_do_not_restart_the_decoder() {
+        let (mut front, mut commands) = front(1824, 1004);
+        front.apply_frame(&video(1, 1824, 1004)).unwrap();
+        assert_eq!(restart_of(&mut commands), Some(false));
+        front.apply_frame(&tile(2, 0, 753, 1825, 252)).unwrap();
+        front.apply_frame(&video(3, 1824, 1004)).unwrap();
+        assert_eq!(restart_of(&mut commands), Some(false));
     }
 }

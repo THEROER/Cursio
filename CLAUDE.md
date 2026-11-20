@@ -72,6 +72,8 @@ cursio devtools Lightmoon leavepulse [--port P] [--close] [--launch]   # its web
 cursio logs Lightmoon --app leavepulse/console   # its web view's console, kept there while a machine may inspect it
 cursio path Lightmoon [auto|network|bluetooth]   # see or choose the path, on both ends
 cursio report all --since 1d                # every machine's day: drops, warnings, memory
+cursio config list [--on Lightmoon]          # every setting by key: value, default, what a change takes
+cursio config set audio.mic_gate -55 [--on POCO]   # applied at once, there; `reset KEY` back to default
 cursio restart Lightmoon | apply-update Lightmoon   # maintain a machine through the mesh
 ```
 

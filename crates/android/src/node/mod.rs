@@ -41,7 +41,7 @@ use cursio_core::module::ModuleRegistry;
 use cursio_core::node_status::NodeStatusMonitor;
 use cursio_core::pairing_window::PairingWindow;
 use cursio_core::NodeIdentity;
-use cursio_protocol::{ModuleId, PeerId, Position};
+use cursio_protocol::{PeerId, Position};
 
 mod apps;
 mod bluetooth;
@@ -107,21 +107,21 @@ impl NodeHandle {
         // somewhere to put applications' builds.
         update::start_apps(config_path.clone());
 
-        // Only the clipboard's switch is the phone's to follow: its other
-        // modules have always run whatever the file says, and a phone that
-        // started obeying a switch nobody set on it would lose audio or its
-        // storage on the next restart.
+        // Only the switches the registry has for a phone: not audio's or
+        // files', which a phone has always run whatever the file says — one
+        // that started obeying a switch nobody set on it would lose its
+        // sound or its storage on the next restart.
         let switches = cursio_core::module::ModuleSwitches::default();
-        switches.set(ModuleId::CLIPBOARD, config.modules.clipboard);
+        for (id, on) in cursio_core::live::switchable(&config) {
+            switches.set(id, on);
+        }
         let applier: cursio_core::control::Applier = {
             let mic_gate = mic_gate.clone();
             let switches = switches.clone();
             Arc::new(move |running: &Config, next: &Config| {
                 let plan = cursio_core::live::plan(running, next);
                 for &(id, on) in &plan.switches {
-                    if id == ModuleId::CLIPBOARD {
-                        switches.set(id, on);
-                    }
+                    switches.set(id, on);
                 }
                 if let Some(gate) = &plan.mic_gate {
                     match MicGate::from_config(gate.as_deref()) {

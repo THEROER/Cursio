@@ -6,7 +6,7 @@ use crate::linux_surrogate::to_texture;
 use crate::linux_surrogate::SurrogateCommand;
 use crate::GtkSurrogate;
 use crate::{
-    framebuffer::{fit_into, refit, Framebuffer},
+    framebuffer::{fit_into, refit, Admitted, Framebuffer},
     surrogate_front::SurrogateFront,
     video_decoder::VideoDecoder,
     WindowError,
@@ -123,7 +123,9 @@ pub(super) fn largest_monitor() -> Option<(i32, i32)> {
 
 /// One window's H.264 decoder, on a thread of its own.
 pub(super) struct VideoThread {
-    packets: std::sync::mpsc::Sender<(u32, Vec<u8>)>,
+    /// `(seq, packet, restart)`, as [`SurrogateCommand::VideoPacket`] carries
+    /// them.
+    packets: std::sync::mpsc::Sender<(u32, Vec<u8>, bool)>,
     /// Converted pictures, at most one waiting: a window that falls behind
     /// holds the decoder back, which then decodes what queued up meanwhile
     /// and converts only the last of it.
@@ -136,7 +138,7 @@ pub(super) fn spawn_video(
     id: WindowId,
     wants_keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> VideoThread {
-    let (packets, packets_rx) = std::sync::mpsc::channel::<(u32, Vec<u8>)>();
+    let (packets, packets_rx) = std::sync::mpsc::channel::<(u32, Vec<u8>, bool)>();
     let (pictures_tx, pictures) = std::sync::mpsc::sync_channel(1);
     let spawned = std::thread::Builder::new()
         .name(format!("surrogate-video-{id}"))
@@ -144,7 +146,12 @@ pub(super) fn spawn_video(
             let mut decoder: Option<VideoDecoder> = None;
             while let Ok(first) = packets_rx.recv() {
                 let mut newest = None;
-                for (seq, packet) in std::iter::once(first).chain(packets_rx.try_iter()) {
+                for (seq, packet, restart) in std::iter::once(first).chain(packets_rx.try_iter())
+                {
+                    if restart {
+                        decoder = None;
+                        newest = None;
+                    }
                     if decoder.is_none() {
                         match VideoDecoder::open() {
                             Ok(d) => decoder = Some(d),
@@ -293,20 +300,19 @@ pub(super) fn build_window(
                         presented_seq =
                             Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
                     }
-                    Ok(SurrogateCommand::VideoPacket { seq, packet }) => {
+                    Ok(SurrogateCommand::VideoPacket {
+                        seq,
+                        packet,
+                        restart,
+                    }) => {
                         let thread =
                             video.get_or_insert_with(|| spawn_video(id, wants_keyframe.clone()));
-                        let _ = thread.packets.send((seq, packet));
+                        let _ = thread.packets.send((seq, packet, restart));
                     }
-                    Ok(SurrogateCommand::Resize { width, height }) => {
-                        fb_for_frames.borrow_mut().resize(width, height);
-                        let (w, h) = fitted(width, height, titlebar);
-                        main_loop_window.set_default_size(w, h);
-                        painted = true;
-                    }
-                    Ok(SurrogateCommand::Grow { width, height }) => {
-                        fb_for_frames.borrow_mut().grow_to(width, height);
-                        let (w, h) = fitted(width, height, titlebar);
+                    Ok(SurrogateCommand::Geometry { seq, change }) => {
+                        let mut fb = fb_for_frames.borrow_mut();
+                        fb.follow(seq, change);
+                        let (w, h) = fitted(fb.width, fb.height, titlebar);
                         main_loop_window.set_default_size(w, h);
                         painted = true;
                     }
@@ -341,14 +347,14 @@ pub(super) fn build_window(
                 // quality change, or an encoder rounding up to whole macroblocks — is
                 // not shown scaled into the old window's size for the rest of the
                 // session.
-                if fb.width != pic.width || fb.height != pic.height {
+                let admitted = fb.admit(seq, pic.width, pic.height);
+                if let Admitted::Resized { from } = admitted {
                     let (w, h) = refit(
                         (picture_for_frames.width(), picture_for_frames.height()),
-                        (fb.width, fb.height),
+                        from,
                         (pic.width, pic.height),
                         largest_monitor(),
                     );
-                    fb.resize(pic.width, pic.height);
                     main_loop_window.set_default_size(w, h + titlebar);
                 }
                 let full = Rect {
@@ -357,13 +363,15 @@ pub(super) fn build_window(
                     width: pic.width,
                     height: pic.height,
                 };
-                match fb.blit(full, &pic.pixels) {
-                    Ok(()) => {
-                        painted = true;
-                        presented_seq =
-                            Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
+                if admitted != Admitted::Stale {
+                    match fb.blit(full, &pic.pixels) {
+                        Ok(()) => {
+                            painted = true;
+                            presented_seq =
+                                Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
+                        }
+                        Err(e) => tracing::warn!(error = %e, "dropping decoded video frame"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "dropping decoded video frame"),
                 }
             }
 

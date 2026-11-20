@@ -289,6 +289,43 @@ export interface CallsConfig {
   input: string | null
 }
 
+/** Mirrors `cursio_protocol::settings::SettingKind`: what a control edits. */
+export type SettingKind =
+  | { type: "toggle" }
+  | { type: "choice"; options: string[] }
+  /** One of `words`, or a whole number from `min` to `max` in `unit`, stored as text. */
+  | { type: "level"; words: string[]; min: number; max: number; unit: string }
+  | { type: "number"; min: number; max: number }
+  | { type: "text"; suggestions: string[] }
+  /** A sound device by name; one not among `options` (unplugged) is still valid. */
+  | { type: "device"; role: "output" | "input"; options: string[] }
+  | { type: "address" }
+  /** Has its own editor or none but the file; shown, not edited here. */
+  | { type: "structured" }
+
+/** Mirrors `cursio_protocol::settings::SettingApply`. */
+export type SettingApply = "live" | "relink" | "restart_module" | "restart"
+
+/** Mirrors `cursio_protocol::settings::SettingView`. */
+export interface SettingView {
+  /** Its dotted key in `config.toml`. */
+  key: string
+  section: string
+  /** In English; the app looks the key up in its own strings first. */
+  title: string
+  hint: string
+  kind: SettingKind
+  /** JSON text; `null` for an optional setting left unset. */
+  value_json: string
+  default_json: string
+  /** `null` is a value it takes: unset, so the module decides. */
+  optional: boolean
+  apply: SettingApply
+  /** A command-line flag holds the running value. */
+  pinned: boolean
+  waits_for_restart: boolean
+}
+
 /** Mirrors `cursio_protocol::calls::Call`. */
 export interface PhoneCall {
   id: number
@@ -366,6 +403,7 @@ export interface NodeConfig {
 export type Reply =
   | { reply: "saved"; pinned: string[]; restart_needed: string[] }
   | { reply: "config"; path: string; file: NodeConfig; effective: NodeConfig; pinned: string[] }
+  | { reply: "settings"; settings: SettingView[] }
   | { reply: "pairing"; state: PairingState | null; last: PairingOutcome | null; nearby?: NearbyMachine[] }
   | { reply: "done" }
   | { reply: "forgotten"; name: string; was_builder: boolean }
@@ -491,9 +529,19 @@ export function useNode() {
       call<Reply>("node_set_barrier", { screen, peer, peerScreen, closed }),
     setName: (name: string) => call<Reply>("node_set_name", { name }),
     config: () => call<Reply>("node_config"),
-    setMicGate: (value: string) => call<Reply>("node_set_mic_gate", { value }),
-    setCalls: (calls: CallsConfig) => call<Reply>("node_set_calls", { calls }),
-    setBluetoothStandby: (on: boolean) => call<Reply>("node_set_bluetooth_standby", { on }),
+    /** Every setting of this machine, or of the peer named `machine`. */
+    settings: async (machine?: string | null): Promise<SettingView[]> => {
+      const reply = await call<Reply>("node_settings", { machine: machine ?? null })
+      if (reply.reply !== "settings") {
+        throw { kind: "failed", message: `the node answered a settings request with ${reply.reply}` }
+      }
+      return (reply as Extract<Reply, { reply: "settings" }>).settings
+    },
+    /** `value` as the setting's JSON; `null` unsets an optional one. */
+    setSetting: (key: string, value: unknown, machine?: string | null) =>
+      call<Reply>("node_set_setting", { machine: machine ?? null, key, value }),
+    resetSetting: (key: string, machine?: string | null) =>
+      call<Reply>("node_reset_setting", { machine: machine ?? null, key }),
     applyConfigEdit: (edit: ConfigEdit) => call<Reply>("node_apply_config_edit", { edit }),
     setStreamVolume: (stream: number, volume: number, muted: boolean) =>
       call<Reply>("node_set_stream_volume", { stream, volume, muted }),

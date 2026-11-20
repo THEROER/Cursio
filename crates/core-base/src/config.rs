@@ -103,6 +103,11 @@ pub struct Config {
     /// application. Empty everywhere else.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub package_access: Vec<PackageGrant>,
+    /// Settings of modules built outside this repository, one table per
+    /// module, in whatever shape the module declared (`settings::register`).
+    /// Carried whole, so a module this build lacks keeps its values.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ext: BTreeMap<String, toml::Table>,
 }
 
 /// On a phone, one app's answer: whether package `package` may talk to the
@@ -118,7 +123,7 @@ pub struct PackageGrant {
 }
 
 /// How this machine takes one application's builds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     /// `auto` installs and hands the build to the application at once;
@@ -143,6 +148,11 @@ pub struct AppConfig {
     /// processes it was given for, whichever comes first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub devtools_grants: Vec<DevtoolsGrant>,
+    /// The application's own settings, as it declared them through
+    /// `cursio-sdk`; kept here so they survive the application and are
+    /// changed from wherever the node's are.
+    #[serde(skip_serializing_if = "toml::Table::is_empty")]
+    pub settings: toml::Table,
 }
 
 /// Whether another machine may ask to inspect an application at all.
@@ -199,6 +209,7 @@ impl Default for AppConfig {
             actions: AdminConsent::Ask,
             devtools: DevtoolsConsent::Deny,
             devtools_grants: Vec::new(),
+            settings: toml::Table::new(),
         }
     }
 }
@@ -491,6 +502,21 @@ pub struct Modules {
     /// Reach a nearby machine over a direct Wi-Fi link beside the router;
     /// see `direct_session`.
     pub direct: bool,
+    /// Windows dragged across, peers' screens, a phone's screen: everything
+    /// the window module carries.
+    pub window: bool,
+    /// A phone's notifications shown here, and this machine's sent to it.
+    pub notify: bool,
+    /// What plays on a peer, and its controls.
+    pub media: bool,
+    /// A phone's calls, rung and answered here.
+    pub calls: bool,
+    /// A phone's text messages.
+    pub messages: bool,
+    /// A machine's photos browsed from another.
+    pub gallery: bool,
+    /// Links, text and files sent to a peer.
+    pub share: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,6 +666,7 @@ impl Default for Config {
             layout: LayoutConfig::default(),
             apps: BTreeMap::new(),
             package_access: Vec::new(),
+            ext: BTreeMap::new(),
         }
     }
 }
@@ -656,6 +683,13 @@ impl Default for Modules {
             remote_screen: false,
             screen_host: true,
             direct: true,
+            window: true,
+            notify: true,
+            media: true,
+            calls: true,
+            messages: true,
+            gallery: true,
+            share: true,
         }
     }
 }

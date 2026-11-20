@@ -17,6 +17,9 @@ pub mod bridge;
 /// A path's real spelling on an owner that compares names with case, for the
 /// Windows mount, which promises Windows it does not.
 pub mod case;
+/// The drive letter each peer volume keeps on Windows, chosen and remembered
+/// here so the choice can be tested off Windows.
+pub mod drive_letters;
 /// The length of a file open on a mount, as far as its handle can vouch for.
 pub mod filesize;
 mod fnv;

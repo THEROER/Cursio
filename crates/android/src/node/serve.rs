@@ -9,7 +9,6 @@ use crate::node::NodeCtx;
 use crate::node::Shared;
 use cursio_core::audio_gate::MicGate;
 use cursio_core::audio_session::AudioFactory;
-use cursio_core::control::ModuleSwitch;
 use cursio_core::control::NodeState;
 use cursio_core::live::Shared as LiveShared;
 use cursio_core::mesh::SharedRegistry;
@@ -60,7 +59,7 @@ pub(super) async fn serve(node: Node) -> anyhow::Result<()> {
         tracing::info!(module = %advert.id, version = advert.version, "module available");
     }
     // Input too: the touchpad drives a peer's cursor through the links.
-    control.set_available(ModuleSwitch::available(&modules.available(), true));
+    control.set_available(modules.available(), true);
 
     let self_id = identity.peer_id;
     let mut seen_rx = spawn_browse(self_id)?;

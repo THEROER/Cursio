@@ -112,40 +112,6 @@ pub fn to_ntstatus(e: &FileError) -> winfsp::FspError {
 mod tests {
     use super::*;
 
-    /// The drive-letter search must skip letters in use.
-    ///
-    /// Asking WinFsp for "the next free drive" left the filesystem mounted but
-    /// unlettered — `fsptool lsvol` showed the volume with a `-` where its drive
-    /// should be, reachable by nothing. The letter is chosen here instead, so
-    /// the bit arithmetic behind that choice is worth pinning down; mounting
-    /// onto a letter already in use fails outright.
-    #[test]
-    fn the_drive_letter_search_reads_the_mask_correctly() {
-        // Mirrors the predicate in `fs::free_drive_letter`, which cannot run on
-        // this host: bit 0 is A:, bit 2 is C:.
-        let taken = |used: u32, c: char| used & (1 << (c as u8 - b'A')) != 0;
-
-        let used = 0b0000_0101; // A: and C:
-        assert!(taken(used, 'A'));
-        assert!(!taken(used, 'B'));
-        assert!(taken(used, 'C'));
-        assert!(!taken(used, 'Z'));
-
-        // Everything but Z: taken — a downward search must land on it.
-        let almost_full = !(1u32 << (b'Z' - b'A'));
-        assert_eq!(
-            ('D'..='Z').rev().find(|c| !taken(almost_full, *c)),
-            Some('Z')
-        );
-
-        // Nothing free is an error, not a silent collision.
-        assert_eq!(('D'..='Z').rev().find(|c| !taken(u32::MAX, *c)), None);
-
-        // C: is never offered even when somehow free — the low letters belong
-        // to real hardware.
-        assert!(!('D'..='Z').contains(&'C'));
-    }
-
     /// The epoch conversion must round-trip, or every file's timestamp is
     /// wrong by 369 years.
     #[test]

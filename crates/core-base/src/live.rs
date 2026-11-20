@@ -47,6 +47,7 @@ use cursio_protocol::{Arrange, Layout, ModuleId, PeerId, Position};
 
 use crate::config::Config;
 pub use crate::module::ModuleSwitches;
+use crate::settings::{self, Apply};
 
 /// A value shared between the node's applier and the factories that read it
 /// when they build a module.
@@ -246,16 +247,22 @@ impl LiveConfig {
     }
 }
 
-/// The modules a config switch turns on and off, by id.
-fn switchable(config: &Config) -> [(ModuleId, bool); 5] {
-    let m = &config.modules;
-    [
-        (ModuleId::CLIPBOARD, m.clipboard),
-        (ModuleId::AUDIO, m.audio),
-        (ModuleId::FILES, m.files),
-        (ModuleId::USB, m.usb),
-        (ModuleId::DIRECT, m.direct),
-    ]
+/// The modules a config switch turns on and off here, by id: every
+/// [`Apply::Switch`] the registry has for this platform.
+pub fn switchable(config: &Config) -> Vec<(ModuleId, bool)> {
+    settings::entries()
+        .iter()
+        .filter_map(|e| match e.apply {
+            Apply::Switch(id) => Some((id, flag(config, &e.key))),
+            _ => None,
+        })
+        .collect()
+}
+
+fn flag(config: &Config, key: &str) -> bool {
+    settings::value(config, key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
 }
 
 /// How to get from one running config to the next without a restart.
@@ -284,93 +291,79 @@ pub struct Plan {
     pub calls: Option<crate::config::CallsConfig>,
 }
 
-/// What applying `next` over `running` takes.
+/// What applying `next` over `running` takes, as the registry says of each
+/// setting that differs ([`Apply`]). Settings that do not exist on this
+/// platform are left alone, whatever the file says of them.
 pub fn plan(running: &Config, next: &Config) -> Plan {
     let mut plan = Plan::default();
-    for ((id, was), (_, now)) in switchable(running).into_iter().zip(switchable(next)) {
-        if was != now {
-            plan.switches.push((id, now));
+    for entry in settings::entries() {
+        let key = entry.key.as_str();
+        if settings::value(running, key) == settings::value(next, key) {
+            continue;
         }
-    }
-    if running.position != next.position {
-        plan.position = Some(next.position);
-    }
-    if running.layout != next.layout {
-        plan.layout = Some(next.layout.clone());
-    }
-    if running.modules.input != next.modules.input {
-        plan.input = Some(next.modules.input);
-    }
-    if running.modules.screen_host != next.modules.screen_host {
-        plan.screen_host = Some(next.modules.screen_host);
-        plan.restart.push(ModuleId::WINDOW);
-    }
-    if running.files.share != next.files.share {
-        plan.files_share_changed = true;
-        plan.restart.push(ModuleId::FILES);
-    }
-    if running.audio.render_device != next.audio.render_device {
-        plan.render_device = Some(next.audio.render_device.clone());
-        plan.restart.push(ModuleId::AUDIO);
-    }
-    if running.input.mac_modifiers != next.input.mac_modifiers {
-        plan.mac_modifiers = Some(next.input.mac_modifiers.clone());
-    }
-    if running.input.crossing != next.input.crossing {
-        plan.crossing = Some(next.input.crossing.clone());
-    }
-    if running.audio.mic_gate != next.audio.mic_gate {
-        plan.mic_gate = Some(next.audio.mic_gate.clone());
-    }
-    if running.calls != next.calls {
-        plan.calls = Some(next.calls.clone());
+        match entry.apply {
+            Apply::Read | Apply::Process => {}
+            Apply::Switch(id) => plan.switches.push((id, flag(next, key))),
+            Apply::Relink | Apply::Handed => {
+                if !hand(&mut plan, key, next) {
+                    tracing::error!(
+                        key,
+                        "a setting applied by hand has nowhere to go; it changes nothing until the node restarts"
+                    );
+                }
+            }
+            Apply::Module(id) => {
+                // A module's own setting is read when it is built again; a
+                // built-in one may also be handed to its factory first.
+                hand(&mut plan, key, next);
+                if !plan.restart.contains(&id) {
+                    plan.restart.push(id);
+                }
+            }
+        }
     }
     plan
 }
 
+/// Put the new value of `key` where the node picks it up; `false` for a key
+/// with nowhere to go. Every built-in setting applied by hand has an arm
+/// here; the registry's tests change each one alone and require the plan to
+/// carry it.
+fn hand(plan: &mut Plan, key: &str, next: &Config) -> bool {
+    match key {
+        "position" => plan.position = Some(next.position),
+        "layout" => plan.layout = Some(next.layout.clone()),
+        "modules.input" => plan.input = Some(next.modules.input),
+        "modules.screen_host" => plan.screen_host = Some(next.modules.screen_host),
+        "files.share" => plan.files_share_changed = true,
+        "audio.render_device" => plan.render_device = Some(next.audio.render_device.clone()),
+        "audio.mic_gate" => plan.mic_gate = Some(next.audio.mic_gate.clone()),
+        "input.mac_modifiers" => plan.mac_modifiers = Some(next.input.mac_modifiers.clone()),
+        "input.crossing" => plan.crossing = Some(next.input.crossing.clone()),
+        k if k.starts_with("calls.") => plan.calls = Some(next.calls.clone()),
+        _ => return false,
+    }
+    true
+}
+
 /// Settings that differ between the config this process `started` with and
-/// the one it runs now, and that only a restart applies. Named as in the file.
+/// the one it runs now, and that only a restart applies: every
+/// [`Apply::Process`] one. Named as in the file.
 ///
 /// Measured against the start rather than the last change, so turning a
 /// setting back takes it off the list.
 pub fn restart_needed(started: &Config, current: &Config) -> Vec<String> {
-    let mut needed = Vec::new();
-    let mut check = |name: &str, differs: bool| {
-        if differs {
-            needed.push(name.to_owned());
-        }
-    };
-    check("port", started.port != current.port);
-    check(
-        "modules.remote_screen",
-        started.modules.remote_screen != current.modules.remote_screen,
-    );
+    let mut needed: Vec<String> = settings::entries()
+        .into_iter()
+        .filter(|e| e.apply == Apply::Process)
+        .filter(|e| settings::value(started, &e.key) != settings::value(current, &e.key))
+        .map(|e| e.key)
+        .collect();
     // Capture is created at startup when input is on, and kept; without it
-    // there is nothing to forward from.
-    check(
-        "modules.input",
-        current.modules.input && !started.modules.input,
-    );
-    check("airplay.mode", started.airplay.mode != current.airplay.mode);
-    check(
-        "airplay.window",
-        started.airplay.window != current.airplay.window,
-    );
-    check(
-        "airplay.share",
-        started.airplay.share != current.airplay.share,
-    );
-    check("airplay.port", started.airplay.port != current.airplay.port);
-    // Opened once per process, and on Windows in the drive helper, which
-    // keeps the cache it was first handed.
-    check(
-        "files.cache_gb",
-        started.files.cache_gb != current.files.cache_gb,
-    );
-    check(
-        "airplay.interface",
-        started.airplay.interface != current.airplay.interface,
-    );
+    // there is nothing to forward from. Turning it off applies at once.
+    if current.modules.input && !started.modules.input {
+        needed.push("modules.input".to_owned());
+    }
     needed
 }
 
@@ -414,10 +407,24 @@ mod tests {
         let running = Config::default();
         let mut next = running.clone();
         next.modules.screen_host = !running.modules.screen_host;
+        next.files.share = Some(toml::toml! { home = true });
+        let plan = plan(&running, &next);
+        assert_eq!(plan.restart, vec![ModuleId::WINDOW, ModuleId::FILES]);
+        assert_eq!(plan.screen_host, Some(next.modules.screen_host));
+        assert!(plan.files_share_changed);
+    }
+
+    #[test]
+    fn a_setting_of_another_platform_changes_nothing_here() {
+        let running = Config::default();
+        let mut next = running.clone();
         next.audio.render_device = Some("Speakers".into());
         let plan = plan(&running, &next);
-        assert_eq!(plan.restart, vec![ModuleId::WINDOW, ModuleId::AUDIO]);
-        assert_eq!(plan.render_device, Some(Some("Speakers".into())));
+        if cfg!(target_os = "windows") {
+            assert_eq!(plan.restart, vec![ModuleId::AUDIO]);
+        } else {
+            assert_eq!(plan, Plan::default());
+        }
     }
 
     #[test]

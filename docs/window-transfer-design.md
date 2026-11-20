@@ -273,6 +273,21 @@ reaches past the edge. A host resize reaches the viewer as video — the first
 frame at a new size is a full-window change — so what is lost is shrinking
 from tiles alone, when no encoder opens.
 
+**The session's size is the only size.** The session reads every frame's
+geometry before the window thread sees it, and checks tiles against what it
+announced. The decoder runs behind the frames (its own thread on Linux,
+pictures held back in Media Foundation), so a picture of the old size can
+reach the window after the resize that replaced it; adopting its size put the
+picture back to the old one while the session went on sending tiles of the
+new, and each was refused as "does not fit" — the viewer froze on a maximised
+window. A size change therefore carries the number of the frame that brought
+it (`Framebuffer::follow`), and a picture decoded from an earlier frame is
+dropped (`Framebuffer::admit`). A video stream that comes at another size is
+a new stream from a reopened encoder, and gets a fresh decoder before its
+keyframe (`VideoSize`): NVDEC keeps the frame pool of the first stream and
+refuses a larger one with `send_packet: Invalid argument`, which used to cost
+that keyframe and leave the window frozen until the next.
+
 **Keyframes by the clock.** A decoder can start only at an IDR, and drops
 everything before one. Both encoders keyed on their own GOP — 120 *frames* —
 but capture encodes a frame only when the screen changed, so on a desktop
@@ -842,9 +857,8 @@ only a target, so frames in flight is the signal it can be steered by.
 
 Turning the phone changes the display's size, and a turn rebuilds the encoder
 at the new size — but the computer's window stays. The new encoder's first
-unit is a keyframe carrying parameter sets at the new size, and both viewers'
-decoders follow a size change mid-stream and reshape their window to it (Media
-Foundation through `MF_E_TRANSFORM_STREAM_CHANGE`). Closing and reopening the
+unit is a keyframe carrying parameter sets at the new size, and both viewers
+open a fresh decoder for it and reshape their window to it. Closing and reopening the
 window instead, as it once did, destroyed it, and with it a call application's
 share of that window. The phone maps the viewer's pointer against the size the
 capture runs at now, not the one it was offered at.

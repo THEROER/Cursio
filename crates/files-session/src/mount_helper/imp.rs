@@ -285,9 +285,11 @@ fn mount_volume(
         .and_then(cursio_files::readcache::shared);
     cursio_files::winmount::mount(
         link,
+        &request.peer_id,
         &request.peer_name,
         &request.volume,
         &request.label,
+        request.drive_letters.as_deref(),
         cache,
     )
     .map(|handle| {
@@ -326,21 +328,12 @@ impl Drop for RelayedMount {
 /// apart as the peer's.
 pub fn mount(
     link: PeerLink,
-    peer_name: &str,
-    volume: &str,
-    label: &str,
+    request: MountRequest,
     publisher: u64,
-    cache: Option<cursio_files::readcache::CacheSettings>,
 ) -> anyhow::Result<RelayedMount> {
     let runtime = tokio::runtime::Handle::try_current()
         .context("a relayed mount needs the link's runtime")?;
     let helper = helper_pid()?;
-    let request = MountRequest {
-        peer_name: peer_name.to_string(),
-        volume: volume.to_string(),
-        label: label.to_string(),
-        cache,
-    };
     let task = runtime.spawn(async move {
         let peer = request.peer_name.clone();
         let volume = request.volume.clone();

@@ -180,6 +180,33 @@ impl NodeLink {
         }
     }
 
+    /// A settings command: this machine's at once, another machine's through
+    /// the mesh, which takes as long as a phone's answer may.
+    #[cfg(desktop)]
+    pub async fn request_settings(&self, command: Command) -> Result<Reply, NodeError> {
+        let deadline = if command.waits_on_peer() {
+            PHONE_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
+        self.request_within(command, deadline).await
+    }
+
+    /// A settings command, on the phone's own node. Another machine's are
+    /// asked through the mesh like the desktop's socket asks them, which is
+    /// an await on a peer rather than a call into the node.
+    #[cfg(mobile)]
+    pub async fn request_settings(&self, command: Command) -> Result<Reply, NodeError> {
+        if !command.waits_on_peer() {
+            return self.request(command).await;
+        }
+        let state = in_process()?;
+        match cursio_core::control::handle_waiting(&state, command).await {
+            Reply::Error { message } => Err(NodeError::Failed { message }),
+            reply => Ok(reply),
+        }
+    }
+
     /// The status as last pushed, or asked for when nothing has been yet.
     pub async fn status(&self) -> Result<Status, NodeError> {
         if let Some(latest) = self.latest.borrow().clone() {
