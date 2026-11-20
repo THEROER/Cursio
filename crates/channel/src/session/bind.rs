@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+use crate::session::authorize::Authorization;
 use crate::trust::{PeerIdentity, Trust, Verified};
 use crate::SessionTag;
 
@@ -40,6 +41,7 @@ pub struct SessionOptions {
     pub(crate) trust: Option<Arc<dyn Trust>>,
     pub(crate) check_every: Duration,
     pub(crate) hand_back: bool,
+    pub(crate) authorization: Option<Authorization>,
 }
 
 impl Default for SessionOptions {
@@ -48,6 +50,7 @@ impl Default for SessionOptions {
             trust: None,
             check_every: CHECK_EVERY,
             hand_back: false,
+            authorization: None,
         }
     }
 }
@@ -66,6 +69,14 @@ impl SessionOptions {
     /// every delivered message.
     pub fn check_every(mut self, every: Duration) -> Self {
         self.check_every = every;
+        self
+    }
+
+    /// Hold the bound peer to `policy` for the lanes and classes it sends in;
+    /// see [`Authorization`]. A session no trust binds has no identity to
+    /// hold to it, and refuses to start with one.
+    pub fn authorize(mut self, policy: Authorization) -> Self {
+        self.authorization = Some(policy);
         self
     }
 
@@ -99,6 +110,10 @@ impl Binding {
 
     pub(super) fn trust(&self) -> &Arc<dyn Trust> {
         &self.trust
+    }
+
+    pub(super) fn identity(&self) -> &PeerIdentity {
+        &self.identity
     }
 
     fn proofs(&self) -> std::sync::MutexGuard<'_, Vec<Verified>> {

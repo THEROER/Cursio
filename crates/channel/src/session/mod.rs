@@ -89,6 +89,7 @@ use crate::{
     SessionTag,
 };
 
+mod authorize;
 mod bind;
 mod congestion;
 mod events;
@@ -100,8 +101,9 @@ mod send;
 mod state;
 mod supervise;
 
+pub use authorize::Authorization;
 pub use bind::{offered_tag, SessionOptions, CHECK_EVERY};
-pub use events::{SessionEvent, SessionEvents};
+pub use events::{SessionEvent, SessionEvents, Unauthorized};
 pub use receive::ResumableRx;
 
 use crate::carrier::TlsInfo;
@@ -573,6 +575,11 @@ impl<E: Envelope> ResumableLink<E> {
             }
             None => None,
         };
+        if options.authorization.is_some() && binding.is_none() {
+            return Err(ChannelError::Other(
+                "an authorization policy needs a session bound to an identity".into(),
+            ));
+        }
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (inbound_tx, inbound): (Vec<_>, Vec<_>) =
             classes.lanes().iter().map(|_| mpsc::channel(16)).unzip();
@@ -587,6 +594,7 @@ impl<E: Envelope> ResumableLink<E> {
             binding,
             ledger: Arc::new(Ledger::new(options.hand_back, events_tx.clone())),
             events: events_tx,
+            authorization: options.authorization,
         });
         inner.install(first);
         live_links()

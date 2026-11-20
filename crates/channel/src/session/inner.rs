@@ -3,6 +3,7 @@
 
 use crate::carrier::TlsInfo;
 use crate::seal::link_tag;
+use crate::session::authorize::Authorization;
 use crate::session::bind::Binding;
 use crate::session::congestion::BackgroundRate;
 use crate::session::events::RawEvent;
@@ -40,6 +41,8 @@ pub(super) struct Inner {
     pub(super) binding: Option<Binding>,
     pub(super) events: mpsc::UnboundedSender<RawEvent>,
     pub(super) ledger: Arc<Ledger>,
+    /// What the bound identity may send in, asked as each class is first used.
+    pub(super) authorization: Option<Authorization>,
 }
 
 impl Inner {

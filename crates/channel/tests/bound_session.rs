@@ -1,6 +1,6 @@
 //! A session bound to the identity that opened it: who may join it, and what
 //! ends it — a proof expiring, a serial revoked while the session is only
-//! held, a fresh proof of someone else.
+//! held, a fresh proof of someone else — and what it may send.
 
 mod common;
 
@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use common::*;
 use cursio_channel::{
-    PrioritizedTx, ResumableLink, ResumableRx, ResumeHandle, SessionEvent, SessionEvents,
-    SessionOptions, Verified,
+    Authorization, PeerIdentity, PrioritizedTx, ResumableLink, ResumableRx, ResumeHandle,
+    SessionEvent, SessionEvents, SessionOptions, Unauthorized, Verified,
 };
 
 struct End {
@@ -20,17 +20,31 @@ struct End {
     events: SessionEvents<Panel>,
 }
 
-fn options(issuer: &Arc<Issuer>) -> SessionOptions {
-    SessionOptions::bound_to(issuer.clone()).check_every(Duration::from_millis(200))
+fn options(issuer: &Arc<Issuer>, policy: Option<&Authorization>) -> SessionOptions {
+    let options = SessionOptions::bound_to(issuer.clone()).check_every(Duration::from_millis(200));
+    match policy {
+        Some(policy) => options.authorize(policy.clone()),
+        None => options,
+    }
 }
 
 /// The agent proves `agent` to the panel; the panel proves `panel`.
 async fn session(issuer: &Arc<Issuer>, agent_proof: Verified) -> (End, End) {
+    session_under(issuer, agent_proof, None).await
+}
+
+/// As [`session`], each end holding the other to `policy`.
+async fn session_under(
+    issuer: &Arc<Issuer>,
+    agent_proof: Verified,
+    policy: Option<Authorization>,
+) -> (End, End) {
     let panel_proof = Issuer::proof("panel", "p1", Duration::from_secs(3600));
     let (a, p, tag) = path_pair(panel_proof.clone(), agent_proof.clone()).await;
     let start = |path, tag| {
+        let options = options(issuer, policy.as_ref());
         let (mut link, handle) =
-            ResumableLink::with_options(path, tag, classes(), options(issuer)).unwrap();
+            ResumableLink::with_options(path, tag, classes(), options).unwrap();
         let events = link.events().unwrap();
         let (tx, rx) = link.split();
         End {
@@ -163,4 +177,77 @@ async fn reauth_with_another_identity_ends_the_session() {
         .unwrap();
     let why = ended(&mut panel).await;
     assert!(why.contains("someone-else"), "{why}");
+}
+
+/// Only the panel may send files; anyone may use the console.
+fn files_only_from_the_panel(enforce: bool) -> Authorization {
+    Authorization::new(enforce, |who, lane, class| {
+        class == CONSOLE || (lane == BULK && *who == PeerIdentity::Host { id: "panel".into() })
+    })
+}
+
+#[tokio::test]
+async fn an_authorization_violation_is_only_reported_when_not_enforcing() {
+    let issuer = Arc::new(Issuer::default());
+    let policy = files_only_from_the_panel(false);
+    let agent_proof = agent_for(Duration::from_secs(3600));
+    let (mut agent, mut panel) = session_under(&issuer, agent_proof, Some(policy)).await;
+    agent.tx.send(&line("allowed")).await.unwrap();
+    assert_eq!(next(&mut panel).await, line("allowed"));
+    let chunk = Panel::Chunk(1, vec![5; 100]);
+    agent.tx.send(&chunk).await.unwrap();
+    assert_eq!(
+        next(&mut panel).await,
+        chunk,
+        "delivered, since not enforced"
+    );
+
+    let report = tokio::time::timeout(Duration::from_secs(5), panel.events.recv())
+        .await
+        .unwrap();
+    assert_eq!(
+        report,
+        Some(SessionEvent::Unauthorized(Unauthorized {
+            identity: PeerIdentity::Host { id: "agent".into() },
+            lane: BULK,
+            class: FILES,
+            enforced: false,
+        }))
+    );
+    panel.tx.send(&Panel::Chunk(2, vec![6; 100])).await.unwrap();
+    assert_eq!(next(&mut agent).await, Panel::Chunk(2, vec![6; 100]));
+    assert!(!panel.handle.is_ended());
+}
+
+#[tokio::test]
+async fn an_authorization_violation_closes_the_session_when_enforcing() {
+    let issuer = Arc::new(Issuer::default());
+    let policy = files_only_from_the_panel(true);
+    let agent_proof = agent_for(Duration::from_secs(3600));
+    let (mut agent, mut panel) = session_under(&issuer, agent_proof, Some(policy)).await;
+    agent.tx.send(&Panel::Chunk(1, vec![5; 100])).await.unwrap();
+    let delivered = tokio::time::timeout(Duration::from_secs(5), panel.rx.recv())
+        .await
+        .unwrap();
+    assert!(delivered.is_err(), "the refused message is not delivered");
+    match panel.events.recv().await {
+        Some(SessionEvent::Unauthorized(report)) => {
+            assert!(report.enforced);
+            assert_eq!(report.lane, BULK);
+        }
+        other => panic!("expected a report, got {other:?}"),
+    }
+    let why = ended(&mut panel).await;
+    assert!(why.contains("may not send"), "{why}");
+}
+
+#[tokio::test]
+async fn a_policy_without_an_identity_to_hold_to_is_refused() {
+    let (a, _, tag) = path_pair(
+        Issuer::proof("panel", "p1", Duration::from_secs(60)),
+        Issuer::proof("agent", "a1", Duration::from_secs(60)),
+    )
+    .await;
+    let options = SessionOptions::default().authorize(files_only_from_the_panel(true));
+    assert!(ResumableLink::<Panel>::with_options(a, tag, classes(), options).is_err());
 }

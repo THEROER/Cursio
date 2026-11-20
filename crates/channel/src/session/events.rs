@@ -9,7 +9,8 @@ use std::marker::PhantomData;
 
 use tokio::sync::mpsc;
 
-use crate::Envelope;
+use crate::trust::PeerIdentity;
+use crate::{ClassId, Envelope, LaneId};
 
 pub(super) enum RawEvent {
     Ended {
@@ -19,6 +20,18 @@ pub(super) enum RawEvent {
     Expired {
         body: Vec<u8>,
     },
+    Unauthorized(Unauthorized),
+}
+
+/// The peer sent in a class its identity is not allowed; see
+/// [`crate::Authorization`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unauthorized {
+    pub identity: PeerIdentity,
+    pub lane: LaneId,
+    pub class: ClassId,
+    /// The session was ended for it, and the message not delivered.
+    pub enforced: bool,
 }
 
 /// One thing a session reports to the application.
@@ -39,6 +52,8 @@ pub enum SessionEvent<E> {
     /// passed before the peer had it: it was not sent, or not sent again,
     /// and the peer will not deliver it.
     Expired(E),
+    /// The peer used a class its identity may not, reported the first time.
+    Unauthorized(Unauthorized),
 }
 
 /// The application's end of a session's reports; see [`SessionEvent`].
@@ -66,6 +81,9 @@ impl<E: Envelope> SessionEvents<E> {
                     if let Some(message) = decode_all(vec![body]).pop() {
                         return Some(SessionEvent::Expired(message));
                     }
+                }
+                RawEvent::Unauthorized(report) => {
+                    return Some(SessionEvent::Unauthorized(report));
                 }
             }
         }

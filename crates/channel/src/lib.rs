@@ -40,8 +40,8 @@ pub use noise::NoisePsk;
 pub use scheduler::{Carrying, PrioritizedTx};
 pub use seal::{Seal, SealedRx, SealedTx};
 pub use session::{
-    Path, PathKind, Paths, ResumableLink, ResumableRx, ResumeHandle, SessionEvent, SessionEvents,
-    SessionOptions,
+    Authorization, Path, PathKind, Paths, ResumableLink, ResumableRx, ResumeHandle, SessionEvent,
+    SessionEvents, SessionOptions, Unauthorized,
 };
 pub use trust::{Opened, PeerIdentity, Revoked, Role, Trust, Verified};
 

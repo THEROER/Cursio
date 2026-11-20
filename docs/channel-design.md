@@ -359,6 +359,13 @@ either side of the move must still form a session.
   `SessionEvent::Expired(message)`, and one still owed when the session ends
   past its deadline is reported expired rather than handed back. A message
   a ledger holds is never folded into.
+- **Authorization is the receiver's**: `Authorization::new(enforce, |identity,
+  lane, class| …)` on a bound session (`SessionOptions::authorize`; refused on
+  an unbound one), decided once per class at the first message of it that
+  arrives. A class this end never declared, or one arriving off its declared
+  lane, is refused whatever the rule says. A refusal is reported as
+  `SessionEvent::Unauthorized` and logged; not enforcing, the message is
+  delivered; enforcing, it is not, and the session ends.
 
 ## Licence
 

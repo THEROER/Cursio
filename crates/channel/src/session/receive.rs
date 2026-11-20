@@ -2,10 +2,12 @@
 //! path it came by.
 
 use crate::seal::{link_tag, part_message_id, Reassembler};
+use crate::session::authorize::Verdicts;
+use crate::session::events::{RawEvent, Unauthorized};
 use crate::session::frame::read_u64;
 use crate::session::frame::SEQ_LOSSY;
 use crate::session::inner::Inner;
-use crate::{ChannelError, Envelope};
+use crate::{ChannelError, ClassId, Envelope, LaneId};
 use std::collections::HashSet;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -22,6 +24,8 @@ pub struct ResumableRx<E> {
     pub(super) lossy_parts: Vec<HashSet<u32>>,
     /// The path the last numbered frame came on.
     pub(super) last_path: Vec<Option<u64>>,
+    /// The session's policy's answer for each class the peer has used.
+    verdicts: Verdicts,
     pub(super) envelope: PhantomData<fn() -> E>,
 }
 
@@ -29,6 +33,7 @@ impl<E: Envelope> ResumableRx<E> {
     pub(super) fn new(inner: Arc<Inner>, inbound: Vec<mpsc::Receiver<(u64, Vec<u8>)>>) -> Self {
         let lanes = inbound.len();
         Self {
+            verdicts: Verdicts::new(inner.classes.classes().len()),
             inner,
             inbound,
             reasm: (0..lanes).map(|_| Reassembler::default()).collect(),
@@ -88,7 +93,11 @@ impl<E: Envelope> ResumableRx<E> {
                 if !self.inner.verify_peer() {
                     return Err(ChannelError::Closed);
                 }
-                E::decode(&body).map(Some)
+                let message = E::decode(&body)?;
+                if !self.permitted(message.class(), lane) {
+                    return Err(ChannelError::Closed);
+                }
+                Ok(Some(message))
             }
             link_tag::ACK | link_tag::RESUME => {
                 self.inner.acknowledge(rest)?;
@@ -98,6 +107,48 @@ impl<E: Envelope> ResumableRx<E> {
                 "unknown frame {other:#x} on a resumable link"
             ))),
         }
+    }
+
+    /// Whether a message of `class`, arrived on `lane`, may be delivered under
+    /// the session's policy; reports the first use of a class refused, and
+    /// ends the session over it when the policy enforces.
+    fn permitted(&mut self, class: ClassId, lane: LaneId) -> bool {
+        let (Some(policy), Some(binding)) = (&self.inner.authorization, &self.inner.binding) else {
+            return true;
+        };
+        let classes = &self.inner.classes;
+        // A class this end never declared, or one arriving off its own lane,
+        // is refused whatever the policy says: no rule was written for it.
+        let declared = class < classes.classes().len() && classes.lane_of(class) == lane;
+        let events = &self.inner.events;
+        let allowed = self.verdicts.get(class, || {
+            let allowed = declared && policy.allows(binding.identity(), lane, class);
+            if !allowed {
+                tracing::warn!(
+                    identity = %binding.identity(),
+                    lane = lane.get(),
+                    class,
+                    enforced = policy.enforce,
+                    "the peer used a class it is not allowed"
+                );
+                let _ = events.send(RawEvent::Unauthorized(Unauthorized {
+                    identity: binding.identity().clone(),
+                    lane,
+                    class,
+                    enforced: policy.enforce,
+                }));
+            }
+            allowed
+        });
+        if allowed || !policy.enforce {
+            return true;
+        }
+        self.inner.end(format!(
+            "{} may not send in class {class} on lane {}",
+            binding.identity(),
+            lane.get()
+        ));
+        false
     }
 
     /// The next message of the session, from whichever lane has one first,
