@@ -92,89 +92,47 @@ pub async fn node_set_barrier(
     .await
 }
 
-/// The node has no command for one audio field, so this edits the file as
-/// written (not the effective config, which would bake flags into it) and
-/// hands the whole of it back. `value` is what the file takes: `auto`,
-/// `off` or a level in dBFS.
-///
-/// Checked here because the node does not check it on save: a running
-/// node only declines to apply a bad value, but the file keeps it and the
-/// next start fails on it. The rule is `audio_gate::MicGate`'s, which the
-/// app cannot call — it lives behind the core's `audio` feature.
+/// Every setting of this machine, or of `machine` through the mesh. The
+/// window builds its settings page from this, so a setting a module gains
+/// shows without a change here.
 #[tauri::command]
-pub async fn node_set_mic_gate(
+pub async fn node_settings(
     link: State<'_, NodeLink>,
-    value: String,
+    machine: Option<String>,
 ) -> Result<Reply, NodeError> {
-    let level_ok = value
-        .parse::<f32>()
-        .is_ok_and(|db| (-100.0..=0.0).contains(&db));
-    if !matches!(value.as_str(), "auto" | "off") && !level_ok {
-        return Err(NodeError::failed(format!(
-            "mic gate {value:?} is not \"auto\", \"off\" or a level in dBFS between -100 and 0"
-        )));
-    }
-    let mut config = match link.request(Command::Config).await? {
-        Reply::Config { file, .. } => *file,
-        other => {
-            return Err(NodeError::failed(format!(
-                "the node answered a config request with {other:?}"
-            )));
-        }
-    };
-    config.audio.mic_gate = Some(value);
-    link.request(Command::SetConfig {
-        config: Box::new(config),
+    link.request_settings(Command::Settings { machine }).await
+}
+
+/// Set one setting by key, here or on `machine`; the node checks the value
+/// against the setting's kind and applies it at once where it can.
+#[tauri::command]
+pub async fn node_set_setting(
+    link: State<'_, NodeLink>,
+    machine: Option<String>,
+    key: String,
+    value: serde_json::Value,
+) -> Result<Reply, NodeError> {
+    link.request_settings(Command::SetSetting {
+        machine,
+        key,
+        value,
     })
     .await
 }
 
-/// Replace the `[calls]` section of the config file, like
-/// [`node_set_mic_gate`]: the file's own config, not the effective one.
+/// Take one setting out of the file, back to its default.
 #[tauri::command]
-pub async fn node_set_calls(
+pub async fn node_reset_setting(
     link: State<'_, NodeLink>,
-    calls: cursio_core::config::CallsConfig,
+    machine: Option<String>,
+    key: String,
 ) -> Result<Reply, NodeError> {
-    let mut config = match link.request(Command::Config).await? {
-        Reply::Config { file, .. } => *file,
-        other => {
-            return Err(NodeError::failed(format!(
-                "the node answered a config request with {other:?}"
-            )));
-        }
-    };
-    config.calls = calls;
-    link.request(Command::SetConfig {
-        config: Box::new(config),
-    })
-    .await
-}
-
-/// Keep a Bluetooth path open beside the network, or not: the config
-/// file's `[bluetooth] standby`, like [`node_set_calls`].
-#[tauri::command]
-pub async fn node_set_bluetooth_standby(
-    link: State<'_, NodeLink>,
-    on: bool,
-) -> Result<Reply, NodeError> {
-    let mut config = match link.request(Command::Config).await? {
-        Reply::Config { file, .. } => *file,
-        other => {
-            return Err(NodeError::failed(format!(
-                "the node answered a config request with {other:?}"
-            )));
-        }
-    };
-    config.bluetooth.standby = on;
-    link.request(Command::SetConfig {
-        config: Box::new(config),
-    })
-    .await
+    link.request_settings(Command::ResetSetting { machine, key })
+        .await
 }
 
 /// Make one change a problem offers, or a settings control names: the
-/// config file read, edited and written back like the setters above.
+/// config file read, edited and written back.
 #[tauri::command]
 pub async fn node_apply_config_edit(
     link: State<'_, NodeLink>,
