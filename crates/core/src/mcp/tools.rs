@@ -596,7 +596,73 @@ impl<A: Ask> Tools<A> {
                 self.maintain(args, cursio_protocol::diag::Maintenance::ApplyUpdate)
                     .await
             }
+            "settings" => self.settings(args).await,
+            "set_setting" => self.set_setting(args).await,
             _ => Err(Failure::UnknownTool),
+        }
+    }
+
+    async fn settings(&self, args: &Value) -> Result<String, Failure> {
+        let machine = opt_str(args, "machine").filter(|m| m != "this");
+        match self.ask.ask(Command::Settings { machine }).await? {
+            Reply::Settings { settings } => {
+                let listed: Vec<Value> = settings
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "key": s.key,
+                            "section": s.section,
+                            "title": s.title,
+                            "hint": s.hint,
+                            "kind": s.kind,
+                            "value": serde_json::from_str::<Value>(&s.value_json).unwrap_or(Value::Null),
+                            "default": serde_json::from_str::<Value>(&s.default_json).unwrap_or(Value::Null),
+                            "optional": s.optional,
+                            "apply": s.apply,
+                            "pinned": s.pinned,
+                            "waits_for_restart": s.waits_for_restart,
+                        })
+                    })
+                    .collect();
+                Ok(pretty(&json!(listed)))
+            }
+            other => Err(answered(other)),
+        }
+    }
+
+    async fn set_setting(&self, args: &Value) -> Result<String, Failure> {
+        let machine = opt_str(args, "machine").filter(|m| m != "this");
+        let key = need_str(args, "key")?;
+        let reset = args.get("reset").and_then(Value::as_bool).unwrap_or(false);
+        let command = if reset {
+            Command::ResetSetting {
+                machine: machine.clone(),
+                key: key.clone(),
+            }
+        } else {
+            let value = args
+                .get("value")
+                .cloned()
+                .ok_or_else(|| Failure::Failed("value is required unless reset is true".into()))?;
+            Command::SetSetting {
+                machine: machine.clone(),
+                key: key.clone(),
+                value,
+            }
+        };
+        let at = machine.as_deref().unwrap_or("this machine");
+        match self.ask.ask(command).await? {
+            Reply::Saved {
+                pinned,
+                restart_needed,
+            } => Ok(if pinned.contains(&key) {
+                format!("{key} saved on {at}; a command-line flag holds the running value until the node restarts without it")
+            } else if restart_needed.contains(&key) {
+                format!("{key} saved on {at}; it applies when that node restarts (restart_machine)")
+            } else {
+                format!("{key} changed on {at} and applied")
+            }),
+            other => Err(answered(other)),
         }
     }
 
@@ -1044,7 +1110,24 @@ pub fn list() -> Vec<Value> {
         tool(
             "apply_update",
             "Switch a machine's Cursio to the build it has downloaded and is waiting to switch to.",
-            false, true, json!({ "machine": machine }), &["machine"],
+            false, true, json!({ "machine": machine.clone() }), &["machine"],
+        ),
+        tool(
+            "settings",
+            "Every setting of a machine by key: its value, default, kind (with the values it takes), what changing it takes, and whether it waits for a restart.",
+            true, false, json!({ "machine": machine.clone() }), &[],
+        ),
+        tool(
+            "set_setting",
+            "Change one setting of a machine by key, as `settings` names it; applied there at once unless it waits for a restart. `reset` puts it back to its default.",
+            false, false,
+            json!({
+                "machine": machine,
+                "key": { "type": "string", "description": "e.g. audio.mic_gate, modules.clipboard" },
+                "value": { "description": "JSON of the setting's kind: true, -55, \"auto\", null to unset an optional one" },
+                "reset": { "type": "boolean", "description": "back to the default instead of setting value" },
+            }),
+            &["key"],
         ),
         tool(
             "phone_screenshot",

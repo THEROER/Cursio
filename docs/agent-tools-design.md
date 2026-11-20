@@ -67,6 +67,8 @@ stdout carries the protocol alone; the log goes to stderr and its file.
 | `apps_send` | destructive | `Command::AppSend`: a text message about a topic to the copies of an application on a machine, as its copy here would send one; fails saying offline, no copy listening, or not allowed (same consent as `apps_call`) |
 | `restart_machine` | destructive | `Command::Maintain(Restart)` |
 | `apply_update` | destructive | `Command::Maintain(ApplyUpdate)` |
+| `settings` | read-only | `Command::Settings`, here or on `machine` |
+| `set_setting` | writes | `Command::SetSetting` / `ResetSetting`: checked against the setting's kind and applied where it lives |
 
 Each carries MCP's annotations — `readOnlyHint`, `destructiveHint`,
 `idempotentHint`, and `openWorldHint` (every tool reaches beyond this
