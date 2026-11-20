@@ -33,7 +33,11 @@ pub mod session;
 pub mod tcp;
 #[cfg(test)]
 pub(crate) mod test_util;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod trust;
+#[cfg(feature = "websocket")]
+pub mod ws;
 
 pub use authenticated::{CarrierAuthenticated, PeerContext, Verifier};
 pub use carrier::{Carrier, CarrierRx, CarrierTx, TlsInfo};

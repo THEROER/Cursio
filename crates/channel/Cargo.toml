@@ -10,8 +10,21 @@ repository.workspace = true
 description = "Several kinds of traffic over one resumable, encrypted link: classes, lanes, a scheduler and a session that outlives its connection"
 readme = "README.md"
 
+[features]
+default = ["websocket", "tls"]
+# A carrier of one WebSocket binary message per frame (`ws`), what a browser
+# can speak.
+websocket = ["dep:tokio-tungstenite", "dep:futures"]
+# TLS under the TCP and WebSocket carriers (`tls`), with what it verified
+# reported to `CarrierAuthenticated`.
+tls = ["dep:rustls", "dep:tokio-rustls"]
+
 [dependencies]
 tokio.workspace = true
+tokio-tungstenite = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 async-trait.workspace = true
 snow.workspace = true
 sha2.workspace = true
@@ -39,3 +52,4 @@ windows-sys = { workspace = true, features = [
 # `start_paused`, so a resumable session's one-minute hold runs out in
 # virtual time.
 tokio = { version = "1", features = ["full", "test-util"] }
+rcgen.workspace = true

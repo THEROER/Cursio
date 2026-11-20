@@ -9,8 +9,7 @@ use async_trait::async_trait;
 use cursio_channel::authenticated::PeerContext;
 use cursio_channel::tcp::TcpCarrier;
 use cursio_channel::{
-    Carrier, CarrierAuthenticated, ChannelError, PeerIdentity, Revoked, Role, Trust, Verified,
-    Verifier,
+    Carrier, CarrierAuthenticated, PeerIdentity, Revoked, Role, Trust, Verified, Verifier,
 };
 
 /// Would trust anyone at all: the refusal must not depend on it.
@@ -44,10 +43,8 @@ async fn assert_refused(mut client: Box<dyn Carrier>, mut server: Box<dyn Carrie
         assert!(refused.to_string().contains("needs TLS"), "{refused}");
     }
     drop(client);
-    assert!(
-        matches!(server.recv().await, Err(ChannelError::Closed)),
-        "the token never crossed"
-    );
+    let after = server.recv().await;
+    assert!(after.is_err(), "the token never crossed: {after:?}");
 }
 
 #[tokio::test]
@@ -57,4 +54,19 @@ async fn carrier_authenticated_over_plain_tcp_is_refused() {
     let (client, accepted) = tokio::join!(TcpCarrier::connect(addr), listener.accept());
     let server = TcpCarrier::from_stream(accepted.unwrap().0).unwrap();
     assert_refused(Box::new(client.unwrap()), Box::new(server)).await;
+}
+
+#[cfg(feature = "websocket")]
+#[tokio::test]
+async fn carrier_authenticated_over_plain_ws_is_refused() {
+    use cursio_channel::ws;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{addr}/channel");
+    let (client, server) = tokio::join!(ws::connect(addr, &url), async {
+        ws::accept(listener.accept().await.unwrap().0).await
+    });
+    let (client, server) = (client.unwrap(), server.unwrap());
+    assert_eq!(client.kind(), "ws");
+    assert_refused(Box::new(client), Box::new(server)).await;
 }

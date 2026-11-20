@@ -379,6 +379,14 @@ either side of the move must still form a session.
   URL. A dialler that wants an existing session says so
   (`CarrierAuthenticated::resuming(tag)`); the acceptor finds it with
   `ResumeHandle::named_by(offer, &path)` and `attach` still re-proves it.
+- **The internet's carriers are features**, on by default for the crate and
+  off in the workspace's dependency on it, so Cursio and its phone build pull
+  no rustls: `websocket` (`ws::connect`/`accept` for `ws://`,
+  `connect_wss`/`accept_wss`; one binary message per frame, a text message
+  fails the carrier) and `tls` (`tls::TlsCarrier`, TCP behind TLS with the
+  usual length prefix). rustls uses ring, already in the lock; the caller
+  hands in its `ClientConfig`/`ServerConfig`, re-exported with `rustls` so
+  the versions match. The exporter is reported for TLS 1.3 only.
 
 ## Licence
 
@@ -386,7 +394,8 @@ either side of the move must still form a session.
 linking it keeps its own licence. Its code was written by the two authors of
 `cursio-transport`, THEROER and IMDelewer, both of whom agreed to this licence
 for it (2026-11-20). Nothing vendored and nothing GPL may enter it; its
-dependencies (`tokio`, `snow`, `tokio-tungstenite`, `thiserror`, `tracing`)
+dependencies (`tokio`, `snow`, `tokio-tungstenite`, `rustls`, `tokio-rustls`,
+`rand`, `thiserror`, `tracing`; `rcgen` for its tests and example)
 are MIT or Apache. It is mirrored to its own public repository the way
 `cursio-sdk` is (`cargo xtask sdk-mirror`).
 

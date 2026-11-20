@@ -47,7 +47,9 @@ cursio-queue = { path = "crates/queue" }
 cursio-protocol = { path = "crates/protocol" }
 cursio-app-protocol = { path = "crates/app-protocol", version = "0.7.1" }
 cursio-sdk = { path = "crates/sdk" }
-cursio-channel = { path = "crates/channel" }
+# Without its WebSocket and TLS carriers: Cursio rides its own carriers, and
+# rustls has no business in a phone build.
+cursio-channel = { path = "crates/channel", default-features = false }
 cursio-transport = { path = "crates/transport" }
 cursio-bluetooth = { path = "crates/bluetooth" }
 cursio-wifidirect = { path = "crates/wifidirect" }
@@ -140,6 +142,12 @@ base64 = "0.22"
 # application's web view through the DevTools tunnel; plain ws:// to
 # loopback, so no TLS.
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect"] }
+# `cursio-channel`'s TLS carriers, for a channel over the internet. ring, which
+# the lock already carries for rustls, rather than aws-lc-rs and its CMake.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# Certificates generated on the spot for the channel's TLS tests and example.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 # `config.toml`: a format people edit by hand, with comments, unlike the JSON
 # the trust store and identity are kept in.
 toml = "0.8"

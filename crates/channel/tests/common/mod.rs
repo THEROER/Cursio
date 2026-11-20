@@ -4,6 +4,9 @@
 
 #![allow(dead_code)]
 
+#[cfg(feature = "tls")]
+pub mod certs;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
