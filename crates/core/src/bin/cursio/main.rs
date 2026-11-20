@@ -74,6 +74,7 @@ mod modules;
 mod pairing;
 mod peer_session;
 mod process;
+mod settings_cli;
 
 fn main() -> anyhow::Result<()> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -163,7 +164,10 @@ async fn run() -> anyhow::Result<()> {
             .await?;
             Ok(())
         }
-        Command::Config => {
+        Command::Config {
+            action: Some(action),
+        } => settings_cli::run(action).await,
+        Command::Config { action: None } => {
             let config = cursio_core::config::Config::load(&config_path)?;
             let origin = match config_path.exists() {
                 true => "read from",
