@@ -17,6 +17,22 @@ pub struct Framebuffer {
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// The frame whose size the picture last took on; see [`Self::follow`].
+    since: Option<u32>,
+}
+
+/// What became of a decoded video picture offered to [`Framebuffer::admit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admitted {
+    /// Its size is the picture's: blit it.
+    Fits,
+    /// The stream came out at another size than its frames said, and the
+    /// picture took that size on, dropping its old `(width, height)`: blit it
+    /// and refit the window.
+    Resized { from: (u32, u32) },
+    /// Decoded from a frame older than the latest size change; drawing it
+    /// would undo that change.
+    Stale,
 }
 
 impl Framebuffer {
@@ -25,13 +41,62 @@ impl Framebuffer {
             pixels: vec![0; (width as usize) * (height as usize) * 4],
             width,
             height,
+            since: None,
         }
+    }
+
+    /// Take on the size the frame numbered `seq` brought, as
+    /// [`geometry_of`] read it.
+    ///
+    /// Remembering `seq` is what lets [`Self::admit`] tell a picture of the
+    /// new size from one decoded before it. The decoder runs behind the
+    /// frames — on its own thread on Linux, holding pictures back in Media
+    /// Foundation — so a picture of the old size can arrive after the resize
+    /// that replaced it. Adopting its size then shrank the picture back while
+    /// the session, which checks tiles against the size *it* last announced,
+    /// went on sending tiles of the new one: every one of them was refused as
+    /// "does not fit" until a tile happened to reach past the old edge.
+    pub fn follow(&mut self, seq: u32, change: Geometry) {
+        match change {
+            Geometry::Unchanged => return,
+            Geometry::Resize { width, height } => self.resize(width, height),
+            Geometry::Grow { width, height } => self.grow_to(width, height),
+        }
+        self.since = Some(seq);
+    }
+
+    /// Decide what to do with a decoded picture of `width`x`height`, from the
+    /// frame numbered `seq`.
+    pub fn admit(&mut self, seq: u32, width: u32, height: u32) -> Admitted {
+        // Frame numbers wrap; an older one is behind by less than half the range.
+        if self
+            .since
+            .is_some_and(|since| (seq.wrapping_sub(since) as i32) < 0)
+        {
+            return Admitted::Stale;
+        }
+        if (self.width, self.height) == (width, height) {
+            return Admitted::Fits;
+        }
+        let from = (self.width, self.height);
+        self.resize(width, height);
+        Admitted::Resized { from }
+    }
+
+    /// A new stream from another source: its frames are numbered afresh, so
+    /// the old stream's sizes say nothing about which of them is stale.
+    pub fn restart(&mut self) {
+        let (width, height) = (self.width, self.height);
+        self.resize(width, height);
+        self.since = None;
     }
 
     /// Grow/shrink to a new geometry, dropping old contents.
     ///
     /// Only for a size learnt from a video frame (see [`geometry_of`]), which
-    /// replaces the discarded pixels wholesale.
+    /// replaces the discarded pixels wholesale. A size a frame brought goes
+    /// through [`Self::follow`] instead, so later pictures can be judged
+    /// against it.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.pixels = vec![0; (width as usize) * (height as usize) * 4];
         self.width = width;
@@ -130,6 +195,38 @@ pub fn geometry_of(dirty: Rect, codec: TileCodec, width: u32, height: u32) -> Ge
         };
     }
     Geometry::Unchanged
+}
+
+/// The size a window's video stream last came at, to notice it starting over
+/// at another.
+///
+/// A host reopens its encoder whenever the window changes size, and the new
+/// stream opens on a keyframe carrying the new geometry. The decoder that read
+/// the old stream must not be handed it: FFmpeg's NVDEC decoder keeps the frame
+/// pool it allocated for the first stream and refuses a larger one ("AVHWFrames
+/// Context is already initialized with incompatible parameters", surfacing as
+/// `send_packet: Invalid argument`). The viewer then restarted the decoder
+/// having already thrown that keyframe away, and the window stood frozen until
+/// the host's next one. A fresh decoder for the new stream takes the keyframe.
+#[derive(Debug, Default)]
+pub struct VideoSize(Option<(u32, u32)>);
+
+impl VideoSize {
+    /// Whether a video frame covering `dirty` belongs to a stream of another
+    /// size than the last one did, so the decoder should start afresh.
+    pub fn starts_over(&mut self, dirty: Rect) -> bool {
+        let size = (
+            dirty.x.saturating_add(dirty.width),
+            dirty.y.saturating_add(dirty.height),
+        );
+        self.0.replace(size).is_some_and(|last| last != size)
+    }
+
+    /// The stream comes from another source now; its first frame starts no
+    /// stream over, since the decoder for it is new anyway.
+    pub fn forget(&mut self) {
+        self.0 = None;
+    }
 }
 
 /// Where a `src_w`x`src_h` picture lands inside a `dst_w`x`dst_h` area when
@@ -485,6 +582,105 @@ mod tests {
                 height: 1100
             }
         );
+    }
+
+    /// What Nocturne logged while Lightmoon maximised a window: the session
+    /// announced 1920 wide, a picture decoded from before the resize put the
+    /// window back to 960, and the host's 1920-wide tiles were refused.
+    #[test]
+    fn a_picture_decoded_before_a_resize_does_not_shrink_the_window_back() {
+        let mut fb = Framebuffer::new(960, 1032);
+        fb.follow(
+            10,
+            Geometry::Resize {
+                width: 1920,
+                height: 1032,
+            },
+        );
+
+        assert_eq!(fb.admit(9, 960, 1032), Admitted::Stale);
+        assert_eq!((fb.width, fb.height), (1920, 1032));
+        let band = rect(0, 0, 1920, 259);
+        fb.blit(band, &vec![0xAA; 1920 * 259 * 4])
+            .expect("a tile of the announced size fits");
+    }
+
+    #[test]
+    fn a_picture_decoded_before_a_tile_grew_the_window_is_not_drawn_over_it() {
+        let mut fb = Framebuffer::new(1824, 1004);
+        fb.follow(
+            40,
+            Geometry::Grow {
+                width: 1825,
+                height: 1005,
+            },
+        );
+        assert_eq!(fb.admit(39, 1824, 1004), Admitted::Stale);
+        assert_eq!((fb.width, fb.height), (1825, 1005));
+    }
+
+    #[test]
+    fn pictures_from_the_resize_on_are_drawn() {
+        let mut fb = Framebuffer::new(960, 1032);
+        fb.follow(
+            10,
+            Geometry::Resize {
+                width: 1920,
+                height: 1032,
+            },
+        );
+        assert_eq!(fb.admit(10, 1920, 1032), Admitted::Fits);
+        assert_eq!(
+            fb.admit(11, 1280, 720),
+            Admitted::Resized { from: (1920, 1032) }
+        );
+        assert_eq!((fb.width, fb.height), (1280, 720));
+    }
+
+    #[test]
+    fn a_picture_is_judged_against_a_resize_across_the_frame_number_wrap() {
+        let mut fb = Framebuffer::new(4, 2);
+        fb.follow(
+            u32::MAX,
+            Geometry::Grow {
+                width: 8,
+                height: 4,
+            },
+        );
+        assert_eq!(fb.admit(u32::MAX - 3, 4, 2), Admitted::Stale);
+        assert_eq!(fb.admit(2, 8, 4), Admitted::Fits);
+    }
+
+    #[test]
+    fn a_restarted_stream_is_not_judged_by_the_old_streams_frame_numbers() {
+        let mut fb = Framebuffer::new(4, 2);
+        fb.follow(
+            5000,
+            Geometry::Resize {
+                width: 8,
+                height: 4,
+            },
+        );
+        fb.restart();
+        assert_eq!(fb.admit(1, 8, 4), Admitted::Fits);
+    }
+
+    #[test]
+    fn an_unchanged_geometry_leaves_later_pictures_alone() {
+        let mut fb = Framebuffer::new(4, 2);
+        fb.follow(7, Geometry::Unchanged);
+        assert_eq!(fb.admit(1, 4, 2), Admitted::Fits);
+    }
+
+    #[test]
+    fn a_video_stream_starts_over_only_when_its_size_changes() {
+        let mut size = VideoSize::default();
+        assert!(!size.starts_over(rect(0, 0, 960, 1032)), "the first stream");
+        assert!(!size.starts_over(rect(0, 0, 960, 1032)));
+        assert!(size.starts_over(rect(0, 0, 1920, 1032)));
+        assert!(!size.starts_over(rect(0, 0, 1920, 1032)));
+        size.forget();
+        assert!(!size.starts_over(rect(0, 0, 640, 480)), "a new source");
     }
 
     #[test]

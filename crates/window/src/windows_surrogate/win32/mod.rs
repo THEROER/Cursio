@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
-use crate::framebuffer::Framebuffer;
+use crate::framebuffer::{Admitted, Framebuffer};
 use crate::video_decoder_win::VideoDecoder;
 
 use super::{unseen, SurrogateCommand, Win32Command};
@@ -481,7 +481,14 @@ pub(crate) fn run(
                         presented_seq =
                             Some(presented_seq.map_or(seq, |previous| previous.max(seq)));
                     }
-                    Ok(SurrogateCommand::VideoPacket { seq, packet }) => {
+                    Ok(SurrogateCommand::VideoPacket {
+                        seq,
+                        packet,
+                        restart,
+                    }) => {
+                        if restart {
+                            decoder = None;
+                        }
                         if decoder.is_none() {
                             match VideoDecoder::open() {
                                 Ok(d) => decoder = Some(d),
@@ -499,15 +506,17 @@ pub(crate) fn run(
                                 let state = &*state_ptr;
                                 for pic in pictures {
                                     let mut fb = state.fb.borrow_mut();
-                                    if fb.width != pic.width || fb.height != pic.height {
-                                        let old = (fb.width, fb.height);
-                                        fb.resize(pic.width, pic.height);
+                                    match fb.admit(seq, pic.width, pic.height) {
+                                        Admitted::Stale => continue,
+                                        Admitted::Fits => {}
                                         // The encoder changed resolution
                                         // mid-stream — a phone turned, or a
                                         // quality change; follow it, or every
                                         // frame from here is squeezed into the
                                         // old shape.
-                                        size_for(hwnd, is_view, old, (pic.width, pic.height));
+                                        Admitted::Resized { from } => {
+                                            size_for(hwnd, is_view, from, (pic.width, pic.height))
+                                        }
                                     }
                                     let full = Rect {
                                         x: 0,
@@ -537,27 +546,16 @@ pub(crate) fn run(
                             wants_keyframe.store(true, Ordering::Relaxed);
                         }
                     }
-                    Ok(SurrogateCommand::Resize { width, height }) => {
+                    Ok(SurrogateCommand::Geometry { seq, change }) => {
                         let state = &*state_ptr;
-                        let old = {
+                        let (old, new) = {
                             let mut fb = state.fb.borrow_mut();
                             let old = (fb.width, fb.height);
-                            fb.resize(width, height);
-                            old
+                            fb.follow(seq, change);
+                            (old, (fb.width, fb.height))
                         };
                         // The host's window was resized, so this one follows it.
-                        size_for(hwnd, is_view, old, (width, height));
-                        painted = true;
-                    }
-                    Ok(SurrogateCommand::Grow { width, height }) => {
-                        let state = &*state_ptr;
-                        let old = {
-                            let mut fb = state.fb.borrow_mut();
-                            let old = (fb.width, fb.height);
-                            fb.grow_to(width, height);
-                            old
-                        };
-                        size_for(hwnd, is_view, old, (width, height));
+                        size_for(hwnd, is_view, old, new);
                         painted = true;
                     }
                     Ok(SurrogateCommand::Platform(Win32Command::Restart { title })) => {
@@ -566,9 +564,7 @@ pub(crate) fn run(
                         // mean nothing to it.
                         decoder = None;
                         let state = &*state_ptr;
-                        let mut fb = state.fb.borrow_mut();
-                        let (w, h) = (fb.width, fb.height);
-                        fb.resize(w, h);
+                        state.fb.borrow_mut().restart();
                         if let Some(view) = state.view.as_ref() {
                             *view.hint.borrow_mut() = Some(if title.is_empty() {
                                 VIEW_HINT.to_string()
