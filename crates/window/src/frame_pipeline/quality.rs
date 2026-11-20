@@ -145,6 +145,9 @@ pub(super) const IN_FLIGHT_GRACE: std::time::Duration = std::time::Duration::fro
 /// reused is counted as late, which a viewer this far behind is anyway.
 pub(super) const SENT_TIMES_KEPT: usize = 256;
 
+/// How long frame round trips are gathered before they are logged.
+pub(super) const ROUND_TRIP_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What the ack path keeps between acks, behind one lock.
 #[derive(Debug, Default)]
 pub(super) struct AckState {
@@ -152,6 +155,54 @@ pub(super) struct AckState {
     threshold: ThresholdLadder,
     /// The newest `seq` any ack has carried.
     last_acked: Option<u32>,
+    round_trips: FrameRoundTrips,
+}
+
+/// How long a video frame takes from being queued here to its ack arriving:
+/// the session's queue, the wire, the viewer's decoder and its window, and the
+/// ack's way back.
+///
+/// The one figure that says what the person looking at the viewer sees. The
+/// queue's own delay and the link's round trip are each measured elsewhere,
+/// but neither includes the decoder or the paint. An ack names the newest
+/// frame the viewer has shown, so while video flows the figure overstates the
+/// trip by at most a frame interval plus how long the viewer held the ack; it
+/// is taken only while video flows, since an ack for a still window names a
+/// frame shown long ago.
+#[derive(Debug, Default)]
+pub(super) struct FrameRoundTrips {
+    millis: Vec<u32>,
+    since: Option<std::time::Instant>,
+}
+
+/// One closed window of [`FrameRoundTrips`], in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RoundTripSummary {
+    samples: usize,
+    p50: u32,
+    p99: u32,
+    max: u32,
+}
+
+impl FrameRoundTrips {
+    /// Record one trip; returns the window's figures when this closes it.
+    fn record(&mut self, millis: u32, now: std::time::Instant) -> Option<RoundTripSummary> {
+        let since = *self.since.get_or_insert(now);
+        self.millis.push(millis);
+        if now.saturating_duration_since(since) < ROUND_TRIP_WINDOW {
+            return None;
+        }
+        self.since = Some(now);
+        let mut all = std::mem::take(&mut self.millis);
+        all.sort_unstable();
+        let at = |fraction: f64| all[((all.len() - 1) as f64 * fraction).round() as usize];
+        Some(RoundTripSummary {
+            samples: all.len(),
+            p50: at(0.5),
+            p99: at(0.99),
+            max: all[all.len() - 1],
+        })
+    }
 }
 
 /// The current lossless/lossy threshold and lossy bitrate, shared between the
@@ -262,6 +313,18 @@ impl AdaptiveQuality {
         (sent_seq - acked_seq) - fresh
     }
 
+    /// Milliseconds since frame `seq` was queued, if its queue time is still
+    /// on record.
+    fn round_trip(&self, seq: u32, now: std::time::Instant) -> Option<u32> {
+        let slot =
+            self.sent_at[seq as usize % SENT_TIMES_KEPT].load(std::sync::atomic::Ordering::Relaxed);
+        if (slot >> 32) as u32 != seq {
+            return None;
+        }
+        let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u32;
+        Some(now_ms.wrapping_sub(slot as u32))
+    }
+
     /// Whether video went out recently enough for acks to say anything about
     /// how much the link carries.
     fn video_active(&self) -> bool {
@@ -322,6 +385,19 @@ impl AdaptiveQuality {
             return None;
         }
         acks.last_acked = Some(acked_seq);
+        if let Some(window) = self
+            .round_trip(acked_seq, now)
+            .filter(|_| active)
+            .and_then(|millis| acks.round_trips.record(millis, now))
+        {
+            tracing::debug!(
+                samples = window.samples,
+                p50_ms = window.p50,
+                p99_ms = window.p99,
+                max_ms = window.max,
+                "video frame queued, shown by the viewer, and acked"
+            );
+        }
         let gap = self.late_frames(acked_seq, sent_seq, now);
         if let Some(pct) = acks.bitrate.observe(gap, active, now) {
             self.bitrate_pct
@@ -464,6 +540,47 @@ pub fn pick_codec(tile_len: usize) -> TileCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_round_trips_close_a_window_with_its_spread() {
+        let mut trips = FrameRoundTrips::default();
+        let start = std::time::Instant::now();
+        for (n, millis) in [40, 10, 30, 20].into_iter().enumerate() {
+            assert!(trips
+                .record(millis, start + std::time::Duration::from_millis(n as u64))
+                .is_none());
+        }
+        let window = trips
+            .record(500, start + ROUND_TRIP_WINDOW)
+            .expect("the window has run its length");
+        assert_eq!(
+            window,
+            RoundTripSummary {
+                samples: 5,
+                p50: 30,
+                p99: 500,
+                max: 500,
+            }
+        );
+        assert!(trips
+            .record(
+                10,
+                start + ROUND_TRIP_WINDOW + std::time::Duration::from_millis(1)
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn an_acked_frame_is_timed_from_when_it_was_queued() {
+        let q = AdaptiveQuality::default();
+        let queued = std::time::Instant::now();
+        q.note_queued(5, queued);
+        assert_eq!(
+            q.round_trip(5, queued + std::time::Duration::from_millis(42)),
+            Some(42)
+        );
+        assert_eq!(q.round_trip(5 + SENT_TIMES_KEPT as u32, queued), None);
+    }
 
     #[test]
     fn network_budget_caps_the_encoder_and_congestion_disables_lossless() {
