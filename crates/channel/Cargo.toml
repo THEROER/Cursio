@@ -15,6 +15,8 @@ tokio.workspace = true
 async-trait.workspace = true
 snow.workspace = true
 sha2.workspace = true
+# The session tag `CarrierAuthenticated` issues, from the OS's generator.
+rand.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

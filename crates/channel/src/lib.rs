@@ -12,7 +12,8 @@
 //! - [`seal`]: that nobody else read or wrote it (Noise transport mode).
 //! - [`carrier`]: moving framed bytes — [`tcp`], [`mem`], or the caller's own.
 //! - [`trust`]: who the other end is, as a verifier proved it, and whether it
-//!   still is; [`noise`] holds the keys of [`noise::NoisePsk`].
+//!   still is; [`noise::NoisePsk`] keys Noise with a shared secret,
+//!   [`CarrierAuthenticated`] takes it from verified TLS and a token.
 //!
 //! This crate was extracted from Cursio's transport, which is its first user
 //! and declares its own classes on top of it; `docs/channel-design.md` in the
@@ -20,6 +21,7 @@
 //! discovery and pairing are the caller's, and so is what makes a peer
 //! trusted — the crate only insists that it was verified.
 
+pub mod authenticated;
 pub mod carrier;
 mod classes;
 mod envelope;
@@ -33,6 +35,7 @@ pub mod tcp;
 pub(crate) mod test_util;
 pub mod trust;
 
+pub use authenticated::{CarrierAuthenticated, PeerContext, Verifier};
 pub use carrier::{Carrier, CarrierRx, CarrierTx, TlsInfo};
 pub use classes::{Class, ClassId, Classes, Lane, LaneId, Window};
 pub use envelope::{Delivery, Envelope};

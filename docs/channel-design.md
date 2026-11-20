@@ -366,6 +366,19 @@ either side of the move must still form a session.
   lane, is refused whatever the rule says. A refusal is reported as
   `SessionEvent::Unauthorized` and logged; not enforcing, the message is
   delivered; enforcing, it is not, and the session ends.
+- **`CarrierAuthenticated` takes a `Verifier`** (`verify(PeerContext { tls,
+  token, renewal })`, `check`) and refuses a carrier whose `tls()` is `None`
+  before sending anything; only `insecure_in_memory_for_tests` lets the
+  in-memory carrier by. `Seal::identity` is crate-private, so this trust is
+  the only way to a seal that leaves frames to TLS. Its opening exchange is
+  one frame each way inside TLS: `OPEN` (`"CA"`, version 1, a resuming flag
+  with the session's exporter-bound offer, `[u32 len][token]`), then
+  `ACCEPT` (`0x00`, a 16-byte tag the acceptor drew from the OS generator,
+  its own token) or a bare `REFUSE` (`0x01`) — the reason stays in the
+  acceptor's log. A token travels only there and in `REAUTH`, never in a
+  URL. A dialler that wants an existing session says so
+  (`CarrierAuthenticated::resuming(tag)`); the acceptor finds it with
+  `ResumeHandle::named_by(offer, &path)` and `attach` still re-proves it.
 
 ## Licence
 

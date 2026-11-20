@@ -100,6 +100,10 @@ impl Seal {
         Self(Some(Arc::new(Mutex::new(state))))
     }
 
+    pub(crate) fn identity() -> Self {
+        Self(None)
+    }
+
     /// Whether frames leave this seal as they came: TLS keeps them instead.
     pub fn is_identity(&self) -> bool {
         self.0.is_none()
