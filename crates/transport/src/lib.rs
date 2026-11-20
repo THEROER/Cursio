@@ -28,6 +28,7 @@ pub mod resume;
 mod send_backlog;
 pub mod stream;
 pub mod tcp;
+pub mod tcp_info;
 #[cfg(test)]
 pub(crate) mod test_util;
 
@@ -218,6 +219,12 @@ pub trait TransportTx: Send {
     /// yields while input flows; see `congestion.rs`. The default does
     /// nothing, for a link with no background traffic to hold back.
     fn note_input(&self) {}
+
+    /// The kernel's counters for the TCP connection this writes to, for a
+    /// sender that writes to one; see [`tcp_info`]. `None` for any other.
+    fn tcp_counters(&self) -> Option<std::io::Result<tcp_info::TcpCounters>> {
+        None
+    }
 }
 
 /// The receive half of a split [`Transport`].

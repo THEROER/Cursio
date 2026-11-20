@@ -160,6 +160,10 @@ impl TransportTx for TcpTx {
         self.write.flush().await?;
         Ok(())
     }
+
+    fn tcp_counters(&self) -> Option<std::io::Result<crate::tcp_info::TcpCounters>> {
+        Some(crate::tcp_info::read(self.write.as_ref()))
+    }
 }
 
 /// Receive half of a split [`TcpTransport`].

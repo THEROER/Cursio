@@ -210,8 +210,13 @@ impl Inner {
 
         let weak = Arc::downgrade(self);
         let write_noise = noise.clone();
+        let lane = kind.lane();
         let write = tokio::spawn(async move {
+            let mut retransmits = crate::tcp_info::RetransmitLog::default();
             while let Some(frame) = next_by_lane(&mut frames).await {
+                if let Some(lane) = lane {
+                    retransmits.sample(tx.as_ref(), lane);
+                }
                 // Whatever else is already waiting leaves in the same write;
                 // see `TransportTx::send_batch` for what that saves.
                 let mut batch = vec![frame];
