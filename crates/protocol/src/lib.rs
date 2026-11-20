@@ -28,6 +28,7 @@ pub mod notify;
 pub mod paths;
 pub mod probe;
 pub mod service;
+pub mod settings;
 pub mod share;
 pub mod update;
 pub mod usb;

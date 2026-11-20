@@ -40,6 +40,8 @@ pub mod quiet;
 /// The session bus, from a thread outside the runtime.
 #[cfg(target_os = "linux")]
 pub mod session_bus;
+/// Every setting, described once: its key, its kind, what changing it takes.
+pub mod settings;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 

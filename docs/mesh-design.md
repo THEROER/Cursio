@@ -258,17 +258,33 @@ negotiated modules are settled at startup, and a fresh start is the one reload
 guaranteed correct. For a toggle in the app that price was wrong — every link
 dropped, the peer's disks unmounted, and on Windows the new process asked for
 elevation again. Now a change lands where it belongs (`core-base/src/live.rs`,
-`core/src/reconfigure.rs`):
+`core/src/reconfigure.rs`).
 
-| Setting | Applied |
-|---|---|
-| `modules.clipboard`, `audio`, `files`, `usb` | live: a switch the registry reads when it advertises, then renegotiated on every link |
-| `position` | live: sent to every peer; both sides re-derive the edge between them |
-| `modules.input` off | live: input stops being forwarded and a cursor that was away comes home |
-| `modules.input` on | live when capture exists (input was on at startup); otherwise at the next restart |
-| `modules.screen_host`, `files.share`, `audio.render_device` | live: the module that read it at build time is restarted on both ends of every link |
-| `input.mac_modifiers` | live: the keymap is replaced |
-| `port`, `modules.remote_screen`, `airplay.*` | **restart**: the listener owns the port, the portal backend claims a D-Bus name, the receiver binds and announces at startup |
+Where is decided per setting, once, in the settings registry
+(`core-base/src/settings.rs`): every setting is an entry with its key in
+`config.toml`, the kind of value it takes, the platforms it exists on and how
+a change reaches a running node. `live::plan` and `live::restart_needed` are
+derived from those entries rather than written per setting, values are read
+and written by key on the TOML form of the config (so the file's own
+deserializer refuses what does not fit), and a test builds a config with
+every field set and requires each value to lie under an entry — a field that
+nobody can see or that silently does nothing does not get past it. A setting
+of another platform (`audio.render_device` off Windows) changes nothing.
+
+| How (`Apply`) | Settings | Applied |
+|---|---|---|
+| `Switch` | `modules.clipboard`, `audio`, `files`, `usb`, `window`, `notify`, `media`, `calls`, `messages`, `gallery`, `share`, `direct` | live: a switch the registry reads when it advertises, then renegotiated on every link. A phone follows only the switches that exist there, so not `audio` or `files`, which it always runs |
+| `Relink` | `position`, `layout` | live: sent to every peer; both sides re-derive the edge between them |
+| `Handed` | `modules.input`, `input.mac_modifiers`, `input.crossing`, `audio.mic_gate`, `calls.*` | live: handed to the piece that uses it. Input off stops forwarding and brings a cursor that was away home; on, it needs capture, which exists only when input was on at startup |
+| `Module` | `modules.screen_host`, `files.share`, `audio.render_device` | live: the module that read it at build time is restarted on both ends of every link |
+| `Read` | `bluetooth.*`, `update.*`, `apps`, `package_access` | live: read at every use |
+| `Process` | `port`, `modules.remote_screen`, `airplay.*`, `files.cache_gb` | **restart**: the listener owns the port, the portal backend claims a D-Bus name, the receiver binds and announces at startup, the read cache opens once |
+
+Modules and applications built outside the repository declare their own
+settings at run time (`settings::register`) under `ext.<module>.` or
+`apps.<id>.settings.`, which the file keeps as tables; they may be read at
+use, switch a module, or restart one, but not be handed to a piece of the
+node by name, since none exists for them.
 
 A running link renegotiates with `Message::Reconfigure` (protocol v18): the
 sender's full advert set and position, plus any modules to restart. Both sides
