@@ -582,7 +582,8 @@ connections are *paths* under it:
   delivered — so every frame reaches the session at most once, which for a key
   press is the difference between typing once and twice.
 - **Fresh state is not replayed.** Pointer motion, scroll, sound and pixels
-  (`Message::is_lossy`) are numbered but never kept: replayed after a gap,
+  (`Delivery::Fresh`, see "Delivery" in `transport-design.md`) are numbered but
+  never kept: replayed after a gap,
   motion would jump the cursor by everything it moved meanwhile and old sound
   would play over new — Mosh's lesson. Presses and releases are never lossy.
 - **Which connection joins.** `Hello::resumable` lists every session a node

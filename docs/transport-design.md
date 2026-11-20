@@ -52,9 +52,11 @@ frames already removed from the queues as well as frames still queued.
 
 Capture already uses a bounded channel and resets its encoder/differ when a
 capture update cannot be queued. The window pumps stop pulling at their video
-high-water mark. Encoded reference frames are not arbitrarily discarded in the
-transport: their dependencies matter. After a connection gap, stale lossy data
-is not replayed, and the existing keyframe/resynchronisation path repairs video.
+high-water mark. Video is dropped in the transport only whole and only for age
+(see "Delivery" below), never to make room: a frame's dependants make a
+dropped one cost a keyframe. After a connection gap or such a drop the viewer
+sees its frame numbers skip and asks for the whole picture
+(`surrogate_front.rs`), which repairs video and tiles alike.
 
 ## Process queues and input overload
 
@@ -166,6 +168,89 @@ presentation feedback remains another bound. Forwarded AirPlay is already
 encoded upstream and cannot obey a local encoding target without transcoding;
 the macOS capture helper likewise has no live encoder control yet. They still
 use bounded queues and independent video delivery.
+
+## Delivery
+
+A message's kind declares two things, not one: its `Priority`, which says what
+goes first, and its `Delivery` (`protocol/src/lib.rs`, `Message::delivery`),
+which says what a late copy is worth. They are independent — sound is urgent
+and worthless once late, a directory listing urgent and needed however late, a
+file chunk neither — and the module that owns a message is the only party that
+knows the second. Delivery is not on the wire: each end decides for what it
+sends, so a message's choice changes without a protocol bump.
+
+- `Reliable`: exactly once, in order within its lane, resent after a dropped
+  connection. The default.
+- `Fresh { within: None }`: never resent after a dropped connection (Mosh's
+  lesson). Pointer motion and scroll, local and in a transferred window. A move
+  waiting behind a stalled one is folded into it rather than dropped for age:
+  on a Bluetooth path, where a phone's audio pauses the radio for a second at a
+  time, dropping would lose motion the hand really made.
+- `Fresh { within: Some(t) }`: also dropped whole, unsent, by a sender that
+  reaches it more than `t` after it was queued (`priority.rs`). Sound at
+  `audio::FRESH_FOR` (250 ms, the same bound the listener's playback feed
+  applies on arrival) and window frames at `window::FRAME_FRESH_FOR` (300 ms,
+  four times the video budget's target queue, so rate control acts long before
+  age does). Only a message's first frame is judged; one part-way out is
+  finished. Drops are counted per class and logged with the queue-delay window.
+
+The limit of doing this over TCP is plain: the choice can be made only until a
+frame is handed to the socket. After that the kernel resends a lost segment
+however late, and everything behind it in that lane waits. Lanes keep one
+class's loss from holding another; nothing keeps a loss from holding its own
+lane. That is the cost a datagram transport would remove, for exactly the
+`Fresh` messages.
+
+### Measuring before choosing a transport
+
+Three figures decide whether that cost is worth a new transport, and each is
+now logged:
+
+- **Retransmissions per lane** (`tcp_info.rs`, every 10 s at debug): the
+  kernel's own count of what it sent and resent on each network path — Linux
+  `TCP_INFO` in segments, Windows `SIO_TCP_INFO` in bytes. A lane that resends
+  nothing gains nothing from skipping a loss.
+- **Video frame round trip** (`frame_pipeline/quality.rs`, every 10 s at
+  debug): from a frame being queued to the viewer's ack naming it — queue, wire,
+  decoder, paint and the ack's return. An upper bound by up to one frame
+  interval, taken only while video flows.
+- **Sound** already reports arrival gaps and lateness (`audio health`), and the
+  link's interactive round trip is logged by the session.
+
+### Datagrams: QUIC or our own UDP
+
+If the figures show lanes stalling behind resends, `Fresh` traffic moves to a
+transport that may skip a loss. Two shapes were weighed:
+
+| | A UDP lane beside the TCP ones | QUIC (`quinn`) as the network path |
+|---|---|---|
+| `Reliable` | stays on the four TCP lanes | QUIC streams, one connection |
+| `Fresh` larger than a datagram | ours to write: fragmenting, reassembly, deadline, loss report | a stream per message, reset at its deadline |
+| Small `Fresh` | ours to write | RFC 9221 datagrams |
+| Congestion control | the kernel's for TCP beside ours for UDP, contending for one radio | one controller for everything |
+| Loss detection, MTU, replay window | ours to write | done |
+| Keys | Noise as now | TLS 1.3; see below |
+| Bluetooth | unchanged | unchanged |
+
+Either way some things do not move. TCP stays: every connection opens with the
+frozen `Preamble`, and that is how a build of any age is updated, so a TCP
+listener is permanent, and it is the fallback where UDP is blocked. Bluetooth
+stays a byte stream under `ResumableLink`; on it `Fresh` is honoured the only
+way a stream allows, by dropping at the sender, which is what the TCP lanes do
+today. And Windows needs an inbound UDP firewall rule, whose absence must show
+in `cursio path` rather than as a quiet fall back to TCP.
+
+TLS is not the obstacle it first looks like. Pairing stays the root of trust:
+each node gains a long-term key (a self-signed certificate or a raw public
+key), and its fingerprint is exchanged over the already-trusted Noise session
+the first time two builds that both speak QUIC meet, so no machine is paired
+again and TLS only checks a pinned key.
+
+QUIC is the choice if the move is made. Video with a deadline needs
+fragmenting, a deadline per message, a loss report to the encoder and a
+congestion controller that does not fight the kernel's — about half of QUIC,
+written fresh. Our own UDP lane wins only if the move stops at sound and small
+datagrams. The `Delivery` API is the same for both, which is why it came first.
 
 ## Recovery and path authentication
 
