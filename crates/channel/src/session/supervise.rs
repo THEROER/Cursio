@@ -27,10 +27,21 @@ pub(super) async fn supervise(weak: Weak<Inner>) {
     let mut tick = tokio::time::interval(TICK);
     let mut last_ack = Instant::now();
     let mut last_keepalive = Instant::now();
+    let mut last_check = Instant::now();
     loop {
         tick.tick().await;
         let Some(inner) = weak.upgrade() else { return };
         let now = Instant::now();
+        if let Some(binding) = &inner.binding {
+            let wall = std::time::SystemTime::now();
+            if binding.past_deadline(wall) || now.duration_since(last_check) >= binding.check_every
+            {
+                last_check = now;
+                if !inner.verify_peer() {
+                    return;
+                }
+            }
+        }
         let mut silent: Vec<(u64, Duration)> = Vec::new();
         let mut degraded = None;
         let mut end = None;

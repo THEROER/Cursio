@@ -124,6 +124,8 @@ impl<T: Transport> EncryptedTransport<T> {
             seal: self.seal,
             kind: kind.into(),
             direct,
+            peer: None,
+            tls: None,
         }
     }
 }

@@ -85,6 +85,9 @@ impl<E: Envelope> ResumableRx<E> {
                 if let Some(id) = part {
                     self.lossy_parts[index].remove(&id);
                 }
+                if !self.inner.verify_peer() {
+                    return Err(ChannelError::Closed);
+                }
                 E::decode(&body).map(Some)
             }
             link_tag::ACK | link_tag::RESUME => {

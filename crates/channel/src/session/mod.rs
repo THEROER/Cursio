@@ -62,10 +62,11 @@
 //!
 //! ## One door in, one way out
 //!
-//! Every connection joins through [`ResumeHandle::attach`], which is where a
-//! trust that is re-checked on every join will answer; every end goes through
-//! one place that carries its reason (`Inner::end`), whether the hold ran
-//! out, the caller ended it, or a trust withdrew.
+//! Every connection joins through [`ResumeHandle::attach`], where a session
+//! bound to an identity re-proves the joining connection (`bind`); every end
+//! goes through one place that carries its reason (`Inner::end`), whether the
+//! hold ran out, the caller ended it, or a trust withdrew, and it is reported
+//! to the application as [`SessionEvent::Ended`].
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -88,7 +89,9 @@ use crate::{
     SessionTag,
 };
 
+mod bind;
 mod congestion;
+mod events;
 mod frame;
 mod inner;
 mod receive;
@@ -96,7 +99,13 @@ mod send;
 mod state;
 mod supervise;
 
+pub use bind::{offered_tag, SessionOptions, CHECK_EVERY};
+pub use events::{SessionEvent, SessionEvents};
 pub use receive::ResumableRx;
+
+use crate::carrier::TlsInfo;
+use crate::session::bind::Binding;
+use crate::trust::Verified;
 
 /// How long a session waits, with no path at all, for one to come back.
 pub const HOLD: Duration = Duration::from_secs(60);
@@ -189,10 +198,17 @@ pub struct Path {
     pub kind: PathKind,
     /// Over a shorter route that may go away, rather than through the router.
     pub direct: bool,
+    /// Who the connection's opening proved, for a session bound to an
+    /// identity; see [`Self::proving`].
+    pub peer: Option<Verified>,
+    /// What the TLS under the connection verified, taken from the carrier
+    /// before it was split.
+    pub tls: Option<Arc<TlsInfo>>,
 }
 
 impl Path {
     pub fn new(carrier: Box<dyn crate::Carrier>, seal: Seal, kind: PathKind, direct: bool) -> Self {
+        let tls = carrier.tls().cloned().map(Arc::new);
         let (tx, rx) = carrier.split();
         Self {
             tx,
@@ -200,7 +216,16 @@ impl Path {
             seal,
             kind,
             direct,
+            peer: None,
+            tls,
         }
+    }
+
+    /// The connection proved `peer`; a bound session admits it only as the
+    /// identity the session was opened by.
+    pub fn proving(mut self, peer: Verified) -> Self {
+        self.peer = Some(peer);
+        self
     }
 
     pub fn kind(&self) -> PathKind {
@@ -393,7 +418,22 @@ impl ResumeHandle {
             seal,
             kind,
             direct,
+            peer,
+            tls,
         } = path;
+        if let Some(binding) = &self.0.binding {
+            let now = std::time::SystemTime::now();
+            if let Err(why) = binding.admit(peer.as_ref(), now) {
+                tracing::warn!(session = %self.0.label(), %why, "a connection was refused the session");
+                return Err(ChannelError::Other(format!(
+                    "the connection may not join: {why}"
+                )));
+            }
+            if !self.0.verify_peer() {
+                return Err(ChannelError::Other("the session is over".into()));
+            }
+        }
+        let offered = offered_tag(&self.tag(), tls.as_ref().and_then(|t| t.exporter.as_ref()));
         let classes = &self.0.classes;
         // Both ends mark the connection alike (each sees its own address on
         // the group), so both propose a lane missing from the same set.
@@ -406,7 +446,7 @@ impl ResumeHandle {
             (state.delivered(), state.missing_lane(class))
         };
         let mut resume = resume_frame(&delivered, proposed);
-        resume.extend_from_slice(&self.tag());
+        resume.extend_from_slice(&offered);
         tx.send(seal.seal(&resume)?).await?;
         let answer = tokio::time::timeout(RESUME_WAIT, rx.recv())
             .await
@@ -420,7 +460,7 @@ impl ResumeHandle {
             ));
         }
         let snapshot_len = 1 + classes.lanes().len() * 8 + 1;
-        if tagged.len() != snapshot_len + self.tag().len() || tagged[snapshot_len..] != self.tag() {
+        if tagged.len() != snapshot_len + offered.len() || tagged[snapshot_len..] != offered {
             return Err(ChannelError::Other(
                 "the path belongs to a different session".into(),
             ));
@@ -450,8 +490,51 @@ impl ResumeHandle {
             seal,
             kind,
             direct,
+            peer: None,
+            tls,
         });
         Ok(())
+    }
+
+    /// Whether `offer`, which a connection's opening exchange named, names
+    /// this session over `path`; see [`offered_tag`].
+    pub fn named_by(&self, offer: &SessionTag, path: &Path) -> bool {
+        let expected = offered_tag(
+            &self.tag(),
+            path.tls.as_ref().and_then(|t| t.exporter.as_ref()),
+        );
+        // Not a secret comparison worth hiding the timing of: a wrong offer
+        // only makes this end refuse, and the join itself re-proves both ends.
+        expected == *offer
+    }
+
+    /// When the session ends unless the peer proves itself again; `None` for
+    /// a session no trust binds, or one whose proofs do not expire.
+    pub fn deadline(&self) -> Option<std::time::SystemTime> {
+        self.0.binding.as_ref().and_then(Binding::deadline)
+    }
+
+    /// Send the peer a fresh proof of this end's identity (`REAUTH`), to
+    /// carry the session past the deadline the last one set. Over the path
+    /// carrying the interactive lane; an error when there is none, so the
+    /// caller tries again once a path is back.
+    pub async fn reauthenticate(&self, proof: Vec<u8>) -> Result<(), ChannelError> {
+        let writer = {
+            let state = self.0.lock();
+            if let Some(why) = &state.ended {
+                return Err(ChannelError::Other(format!("the session is over: {why}")));
+            }
+            state
+                .carrying(LaneId::INTERACTIVE, Instant::now())
+                .map(|path| path.control().clone())
+        };
+        let writer = writer.ok_or_else(|| {
+            ChannelError::Other("no path carries the session to send a fresh proof on".into())
+        })?;
+        let mut frame = Vec::with_capacity(1 + proof.len());
+        frame.push(link_tag::REAUTH);
+        frame.extend_from_slice(&proof);
+        writer.send(frame).await.map_err(|_| ChannelError::Closed)
     }
 }
 
@@ -460,12 +543,40 @@ pub struct ResumableLink<E> {
     inner: Arc<Inner>,
     rx: Option<ResumableRx<E>>,
     tx: Option<PrioritizedTx<E>>,
+    events: Option<SessionEvents<E>>,
 }
 
 impl<E: Envelope> ResumableLink<E> {
     /// Start a session over `first`, known to both ends as `tag`. Spawns its
     /// tasks, so it must run inside the runtime the session will.
     pub fn new(first: Path, tag: SessionTag, classes: Arc<Classes>) -> (Self, ResumeHandle) {
+        Self::with_options(first, tag, classes, SessionOptions::default())
+            .expect("a session no trust binds asks nothing of its first path")
+    }
+
+    /// As [`Self::new`], run as `options` say. A session bound to a trust
+    /// refuses a first path that proved no identity, or one the trust no
+    /// longer stands behind.
+    pub fn with_options(
+        first: Path,
+        tag: SessionTag,
+        classes: Arc<Classes>,
+        options: SessionOptions,
+    ) -> Result<(Self, ResumeHandle), ChannelError> {
+        let binding = match options.trust {
+            Some(trust) => {
+                let peer = first.peer.clone().ok_or_else(|| {
+                    ChannelError::Other("a bound session's first path proved no identity".into())
+                })?;
+                let binding = Binding::new(trust, peer, options.check_every);
+                binding
+                    .verify(std::time::SystemTime::now())
+                    .map_err(ChannelError::Other)?;
+                Some(binding)
+            }
+            None => None,
+        };
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (inbound_tx, inbound): (Vec<_>, Vec<_>) =
             classes.lanes().iter().map(|_| mpsc::channel(16)).unzip();
         let inner = Arc::new(Inner {
@@ -476,6 +587,8 @@ impl<E: Envelope> ResumableLink<E> {
             tag,
             observer: Mutex::new(None),
             congestion: Mutex::new(congestion::BackgroundRate::default()),
+            binding,
+            events: events_tx,
         });
         inner.install(first);
         live_links()
@@ -485,14 +598,24 @@ impl<E: Envelope> ResumableLink<E> {
         tokio::spawn(supervise(Arc::downgrade(&inner)));
         let rx = ResumableRx::new(inner.clone(), inbound);
         let handle = ResumeHandle(inner.clone());
-        (
+        Ok((
             Self {
                 inner,
                 rx: Some(rx),
                 tx: None,
+                events: Some(SessionEvents {
+                    rx: events_rx,
+                    envelope: std::marker::PhantomData,
+                }),
             },
             handle,
-        )
+        ))
+    }
+
+    /// What the session reports besides its messages; see [`SessionEvent`].
+    /// Taken once, before [`Self::split`], which drops it otherwise.
+    pub fn events(&mut self) -> Option<SessionEvents<E>> {
+        self.events.take()
     }
 
     fn sender(&mut self) -> PrioritizedTx<E> {

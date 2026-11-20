@@ -39,7 +39,10 @@ pub use envelope::{Delivery, Envelope};
 pub use noise::NoisePsk;
 pub use scheduler::{Carrying, PrioritizedTx};
 pub use seal::{Seal, SealedRx, SealedTx};
-pub use session::{Path, PathKind, Paths, ResumableLink, ResumableRx, ResumeHandle};
+pub use session::{
+    Path, PathKind, Paths, ResumableLink, ResumableRx, ResumeHandle, SessionEvent, SessionEvents,
+    SessionOptions,
+};
 pub use trust::{Opened, PeerIdentity, Revoked, Role, Trust, Verified};
 
 use serde::{Deserialize, Serialize};

@@ -1,8 +1,11 @@
 //! The link's shared core: its state behind one lock, and what a path's
 //! arrival, failure or acknowledgement does to it.
 
+use crate::carrier::TlsInfo;
 use crate::seal::link_tag;
+use crate::session::bind::Binding;
 use crate::session::congestion::BackgroundRate;
+use crate::session::events::RawEvent;
 use crate::session::frame::ack_frame;
 use crate::session::frame::read_delivered;
 use crate::session::frame::read_u64;
@@ -12,8 +15,10 @@ use crate::session::Path;
 use crate::session::PathKind;
 use crate::session::Paths;
 use crate::{ChannelError, Classes, LaneId, SessionTag};
+use sha2::Digest;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::SystemTime;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
@@ -30,6 +35,9 @@ pub(super) struct Inner {
     pub(super) tag: SessionTag,
     pub(super) observer: Mutex<Option<PathsObserver>>,
     pub(super) congestion: Mutex<BackgroundRate>,
+    /// The identity the session is bound to, for a session over the internet.
+    pub(super) binding: Option<Binding>,
+    pub(super) events: mpsc::UnboundedSender<RawEvent>,
 }
 
 impl Inner {
@@ -49,11 +57,49 @@ impl Inner {
         }
     }
 
-    /// The session in logs: the first bytes of its tag, the same on both
-    /// ends. A node holds a session per peer and the transport knows no
-    /// peer, so without it two sessions' path numbers read as one's.
+    /// The session in logs, the same on both ends. A node holds a session per
+    /// peer and the transport knows no peer, so without it two sessions' path
+    /// numbers read as one's. A hash of the tag rather than its first bytes:
+    /// the tag is what a connection offers to join, and a log is read by more
+    /// people than the session's two ends.
     pub(super) fn label(&self) -> String {
-        self.tag[..4].iter().map(|b| format!("{b:02x}")).collect()
+        let digest = sha2::Sha256::digest([b"cursio-channel label".as_slice(), &self.tag].concat());
+        digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Whether the session's peer is still who it proved to be, ending the
+    /// session if not. Always true of a session no trust binds.
+    pub(super) fn verify_peer(&self) -> bool {
+        let Some(binding) = &self.binding else {
+            return true;
+        };
+        match binding.verify(SystemTime::now()) {
+            Ok(()) => true,
+            Err(why) => {
+                self.end(why);
+                false
+            }
+        }
+    }
+
+    /// A `REAUTH` arrived on a path over `tls`: verify the fresh proof off the
+    /// reader, then renew the session's footing with it or end the session.
+    pub(super) fn reauthenticate(self: &Arc<Self>, proof: Vec<u8>, tls: Option<Arc<TlsInfo>>) {
+        let inner = self.clone();
+        tokio::spawn(async move {
+            let Some(binding) = &inner.binding else {
+                inner.end("a fresh proof arrived for a session no trust binds".into());
+                return;
+            };
+            let verified = binding.trust().reverify(&proof, tls.as_deref()).await;
+            let renewed = verified
+                .map_err(|e| format!("a fresh proof was refused: {e}"))
+                .and_then(|verified| binding.renew(verified, SystemTime::now()));
+            match renewed {
+                Ok(()) => tracing::info!(session = %inner.label(), "the peer proved itself again"),
+                Err(why) => inner.end(why),
+            }
+        });
     }
 
     pub(super) fn kick(&self, flags: u8) {
@@ -127,9 +173,15 @@ impl Inner {
                 return;
             }
             tracing::info!(session = %self.label(), %why, "the session can no longer be resumed; ending it");
-            state.ended = Some(why);
+            state.ended = Some(why.clone());
             state.paths.clear();
         }
+        // Nobody reading the reports is ordinary (Cursio never does), so a
+        // closed receiver is not an error.
+        let _ = self.events.send(RawEvent::Ended {
+            reason: why,
+            unacknowledged: Vec::new(),
+        });
         self.changed.notify_waiters();
         self.report();
     }
@@ -210,6 +262,8 @@ impl Inner {
             seal,
             kind,
             direct,
+            tls,
+            ..
         } = path;
         let (writers, mut frames): (Vec<_>, Vec<_>) = self
             .classes
@@ -299,6 +353,10 @@ impl Inner {
                             Some(&link_tag::PING) | Some(&link_tag::PONG)
                         ) {
                             inner.probe(id, &tagged);
+                            continue;
+                        }
+                        if tagged.first() == Some(&link_tag::REAUTH) {
+                            inner.reauthenticate(tagged[1..].to_vec(), tls.clone());
                             continue;
                         }
                         if tagged.first() == Some(&link_tag::ACK) {

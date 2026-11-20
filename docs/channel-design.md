@@ -317,6 +317,31 @@ either side of the move must still form a session.
   session rather than passing unchecked.
 - **A carrier says what its TLS verified** (`Carrier::tls`: the peer's chain
   and the RFC 9266 exporter); `None` is everything that is not verified TLS.
+- **Binding is opt-in per session**: `ResumableLink::with_options(…,
+  SessionOptions::bound_to(trust))`, the first path carrying its proof
+  (`Path::proving`). Unbound — Cursio's — sessions behave as before.
+- **A joining connection that fails is refused, not fatal.** Another identity,
+  an expired or revoked proof, or no proof at all refuses that connection
+  and leaves the session alone, so whoever saw the tag cannot end it by
+  knocking; the session's own proofs are re-checked at the same moment, and
+  those failing end it.
+- **The session stands on a set of proofs**: the first path's plus each joined
+  path's (at most eight, the first always kept); its deadline is their
+  earliest `not_after`. A `REAUTH` (tag `0x07`, `[proof]`, written by
+  `ResumeHandle::reauthenticate` on the interactive lane's path) replaces the
+  whole set once `reverify` and `check` accept it.
+- **When the trust is asked**: every join, every delivered message, every
+  `check_every` (5 s by default) on the session's timer, and on any tick past
+  the deadline — the timer runs with no path at all, which is how a held
+  session hears of revocation.
+- **The tag is bound only where there is TLS.** `RESUME` carries
+  `SHA-256("cursio-channel resume" || tag || exporter)[..16]` on a path with
+  an exporter and the bare tag on any other, so Cursio's `RESUME` bytes are
+  unchanged.
+- **Logs carry a hash of the tag** (`SHA-256("cursio-channel label" || tag)`,
+  four bytes), never the tag's own bytes.
+- **Endings are reported**: `ResumableLink::events` yields
+  `SessionEvent::Ended { reason, … }` once, whatever ended it.
 
 ## Licence
 

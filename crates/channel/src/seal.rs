@@ -6,7 +6,7 @@
 //! `[u32 message][u16 index][u16 count]` and one piece of a message too big
 //! for a single Noise frame; the receiver buffers pieces by message and
 //! decodes once all have arrived. The session's own frames (`SEQ`, `ACK`,
-//! `RESUME`, `PING`, `PONG`) share the tag space; see [`link_tag`].
+//! `RESUME`, `PING`, `PONG`, `REAUTH`) share the tag space; see [`link_tag`].
 //!
 //! Chunking lives here, at the seal, because this is where both the exact
 //! encoded size and Noise's limit of 65535 bytes per message (including the
@@ -46,6 +46,10 @@ pub(crate) mod link_tag {
     pub const RESUME: u8 = 0x04;
     pub const PING: u8 = 0x05;
     pub const PONG: u8 = 0x06;
+    /// `[proof]`: a fresh proof of the same identity, for a session bound to
+    /// one, verified by the session's trust; see `session::bind`. Cursio's
+    /// sessions are bound to none and never send it.
+    pub const REAUTH: u8 = 0x07;
     /// What `SEQ` puts in front of a tagged frame: the tag, the lane, the
     /// number and the flags.
     pub const SEQ_HEADER_LEN: usize = 1 + 1 + 8 + 1;
