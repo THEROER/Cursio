@@ -264,11 +264,16 @@ pub struct AudioEngine {
     /// diagnose. Logging on a wall-clock interval instead keeps the rate constant
     /// no matter how much audio is flowing.
     last_health_log: Option<std::time::Instant>,
-    /// When a chunk was last received from the peer, for stall detection.
-    last_chunk_at: Option<std::time::Instant>,
-    /// Whether we have already reported the current stall, so one silent link
+    /// Inbound streams the peer said went quiet
+    /// ([`AudioMsg::StreamIdle`](cursio_protocol::AudioMsg::StreamIdle)) and
+    /// that have sent nothing since, so their silence is not a stall.
+    peer_idle: std::collections::HashSet<u32>,
+    /// Inbound streams already reported as stalled, so one silent link
     /// produces one warning instead of a line per check.
-    stall_reported: bool,
+    stalled: std::collections::HashSet<u32>,
+    /// When each outbound stream last sent a chunk, for streams that have not
+    /// been announced idle since. See [`send::IDLE_ANNOUNCE_AFTER`].
+    last_sent_at: HashMap<u32, std::time::Instant>,
     /// Next free slot in the per-app id range; only ever counts up, so a Remote
     /// Stream id is never reused as apps join and leave Intent Sinks.
     next_app_slot: u32,
@@ -418,8 +423,9 @@ impl AudioEngine {
             stale_dropped: 0,
             over_budget: 0,
             last_health_log: None,
-            last_chunk_at: None,
-            stall_reported: false,
+            peer_idle: std::collections::HashSet::new(),
+            stalled: std::collections::HashSet::new(),
+            last_sent_at: HashMap::new(),
             next_app_slot: 0,
             encoders: HashMap::new(),
             pending_packets: HashMap::new(),
@@ -513,4 +519,6 @@ impl crate::module::ModuleFactory for AudioFactory {
 
 /// Version of this module's wire vocabulary ([`AudioMsg`](cursio_protocol::AudioMsg)). Bump when those
 /// types change shape; peers run the module only on an exact match.
-pub const VERSION: u16 = 1;
+/// 2: [`AudioMsg::StreamIdle`](cursio_protocol::AudioMsg::StreamIdle), the
+/// owner saying a stream went quiet so the consumer does not call it a stall.
+pub const VERSION: u16 = 2;

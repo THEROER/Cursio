@@ -210,6 +210,13 @@ the current value.
 - `Message::AudioGain { id, gain }` — logical volume for a node (per-app or
   master), driven by the knob. Applied above the OS mixer.
 - `Message::AudioStreamClose { id, reason }` — app stopped / device gone.
+- `AudioMsg::StreamIdle { id }` (audio module version 2) — owner → consumer:
+  the stream has sent nothing for 500 ms (silence is gated out before sending,
+  and a paused app gives the capture nothing), and the next chunk ends the
+  quiet. The consumer warns "audio from the peer stalled" only for a stream it
+  is playing that went 2 s without a chunk *and* without this, so a pause is not
+  reported as a broken link. Same priority class as the chunks, so it cannot
+  overtake the last of them.
 
 ## Backends (behind traits, like `InputInjector`)
 
