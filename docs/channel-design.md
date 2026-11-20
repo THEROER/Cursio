@@ -302,6 +302,22 @@ either side of the move must still form a session.
   unacknowledged messages will sit. `Trust::open` returns the seal and the
   session tag only; the verified identity joins `Opened` with `check`.
 
+### What step 2 settled
+
+- **The canonical form is a string with the kind in front** (`service:`,
+  `host:`, `user:<len of sub>:<sub>:<aud>`, `paired:<hex>`), compared exactly:
+  no case folding, and the subject's length keeps a `sub` containing `:` from
+  borrowing its audience. `Verified` carries the identity, an optional
+  `serial` and an optional `not_after`.
+- **`NoisePsk` proves `Paired` with the id the caller names**
+  (`paired_with`; zeros until it does), and its `check` always passes. Its
+  handshake bytes did not move.
+- **A fresh proof is the trust's to verify**: `Trust::reverify(proof, tls)`,
+  refused by default, so a `REAUTH` on a trust that takes none ends the
+  session rather than passing unchecked.
+- **A carrier says what its TLS verified** (`Carrier::tls`: the peer's chain
+  and the RFC 9266 exporter); `None` is everything that is not verified TLS.
+
 ## Licence
 
 `cursio-channel` is MIT OR Apache-2.0, like `cursio-sdk`, so Leave's code

@@ -35,8 +35,33 @@ pub trait Carrier: Send {
         None
     }
 
+    /// What the TLS under this carrier verified, for a carrier over TLS whose
+    /// handshake checked its peer against the configuration it was given.
+    /// `None` for anything else — plain TCP, `ws://`, an in-memory pair — and
+    /// [`crate::CarrierAuthenticated`] refuses those.
+    fn tls(&self) -> Option<&TlsInfo> {
+        None
+    }
+
     fn split(self: Box<Self>) -> (Box<dyn CarrierTx>, Box<dyn CarrierRx>);
 }
+
+/// What a verified TLS connection established, as a verifier needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsInfo {
+    /// The peer's certificate chain, leaf first, DER; empty when the peer
+    /// presented none (a browser's side of WSS, proven by a token instead).
+    pub peer_certificates: Vec<Vec<u8>>,
+    /// The connection's channel binding (RFC 9266 `tls-exporter`: label
+    /// `EXPORTER-Channel-Binding`, empty context, 32 bytes) where the TLS
+    /// version defines one. A session tag offered over this connection is
+    /// bound to it, so a tag seen on one connection cannot be replayed on
+    /// another.
+    pub exporter: Option<[u8; 32]>,
+}
+
+/// RFC 9266's exporter label for the `tls-exporter` channel binding.
+pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-Channel-Binding";
 
 /// The send half of a split [`Carrier`].
 #[async_trait]

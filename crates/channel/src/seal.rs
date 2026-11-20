@@ -82,19 +82,32 @@ pub const MIN_FRAME: usize = 1024;
 /// keeps separate send and receive nonces), so the halves of a split carrier
 /// share it behind a mutex, held only for the CPU-bound call — never across
 /// an `.await` — so it never serialises network I/O.
+///
+/// Or no Noise at all, over a carrier whose TLS verified its peer: the frames
+/// then go in the clear inside TLS, which already keeps them. Only
+/// [`crate::CarrierAuthenticated`] makes such a seal, and only once it has
+/// seen that TLS — a seal that is the identity over anything else would be a
+/// plaintext link that looks like a sealed one.
 #[derive(Clone)]
-pub struct Seal(Arc<Mutex<TransportState>>);
+pub struct Seal(Option<Arc<Mutex<TransportState>>>);
 
 impl Seal {
     pub(crate) fn new(state: TransportState) -> Self {
-        Self(Arc::new(Mutex::new(state)))
+        Self(Some(Arc::new(Mutex::new(state))))
+    }
+
+    /// Whether frames leave this seal as they came: TLS keeps them instead.
+    pub fn is_identity(&self) -> bool {
+        self.0.is_none()
     }
 
     /// Seal one tagged plaintext frame.
     pub fn seal(&self, tagged: &[u8]) -> Result<Vec<u8>, ChannelError> {
+        let Some(state) = &self.0 else {
+            return Ok(tagged.to_vec());
+        };
         let mut ciphertext = vec![0u8; tagged.len() + 16];
-        let len = self
-            .0
+        let len = state
             .lock()
             .unwrap()
             .write_message(tagged, &mut ciphertext)
@@ -105,9 +118,11 @@ impl Seal {
 
     /// Open one sealed frame to its tagged plaintext.
     pub fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>, ChannelError> {
+        let Some(state) = &self.0 else {
+            return Ok(ciphertext.to_vec());
+        };
         let mut plaintext = vec![0u8; ciphertext.len()];
-        let len = self
-            .0
+        let len = state
             .lock()
             .unwrap()
             .read_message(ciphertext, &mut plaintext)

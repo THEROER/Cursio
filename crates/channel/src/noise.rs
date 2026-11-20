@@ -18,6 +18,13 @@
 //! prefix of its own, `[u32 len][message]`. That prefix carries nothing a
 //! frame does not already say; it is kept because Cursio has always sent its
 //! handshake that way, and a peer built before this crate must still answer.
+//!
+//! The secret is the whole of the proof, so the identity an opening yields is
+//! the one the caller named when it chose the secret
+//! ([`NoisePsk::paired_with`]), and [`Trust::check`] always passes: nothing
+//! here can be revoked short of the caller forgetting the secret.
+
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -25,7 +32,9 @@ use snow::HandshakeState;
 
 use crate::carrier::{decode_frame, encode_frame};
 use crate::seal::{noise_error, Seal};
-use crate::{Carrier, ChannelError, SessionTag};
+pub use crate::trust::{Opened, Role, Trust};
+use crate::trust::{PeerIdentity, Revoked, Verified};
+use crate::{Carrier, ChannelError};
 
 /// `NNpsk0`: no static keys, the PSK mixed at position 0; X25519, ChaChaPoly,
 /// BLAKE2s.
@@ -34,46 +43,30 @@ const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// A half-open handshake must not reserve a peer's session indefinitely.
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Which side of the opening exchange this end is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    /// The side that dialled.
-    Initiator,
-    /// The side that accepted.
-    Responder,
-}
-
-/// What an opening exchange established.
-pub struct Opened {
-    pub seal: Seal,
-    /// The same on both ends and unique to this connection: what names a
-    /// session for resumption.
-    pub session_tag: SessionTag,
-}
-
-/// Who the other end is and the keys to talk to it with.
-#[async_trait]
-pub trait Trust: Send + Sync {
-    /// The opening exchange over a fresh carrier, as the side that dialled
-    /// or the side that accepted.
-    async fn open(&self, carrier: &mut dyn Carrier, role: Role) -> Result<Opened, ChannelError>;
-}
-
 /// `Noise_NNpsk0` keyed by a secret both ends hold.
 #[derive(Clone)]
 pub struct NoisePsk {
     psk: [u8; 32],
+    peer: [u8; 16],
 }
 
 impl NoisePsk {
-    /// Key the handshake with `SHA-256(domain || secret)`.
+    /// Key the handshake with `SHA-256(domain || secret)`. The peer it proves
+    /// is unnamed (`Paired` with zeros) until [`Self::paired_with`] names it.
     pub fn from_secret(domain: &[u8], secret: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(domain);
         hasher.update(secret);
         Self {
             psk: hasher.finalize().into(),
+            peer: [0; 16],
         }
+    }
+
+    /// Name the peer that holds the secret, as the caller's pairing knows it.
+    pub fn paired_with(mut self, peer: [u8; 16]) -> Self {
+        self.peer = peer;
+        self
     }
 
     async fn initiate(
@@ -161,9 +154,15 @@ impl Trust for NoisePsk {
         let mut session_tag = [0u8; 16];
         session_tag.copy_from_slice(&Sha256::digest(hs.get_handshake_hash())[..16]);
         Ok(Opened {
+            peer: Verified::lasting(PeerIdentity::Paired { id: self.peer }),
             seal: Seal::new(hs.into_transport_mode().map_err(noise_error)?),
             session_tag,
+            resume: None,
         })
+    }
+
+    fn check(&self, _peer: &Verified, _now: SystemTime) -> Result<(), Revoked> {
+        Ok(())
     }
 }
 
@@ -209,6 +208,25 @@ mod tests {
             a.seal.open(&b.seal.seal(b"back").unwrap()).unwrap(),
             b"back"
         );
+    }
+
+    #[tokio::test]
+    async fn the_peer_proven_is_the_one_the_caller_paired_and_is_never_revoked() {
+        let (mut a, mut b) = MemCarrier::pair();
+        let trust = NoisePsk::from_secret(b"t", b"k").paired_with([7; 16]);
+        let unnamed = NoisePsk::from_secret(b"t", b"k");
+        let (oa, ob) = tokio::join!(
+            trust.open(&mut a, Role::Initiator),
+            unnamed.open(&mut b, Role::Responder)
+        );
+        let peer = oa.unwrap().peer;
+        assert_eq!(peer.identity, PeerIdentity::Paired { id: [7; 16] });
+        assert_eq!(peer.not_after, None);
+        assert_eq!(
+            ob.unwrap().peer.identity,
+            PeerIdentity::Paired { id: [0; 16] }
+        );
+        assert!(trust.check(&peer, SystemTime::now()).is_ok());
     }
 
     #[tokio::test]
