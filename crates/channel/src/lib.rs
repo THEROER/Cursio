@@ -10,7 +10,8 @@
 //! - [`scheduler`]: which waiting frame goes next.
 //! - [`session`]: that every reliable frame arrives once, across connections.
 //! - [`seal`]: that nobody else read or wrote it (Noise transport mode).
-//! - [`carrier`]: moving framed bytes — [`tcp`], [`mem`], or the caller's own.
+//! - [`carrier`]: moving framed bytes — [`tcp`], [`mem`], `ws` (WebSocket)
+//!   and `tls` with their features, or the caller's own.
 //! - [`trust`]: who the other end is, as a verifier proved it, and whether it
 //!   still is; [`noise::NoisePsk`] keys Noise with a shared secret,
 //!   [`CarrierAuthenticated`] takes it from verified TLS and a token.

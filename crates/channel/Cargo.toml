@@ -48,8 +48,14 @@ windows-sys = { workspace = true, features = [
     "Win32_System_IO",
 ] }
 
+[[example]]
+name = "panel"
+required-features = ["websocket", "tls"]
+
 [dev-dependencies]
 # `start_paused`, so a resumable session's one-minute hold runs out in
 # virtual time.
 tokio = { version = "1", features = ["full", "test-util"] }
 rcgen.workspace = true
+# The example's `RUST_LOG`, to watch a session's paths come and go.
+tracing-subscriber.workspace = true

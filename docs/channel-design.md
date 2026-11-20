@@ -387,6 +387,17 @@ either side of the move must still form a session.
   usual length prefix). rustls uses ring, already in the lock; the caller
   hands in its `ClientConfig`/`ServerConfig`, re-exported with `rustls` so
   the versions match. The exporter is reported for TLS 1.3 only.
+- **A full resend buffer no longer holds a lane across a change of path.**
+  The example found it: an upload that filled the 16 MiB buffer while the
+  session was held waited for room before resending, and room comes only
+  from acknowledgements of the resend. A lane waiting for room now writes
+  its unacknowledged frames on the new path first.
+- **The example pair is `examples/panel.rs`**, one process, a service and a
+  user over WSS with certificates from `rcgen`: a console lane and a bulk
+  lane, a 32 MiB upload, every connection killed halfway and resumed. It
+  prints each chunk arriving once, the console's answer time beside the
+  upload, the load samples from the break not replayed, and what was handed
+  back when the user closed the session.
 
 ## Licence
 
