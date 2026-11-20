@@ -880,6 +880,32 @@ mod tests {
         assert!(a.handle.network_complete());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_resend_buffer_filled_while_held_is_written_on_the_path_that_comes_back() {
+        let (mut a, mut b) = session().await;
+        cut(&a, &b).await;
+        let blob = |n: u8| Msg::Blob(BULK, vec![n; 1024 * 1024]);
+        let mut tx = a.tx.clone();
+        let upload = tokio::spawn(async move {
+            for n in 0..24u8 {
+                tx.send(&blob(n)).await.unwrap();
+            }
+        });
+        // Well past the resend cap: the lane's sink now waits for room.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        rejoin(&a, &b).await;
+        for n in 0..24u8 {
+            let got = tokio::time::timeout(Duration::from_secs(60), b.rx.recv())
+                .await
+                .expect("the held upload moves once a path is back")
+                .unwrap();
+            assert_eq!(got, blob(n));
+        }
+        upload.await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_lane_missing_at_only_one_end_is_selected_without_replacing_control() {
         let (a, b) = session().await;

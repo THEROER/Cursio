@@ -8,13 +8,14 @@ use crate::session::frame::read_u64;
 use crate::session::frame::seq_frame;
 use crate::session::frame::ACK_ALL_PATHS;
 use crate::session::inner::Inner;
-use crate::session::state::Kept;
+use crate::session::state::{Kept, State};
 use crate::session::PathKind;
 use crate::session::RESEND_CAP;
 use crate::{ChannelError, LaneId};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 /// The drainer's end of a resumable link: numbers each frame, keeps the
@@ -51,11 +52,12 @@ impl FrameSink for ResumableSink {
         }
         if !ack && !out.lossy {
             loop {
-                let changed = self.inner.changed.notified();
+                let inner = self.inner.clone();
+                let changed = inner.changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                {
-                    let state = self.inner.lock();
+                let moved = {
+                    let mut state = inner.lock();
                     if let Some(why) = &state.ended {
                         return Err(ChannelError::Other(why.clone()));
                     }
@@ -64,8 +66,24 @@ impl FrameSink for ResumableSink {
                     {
                         break;
                     }
+                    resend_if_moved(&mut self.last_path, self.lane, &mut state, Instant::now())
+                };
+                // A full resend buffer waits for acknowledgements, and after a
+                // change of path none come until its frames are written on
+                // the new one: waiting first held a lane whose buffer filled
+                // while the session was held for good.
+                match moved {
+                    Some((writes, withheld)) => {
+                        self.withheld(withheld, None, false);
+                        self.write(writes, spec.paced, lane).await;
+                    }
+                    None => changed.await,
                 }
-                changed.await;
+            }
+            if let Some(id) = out.message {
+                if self.inner.ledger.skip(id, last) {
+                    return Ok(());
+                }
             }
         }
         let now = Instant::now();
@@ -79,18 +97,11 @@ impl FrameSink for ResumableSink {
             let carrying = state
                 .carrying(self.lane, now)
                 .map(|p| (p.id, p.kind, p.writer(self.lane).clone()));
-            if let Some((id, _, writer)) = &carrying {
-                if self.last_path != Some(*id) {
-                    self.last_path = Some(*id);
-                    withheld = state.withhold_expired(self.lane, SystemTime::now());
-                    for kept in &mut state.lanes[lane].unacked {
-                        kept.sent_at = None;
-                        kept.sent_on = None;
-                        writes.push((writer.clone(), *id, kept.frame.clone()));
-                    }
-                }
-            } else {
-                self.last_path = None;
+            if let Some((moved, expired)) =
+                resend_if_moved(&mut self.last_path, self.lane, &mut state, now)
+            {
+                writes = moved;
+                withheld = expired;
             }
             if ack {
                 if self.lane == LaneId::INTERACTIVE {
@@ -171,12 +182,66 @@ impl FrameSink for ResumableSink {
                 }
             }
         }
+        self.withheld(withheld, out.message, last);
+        self.write(writes, spec.paced, lane).await;
+        Ok(())
+    }
+}
+
+/// A frame to write on a path: the path's writer, its id, the frame.
+type Write = (mpsc::Sender<Vec<u8>>, u64, Vec<u8>);
+
+/// The frames to write again on a new path, and the ledger's messages
+/// withheld from them with whether more of each may still come.
+type Resend = (Vec<Write>, Vec<(u64, bool)>);
+
+/// When the path carrying `lane` is not the one it last wrote on: every
+/// frame still unacknowledged, to write on the new one, and the messages
+/// withheld from that resend for their deadlines.
+fn resend_if_moved(
+    last_path: &mut Option<u64>,
+    lane: LaneId,
+    state: &mut State,
+    now: Instant,
+) -> Option<Resend> {
+    let Some((id, writer)) = state
+        .carrying(lane, now)
+        .map(|p| (p.id, p.writer(lane).clone()))
+    else {
+        *last_path = None;
+        return None;
+    };
+    if *last_path == Some(id) {
+        return None;
+    }
+    *last_path = Some(id);
+    let withheld = state.withhold_expired(lane, SystemTime::now());
+    let writes = state.lanes[lane.index()]
+        .unacked
+        .iter_mut()
+        .map(|kept| {
+            kept.sent_at = None;
+            kept.sent_on = None;
+            (writer.clone(), id, kept.frame.clone())
+        })
+        .collect();
+    Some((writes, withheld))
+}
+
+impl ResumableSink {
+    /// Report what a resend withheld for its deadline; the frame in hand,
+    /// a part of `current` ending it when `last`, is the last that could
+    /// still have come.
+    fn withheld(&self, withheld: Vec<(u64, bool)>, current: Option<u64>, last: bool) {
         for (id, more_queued) in withheld {
-            let ends_here = out.message == Some(id) && last;
+            let ends_here = current == Some(id) && last;
             self.inner.ledger.expired(id, more_queued && !ends_here);
         }
+    }
+
+    async fn write(&mut self, writes: Vec<Write>, paced: bool, lane: usize) {
         for (writer, id, frame) in writes {
-            if spec.paced {
+            if paced {
                 // Only when the slot is still ahead: a zero-length sleep is
                 // not free. Tokio rounds a deadline up to its next millisecond
                 // and fires it on a turn of its timer, which Windows takes on
@@ -205,7 +270,6 @@ impl FrameSink for ResumableSink {
                 self.inner.path_failed(id, "its writer stopped");
             }
         }
-        Ok(())
     }
 }
 
