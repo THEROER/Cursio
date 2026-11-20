@@ -39,6 +39,8 @@ struct Shown {
     held: usize,
     /// Asked the phone for a keyframe and not yet sent it.
     want_key: bool,
+    /// A hole in `units` would decode into a smeared screenshot.
+    gap: cursio_window::frame_gap::FrameGap,
 }
 
 struct Phone {
@@ -89,6 +91,7 @@ pub fn offered(phone: &str, meta: &WindowMeta) {
             units: Vec::new(),
             held: 0,
             want_key: false,
+            gap: Default::default(),
         });
     }
 }
@@ -106,6 +109,11 @@ pub fn frame(phone: &str, frame: &WindowFrame) {
     else {
         return;
     };
+    if shown.gap.note(frame.seq) > 0 {
+        shown.units.clear();
+        shown.held = 0;
+        shown.want_key = true;
+    }
     if cursio_window::video::contains_keyframe(&frame.data) {
         shown.units.clear();
         shown.held = 0;
@@ -351,6 +359,27 @@ mod tests {
 
         closed("Test Phone A", 3);
         assert!(stream("Test Phone A").is_err());
+    }
+
+    #[test]
+    fn a_missing_frame_drops_the_kept_stream_and_asks_for_a_keyframe() {
+        let _link = register("Test Phone C");
+        offered(
+            "Test Phone C",
+            &meta(4, &super::super::title("Test Phone C")),
+        );
+        let numbered = |seq, data| WindowFrame {
+            seq,
+            ..video(4, data)
+        };
+        frame("Test Phone C", &numbered(1, nal(5)));
+        frame("Test Phone C", &numbered(2, nal(1)));
+        assert_eq!(wants_keyframe("Test Phone C"), None);
+        frame("Test Phone C", &numbered(4, nal(1)));
+        assert!(stream("Test Phone C").unwrap_err().contains("no picture"));
+        assert_eq!(wants_keyframe("Test Phone C"), Some(4));
+        frame("Test Phone C", &numbered(5, nal(5)));
+        assert_eq!(stream("Test Phone C").unwrap().units.len(), 1);
     }
 
     #[tokio::test]

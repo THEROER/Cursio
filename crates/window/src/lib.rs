@@ -39,6 +39,8 @@ pub const LOCAL_VIDEO_CAPS: VideoCaps = VideoCaps {
 };
 
 pub mod codec;
+/// Frames of a stream that never arrived, noticed by every kind of viewer.
+pub mod frame_gap;
 /// Diffing and codec routing, shared by every capture backend.
 pub mod frame_pipeline;
 /// The viewer's assembled window image, shared by every surrogate backend.

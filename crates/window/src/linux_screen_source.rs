@@ -41,6 +41,7 @@ use cursio_protocol::{
 use tokio::sync::mpsc;
 
 use crate::codec::decode_tile;
+use crate::frame_gap::FrameGap;
 use crate::framebuffer::{geometry_of, scale_into, Framebuffer, Geometry};
 use crate::presentation_ack::PresentationAcks;
 use crate::video_decoder::VideoDecoder;
@@ -71,8 +72,10 @@ pub struct PipeWireScreenSource {
     input: mpsc::UnboundedReceiver<WindowInput>,
     _input_tx: mpsc::UnboundedSender<WindowInput>,
     ended: Arc<AtomicBool>,
-    /// Raised by the node thread while its decoder waits for a keyframe.
+    /// Raised by the node thread while its decoder waits for a keyframe,
+    /// and here when frames went missing on the way.
     wants_keyframe: Arc<AtomicBool>,
+    gap: FrameGap,
 }
 
 impl PipeWireScreenSource {
@@ -133,6 +136,7 @@ impl PipeWireScreenSource {
             _input_tx: input_tx,
             ended,
             wants_keyframe,
+            gap: FrameGap::default(),
         })
     }
 
@@ -153,6 +157,15 @@ impl PipeWireScreenSource {
 
 impl Surrogate for PipeWireScreenSource {
     fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
+        let missing = self.gap.note(frame.seq);
+        if missing > 0 {
+            tracing::debug!(
+                id = self.id,
+                missing,
+                "frames went missing; asking for the whole picture"
+            );
+            self.wants_keyframe.store(true, Ordering::Relaxed);
+        }
         match geometry_of(frame.dirty, frame.codec, self.width, self.height) {
             Geometry::Unchanged => {}
             Geometry::Resize { width, height } => {
@@ -200,6 +213,7 @@ impl Surrogate for PipeWireScreenSource {
 
     fn restart_stream(&mut self, _title: &str) {
         self.acks = PresentationAcks::new(self.id);
+        self.gap.reset();
         let _ = self.send(Command::Restart);
     }
 

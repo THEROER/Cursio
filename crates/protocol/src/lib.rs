@@ -423,9 +423,15 @@ impl Message {
             Message::AudioChunk(_) => Delivery::Fresh {
                 within: Some(audio::FRESH_FOR),
             },
-            Message::WindowFrame(_) => Delivery::Fresh {
-                within: Some(window::FRAME_FRESH_FOR),
-            },
+            // Never dropped for age, though a stale frame is worthless: what a
+            // drop costs is a host resending the whole picture, which AirPlay
+            // and a Mac host cannot do on request, and which a tile update
+            // cannot even be seen to need once its last frame or one of its
+            // bands sharing a number is gone. On a slow path the resent
+            // picture would itself outlive the time behind it, and every drop
+            // would ask for another. Video is held back by its bitrate budget
+            // and the pump's high-water mark instead.
+            Message::WindowFrame(_) => Delivery::Fresh { within: None },
             // Never dropped for age on a live connection: a move or scroll
             // waiting behind a stalled one is folded into it, and the sum is
             // what the hand did. Dropping it instead would lose real motion on
@@ -772,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn sound_and_pixels_expire_while_motion_waits_to_be_folded() {
+    fn only_sound_expires_and_pixels_and_motion_are_merely_not_resent() {
         let chunk = Message::AudioChunk(AudioChunk {
             id: 1,
             seq: 0,
@@ -797,12 +803,7 @@ mod tests {
             codec: TileCodec::LossyVideo,
             data: Vec::new(),
         });
-        assert_eq!(
-            frame.delivery(),
-            Delivery::Fresh {
-                within: Some(window::FRAME_FRESH_FOR)
-            }
-        );
+        assert_eq!(frame.delivery(), Delivery::Fresh { within: None });
         assert_eq!(
             Message::Input(InputEvent::PointerMotion { dx: 1, dy: 0 }).delivery(),
             Delivery::Fresh { within: None }

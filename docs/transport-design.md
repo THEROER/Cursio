@@ -52,11 +52,12 @@ frames already removed from the queues as well as frames still queued.
 
 Capture already uses a bounded channel and resets its encoder/differ when a
 capture update cannot be queued. The window pumps stop pulling at their video
-high-water mark. Video is dropped in the transport only whole and only for age
-(see "Delivery" below), never to make room: a frame's dependants make a
-dropped one cost a keyframe. After a connection gap or such a drop the viewer
-sees its frame numbers skip and asks for the whole picture
-(`surrogate_front.rs`), which repairs video and tiles alike.
+high-water mark. Encoded reference frames are not discarded in the transport,
+not even for age (see "Delivery" below): their dependants make a dropped one
+cost a whole picture, which not every host can send. After a connection gap,
+stale lossy data is not replayed; every viewer — a surrogate window, a
+remote-screen node, the phone screen kept for `cursio phone` — sees its frame
+numbers skip and asks for the whole picture (`frame_gap.rs`).
 
 ## Process queues and input overload
 
@@ -187,12 +188,22 @@ sends, so a message's choice changes without a protocol bump.
   on a Bluetooth path, where a phone's audio pauses the radio for a second at a
   time, dropping would lose motion the hand really made.
 - `Fresh { within: Some(t) }`: also dropped whole, unsent, by a sender that
-  reaches it more than `t` after it was queued (`priority.rs`). Sound at
+  reaches it more than `t` after it was queued (`priority.rs`). Sound, at
   `audio::FRESH_FOR` (250 ms, the same bound the listener's playback feed
-  applies on arrival) and window frames at `window::FRAME_FRESH_FOR` (300 ms,
-  four times the video budget's target queue, so rate control acts long before
-  age does). Only a message's first frame is judged; one part-way out is
-  finished. Drops are counted per class and logged with the queue-delay window.
+  applies on arrival). Only a message's first frame is judged; one part-way out
+  is finished. Drops are counted per class and logged with the queue-delay
+  window.
+
+Window frames are `Fresh { within: None }`, though a late picture is as
+worthless as late sound. A chunk of sound stands alone; a frame does not, and a
+dropped one costs a whole picture. AirPlay and a Mac host cannot send one on
+request. A tile update cannot even be seen to need one when what went missing
+was one of its bands sharing a number, or its last frame before the window
+went still. And on a slow path the resent picture outlives the deadline of
+every frame behind it, so each drop asks for the next. Dropping video for age
+needs the host to say it can resync and each update to say how many frames it
+has; until then video is held back by its bitrate budget and the pump's
+high-water mark.
 
 The limit of doing this over TCP is plain: the choice can be made only until a
 frame is handed to the socket. After that the kernel resends a lost segment

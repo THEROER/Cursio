@@ -17,6 +17,7 @@ use cursio_protocol::{Rect, TileCodec, WindowCloseReason, WindowFrame, WindowFra
 use tokio::sync::mpsc;
 
 use crate::codec::decode_tile;
+use crate::frame_gap::FrameGap;
 use crate::framebuffer::{geometry_of, Geometry};
 use crate::presentation_ack::PresentationAcks;
 use crate::WindowError;
@@ -68,8 +69,7 @@ pub(crate) struct SurrogateFront<X> {
     /// Raised by the window thread while its decoder waits for a keyframe,
     /// and here when frames went missing on the way.
     wants_keyframe: Arc<AtomicBool>,
-    /// The newest `seq` seen, to notice frames that never arrived.
-    last_seq: Option<u32>,
+    gap: FrameGap,
 }
 
 impl<X> SurrogateFront<X> {
@@ -89,7 +89,7 @@ impl<X> SurrogateFront<X> {
             acks: PresentationAcks::new(id),
             video_started: false,
             wants_keyframe,
-            last_seq: None,
+            gap: FrameGap::default(),
         }
     }
 
@@ -102,7 +102,15 @@ impl<X> SurrogateFront<X> {
 
     /// Route one frame to the window thread.
     pub(crate) fn apply_frame(&mut self, frame: &WindowFrame) -> Result<(), WindowError> {
-        self.note_seq(frame.seq);
+        let missing = self.gap.note(frame.seq);
+        if missing > 0 {
+            tracing::debug!(
+                id = self.id,
+                missing,
+                "frames went missing; asking for the whole picture"
+            );
+            self.wants_keyframe.store(true, Ordering::Relaxed);
+        }
         // A frame the picture cannot hold means the host resized the window;
         // adopt the new geometry before blitting into it.
         match geometry_of(frame.dirty, frame.codec, self.width, self.height) {
@@ -144,38 +152,6 @@ impl<X> SurrogateFront<X> {
         })
     }
 
-    /// Ask for the whole picture when numbers were skipped.
-    ///
-    /// A frame can go missing on purpose: a sender drops video too old to be
-    /// worth showing, and a session moving to another path does not resend
-    /// it. Every later H.264 packet then references a picture this decoder
-    /// never had, and a lost tile leaves its region stale, both until the
-    /// host sends the whole picture — which, with an unbounded GOP, it does
-    /// only when asked. The decoder cannot notice by itself: it decodes the
-    /// references it lacks into smears rather than failing. Tiles of one
-    /// update share a `seq`, so only a step of two or more is a loss; a
-    /// number going backwards is a stream that started over.
-    fn note_seq(&mut self, seq: u32) {
-        if let Some(last) = self.last_seq {
-            let step = seq.wrapping_sub(last);
-            if step == 0 || step > u32::MAX / 2 {
-                if step != 0 {
-                    self.last_seq = Some(seq);
-                }
-                return;
-            }
-            if step > 1 {
-                tracing::debug!(
-                    id = self.id,
-                    missing = step - 1,
-                    "frames went missing; asking for the whole picture"
-                );
-                self.wants_keyframe.store(true, Ordering::Relaxed);
-            }
-        }
-        self.last_seq = Some(seq);
-    }
-
     pub(crate) fn take_ack(&mut self) -> Option<WindowFrameAck> {
         while let Ok(seq) = self.presented.try_recv() {
             self.acks.note_presented(seq);
@@ -193,7 +169,7 @@ impl<X> SurrogateFront<X> {
     pub(crate) fn restart(&mut self) {
         self.video_started = false;
         self.acks = PresentationAcks::new(self.id);
-        self.last_seq = None;
+        self.gap.reset();
     }
 
     /// The window thread ended, and with it the command receiver. Win32 learns
@@ -276,24 +252,5 @@ mod tests {
         assert!(!front.take_keyframe_request());
         front.apply_frame(&video(4)).unwrap();
         assert!(front.take_keyframe_request());
-    }
-
-    #[test]
-    fn tiles_sharing_a_number_and_a_restarted_stream_are_not_losses() {
-        let (mut front, _window) = front();
-        front.apply_frame(&video(10)).unwrap();
-        front.apply_frame(&video(10)).unwrap();
-        front.apply_frame(&video(11)).unwrap();
-        front.apply_frame(&video(0)).unwrap();
-        front.apply_frame(&video(1)).unwrap();
-        assert!(!front.take_keyframe_request());
-    }
-
-    #[test]
-    fn numbering_wraps_without_a_loss() {
-        let (mut front, _window) = front();
-        front.apply_frame(&video(u32::MAX)).unwrap();
-        front.apply_frame(&video(0)).unwrap();
-        assert!(!front.take_keyframe_request());
     }
 }
