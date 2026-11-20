@@ -196,14 +196,18 @@ impl NotifyDisplay for FdoDisplay {
             }
             id
         };
+        // Not waited for: a link ending takes down everything it showed, one
+        // round trip to the Shell each, and the Shell answers from its main
+        // thread. The id is already forgotten above, so a copy shown again
+        // under this key is a new notification, queued behind this close.
         if let Some(id) = id {
-            let closed = crate::session_bus::with_bus(move |bus| {
-                bus.call_method(Some(DEST), PATH, Some(DEST), "CloseNotification", &id)
-                    .map(drop)
+            crate::session_bus::post(move |bus| {
+                if let Err(e) =
+                    bus.call_method(Some(DEST), PATH, Some(DEST), "CloseNotification", &id)
+                {
+                    tracing::debug!(error = %e, "could not take a notification down");
+                }
             });
-            if let Some(Err(e)) = closed {
-                tracing::debug!(error = %e, "could not take a notification down");
-            }
         }
     }
 }

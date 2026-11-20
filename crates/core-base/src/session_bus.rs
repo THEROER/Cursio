@@ -69,6 +69,19 @@ pub fn with_bus<T: Send + 'static>(
     rx.recv().ok()
 }
 
+/// Hand `job` to the session bus without waiting for it, for a call whose
+/// answer changes nothing here. A caller that must not stall — a module
+/// letting go at the end of its session — returns at once however slow or
+/// wedged the far end is. Jobs run in the order given, so a later
+/// [`with_bus`] still finds this one done.
+pub fn post(job: impl FnOnce(&Connection) + Send + 'static) {
+    let Some(inbox) = worker() else { return };
+    let _ = inbox
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .send(Box::new(job));
+}
+
 /// The connection itself, for a thread of the caller's own that only waits
 /// on signals. Cloned on the worker, so no blocking call happens here.
 pub fn connection() -> Option<Connection> {

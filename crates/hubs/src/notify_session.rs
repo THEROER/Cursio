@@ -360,7 +360,10 @@ impl SessionModule for NotifyEngine {
 impl Drop for NotifyEngine {
     fn drop(&mut self) {
         hub().unregister(&self.peer, self.posts.1);
-        // Its buttons answer through this link, which is gone.
+        // Its buttons answer through this link, which is gone. A session
+        // that resumes on a new connection keeps this module, so only a link
+        // that really ended withdraws them. Every display queues the close
+        // rather than waiting on it, so this never holds up the teardown.
         if let Some(display) = &self.display {
             for key in self.shown.drain() {
                 display.close(self.peer, &key);
