@@ -16,6 +16,9 @@ pub(super) enum RawEvent {
         reason: String,
         unacknowledged: Vec<Vec<u8>>,
     },
+    Expired {
+        body: Vec<u8>,
+    },
 }
 
 /// One thing a session reports to the application.
@@ -26,10 +29,16 @@ pub enum SessionEvent<E> {
         reason: String,
         /// Every reliable message this end sent that the peer never
         /// acknowledged, in the order it was sent, for the application to
-        /// keep and send again in a session of its own making. Empty unless
-        /// the session was asked to hand them back.
+        /// keep and send again in a session of its own making: all of them
+        /// for a session told to hand them back
+        /// ([`SessionOptions::hand_back`](crate::SessionOptions::hand_back)),
+        /// and otherwise only those that carry a deadline not yet passed.
         unacknowledged: Vec<E>,
     },
+    /// A reliable message's [`expires_at`](crate::Envelope::expires_at)
+    /// passed before the peer had it: it was not sent, or not sent again,
+    /// and the peer will not deliver it.
+    Expired(E),
 }
 
 /// The application's end of a session's reports; see [`SessionEvent`].
@@ -42,16 +51,24 @@ impl<E: Envelope> SessionEvents<E> {
     /// The next report; `None` once the session is gone and every report
     /// has been read.
     pub async fn recv(&mut self) -> Option<SessionEvent<E>> {
-        let raw = self.rx.recv().await?;
-        Some(match raw {
-            RawEvent::Ended {
-                reason,
-                unacknowledged,
-            } => SessionEvent::Ended {
-                reason,
-                unacknowledged: decode_all(unacknowledged),
-            },
-        })
+        loop {
+            match self.rx.recv().await? {
+                RawEvent::Ended {
+                    reason,
+                    unacknowledged,
+                } => {
+                    return Some(SessionEvent::Ended {
+                        reason,
+                        unacknowledged: decode_all(unacknowledged),
+                    })
+                }
+                RawEvent::Expired { body } => {
+                    if let Some(message) = decode_all(vec![body]).pop() {
+                        return Some(SessionEvent::Expired(message));
+                    }
+                }
+            }
+        }
     }
 }
 

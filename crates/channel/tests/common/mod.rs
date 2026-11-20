@@ -61,6 +61,13 @@ impl Envelope for Panel {
         Delivery::Reliable
     }
 
+    fn expires_at(&self) -> Option<SystemTime> {
+        match self {
+            Panel::Console(_, at) => *at,
+            Panel::Chunk(..) => None,
+        }
+    }
+
     fn encode(&self) -> Result<Vec<u8>, ChannelError> {
         let mut out = Vec::new();
         match self {
@@ -105,6 +112,17 @@ impl Envelope for Panel {
 
 pub fn line(text: &str) -> Panel {
     Panel::Console(text.into(), None)
+}
+
+/// A deadline `after` from now, to the millisecond the wire carries, so a
+/// message decoded back compares equal to the one sent.
+pub fn deadline_in(after: Duration) -> SystemTime {
+    let at = SystemTime::now() + after;
+    let millis = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    SystemTime::UNIX_EPOCH + Duration::from_millis(millis)
 }
 
 /// Proofs as text, `id|serial|unix millis`, and a deny list of serials.

@@ -47,6 +47,21 @@ pub trait Envelope: Clone + Send + 'static {
         Delivery::Reliable
     }
 
+    /// For a [`Delivery::Reliable`] message on a resumable session: the
+    /// instant, on the sender's wall clock, past which it must not reach the
+    /// peer — a command run late is worse than one refused. Past it the
+    /// message is neither sent nor resent after a resume, and is reported
+    /// ([`SessionEvent::Expired`](crate::SessionEvent::Expired)) rather than
+    /// dropped quietly. Judged only before any of it has reached the peer: a
+    /// message already partly delivered is finished.
+    ///
+    /// Apart from [`Delivery::Fresh`]'s `within`, which is measured against
+    /// the sender's own queue and suits samples, not commands; ignored for a
+    /// fresh message.
+    fn expires_at(&self) -> Option<std::time::SystemTime> {
+        None
+    }
+
     fn encode(&self) -> Result<Vec<u8>, ChannelError>;
 
     fn decode(bytes: &[u8]) -> Result<Self, ChannelError>;

@@ -39,6 +39,7 @@ const MAX_PROOFS: usize = 8;
 pub struct SessionOptions {
     pub(crate) trust: Option<Arc<dyn Trust>>,
     pub(crate) check_every: Duration,
+    pub(crate) hand_back: bool,
 }
 
 impl Default for SessionOptions {
@@ -46,6 +47,7 @@ impl Default for SessionOptions {
         Self {
             trust: None,
             check_every: CHECK_EVERY,
+            hand_back: false,
         }
     }
 }
@@ -64,6 +66,14 @@ impl SessionOptions {
     /// every delivered message.
     pub fn check_every(mut self, every: Duration) -> Self {
         self.check_every = every;
+        self
+    }
+
+    /// When the session ends, hand the application every reliable message
+    /// the peer never acknowledged ([`crate::SessionEvent::Ended`]). Costs a
+    /// copy of each reliable message until its acknowledgement.
+    pub fn hand_back(mut self) -> Self {
+        self.hand_back = true;
         self
     }
 }

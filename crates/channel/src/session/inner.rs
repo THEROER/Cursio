@@ -9,6 +9,7 @@ use crate::session::events::RawEvent;
 use crate::session::frame::ack_frame;
 use crate::session::frame::read_delivered;
 use crate::session::frame::read_u64;
+use crate::session::ledger::Ledger;
 use crate::session::state::PathSlot;
 use crate::session::state::State;
 use crate::session::Path;
@@ -38,6 +39,7 @@ pub(super) struct Inner {
     /// The identity the session is bound to, for a session over the internet.
     pub(super) binding: Option<Binding>,
     pub(super) events: mpsc::UnboundedSender<RawEvent>,
+    pub(super) ledger: Arc<Ledger>,
 }
 
 impl Inner {
@@ -178,9 +180,10 @@ impl Inner {
         }
         // Nobody reading the reports is ordinary (Cursio never does), so a
         // closed receiver is not an error.
+        let unacknowledged = self.ledger.end();
         let _ = self.events.send(RawEvent::Ended {
             reason: why,
-            unacknowledged: Vec::new(),
+            unacknowledged,
         });
         self.changed.notify_waiters();
         self.report();
@@ -244,14 +247,23 @@ impl Inner {
 
     pub(super) fn acknowledge(&self, bytes: &[u8]) -> Result<(), ChannelError> {
         let delivered = read_delivered(bytes, self.lanes())?;
-        {
+        self.acknowledged(&delivered);
+        Ok(())
+    }
+
+    /// The peer has delivered each lane up to `delivered`.
+    pub(super) fn acknowledged(&self, delivered: &[u64]) {
+        let settled = {
             let mut state = self.lock();
             for lane in self.classes.lane_ids() {
                 state.acknowledged(lane, delivered[lane.index()]);
             }
+            std::mem::take(&mut state.settled)
+        };
+        if !settled.is_empty() {
+            self.ledger.settled(settled);
         }
         self.changed.notify_waiters();
-        Ok(())
     }
 
     /// Start a path's reader and writer and add it to the session.

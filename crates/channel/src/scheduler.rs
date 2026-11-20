@@ -56,6 +56,11 @@
 //! message's first frame is judged: a message part-way out is finished, or
 //! the receiver would reassemble its tail onto the next one.
 //!
+//! A reliable message with a deadline ([`Envelope::expires_at`]) is judged
+//! the same way against the wall clock, but only under a session, whose
+//! ledger reports it expired: dropped here with nobody told, it would be lost
+//! quietly, which is the one thing a deadline must not cause.
+//!
 //! ## Measuring it
 //!
 //! Every frame carries the instant it was queued, and the drainer records how
@@ -66,7 +71,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use tokio::sync::Notify;
@@ -185,6 +190,11 @@ struct Queued<E> {
     starts_message: bool,
     /// When its message stops being worth sending ([`Delivery::Fresh`]).
     expires: Option<Instant>,
+    /// When its reliable message must no longer reach the peer
+    /// ([`Envelope::expires_at`]); set only on a message the ledger tracks.
+    deadline: Option<SystemTime>,
+    /// The message's entry in the session's ledger, if it has one.
+    message: Option<u64>,
     /// A message still waiting here whole, in one frame, that a later one may
     /// fold into rather than queue behind; see [`PrioritizedTx::send`].
     held: Option<E>,
@@ -195,6 +205,29 @@ pub(crate) struct OutFrame {
     pub tagged: Vec<u8>,
     pub class: ClassId,
     pub lossy: bool,
+    pub message: Option<u64>,
+    pub first: bool,
+    pub deadline: Option<SystemTime>,
+}
+
+/// Where a session keeps the reliable messages it still owes its peer whole;
+/// see `session::ledger`.
+pub(crate) trait MessageLedger: Send + Sync {
+    /// Enter a message being admitted: `Some` id when it is to be tracked,
+    /// an error once the session is over and can owe nothing more.
+    fn register(
+        &self,
+        body: &[u8],
+        deadline: Option<SystemTime>,
+    ) -> Result<Option<u64>, ChannelError>;
+
+    /// Message `id` passed its deadline before reaching the peer. With
+    /// `more_queued`, frames of it may still come through the scheduler and
+    /// are to be skipped.
+    fn expired(&self, id: u64, more_queued: bool);
+
+    /// Whether a reliable message with `deadline` would be entered.
+    fn tracks(&self, deadline: Option<SystemTime>) -> bool;
 }
 
 /// Where the drainer writes, one frame at a time, in the order it chose them.
@@ -268,6 +301,8 @@ struct Queues<E> {
     /// Messages dropped unsent in the running window because they outlived
     /// their [`Delivery::Fresh`] time, per class.
     expired: Vec<u32>,
+    /// The session's ledger, for a scheduler under one.
+    ledger: Option<Arc<dyn MessageLedger>>,
 }
 
 impl<E> Queues<E> {
@@ -288,6 +323,7 @@ impl<E> Queues<E> {
             window_start: None,
             last_window: vec![QueueDelay::default(); n],
             expired: vec![0; n],
+            ledger: None,
         }
     }
 
@@ -298,6 +334,18 @@ impl<E> Queues<E> {
 
     /// Queue every frame of one message, contiguously.
     fn push_message(&mut self, class: usize, frames: Vec<Vec<u8>>, delivery: Delivery) {
+        self.push_tracked(class, frames, delivery, None, None);
+    }
+
+    /// As [`Self::push_message`], for a message the ledger may hold.
+    fn push_tracked(
+        &mut self,
+        class: usize,
+        frames: Vec<Vec<u8>>,
+        delivery: Delivery,
+        message: Option<u64>,
+        deadline: Option<SystemTime>,
+    ) {
         let queued_at = Instant::now();
         let (lossy, expires) = match delivery {
             Delivery::Reliable => (false, None),
@@ -311,6 +359,8 @@ impl<E> Queues<E> {
                 lossy,
                 starts_message: n == 0,
                 expires,
+                deadline,
+                message,
                 held: None,
             });
         }
@@ -322,11 +372,16 @@ impl<E> Queues<E> {
         loop {
             let front = self.classes[class].pop_front()?;
             self.queued_bytes[class] -= front.frame.len();
-            let expired = front.starts_message && front.expires.is_some_and(|at| now >= at);
+            let expired = front.starts_message
+                && (front.expires.is_some_and(|at| now >= at)
+                    || front.deadline.is_some_and(|at| SystemTime::now() >= at));
             if !expired {
                 return Some(front);
             }
             self.expired[class] += 1;
+            if let (Some(id), Some(ledger)) = (front.message, &self.ledger) {
+                ledger.expired(id, false);
+            }
             let mut more = has_more_parts(&front.frame);
             while more {
                 let Some(part) = self.classes[class].pop_front() else {
@@ -604,6 +659,9 @@ impl<E: Envelope> PrioritizedTx<E> {
                             tagged: queued.frame,
                             class,
                             lossy: queued.lossy,
+                            message: queued.message,
+                            first: queued.starts_message,
+                            deadline: queued.deadline,
                         };
                         let result = sink.send_frame(out).await;
                         let finished = {
@@ -659,6 +717,12 @@ impl<E: Envelope> PrioritizedTx<E> {
         self
     }
 
+    /// Enter every message `ledger` wants into it as it is admitted.
+    pub(crate) fn with_ledger(self, ledger: Arc<dyn MessageLedger>) -> Self {
+        self.shared.queues.lock().unwrap().ledger = Some(ledger);
+        self
+    }
+
     /// Tell `seen` of every activity message that crosses this link.
     pub(crate) fn with_input_seen(mut self, seen: InputSeen) -> Self {
         self.input_seen = Some(seen);
@@ -688,7 +752,9 @@ impl<E: Envelope> Queues<E> {
         let Some(last) = self.classes[class].back_mut() else {
             return Ok(false);
         };
-        let Some(mut folded) = last.held.clone() else {
+        // A message the ledger holds is owed as it was admitted; folding into
+        // it would hand back or report a message that never existed.
+        let Some(mut folded) = last.held.clone().filter(|_| last.message.is_none()) else {
             return Ok(false);
         };
         if !folded.fold(next) {
@@ -723,10 +789,16 @@ impl<E: Envelope> PrioritizedTx<E> {
         // deliver the backlog as a burst of tiny steps after a pause, felt as
         // the pointer jerking. A Bluetooth mouse does the same: it adds up its
         // motion and reports once per connection interval.
+        let deadline = match delivery {
+            Delivery::Reliable => msg.expires_at(),
+            Delivery::Fresh { .. } => None,
+        };
         let folds = msg.folds();
         if folds {
             let mut q = self.shared.queues.lock().unwrap();
-            if q.terminal_error.is_none() && !q.closed && q.fold_into_last(idx, msg)? {
+            let tracked = delivery == Delivery::Reliable
+                && q.ledger.as_ref().is_some_and(|l| l.tracks(deadline));
+            if !tracked && q.terminal_error.is_none() && !q.closed && q.fold_into_last(idx, msg)? {
                 return Ok(());
             }
         }
@@ -749,8 +821,15 @@ impl<E: Envelope> PrioritizedTx<E> {
                     return Err(ChannelError::Closed);
                 }
                 if q.queued_bytes[idx] + size <= self.shared.spec.class(idx).budget.max(size) {
+                    // Entered under the queue's lock, at admission: a send
+                    // cancelled while it waited for room owes nothing.
+                    let message = match (&q.ledger, delivery) {
+                        (Some(ledger), Delivery::Reliable) => ledger.register(&body, deadline)?,
+                        _ => None,
+                    };
+                    let deadline = deadline.filter(|_| message.is_some());
                     let single = frames.len() == 1;
-                    q.push_message(idx, frames, delivery);
+                    q.push_tracked(idx, frames, delivery, message, deadline);
                     if single && folds {
                         if let Some(last) = q.classes[idx].back_mut() {
                             last.held = Some(msg.clone());

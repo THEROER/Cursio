@@ -18,6 +18,14 @@ pub(super) struct Kept {
     pub(super) frame: Vec<u8>,
     pub(super) sent_at: Option<Instant>,
     pub(super) sent_on: Option<u64>,
+    /// The message's entry in the ledger, for a message it holds.
+    pub(super) message: Option<u64>,
+    /// The frame starts its message: while it is unacknowledged, none of the
+    /// message has been delivered, so the whole of it may still be withheld.
+    pub(super) first: bool,
+    /// The frame ends its message, so its acknowledgement settles it.
+    pub(super) last: bool,
+    pub(super) deadline: Option<std::time::SystemTime>,
 }
 
 pub(super) struct PathSlot {
@@ -84,6 +92,9 @@ pub(super) struct State {
     pub(super) bulk_active: Option<Instant>,
     pub(super) next_probe: u64,
     pub(super) choice: PathChoice,
+    /// Ledger entries whose last frame was acknowledged, for the caller to
+    /// settle once it has let go of this lock.
+    pub(super) settled: Vec<u64>,
 }
 
 impl State {
@@ -100,6 +111,7 @@ impl State {
             bulk_active: None,
             next_probe: 0,
             choice: PathChoice::default(),
+            settled: Vec::new(),
         }
     }
 
@@ -226,9 +238,46 @@ impl State {
                 if let Some(at) = kept.sent_at {
                     rtt = Some(at.elapsed());
                 }
+                if let Some(id) = kept.message.filter(|_| kept.last) {
+                    self.settled.push(id);
+                }
             }
         }
         rtt
+    }
+
+    /// Take out of `lane`'s resend buffer every message past its deadline of
+    /// which the peer has nothing yet — its first frame still unacknowledged —
+    /// as it is about to be resent. Each comes back with whether frames of it
+    /// may still be on their way from the scheduler.
+    pub(super) fn withhold_expired(
+        &mut self,
+        lane: LaneId,
+        now: std::time::SystemTime,
+    ) -> Vec<(u64, bool)> {
+        let delivery = &mut self.lanes[lane.index()];
+        let mut expired: Vec<(u64, bool)> = delivery
+            .unacked
+            .iter()
+            .filter(|k| k.first && k.deadline.is_some_and(|at| now >= at))
+            .filter_map(|k| k.message.map(|id| (id, true)))
+            .collect();
+        if expired.is_empty() {
+            return expired;
+        }
+        let mut bytes = 0;
+        delivery.unacked.retain(|kept| {
+            let Some(entry) = expired.iter_mut().find(|(id, _)| Some(*id) == kept.message) else {
+                return true;
+            };
+            if kept.last {
+                entry.1 = false;
+            }
+            bytes += kept.frame.len();
+            false
+        });
+        delivery.unacked_bytes -= bytes;
+        expired
     }
 
     pub(super) fn delivered(&self) -> Vec<u64> {
@@ -354,6 +403,10 @@ mod tests {
                 frame: Vec::new(),
                 sent_at: Some(now),
                 sent_on: Some(1),
+                message: None,
+                first: true,
+                last: true,
+                deadline: None,
             });
         assert!(state.input_stalled_on(1, now + INPUT_STALL * 2));
     }

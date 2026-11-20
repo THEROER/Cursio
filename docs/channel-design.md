@@ -342,6 +342,23 @@ either side of the move must still form a session.
   four bytes), never the tag's own bytes.
 - **Endings are reported**: `ResumableLink::events` yields
   `SessionEvent::Ended { reason, … }` once, whatever ended it.
+- **What is owed is kept as messages, not frames** (`session/ledger.rs`): a
+  reliable message is entered whole, as its encoded body, when the scheduler
+  admits it, and leaves when the frame that ends it is acknowledged. That
+  covers the scheduler's queue, the frame in the drainer's hands and the
+  resend buffer at once, and a chunked message's early parts need no keeping
+  of their own. `SessionOptions::hand_back` enters every reliable message;
+  without it only messages with a deadline are entered, so Cursio's sessions
+  keep nothing and pay one branch per message. `Ended.unacknowledged` comes
+  in admission order, decoded with `Envelope::decode`.
+- **A deadline is `Envelope::expires_at`**, for reliable messages on a
+  session. It is judged where the message can still be withheld whole: at
+  the scheduler's queue, when the drainer hands it over, and when a new path
+  resends — only while its first frame is unacknowledged, so the peer has
+  none of it; later frames still queued are skipped. It is reported as
+  `SessionEvent::Expired(message)`, and one still owed when the session ends
+  past its deadline is reported expired rather than handed back. A message
+  a ledger holds is never folded into.
 
 ## Licence
 

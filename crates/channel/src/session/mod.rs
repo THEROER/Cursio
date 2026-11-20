@@ -94,6 +94,7 @@ mod congestion;
 mod events;
 mod frame;
 mod inner;
+mod ledger;
 mod receive;
 mod send;
 mod state;
@@ -105,6 +106,7 @@ pub use receive::ResumableRx;
 
 use crate::carrier::TlsInfo;
 use crate::session::bind::Binding;
+use crate::session::ledger::Ledger;
 use crate::trust::Verified;
 
 /// How long a session waits, with no path at all, for one to come back.
@@ -478,12 +480,7 @@ impl ResumeHandle {
             PathKind::Standby => kind,
             PathKind::Lane(_) => PathKind::Lane(lane),
         };
-        {
-            let mut state = self.0.lock();
-            for lane in classes.lane_ids() {
-                state.acknowledged(lane, peer_delivered[lane.index()]);
-            }
-        }
+        self.0.acknowledged(&peer_delivered);
         self.0.install(Path {
             tx,
             rx,
@@ -588,6 +585,7 @@ impl<E: Envelope> ResumableLink<E> {
             observer: Mutex::new(None),
             congestion: Mutex::new(congestion::BackgroundRate::default()),
             binding,
+            ledger: Arc::new(Ledger::new(options.hand_back, events_tx.clone())),
             events: events_tx,
         });
         inner.install(first);
@@ -678,7 +676,8 @@ impl<E: Envelope> ResumableLink<E> {
             .with_holding(holding)
             .with_carrying_path(carrying)
             .with_input_seen(input_seen)
-            .with_frame_limit(frame_limit);
+            .with_frame_limit(frame_limit)
+            .with_ledger(self.inner.ledger.clone());
         self.inner.lock().kick = Some(tx.kick_handle());
         tx
     }

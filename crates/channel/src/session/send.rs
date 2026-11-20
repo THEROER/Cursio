@@ -1,8 +1,8 @@
 //! The send side: numbering each frame, keeping what may need resending, and
 //! choosing the path that carries it.
 
-use crate::scheduler::{FrameSink, OutFrame};
-use crate::seal::link_tag;
+use crate::scheduler::{FrameSink, MessageLedger, OutFrame};
+use crate::seal::{has_more_parts, link_tag};
 use crate::session::frame::ack_frame;
 use crate::session::frame::read_u64;
 use crate::session::frame::seq_frame;
@@ -14,7 +14,7 @@ use crate::session::RESEND_CAP;
 use crate::{ChannelError, LaneId};
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 /// The drainer's end of a resumable link: numbers each frame, keeps the
@@ -37,6 +37,18 @@ impl FrameSink for ResumableSink {
         let lane = self.lane.index();
         let spec = self.inner.classes.lane(self.lane).clone();
         let ack = out.tagged.first() == Some(&link_tag::ACK);
+        let last = !has_more_parts(&out.tagged);
+        if let Some(id) = out.message {
+            if self.inner.ledger.skip(id, last) {
+                return Ok(());
+            }
+            // Past its deadline before any of it was numbered: it is withheld
+            // here, the last place it still can be.
+            if out.first && out.deadline.is_some_and(|at| SystemTime::now() >= at) {
+                self.inner.ledger.expired(id, !last);
+                return Ok(());
+            }
+        }
         if !ack && !out.lossy {
             loop {
                 let changed = self.inner.changed.notified();
@@ -58,6 +70,7 @@ impl FrameSink for ResumableSink {
         }
         let now = Instant::now();
         let mut writes = Vec::new();
+        let mut withheld = Vec::new();
         {
             let mut state = self.inner.lock();
             if let Some(why) = &state.ended {
@@ -69,6 +82,7 @@ impl FrameSink for ResumableSink {
             if let Some((id, _, writer)) = &carrying {
                 if self.last_path != Some(*id) {
                     self.last_path = Some(*id);
+                    withheld = state.withhold_expired(self.lane, SystemTime::now());
                     for kept in &mut state.lanes[lane].unacked {
                         kept.sent_at = None;
                         kept.sent_on = None;
@@ -101,6 +115,11 @@ impl FrameSink for ResumableSink {
                         }
                     }
                 }
+            } else if out
+                .message
+                .is_some_and(|m| withheld.iter().any(|(id, _)| *id == m))
+            {
+                // The rest of a message withheld just now goes no further.
             } else {
                 if spec.paced {
                     state.bulk_active = Some(now);
@@ -115,6 +134,10 @@ impl FrameSink for ResumableSink {
                         frame: frame.clone(),
                         sent_at: None,
                         sent_on: None,
+                        message: out.message,
+                        first: out.first,
+                        last,
+                        deadline: out.deadline,
                     });
                 }
                 // The receiver delivers whatever number comes first and takes
@@ -147,6 +170,10 @@ impl FrameSink for ResumableSink {
                     None => {}
                 }
             }
+        }
+        for (id, more_queued) in withheld {
+            let ends_here = out.message == Some(id) && last;
+            self.inner.ledger.expired(id, more_queued && !ends_here);
         }
         for (writer, id, frame) in writes {
             if spec.paced {
