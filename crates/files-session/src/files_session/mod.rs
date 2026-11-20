@@ -72,6 +72,10 @@ mod wire;
 
 /// Serves our volumes to the peer and mounts theirs here.
 pub struct FilesEngine {
+    /// The peer's stable id, which a Windows mount remembers its drive letter
+    /// by; see [`cursio_files::drive_letters`].
+    #[cfg_attr(not(all(target_os = "windows", target_env = "msvc")), allow(dead_code))]
+    peer_id: String,
     peer_name: String,
     /// Our disks, as the peer sees them. Behind a mutex because the blocking
     /// tasks that touch the disk need it across await points.
@@ -228,6 +232,7 @@ pub struct FilesEngine {
 
 impl FilesEngine {
     pub fn new(
+        peer_id: String,
         peer_name: String,
         share: cursio_files::SharePolicy,
         read_cache: Option<cursio_files::readcache::CacheSettings>,
@@ -259,6 +264,7 @@ impl FilesEngine {
         cursio_files::walk::set_reporter(report_walk);
 
         Ok(Self {
+            peer_id,
             peer_name,
             server: std::sync::Arc::new(std::sync::Mutex::new(server)),
             local_volumes,
@@ -355,6 +361,7 @@ impl crate::module::ModuleFactory for FilesFactory {
 
     fn build(&self, ctx: &crate::module::SessionCtx) -> anyhow::Result<Box<dyn SessionModule>> {
         Ok(Box::new(FilesEngine::new(
+            ctx.peer.peer_id.to_string(),
             ctx.peer_name().to_string(),
             self.share.get(),
             self.read_cache.clone(),

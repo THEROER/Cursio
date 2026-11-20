@@ -165,6 +165,7 @@ pub(super) fn mount_is_alive(mount: &Mount) -> bool {
 #[cfg(target_os = "linux")]
 pub(super) fn mount_one_volume(
     peer: PeerLink,
+    _peer_id: &str,
     peer_name: &str,
     volume: &Volume,
     _publisher: u64,
@@ -185,23 +186,27 @@ pub(super) fn mount_one_volume(
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 pub(super) fn mount_one_volume(
     peer: PeerLink,
+    peer_id: &str,
     peer_name: &str,
     volume: &Volume,
     publisher: u64,
     cache: Option<&cursio_files::readcache::CacheSettings>,
 ) -> anyhow::Result<Mount> {
-    let name = cursio_files::peer_volume_name(peer_name, &volume.id, volume.removable);
+    let request = cursio_files::relay::MountRequest {
+        peer_id: peer_id.to_string(),
+        peer_name: peer_name.to_string(),
+        volume: volume.id.clone(),
+        label: cursio_files::peer_volume_name(peer_name, &volume.id, volume.removable),
+        // In the node's data directory whichever process mounts, so the helper
+        // and a node mounting for itself remember the same letters.
+        drive_letters: cursio_core_base::data_dir::data_dir()
+            .map(|dir| dir.join("drive-letters.json")),
+        cache: cache.cloned(),
+    };
     #[cfg(feature = "files-mount")]
     {
         if crate::elevate::is_elevated() {
-            match crate::mount_helper::mount(
-                peer.clone(),
-                peer_name,
-                &volume.id,
-                &name,
-                publisher,
-                cache.cloned(),
-            ) {
+            match crate::mount_helper::mount(peer.clone(), request.clone(), publisher) {
                 Ok(relayed) => return Ok(Mount::Helper(relayed)),
                 Err(e) => tracing::warn!(
                     peer = %peer_name,
@@ -213,7 +218,16 @@ pub(super) fn mount_one_volume(
             }
         }
         let cache = cache.and_then(cursio_files::readcache::shared);
-        cursio_files::winmount::mount(peer, peer_name, &volume.id, &name, cache).map(|drive| {
+        cursio_files::winmount::mount(
+            peer,
+            peer_id,
+            peer_name,
+            &volume.id,
+            &request.label,
+            request.drive_letters.as_deref(),
+            cache,
+        )
+        .map(|drive| {
             super::peer_paths::note_drive(publisher, peer_name, &volume.id, drive.mountpoint());
             Mount::Here { _drive: drive }
         })
@@ -222,15 +236,7 @@ pub(super) fn mount_one_volume(
     // elevated or not.
     #[cfg(not(feature = "files-mount"))]
     {
-        crate::mount_helper::mount(
-            peer,
-            peer_name,
-            &volume.id,
-            &name,
-            publisher,
-            cache.cloned(),
-        )
-        .map(Mount::Helper)
+        crate::mount_helper::mount(peer, request, publisher).map(Mount::Helper)
     }
 }
 
@@ -373,6 +379,7 @@ impl FilesEngine {
             }
             match mount_one_volume(
                 self.mount_link.clone(),
+                &self.peer_id,
                 &self.peer_name,
                 volume,
                 self.mounts_publisher,
