@@ -286,6 +286,16 @@ settings at run time (`settings::register`) under `ext.<module>.` or
 use, switch a module, or restart one, but not be handed to a piece of the
 node by name, since none exists for them.
 
+Every reader changes a setting the same way, by key: the control socket's
+`settings`, `set_setting` and `reset_setting` (control v25) list each
+setting with its kind, value, default, what changing it takes and whether a
+flag pins it, and set or reset one. Given a `machine`, the same requests go
+to that machine through the diag module (`DiagRequest::Settings`,
+`SetSetting`), which answers, writes and applies them there exactly as its
+own socket would, and logs who asked. A change is always written to the file
+and then applied by the running node's applier, so it lands as an edit of
+`config.toml` would and the file stays the one record of what is set.
+
 A running link renegotiates with `Message::Reconfigure` (protocol v18): the
 sender's full advert set and position, plus any modules to restart. Both sides
 recompute `negotiate` from the latest adverts each holds of the other, stop
