@@ -7,6 +7,7 @@ members = [
     "crates/queue",
     "crates/logging",
     "crates/clipboard-core",
+    "crates/channel",
     "crates/transport",
     "crates/airplay",
     "crates/input",
@@ -46,6 +47,7 @@ cursio-queue = { path = "crates/queue" }
 cursio-protocol = { path = "crates/protocol" }
 cursio-app-protocol = { path = "crates/app-protocol", version = "0.7.1" }
 cursio-sdk = { path = "crates/sdk" }
+cursio-channel = { path = "crates/channel" }
 cursio-transport = { path = "crates/transport" }
 cursio-bluetooth = { path = "crates/bluetooth" }
 cursio-wifidirect = { path = "crates/wifidirect" }

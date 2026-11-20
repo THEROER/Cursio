@@ -1,0 +1,39 @@
+[package]
+name = "cursio-channel"
+version.workspace = true
+edition.workspace = true
+# Not the workspace's GPL: Leave links this crate into code of its own
+# licence, so nothing GPL or vendored may enter it (`docs/channel-design.md`,
+# "Licence").
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+description = "Several kinds of traffic over one resumable, encrypted link: classes, lanes, a scheduler and a session that outlives its connection"
+readme = "README.md"
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+snow.workspace = true
+sha2.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# `setsockopt` for `TCP_NOTSENT_LOWAT` and `TCP_USER_TIMEOUT`, which tokio
+# does not expose; see `tcp::send_backlog` and `tcp::dead_peer`.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# `SIO_IDEAL_SEND_BACKLOG_QUERY`, `SO_SNDBUF`, `TCP_MAXRT` and `SIO_TCP_INFO`;
+# see `tcp::send_backlog`, `tcp::dead_peer` and `tcp::info`.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Networking_WinSock",
+    # `WSAIoctl`'s signature names `OVERLAPPED`, even when none is passed.
+    "Win32_System_IO",
+] }
+
+[dev-dependencies]
+# `start_paused`, so a resumable session's one-minute hold runs out in
+# virtual time.
+tokio = { version = "1", features = ["full", "test-util"] }
