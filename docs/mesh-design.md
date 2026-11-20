@@ -486,7 +486,7 @@ bounds still apply separately to every lane.
 ### Historical single-socket scheduling
 
 Every module rides one Noise-over-TCP link, so the order bytes leave in is the
-latency each module gets. `transport/src/priority.rs` queues frames per class —
+latency each module gets. `channel/src/scheduler.rs` queues frames per class —
 `Control` > `Input` > `Audio` > `Video` > `Metadata` > `Bulk` — and a drainer
 writes the most urgent one next, re-choosing between frames. That choice only
 reaches as far as the socket: whatever the kernel already holds goes out first,
@@ -502,7 +502,7 @@ So an input frame now waits behind at most two things, both bounded:
   is corrupt. Frames are at most one Noise message, 64 KiB: 0.5 ms on gigabit.
   They are not cut smaller for the lower classes, because a 64 MiB message would
   then need more parts than a receiver accepts.
-- **What the kernel holds unsent** (`transport/src/send_backlog.rs`). On Linux,
+- **What the kernel holds unsent** (`channel/src/tcp/send_backlog.rs`). On Linux,
   Android and macOS, `TCP_NOTSENT_LOWAT` = 32 KiB: the socket reports writable
   only below that many unsent bytes. Sent-but-unacknowledged bytes are not
   counted, so the congestion window — and throughput — is untouched; only the
@@ -570,7 +570,7 @@ down — disks unmounted, streams closed, the cursor sent home — and rebuilt o
 the mesh dialled again. dark, on a b43 radio that loses its access point about
 once an hour for a median of eight seconds, paid that every time.
 
-Now the session rides a `ResumableLink` (`transport/src/resume/`) and
+Now the session rides a `ResumableLink` (`channel/src/session/`, Cursio's binding in `transport/src/resume.rs`) and
 connections are *paths* under it:
 
 - **Sequenced, acknowledged, resent.** XMPP's stream management (XEP-0198) is
@@ -604,7 +604,7 @@ connections are *paths* under it:
   path silent for 10 s, whose radio pauses for seconds while it pages or opens
   a profile, and a standby silent for 45 s, whose keepalive is every 15 s,
   are let go of; so is any connection whose sent data stays
-  unacknowledged for 10 s (`TCP_USER_TIMEOUT`, `transport/src/dead_peer.rs` —
+  unacknowledged for 10 s (`TCP_USER_TIMEOUT`, `channel/src/tcp/dead_peer.rs` —
   keepalive alone never fires while data is queued). A carrying path whose
   frames stay unacknowledged for 3 s while another path exists is *degraded*
   for 10 s and the session moves (1 s for input on a network path with a
@@ -785,7 +785,7 @@ All five parts shipped, and the code is laid out along the same seams:
 | Peer registry | `PeerState`, `should_dial` — `registry.rs` |
 | N sessions | one task per peer, supervised by the registry |
 | Node state | `NodeStatus` — `protocol/src/node.rs`; reading it — `core-base/src/node_status.rs` |
-| Priority to the wire | drainer, queue delay — `transport/src/priority.rs`; kernel backlog — `transport/src/send_backlog.rs` |
+| Priority to the wire | drainer, queue delay — `channel/src/scheduler.rs`; kernel backlog — `channel/src/tcp/send_backlog.rs` |
 
 `PeerState` gained a third state the original design did not name: `Connecting`,
 so the supervisor does not start a second attempt for a peer that already has one

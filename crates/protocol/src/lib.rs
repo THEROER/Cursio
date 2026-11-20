@@ -99,11 +99,7 @@ pub use window::{
 /// ([`layout::ScreenOffset`]).
 pub const PROTOCOL_VERSION: u16 = 25;
 
-/// Names one live session between two nodes, the same on both ends: derived
-/// from the Noise handshake that opened it. Not a secret — a connection that
-/// offers it must still complete Noise with the pair's key before it can carry
-/// anything.
-pub type SessionTag = [u8; 16];
+pub use cursio_channel::{Delivery, SessionTag};
 
 /// A stable identifier for a Cursio node, persisted across restarts.
 pub type PeerId = uuid::Uuid;
@@ -593,37 +589,54 @@ impl Message {
     }
 }
 
-/// How much a link must do to deliver a message: the other half of what a
-/// message's kind declares, beside its [`Priority`].
+/// `Message` on the shared channel: its class is its [`Priority`], in the
+/// order the transport declares them, and its delivery is [`Message::delivery`].
 ///
-/// Priority says what goes *first*; this says what a late copy is *worth*.
-/// The two are independent: sound is urgent and worthless once late, a
-/// directory listing is urgent and must arrive however late, a file chunk is
-/// neither urgent nor ever worthless.
-///
-/// Not on the wire. Each end decides for what it sends, which is why a peer
-/// of any version can be sent to, and why a message's choice can change
-/// without a protocol bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Delivery {
-    /// Arrives exactly once and in order within its lane, resent after a
-    /// dropped connection. A key press, a release, a file request: lost, it
-    /// leaves a key held or a process asleep in a filesystem call forever.
-    Reliable,
-    /// Describes the present, so a copy that missed its moment is worth less
-    /// than nothing: pointer motion, sound, pixels.
-    ///
-    /// Never kept for resending after a dropped connection. Replayed, five
-    /// seconds of buffered motion jump the cursor by all of it at once and old
-    /// sound plays over new — Mosh's lesson, that a mobile link should deliver
-    /// the latest state rather than the history.
-    ///
-    /// With `within`, a sender that has not started the message that long
-    /// after it was queued drops it whole instead, so a link coming back from
-    /// a stall spends itself on what is current rather than on a backlog the
-    /// receiver would throw away on arrival. The receiver sees a gap, as it
-    /// would after a dropped connection, and must already cope with one.
-    Fresh { within: Option<std::time::Duration> },
+/// Pointer motion folds: a move that finds the previous one still unsent
+/// joins it, since relative deltas sum exactly. Only a person's input counts
+/// as activity — the link test's pings ride the input class to measure what a
+/// pointer feels, and must not themselves make bulk yield.
+impl cursio_channel::Envelope for Message {
+    fn class(&self) -> cursio_channel::ClassId {
+        self.priority().class()
+    }
+
+    fn delivery(&self) -> Delivery {
+        Message::delivery(self)
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, cursio_channel::ChannelError> {
+        self.to_bytes()
+            .map_err(|e| cursio_channel::ChannelError::Envelope(format!("protocol error: {e}")))
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, cursio_channel::ChannelError> {
+        Message::from_bytes(bytes)
+            .map_err(|e| cursio_channel::ChannelError::Envelope(format!("protocol error: {e}")))
+    }
+
+    fn folds(&self) -> bool {
+        matches!(self, Message::Input(InputEvent::PointerMotion { .. }))
+    }
+
+    fn fold(&mut self, next: &Self) -> bool {
+        let (
+            Message::Input(InputEvent::PointerMotion { dx, dy }),
+            Message::Input(InputEvent::PointerMotion { dx: nx, dy: ny }),
+        ) = (&*self, next)
+        else {
+            return false;
+        };
+        let (Some(x), Some(y)) = (dx.checked_add(*nx), dy.checked_add(*ny)) else {
+            return false;
+        };
+        *self = Message::Input(InputEvent::PointerMotion { dx: x, dy: y });
+        true
+    }
+
+    fn is_activity(&self) -> bool {
+        matches!(self, Message::Input(_))
+    }
 }
 
 /// Scheduling classes for the shared channel, highest first.
@@ -663,6 +676,31 @@ pub enum Priority {
     Control,
 }
 
+impl Priority {
+    /// Every class, highest first: the order the channel's classes are
+    /// declared in, so a priority's index here is its class.
+    pub const ALL: [Priority; 6] = [
+        Priority::Control,
+        Priority::Input,
+        Priority::Audio,
+        Priority::Video,
+        Priority::Metadata,
+        Priority::Bulk,
+    ];
+
+    /// This priority's class on the channel.
+    pub const fn class(self) -> cursio_channel::ClassId {
+        match self {
+            Priority::Control => 0,
+            Priority::Input => 1,
+            Priority::Audio => 2,
+            Priority::Video => 3,
+            Priority::Metadata => 4,
+            Priority::Bulk => 5,
+        }
+    }
+}
+
 /// Errors from (de)serializing a [`Message`].
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -687,6 +725,28 @@ mod tests {
             .unwrap();
         assert_eq!(hello[..4], [0, 0, 0, 0]);
         assert_eq!(u16::from_le_bytes([hello[4], hello[5]]), PROTOCOL_VERSION);
+    }
+
+    /// As the channel's envelope: motion folds into motion and nothing else,
+    /// only a person's input is activity, and the bytes are the bincode.
+    #[test]
+    fn a_message_folds_only_motion_into_motion_and_encodes_as_its_bincode() {
+        use cursio_channel::Envelope;
+        let motion = |dx, dy| Message::Input(InputEvent::PointerMotion { dx, dy });
+        let mut waiting = motion(1, 2);
+        assert!(waiting.folds());
+        assert!(waiting.fold(&motion(3, 4)));
+        assert_eq!(waiting, motion(4, 6));
+        assert!(!waiting.fold(&Message::Bye));
+        assert!(!motion(i32::MAX, 0).fold(&motion(1, 0)));
+        assert!(!Message::Bye.folds());
+        assert!(waiting.is_activity());
+        assert!(!Message::Heartbeat { nonce: 1 }.is_activity());
+        assert_eq!(Envelope::class(&Message::Bye), Priority::Control.class());
+        assert_eq!(
+            Envelope::encode(&Message::Update(vec![0xab])).unwrap(),
+            Message::Update(vec![0xab]).to_bytes().unwrap()
+        );
     }
 
     #[test]

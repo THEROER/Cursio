@@ -1,11 +1,17 @@
 //! Encrypted transport via the Noise protocol.
 //!
 //! After pairing, both peers hold the same SPAKE2-derived secret. This module
-//! wraps any [`Transport`] in an [`EncryptedTransport`] that runs a Noise
-//! `NNpsk0` handshake keyed by that secret, then transparently encrypts and
+//! wraps any [`Transport`] in an [`EncryptedTransport`] that runs the
+//! channel's [`NoisePsk`] handshake keyed by that secret, then encrypts and
 //! decrypts every [`Message`]. Layers above (`session::handshake`,
 //! `run_heartbeat`) keep working against the [`Transport`] trait, unaware that
 //! bytes are now ciphertext.
+//!
+//! What crosses the inner transport is the channel's frames, each as a
+//! [`Message::Opaque`]: the handshake, the tagged chunks and the session's own
+//! frames alike (`OpaqueCarrier`). That is the shape every Cursio build has
+//! put on the wire, so a peer from before the channel was extracted still
+//! forms a session with this one.
 //!
 //! ## Why `NNpsk0`
 //!
@@ -21,104 +27,18 @@
 //! shared_key)` — fixed length, with domain separation so this key can't be
 //! confused with the pairing confirmation tags.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
-use cursio_protocol::{decode_frame, encode_frame, Message};
-use sha2::{Digest, Sha256};
-use snow::{HandshakeState, TransportState};
+use cursio_channel::seal::{chunk, Reassembler, SealedRx, SealedTx};
+use cursio_channel::{Carrier, ChannelError, NoisePsk, Seal, Trust};
+use cursio_protocol::Message;
 
 use crate::pairing::Role;
-use crate::{Transport, TransportError, TransportRx, TransportTx};
-
-/// The Noise parameter string. `NNpsk0` = no static keys, PSK mixed at
-/// position 0; X25519 DH, ChaChaPoly AEAD, BLAKE2s hash.
-const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
+use crate::{
+    OpaqueCarrier, OpaqueRx, OpaqueTx, Transport, TransportError, TransportRx, TransportTx,
+};
 
 /// Domain tag for deriving the Noise PSK from the SPAKE2 secret.
 const PSK_DERIVATION_TAG: &[u8] = b"cursio-noise-psk-v1";
-
-/// Max plaintext per Noise message. The Noise spec caps a single message at
-/// 65535 bytes (including the 16-byte AEAD tag), so keep plaintext safely
-/// under that. Control messages are tiny; larger payloads (clipboard images,
-/// files, video) are split across several frames — see [`seal_chunked`].
-const MAX_NOISE_PLAINTEXT: usize = 65535 - 16;
-
-/// One-byte tag at the front of every sealed plaintext, so the receiver can
-/// tell a whole message from one piece of a chunked one.
-///
-/// A single `Message::to_bytes()` used to be sealed directly; now we always
-/// prefix a tag. Old peers don't interoperate across this change, which is fine
-/// — both sides ship together.
-mod frame_tag {
-    /// The rest of the plaintext is a complete `Message` (the common case:
-    /// input, audio, small control messages all fit in one frame).
-    pub const WHOLE: u8 = 0x00;
-    /// The rest is `[u32 msg_id][u16 part_idx][u16 part_count][chunk bytes]`:
-    /// one piece of a message too big for a single Noise frame. The receiver
-    /// buffers pieces by `msg_id` and reassembles once all `part_count` arrive.
-    pub const PART: u8 = 0x01;
-}
-
-/// Tags only a resumable link writes (see [`crate::resume`]); the plain
-/// transport never sees them.
-pub(crate) mod link_tag {
-    /// `[u8 lane][u64 seq][u8 flags][tagged frame]`: one frame of the session, numbered
-    /// so the receiver drops the copies a resend produces.
-    pub const SEQ: u8 = 0x02;
-    /// `[u64 delivered; 4][u8 flags]`: the highest sequence number this side has
-    /// delivered. Doubles as the path's keepalive.
-    pub const ACK: u8 = 0x03;
-    /// `[u64 delivered; 4][u8 lane][u8 session_tag; 16]`: the first frame on a path joining a session, after
-    /// which each side resends whatever the other has not delivered.
-    pub const RESUME: u8 = 0x04;
-    pub const PING: u8 = 0x05;
-    pub const PONG: u8 = 0x06;
-    /// What `SEQ` puts in front of a tagged frame: the tag, the number and
-    /// the flags.
-    pub const SEQ_HEADER_LEN: usize = 1 + 1 + 8 + 1;
-}
-
-/// The most of a Noise message a tagged frame may fill. A resumable link
-/// wraps every frame in a `SEQ` header before sealing it, so a frame cut to
-/// the whole Noise budget no longer fits once wrapped: the seal fails, the
-/// path drops, and the same frame waits at the head of the resend buffer to
-/// end every path that joins after it.
-const MAX_TAGGED_PLAINTEXT: usize = MAX_NOISE_PLAINTEXT - link_tag::SEQ_HEADER_LEN;
-
-/// Header on every `PART` frame: which message, which piece, how many total.
-/// Fixed 8 bytes, big-endian, right after [`frame_tag::PART`].
-const PART_HEADER_LEN: usize = 4 + 2 + 2;
-
-/// Whether a tagged plaintext frame has more of its message queued behind it,
-/// which is what lets the drainer release a whole message as a unit.
-///
-/// The tag alone cannot answer this: the *last* piece of a chunked message is
-/// tagged `PART` like every other, so a drainer keying on the tag never sees a
-/// message end while chunked messages keep arriving back to back.
-pub(crate) fn has_more_parts(tagged: &[u8]) -> bool {
-    if tagged.first() != Some(&frame_tag::PART) || tagged.len() < 1 + PART_HEADER_LEN {
-        return false;
-    }
-    let idx = u16::from_be_bytes([tagged[5], tagged[6]]);
-    let count = u16::from_be_bytes([tagged[7], tagged[8]]);
-    idx.saturating_add(1) < count
-}
-
-/// Usable payload per `PART` frame: the tagged-frame budget minus the 1-byte
-/// tag and the part header. What's left is how much of the message each frame
-/// carries.
-const MAX_CHUNK_PAYLOAD: usize = MAX_TAGGED_PLAINTEXT - 1 - PART_HEADER_LEN;
-// The frozen update lane still receives plain encrypted frames from older
-// sessions, whose smaller SEQ header left a larger chunk budget.
-const MAX_ACCEPTED_CHUNK_PAYLOAD: usize = MAX_NOISE_PLAINTEXT - 1 - PART_HEADER_LEN;
-
-/// Largest logical message accepted by the encrypted transport.
-const MAX_LOGICAL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_PARTS: usize = MAX_LOGICAL_MESSAGE_BYTES.div_ceil(MAX_CHUNK_PAYLOAD);
-/// Priority scheduling can interleave several chunked messages, but a peer may
-/// not create unbounded half-finished allocations.
-const MAX_IN_FLIGHT_MESSAGES: usize = 8;
 
 /// Errors specific to the encrypted transport.
 #[derive(Debug, thiserror::Error)]
@@ -131,9 +51,13 @@ pub enum CryptoError {
     MessageTooLarge(usize),
 }
 
-impl From<snow::Error> for CryptoError {
-    fn from(e: snow::Error) -> Self {
-        CryptoError::Noise(format!("{e:?}"))
+impl From<ChannelError> for CryptoError {
+    fn from(e: ChannelError) -> Self {
+        match e {
+            ChannelError::Noise(message) => CryptoError::Noise(message),
+            ChannelError::MessageTooLarge(len) => CryptoError::MessageTooLarge(len),
+            other => CryptoError::Transport(other.into()),
+        }
     }
 }
 
@@ -143,266 +67,12 @@ impl From<CryptoError> for TransportError {
     }
 }
 
-/// Derive the 32-byte Noise PSK from the SPAKE2 shared secret.
-fn derive_psk(shared_key: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(PSK_DERIVATION_TAG);
-    hasher.update(shared_key);
-    hasher.finalize().into()
-}
-
-/// Shared Noise cipher state. Both directions share one [`TransportState`]
-/// (snow keeps separate send/recv nonces internally), so when the transport is
-/// split the two halves share it behind a mutex. The lock is held only for the
-/// CPU-bound encrypt/decrypt call — never across an `.await` — so it never
-/// serialises network I/O.
-pub(crate) type SharedNoise = std::sync::Arc<std::sync::Mutex<TransportState>>;
-
-/// Next message id for chunked sends. Only meaningful within one sender; wraps
-/// harmlessly (the receiver keys reassembly on id + arrival, and a wrapped id
-/// can't collide with a still-in-flight one at any realistic rate).
-static NEXT_MSG_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Seal one plaintext buffer (already tagged) into an `Opaque` ciphertext frame.
-pub(crate) fn seal_frame(
-    noise: &SharedNoise,
-    tagged_plaintext: &[u8],
-) -> Result<Message, TransportError> {
-    let mut ciphertext = vec![0u8; tagged_plaintext.len() + 16];
-    let len = {
-        let mut guard = noise.lock().unwrap();
-        guard
-            .write_message(tagged_plaintext, &mut ciphertext)
-            .map_err(CryptoError::from)?
-    };
-    ciphertext.truncate(len);
-    Ok(Message::Opaque(ciphertext))
-}
-
-/// Split `msg` into one or more **tagged plaintext** frames, ready to seal.
-///
-/// Small messages (the overwhelming majority — input, audio, control) yield one
-/// [`frame_tag::WHOLE`] buffer. A message whose serialized form exceeds one
-/// Noise frame yields several [`frame_tag::PART`] buffers the peer reassembles
-/// (see [`Reassembler`]). Chunking lives here, at the crypto layer, because
-/// this is where the exact post-serialization size and the Noise size limit are
-/// both known.
-///
-/// Sealing is kept *separate* (see [`seal_frame`]) so a priority multiplexer
-/// can queue these plaintext pieces and seal them one at a time in send order —
-/// Noise nonces must advance in exactly the order frames hit the wire, so we
-/// must not seal until the drainer has decided what goes next.
-pub(crate) fn chunk_plaintext(msg: &Message) -> Result<Vec<Vec<u8>>, TransportError> {
-    chunk_plaintext_within(msg, || MAX_TAGGED_PLAINTEXT)
-}
-
-/// The smallest frame [`chunk_plaintext_within`] cuts to.
-pub(crate) const MIN_FRAME: usize = 1024;
-
-/// As [`chunk_plaintext`], with each tagged frame at most `frame` bytes,
-/// which is asked only of a message too large for [`MIN_FRAME`].
-///
-/// A frame on the wire cannot be interrupted, so its length is how long
-/// whatever is queued behind it waits: on a slow path that bounds how long a
-/// pointer move waits behind a file or an image. Receivers accept any piece
-/// up to the full budget, and the piece grows past `frame` only where a
-/// message would otherwise need more pieces than a receiver accepts.
-pub(crate) fn chunk_plaintext_within(
-    msg: &Message,
-    frame: impl FnOnce() -> usize,
-) -> Result<Vec<Vec<u8>>, TransportError> {
-    let body = msg.to_bytes()?;
-    if body.len() > MAX_LOGICAL_MESSAGE_BYTES {
-        return Err(CryptoError::MessageTooLarge(body.len()).into());
-    }
-    let frame = if body.len() < MIN_FRAME {
-        MAX_TAGGED_PLAINTEXT
-    } else {
-        frame().clamp(MIN_FRAME, MAX_TAGGED_PLAINTEXT)
-    };
-
-    // Fast path: fits whole. Tag byte + body in one frame.
-    if body.len() < frame {
-        let mut tagged = Vec::with_capacity(body.len() + 1);
-        tagged.push(frame_tag::WHOLE);
-        tagged.extend_from_slice(&body);
-        return Ok(vec![tagged]);
-    }
-
-    let payload = (frame - 1 - PART_HEADER_LEN)
-        .max(body.len().div_ceil(MAX_PARTS))
-        .min(MAX_CHUNK_PAYLOAD);
-    let part_count = body.len().div_ceil(payload);
-    if part_count > MAX_PARTS {
-        return Err(CryptoError::MessageTooLarge(body.len()).into());
-    }
-    let msg_id = NEXT_MSG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    let mut frames = Vec::with_capacity(part_count);
-    for (idx, chunk) in body.chunks(payload).enumerate() {
-        let mut tagged = Vec::with_capacity(1 + PART_HEADER_LEN + chunk.len());
-        tagged.push(frame_tag::PART);
-        tagged.extend_from_slice(&msg_id.to_be_bytes());
-        tagged.extend_from_slice(&(idx as u16).to_be_bytes());
-        tagged.extend_from_slice(&(part_count as u16).to_be_bytes());
-        tagged.extend_from_slice(chunk);
-        frames.push(tagged);
-    }
-    Ok(frames)
-}
-
-/// Encrypt `msg` into one or more `Opaque` ciphertext frames (chunk + seal).
-fn seal_chunked(noise: &SharedNoise, msg: &Message) -> Result<Vec<Message>, TransportError> {
-    chunk_plaintext(msg)?
-        .iter()
-        .map(|tagged| seal_frame(noise, tagged))
-        .collect()
-}
-
-/// Decrypt one inbound `Opaque` frame to its tagged plaintext.
-pub(crate) fn open_frame(
-    noise: &SharedNoise,
-    incoming: Message,
-) -> Result<Vec<u8>, TransportError> {
-    let ciphertext = match incoming {
-        Message::Opaque(c) => c,
-        _ => return Err(CryptoError::Noise("expected opaque ciphertext frame".into()).into()),
-    };
-    let mut plaintext = vec![0u8; ciphertext.len()];
-    let len = {
-        let mut guard = noise.lock().unwrap();
-        guard
-            .read_message(&ciphertext, &mut plaintext)
-            .map_err(CryptoError::from)?
-    };
-    plaintext.truncate(len);
-    Ok(plaintext)
-}
-
-/// Reassembles chunked messages on the receive side.
-///
-/// One per receiver (the un-split `recv` and each `EncryptedRx` own one). A
-/// `WHOLE` frame decodes immediately; `PART` frames accumulate by `msg_id`
-/// until every piece has arrived, then the full body is decoded. Priority
-/// scheduling deliberately interleaves high-priority frames between large
-/// lower-priority messages, so partials are tracked independently by id.
-#[derive(Default)]
-pub(crate) struct Reassembler {
-    in_progress: HashMap<u32, Partial>,
-    buffered_bytes: usize,
-}
-
-/// The chunked message id a tagged `PART` frame belongs to, if it is one.
-pub(crate) fn part_message_id(tagged: &[u8]) -> Option<u32> {
-    if tagged.first() != Some(&frame_tag::PART) || tagged.len() < 1 + PART_HEADER_LEN {
-        return None;
-    }
-    Some(u32::from_be_bytes([
-        tagged[1], tagged[2], tagged[3], tagged[4],
-    ]))
-}
-
-/// Accumulated pieces of one chunked message.
-struct Partial {
-    part_count: u16,
-    /// Received parts by index; `None` until that piece arrives.
-    parts: Vec<Option<Vec<u8>>>,
-    /// How many of `part_count` we have, so we know when it's complete without
-    /// rescanning `parts`.
-    received: u16,
-}
-
-impl Reassembler {
-    /// Give up on a chunked message whose remaining pieces will never come —
-    /// a lossy one cut off by a connection that dropped.
-    pub(crate) fn forget(&mut self, msg_id: u32) {
-        if let Some(partial) = self.in_progress.remove(&msg_id) {
-            let held: usize = partial.parts.iter().flatten().map(Vec::len).sum();
-            self.buffered_bytes -= held;
+impl From<Role> for cursio_channel::Role {
+    fn from(role: Role) -> Self {
+        match role {
+            Role::Initiator => cursio_channel::Role::Initiator,
+            Role::Responder => cursio_channel::Role::Responder,
         }
-    }
-
-    /// Feed one decrypted tagged plaintext. Returns `Some(msg)` when a complete
-    /// message is available (a whole frame, or the final piece of a chunked
-    /// one), or `None` when more pieces are still needed.
-    pub(crate) fn accept(&mut self, tagged: &[u8]) -> Result<Option<Message>, TransportError> {
-        let (&tag, rest) = tagged
-            .split_first()
-            .ok_or_else(|| CryptoError::Noise("empty frame".into()))?;
-        match tag {
-            frame_tag::WHOLE => Ok(Some(Message::from_bytes(rest)?)),
-            frame_tag::PART => self.accept_part(rest),
-            other => Err(CryptoError::Noise(format!("unknown frame tag {other}")).into()),
-        }
-    }
-
-    fn accept_part(&mut self, rest: &[u8]) -> Result<Option<Message>, TransportError> {
-        if rest.len() < PART_HEADER_LEN {
-            return Err(CryptoError::Noise("truncated chunk header".into()).into());
-        }
-        let msg_id = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
-        let part_idx = u16::from_be_bytes([rest[4], rest[5]]);
-        let part_count = u16::from_be_bytes([rest[6], rest[7]]);
-        let chunk = &rest[PART_HEADER_LEN..];
-
-        if part_count == 0 || part_idx >= part_count {
-            return Err(CryptoError::Noise("bad chunk indices".into()).into());
-        }
-
-        if usize::from(part_count) > MAX_PARTS || chunk.len() > MAX_ACCEPTED_CHUNK_PAYLOAD {
-            return Err(
-                CryptoError::MessageTooLarge(usize::from(part_count) * MAX_CHUNK_PAYLOAD).into(),
-            );
-        }
-        if !self.in_progress.contains_key(&msg_id) {
-            if self.in_progress.len() >= MAX_IN_FLIGHT_MESSAGES {
-                return Err(
-                    CryptoError::Noise("too many chunked messages in flight".into()).into(),
-                );
-            }
-            self.in_progress.insert(
-                msg_id,
-                Partial {
-                    part_count,
-                    parts: (0..part_count).map(|_| None).collect(),
-                    received: 0,
-                },
-            );
-        }
-        let partial = self
-            .in_progress
-            .get_mut(&msg_id)
-            .expect("partial was inserted above");
-
-        if partial.part_count != part_count {
-            return Err(CryptoError::Noise("inconsistent chunk count".into()).into());
-        }
-        // Ignore a duplicate piece (retransmit / reorder) rather than double-count.
-        if partial.parts[part_idx as usize].is_none() {
-            if self.buffered_bytes.saturating_add(chunk.len()) > MAX_LOGICAL_MESSAGE_BYTES {
-                return Err(CryptoError::MessageTooLarge(self.buffered_bytes + chunk.len()).into());
-            }
-            partial.parts[part_idx as usize] = Some(chunk.to_vec());
-            partial.received += 1;
-            self.buffered_bytes += chunk.len();
-        }
-
-        if partial.received < partial.part_count {
-            return Ok(None);
-        }
-
-        // Complete: concatenate in order and decode.
-        let partial = self
-            .in_progress
-            .remove(&msg_id)
-            .expect("complete partial is still tracked");
-        let total: usize = partial.parts.iter().flatten().map(|p| p.len()).sum();
-        self.buffered_bytes -= total;
-        let mut body = Vec::with_capacity(total);
-        for part in partial.parts {
-            body.extend_from_slice(&part.expect("all parts present when received == count"));
-        }
-        Ok(Some(Message::from_bytes(&body)?))
     }
 }
 
@@ -411,17 +81,12 @@ impl Reassembler {
 /// Construct via [`EncryptedTransport::establish`], which performs the Noise
 /// handshake over the inner transport before any application messages flow.
 pub struct EncryptedTransport<T: Transport> {
-    inner: T,
-    noise: SharedNoise,
+    inner: OpaqueCarrier<T>,
+    seal: Seal,
     /// Receive-side reassembly state for chunked messages.
     reasm: Reassembler,
-    /// The Noise handshake hash, identical on both ends and unique to this
-    /// connection: what names a session for resumption.
-    handshake_hash: Vec<u8>,
+    session_tag: cursio_protocol::SessionTag,
 }
-
-/// A half-open handshake must not reserve a peer's session indefinitely.
-const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl<T: Transport> EncryptedTransport<T> {
     /// Run the Noise `NNpsk0` handshake over `inner`, then return an encrypted
@@ -430,167 +95,35 @@ impl<T: Transport> EncryptedTransport<T> {
     /// `shared_key` is the SPAKE2 secret from pairing; `role` must match the
     /// role used during pairing so initiator/responder agree on handshake
     /// direction. Both peers must call this at the same point in the protocol.
-    pub async fn establish(
-        mut inner: T,
-        shared_key: &[u8],
-        role: Role,
-    ) -> Result<Self, CryptoError> {
-        let psk = derive_psk(shared_key);
-        let params = NOISE_PARAMS
-            .parse()
-            .map_err(|e| CryptoError::Noise(format!("bad params: {e:?}")))?;
-        let builder = snow::Builder::new(params).psk(0, &psk);
-
-        let handshake = match role {
-            Role::Initiator => builder.build_initiator()?,
-            Role::Responder => builder.build_responder()?,
-        };
-
-        let kind = inner.kind();
-        let handshake = async {
-            match role {
-                Role::Initiator => Self::handshake_initiator(&mut inner, handshake).await,
-                Role::Responder => Self::handshake_responder(&mut inner, handshake).await,
-            }
-        };
-        let (noise, handshake_hash) = tokio::time::timeout(NOISE_HANDSHAKE_TIMEOUT, handshake)
-            .await
-            .map_err(|_| {
-                CryptoError::Noise(format!(
-                    "Noise handshake over {kind} timed out after {} seconds",
-                    NOISE_HANDSHAKE_TIMEOUT.as_secs()
-                ))
-            })??;
-
+    pub async fn establish(inner: T, shared_key: &[u8], role: Role) -> Result<Self, CryptoError> {
+        let mut inner = OpaqueCarrier(inner);
+        let opened = NoisePsk::from_secret(PSK_DERIVATION_TAG, shared_key)
+            .open(&mut inner, role.into())
+            .await?;
         Ok(Self {
             inner,
-            noise: std::sync::Arc::new(std::sync::Mutex::new(noise)),
+            seal: opened.seal,
             reasm: Reassembler::default(),
-            handshake_hash,
+            session_tag: opened.session_tag,
         })
     }
 
     /// The tag a session started on this connection is known by, on both ends.
     pub fn session_tag(&self) -> cursio_protocol::SessionTag {
-        let mut tag = [0u8; 16];
-        let hash = Sha256::digest(&self.handshake_hash);
-        tag.copy_from_slice(&hash[..16]);
-        tag
+        self.session_tag
     }
 
     /// Take the connection apart into a path a resumable link can carry a
     /// session over: the raw halves, and the Noise state that seals for them.
     pub fn into_path(self, kind: crate::resume::PathKind) -> crate::resume::Path {
-        let direct = self.inner.local_ip().is_some_and(crate::direct::is_local);
-        let (tx, rx) = Box::new(self.inner).split();
+        let direct = self.inner.0.local_ip().is_some_and(crate::direct::is_local);
+        let (tx, rx) = Box::new(self.inner.0).split();
         crate::resume::Path {
-            tx,
-            rx,
-            noise: self.noise,
-            kind,
+            tx: Box::new(OpaqueTx(tx)),
+            rx: Box::new(OpaqueRx(rx)),
+            seal: self.seal,
+            kind: kind.into(),
             direct,
-        }
-    }
-
-    /// Initiator side of the 2-message `NNpsk0` handshake: send msg1, read msg2.
-    async fn handshake_initiator(
-        inner: &mut T,
-        mut hs: HandshakeState,
-    ) -> Result<(TransportState, Vec<u8>), CryptoError> {
-        // -> e (msg1)
-        let mut buf = vec![0u8; 1024];
-        let len = hs.write_message(&[], &mut buf)?;
-        Self::send_raw(inner, &buf[..len]).await?;
-        // Each step said, because a handshake that stalls says nothing else:
-        // a Bluetooth join was seen to stop here, past `Hello`, for minutes.
-        tracing::debug!(
-            kind = inner.kind(),
-            "noise: first message sent, waiting for the answer"
-        );
-
-        // <- e, ee, psk (msg2)
-        let msg2 = Self::recv_raw(inner).await?;
-        tracing::debug!(kind = inner.kind(), "noise: answer received");
-        let mut scratch = vec![0u8; 1024];
-        hs.read_message(&msg2, &mut scratch)?;
-
-        let hash = hs.get_handshake_hash().to_vec();
-        Ok((hs.into_transport_mode()?, hash))
-    }
-
-    /// Responder side: read msg1, send msg2.
-    async fn handshake_responder(
-        inner: &mut T,
-        mut hs: HandshakeState,
-    ) -> Result<(TransportState, Vec<u8>), CryptoError> {
-        // -> e (msg1)
-        tracing::debug!(kind = inner.kind(), "noise: waiting for the first message");
-        let msg1 = Self::recv_raw(inner).await?;
-        tracing::debug!(
-            kind = inner.kind(),
-            "noise: first message received, answering"
-        );
-        let mut scratch = vec![0u8; 1024];
-        hs.read_message(&msg1, &mut scratch)?;
-
-        // <- e, ee, psk (msg2)
-        let mut buf = vec![0u8; 1024];
-        let len = hs.write_message(&[], &mut buf)?;
-        Self::send_raw(inner, &buf[..len]).await?;
-
-        let hash = hs.get_handshake_hash().to_vec();
-        Ok((hs.into_transport_mode()?, hash))
-    }
-
-    /// Send raw handshake bytes as one length-prefixed frame on the inner
-    /// transport. We can't use `inner.send` (it expects a [`Message`]), so we
-    /// frame the bytes ourselves and go through a private raw channel.
-    async fn send_raw(inner: &mut T, bytes: &[u8]) -> Result<(), CryptoError> {
-        let frame = encode_frame(bytes).map_err(TransportError::from)?;
-        inner.send(&Message::Opaque(frame)).await?;
-        Ok(())
-    }
-
-    /// Receive one raw handshake frame from the inner transport.
-    async fn recv_raw(inner: &mut T) -> Result<Vec<u8>, CryptoError> {
-        match inner.recv().await? {
-            Message::Opaque(frame) => {
-                let (payload, _) = decode_frame(&frame)
-                    .map_err(TransportError::from)?
-                    .ok_or_else(|| CryptoError::Noise("truncated handshake frame".into()))?;
-                Ok(payload)
-            }
-            _ => Err(CryptoError::Noise("expected opaque handshake frame".into())),
-        }
-    }
-}
-
-/// Seal `msg` and write all its frames to `inner`. Shared by the un-split and
-/// split send paths.
-async fn send_chunked(
-    inner: &mut dyn TransportTx,
-    noise: &SharedNoise,
-    msg: &Message,
-) -> Result<(), TransportError> {
-    for frame in seal_chunked(noise, msg)? {
-        inner.send(&frame).await?;
-    }
-    Ok(())
-}
-
-/// Read frames from `inner` until a complete message reassembles, then return
-/// it. Intermediate chunk frames yield no message, so we keep reading — a
-/// chunked send is several frames arriving back-to-back on the ordered stream.
-async fn recv_reassembled(
-    inner: &mut dyn TransportRx,
-    noise: &SharedNoise,
-    reasm: &mut Reassembler,
-) -> Result<Message, TransportError> {
-    loop {
-        let incoming = inner.recv().await?;
-        let tagged = open_frame(noise, incoming)?;
-        if let Some(msg) = reasm.accept(&tagged)? {
-            return Ok(msg);
         }
     }
 }
@@ -598,18 +131,18 @@ async fn recv_reassembled(
 #[async_trait]
 impl<T: Transport> Transport for EncryptedTransport<T> {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        for frame in seal_chunked(&self.noise, msg)? {
-            self.inner.send(&frame).await?;
+        for tagged in chunk(&msg.to_bytes()?)? {
+            Carrier::send(&mut self.inner, self.seal.seal(&tagged)?).await?;
         }
         Ok(())
     }
 
     async fn recv(&mut self) -> Result<Message, TransportError> {
         loop {
-            let incoming = self.inner.recv().await?;
-            let tagged = open_frame(&self.noise, incoming)?;
-            if let Some(msg) = self.reasm.accept(&tagged)? {
-                return Ok(msg);
+            let sealed = Carrier::recv(&mut self.inner).await?;
+            let tagged = self.seal.open(&sealed)?;
+            if let Some(body) = self.reasm.accept(&tagged)? {
+                return Ok(Message::from_bytes(&body)?);
             }
         }
     }
@@ -619,20 +152,16 @@ impl<T: Transport> Transport for EncryptedTransport<T> {
     }
 
     fn local_ip(&self) -> Option<std::net::IpAddr> {
-        self.inner.local_ip()
+        self.inner.0.local_ip()
     }
 
     fn split(self: Box<Self>) -> (Box<dyn TransportTx>, Box<dyn TransportRx>) {
-        let (inner_tx, inner_rx) = Box::new(self.inner).split();
-        let tx = EncryptedTx {
-            inner: inner_tx,
-            noise: self.noise.clone(),
-        };
-        let rx = EncryptedRx {
-            inner: inner_rx,
-            noise: self.noise,
-            reasm: Reassembler::default(),
-        };
+        let (inner_tx, inner_rx) = Box::new(self.inner.0).split();
+        let tx = EncryptedTx(SealedTx::new(
+            Box::new(OpaqueTx(inner_tx)),
+            self.seal.clone(),
+        ));
+        let rx = EncryptedRx(SealedRx::new(Box::new(OpaqueRx(inner_rx)), self.seal));
         (Box::new(tx), Box::new(rx))
     }
 
@@ -645,52 +174,42 @@ impl<T: Transport> Transport for EncryptedTransport<T> {
     /// receiver is unchanged — reassembly happens the same way regardless of how
     /// the peer scheduled its sends. This is what the session uses.
     fn split_prioritized(self: Box<Self>) -> (Box<dyn TransportTx>, Box<dyn TransportRx>) {
-        let (inner_tx, inner_rx) = Box::new(self.inner).split();
-        // The prioritized sender seals frames itself (in the drainer), so it
-        // wraps the *raw* inner tx, not the sealing EncryptedTx.
-        let tx = crate::priority::PrioritizedTx::spawn(inner_tx, self.noise.clone());
-        let rx = EncryptedRx {
-            inner: inner_rx,
-            noise: self.noise,
-            reasm: Reassembler::default(),
-        };
+        let (inner_tx, inner_rx) = Box::new(self.inner.0).split();
+        let tx = crate::priority::PrioritizedTx::spawn(
+            Box::new(OpaqueTx(inner_tx)),
+            self.seal.clone(),
+            crate::lane::classes(),
+        );
+        let rx = EncryptedRx(SealedRx::new(Box::new(OpaqueRx(inner_rx)), self.seal));
         (Box::new(tx), Box::new(rx))
     }
 }
 
 /// Send half of a split [`EncryptedTransport`]: seals then writes.
-pub struct EncryptedTx {
-    inner: Box<dyn TransportTx>,
-    noise: SharedNoise,
-}
+pub struct EncryptedTx(SealedTx);
 
 #[async_trait]
 impl TransportTx for EncryptedTx {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        send_chunked(self.inner.as_mut(), &self.noise, msg).await
+        Ok(self.0.send_body(&msg.to_bytes()?).await?)
     }
 }
 
 /// Receive half of a split [`EncryptedTransport`]: reads, opens, reassembles.
-pub struct EncryptedRx {
-    inner: Box<dyn TransportRx>,
-    noise: SharedNoise,
-    /// Receive-side reassembly state for chunked messages.
-    reasm: Reassembler,
-}
+pub struct EncryptedRx(SealedRx);
 
 #[async_trait]
 impl TransportRx for EncryptedRx {
     async fn recv(&mut self) -> Result<Message, TransportError> {
-        recv_reassembled(self.inner.as_mut(), &self.noise, &mut self.reasm).await
+        Ok(Message::from_bytes(&self.0.recv_body().await?)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::MemTransport;
     use cursio_protocol::{Hello, PeerId};
-    use tokio::sync::mpsc;
 
     #[tokio::test(start_paused = true)]
     async fn an_unresponsive_noise_peer_times_out_and_releases_the_transport_in_both_roles() {
@@ -701,83 +220,8 @@ mod tests {
             assert!(
                 matches!(result, Err(CryptoError::Noise(message)) if message.contains("timed out"))
             );
-            assert_eq!(started.elapsed(), NOISE_HANDSHAKE_TIMEOUT);
+            assert_eq!(started.elapsed(), cursio_channel::noise::HANDSHAKE_TIMEOUT);
             assert!(remote.send(&Message::Heartbeat { nonce: 1 }).await.is_err());
-        }
-    }
-
-    #[test]
-    fn psk_derivation_is_deterministic_and_32_bytes() {
-        let k1 = derive_psk(b"some-shared-secret");
-        let k2 = derive_psk(b"some-shared-secret");
-        assert_eq!(k1, k2);
-        assert_eq!(k1.len(), 32);
-    }
-
-    #[test]
-    fn psk_differs_for_different_secrets() {
-        assert_ne!(derive_psk(b"secret-a"), derive_psk(b"secret-b"));
-    }
-
-    /// In-memory transport: two of these cross-wired form a bidirectional link,
-    /// letting us exercise the Noise handshake and encrypted round-trips without
-    /// real sockets.
-    struct MemTransport {
-        tx: mpsc::UnboundedSender<Message>,
-        rx: mpsc::UnboundedReceiver<Message>,
-    }
-
-    impl MemTransport {
-        fn pair() -> (Self, Self) {
-            let (tx_a, rx_b) = mpsc::unbounded_channel();
-            let (tx_b, rx_a) = mpsc::unbounded_channel();
-            (
-                MemTransport { tx: tx_a, rx: rx_a },
-                MemTransport { tx: tx_b, rx: rx_b },
-            )
-        }
-    }
-
-    #[async_trait]
-    impl Transport for MemTransport {
-        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-            self.tx
-                .send(msg.clone())
-                .map_err(|_| TransportError::Closed)
-        }
-        async fn recv(&mut self) -> Result<Message, TransportError> {
-            self.rx.recv().await.ok_or(TransportError::Closed)
-        }
-        fn kind(&self) -> &'static str {
-            "mem"
-        }
-        fn split(self: Box<Self>) -> (Box<dyn TransportTx>, Box<dyn TransportRx>) {
-            (
-                Box::new(MemTx { tx: self.tx }),
-                Box::new(MemRx { rx: self.rx }),
-            )
-        }
-    }
-
-    struct MemTx {
-        tx: mpsc::UnboundedSender<Message>,
-    }
-    #[async_trait]
-    impl TransportTx for MemTx {
-        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-            self.tx
-                .send(msg.clone())
-                .map_err(|_| TransportError::Closed)
-        }
-    }
-
-    struct MemRx {
-        rx: mpsc::UnboundedReceiver<Message>,
-    }
-    #[async_trait]
-    impl TransportRx for MemRx {
-        async fn recv(&mut self) -> Result<Message, TransportError> {
-            self.rx.recv().await.ok_or(TransportError::Closed)
         }
     }
 
@@ -790,230 +234,143 @@ mod tests {
         EncryptedTransport<MemTransport>,
     ) {
         let (a, b) = MemTransport::pair();
-        let ka = key.to_vec();
-        let kb = key.to_vec();
-        let init = tokio::spawn(async move {
-            EncryptedTransport::establish(a, &ka, Role::Initiator)
-                .await
-                .unwrap()
-        });
-        let resp = EncryptedTransport::establish(b, &kb, Role::Responder)
-            .await
-            .unwrap();
-        (init.await.unwrap(), resp)
+        let (init, resp) = tokio::join!(
+            EncryptedTransport::establish(a, key, Role::Initiator),
+            EncryptedTransport::establish(b, key, Role::Responder)
+        );
+        (init.unwrap(), resp.unwrap())
     }
 
     #[tokio::test]
     async fn encrypted_roundtrip_with_matching_key() {
         let (mut init, mut resp) = establish_pair(b"shared-secret-from-spake2").await;
-
         let msg = Message::Hello(Hello::bare(PeerId::nil(), "encrypted"));
         init.send(&msg).await.unwrap();
         assert_eq!(resp.recv().await.unwrap(), msg);
-
-        // And the reverse direction.
         resp.send(&Message::Heartbeat { nonce: 7 }).await.unwrap();
         assert_eq!(init.recv().await.unwrap(), Message::Heartbeat { nonce: 7 });
+        assert_eq!(init.session_tag(), resp.session_tag());
     }
 
+    /// What crosses the inner transport: the handshake and every sealed frame
+    /// as `Message::Opaque`, the handshake's with a length prefix of its own,
+    /// and nothing of the plaintext — the shape a peer of any age expects.
     #[tokio::test]
-    async fn ciphertext_is_not_plaintext() {
-        // Confirm what goes on the inner transport is actually encrypted: send
-        // via the encrypted end, peek the raw Opaque frame on the inner channel.
-        let (a, b) = MemTransport::pair();
-        let key = b"k".to_vec();
-        let init = tokio::spawn(async move {
-            EncryptedTransport::establish(a, &key, Role::Initiator)
-                .await
-                .unwrap()
+    async fn every_frame_rides_as_an_opaque_message_and_hides_the_plaintext() {
+        let (a, mut far) = MemTransport::pair();
+        let opening = tokio::spawn(EncryptedTransport::establish(a, b"k", Role::Initiator));
+        let Message::Opaque(first) = far.recv().await.unwrap() else {
+            panic!("the handshake must ride as an opaque message");
+        };
+        // `NNpsk0`'s first message: an ephemeral key and the tag of an empty
+        // payload, behind its own big-endian length.
+        assert_eq!(first[..4], [0, 0, 0, 48]);
+        assert_eq!(first.len(), 4 + 48);
+        let mut responder = OpaqueCarrier(far);
+        let respond = NoisePsk::from_secret(PSK_DERIVATION_TAG, b"k");
+        let mut replay = OpaqueCarrier(ReplayFirst {
+            first: Some(Message::Opaque(first)),
+            inner: &mut responder,
         });
-        let mut resp = EncryptedTransport::establish(b, b"k", Role::Responder)
+        let opened = respond
+            .open(&mut replay, cursio_channel::Role::Responder)
             .await
             .unwrap();
-        let mut init = init.await.unwrap();
+        let mut init = opening.await.unwrap().unwrap();
+        init.send(&Message::Hello(Hello::bare(PeerId::nil(), "TOPSECRET")))
+            .await
+            .unwrap();
+        let Message::Opaque(sealed) = responder.0.recv().await.unwrap() else {
+            panic!("a sealed frame must ride as an opaque message");
+        };
+        assert!(!sealed.windows(9).any(|w| w == b"TOPSECRET"));
+        let tagged = opened.seal.open(&sealed).unwrap();
+        let mut reasm = Reassembler::default();
+        let body = reasm.accept(&tagged).unwrap().unwrap();
+        assert_eq!(
+            Message::from_bytes(&body).unwrap(),
+            Message::Hello(Hello::bare(PeerId::nil(), "TOPSECRET"))
+        );
+    }
 
-        let secret = Message::Hello(Hello::bare(PeerId::nil(), "TOPSECRET"));
-        init.send(&secret).await.unwrap();
-        let got = resp.recv().await.unwrap();
-        assert_eq!(got, secret);
+    /// A transport that answers its first `recv` with a message already read
+    /// off the one it wraps.
+    struct ReplayFirst<'a> {
+        first: Option<Message>,
+        inner: &'a mut OpaqueCarrier<MemTransport>,
+    }
 
-        // The plaintext marker must not appear verbatim in the derived PSK path;
-        // here we assert decryption succeeded and produced the original, which
-        // together with a *different* key failing (below) shows real crypto.
+    #[async_trait]
+    impl Transport for ReplayFirst<'_> {
+        async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
+            self.inner.0.send(msg).await
+        }
+        async fn recv(&mut self) -> Result<Message, TransportError> {
+            match self.first.take() {
+                Some(first) => Ok(first),
+                None => self.inner.0.recv().await,
+            }
+        }
+        fn kind(&self) -> &'static str {
+            "replay"
+        }
+        fn split(self: Box<Self>) -> (Box<dyn TransportTx>, Box<dyn TransportRx>) {
+            unreachable!("the handshake never splits its transport")
+        }
     }
 
     #[tokio::test]
     async fn mismatched_keys_fail_to_communicate() {
-        // Different SPAKE2 secrets => different PSKs => the NNpsk0 handshake
-        // must fail (psk is mixed into the handshake hash).
         let (a, b) = MemTransport::pair();
-        let init = tokio::spawn(async move {
-            EncryptedTransport::establish(a, b"key-A", Role::Initiator).await
-        });
-        let resp = EncryptedTransport::establish(b, b"key-B", Role::Responder).await;
-
-        // At least one side must reject the handshake.
-        let init_res = init.await.unwrap();
+        let (init, resp) = tokio::join!(
+            EncryptedTransport::establish(a, b"key-A", Role::Initiator),
+            EncryptedTransport::establish(b, b"key-B", Role::Responder)
+        );
         assert!(
-            init_res.is_err() || resp.is_err(),
+            init.is_err() || resp.is_err(),
             "handshake should fail with mismatched PSKs"
         );
     }
 
-    #[test]
-    fn the_update_lane_accepts_chunks_from_before_the_session_header_grew() {
-        let message = Message::Opaque(vec![7; 200_000]);
-        let body = message.to_bytes().unwrap();
-        let old_chunk_size = MAX_CHUNK_PAYLOAD + 1;
-        let count = body.len().div_ceil(old_chunk_size);
-        let mut reassembler = Reassembler::default();
-        let mut received = None;
-        for (index, chunk) in body.chunks(old_chunk_size).enumerate() {
-            let mut tagged = vec![frame_tag::PART];
-            tagged.extend_from_slice(&1u32.to_be_bytes());
-            tagged.extend_from_slice(&(index as u16).to_be_bytes());
-            tagged.extend_from_slice(&(count as u16).to_be_bytes());
-            tagged.extend_from_slice(chunk);
-            received = reassembler.accept(&tagged).unwrap().or(received);
-        }
-        assert_eq!(received, Some(message));
-    }
-
-    /// A message far larger than one Noise frame must survive a round-trip,
-    /// reassembled from its pieces. This is the clipboard-image / file / video
-    /// case that used to kill the session with `MessageTooLarge`.
+    /// A message far larger than one Noise frame survives a round-trip,
+    /// reassembled from its pieces: the clipboard-image / file / video case
+    /// that used to kill the session with `MessageTooLarge`.
     #[tokio::test]
     async fn large_message_roundtrips_via_chunking() {
         let (mut init, mut resp) = establish_pair(b"chunk-key").await;
-
-        // ~5 frames' worth: comfortably past the single-frame limit, and past a
-        // page so it exercises multi-part concatenation order.
         let big = Message::Opaque((0..300_000u32).map(|i| i as u8).collect());
         init.send(&big).await.unwrap();
         assert_eq!(resp.recv().await.unwrap(), big);
     }
 
-    /// The exact boundary: a body one byte over what fits whole must chunk and
-    /// still round-trip. Off-by-one here would either corrupt or wrongly reject.
+    /// A body just over what fits whole is chunked and still round-trips.
     #[tokio::test]
     async fn just_over_one_frame_roundtrips() {
         let (mut init, mut resp) = establish_pair(b"boundary-key").await;
-
-        // Opaque's bincode encoding is the tag + an 8-byte length + the bytes,
-        // so pick a payload that pushes the whole body just past the fast-path
-        // limit. Being generous by a few KB keeps this robust to header size.
-        let payload_len = MAX_NOISE_PLAINTEXT; // > (limit - 1) after the enum/length prefix
-        let msg = Message::Opaque(vec![0xABu8; payload_len]);
+        let msg = Message::Opaque(vec![0xABu8; 65535 - 16]);
         init.send(&msg).await.unwrap();
         assert_eq!(resp.recv().await.unwrap(), msg);
     }
 
-    /// A small message sent right after a large one must still decode.
     #[tokio::test]
     async fn small_after_large_still_decodes() {
         let (mut init, mut resp) = establish_pair(b"seq-key").await;
-
         let big = Message::Opaque(vec![7u8; 200_000]);
         init.send(&big).await.unwrap();
         assert_eq!(resp.recv().await.unwrap(), big);
-
         init.send(&Message::Heartbeat { nonce: 42 }).await.unwrap();
         assert_eq!(resp.recv().await.unwrap(), Message::Heartbeat { nonce: 42 });
     }
 
-    #[test]
-    fn interleaved_chunked_messages_reassemble_independently() {
-        let first = Message::Opaque(vec![0x11; 220_000]);
-        let second = Message::Opaque(vec![0x22; 150_000]);
-        let first_frames = chunk_plaintext(&first).unwrap();
-        let second_frames = chunk_plaintext(&second).unwrap();
-        let whole = chunk_plaintext(&Message::Heartbeat { nonce: 9 }).unwrap();
-        let mut reassembler = Reassembler::default();
-        let mut completed = Vec::new();
-
-        assert!(reassembler.accept(&first_frames[0]).unwrap().is_none());
-        assert!(reassembler.accept(&second_frames[0]).unwrap().is_none());
-        completed.push(reassembler.accept(&whole[0]).unwrap().unwrap());
-
-        for index in 1..first_frames.len().max(second_frames.len()) {
-            if let Some(frame) = first_frames.get(index) {
-                if let Some(message) = reassembler.accept(frame).unwrap() {
-                    completed.push(message);
-                }
-            }
-            if let Some(frame) = second_frames.get(index) {
-                if let Some(message) = reassembler.accept(frame).unwrap() {
-                    completed.push(message);
-                }
-            }
-        }
-
-        assert!(completed.contains(&Message::Heartbeat { nonce: 9 }));
-        assert!(completed.contains(&first));
-        assert!(completed.contains(&second));
-        assert!(reassembler.in_progress.is_empty());
-        assert_eq!(reassembler.buffered_bytes, 0);
-    }
-
-    #[test]
-    fn oversized_chunk_count_is_rejected_before_allocation() {
-        let mut tagged = vec![frame_tag::PART];
-        tagged.extend_from_slice(&1_u32.to_be_bytes());
-        tagged.extend_from_slice(&0_u16.to_be_bytes());
-        tagged.extend_from_slice(&((MAX_PARTS + 1) as u16).to_be_bytes());
-
-        let mut reassembler = Reassembler::default();
-        assert!(reassembler.accept(&tagged).is_err());
-        assert!(reassembler.in_progress.is_empty());
-        assert_eq!(reassembler.buffered_bytes, 0);
-    }
-
-    #[test]
-    fn only_the_last_part_of_a_chunked_message_ends_it() {
-        let frames = chunk_plaintext(&Message::Opaque(vec![0u8; 3 * MAX_CHUNK_PAYLOAD])).unwrap();
-        let (last, rest) = frames.split_last().unwrap();
-        assert!(rest.iter().all(|f| has_more_parts(f)));
-        assert!(!has_more_parts(last), "the last part is tagged PART too");
-
-        let whole = chunk_plaintext(&Message::Opaque(vec![0u8; 16])).unwrap();
-        assert!(!has_more_parts(&whole[0]));
-    }
-
-    #[test]
-    fn small_frames_reassemble_into_the_same_message() {
-        let msg = Message::Opaque((0..100_000u32).map(|i| i as u8).collect());
-        let frames = chunk_plaintext_within(&msg, || 4096).unwrap();
-        assert!(frames.len() > 20);
-        assert!(frames.iter().all(|f| f.len() <= 4096));
-
-        let mut reassembler = Reassembler::default();
-        let mut done = None;
-        for frame in &frames {
-            done = reassembler.accept(frame).unwrap().or(done);
-        }
-        assert_eq!(done, Some(msg));
-    }
-
-    #[test]
-    fn small_frames_grow_rather_than_exceed_what_a_receiver_accepts() {
-        let msg = Message::Opaque(vec![7u8; 16 * 1024 * 1024]);
-        let frames = chunk_plaintext_within(&msg, || 4096).unwrap();
-        assert!(frames.len() <= MAX_PARTS);
-
-        let mut reassembler = Reassembler::default();
-        let mut done = None;
-        for frame in &frames {
-            done = reassembler.accept(frame).unwrap().or(done);
-        }
-        assert_eq!(done, Some(msg));
-    }
-
-    #[test]
-    fn a_message_below_the_smallest_frame_is_never_asked_about() {
-        let frames = chunk_plaintext_within(&Message::Heartbeat { nonce: 1 }, || {
-            panic!("a small message needs no frame limit")
-        })
-        .unwrap();
-        assert_eq!(frames.len(), 1);
+    #[tokio::test]
+    async fn the_split_halves_seal_and_open_for_each_other() {
+        let (init, resp) = establish_pair(b"split-key").await;
+        let (mut tx, _) = Box::new(init).split();
+        let (_, mut rx) = Box::new(resp).split();
+        let big = Message::Opaque(vec![1u8; 150_000]);
+        tx.send(&big).await.unwrap();
+        tx.send(&Message::Bye).await.unwrap();
+        assert_eq!(rx.recv().await.unwrap(), big);
+        assert_eq!(rx.recv().await.unwrap(), Message::Bye);
     }
 }

@@ -1,38 +1,44 @@
-//! Cursio transport layer.
+//! Cursio transport layer: Cursio's binding of `cursio-channel`.
 //!
-//! Responsibilities:
+//! The channel — classes and lanes, the scheduler, the resumable session, the
+//! Noise seal, the TCP carrier — is generic and lives in `cursio-channel`
+//! (`docs/channel-design.md`). What is Cursio's own stays here:
+//! - [`lane`]: Cursio's six classes on four lanes, declared for the channel.
 //! - [`discovery`]: find/announce peers on the LAN (mDNS).
 //! - [`pairing`]: password-authenticated key agreement (SPAKE2) + a confirmed
 //!   shared secret, plus persistence of trusted peers.
-//! - [`tcp`]: the concrete Wi-Fi/LAN transport (framed TCP over tokio).
+//! - [`tcp`]: [`Message`]s over the channel's TCP carrier.
 //! - [`stream`]: the same framing over any byte stream — the Bluetooth link.
-//! - [`Transport`] / [`select_transport`]: the abstraction and auto-selection
-//!   that let a future channel slot in without touching callers.
+//! - [`crypto`]: the channel's `NoisePsk` over a [`Transport`], every sealed
+//!   frame riding as a [`Message::Opaque`], as it always has on the wire.
+//! - [`Transport`] / [`select_transport`]: the message-level abstraction the
+//!   greeting, pairing and the frozen update lane speak before and beside the
+//!   channel, and auto-selection between candidates.
 //!
 //! TCP and a Bluetooth byte stream carry the same messages: everything above
 //! [`Transport`] — the handshake, Noise, modules, priorities — is written
 //! against the trait, so a link is the same link whichever one carries it.
 
 use async_trait::async_trait;
+use cursio_channel::{CarrierRx, CarrierTx, ChannelError};
 use cursio_protocol::Message;
 
-mod congestion;
 pub mod crypto;
-pub mod dead_peer;
 pub mod direct;
 pub mod discovery;
 pub mod lane;
 pub mod pairing;
 pub mod priority;
 pub mod resume;
-mod send_backlog;
 pub mod stream;
 pub mod tcp;
-pub mod tcp_info;
 #[cfg(test)]
 pub(crate) mod test_util;
 
 pub use crypto::EncryptedTransport;
+pub use cursio_channel::tcp::dead_peer;
+pub use cursio_channel::tcp::info as tcp_info;
+pub use cursio_channel::{QueueDelay, QueueDepth};
 pub use priority::PrioritizedTx;
 pub use tcp::TcpTransport;
 
@@ -49,6 +55,26 @@ pub enum TransportError {
     Closed,
     #[error("{0}")]
     Other(String),
+}
+
+impl From<ChannelError> for TransportError {
+    fn from(e: ChannelError) -> Self {
+        match e {
+            ChannelError::Io(e) => TransportError::Io(e),
+            ChannelError::Closed => TransportError::Closed,
+            other => TransportError::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<TransportError> for ChannelError {
+    fn from(e: TransportError) -> Self {
+        match e {
+            TransportError::Io(e) => ChannelError::Io(e),
+            TransportError::Closed => ChannelError::Closed,
+            other => ChannelError::Other(other.to_string()),
+        }
+    }
 }
 
 /// A bidirectional, message-oriented link to a single peer.
@@ -96,45 +122,6 @@ pub trait Transport: Send {
     fn split_prioritized(self: Box<Self>) -> (Box<dyn TransportTx>, Box<dyn TransportRx>) {
         self.split()
     }
-}
-
-/// What one priority class has waiting, and what it has already got out.
-///
-/// A bulk producer (the files module) has no other way to tell whether the link
-/// is keeping up with it: [`TransportTx::send`] on the priority multiplexer only
-/// *queues*, so it succeeds just as quickly whether the socket is idle or an
-/// hour behind. Reading the depth back turns that blind write into a control
-/// loop — see `cursio_core::files_session`, which sizes its in-flight window
-/// from the delay these two numbers imply.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct QueueDepth {
-    /// Bytes queued in this class and not yet written to the socket.
-    pub queued_bytes: usize,
-    /// Bytes of this class written to the socket since the link came up.
-    ///
-    /// Monotonic, so the difference between two readings over a known interval
-    /// is the rate this class is actually draining at.
-    pub sent_bytes: u64,
-}
-
-/// How long one priority class's frames waited to reach the socket, over the
-/// most recent complete measurement window.
-///
-/// Measured from `send` queuing a frame to the socket accepting its last byte,
-/// so it covers both waiting behind other classes in our queue and waiting for
-/// the kernel to take the frame. For input this is the lag the scheduler adds
-/// to the pointer — the number to read when a mouse feels slow.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct QueueDelay {
-    /// Frames of this class sent in the window; zero means the other fields
-    /// say nothing.
-    pub frames: u32,
-    /// Median wait, to within a quarter octave.
-    pub p50: std::time::Duration,
-    /// 99th-percentile wait, to within a quarter octave.
-    pub p99: std::time::Duration,
-    /// Longest single wait, exact.
-    pub max: std::time::Duration,
 }
 
 /// The send half of a split [`Transport`].
@@ -231,6 +218,74 @@ pub trait TransportTx: Send {
 #[async_trait]
 pub trait TransportRx: Send {
     async fn recv(&mut self) -> Result<Message, TransportError>;
+}
+
+/// A [`Transport`] as the channel's carrier: each frame rides as a
+/// [`Message::Opaque`] — the bincode of that message inside the transport's
+/// own framing — which is how every Cursio build has sent Noise frames, so
+/// the channel's frames reach a peer of any age as they always have.
+pub(crate) struct OpaqueCarrier<T>(pub(crate) T);
+
+#[async_trait]
+impl<T: Transport> cursio_channel::Carrier for OpaqueCarrier<T> {
+    async fn send(&mut self, frame: Vec<u8>) -> Result<(), ChannelError> {
+        Ok(self.0.send(&Message::Opaque(frame)).await?)
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>, ChannelError> {
+        opaque(self.0.recv().await?)
+    }
+
+    fn kind(&self) -> &'static str {
+        self.0.kind()
+    }
+
+    fn local_ip(&self) -> Option<std::net::IpAddr> {
+        self.0.local_ip()
+    }
+
+    fn split(self: Box<Self>) -> (Box<dyn CarrierTx>, Box<dyn CarrierRx>) {
+        let (tx, rx) = Box::new(self.0).split();
+        (Box::new(OpaqueTx(tx)), Box::new(OpaqueRx(rx)))
+    }
+}
+
+fn opaque(msg: Message) -> Result<Vec<u8>, ChannelError> {
+    match msg {
+        Message::Opaque(frame) => Ok(frame),
+        _ => Err(ChannelError::Noise(
+            "expected opaque ciphertext frame".into(),
+        )),
+    }
+}
+
+/// The send half of an [`OpaqueCarrier`].
+pub(crate) struct OpaqueTx(pub(crate) Box<dyn TransportTx>);
+
+#[async_trait]
+impl CarrierTx for OpaqueTx {
+    async fn send(&mut self, frame: Vec<u8>) -> Result<(), ChannelError> {
+        Ok(self.0.send(&Message::Opaque(frame)).await?)
+    }
+
+    async fn send_batch(&mut self, frames: Vec<Vec<u8>>) -> Result<(), ChannelError> {
+        let msgs: Vec<Message> = frames.into_iter().map(Message::Opaque).collect();
+        Ok(self.0.send_batch(&msgs).await?)
+    }
+
+    fn counters(&self) -> Option<std::io::Result<tcp_info::TcpCounters>> {
+        self.0.tcp_counters()
+    }
+}
+
+/// The receive half of an [`OpaqueCarrier`].
+pub(crate) struct OpaqueRx(pub(crate) Box<dyn TransportRx>);
+
+#[async_trait]
+impl CarrierRx for OpaqueRx {
+    async fn recv(&mut self) -> Result<Vec<u8>, ChannelError> {
+        opaque(self.0.recv().await?)
+    }
 }
 
 /// Describes a channel a peer is reachable over, ranked so we can pick the best.

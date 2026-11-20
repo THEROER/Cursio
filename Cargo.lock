@@ -1466,6 +1466,7 @@ version = "0.9.0"
 dependencies = [
  "bincode",
  "clipboard-core",
+ "cursio-channel",
  "serde",
  "thiserror 1.0.69",
  "uuid",
@@ -1509,23 +1510,20 @@ name = "cursio-transport"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "cursio-channel",
  "cursio-protocol",
  "directories",
- "futures",
  "if-addrs 0.13.4",
- "libc",
  "mdns-sd",
  "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2",
- "snow",
  "spake2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

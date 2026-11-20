@@ -51,12 +51,15 @@ exchange stay in Cursio.
 ### Envelope
 
 ```rust
-pub trait Envelope: Sized + Send + 'static {
+pub trait Envelope: Clone + Send + 'static {
     /// Index into the channel's classes, highest priority first.
     fn class(&self) -> ClassId;
-    fn delivery(&self) -> Delivery;
-    fn encode(&self) -> Result<Vec<u8>, EncodeError>;
-    fn decode(bytes: &[u8]) -> Result<Self, DecodeError>;
+    fn delivery(&self) -> Delivery { Delivery::Reliable }
+    fn encode(&self) -> Result<Vec<u8>, ChannelError>;
+    fn decode(bytes: &[u8]) -> Result<Self, ChannelError>;
+    /// A later message may fold into this one while it waits; only such
+    /// messages are kept decoded beside their frame (a clone).
+    fn folds(&self) -> bool { false }
     /// Fold `next` into `self` while both wait unsent (pointer motion in
     /// Cursio, a progress counter elsewhere); `false` queues it behind.
     fn fold(&mut self, _next: &Self) -> bool { false }
@@ -137,13 +140,16 @@ either way.
 ### Carrier
 
 ```rust
-pub trait Carrier: Send + 'static {
+#[async_trait] pub trait Carrier: Send {
+    async fn send(&mut self, frame: Vec<u8>) -> Result<(), ChannelError>;
+    async fn recv(&mut self) -> Result<Vec<u8>, ChannelError>;
+    fn kind(&self) -> &'static str;
+    fn local_ip(&self) -> Option<IpAddr> { None }
     fn split(self: Box<Self>) -> (Box<dyn CarrierTx>, Box<dyn CarrierRx>);
-    fn kind(&self) -> CarrierKind;
 }
 #[async_trait] pub trait CarrierTx: Send {
-    async fn send(&mut self, frame: &[u8]) -> Result<(), ChannelError>;
-    async fn send_batch(&mut self, frames: &[Vec<u8>]) -> Result<(), ChannelError>;
+    async fn send(&mut self, frame: Vec<u8>) -> Result<(), ChannelError>;
+    async fn send_batch(&mut self, frames: Vec<Vec<u8>>) -> Result<(), ChannelError>;
     fn counters(&self) -> Option<std::io::Result<TcpCounters>> { None }
 }
 #[async_trait] pub trait CarrierRx: Send {
@@ -260,6 +266,41 @@ through the channel at all. **Nothing changes on the wire**: the update lane's
 pinned bytes, the resume and frame tags and the Noise parameters are covered by
 the existing tests, which must pass unchanged at every step, and two builds
 either side of the move must still form a session.
+
+### What the extraction settled
+
+- **Frames are owned.** A carrier takes `Vec<u8>`, not `&[u8]`: Cursio's
+  carrier wraps each frame in a `Message::Opaque` without copying it again.
+- **Cursio's frames still ride as `Message::Opaque`.** Every Noise frame has
+  always crossed Cursio's TCP and RFCOMM transports as the bincode of a
+  `Message::Opaque` inside the length prefix, so Cursio's carrier is its
+  `Transport` behind an adapter (`OpaqueCarrier`) that keeps that shape. The
+  channel's own TCP carrier sends the frame bare; the two are different wires
+  and are not meant to meet.
+- **The handshake keeps a length prefix of its own.** Each `NNpsk0` message
+  travels as `[u32 len][message]` inside its frame, as Cursio has always sent
+  it; `NoisePsk` specifies that, and it is part of the format of step 3.
+- **`Message: Envelope` lives in `cursio-protocol`.** The orphan rule allows
+  the impl only beside the trait or the type; the protocol crate depends on
+  the channel for `Delivery`, `SessionTag`, `PathChoice` and `PathReport`
+  anyway. The class order is `Priority::class`; the declaration — budgets,
+  lanes, which classes are urgent — is `cursio_transport::lane::classes`.
+- **A declaration is `Classes::new(lanes, classes)`.** A lane names itself
+  and its path for logs, its writer depth, whether it is paced against the
+  interactive round trip, and whether a standby skips its fresh frames; a
+  class names its lane, its budget and whether it is urgent (never waits for
+  a forced bulk release). The first lane is the interactive one. The
+  scheduler's finished delay windows go to a report function the declaration
+  may replace; Cursio's keeps its log lines and their target.
+- **`PathKind` is `Lane(LaneId)` or `Standby`**, with a flag for a direct
+  path beside it. Reports keep the names `network` and `bluetooth`, which
+  Cursio's control socket and diagnostics already carry, for the lane carriers
+  and the standby.
+- **Hooks for step 2.** Every connection joins in `ResumeHandle::attach`, and
+  every end goes through one place that carries its reason (`Inner::end`):
+  where `Trust::check`, `REAUTH`, deadlines (`expires_at`) and handing back
+  unacknowledged messages will sit. `Trust::open` returns the seal and the
+  session tag only; the verified identity joins `Opened` with `check`.
 
 ## Licence
 

@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# `Delivery`, `SessionTag` and the path report are the channel's; `Message`
+# is its envelope.
+cursio-channel.workspace = true
 serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true

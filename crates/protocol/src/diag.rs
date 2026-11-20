@@ -53,18 +53,9 @@ pub fn valid_log_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Which of a session's paths should carry it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum PathChoice {
-    /// The network whenever it is there; Bluetooth when it is not.
-    #[default]
-    Auto,
-    /// The network even while it is failing: no move to Bluetooth while a
-    /// network path exists, which is how the network alone is tested.
-    Network,
-    /// Bluetooth whenever there is a Bluetooth path, the network standing by.
-    Bluetooth,
-}
+/// Which of a session's paths should carry it, and one end's view of them:
+/// the channel's, whose names were Cursio's first.
+pub use cursio_channel::{PathChoice, PathReport};
 
 /// What one machine asks another.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,17 +393,6 @@ pub struct NodeReport {
     /// first.
     pub warnings: Vec<Counted>,
     pub slow_modules: Vec<SlowModule>,
-}
-
-/// One end's view of the session between two machines.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PathReport {
-    pub network: bool,
-    pub bluetooth: bool,
-    /// What carries input from this end now: "network", "bluetooth", or
-    /// `None` while the session waits for a path.
-    pub carrying: Option<String>,
-    pub choice: PathChoice,
 }
 
 /// The diagnostics module's messages.

@@ -44,7 +44,7 @@ its drainer waits for acknowledgements; it never silently abandons resumability.
 There are 16 incoming frames per lane and two frames per socket writer, plus the
 frame currently being written. Reassembly has the existing bounded-message
 checks, independently per lane. Kernel unsent-backlog limits remain in force on
-every TCP socket (`send_backlog.rs`).
+every TCP socket (`channel/src/tcp/send_backlog.rs`).
 
 `queue_age` reports the oldest queued or currently sending frame. Completed
 queue-delay histograms and byte counters remain available. `flush` waits for
@@ -188,7 +188,7 @@ sends, so a message's choice changes without a protocol bump.
   on a Bluetooth path, where a phone's audio pauses the radio for a second at a
   time, dropping would lose motion the hand really made.
 - `Fresh { within: Some(t) }`: also dropped whole, unsent, by a sender that
-  reaches it more than `t` after it was queued (`priority.rs`). Sound, at
+  reaches it more than `t` after it was queued (`channel/src/scheduler.rs`). Sound, at
   `audio::FRESH_FOR` (250 ms, the same bound the listener's playback feed
   applies on arrival). Only a message's first frame is judged; one part-way out
   is finished. Drops are counted per class and logged with the queue-delay
@@ -217,7 +217,7 @@ lane. That is the cost a datagram transport would remove, for exactly the
 Three figures decide whether that cost is worth a new transport, and each is
 now logged:
 
-- **Retransmissions per lane** (`tcp_info.rs`, every 10 s at debug): the
+- **Retransmissions per lane** (`channel/src/tcp/info.rs`, every 10 s at debug): the
   kernel's own count of what it sent and resent on each network path — Linux
   `TCP_INFO` in segments, Windows `SIO_TCP_INFO` in bytes. A lane that resends
   nothing gains nothing from skipping a loss.

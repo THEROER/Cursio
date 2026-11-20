@@ -1,116 +1,55 @@
-//! Framed TCP transport (Wi-Fi/LAN).
+//! Framed TCP transport (Wi-Fi/LAN): [`Message`]s over the channel's
+//! [`TcpCarrier`].
 //!
-//! Wraps a [`tokio::net::TcpStream`] and speaks the length-prefixed framing
-//! from `cursio-protocol`. Incoming bytes accumulate in a read buffer until a
-//! whole frame is available, so partial reads are handled transparently.
-//!
-//! Every connection, dialled or accepted, has its kernel send backlog bounded
-//! before the first byte is written ([`crate::send_backlog`]): the priority
-//! drainer's ordering only holds if the socket does not keep a deep queue of
-//! its own — and how long sent data may go unacknowledged bounded too
-//! ([`crate::dead_peer`]), so a peer that vanished mid-write is let go of in
-//! seconds rather than after minutes of retransmission.
+//! Each message is its bincode encoding in one length-prefixed frame. The
+//! carrier bounds the kernel send backlog and how long sent data may go
+//! unacknowledged before the first byte is written, and reports the kernel's
+//! retransmission counters; see `cursio_channel::tcp`.
 
 use std::net::SocketAddr;
 
 use async_trait::async_trait;
-use cursio_protocol::{decode_frame, encode_frame, Message};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use cursio_channel::tcp::TcpCarrier;
+use cursio_channel::{Carrier, CarrierRx, CarrierTx};
+use cursio_protocol::Message;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::{Transport, TransportError, TransportRx, TransportTx};
 
-/// How long a dial may wait for the peer to answer.
-///
-/// The OS waits minutes for a SYN nobody acknowledges, and an address that
-/// stopped being on this network — the home LAN, dialled from a phone's
-/// hotspot whose traffic leaves over mobile data — is exactly that. A peer on
-/// the same LAN answers in milliseconds; three seconds is far above that and
-/// short enough that a sweep of stale addresses does not hold up the node.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// A message-oriented link over a single TCP connection.
 pub struct TcpTransport {
-    stream: TcpStream,
-    /// Leftover bytes read past a frame boundary, carried into the next `recv`.
-    read_buf: Vec<u8>,
-    peer_addr: SocketAddr,
+    carrier: TcpCarrier,
 }
 
 impl TcpTransport {
     /// Dial `addr` and wrap the resulting connection.
     pub async fn connect(addr: SocketAddr) -> Result<Self, TransportError> {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "no answer from {addr} within {}s",
-                        CONNECT_TIMEOUT.as_secs()
-                    ),
-                )
-            })??;
-        Self::from_stream(stream)
+        Ok(Self {
+            carrier: TcpCarrier::connect(addr).await?,
+        })
     }
 
     /// Wrap an already-accepted connection (server side).
     pub fn from_stream(stream: TcpStream) -> Result<Self, TransportError> {
-        crate::send_backlog::bound(&stream);
-        crate::dead_peer::bound(&stream);
-        Self::wrap(stream)
-    }
-
-    /// A connection that keeps the kernel's own, autotuned send buffer: what
-    /// every link was before the backlog was bounded, kept so tests can show
-    /// the difference the bound makes.
-    #[cfg(test)]
-    pub(crate) fn from_stream_unbounded(stream: TcpStream) -> Result<Self, TransportError> {
-        Self::wrap(stream)
-    }
-
-    fn wrap(stream: TcpStream) -> Result<Self, TransportError> {
-        stream.set_nodelay(true)?;
-        let peer_addr = stream.peer_addr()?;
         Ok(Self {
-            stream,
-            read_buf: Vec::new(),
-            peer_addr,
+            carrier: TcpCarrier::from_stream(stream)?,
         })
     }
 
     /// The remote address of this connection.
     pub fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr
+        self.carrier.peer_addr()
     }
 }
 
 #[async_trait]
 impl Transport for TcpTransport {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        let payload = msg.to_bytes()?;
-        let frame = encode_frame(&payload)?;
-        self.stream.write_all(&frame).await?;
-        self.stream.flush().await?;
-        Ok(())
+        Ok(self.carrier.send(msg.to_bytes()?).await?)
     }
 
     async fn recv(&mut self) -> Result<Message, TransportError> {
-        loop {
-            // Try to satisfy the read from what we already buffered first.
-            if let Some((payload, consumed)) = decode_frame(&self.read_buf)? {
-                self.read_buf.drain(..consumed);
-                return Ok(Message::from_bytes(&payload)?);
-            }
-
-            // Need more bytes from the socket.
-            let mut chunk = [0u8; 8192];
-            let n = self.stream.read(&mut chunk).await?;
-            if n == 0 {
-                return Err(TransportError::Closed);
-            }
-            self.read_buf.extend_from_slice(&chunk[..n]);
-        }
+        Ok(Message::from_bytes(&self.carrier.recv().await?)?)
     }
 
     fn kind(&self) -> &'static str {
@@ -118,75 +57,36 @@ impl Transport for TcpTransport {
     }
 
     fn local_ip(&self) -> Option<std::net::IpAddr> {
-        self.stream.local_addr().ok().map(|a| a.ip())
+        self.carrier.local_ip()
     }
 
     fn split(self: Box<Self>) -> (Box<dyn TransportTx>, Box<dyn TransportRx>) {
-        // Owned split gives independent read/write halves that can live in
-        // separate tasks. The read half carries our leftover buffer so no
-        // already-read bytes are lost across the split.
-        let (read, write) = self.stream.into_split();
-        (
-            Box::new(TcpTx {
-                write,
-                #[cfg(target_os = "windows")]
-                backlog: crate::send_backlog::IdealBacklog::new(),
-            }),
-            Box::new(TcpRx {
-                read,
-                read_buf: self.read_buf,
-            }),
-        )
+        let (tx, rx) = Box::new(self.carrier).split();
+        (Box::new(TcpTx(tx)), Box::new(TcpRx(rx)))
     }
 }
 
 /// Send half of a split [`TcpTransport`].
-pub struct TcpTx {
-    write: tokio::net::tcp::OwnedWriteHalf,
-    /// The split tx is what the priority drainer writes through, so this is
-    /// where the send buffer follows the stack's estimate as a link ramps up.
-    #[cfg(target_os = "windows")]
-    backlog: crate::send_backlog::IdealBacklog,
-}
+pub struct TcpTx(Box<dyn CarrierTx>);
 
 #[async_trait]
 impl TransportTx for TcpTx {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        #[cfg(target_os = "windows")]
-        self.backlog.retune(self.write.as_ref());
-        let payload = msg.to_bytes()?;
-        let frame = encode_frame(&payload)?;
-        self.write.write_all(&frame).await?;
-        self.write.flush().await?;
-        Ok(())
+        Ok(self.0.send(msg.to_bytes()?).await?)
     }
 
     fn tcp_counters(&self) -> Option<std::io::Result<crate::tcp_info::TcpCounters>> {
-        Some(crate::tcp_info::read(self.write.as_ref()))
+        self.0.counters()
     }
 }
 
 /// Receive half of a split [`TcpTransport`].
-pub struct TcpRx {
-    read: tokio::net::tcp::OwnedReadHalf,
-    read_buf: Vec<u8>,
-}
+pub struct TcpRx(Box<dyn CarrierRx>);
 
 #[async_trait]
 impl TransportRx for TcpRx {
     async fn recv(&mut self) -> Result<Message, TransportError> {
-        loop {
-            if let Some((payload, consumed)) = decode_frame(&self.read_buf)? {
-                self.read_buf.drain(..consumed);
-                return Ok(Message::from_bytes(&payload)?);
-            }
-            let mut chunk = [0u8; 8192];
-            let n = self.read.read(&mut chunk).await?;
-            if n == 0 {
-                return Err(TransportError::Closed);
-            }
-            self.read_buf.extend_from_slice(&chunk[..n]);
-        }
+        Ok(Message::from_bytes(&self.0.recv().await?)?)
     }
 }
 
@@ -266,5 +166,25 @@ mod tests {
         let (a, b) = server.await.unwrap();
         assert_eq!(a, Message::Heartbeat { nonce: 1 });
         assert_eq!(b, Message::Heartbeat { nonce: 2 });
+    }
+
+    /// The bytes on the socket are Cursio's own framing: a big-endian length,
+    /// then the message's bincode — what the frozen update lane and every
+    /// older build read.
+    #[tokio::test]
+    async fn a_message_is_its_length_then_its_bincode_on_the_wire() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = TcpTransport::connect(addr).await.unwrap();
+        let mut raw = accept.await.unwrap();
+        let msg = Message::Update(vec![0xab]);
+        client.send(&msg).await.unwrap();
+        let body = msg.to_bytes().unwrap();
+        let mut got = vec![0u8; 4 + body.len()];
+        raw.read_exact(&mut got).await.unwrap();
+        assert_eq!(got[..4], (body.len() as u32).to_be_bytes());
+        assert_eq!(got[4..], body[..]);
     }
 }

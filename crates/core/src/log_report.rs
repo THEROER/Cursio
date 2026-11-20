@@ -60,7 +60,10 @@ pub fn build(
                 entry.1 = entry.1.max(ms.parse().unwrap_or(0));
             }
         }
-        if line.contains("cursio_transport::resume")
+        // The session's lines come from the channel's crate now and from the
+        // transport's in a log written before it was extracted.
+        if line.contains("cursio_channel::session")
+            || line.contains("cursio_transport::resume")
             || line.contains("holding the session with this peer")
         {
             timeline.push(line.to_string());
@@ -343,17 +346,31 @@ mod tests {
 ";
 
     fn day() -> NodeReport {
+        day_of(DAY)
+    }
+
+    fn day_of(log: &str) -> NodeReport {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("cursio-log-report-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cursio.log.2026-10-31"), DAY).unwrap();
+        std::fs::write(dir.join("cursio.log.2026-10-31"), log).unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_466_000);
         let report = build(&dir, "cursio.log", Duration::from_secs(3600), now).unwrap();
         let _ = std::fs::remove_dir_all(dir);
         report
+    }
+
+    #[test]
+    fn the_sessions_lines_read_alike_from_the_channel_and_from_older_logs() {
+        let channel = DAY.replace(
+            "cursio_transport::resume::inner",
+            "cursio_channel::session::inner",
+        );
+        assert_eq!(day_of(&channel).peers, day().peers);
+        assert!(!day().peers.is_empty());
     }
 
     #[test]
