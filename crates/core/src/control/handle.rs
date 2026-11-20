@@ -397,8 +397,71 @@ async fn ask_diag(command: &Command) -> Option<Reply> {
                 there_error,
             }
         }
+        Command::Settings {
+            machine: Some(machine),
+        } => match hub.ask(machine, DiagRequest::Settings).await {
+            Ok(DiagResponse::Settings(settings)) => Reply::Settings { settings },
+            Ok(other) => error(format!("a settings request was answered with {other:?}")),
+            Err(message) => error(older_build(machine, message)),
+        },
+        Command::SetSetting {
+            machine: Some(machine),
+            key,
+            value,
+        } => {
+            let request = DiagRequest::SetSetting {
+                key: key.clone(),
+                value_json: (!value.is_null()).then(|| value.to_string()),
+                reset: false,
+            };
+            remote_saved(machine, key, hub.ask(machine, request).await)
+        }
+        Command::ResetSetting {
+            machine: Some(machine),
+            key,
+        } => {
+            let request = DiagRequest::SetSetting {
+                key: key.clone(),
+                value_json: None,
+                reset: true,
+            };
+            remote_saved(machine, key, hub.ask(machine, request).await)
+        }
         _ => return None,
     })
+}
+
+/// A settings request that went unanswered most likely reached a build from
+/// before settings could be asked for, which reads past the request.
+fn older_build(machine: &str, message: String) -> String {
+    format!("{message} (a machine on a build older than settings by key does not answer; update {machine})")
+}
+
+fn remote_saved(
+    machine: &str,
+    key: &str,
+    answer: Result<cursio_protocol::diag::DiagResponse, String>,
+) -> Reply {
+    match answer {
+        Ok(cursio_protocol::diag::DiagResponse::SettingSaved(saved)) => self::saved(key, Ok(saved)),
+        Ok(other) => error(format!("a setting change was answered with {other:?}")),
+        Err(message) => error(older_build(machine, message)),
+    }
+}
+
+/// What a setting change did, as the control socket replies to every save.
+fn saved(key: &str, result: Result<cursio_protocol::settings::SettingSaved, String>) -> Reply {
+    match result {
+        Ok(saved) => Reply::Saved {
+            pinned: if saved.pinned {
+                vec![key.to_owned()]
+            } else {
+                Vec::new()
+            },
+            restart_needed: saved.restart_needed,
+        },
+        Err(message) => Reply::Error { message },
+    }
 }
 
 /// Answer a command that waits on a peer; anything else goes to `state`.
@@ -781,6 +844,27 @@ impl NodeState {
             Command::LinkTests { peer } => Reply::LinkTests {
                 tests: crate::probe_history::read(peer.as_deref()),
             },
+            Command::Settings { machine: None } => Reply::Settings {
+                settings: self.settings(),
+            },
+            Command::SetSetting {
+                machine: None,
+                key,
+                value,
+            } => saved(
+                &key,
+                crate::settings::from_json(value)
+                    .map_err(|e| e.to_string())
+                    .and_then(|value| self.set_setting(&key, value)),
+            ),
+            Command::ResetSetting { machine: None, key } => saved(&key, self.reset_setting(&key)),
+            Command::Settings { machine: Some(_) }
+            | Command::SetSetting {
+                machine: Some(_), ..
+            }
+            | Command::ResetSetting {
+                machine: Some(_), ..
+            } => error("another machine's settings are asked through a desktop's control socket"),
         }
     }
 

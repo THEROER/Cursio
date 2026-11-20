@@ -37,8 +37,13 @@ pub(crate) enum Command {
     /// What runs comes from `config.toml` (see `cursio config`); every flag
     /// below overrides the file for this run only.
     Mesh(MeshArgs),
-    /// Print the config `cursio mesh` would run with, and where it is read from.
-    Config,
+    /// Print the config `cursio mesh` would run with, and where it is read
+    /// from; or list, read and change settings by key, of this machine or of
+    /// another one.
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
     /// Install, switch and roll back versions of Cursio on this machine.
     Update {
         #[command(subcommand)]
@@ -662,6 +667,42 @@ pub(crate) enum PortalAction {
     /// Forward every screen-cast request to GNOME; what D-Bus starts when no
     /// `cursio mesh` holds the backend's name.
     Relay,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigAction {
+    /// Every setting with its value, what it would be by default, and what
+    /// changing it takes. Asks the running node.
+    List {
+        /// Another machine of the mesh, by name or id.
+        #[arg(long)]
+        on: Option<String>,
+        /// As JSON, every field.
+        #[arg(long)]
+        json: bool,
+    },
+    /// One setting's value, as JSON.
+    Get {
+        /// Its key, as `cursio config list` names it: `audio.mic_gate`.
+        key: String,
+        #[arg(long)]
+        on: Option<String>,
+    },
+    /// Change one setting; it applies at once unless `list` says it waits
+    /// for a restart.
+    Set {
+        key: String,
+        /// JSON (`true`, `-55`, `null` to unset) or plain text (`auto`).
+        value: String,
+        #[arg(long)]
+        on: Option<String>,
+    },
+    /// Take one setting out of the file, back to its default.
+    Reset {
+        key: String,
+        #[arg(long)]
+        on: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

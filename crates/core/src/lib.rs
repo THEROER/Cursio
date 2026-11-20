@@ -90,7 +90,7 @@ pub use cursio_core_base::session_bus;
 use cursio_core_base::test_support;
 pub use cursio_core_base::{
     at_phone, config, data_dir, diagnostics, elevate, health, identity, live, mixer, module,
-    module_host, modules_busy, node_status, queue, NodeIdentity,
+    module_host, modules_busy, node_status, queue, settings, NodeIdentity,
 };
 #[cfg(feature = "gallery")]
 pub use cursio_exchange::gallery_folder;

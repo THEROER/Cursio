@@ -161,6 +161,19 @@ pub enum DiagRequest {
     /// answers why; an older phone does not answer, and the computer takes
     /// the picture from the stream as before.
     PhoneShot,
+    /// Every setting the node has, with its value; answered as
+    /// [`DiagResponse::Settings`]. A node older than this does not answer,
+    /// and the asking machine says that one needs updating.
+    Settings,
+    /// Set the setting at `key` to `value_json` (JSON text; `None` unsets an
+    /// optional one, `reset` takes it out of the file), as an edit of that
+    /// node's own config would: written there, applied there, and logged
+    /// there with who asked. Answered as [`DiagResponse::SettingSaved`].
+    SetSetting {
+        key: String,
+        value_json: Option<String>,
+        reset: bool,
+    },
 }
 
 /// How a request names an element of a window's interface.
@@ -328,7 +341,18 @@ pub enum DiagResponse {
         nodes: u32,
         truncated: bool,
     },
+    /// The answer to [`DiagRequest::Settings`].
+    Settings(Vec<crate::settings::SettingView>),
+    /// The answer to [`DiagRequest::SetSetting`].
+    SettingSaved(crate::settings::SettingSaved),
 }
+
+/// Longest setting key a request may name.
+pub const MAX_SETTING_KEY: usize = 128;
+
+/// Most JSON a request may set a setting to: a share policy or a desk layout
+/// is a few kilobytes, nothing is near this.
+pub const MAX_SETTING_JSON: usize = 64 * 1024;
 
 /// A node's own memory. `None` is "cannot say".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

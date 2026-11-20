@@ -57,6 +57,32 @@ pub fn set_maintainer(act: Maintainer) {
     *maintainer() = Some(act);
 }
 
+/// Answers a peer's [`DiagRequest::Settings`] and
+/// [`DiagRequest::SetSetting`], given who asked; set by the node's control
+/// state, which owns the config file and the applier.
+pub type SettingsAccess =
+    Arc<dyn Fn(&str, &DiagRequest) -> Result<DiagResponse, String> + Send + Sync>;
+
+fn settings_access() -> std::sync::MutexGuard<'static, Option<SettingsAccess>> {
+    static ACCESS: OnceLock<Mutex<Option<SettingsAccess>>> = OnceLock::new();
+    ACCESS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Let peers read and change this node's settings through `access`.
+pub fn set_settings_access(access: SettingsAccess) {
+    *settings_access() = Some(access);
+}
+
+fn settings(peer: &str, request: &DiagRequest) -> Result<DiagResponse, String> {
+    let access = settings_access()
+        .clone()
+        .ok_or("this node takes no setting changes from its peers")?;
+    access(peer, request)
+}
+
 /// Do `what` to this node, shortly: the answer goes out first.
 pub fn maintain(what: Maintenance) -> Result<(), String> {
     // Asked for "now" rather than at a quiet moment, but a call is the one
@@ -288,6 +314,9 @@ impl Exchange for Diag {
             DiagRequest::WindowElement { target, pick, act } => {
                 crate::desktop_window::element(&store.peer_name, target, pick, act)
             }
+            DiagRequest::Settings | DiagRequest::SetSetting { .. } => {
+                settings(&store.peer_name, request)
+            }
         }
     }
 
@@ -414,10 +443,34 @@ impl Exchange for Diag {
                 crate::desktop_window::check_element(&pick, &act)?;
                 Ok(DiagRequest::WindowElement { target, pick, act })
             }
+            DiagRequest::SetSetting {
+                key,
+                value_json,
+                reset,
+            } => {
+                use cursio_protocol::diag::{MAX_SETTING_JSON, MAX_SETTING_KEY};
+                if key.len() > MAX_SETTING_KEY {
+                    return Err(format!("a setting key is at most {MAX_SETTING_KEY} bytes"));
+                }
+                if value_json
+                    .as_ref()
+                    .is_some_and(|v| v.len() > MAX_SETTING_JSON)
+                {
+                    return Err(format!(
+                        "a setting's value is at most {MAX_SETTING_JSON} bytes"
+                    ));
+                }
+                Ok(DiagRequest::SetSetting {
+                    key,
+                    value_json,
+                    reset,
+                })
+            }
             other @ (DiagRequest::Paths { .. }
             | DiagRequest::Maintain(_)
             | DiagRequest::PhoneTouch
-            | DiagRequest::PhoneShot) => Ok(other),
+            | DiagRequest::PhoneShot
+            | DiagRequest::Settings) => Ok(other),
         }
     }
 

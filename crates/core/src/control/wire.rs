@@ -38,7 +38,9 @@ use std::path::PathBuf;
 /// v21: `arrange_screen`, and each desk screen's `dx_mm`/`dy_mm`.
 /// v22: `waiting_builds` in the status. v23: `fetching_builds`.
 /// v24: `link_test` and `link_tests`, a link measured and its tests kept.
-pub const CONTROL_VERSION: u32 = 24;
+/// v25: `settings`, `set_setting` and `reset_setting`, every setting by key,
+/// here or on another machine.
+pub const CONTROL_VERSION: u32 = 25;
 
 /// The id a pushed message carries. Requests number from 1.
 pub const PUSH_ID: u64 = 0;
@@ -364,6 +366,26 @@ pub enum Command {
         #[serde(default)]
         peer: Option<String>,
     },
+    /// Every setting of this machine, or of `machine` through the mesh, with
+    /// its value; answered as [`Reply::Settings`].
+    Settings {
+        #[serde(default)]
+        machine: Option<String>,
+    },
+    /// Set one setting by key, here or on `machine`; `null` unsets an
+    /// optional one. Answered as [`Reply::Saved`].
+    SetSetting {
+        #[serde(default)]
+        machine: Option<String>,
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Take one setting out of the file, back to its default.
+    ResetSetting {
+        #[serde(default)]
+        machine: Option<String>,
+        key: String,
+    },
     /// Copy one item to this machine's `Pictures/Cursio/<peer>`, or into `dir`
     /// when given: a folder the user picked, or the app's cache for a file it
     /// is about to open, copy or send on.
@@ -621,6 +643,15 @@ impl Command {
                     | Command::WindowTree { .. }
                     | Command::WindowElement { .. }
                     | Command::Devtools { .. }
+                    | Command::Settings { machine: Some(_) }
+                    | Command::SetSetting {
+                        machine: Some(_),
+                        ..
+                    }
+                    | Command::ResetSetting {
+                        machine: Some(_),
+                        ..
+                    }
             )
     }
 }
@@ -710,6 +741,11 @@ pub enum Reply {
     /// The tests [`Command::LinkTests`] asked for, oldest first.
     LinkTests {
         tests: Vec<crate::probe_history::Kept>,
+    },
+    /// The answer to [`Command::Settings`]: each setting's value is JSON
+    /// text, as it crosses the mesh.
+    Settings {
+        settings: Vec<cursio_protocol::settings::SettingView>,
     },
     Paths {
         here: cursio_protocol::diag::PathReport,

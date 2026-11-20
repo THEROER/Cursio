@@ -493,16 +493,6 @@
     "saved": "Saved",
     "themeTitle": "Theme",
     "themeDescription": "The colours, accent, corners, control size and animation speed of this app, kept on this machine.",
-    "audioTitle": "Audio",
-    "micGate": "Microphone gate",
-    "micGateHint": "Who records from this machine's microphone on another device hears it only while you speak. Auto follows the mic's background noise.",
-    "micGateAuto": "Auto",
-    "micGateFixed": "Fixed",
-    "micGateOff": "Off",
-    "micGateLevel": "Gate level",
-    "micGateDb": "{db} dBFS",
-    "micGatePinned": "A command-line flag fixes the microphone gate; this choice is saved for when the node runs without it.",
-    "micGateFailed": "The microphone gate was not changed",
     "callsTitle": "Calls",
     "callsDescription": "This computer as a paired phone's Bluetooth headset: the call's voice and the phone's sound come through here.",
     "callsRoles": "Bluetooth roles",
@@ -517,27 +507,7 @@
     "callsNoPhones": "No phone is paired with this computer over Bluetooth.",
     "callsUnpaired": "Not paired over Bluetooth: {phones}. Their calls ring here, but the voice stays on the phone until you pair it with this computer in the system's Bluetooth settings.",
     "callsConnected": "Connected",
-    "callsAnswerMoves": "Answering here brings the voice here",
-    "callsAnswerMovesHint": "As on Phone Link: answer or dial from a computer and the call's voice comes to it. Answer on the phone and it stays there.",
-    "callsVoice": "Where the voice plays",
-    "callsVoiceHint": "\"Where I am\" follows you to the machine this one's mouse is driving.",
-    "callsVoiceHere": "This computer",
-    "callsVoiceFollow": "Where I am",
-    "callsOutput": "Plays on",
-    "callsInput": "Microphone",
-    "callsDefault": "System default",
-    "callsFailedSave": "Call settings were not changed",
     "callsUnsupported": "Only a Linux computer can be a phone's Bluetooth headset. Calls still show here, and a call another computer carries can bring its voice to this one.",
-    "standbyTitle": "Bluetooth",
-    "standbyDescription": "When the network stops reaching a paired machine, the connection to it moves to Bluetooth instead of stopping.",
-    "bluetoothMode": "Use Bluetooth for the mesh",
-    "bluetoothModeHint": "Automatic leaves it off on a machine whose Wi-Fi card is known to lose the network while Bluetooth is busy.",
-    "bluetoothAuto": "Automatic",
-    "bluetoothOn": "On",
-    "bluetoothOff": "Off",
-    "standbyToggle": "Keep a Bluetooth link ready",
-    "standbyHint": "Moves within seconds when Wi-Fi drops, at the cost of a little battery and some Wi-Fi speed on 2.4 GHz. Without it, Bluetooth takes over once Wi-Fi has been gone for 20 seconds. Machines have to be paired over Bluetooth.",
-    "standbyFailed": "The Bluetooth standby was not changed",
     "nodeTitle": "Node",
     "configFile": "Config file",
     "pinned": "Fixed by command-line flags: {fields}",
@@ -561,6 +531,253 @@
     "renameFailed": "The name was not changed",
     "namePhoneHint": "Renaming restarts Cursio on this phone; its links drop for a few seconds.",
     "nameWaits": "Peers still see the old name until the node restarts."
+  },
+  "settingsPage": {
+    "title": "Node settings",
+    "description": "Everything the node can change, as it reports it. Pick another machine to change its settings from here.",
+    "machine": "Machine",
+    "thisMachine": "This machine ({name})",
+    "loadFailed": "The node did not list its settings",
+    "peerFailed": "{machine} did not answer",
+    "failed": "{setting} was not changed",
+    "resetFailed": "{setting} was not reset",
+    "savedPinned": "Saved, but a command-line flag holds the running value until the node runs without it.",
+    "savedAfterRestart": "Saved. It applies when the node restarts.",
+    "default": "Default",
+    "defaultDevice": "System default",
+    "notPresent": "{device} (not connected)",
+    "level": "Level",
+    "notSet": "not set",
+    "anyAddress": "Every network",
+    "reset": "Back to the default",
+    "appliesAfterRestart": "After restart",
+    "waitsForRestart": "Waiting for restart",
+    "pinned": "Held by a flag",
+    "editedOnPlacement": "Changed on the Placement page",
+    "editedInCrossing": "Changed in Edge crossing on this page",
+    "editedInFile": "Changed in the config file",
+    "editedInPeerFile": "Changed in that machine's config file",
+    "sections": {
+      "modules": "Modules",
+      "input": "Keyboard and mouse",
+      "audio": "Audio",
+      "calls": "Call settings",
+      "files": "Files",
+      "network": "Network",
+      "bluetooth": "Bluetooth",
+      "updates": "Updates",
+      "airplay": "AirPlay",
+      "desk": "Desk",
+      "apps": "Applications"
+    }
+  },
+  "settingsRegistry": {
+    "modules": {
+      "input": {
+        "title": "Share keyboard and mouse",
+        "hint": "Capture this machine's keyboard and mouse and move them to the machine the cursor crosses to."
+      },
+      "clipboard": {
+        "title": "Shared clipboard",
+        "hint": "Copy on one machine, paste on another."
+      },
+      "audio": {
+        "title": "Audio",
+        "hint": "Peers' applications and microphones as devices here, and this machine's for them."
+      },
+      "files": {
+        "title": "Shared disks",
+        "hint": "Peers' disks as folders here, and this machine's for them."
+      },
+      "usb": {
+        "title": "USB devices",
+        "hint": "Use a peer's USB devices as if they were plugged in here."
+      },
+      "window": {
+        "title": "Windows and screens",
+        "hint": "Windows dragged across, peers' screens and a phone's screen."
+      },
+      "screen_host": {
+        "title": "Let peers view this screen",
+        "hint": "Peers may show this machine's windows and screens."
+      },
+      "remote_screen": {
+        "title": "Peers' screens in Discord and OBS",
+        "hint": "Offer every peer's windows and screens to screen-sharing apps here."
+      },
+      "notify": {
+        "title": "Notifications",
+        "hint": "A phone's notifications shown here, and this machine's sent to it."
+      },
+      "media": {
+        "title": "Media controls",
+        "hint": "What plays on a peer, and its controls."
+      },
+      "calls": {
+        "title": "Calls",
+        "hint": "A phone's calls, rung and answered here."
+      },
+      "messages": {
+        "title": "Text messages",
+        "hint": "A phone's SMS, read and sent from here."
+      },
+      "gallery": {
+        "title": "Gallery",
+        "hint": "A machine's photos, browsed from another."
+      },
+      "share": {
+        "title": "Send to a peer",
+        "hint": "Links, text and files sent to a peer."
+      },
+      "direct": {
+        "title": "Direct Wi-Fi",
+        "hint": "Reach a nearby machine over a Wi-Fi link of its own, beside the router."
+      }
+    },
+    "position": {
+      "title": "Position on the grid",
+      "hint": "Where this machine stands among the others, in grid cells."
+    },
+    "layout": {
+      "title": "Place on the desk",
+      "hint": "Where this machine's screens stand on the shared desk, and which seams are closed."
+    },
+    "input": {
+      "crossing": {
+        "title": "Crossing edges",
+        "hint": "Which part of each edge sends the cursor on."
+      },
+      "mac_modifiers": {
+        "title": "Modifier keys on this Mac",
+        "hint": "Where a peer's modifier keys land: positional, swapped, or from=to pairs such as rightalt=globe.",
+        "options": {
+          "positional": "Positional",
+          "swapped": "Swapped"
+        }
+      }
+    },
+    "audio": {
+      "mic_gate": {
+        "title": "Microphone gate",
+        "hint": "Who records from this machine's microphone on another device hears it only while you speak. Auto follows the mic's background noise.",
+        "options": {
+          "auto": "Auto",
+          "off": "Off"
+        }
+      },
+      "render_device": {
+        "title": "Output for peers' sound",
+        "hint": "Where peers' audio plays on this machine."
+      }
+    },
+    "calls": {
+      "answer_moves_voice": {
+        "title": "Answering here brings the voice here",
+        "hint": "As on Phone Link: answer or dial from a computer and the call's voice comes to it. Answer on the phone and it stays there."
+      },
+      "voice": {
+        "title": "Where the voice plays",
+        "hint": "\"Where I am\" follows you to the machine this one's mouse is driving.",
+        "options": {
+          "follow": "Where I am",
+          "here": "This computer"
+        }
+      },
+      "output": {
+        "title": "Call plays on",
+        "hint": "The output a call's voice plays on here."
+      },
+      "input": {
+        "title": "Call microphone",
+        "hint": "The microphone a call hears here."
+      }
+    },
+    "files": {
+      "share": {
+        "title": "What this machine shares",
+        "hint": "The disks and folders peers may see, and how."
+      },
+      "cache_gb": {
+        "title": "Read cache, GiB",
+        "hint": "How much of peers' files a mount here keeps on this disk across runs; 0 turns it off."
+      }
+    },
+    "port": {
+      "title": "Port",
+      "hint": "The TCP port peers reach this node on."
+    },
+    "bluetooth": {
+      "mesh": {
+        "title": "Use Bluetooth for the mesh",
+        "hint": "When the network stops reaching a paired machine, the connection moves to Bluetooth instead of stopping. Automatic leaves it off on a machine whose Wi-Fi card is known to lose the network while Bluetooth is busy.",
+        "options": {
+          "auto": "Automatic",
+          "on": "On",
+          "off": "Off"
+        }
+      },
+      "standby": {
+        "title": "Keep a Bluetooth link ready",
+        "hint": "Moves within seconds when Wi-Fi drops, at the cost of a little battery and some Wi-Fi speed on 2.4 GHz. Without it, Bluetooth takes over once Wi-Fi has been gone for 20 seconds. Machines have to be paired over Bluetooth."
+      }
+    },
+    "update": {
+      "policy": {
+        "title": "New builds",
+        "hint": "Automatic switches at a quiet moment, Ask waits for you, Never takes none.",
+        "options": {
+          "auto": "Automatic",
+          "ask": "Ask",
+          "never": "Never"
+        }
+      },
+      "channel": {
+        "title": "Channel",
+        "hint": "Stable takes release builds only; Dev also those of trusted builders.",
+        "options": {
+          "stable": "Stable",
+          "dev": "Dev"
+        }
+      },
+      "trusted_builders": {
+        "title": "Trusted builders",
+        "hint": "Machines whose dev builds this one accepts, each pinned to its key."
+      }
+    },
+    "airplay": {
+      "mode": {
+        "title": "AirPlay",
+        "hint": "on, off, or a quality such as 1080p60 this machine asks the mesh for."
+      },
+      "window": {
+        "title": "Show the mirrored picture here",
+        "hint": "Open the iPhone's picture on this machine."
+      },
+      "share": {
+        "title": "Offer it to every peer",
+        "hint": "Stream the mirrored screen to every connected machine."
+      },
+      "port": {
+        "title": "AirPlay port",
+        "hint": "The receiver's control port; its own default when unset."
+      },
+      "interface": {
+        "title": "AirPlay network",
+        "hint": "Announce AirPlay only on the network interface with this address."
+      }
+    },
+    "apps": {
+      "title": "Applications",
+      "hint": "Other applications' builds this machine takes, and what they may do."
+    },
+    "package_access": {
+      "title": "Apps allowed to reach the node",
+      "hint": "Which of the phone's apps may talk to the node, and as which application."
+    },
+    "ext": {
+      "title": "Modules built outside Cursio",
+      "hint": "Each such module's own settings; they are listed one by one once the module declares them."
+    }
   },
   "crossing": {
     "title": "Edge crossing",

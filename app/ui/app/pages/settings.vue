@@ -1,11 +1,10 @@
 <script setup lang="ts">
 import type { TocLink } from "@leavepulse/ui"
 import { invoke } from "@tauri-apps/api/core"
-import type { BluetoothMesh, CallsConfig, Reply, ServiceState } from "~/composables/useNode"
+import type { ServiceState } from "~/composables/useNode"
 
 const { t } = useI18n()
-const { status, restart, config, setMicGate, setName, setCalls, setBluetoothStandby, applyConfigEdit } =
-  useNode()
+const { status, restart, setName } = useNode()
 const { isMobile, ready } = usePlatform()
 const toast = useCursioToast()
 
@@ -14,14 +13,19 @@ const NAME_MAX = 40
 
 // The palette links to a section (`/settings#calls`). Most sections wait for
 // the node's status, so the router's own jump finds nothing to land on;
-// this one waits for the section to exist, then scrolls to it.
+// this one waits for the section to exist, then scrolls to it. The node's own
+// settings arrive later still, so a section not there yet is scrolled to by
+// `collectToc` when it appears.
 const route = useRoute()
+let awaitedSection: string | null = null
 watch(
   [() => route.hash, () => !!status.value],
   async ([hash]) => {
     if (!hash) return
     await nextTick()
-    document.getElementById(hash.slice(1))?.scrollIntoView({ behavior: "smooth", block: "start" })
+    const target = document.getElementById(hash.slice(1))
+    awaitedSection = target ? null : hash.slice(1)
+    target?.scrollIntoView({ behavior: "smooth", block: "start" })
   },
   { immediate: true },
 )
@@ -70,76 +74,6 @@ async function saveName() {
   }
 }
 
-type GateMode = "auto" | "fixed" | "off"
-const GATE_MIN = -80
-const GATE_MAX = -20
-
-/** `null` until the node's config has been read. */
-const gateMode = ref<GateMode | null>(null)
-const gateLevel = ref(-55)
-const gatePinned = ref(false)
-const gateBusy = ref(false)
-
-const gateModes = computed(() => [
-  { value: "auto", label: t("settings.micGateAuto") },
-  { value: "fixed", label: t("settings.micGateFixed") },
-  { value: "off", label: t("settings.micGateOff") },
-])
-
-/** Reads the effective value, so a flag pinning it shows what is running. */
-async function loadMicGate() {
-  try {
-    const reply = await config()
-    if (reply.reply !== "config") return
-    const { effective, pinned } = reply as Extract<Reply, { reply: "config" }>
-    const value = effective.audio.mic_gate?.trim() ?? "auto"
-    gatePinned.value = pinned.includes("audio.mic_gate")
-    if (value === "auto" || value === "off") {
-      gateMode.value = value
-      return
-    }
-    const db = Number.parseFloat(value)
-    gateMode.value = "fixed"
-    if (Number.isFinite(db)) gateLevel.value = Math.round(Math.min(GATE_MAX, Math.max(GATE_MIN, db)))
-  } catch (e) {
-    toast.failure(e, { title: t("settings.micGateFailed") })
-  }
-}
-
-watch(
-  () => !!status.value,
-  (up) => {
-    if (up && gateMode.value === null) void loadMicGate()
-  },
-  { immediate: true },
-)
-
-async function saveMicGate() {
-  const value = gateMode.value === "fixed" ? String(gateLevel.value) : gateMode.value
-  if (!value) return
-  gateBusy.value = true
-  try {
-    const reply = await setMicGate(value)
-    if (reply.reply === "saved" && (reply.pinned as string[]).includes("audio.mic_gate")) {
-      toast.warning(t("settings.micGatePinned"))
-    } else {
-      toast.success(t("settings.saved"))
-    }
-  } catch (e) {
-    toast.failure(e, { title: t("settings.micGateFailed"), retry: saveMicGate })
-  } finally {
-    gateBusy.value = false
-  }
-}
-
-function setGateMode(mode: string) {
-  gateMode.value = mode as GateMode
-  void saveMicGate()
-}
-
-/** The `[calls]` section as the file has it; `null` until read. */
-const calls = ref<CallsConfig | null>(null)
-const callsBusy = ref(false)
 const callSetup = computed(() => status.value?.call_setup ?? null)
 /**
  * Phones linked over the mesh that this computer has no Bluetooth pairing
@@ -153,25 +87,6 @@ const unpairedPhones = computed(() => {
     .filter((peer) => peer.link?.device_kind === "Phone" && !paired.has(peer.name.toLowerCase()))
     .map((peer) => peer.name)
 })
-
-/** "No device chosen", as a value the select can hold: it takes no empty string. */
-const DEFAULT_DEVICE = "cursio:default"
-
-const voiceModes = computed(() => [
-  { value: "follow", label: t("settings.callsVoiceFollow") },
-  { value: "here", label: t("settings.callsVoiceHere") },
-])
-
-function deviceOptions(devices: { id: string; name: string }[], chosen: string | null) {
-  const options = [{ value: DEFAULT_DEVICE, label: t("settings.callsDefault") }]
-  for (const d of devices) options.push({ value: d.id, label: d.name })
-  // A device chosen earlier that is not plugged in now is still the setting.
-  if (chosen && !devices.some((d) => d.id === chosen)) options.push({ value: chosen, label: chosen })
-  return options
-}
-
-const outputOptions = computed(() => deviceOptions(callSetup.value?.outputs ?? [], calls.value?.output ?? null))
-const inputOptions = computed(() => deviceOptions(callSetup.value?.inputs ?? [], calls.value?.input ?? null))
 
 function serviceLabel(state: ServiceState) {
   if (state.state === "running") return t("settings.callsRunning")
@@ -203,105 +118,6 @@ const nodeFacts = computed(() =>
       ]
     : [],
 )
-
-async function loadCalls() {
-  try {
-    const reply = await config()
-    if (reply.reply !== "config") return
-    const { file } = reply as Extract<Reply, { reply: "config" }>
-    calls.value = file.calls ?? { answer_moves_voice: true, voice: "follow", output: null, input: null }
-  } catch (e) {
-    toast.failure(e, { title: t("settings.callsFailedSave") })
-  }
-}
-
-watch(
-  () => !!callSetup.value,
-  (up) => {
-    if (up && calls.value === null) void loadCalls()
-  },
-  { immediate: true },
-)
-
-async function saveCalls(change: Partial<CallsConfig>) {
-  if (!calls.value) return
-  const next = { ...calls.value, ...change }
-  callsBusy.value = true
-  try {
-    await setCalls(next)
-    calls.value = next
-    toast.success(t("settings.saved"))
-  } catch (e) {
-    toast.failure(e, { title: t("settings.callsFailedSave"), retry: () => saveCalls(change) })
-  } finally {
-    callsBusy.value = false
-  }
-}
-
-/**
- * The mesh's Bluetooth path: whether this machine uses it at all, and whether
- * it is kept open beside the network so a session moves there within seconds
- * when Wi-Fi drops. `null` until read.
- */
-const standby = ref<boolean | null>(null)
-const standbyBusy = ref(false)
-const bluetoothMesh = ref<BluetoothMesh>("auto")
-
-const meshModes = computed(() => [
-  { value: "auto", label: t("settings.bluetoothAuto") },
-  { value: "on", label: t("settings.bluetoothOn") },
-  { value: "off", label: t("settings.bluetoothOff") },
-])
-
-async function loadStandby() {
-  try {
-    const reply = await config()
-    if (reply.reply !== "config") return
-    const { file } = reply as Extract<Reply, { reply: "config" }>
-    standby.value = file.bluetooth?.standby ?? false
-    bluetoothMesh.value = file.bluetooth?.mesh ?? "auto"
-  } catch (e) {
-    toast.failure(e, { title: t("settings.standbyFailed") })
-  }
-}
-
-watch(
-  () => !!status.value,
-  (up) => {
-    if (up && standby.value === null) void loadStandby()
-  },
-  { immediate: true },
-)
-
-async function saveMesh(mode: BluetoothMesh) {
-  standbyBusy.value = true
-  try {
-    await applyConfigEdit({ bluetooth_mesh: mode })
-    bluetoothMesh.value = mode
-    toast.success(t("settings.saved"))
-  } catch (e) {
-    toast.failure(e, { title: t("settings.standbyFailed"), retry: () => saveMesh(mode) })
-  } finally {
-    standbyBusy.value = false
-  }
-}
-
-/**
- * The switches below save themselves (the kit's `action`): they show the
- * change at once, spin while it is sent, and go back on their own when it
- * fails. What is left here is the saving, and the failure with its retry —
- * the switch is back where it was by then, so the retry is the other value.
- */
-async function saveStandby(on: boolean) {
-  await setBluetoothStandby(on)
-  standby.value = on
-  toast.success(t("settings.saved"))
-}
-
-function standbyFailed(e: unknown) {
-  const on = !standby.value
-  toast.failure(e, { title: t("settings.standbyFailed"), retry: () => saveStandby(on) })
-}
 
 interface Autostart {
   node: boolean
@@ -347,6 +163,11 @@ function collectToc() {
     id: s.id,
     text: s.querySelector("h1, h2, h3, h4")?.textContent?.trim() || s.id,
   }))
+  const awaited = awaitedSection && document.getElementById(awaitedSection)
+  if (awaited) {
+    awaitedSection = null
+    awaited.scrollIntoView({ behavior: "smooth", block: "start" })
+  }
 }
 let watcher: MutationObserver | undefined
 onMounted(() => {
@@ -410,48 +231,13 @@ async function restartNode() {
           </LpCard>
         </section>
 
-        <section v-if="status" id="audio" class="flex scroll-mt-4 flex-col gap-3">
-          <LpSection :title="t('settings.audioTitle')" icon="lucide:mic" />
-          <LpSkeleton v-if="!gateMode" rounded="card" class="h-24" />
-          <LpCard v-else padded class="flex flex-col gap-3">
-            <div class="flex flex-wrap items-center gap-4">
-              <div class="min-w-0 flex-1">
-                <p class="text-sm font-medium">{{ t("settings.micGate") }}</p>
-                <p class="text-xs text-muted">{{ t("settings.micGateHint") }}</p>
-              </div>
-              <LpSegmented
-                :model-value="gateMode"
-                :options="gateModes"
-                :disabled="gateBusy"
-                size="sm"
-                @update:model-value="setGateMode"
-              />
-            </div>
-            <div v-if="gateMode === 'fixed'" class="flex items-center gap-4">
-              <LpSlider
-                v-model="gateLevel"
-                :min="GATE_MIN"
-                :max="GATE_MAX"
-                :step="1"
-                :disabled="gateBusy"
-                :aria-label="t('settings.micGateLevel')"
-                class="flex-1"
-                @change="saveMicGate"
-              />
-              <span class="w-20 text-right font-mono text-xs tabular-nums">
-                {{ t("settings.micGateDb", { db: gateLevel }) }}
-              </span>
-            </div>
-            <p v-if="gatePinned" class="text-xs text-muted">{{ t("settings.micGatePinned") }}</p>
-          </LpCard>
-        </section>
+        <SettingsRegistry @restart="confirmRestart = true" />
 
         <section v-if="status && !isMobile" id="calls" class="flex scroll-mt-4 flex-col gap-3">
           <LpSection :title="t('settings.callsTitle')" :description="t('settings.callsDescription')" icon="lucide:phone" />
           <LpCard v-if="!callSetup" padded>
             <p class="text-sm text-muted">{{ t("settings.callsUnsupported") }}</p>
           </LpCard>
-          <LpSkeleton v-else-if="!calls" rounded="card" class="h-48" />
           <LpCard v-else padded class="flex flex-col gap-4">
             <p v-if="callSetup.headset === false" class="text-sm text-muted">{{ t("settings.callsUnsupported") }}</p>
             <ul v-else class="flex flex-col divide-y divide-line">
@@ -501,50 +287,6 @@ async function restartNode() {
                 </p>
               </li>
             </ul>
-
-            <div class="flex items-center gap-4">
-              <div class="min-w-0 flex-1">
-                <p class="text-sm font-medium">{{ t("settings.callsAnswerMoves") }}</p>
-                <p class="text-xs text-muted">{{ t("settings.callsAnswerMovesHint") }}</p>
-              </div>
-              <LpSwitch
-                :model-value="calls.answer_moves_voice"
-                :disabled="callsBusy"
-                :aria-label="t('settings.callsAnswerMoves')"
-                @update:model-value="(v: boolean) => saveCalls({ answer_moves_voice: v })"
-              />
-            </div>
-            <div class="flex flex-wrap items-center gap-4">
-              <div class="min-w-0 flex-1">
-                <p class="text-sm font-medium">{{ t("settings.callsVoice") }}</p>
-                <p class="text-xs text-muted">{{ t("settings.callsVoiceHint") }}</p>
-              </div>
-              <LpSegmented
-                :model-value="calls.voice"
-                :options="voiceModes"
-                :disabled="callsBusy"
-                size="sm"
-                @update:model-value="(v: string) => saveCalls({ voice: v as CallsConfig['voice'] })"
-              />
-            </div>
-            <div class="grid gap-3 sm:grid-cols-2">
-              <LpFormField :label="t('settings.callsOutput')">
-                <LpSelect
-                  :model-value="calls.output ?? DEFAULT_DEVICE"
-                  :options="outputOptions"
-                  :disabled="callsBusy"
-                  @update:model-value="(v: string) => saveCalls({ output: v === DEFAULT_DEVICE ? null : v })"
-                />
-              </LpFormField>
-              <LpFormField :label="t('settings.callsInput')">
-                <LpSelect
-                  :model-value="calls.input ?? DEFAULT_DEVICE"
-                  :options="inputOptions"
-                  :disabled="callsBusy"
-                  @update:model-value="(v: string) => saveCalls({ input: v === DEFAULT_DEVICE ? null : v })"
-                />
-              </LpFormField>
-            </div>
           </LpCard>
         </section>
 
@@ -566,37 +308,6 @@ async function restartNode() {
         <section v-if="status && !isMobile" id="crossing" class="flex scroll-mt-4 flex-col gap-3">
           <LpSection :title="t('crossing.title')" :description="t('crossing.description')" icon="lucide:panel-bottom" />
           <EdgeCrossingCard />
-        </section>
-
-        <section v-if="status" id="standby" class="flex scroll-mt-4 flex-col gap-3">
-          <LpSection :title="t('settings.standbyTitle')" :description="t('settings.standbyDescription')" icon="lucide:bluetooth" />
-          <LpSkeleton v-if="standby === null" rounded="card" class="h-16" />
-          <LpCard v-if="standby !== null" padded class="flex items-center gap-4">
-            <div class="min-w-0 flex-1">
-              <p class="text-sm font-medium">{{ t("settings.bluetoothMode") }}</p>
-              <p class="text-xs text-muted">{{ t("settings.bluetoothModeHint") }}</p>
-            </div>
-            <LpSegmented
-              :model-value="bluetoothMesh"
-              :options="meshModes"
-              :disabled="standbyBusy"
-              size="sm"
-              @update:model-value="(v: string) => saveMesh(v as BluetoothMesh)"
-            />
-          </LpCard>
-          <LpCard v-if="standby !== null && bluetoothMesh !== 'off'" padded class="flex items-center gap-4">
-            <div class="min-w-0 flex-1">
-              <p class="text-sm font-medium">{{ t("settings.standbyToggle") }}</p>
-              <p class="text-xs text-muted">{{ t("settings.standbyHint") }}</p>
-            </div>
-            <LpSwitch
-              v-model="standby"
-              :action="saveStandby"
-              :disabled="standbyBusy"
-              :aria-label="t('settings.standbyToggle')"
-              @error="standbyFailed"
-            />
-          </LpCard>
         </section>
 
         <section v-if="status" id="playing" class="flex scroll-mt-4 flex-col gap-3">

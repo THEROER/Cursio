@@ -39,6 +39,7 @@
 
 mod arrange;
 mod handle;
+mod settings;
 #[cfg(test)]
 mod test_support;
 mod view;
@@ -75,6 +76,8 @@ struct Inner {
     /// saved one: links carry a name from their greeting.
     greeted_as: Option<String>,
     available: Vec<ModuleSwitch>,
+    /// The modules this build can run here.
+    modules: Vec<cursio_protocol::ModuleId>,
     /// Every machine discovery reported, by id: name, address, when.
     nearby: BTreeMap<PeerId, (String, std::net::SocketAddr, SystemTime)>,
     /// This machine's screens as last read.
@@ -163,7 +166,7 @@ impl NodeState {
                 .map(|_| ())
                 .map_err(|e| e.to_string()),
         }));
-        Self {
+        let state = Self {
             inner: Arc::new(Mutex::new(Inner {
                 node: NodeView {
                     id: identity.peer_id,
@@ -179,6 +182,7 @@ impl NodeState {
                 links: BTreeMap::new(),
                 greeted_as: None,
                 available: Vec::new(),
+                modules: Vec::new(),
                 nearby: BTreeMap::new(),
                 screens: Vec::new(),
             })),
@@ -193,7 +197,12 @@ impl NodeState {
             on_forget: Arc::new(Mutex::new(None)),
             on_arrange: Arc::new(Mutex::new(None)),
             mixer: crate::mixer::LocalMixer::default(),
-        }
+        };
+        let access = state.clone();
+        crate::diag_session::set_settings_access(Arc::new(move |peer, request| {
+            access.answer_settings(peer, request)
+        }));
+        state
     }
 
     /// Where [`Command::Forget`] reaches the running mesh: ending the link and
@@ -240,10 +249,16 @@ impl NodeState {
         self.inner().node.id
     }
 
-    /// Which module switches this build can act on. Set once by whoever built
-    /// the module registry, which is the only place that knows.
-    pub fn set_available(&self, available: Vec<ModuleSwitch>) {
-        self.inner().available = available;
+    /// The modules this build can run here, and whether it has an input
+    /// backend. Set once by whoever built the module registry, which is the
+    /// only place that knows; the switches offered and the settings listed
+    /// both follow from it.
+    pub fn set_available(&self, modules: Vec<cursio_protocol::ModuleId>, input: bool) {
+        {
+            let mut inner = self.inner();
+            inner.available = ModuleSwitch::available(&modules, input);
+            inner.modules = modules;
+        }
         self.changed();
     }
 
