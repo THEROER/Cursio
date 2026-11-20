@@ -882,7 +882,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_resend_buffer_filled_while_held_is_written_on_the_path_that_comes_back() {
-        let (mut a, mut b) = session().await;
+        let (a, mut b) = session().await;
         cut(&a, &b).await;
         let blob = |n: u8| Msg::Blob(BULK, vec![n; 1024 * 1024]);
         let mut tx = a.tx.clone();
