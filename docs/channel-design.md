@@ -107,15 +107,32 @@ is only what it names:
 
 This is the piece Leave's command results need: a result sent while the
 stream is down is kept and resent when the agent's next connection joins the
-session, and delivered exactly once.
+session.
+
+**The guarantee is exactly once within one session**, and no more. Kept
+frames live in memory: they are gone when the hold runs out, when either
+process restarts, or when the trust ends the session. So when a session ends
+for any reason, the application is handed every reliable message the peer
+never acknowledged, decoded, to keep and send again in a session of its own
+making; a durable truth (Leave's `command_id` and the agent's journal) stays
+the application's, and so does deduplication across sessions.
+
+**A reliable message may carry an absolute deadline** (`expires_at`, the
+sender's wall clock), apart from `Fresh { within }`, which is judged against
+the sender's own queue and suits metrics, not commands. A reliable message
+past its deadline is not sent, not resent after a resume, and is reported to
+the sender as expired — never lost quietly. A command run late is worse than
+one refused.
 
 ### Seal
 
 Noise transport mode over each carrier, exactly as now, when the trust
-produced Noise keys. When the carrier is already authenticated and encrypted
-(TLS with mutual certificates, a WSS connection whose user presented a token),
-sealing is the identity: frames go in the clear inside TLS. Frame tags and
-chunking are the same either way.
+produced Noise keys. When the carrier is TLS that verified its peer (mutual
+certificates, or a WSS connection whose user then presented a token), sealing
+is the identity: frames go in the clear inside TLS. That mode is refused on
+anything else — plain TCP, `ws://` — whatever the configuration says; only the
+in-memory carrier of the tests is exempt. Frame tags and chunking are the same
+either way.
 
 ### Carrier
 
@@ -144,35 +161,85 @@ datagrams) follows the measurements in `docs/transport-design.md`.
 
 ### Trust
 
+Identity is never something a caller asserts. It is a value a verifier
+produced from what it checked — a TLS handshake, a token, a Noise static
+key — and it is typed, so a service cannot be confused with a user and a
+display name never takes part in a decision:
+
 ```rust
+pub enum PeerIdentity {
+    /// A workload: `spiffe://leave/service/<id>` from the one URI SAN of a
+    /// client certificate with clientAuth, never a CN or a header.
+    Service { id: String },
+    Host { id: String },
+    /// A person, from a token whose audience was checked.
+    User { sub: String, aud: String },
+    /// A Cursio node, after pairing.
+    Paired { id: [u8; 16] },
+}
+// Equality is on the canonical form only: a certificate rotated to a new
+// serial is the same peer, so its session lives on.
+
 #[async_trait] pub trait Trust: Send + Sync {
-    /// Run the opening exchange over a fresh carrier, as the side that
-    /// dialled or the side that accepted.
+    /// The opening exchange over a fresh carrier, as the side that dialled
+    /// or the side that accepted.
     async fn open(&self, carrier: &mut dyn Carrier, role: Role) -> Result<Opened, ChannelError>;
+    /// Is `peer` still trusted now? Asked on every connection that joins
+    /// the session (with the joining connection's own fresh proof), on a
+    /// timer, and before each message is delivered. `Err` ends the session,
+    /// held or not.
+    fn check(&self, peer: &Verified, now: SystemTime) -> Result<(), Revoked>;
 }
 pub struct Opened {
-    pub peer: PeerIdentity,       // opaque bytes plus a display name
-    pub seal: Seal,               // Noise keys, or Identity for an authenticated carrier
-    pub session_tag: SessionTag,  // same on both ends, unguessable
+    pub peer: Verified,           // the identity, its proof's serial, and not_after
+    pub seal: Seal,               // Noise keys, or Identity for a verified TLS carrier
+    pub session_tag: SessionTag,  // same on both ends, unguessable, never logged
 }
 ```
+
+Rules every trust and the session around it keep:
+
+- **Continuous, not once.** A session has a deadline: the earliest
+  `not_after` of what proved it (a certificate's, a token's `exp`). At the
+  deadline it ends, unless a `REAUTH` frame carried a fresh proof of the same
+  canonical identity first (a renewed JWT of the same `sub` and `aud`); a
+  proof of another identity ends it. Revocation — a serial on a deny list, a
+  token the issuer's introspection rejects — ends it at the next `check`,
+  including a session only held and waiting for a path.
+- **Resuming re-proves both ends.** A connection joins a session only after
+  passing the full check again (expiry, deny list, audience) as the same
+  canonical identity, and offering the session's tag. Both sides do it: the
+  agent confirms the control it rejoins is the one it held results for, or
+  they would go to another server. For a bearer token over WSS the tag is
+  bound to the TLS connection (`tls-exporter`, RFC 9266), so a stolen tag
+  cannot be replayed on another one.
+- **Configured, never negotiated.** An endpoint names its trust in its
+  configuration. There is no negotiation between trusts and no fallback: a
+  TLS failure (wrong CA, name, expiry) fails closed and does not try Noise.
+- **Tokens are in the opening exchange**, never in a URL.
 
 Shipped implementations:
 
 - **`NoisePsk`** — `Noise_NNpsk0` keyed by a shared secret, Cursio's handshake
   byte for byte. SPAKE2 pairing, which produces the secret, stays in Cursio.
-- **`NoiseKeys`** — `Noise_IK`/`XX` with static Ed25519/X25519 keys made on
-  each node, the peer's key pinned by the caller or vouched for by a
-  certificate the caller verifies (Leave's spiffe CA): what a server's
-  agent and a control plane use when TLS is not underneath.
-- **`CarrierAuthenticated`** — for a carrier TLS already authenticated: the
-  caller says who the peer is (a verified client certificate, a validated
-  JWT), the session tag is issued by the accepting side over that carrier
-  and presented again to resume. A tag alone never authenticates: a joining
-  connection must authenticate as the same peer first.
+  Not for Leave: a shared secret there is a shared token.
+- **`CarrierAuthenticated`** — for a carrier TLS verified: the verifier of
+  the caller's choosing (Leave's spiffe rules, a JWT validator with audience
+  and introspection) turns that TLS context, and the token sent in the
+  opening exchange, into a `Verified`, and answers `check`. Refused on a
+  carrier that is not verified TLS.
+- **`NoiseKeys`** — `Noise_IK`/`XX` with pinned static keys, where TLS is not
+  underneath. Binding a static key to an X.509 certificate (Leave's ECDSA
+  P-256 service CA) needs a specification of its own and is out of scope
+  until someone needs it.
 
-The session binds resumption to the trust: a connection joins a session only
-when it opened as the same peer and offered that session's tag.
+### Authorization
+
+Who a peer is and what it may do are separate. An endpoint carries a policy
+from identity to the lanes and classes it may open — a user's console lane,
+a service's bulk lane — checked when a class is first used and enforced only
+when the policy says `enforce`, the way Leave's toolkit checks a caller
+against a method.
 
 ## Wire format, for implementations in other languages
 
@@ -210,10 +277,16 @@ are MIT or Apache. It is mirrored to its own public repository the way
    session, seal, the TCP and in-memory carriers, `NoisePsk`.
    `cursio-transport` becomes the binding. Every existing transport, core and
    live test passes unchanged; nothing on the wire moves.
-2. **Trust and carriers for the internet**: `NoiseKeys`,
-   `CarrierAuthenticated`, the WebSocket carrier, and an example pair (a
-   service and a client with a console lane and a bulk lane, killing the
-   connection mid-transfer and resuming) that Leave can start from.
+2. **Trust and carriers for the internet**: typed `Verified` identities,
+   `Trust::check`, deadlines and `REAUTH`, `CarrierAuthenticated` over TLS and
+   WSS, authorization per lane and class, the WebSocket carrier, and an
+   example pair (a service and a client with a console lane and a bulk lane,
+   the connection killed mid-transfer and resumed) that Leave can start from.
+   Its tests: a resume by another peer is refused; a certificate expiring
+   mid-stream closes the session; a serial added to the deny list closes a
+   held session; `CarrierAuthenticated` over `ws://` is refused; a reliable
+   message past its deadline is reported expired; a session that ends hands
+   back what was never acknowledged.
 3. **Specification and test vectors** for implementations in other languages.
 4. **QUIC carrier**, when the measurements say the lanes stall on resends.
 5. **First Leave consumer**, chosen there: the panel's console and files, or
